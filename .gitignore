@@ -1,0 +1,28 @@
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Node
+node_modules/
+dist/
+
+# Rust
+target/
+
+# Go
+bin/
+
+# Python
+__pycache__/
+.venv/
+
+# Local model weights & caches — never commit
+models/
+*.gguf
+
+# Secrets — keys live in the OS keychain, never in the repo
+.env
+.env.*
