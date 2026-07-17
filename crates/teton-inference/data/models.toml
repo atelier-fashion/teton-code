@@ -1,0 +1,50 @@
+# Teton Code local-model catalog.
+#
+# Versioned *data*, not code: the daemon can replace this file with a newer
+# catalog (bumping `version`) without a teton-inference release. Each entry maps
+# a model name to its GGUF download URL, expected SHA-256, download size, and the
+# minimum system RAM required to load it, plus the OQ-3 hardware band it serves:
+#
+#   small -> 1.5B-3B  (8-16 GiB machines)
+#   mid   -> 7B       (16-32 GiB machines)
+#   large -> 30B-A3B  (32 GiB+ machines, optional)
+#
+# NOTE: the `sha256` and `url` values below are PLACEHOLDERS pending the
+# dogfooding benchmark that fixes the exact model picks (REQ-544 OQ-3). Replace
+# them with the real digests before wiring first-run downloads to these URLs.
+# The download checksum path is exercised by tests against synthetic byte streams
+# with real, computed digests, so these placeholders do not affect verification.
+
+version = 1
+
+[[models]]
+name = "qwen2.5-coder-1.5b"
+url = "https://models.tetoncode.ai/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000001"
+size_bytes = 1_100_000_000
+ram_floor_bytes = 3_221_225_472
+band = "small"
+
+[[models]]
+name = "qwen2.5-coder-3b"
+url = "https://models.tetoncode.ai/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
+size_bytes = 2_000_000_000
+ram_floor_bytes = 5_368_709_120
+band = "small"
+
+[[models]]
+name = "qwen2.5-coder-7b"
+url = "https://models.tetoncode.ai/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000003"
+size_bytes = 4_700_000_000
+ram_floor_bytes = 9_663_676_416
+band = "mid"
+
+[[models]]
+name = "qwen3-coder-30b-a3b"
+url = "https://models.tetoncode.ai/qwen3-coder-30b-a3b-instruct-q4_k_m.gguf"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000004"
+size_bytes = 18_000_000_000
+ram_floor_bytes = 21_474_836_480
+band = "large"

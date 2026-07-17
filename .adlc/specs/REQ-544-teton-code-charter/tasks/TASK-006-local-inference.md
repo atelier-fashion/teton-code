@@ -1,10 +1,11 @@
 ---
 id: TASK-006
 title: "teton-inference: llama.cpp embed, probe, download, benchmark"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17
+completed: 2026-07-17
 dependencies: [TASK-003]
 ---
 
@@ -26,11 +27,11 @@ adaptation.
 
 ## Acceptance Criteria
 
-- [ ] Probe decision table matches OQ-3 for simulated profiles incl. <8GB → local tier disabled, sessions proceed remote-only (AC-8)
-- [ ] Forced-slow benchmark triggers step-down to next smaller model; step-down chain terminates at disabled, never loops (AC-8)
-- [ ] Download resumes after interruption; checksum mismatch discards and re-fetches
-- [ ] Simulated memory pressure unloads the model and emits `model_lifecycle`; inference requests during unload return typed "local tier unavailable" (router bypasses per BR-8)
-- [ ] User-pinned model in config overrides the probe (BR-9)
+- [x] Probe decision table matches OQ-3 for simulated profiles incl. <8GB → local tier disabled, sessions proceed remote-only (AC-8)
+- [x] Forced-slow benchmark triggers step-down to next smaller model; step-down chain terminates at disabled, never loops (AC-8)
+- [x] Download resumes after interruption; checksum mismatch discards and re-fetches
+- [x] Simulated memory pressure unloads the model and emits `model_lifecycle`; inference requests during unload return typed "local tier unavailable" (router bypasses per BR-8)
+- [x] User-pinned model in config overrides the probe (BR-9)
 
 ## Technical Notes
 
