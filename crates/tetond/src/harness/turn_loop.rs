@@ -37,7 +37,7 @@ use serde_json::Value;
 use teton_inference::{Engine, EngineError, GenParams};
 use teton_protocol::events::{Event, SessionUpdate, SessionUpdatePayload, ToolCallStatus};
 use teton_protocol::methods::StopReason;
-use teton_protocol::SessionId;
+use teton_protocol::{ProviderId, SessionId};
 use teton_providers::{HarnessProfile, ToolCall};
 
 use crate::broadcast::EventBus;
@@ -114,6 +114,48 @@ impl HarnessConfig {
             require_verification: profile.require_verification,
             ..Self::default()
         }
+    }
+}
+
+/// A per-turn routing input from the router (TASK-010): which provider serves
+/// the turn and the harness profile it runs under.
+///
+/// This is the seam by which the router hands the loop a **provider + profile per
+/// turn** — the BR-6 degradation decision — without touching the local-first
+/// [`run_session_turn`] signature. The offline AC-1 path stays a transport-free,
+/// zero-egress call; a routed turn wraps it with [`run_routed_session_turn`],
+/// which runs the same loop under [`TurnRoute::config`]. The remote wiring proper
+/// (privacy + cost) lives at the egress choke point the router builds a context
+/// for; the loop's job here is only to run at the right profile and to know which
+/// provider the turn is attributed to.
+#[derive(Debug, Clone)]
+pub struct TurnRoute {
+    /// Provider selected for this turn (attribution; feeds `route_decided` /
+    /// `cost_recorded` above this layer).
+    pub provider_id: ProviderId,
+    /// Concrete model chosen, when known.
+    pub model: Option<String>,
+    /// Harness configuration for this turn — the BR-6 profile the router derived
+    /// from the selected provider's capabilities.
+    pub config: HarnessConfig,
+}
+
+impl TurnRoute {
+    /// A route naming `provider_id` and running under `config`, with no model.
+    #[must_use]
+    pub fn new(provider_id: impl Into<ProviderId>, config: HarnessConfig) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model: None,
+            config,
+        }
+    }
+
+    /// Set the concrete model for this turn.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 }
 
@@ -333,6 +375,44 @@ pub async fn run_session_turn(
     }
 }
 
+/// Drive one prompt turn under an explicit [`TurnRoute`] chosen by the router
+/// (TASK-010).
+///
+/// A thin, additive wrapper over [`run_session_turn`]: it runs the same loop
+/// under the route's degradation-derived [`HarnessConfig`] (BR-6), so a turn
+/// routed to a weak tool-caller runs the reduced profile and a turn routed to a
+/// reliable one runs the full loop — from a single per-turn decision. The
+/// `engine` still serves the tokens and the local-only [`run_session_turn`] path
+/// is unchanged; the route names the provider the turn is attributed to and pins
+/// its profile. Remote privacy/cost enforcement is applied at the egress choke
+/// point the router builds a context for, not here.
+///
+/// # Errors
+/// Propagates [`HarnessError`] from the underlying [`run_session_turn`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_routed_session_turn(
+    engine: &Mutex<dyn Engine>,
+    tools: &ToolRegistry,
+    tool_ctx: &ToolContext,
+    gate: &PermissionGate,
+    events: &SessionEvents,
+    ctx: &mut ContextManager,
+    route: &TurnRoute,
+    hook: &mut dyn ProvenanceHook,
+) -> Result<TurnOutcome, HarnessError> {
+    run_session_turn(
+        engine,
+        tools,
+        tool_ctx,
+        gate,
+        events,
+        ctx,
+        &route.config,
+        hook,
+    )
+    .await
+}
+
 /// Build the system prompt: the agent's instructions plus the exposed tool docs
 /// and the tool-call format the local model must follow.
 #[must_use]
@@ -535,6 +615,17 @@ mod tests {
         let cands = json_object_candidates(r#"{"tool":"grep","arguments":{"pattern":"a}b{c"}}"#);
         assert_eq!(cands.len(), 1);
         assert!(serde_json::from_str::<Value>(&cands[0]).is_ok());
+    }
+
+    #[test]
+    fn turn_route_carries_provider_model_and_profile() {
+        let route = TurnRoute::new("deepseek", HarnessConfig::for_strong_model())
+            .with_model("deepseek-chat");
+        assert_eq!(route.provider_id, ProviderId::from("deepseek"));
+        assert_eq!(route.model.as_deref(), Some("deepseek-chat"));
+        // The profile is carried verbatim — the loop runs under exactly it.
+        assert_eq!(route.config.max_turns, 40);
+        assert!(route.model.is_some());
     }
 
     #[test]

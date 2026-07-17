@@ -16,6 +16,10 @@
 //! - [`cost`] — the append-only cost ledger, price table, and report (BR-2): one
 //!   `CostRecord` per remote call, recorded at the egress hook.
 //! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
+//! - [`router`] — phase-policy routing (BR-5), BR-6 degradation, remote wiring
+//!   through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
+//! - [`heuristics`] — freeform-mode routing (BR-5): local for auxiliary duties,
+//!   the configured default for coding turns, with a BR-8 local-tier bypass.
 //! - [`mcp`] — user-registered MCP servers as egress-gated tool providers
 //!   (ADR-003): the protocol client, the server registry, and the tool bridge.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
@@ -26,7 +30,9 @@ pub mod broadcast;
 pub mod cost;
 pub mod egress;
 pub mod harness;
+pub mod heuristics;
 pub mod mcp;
+pub mod router;
 pub mod server;
 pub mod sessions;
 pub mod single_instance;
