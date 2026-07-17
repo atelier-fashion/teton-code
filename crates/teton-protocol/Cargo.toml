@@ -8,7 +8,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# Pure protocol types: serialization + typed errors only. Deliberately no
+# transport, socket, or async dependency (that lives in tetond, TASK-004) so
+# these types can be mirrored verbatim in the TypeScript extension (ADR-002).
+# serde_json is the JSON codec (not I/O) — required for round-trip helpers and
+# the free-form `data` member of a JSON-RPC error.
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
 
 [lints]
 workspace = true

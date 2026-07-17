@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 title: "teton-protocol: JSON-RPC types, events, handshake"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17
@@ -25,11 +25,11 @@ diff. Serde types only — no transport code (that's TASK-004).
 
 ## Acceptance Criteria
 
-- [ ] All method/event payloads round-trip serde JSON (unit tests per type)
-- [ ] Unknown-field tolerance: deserializing payloads with extra fields succeeds (forward compat)
-- [ ] Handshake rejects incompatible version ranges with a typed error
-- [ ] Event names match the spec's Events table (REQ-544 System Model)
-- [ ] No transport, socket, or async code in this crate
+- [x] All method/event payloads round-trip serde JSON (unit tests per type)
+- [x] Unknown-field tolerance: deserializing payloads with extra fields succeeds (forward compat)
+- [x] Handshake rejects incompatible version ranges with a typed error
+- [x] Event names match the spec's Events table (REQ-544 System Model)
+- [x] No transport, socket, or async code in this crate
 
 ## Technical Notes
 
