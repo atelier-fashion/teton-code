@@ -1,5 +1,5 @@
 ---
-id: REQ-TBD          # allocated from ~/.claude/.global-next-req when formally filed after /init
+id: REQ-544
 title: "Teton Code — hybrid local/remote AI coding agent with workflow-aware model routing"
 status: draft
 deployable: true
@@ -188,8 +188,9 @@ _MVP = daemon + CLI. Extension is phase 2 (see Out of Scope)._
   meaningfully shrink the early-adopter pool.
 - macOS/Apple Silicon is the first-class platform for MVP; Linux follows; Windows
   later.
-- REQ id allocated without remote verification — spec drafted pre-`/init`,
-  outside a repo; verify id and file into `.adlc/specs/` when the repo exists.
+- Daemon and CLI implemented in Rust (ADR-001 in
+  `.adlc/context/architecture.md`); the VS Code extension (phase 2) is
+  TypeScript talking to the daemon over the protocol.
 
 ## Open Questions
 

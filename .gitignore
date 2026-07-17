@@ -26,3 +26,15 @@ models/
 # Secrets — keys live in the OS keychain, never in the repo
 .env
 .env.*
+
+# ADLC worktrees (used by /proceed for parallel session isolation)
+.worktrees/
+
+# Claude Code per-user permission overrides (team settings live in .claude/settings.json)
+.claude/settings.local.json
+
+# ADLC ID counters are global (~/.claude/.global-next-req etc.) — not per-project
+# Legacy per-project counters (deprecated, ignored if present)
+.adlc/.next-bug
+.adlc/.next-req
+.adlc/.next-lesson

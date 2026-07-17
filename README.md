@@ -41,8 +41,10 @@ daemon. Clients are thin:
 ## Status
 
 🚧 **Pre-alpha — product spec stage.** See
-[docs/requirement-draft.md](docs/requirement-draft.md) for the full requirement
-spec (business rules, acceptance criteria, open questions).
+[the product charter](.adlc/specs/REQ-544-teton-code-charter/requirement.md)
+for the full requirement spec (business rules, acceptance criteria, open
+questions). The daemon and CLI will be Rust; architecture decisions are
+recorded in [.adlc/context/architecture.md](.adlc/context/architecture.md).
 
 ## License
 
