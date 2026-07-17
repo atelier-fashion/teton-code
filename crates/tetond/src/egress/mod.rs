@@ -63,6 +63,7 @@ use teton_providers::transport::{
 };
 
 use crate::broadcast::EventBus;
+use crate::cost::{CostAttribution, CostMeter};
 
 pub use inspector::{inspect, Inspection, Violation};
 pub use provenance::{assembled_provenance, ContextBlock, Provenance};
@@ -157,6 +158,12 @@ pub struct EgressContext {
     /// [`PrivacyAction::ReroutedToLocal`]: the remote call is prevented and the
     /// turn is to be served on the local tier.
     pub block_action: PrivacyAction,
+    /// Billing attribution for this call (TASK-008, BR-2). When present *and* the
+    /// choke point holds a cost meter, an allowed forward is recorded as one
+    /// `CostRecord`; when absent, the call forwards unmetered (e.g. a
+    /// non-billable probe). Carries the phase and model the choke point cannot
+    /// otherwise know.
+    pub cost: Option<CostAttribution>,
 }
 
 impl EgressContext {
@@ -168,6 +175,7 @@ impl EgressContext {
             provider_id: provider_id.into(),
             session_id: None,
             block_action: PrivacyAction::ReroutedToLocal,
+            cost: None,
         }
     }
 
@@ -184,6 +192,14 @@ impl EgressContext {
         self.block_action = action;
         self
     }
+
+    /// Attach billing attribution so an allowed forward is recorded as a
+    /// `CostRecord` (TASK-008, BR-2).
+    #[must_use]
+    pub fn with_cost(mut self, attribution: CostAttribution) -> Self {
+        self.cost = Some(attribution);
+        self
+    }
 }
 
 /// The egress choke point: a privacy/cost guard wrapping an inner [`Transport`].
@@ -196,6 +212,7 @@ pub struct Egress<T: Transport> {
     inner: T,
     boundaries: Vec<PrivacyBoundary>,
     sink: Arc<dyn PrivacyEventSink>,
+    cost: Option<Arc<dyn CostMeter>>,
 }
 
 impl<T: Transport> Egress<T> {
@@ -211,7 +228,17 @@ impl<T: Transport> Egress<T> {
             inner,
             boundaries,
             sink,
+            cost: None,
         }
+    }
+
+    /// Install the cost meter (TASK-008): every allowed forward carrying a
+    /// [`CostAttribution`] is recorded as one `CostRecord` (BR-2). Additive —
+    /// a choke point without a meter forwards exactly as before.
+    #[must_use]
+    pub fn with_cost_meter(mut self, meter: Arc<dyn CostMeter>) -> Self {
+        self.cost = Some(meter);
+        self
     }
 
     /// The configured boundaries (read-only).
@@ -257,10 +284,23 @@ impl<T: Transport> Egress<T> {
 
         // Cleared. TASK-008 wraps this forward to record a CostRecord (BR-2) from
         // the streamed usage — the single point where every remote call is billed.
-        self.inner
+        let response = self
+            .inner
             .execute(request)
             .await
-            .map_err(EgressError::Transport)
+            .map_err(EgressError::Transport)?;
+        // Bill the call iff the caller attached attribution and a meter is
+        // installed; the meter wraps the response so recording happens from the
+        // streamed usage when the body drains.
+        match (&self.cost, &ctx.cost) {
+            (Some(meter), Some(attribution)) => Ok(meter.meter_response(
+                response,
+                ctx.session_id.clone(),
+                ctx.provider_id.clone(),
+                attribution.clone(),
+            )),
+            _ => Ok(response),
+        }
     }
 
     /// A per-turn, provenance-scoped [`Transport`] view for the adapter seam.

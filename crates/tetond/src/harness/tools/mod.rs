@@ -21,12 +21,14 @@ use serde_json::Value;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod mcp;
 pub mod read;
 pub mod shell;
 
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use mcp::{register_mcp_tools, McpToolHandle};
 pub use read::ReadTool;
 pub use shell::ShellTool;
 

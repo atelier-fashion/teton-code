@@ -17,7 +17,8 @@ teton-providers = { path = "../teton-providers" }
 teton-inference = { path = "../teton-inference" }
 
 # Async runtime + Unix-domain-socket transport (ADR-002). Only the features the
-# daemon actually uses, to keep the binary lean (ADR-001).
+# daemon actually uses, to keep the binary lean (ADR-001). `process` spawns local
+# stdio MCP servers (TASK-011, ADR-003); the child speaks JSON-RPC over its pipes.
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -25,11 +26,20 @@ tokio = { version = "1", features = [
     "io-util",
     "sync",
     "time",
+    "process",
 ] }
-# JSON-RPC framing codec (serde derives live in teton-protocol; here we only
-# serialize/deserialize the shared wire types and need the `Serialize` trait).
-serde = "1"
+# JSON-RPC framing codec plus the cost module's own serde-derived report/price
+# types (TASK-008): `derive` covers both the shared wire types and the local
+# `PriceTable` / `CostReport` structs.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The cost price table (TASK-008) is a versioned TOML data file, mirroring the
+# local-model catalog in `teton-inference/data/models.toml`.
+toml = "0.8"
+# The cost ledger (TASK-008, BR-2) is an append-only SQLite store. `bundled`
+# compiles SQLite from source so the daemon needs no system libsqlite3 — the
+# same zero-system-dependency stance as `rustls-tls` above (ADR-001 lean binary).
+rusqlite = { version = "0.31", features = ["bundled"] }
 # anyhow at the binary edge; thiserror for typed daemon errors (conventions).
 anyhow = "1"
 thiserror = "2"
@@ -50,7 +60,8 @@ async-trait = "0.1"
 futures = { version = "0.3", features = ["std", "async-await"] }
 
 [dev-dependencies]
-# Integration tests act as clients over the socket and need the test macro.
+# Integration tests act as clients over the socket and need the test macro. The
+# MCP egress test (TASK-011) spawns a mock stdio server, so `process` here too.
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -58,6 +69,7 @@ tokio = { version = "1", features = [
     "io-util",
     "sync",
     "time",
+    "process",
 ] }
 serde_json = "1"
 # The egress-capture harness implements a mock `Transport` (async-trait) and

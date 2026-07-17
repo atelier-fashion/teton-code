@@ -13,14 +13,20 @@
 //! - [`broadcast`] — the bounded, slow-client-evicting event bus.
 //! - [`egress`] — the single egress choke point: privacy-boundary enforcement
 //!   (BR-1), the sole HTTP client, and the cost-recording hook (BR-2).
+//! - [`cost`] — the append-only cost ledger, price table, and report (BR-2): one
+//!   `CostRecord` per remote call, recorded at the egress hook.
 //! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
+//! - [`mcp`] — user-registered MCP servers as egress-gated tool providers
+//!   (ADR-003): the protocol client, the server registry, and the tool bridge.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
 //! - [`socket_path`] — socket and lock path resolution.
 
 pub mod auth;
 pub mod broadcast;
+pub mod cost;
 pub mod egress;
 pub mod harness;
+pub mod mcp;
 pub mod server;
 pub mod sessions;
 pub mod single_instance;

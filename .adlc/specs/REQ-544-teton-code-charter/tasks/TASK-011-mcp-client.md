@@ -1,7 +1,7 @@
 ---
 id: TASK-011
 title: "tetond MCP client: servers as tool providers, egress-gated"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17
@@ -23,11 +23,11 @@ flows through egress so BR-1 holds for tool calls too. Delivers AC-9.
 
 ## Acceptance Criteria
 
-- [ ] Config-registered MCP server's tools appear in sessions and execute behind permission prompts (AC-9)
-- [ ] `local-only` content never reaches a remote MCP server (egress-capture test, AC-9)
-- [ ] Local stdio MCP servers are exempt from remote-egress rules but their RESULTS are provenance-tagged when they read boundary paths
-- [ ] MCP server crash/timeout degrades that server's tools only; session continues
-- [ ] Tool results are treated as data: injection-shaped result content is passed to the model with untrusted-content framing, never executed as harness commands
+- [x] Config-registered MCP server's tools appear in sessions and execute behind permission prompts (AC-9)
+- [x] `local-only` content never reaches a remote MCP server (egress-capture test, AC-9)
+- [x] Local stdio MCP servers are exempt from remote-egress rules but their RESULTS are provenance-tagged when they read boundary paths
+- [x] MCP server crash/timeout degrades that server's tools only; session continues
+- [x] Tool results are treated as data: injection-shaped result content is passed to the model with untrusted-content framing, never executed as harness commands
 
 ## Technical Notes
 
