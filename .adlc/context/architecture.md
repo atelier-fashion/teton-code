@@ -6,7 +6,7 @@
  ┌─────────────┐   ┌──────────────────┐
  │  CLI: teton │   │ VS Code extension │   (thin clients — render + input only)
  └──────┬──────┘   └────────┬─────────┘
-        │    client↔daemon protocol (OQ-4, undecided)
+        │  bespoke JSON-RPC over Unix socket (ADR-002)
         ▼                   ▼
  ┌──────────────────────────────────────────────┐
  │              tetond (Rust daemon)            │
@@ -77,8 +77,49 @@ inference and shipping a lean daemon).
 to the daemon over the protocol rather than sharing code — which the
 engine/surface split requires anyway.
 
-### ADR-002 (pending): client↔daemon protocol
+### ADR-002: Bespoke JSON-RPC protocol, ACP-informed, over Unix domain socket (2026-07-17)
 
-OQ-4 in the founding REQ. Candidates: adopt/extend an existing agent-client
-protocol vs. bespoke JSON-RPC. Must be decided before daemon skeleton work
-begins — it is the contract every client hangs on.
+**Decision**: the client↔daemon protocol is a bespoke JSON-RPC 2.0 protocol
+over a Unix domain socket, with an event-subscription model (clients subscribe
+to session/event streams; the daemon broadcasts). Message vocabulary borrows
+ACP's terms wherever the concepts overlap (session, prompt turn,
+permission-request, diff semantics) so a future ACP compatibility shim — a thin
+stdio↔socket adapter process — stays cheap. Protocol types live in the
+`teton-protocol` crate, shared by daemon and CLI and mirrored in TypeScript for
+the extension.
+
+**Rationale**: ACP's structural model is "editor spawns agent as owned
+subprocess over stdio," which inverts our architecture — a persistent shared
+daemon that multiple clients attach to and detach from, with sessions that
+outlive any client (BR-4). Our differentiating surfaces (`route_decided`,
+`privacy_block`, `cost_recorded`, model download/benchmark progress) have no
+ACP vocabulary. Bespoke gives an exact fit; borrowing ACP vocabulary preserves
+the ecosystem option (Zed, Neovim, Emacs speak ACP) without contorting the
+daemon around a subprocess model it doesn't have.
+
+**Alternatives rejected**: stock ACP (subprocess model mismatch,
+single-client assumption); raw stdio per-client agents (no shared daemon, no
+shared local model); gRPC (heavier toolchain, worse fit for extension-side
+TypeScript, no ACP affinity).
+
+**Consequences**: all editor integrations are first-party work until the ACP
+shim exists; protocol versioning, socket auth (filesystem permissions +
+peer-credential check), and backpressure are ours to design — to be specified
+in the protocol child REQ at decomposition time.
+
+### ADR-003: MCP server consumption is first-class (2026-07-17)
+
+**Decision**: Teton Code consumes MCP (Model Context Protocol) servers as tool
+providers — users can register MCP servers and their tools become available to
+agent sessions, subject to the same permission model and privacy egress rules
+as built-in tools.
+
+**Rationale**: MCP is the de-facto standard for agent tooling; users arrive
+with existing MCP servers and expect them to work. Note the role split: MCP is
+agent↔tools; ADR-002's protocol is client↔daemon. They do not compete.
+
+**Consequences**: tool calls to remote MCP servers are egress and MUST flow
+through the privacy boundary choke point (BR-1) — content under a `local-only`
+boundary never reaches a remote MCP server. Tool-result content entering
+context is data, not instructions (prompt-injection posture to be detailed in
+the harness child REQ).

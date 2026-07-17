@@ -160,6 +160,10 @@ _MVP = daemon + CLI. Extension is phase 2 (see Out of Scope)._
       inference) triggers automatic step-down to the next smaller model. On a
       simulated <8GB machine, the local tier is disabled and freeform sessions
       run remote-only without error.
+- [ ] AC-9: User can register an MCP server in config; its tools appear in a
+      session and execute under the standard permission prompts, and a
+      `local-only` boundary blocks boundary content from reaching a remote MCP
+      server (same egress-capture verification as AC-5). (informed by ADR-003)
 
 ## External Dependencies
 
@@ -171,8 +175,9 @@ _MVP = daemon + CLI. Extension is phase 2 (see Out of Scope)._
 - Provider APIs: Anthropic Messages API, OpenAI-compatible chat/completions
   (covers DeepSeek, Kimi, Ollama, vLLM, etc.).
 - OS keychain integration (macOS Keychain first).
-- A client↔daemon protocol — evaluate adopting/extending an existing agent
-  protocol vs. bespoke JSON-RPC (open question OQ-4).
+- MCP (Model Context Protocol) client support — user-registered MCP servers as
+  tool providers (ADR-003); subject to the permission model and BR-1 egress
+  enforcement.
 
 ## Assumptions
 
@@ -206,9 +211,10 @@ _MVP = daemon + CLI. Extension is phase 2 (see Out of Scope)._
       remote-only, 8–16GB → Qwen2.5-Coder 1.5B–3B, 16–32GB → 7B, 32GB+ →
       optional Qwen3-Coder-30B-A3B. Validate tiers and exact model picks during
       dogfooding benchmarks.
-- [ ] OQ-4: Client↔daemon protocol: adopt an existing agent-client protocol for
-      free editor integrations, or bespoke JSON-RPC for control? Decide before
-      CLI work starts — it's the contract everything hangs on.
+- [x] OQ-4: ~~Client↔daemon protocol?~~ RESOLVED 2026-07-17: bespoke JSON-RPC
+      2.0 over Unix domain socket with event subscriptions, ACP-informed
+      vocabulary, ACP compatibility shim deferred post-MVP (ADR-002 in
+      `.adlc/context/architecture.md`).
 - [ ] OQ-5: How does structured mode acquire ADLC artifacts in repos that don't
       have them — bundled generic templates, an in-product `/init` equivalent,
       or import of an existing `.adlc/`?
