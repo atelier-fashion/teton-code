@@ -1,7 +1,7 @@
 ---
 id: TASK-007
 title: "tetond egress module: privacy boundary enforcement"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17

@@ -35,6 +35,19 @@ anyhow = "1"
 thiserror = "2"
 # Peer-credential (`getpeereid`) and single-instance (`flock`) syscalls.
 libc = "0.2"
+# The single egress choke point (architecture D-2): `reqwest` is the ONE real
+# HTTP client in the whole workspace — a CI deny-check (egress::deny_http_client)
+# fails the build if any other crate grows a client. `rustls-tls` keeps the
+# daemon free of a system OpenSSL dependency (ADR-001 lean binary); `stream`
+# gives the streaming response body the `Transport` contract requires.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+# The egress module implements the object-safe `Transport` trait and maps a
+# streaming response body — same async plumbing the provider adapters use.
+async-trait = "0.1"
+futures = { version = "0.3", features = ["std", "async-await"] }
 
 [dev-dependencies]
 # Integration tests act as clients over the socket and need the test macro.
@@ -47,6 +60,10 @@ tokio = { version = "1", features = [
     "time",
 ] }
 serde_json = "1"
+# The egress-capture harness implements a mock `Transport` (async-trait) and
+# builds response byte streams (futures).
+async-trait = "0.1"
+futures = { version = "0.3", features = ["std", "async-await"] }
 
 [lints]
 workspace = true
