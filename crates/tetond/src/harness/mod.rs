@@ -19,15 +19,24 @@
 //!   client round-trip over TASK-004's bus, and session-scoped grants.
 //! - [`context`] — small-model context management: truncation, local
 //!   summarization, and the provenance-tagging seam for egress.
+//! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
+//!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
+//!   impl that streams through the egress choke point (BR-1/BR-2). This is what
+//!   lets one loop run either tier.
 //! - [`turn_loop`] — the loop itself (named `turn_loop` because `loop` is a
 //!   keyword): context assembly, model call, tool dispatch, result folding, and
 //!   bounded termination.
 
+pub mod completion;
 pub mod context;
 pub mod permissions;
 pub mod tools;
 pub mod turn_loop;
 
+pub use completion::{
+    context_provenance, CompletionSource, LocalEngineSource, RemoteProviderSource, SourceTurn,
+    TurnDecision,
+};
 pub use context::{
     ContextBlock, ContextManager, NoopProvenanceHook, Provenance, ProvenanceHook,
     RecordingProvenanceHook,
@@ -37,5 +46,6 @@ pub use permissions::{
 };
 pub use tools::{Tool, ToolContext, ToolOutcome, ToolRegistry};
 pub use turn_loop::{
-    build_system_prompt, run_session_turn, HarnessConfig, HarnessError, SessionEvents, TurnOutcome,
+    build_system_prompt, run_session_turn, run_session_turn_with_source, HarnessConfig,
+    HarnessError, SessionEvents, TurnOutcome,
 };

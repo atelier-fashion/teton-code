@@ -1,7 +1,7 @@
 ---
 id: TASK-013
 title: "tetond structured mode: phase state machine + artifact gates"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17

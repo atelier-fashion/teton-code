@@ -38,10 +38,13 @@ use teton_inference::{Engine, EngineError, GenParams};
 use teton_protocol::events::{Event, SessionUpdate, SessionUpdatePayload, ToolCallStatus};
 use teton_protocol::methods::StopReason;
 use teton_protocol::{ProviderId, SessionId};
-use teton_providers::{HarnessProfile, ToolCall};
+use teton_providers::{HarnessProfile, ProviderError, ToolCall};
 
 use crate::broadcast::EventBus;
 
+use super::completion::{
+    context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
+};
 use super::context::{summarize_if_large, ContextManager, ProvenanceHook};
 use super::permissions::{PermissionDecision, PermissionGate};
 use super::tools::{ToolContext, ToolRegistry};
@@ -57,6 +60,12 @@ pub enum HarnessError {
     /// local turn.
     #[error("local engine error: {0}")]
     Engine(#[from] EngineError),
+    /// A remote provider or transport failure while streaming a routed turn. A
+    /// privacy block (BR-1) manifests here as a transport refusal; the
+    /// authoritative `privacy_block` event has already been emitted at the egress
+    /// choke point, so this variant carries no boundary content.
+    #[error("remote provider error: {0}")]
+    Remote(#[from] ProviderError),
 }
 
 /// Tuning for the loop. The [`Default`] is the weak-model profile (BR-6): short
@@ -228,6 +237,12 @@ impl SessionEvents {
 /// [`build_system_prompt`]). The loop appends the model's turns and tool results
 /// to it as it runs.
 ///
+/// This is the transport-free offline path (AC-1, architecture D-3): it wraps the
+/// engine in a [`LocalEngineSource`] and drives the unified
+/// [`run_session_turn_with_source`] loop. Because no [`Transport`](teton_providers::Transport)
+/// ever enters this path, egress is impossible here by construction. The *same*
+/// engine also serves the loop's local tool-result summarization duty (BR-8).
+///
 /// # Errors
 /// Returns [`HarnessError::Engine`] if the local engine cannot serve. Tool
 /// failures and malformed model output are *not* errors — they are folded back
@@ -247,6 +262,52 @@ pub async fn run_session_turn(
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
 ) -> Result<TurnOutcome, HarnessError> {
+    let mut source = LocalEngineSource::new(engine);
+    run_session_turn_with_source(
+        &mut source,
+        tools,
+        tool_ctx,
+        gate,
+        events,
+        ctx,
+        config,
+        hook,
+        Some(engine),
+    )
+    .await
+}
+
+/// Drive one prompt turn to completion against an arbitrary [`CompletionSource`]
+/// — the single loop that runs a local-engine turn or a remote-provider turn.
+///
+/// This is the code path a phase routed to a remote model executes: build the
+/// context, ask the `source` for a turn (which, for a
+/// [`RemoteProviderSource`](super::completion::RemoteProviderSource), streams
+/// through the egress choke point so BR-1/BR-2 hold), dispatch any tool call under
+/// the permission gate, fold the result back, and repeat under the same bounded
+/// termination and mandatory-verification rules the local loop uses.
+///
+/// `summarizer` is the *local* engine used to condense oversized tool results
+/// (BR-8, a latency duty): pass `Some(engine)` on any machine with a local tier,
+/// or `None` (remote-only machines) to fold results verbatim. It is never the turn
+/// producer — that is `source`.
+///
+/// # Errors
+/// [`HarnessError::Engine`] on a local backend failure, or
+/// [`HarnessError::Remote`] on a provider/transport failure (including a privacy
+/// block, surfaced as a transport refusal after its `privacy_block` event fires).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_session_turn_with_source(
+    source: &mut dyn CompletionSource,
+    tools: &ToolRegistry,
+    tool_ctx: &ToolContext,
+    gate: &PermissionGate,
+    events: &SessionEvents,
+    ctx: &mut ContextManager,
+    config: &HarnessConfig,
+    hook: &mut dyn ProvenanceHook,
+    summarizer: Option<&Mutex<dyn Engine>>,
+) -> Result<TurnOutcome, HarnessError> {
     let exposed = tools.exposed_names(config.max_tools);
     let mut turns = 0u32;
     let mut edited = false;
@@ -264,19 +325,24 @@ pub async fn run_session_turn(
             });
         }
 
-        // ---- model call (engine lock is never held across an await) ----
+        // ---- model call ----
+        // The egress provenance of the assembled context travels with the turn so
+        // a remote source's send is blocked before a byte crosses a `local-only`
+        // boundary (BR-1); the local source ignores it. The source streams tokens
+        // through `on_token`, so a remote turn surfaces first-token latency.
+        let provenance = context_provenance(ctx);
         let prompt = ctx.assemble(hook);
-        let text = {
-            let guard = engine.lock().expect("engine mutex poisoned");
-            guard
-                .complete(&prompt, &config.gen_params, &mut |_| {})?
-                .text
+        let produced = {
+            let mut on_token = |token: &str| events.agent_message(token);
+            source
+                .produce_turn(&prompt, &provenance, config, tools, &exposed, &mut on_token)
+                .await?
         };
         turns += 1;
-        events.agent_message(&text);
+        let SourceTurn { text, decision, .. } = produced;
 
-        match parse_turn(&text, &exposed) {
-            ParsedTurn::EndTurn(final_text) => {
+        match decision {
+            TurnDecision::EndTurn { final_text } => {
                 // Mandatory verification (BR-6): a weak model may not declare an
                 // edit done without checking it. Nudge once, then respect the
                 // model's decision so the loop still terminates.
@@ -302,7 +368,7 @@ pub async fn run_session_turn(
                 });
             }
 
-            ParsedTurn::Malformed(reason) => {
+            TurnDecision::Malformed { reason } => {
                 // A hallucinated tool or bad arguments: correct the model and keep
                 // going, still bounded by max_turns (no unbounded loop).
                 ctx.push_model(text.clone());
@@ -319,7 +385,7 @@ pub async fn run_session_turn(
                 continue;
             }
 
-            ParsedTurn::ToolCall { name, arguments } => {
+            TurnDecision::ToolCall { name, arguments } => {
                 ctx.push_model(text.clone());
                 let call = ToolCall {
                     id: format!("call-{turns}"),
@@ -359,12 +425,17 @@ pub async fn run_session_turn(
                         } else {
                             outcome.content
                         };
-                        let folded = summarize_if_large(
-                            engine,
-                            &name,
-                            &folded,
-                            config.summarize_threshold_tokens,
-                        );
+                        // Summarize oversized results on the local tier when one is
+                        // present; a remote-only machine folds them verbatim.
+                        let folded = match summarizer {
+                            Some(engine) => summarize_if_large(
+                                engine,
+                                &name,
+                                &folded,
+                                config.summarize_threshold_tokens,
+                            ),
+                            None => folded,
+                        };
                         ctx.push_tool_result(name, path_arg(&arguments), folded);
                         ctx.truncate_to_budget();
                         continue;
@@ -436,9 +507,10 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     s
 }
 
-/// What the loop parsed out of one model reply.
+/// What the local text parser made of one model reply. The remote path decides
+/// this directly from the provider's structured events instead of parsing text.
 #[derive(Debug, Clone, PartialEq)]
-enum ParsedTurn {
+pub(crate) enum ParsedTurn {
     /// A well-formed call to a known tool.
     ToolCall {
         /// Tool name.
@@ -455,7 +527,7 @@ enum ParsedTurn {
 /// Parse a model reply into a tool call, an end-of-turn answer, or a malformed
 /// call. A reply is a tool call only if it contains a JSON object with a `tool`
 /// (or `name`) key; anything else is treated as the final answer.
-fn parse_turn(text: &str, known_tools: &[&str]) -> ParsedTurn {
+pub(crate) fn parse_turn(text: &str, known_tools: &[&str]) -> ParsedTurn {
     for candidate in json_object_candidates(text) {
         let Ok(value) = serde_json::from_str::<Value>(&candidate) else {
             continue;
