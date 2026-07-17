@@ -16,5 +16,37 @@ teton-protocol = { path = "../teton-protocol" }
 teton-providers = { path = "../teton-providers" }
 teton-inference = { path = "../teton-inference" }
 
+# Async runtime + Unix-domain-socket transport (ADR-002). Only the features the
+# daemon actually uses, to keep the binary lean (ADR-001).
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+] }
+# JSON-RPC framing codec (serde derives live in teton-protocol; here we only
+# serialize/deserialize the shared wire types and need the `Serialize` trait).
+serde = "1"
+serde_json = "1"
+# anyhow at the binary edge; thiserror for typed daemon errors (conventions).
+anyhow = "1"
+thiserror = "2"
+# Peer-credential (`getpeereid`) and single-instance (`flock`) syscalls.
+libc = "0.2"
+
+[dev-dependencies]
+# Integration tests act as clients over the socket and need the test macro.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+] }
+serde_json = "1"
+
 [lints]
 workspace = true
