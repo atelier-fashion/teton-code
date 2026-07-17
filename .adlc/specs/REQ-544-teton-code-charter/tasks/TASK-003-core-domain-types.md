@@ -1,7 +1,7 @@
 ---
 id: TASK-003
 title: "teton-core: domain entities, config schema, policy evaluation"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17

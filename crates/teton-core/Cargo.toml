@@ -9,9 +9,14 @@ repository.workspace = true
 authors.workspace = true
 
 # teton-core is the privacy/logic core: NO I/O dependencies (no tokio, no
-# reqwest). Keep this section deliberately empty until a pure-logic dep is
-# genuinely required.
+# reqwest, no async runtime). Only pure-logic crates are allowed here so the
+# routing and privacy-boundary logic stays trivially testable and cannot itself
+# perform egress.
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+globset = "0.4"
 
 [lints]
 workspace = true
