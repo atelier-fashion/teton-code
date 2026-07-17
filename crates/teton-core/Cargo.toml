@@ -1,0 +1,17 @@
+[package]
+name = "teton-core"
+description = "Router, session state, and cost ledger — pure logic, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# teton-core is the privacy/logic core: NO I/O dependencies (no tokio, no
+# reqwest). Keep this section deliberately empty until a pure-logic dep is
+# genuinely required.
+[dependencies]
+
+[lints]
+workspace = true

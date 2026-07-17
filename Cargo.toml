@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/teton-core",
+    "crates/teton-protocol",
+    "crates/teton-providers",
+    "crates/teton-inference",
+    "crates/tetond",
+    "crates/teton",
+]
+
+# Shared metadata inherited by every crate via `*.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/atelier-fashion/teton-code"
+authors = ["Teton Code contributors"]
+
+# Shared lints inherited by every crate via `[lints] workspace = true`.
+# Clippy warnings are denied from day one (retrofitting is misery).
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+# Ship lean single binaries per platform (ADR-001).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

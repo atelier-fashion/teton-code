@@ -1,0 +1,17 @@
+[package]
+name = "teton"
+description = "Teton Code CLI — thin client that speaks the daemon protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The CLI is a thin, stateless client: it depends only on the shared protocol
+# types, not on daemon-side logic (engine/surface separation).
+[dependencies]
+teton-protocol = { path = "../teton-protocol" }
+
+[lints]
+workspace = true

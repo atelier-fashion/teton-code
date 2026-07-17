@@ -1,0 +1,20 @@
+[package]
+name = "tetond"
+description = "Teton Code daemon — session state, routing, cost, egress, inference."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The daemon is where all differentiating logic lives, so it depends on every
+# library crate. Binaries may depend on libs; libs never depend on binaries.
+[dependencies]
+teton-core = { path = "../teton-core" }
+teton-protocol = { path = "../teton-protocol" }
+teton-providers = { path = "../teton-providers" }
+teton-inference = { path = "../teton-inference" }
+
+[lints]
+workspace = true
