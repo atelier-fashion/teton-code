@@ -8,7 +8,22 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# THE load-bearing constraint (architecture D-2): this crate performs NO I/O of
+# its own. Adapters receive a `Transport` (implemented by tetond's single egress
+# choke point) and never construct an HTTP client. There is therefore NO http
+# client dependency here (no reqwest / hyper / curl) — that is enforced by
+# `cargo tree` and is what makes the privacy boundary (BR-1) and cost recording
+# (BR-2) enforceable at one point rather than sprinkled across adapters.
 [dependencies]
+teton-core = { path = "../teton-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Async plumbing only — Stream/StreamExt for the turn stream, object-safe async
+# traits, and an ergonomic stream builder. None of these reach the network.
+futures = { version = "0.3", features = ["std", "async-await", "executor"] }
+async-trait = "0.1"
+async-stream = "0.3"
 
 [lints]
 workspace = true
