@@ -1,7 +1,7 @@
 ---
 id: TASK-012
 title: "teton CLI: interactive sessions, config, cost meter, first-run"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17

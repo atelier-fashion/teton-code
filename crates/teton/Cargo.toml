@@ -8,10 +8,26 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# The CLI is a thin, stateless client: it depends only on the shared protocol
-# types, not on daemon-side logic (engine/surface separation).
+# The CLI is a thin, stateless client: it depends on the shared protocol types
+# and renders the daemon's event stream (engine/surface separation). It holds no
+# session state the daemon lacks (BR-4) and — critically — no HTTP client: every
+# remote call flows through the daemon's single egress choke point (BR-1), which
+# a workspace deny-check enforces.
 [dependencies]
 teton-protocol = { path = "../teton-protocol" }
+# Command tree + typed argument parsing; `derive` for the declarative CLI.
+clap = { version = "4", features = ["derive"] }
+# JSON-RPC (de)serialization of the newline-delimited wire frames.
+serde_json = "1"
+# anyhow at the binary edge (conventions: anyhow at binaries, thiserror in libs).
+anyhow = "1"
+
+# The OS keychain lives behind the `Keychain` trait (see `keychain.rs`); the real
+# macOS implementation uses the Security framework and is compiled only on macOS
+# (BR-7, macOS-first). Other targets get an "unsupported" implementation, and
+# tests use an in-memory mock, so the crate builds and tests on Linux CI too.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2"
 
 [lints]
 workspace = true
