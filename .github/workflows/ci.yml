@@ -43,3 +43,24 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  e2e:
+    name: acceptance suite (AC-1..AC-9)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # The end-to-end acceptance suite (TASK-014) spawns the real `tetond`
+      # binary and drives every AC against mock transports/engines — no model
+      # weights and no live API keys. It gates every PR. The `--features live`
+      # real-provider smoke test stays ignored here by design.
+      - name: Acceptance suite
+        run: cargo test -p tetond --test e2e

@@ -19,11 +19,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use teton_protocol::events::{DaemonClientAttach, Event, PhaseTransition};
+use teton_protocol::events::{DaemonClientAttach, Event, ModelLifecycle, PhaseTransition};
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
 use teton_protocol::methods::{
-    RpcMethod, SessionAttachParams, SessionAttachResult, SessionCreateParams, SessionCreateResult,
+    ConfigGetParams, ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams,
+    PermissionRespondParams, PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod,
+    SessionAttachParams, SessionAttachResult, SessionCreateParams, SessionCreateResult,
     SessionListParams, SessionListResult,
 };
 
@@ -31,6 +33,7 @@ use crate::auth;
 use crate::broadcast::{
     EventBus, Subscription, DEFAULT_CAPACITY, SUBSCRIPTION_LAGGED_CODE, SUBSCRIPTION_LAGGED_METHOD,
 };
+use crate::runtime::DaemonRuntime;
 use crate::sessions::SessionRegistry;
 
 /// Depth of a client's outbound message queue (responses + events).
@@ -48,15 +51,34 @@ pub struct Daemon {
     pub sessions: SessionRegistry,
     /// Event fan-out to subscribed clients.
     pub events: Arc<EventBus>,
+    /// The assembled engine/router/egress/cost/MCP state prompt turns drive.
+    pub runtime: Arc<DaemonRuntime>,
 }
 
 impl Daemon {
-    /// A daemon with no sessions and no subscribers.
+    /// A daemon with no sessions, no subscribers, and a minimal runtime (no local
+    /// tier, empty config). Used by the skeleton session-registry tests where no
+    /// prompt turns run.
     #[must_use]
     pub fn new() -> Self {
         Self {
             sessions: SessionRegistry::new(),
             events: Arc::new(EventBus::new()),
+            runtime: Arc::new(DaemonRuntime::minimal()),
+        }
+    }
+
+    /// A daemon over an explicit event bus and assembled [`DaemonRuntime`]. This
+    /// is the production path ([`crate::main`]) and the acceptance suite's entry
+    /// point: the runtime carries the engine, providers, and cost ledger, while
+    /// the shared bus is the same one the runtime records cost and privacy events
+    /// onto, so those events reach attached clients.
+    #[must_use]
+    pub fn with_runtime(events: Arc<EventBus>, runtime: Arc<DaemonRuntime>) -> Self {
+        Self {
+            sessions: SessionRegistry::new(),
+            events,
+            runtime,
         }
     }
 }
@@ -121,6 +143,11 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
     let mut reader = BufReader::new(read_half);
     let mut handshaked = false;
     let mut forwarder: Option<JoinHandle<()>> = None;
+    // In-flight `session/prompt` executions. A prompt turn is run on its own task
+    // so the reader loop stays free to process the `permission/respond` that
+    // unblocks the harness permission gate mid-turn (otherwise the loop would
+    // deadlock awaiting a reply it cannot read).
+    let mut prompt_tasks: Vec<JoinHandle<()>> = Vec::new();
     let mut line = String::new();
 
     loop {
@@ -177,18 +204,100 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
             continue;
         }
 
+        // `session/prompt` runs on its own task (see `prompt_tasks`); every other
+        // method dispatches synchronously and replies immediately.
+        if method == PromptTurnParams::METHOD {
+            if let Some(handle) = spawn_prompt_turn(&daemon, id, params, &out_tx) {
+                prompt_tasks.push(handle);
+            }
+            continue;
+        }
+
         if let Some(response) = dispatch(&daemon, id, method, params) {
             let _ = out_tx.send(response).await;
         }
     }
 
-    // Teardown: stop forwarding events, then let the writer drain and exit once
-    // every outbound sender is gone.
+    // Teardown: stop forwarding events and abandon any in-flight prompt turns,
+    // then let the writer drain and exit once every outbound sender is gone.
     if let Some(forwarder) = forwarder {
         forwarder.abort();
     }
+    for task in prompt_tasks {
+        task.abort();
+    }
     drop(out_tx);
     let _ = writer.await;
+}
+
+/// Spawns a `session/prompt` turn on its own task. The turn streams events over
+/// the shared bus while it runs and sends its terminal response (or error) over
+/// `out_tx` when it finishes. Returns the task handle so teardown can abandon it,
+/// or `None` when the request could not be started (an error response is queued).
+fn spawn_prompt_turn(
+    daemon: &Arc<Daemon>,
+    id: Id,
+    params: Value,
+    out_tx: &mpsc::Sender<String>,
+) -> Option<JoinHandle<()>> {
+    let params: PromptTurnParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => {
+            let _ = out_tx.try_send(error_string(
+                id,
+                error_code::INVALID_PARAMS,
+                "invalid params",
+            ));
+            return None;
+        }
+    };
+
+    let Some(summary) = daemon.sessions.get(&params.session_id) else {
+        let _ = out_tx.try_send(error_string(
+            id,
+            error_code::UNKNOWN_SESSION,
+            "unknown session",
+        ));
+        return None;
+    };
+
+    let prompt = flatten_prompt(&params.prompt);
+    let runtime = Arc::clone(&daemon.runtime);
+    let events = Arc::clone(&daemon.events);
+    let out = out_tx.clone();
+
+    Some(tokio::spawn(async move {
+        let result = runtime
+            .run_prompt_turn(
+                &events,
+                summary.session_id.clone(),
+                summary.mode,
+                summary.phase,
+                prompt,
+            )
+            .await;
+        let response = match result {
+            Ok(res) => ok_string(id, &res),
+            Err(err) => error_from(id, err),
+        };
+        let _ = out.send(response).await;
+    }))
+}
+
+/// Flatten prompt content blocks into a single prompt string. Text blocks join
+/// with newlines; a resource link contributes a bracketed reference.
+fn flatten_prompt(blocks: &[PromptBlock]) -> String {
+    let mut parts = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        match block {
+            PromptBlock::Text { text } => parts.push(text.clone()),
+            PromptBlock::ResourceLink { uri, name } => {
+                let label = name.as_deref().unwrap_or(uri);
+                parts.push(format!("[resource: {label} ({uri})]"));
+            }
+        }
+    }
+    parts.join("\n")
 }
 
 /// Performs the handshake, and on success subscribes this client to the bus.
@@ -239,6 +348,18 @@ fn do_handshake(
         capabilities: Vec::new(),
     };
     let _ = out_tx.try_send(ok_string(id, &result));
+
+    // Replay the local-model lifecycle (BR-9 / AC-8) to the just-subscribed
+    // client so it can observe probe → benchmark → ready (or disabled /
+    // stepped-down). Published after the subscribe above, so this client receives
+    // it; a machine with no local tier has an empty sequence and emits nothing.
+    for lifecycle in daemon.runtime.lifecycle_events() {
+        daemon.events.publish(
+            None,
+            Event::ModelLifecycle(ModelLifecycle::clone(lifecycle)),
+        );
+    }
+
     Some(subscription)
 }
 
@@ -254,11 +375,61 @@ fn dispatch(daemon: &Daemon, id: Id, method: &str, params: Value) -> Option<Stri
             Some(ok_string(id, &result))
         }
         SessionAttachParams::METHOD => Some(handle_session_attach(daemon, id, params)),
+        PermissionRespondParams::METHOD => Some(handle_permission_respond(daemon, id, params)),
+        ConfigGetParams::METHOD => Some(handle_config_get(daemon, id)),
+        ConfigSetParams::METHOD => Some(handle_config_set(daemon, id, params)),
+        CostQueryParams::METHOD => Some(handle_cost_query(daemon, id)),
         _ => Some(error_string(
             id,
             error_code::METHOD_NOT_FOUND,
             "method not found",
         )),
+    }
+}
+
+/// Deliver a client's `permission/respond` to the waiting harness gate. Always
+/// acknowledges (idempotent): a late or duplicate reply for a prompt that already
+/// resolved simply finds no waiter.
+fn handle_permission_respond(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: PermissionRespondParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    daemon
+        .runtime
+        .pending()
+        .resolve(&params.request_id, params.outcome);
+    ok_string(id, &PermissionRespondResult {})
+}
+
+/// Serve the current configuration snapshot (`config/get`).
+fn handle_config_get(daemon: &Daemon, id: Id) -> String {
+    ok_string(
+        id,
+        &ConfigGetResult {
+            snapshot: daemon.runtime.config_snapshot(),
+        },
+    )
+}
+
+/// Apply a configuration mutation (`config/set`), rejecting it on validation
+/// failure (e.g. a raw key in `auth_ref`, BR-7).
+fn handle_config_set(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: ConfigSetParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    match daemon.runtime.apply_config_update(params.update) {
+        Ok(()) => ok_string(id, &ConfigSetResult { applied: true }),
+        Err(err) => error_from(id, err),
+    }
+}
+
+/// Serve the authoritative cost report from the ledger (`cost/query`, BR-2).
+fn handle_cost_query(daemon: &Daemon, id: Id) -> String {
+    match daemon.runtime.cost_report() {
+        Ok(result) => ok_string(id, &result),
+        Err(err) => error_from(id, err),
     }
 }
 

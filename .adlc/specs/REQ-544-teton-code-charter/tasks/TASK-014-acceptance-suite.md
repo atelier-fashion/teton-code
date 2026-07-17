@@ -1,7 +1,7 @@
 ---
 id: TASK-014
 title: "End-to-end acceptance suite: AC-1..AC-9 scripted verification"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17

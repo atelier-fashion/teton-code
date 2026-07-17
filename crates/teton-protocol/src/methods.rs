@@ -306,6 +306,76 @@ impl RpcMethod for ConfigSetParams {
     type Result = ConfigSetResult;
 }
 
+// ---------------------------------------------------------------------------
+// cost query
+// ---------------------------------------------------------------------------
+
+/// Query the daemon's authoritative cost ledger (BR-2).
+///
+/// The cost meter is derived only from recorded model calls; this method reads
+/// the persisted ledger so a client (`teton cost`) can report authoritative
+/// history rather than only what it happened to observe on the live event
+/// stream. Teton differentiator — no ACP equivalent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CostQueryParams {}
+
+/// One roll-up group in a [`CostReportView`] (per phase or per provider).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostGroupView {
+    /// Grouping key (phase wire-name, or provider id, or `none`/`unpriced`).
+    pub key: String,
+    /// Calls attributed to this group.
+    pub calls: u64,
+    /// Input tokens summed over the group.
+    pub input_tokens: u64,
+    /// Output tokens summed over the group.
+    pub output_tokens: u64,
+    /// Recorded spend for the group, in integer micro-USD (priced calls only).
+    pub usd_micros: i64,
+}
+
+/// A serializable projection of the daemon's cost report (BR-2 / AC-4).
+///
+/// Mirrors the daemon's internal aggregation over the ledger, flattened to wire
+/// types the CLI can render without a daemon dependency. `usd_micros` is integer
+/// micro-USD so money never rounds on the wire; the savings figure is always an
+/// estimate and carries its `methodology` verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CostReportView {
+    /// Total recorded spend across priced calls, in micro-USD.
+    pub total_usd_micros: i64,
+    /// Total recorded calls (priced and unpriced).
+    pub total_calls: u64,
+    /// Calls that were priced (had a matching price-table entry).
+    pub priced_calls: u64,
+    /// Calls with no price-table entry (never guessed a cost).
+    pub unpriced_calls: u64,
+    /// `baseline − actual`; the estimated saving vs. an all-frontier baseline.
+    pub savings_usd_micros: i64,
+    /// What the same token volume would cost at the baseline, in micro-USD.
+    pub baseline_usd_micros: i64,
+    /// The baseline comparator, as `provider/model`.
+    pub baseline_model: String,
+    /// The savings methodology, verbatim (never presented as a measurement).
+    pub methodology: String,
+    /// Per-phase roll-up, ordered by phase wire-name.
+    pub per_phase: Vec<CostGroupView>,
+    /// Per-provider roll-up, ordered by provider id.
+    pub per_provider: Vec<CostGroupView>,
+}
+
+/// Result of [`CostQueryParams`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CostQueryResult {
+    /// The authoritative cost report.
+    pub report: CostReportView,
+}
+
+impl RpcMethod for CostQueryParams {
+    const METHOD: &'static str = "cost/query";
+    type Result = CostQueryResult;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,12 +513,44 @@ mod tests {
     }
 
     #[test]
+    fn cost_query_round_trips() {
+        round_trip(&CostQueryParams::default());
+        round_trip(&CostQueryResult {
+            report: CostReportView {
+                total_usd_micros: 48_100,
+                total_calls: 3,
+                priced_calls: 2,
+                unpriced_calls: 1,
+                savings_usd_micros: 500_000,
+                baseline_usd_micros: 548_100,
+                baseline_model: "anthropic/claude-opus-4".to_owned(),
+                methodology: "Estimate, not a measurement.".to_owned(),
+                per_phase: vec![CostGroupView {
+                    key: "implement".to_owned(),
+                    calls: 1,
+                    input_tokens: 4_000,
+                    output_tokens: 2_000,
+                    usd_micros: 3_000,
+                }],
+                per_provider: vec![CostGroupView {
+                    key: "deepseek".to_owned(),
+                    calls: 1,
+                    input_tokens: 4_000,
+                    output_tokens: 2_000,
+                    usd_micros: 3_000,
+                }],
+            },
+        });
+    }
+
+    #[test]
     fn request_helper_fills_method_from_trait() {
         let req = request(Id::Number(1), SessionListParams::default());
         assert_eq!(req.method, "session/list");
         assert_eq!(SessionCreateParams::METHOD, "session/create");
         assert_eq!(PromptTurnParams::METHOD, "session/prompt");
         assert_eq!(ConfigSetParams::METHOD, "config/set");
+        assert_eq!(CostQueryParams::METHOD, "cost/query");
     }
 
     #[test]

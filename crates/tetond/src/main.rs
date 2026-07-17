@@ -8,6 +8,8 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use tetond::broadcast::EventBus;
+use tetond::runtime::DaemonRuntime;
 use tetond::single_instance::SingleInstance;
 use tetond::{server, socket_path, Daemon};
 
@@ -55,10 +57,21 @@ fn main() -> anyhow::Result<ExitCode> {
         .enable_all()
         .build()?;
 
+    let base_dir = paths
+        .socket
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+
     runtime.block_on(async move {
         let listener = server::bind_listener(&paths.socket)?;
         eprintln!("tetond listening on {}", paths.socket.display());
-        let daemon = Arc::new(Daemon::new());
+        // Assemble the runtime (local tier, providers, cost ledger, MCP) from
+        // config and the environment, sharing the event bus so cost and privacy
+        // events reach attached clients.
+        let events = Arc::new(EventBus::new());
+        let daemon_runtime = Arc::new(DaemonRuntime::from_env(&base_dir, &events)?);
+        let daemon = Arc::new(Daemon::with_runtime(events, daemon_runtime));
         server::serve(listener, daemon).await?;
         Ok::<(), anyhow::Error>(())
     })?;

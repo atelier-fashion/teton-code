@@ -10,6 +10,12 @@ authors.workspace = true
 
 # The daemon is where all differentiating logic lives, so it depends on every
 # library crate. Binaries may depend on libs; libs never depend on binaries.
+# The `live` feature un-ignores the e2e suite's real-model / real-provider smoke
+# test (`tests/e2e`), which needs live endpoints and keys via `TETON_LIVE_*` env.
+# CI never enables it: the default acceptance run uses mocks only.
+[features]
+live = []
+
 [dependencies]
 teton-core = { path = "../teton-core" }
 teton-protocol = { path = "../teton-protocol" }

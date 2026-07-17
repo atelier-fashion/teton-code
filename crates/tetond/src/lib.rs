@@ -18,6 +18,8 @@
 //! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
 //! - [`router`] — phase-policy routing (BR-5), BR-6 degradation, remote wiring
 //!   through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
+//! - [`runtime`] — the assembled engine/router/egress/cost/MCP state the JSON-RPC
+//!   handlers drive: `session/prompt` execution, config, and the cost query.
 //! - [`structured`] — structured (ADLC) mode (D-4, BR-3): the phase state machine,
 //!   artifact gates, `.teton/` artifact storage, and bundled generic templates.
 //! - [`heuristics`] — freeform-mode routing (BR-5): local for auxiliary duties,
@@ -35,6 +37,7 @@ pub mod harness;
 pub mod heuristics;
 pub mod mcp;
 pub mod router;
+pub mod runtime;
 pub mod server;
 pub mod sessions;
 pub mod single_instance;
