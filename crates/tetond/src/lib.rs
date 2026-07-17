@@ -13,12 +13,14 @@
 //! - [`broadcast`] — the bounded, slow-client-evicting event bus.
 //! - [`egress`] — the single egress choke point: privacy-boundary enforcement
 //!   (BR-1), the sole HTTP client, and the cost-recording hook (BR-2).
+//! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
 //! - [`single_instance`] — the `flock`-based single-instance guard.
 //! - [`socket_path`] — socket and lock path resolution.
 
 pub mod auth;
 pub mod broadcast;
 pub mod egress;
+pub mod harness;
 pub mod server;
 pub mod sessions;
 pub mod single_instance;

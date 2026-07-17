@@ -64,6 +64,10 @@ serde_json = "1"
 # builds response byte streams (futures).
 async-trait = "0.1"
 futures = { version = "0.3", features = ["std", "async-await"] }
+# The offline-session harness test drives the local `Engine` (a scripted mock
+# implementing the trait) and asserts on protocol stop-reason / session ids.
+teton-inference = { path = "../teton-inference" }
+teton-protocol = { path = "../teton-protocol" }
 
 [lints]
 workspace = true
