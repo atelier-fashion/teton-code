@@ -3,10 +3,10 @@
 //! ADR-002 specifies two layers of socket auth. The first is discretionary: the
 //! socket file is created `0600` so only the owning user may `connect(2)`. The
 //! second is a defence-in-depth peer-credential check — the daemon reads the
-//! connecting process's effective uid from the kernel (`getpeereid`, portable
-//! across macOS and Linux) and refuses any peer whose uid differs from the
-//! daemon's own. Error text never carries paths, content, or credentials
-//! (conventions: privacy in error messages).
+//! connecting process's effective uid from the kernel (per-platform:
+//! `getpeereid(2)` on macOS/BSD, `getsockopt(SO_PEERCRED)` on Linux) and refuses
+//! any peer whose uid differs from the daemon's own. Error text never carries
+//! paths, content, or credentials (conventions: privacy in error messages).
 
 use std::io;
 use std::os::fd::AsRawFd;
@@ -40,7 +40,15 @@ pub enum AuthError {
 /// # Errors
 ///
 /// Returns the underlying OS error if the kernel refuses the query.
-#[cfg(any(target_os = "macos", target_os = "ios", target_vendor = "apple", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
 pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let fd = stream.as_raw_fd();
     let mut uid: libc::uid_t = 0;
