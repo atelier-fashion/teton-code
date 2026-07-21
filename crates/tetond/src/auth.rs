@@ -32,12 +32,15 @@ pub enum AuthError {
 
 /// Reads the effective uid of the process on the other end of `stream`.
 ///
-/// Uses `getpeereid(2)`, which is available on both macOS/BSD and glibc Linux
-/// and reports the peer's effective uid/gid for an `AF_UNIX` stream socket.
+/// The kernel-attested peer credential is obtained per platform: `getpeereid(2)`
+/// on macOS/BSD (glibc does **not** provide it), and `getsockopt(SO_PEERCRED)`
+/// on Linux. Both report the peer's uid for an `AF_UNIX` stream socket and are
+/// not TOCTOU-spoofable (the credential is a property of the connected socket).
 ///
 /// # Errors
 ///
 /// Returns the underlying OS error if the kernel refuses the query.
+#[cfg(any(target_os = "macos", target_os = "ios", target_vendor = "apple", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))]
 pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let fd = stream.as_raw_fd();
     let mut uid: libc::uid_t = 0;
@@ -47,6 +50,36 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
     if rc == 0 {
         Ok(uid)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Linux variant: peer credentials via `getsockopt(SOL_SOCKET, SO_PEERCRED)`,
+/// which fills a `ucred { pid, uid, gid }` with the connecting process's
+/// credentials as recorded by the kernel at `connect(2)` time.
+#[cfg(target_os = "linux")]
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let fd = stream.as_raw_fd();
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `fd` is a valid, open socket descriptor owned by `stream`; `cred`
+    // and `len` reference live stack storage sized exactly for `ucred`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::addr_of_mut!(cred).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Ok(cred.uid)
     } else {
         Err(io::Error::last_os_error())
     }
