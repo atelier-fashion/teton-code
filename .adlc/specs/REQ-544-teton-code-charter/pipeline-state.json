@@ -2,7 +2,7 @@
   "req": "REQ-544",
   "branch": "feat/REQ-544-teton-code-mvp",
   "startedAt": "2026-07-17T17:00:38Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,11 @@
       "phase": 7,
       "name": "CI green",
       "completedAt": "2026-07-21T20:58:42Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup (merge + knowledge)",
+      "completedAt": "2026-07-21T21:01:37Z"
     }
   ],
   "integrationBranch": "main",
@@ -67,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/1",
       "prNumber": 1,
       "prCreatedAt": "2026-07-21T20:50:04Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
