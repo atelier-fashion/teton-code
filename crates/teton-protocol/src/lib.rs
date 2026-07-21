@@ -16,11 +16,14 @@
 //! - [`methods`] — typed client→daemon requests and their result types.
 //! - [`events`] — the daemon→client event envelope and its payloads.
 //! - [`handshake`] — protocol-version negotiation.
+//! - [`socket_path`] — the shared socket/lock path resolution both the daemon and
+//!   every client must agree on.
 
 pub mod events;
 pub mod handshake;
 pub mod jsonrpc;
 pub mod methods;
+pub mod socket_path;
 
 use std::fmt;
 

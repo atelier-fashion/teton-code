@@ -27,7 +27,10 @@
 //! - [`mcp`] — user-registered MCP servers as egress-gated tool providers
 //!   (ADR-003): the protocol client, the server registry, and the tool bridge.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
-//! - [`socket_path`] — socket and lock path resolution.
+//!
+//! Socket and lock path resolution lives in the shared
+//! [`teton_protocol::socket_path`] module so the daemon and every client resolve
+//! the same path (REQ-544 — was a byte-identical copy in each binary).
 
 pub mod auth;
 pub mod broadcast;
@@ -42,7 +45,6 @@ pub mod runtime;
 pub mod server;
 pub mod sessions;
 pub mod single_instance;
-pub mod socket_path;
 pub mod structured;
 
 pub use server::{bind_listener, serve, Daemon};

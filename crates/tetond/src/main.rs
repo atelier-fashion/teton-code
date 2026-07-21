@@ -8,10 +8,11 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use teton_protocol::socket_path;
 use tetond::broadcast::EventBus;
 use tetond::runtime::DaemonRuntime;
 use tetond::single_instance::SingleInstance;
-use tetond::{server, socket_path, Daemon};
+use tetond::{server, Daemon};
 
 /// Returns `true` when the process was asked to print its version.
 fn wants_version() -> bool {

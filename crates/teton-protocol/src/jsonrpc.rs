@@ -39,8 +39,12 @@ impl<'de> Deserialize<'de> for JsonRpcV2 {
 
 /// A JSON-RPC request/response correlation id.
 ///
-/// The spec permits string or number ids; we model both and forbid the
-/// `null` form (the daemon always issues concrete ids).
+/// The spec permits string or number ids; the daemon always issues concrete
+/// numeric ids. The [`Id::Null`] form is reserved for the one case the spec
+/// mandates it: a response to a request whose id could not be determined (a parse
+/// error, or a missing/malformed `id`). Using `null` there — rather than a
+/// sentinel like `0` — means two such error responses cannot collide with each
+/// other or with a real pending request id (REQ-544 minor).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Id {
@@ -48,6 +52,10 @@ pub enum Id {
     Number(i64),
     /// String id (accepted for clients that prefer opaque tokens).
     Str(String),
+    /// The JSON `null` id — only for an error response to an unidentifiable
+    /// request (never issued for a real call). Serializes to `null`. Listed last
+    /// so a numeric/string id never matches it.
+    Null,
 }
 
 impl From<i64> for Id {
@@ -244,6 +252,26 @@ mod tests {
         assert_eq!(s, Id::Str("abc".to_owned()));
         assert_eq!(serde_json::to_string(&Id::Number(7)).unwrap(), "7");
         assert_eq!(serde_json::to_string(&Id::from("abc")).unwrap(), "\"abc\"");
+    }
+
+    #[test]
+    fn null_id_round_trips_and_is_distinct() {
+        // The spec-mandated null id for an unidentifiable request serializes to
+        // `null` and parses back — and never equals a real numeric/string id, so
+        // two parse-error responses can't collide (REQ-544 minor).
+        assert_eq!(serde_json::to_string(&Id::Null).unwrap(), "null");
+        let back: Id = serde_json::from_str("null").unwrap();
+        assert_eq!(back, Id::Null);
+        assert_ne!(Id::Null, Id::Number(0));
+        // A numeric id must still parse as Number, not accidentally as Null.
+        assert_eq!(serde_json::from_str::<Id>("0").unwrap(), Id::Number(0));
+
+        // It round-trips inside a full error response, too.
+        let resp = Response::<Value>::failure(Id::Null, RpcError::new(-32700, "invalid json"));
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"id\":null"), "{json}");
+        let back: Response<Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, Id::Null);
     }
 
     #[test]

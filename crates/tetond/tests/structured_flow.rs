@@ -370,6 +370,27 @@ async fn demo_requirement_flows_all_four_phases_with_per_phase_routing_and_real_
             "the task artifact must reach the model (cheap-model-viability); request: {}",
             sent[0]
         );
+
+        // REQ-544 M-8: the remote request is a real system prompt plus role-typed
+        // messages, NOT one collapsed user blob. The first request already carries
+        // a system message + a user message; the second (after the tool call)
+        // additionally carries an assistant turn — proof the roles are preserved.
+        assert!(
+            sent[0].contains(r#""role":"system""#),
+            "the request must carry a system message, not system:None; request: {}",
+            sent[0]
+        );
+        assert!(
+            sent[0].contains(r#""role":"user""#),
+            "the request must carry a user message; request: {}",
+            sent[0]
+        );
+        let last = sent.last().unwrap();
+        assert!(
+            last.contains(r#""role":"assistant""#),
+            "a follow-up request must preserve the prior assistant turn as its own \
+             role-typed message (not folded into a user blob); request: {last}"
+        );
     }
 
     // --- The file was really edited by the remote implement turn ---

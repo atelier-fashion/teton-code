@@ -355,7 +355,10 @@ pub async fn run_session_turn_with_source(
         // boundary (BR-1); the local source ignores it. The source streams tokens
         // through `on_token`, so a remote turn surfaces first-token latency.
         let provenance = context_provenance(ctx);
-        let prompt = ctx.assemble(hook);
+        // REQ-544 M-8: prepare both prompt shapes at once — the flat string for a
+        // local text engine and the system + role-typed messages for a remote chat
+        // provider. The provenance hook is invoked here exactly as before.
+        let prompt = ctx.prepare(hook);
         let produced = {
             let mut on_token = |token: &str| events.agent_message(token);
             source
@@ -440,7 +443,12 @@ pub async fn run_session_turn_with_source(
                             edited = true;
                             verified = false;
                         }
-                        if edited && VERIFY_TOOLS.contains(&name.as_str()) {
+                        // REQ-544 MED-4: only a verification tool call that
+                        // SUCCEEDED satisfies the BR-6 gate. A failing verify (a
+                        // non-zero shell exit, an unreadable file) leaves the edit
+                        // unverified, so the model is still nudged to check its work
+                        // rather than declaring victory off a failed check.
+                        if edited && !outcome.is_error && VERIFY_TOOLS.contains(&name.as_str()) {
                             verified = true;
                         }
 

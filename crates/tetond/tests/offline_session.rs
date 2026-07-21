@@ -199,6 +199,76 @@ async fn offline_read_edit_verify_completes_with_zero_egress() {
 }
 
 #[tokio::test]
+async fn a_failing_verify_after_an_edit_does_not_satisfy_the_gate() {
+    // REQ-544 MED-4: the BR-6 verification gate is only satisfied by a verify
+    // tool call that SUCCEEDED. Here the model edits the file, then runs a
+    // verification step that FAILS (a non-zero shell exit). The failing check
+    // must NOT flip `verified` true — the loop nudges the model to actually
+    // verify, and the turn ends with `verified == false`.
+    let repo = temp_repo();
+
+    let script = [
+        r#"Change the constant.
+{"tool": "edit", "arguments": {"path": "src/lib.rs", "old_string": "pub const ANSWER: u32 = 1;", "new_string": "pub const ANSWER: u32 = 2;"}}"#,
+        // A verification attempt that FAILS (non-zero exit → is_error). Under the
+        // old code this still marked the edit verified; it must not now.
+        r#"Verify the change.
+{"tool": "shell", "arguments": {"command": "exit 3"}}"#,
+        // First end-of-turn: the loop nudges once because the edit is unverified.
+        "I believe the change is complete.",
+        // Second end-of-turn after the nudge: the loop respects it and returns.
+        "Done.",
+    ];
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine: Mutex<ScriptedEngine> =
+        Mutex::new(ScriptedEngine::new(&script, Arc::clone(&calls)));
+
+    let config = HarnessConfig::default(); // weak-model shape: verification required
+    let tools = ToolRegistry::with_builtins();
+    let tool_ctx = ToolContext::new(&repo);
+
+    let system = build_system_prompt(&tools, &config);
+    let mut ctx = ContextManager::new(system, config.context_budget_tokens);
+    ctx.push_user("In src/lib.rs change ANSWER from 1 to 2, then verify it.");
+
+    let bus = Arc::new(EventBus::new());
+    let pending = Arc::new(PendingPermissions::new());
+    let session_id = SessionId::from("failing-verify-1");
+    let gate = PermissionGate::new(
+        session_id.clone(),
+        PermissionConfig::permissive(),
+        Arc::clone(&bus),
+        Arc::clone(&pending),
+    );
+    let events = SessionEvents::new(Arc::clone(&bus), session_id);
+    let mut hook = tetond::harness::NoopProvenanceHook;
+
+    let outcome = run_session_turn(
+        &engine, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook,
+    )
+    .await
+    .expect("local turn completes");
+
+    assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+    assert!(outcome.edited, "the edit landed");
+    assert!(
+        !outcome.verified,
+        "a FAILING verify tool must not satisfy the verification gate"
+    );
+    // The failing verify forced the one-shot nudge, so the model was asked to
+    // verify again before the loop honored its end-of-turn (edit, fail-verify,
+    // end→nudge, end).
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "the failing verify should have triggered the mandatory-verification nudge"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[tokio::test]
 async fn malformed_tool_calls_do_not_cause_an_unbounded_loop() {
     let repo = temp_repo();
 

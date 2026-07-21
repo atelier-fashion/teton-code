@@ -30,7 +30,7 @@
 //! weights itself); they exist so the whole daemon can be exercised end to end
 //! against mocks.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,7 +59,8 @@ use teton_protocol::{
 };
 
 use teton_providers::{
-    AnthropicAdapter, CapabilityProfile, OpenAiCompatAdapter, OpenAiCompatConfig, Provider,
+    classify, AnthropicAdapter, CapabilityProfile, FailureAction, FailureClass,
+    OpenAiCompatAdapter, OpenAiCompatConfig, Provider,
 };
 
 use crate::broadcast::EventBus;
@@ -227,6 +228,12 @@ pub struct DaemonRuntime {
     /// Per-session privacy taint: sessions pinned to the local tier because their
     /// context touched `local-only` or unknown-provenance content (REQ-544 C-2).
     session_taint: SessionTaint,
+    /// Daemon-wide provider health, persisted across turns (REQ-544 M-5). Updated
+    /// by `on_provider_failure` / turn outcomes and READ by [`build_router`] when
+    /// it seeds the router each turn, so a provider observed `Unavailable` stays
+    /// `Unavailable` into the next turn's route resolution — activating the policy
+    /// layer's cross-turn health fallback. Absent id ⇒ `Healthy`.
+    provider_health: Mutex<BTreeMap<String, ProviderHealth>>,
     /// Resolves a provider's `auth_ref` to its secret at call time (BR-7, REQ-544
     /// M-3). Holds the OS-keychain backend behind a trait; the secret is injected
     /// as an endpoint-bound authorization header at the egress choke point and
@@ -256,6 +263,7 @@ impl DaemonRuntime {
             lifecycle: Vec::new(),
             turn_counter: AtomicU64::new(0),
             session_taint: SessionTaint::new(),
+            provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         }
     }
@@ -309,6 +317,7 @@ impl DaemonRuntime {
             lifecycle: probe.lifecycle,
             turn_counter: AtomicU64::new(0),
             session_taint: SessionTaint::new(),
+            provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         })
     }
@@ -367,6 +376,16 @@ impl DaemonRuntime {
         })
     }
 
+    /// Record a provider's observed health so it persists into the next turn's
+    /// routing (REQ-544 M-5). Downgrades survive across turns: a provider seen
+    /// `Unavailable` stays `Unavailable` until it serves a turn again.
+    fn record_provider_health(&self, provider_id: &str, health: ProviderHealth) {
+        self.provider_health
+            .lock()
+            .expect("provider_health mutex poisoned")
+            .insert(provider_id.to_owned(), health);
+    }
+
     /// Run one prompt turn for `session`, streaming events over `events` and
     /// returning the turn result.
     ///
@@ -393,7 +412,19 @@ impl DaemonRuntime {
         ));
 
         let config = self.config.lock().expect("config mutex poisoned").clone();
-        let router = build_router(&config, self.local_available, self.ledger.prices());
+        // REQ-544 M-5: seed the router from the daemon-wide health map so a
+        // provider marked Unavailable on an earlier turn stays Unavailable here.
+        let health_snapshot = self
+            .provider_health
+            .lock()
+            .expect("provider_health mutex poisoned")
+            .clone();
+        let router = build_router(
+            &config,
+            self.local_available,
+            self.ledger.prices(),
+            &health_snapshot,
+        );
 
         // Resolve the initial route (BR-5): structured -> phase policy; freeform
         // -> heuristic. Emitting `route_decided` is the legibility promise.
@@ -419,6 +450,21 @@ impl DaemonRuntime {
 
         // Assemble the harness context, tools, and the permission gate once; a
         // fallback re-runs the loop against the same accumulated context.
+        //
+        // REQ-544 (known limitation, deliberately deferred): the retry/fallback
+        // path below re-runs the loop against this *same* `ctx`, which by design
+        // preserves completed work (file reads/edits done before a mid-turn
+        // transient failure). The trade-off is that the accumulated context is
+        // re-sent to the retry/fallback provider and thus re-billed as input
+        // tokens — a mid-turn transient failure re-bills the partial progress.
+        // A clean fix (snapshot `ctx` here and restore it before a retry, or drive
+        // retries at single-call granularity so only the failed call is re-issued)
+        // changes the "continue vs. restart" semantics and needs a product call on
+        // whether a fallback should preserve or discard partial work; it is out of
+        // scope for this correctness pass. `ContextManager` is `Clone`, so the
+        // snapshot itself is cheap when that decision is made.
+        // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
+        // semantics are decided.
         let tools = self.build_tools(events, &session_id).await;
         let tool_ctx = ToolContext::new(&self.repo_root);
         let gate = PermissionGate::new(
@@ -491,6 +537,12 @@ impl DaemonRuntime {
 
             match result {
                 Ok(outcome) => {
+                    // REQ-544 M-5: a provider that just served a turn is healthy
+                    // again — clear any earlier downgrade so a recovered provider
+                    // returns to rotation on the next turn.
+                    if let Some(pid) = route.provider_id.as_ref() {
+                        self.record_provider_health(&pid.0, ProviderHealth::Healthy);
+                    }
                     // REQ-544 C-2: if this turn's context intersects a local-only
                     // boundary or carries unknown provenance, pin the session to
                     // the local tier for every subsequent turn (the backstop for
@@ -517,6 +569,12 @@ impl DaemonRuntime {
                             "provider failed unrecoverably",
                         ));
                     };
+                    // REQ-544 M-5: persist the failed provider's health so the
+                    // downgrade survives into the next turn's routing. A transient
+                    // failure (Retry) leaves health untouched.
+                    if let Some(h) = health_after_failure(class) {
+                        self.record_provider_health(&pid.0, h);
+                    }
                     let fo = router.on_provider_failure(core_phase, &pid.0, class);
                     if let Some(degraded) = fo.degraded {
                         router.emit_provider_degraded(events, Some(session_id.clone()), degraded);
@@ -942,7 +1000,7 @@ fn provider_auth_headers(kind: ProviderKind, secret: &str) -> Vec<(String, Strin
             ("x-api-key".to_owned(), secret.to_owned()),
             ("anthropic-version".to_owned(), ANTHROPIC_VERSION.to_owned()),
         ],
-        ProviderKind::OpenAiCompatible | ProviderKind::Custom => {
+        ProviderKind::OpenaiCompatible | ProviderKind::Custom => {
             vec![("authorization".to_owned(), format!("Bearer {secret}"))]
         }
         // The local tier does not reach a remote transport, so it needs no auth.
@@ -970,7 +1028,12 @@ fn build_provider(provider: &ModelProvider, caps: CapabilityProfile) -> Box<dyn 
 /// Each provider's billed model name is resolved from the price table
 /// ([`billing_model`]) so cost attribution (BR-2) hits a real price entry rather
 /// than the bare provider id.
-fn build_router(config: &Config, local_available: bool, prices: &PriceTable) -> Router {
+fn build_router(
+    config: &Config,
+    local_available: bool,
+    prices: &PriceTable,
+    health: &BTreeMap<String, ProviderHealth>,
+) -> Router {
     let local_provider = config
         .providers
         .iter()
@@ -985,14 +1048,35 @@ fn build_router(config: &Config, local_available: bool, prices: &PriceTable) -> 
     let mut router = Router::new(config.routing.clone(), default_provider, local_provider)
         .with_local_available(local_available);
     for p in &config.providers {
+        // REQ-544 M-5: seed each provider's health from the persisted map (default
+        // Healthy for a provider never observed failing). This is the read side of
+        // the cross-turn health fallback — a provider marked Unavailable last turn
+        // is seeded Unavailable now, so policy evaluation fails over to the fallback.
+        let seed = health
+            .get(&p.id)
+            .copied()
+            .unwrap_or(ProviderHealth::Healthy);
         router = router.with_provider(
             p.id.clone(),
             billing_model(prices, &p.id),
             CapabilityProfile::from_core(p.capabilities),
-            ProviderHealth::Healthy,
+            seed,
         );
     }
     router
+}
+
+/// The cross-turn health a provider should carry after a failure of `class`
+/// (REQ-544 M-5). A persistent failure (fallback / fail) marks it `Unavailable`
+/// so the next turn's policy evaluation fails over; a weak-tool-calling failure
+/// marks it `Degraded` (kept, reduced profile); a transient failure leaves health
+/// unchanged (`None`) so a retryable blip does not strand a provider.
+fn health_after_failure(class: FailureClass) -> Option<ProviderHealth> {
+    match classify(class).action {
+        FailureAction::Fallback | FailureAction::Fail => Some(ProviderHealth::Unavailable),
+        FailureAction::Degrade => Some(ProviderHealth::Degraded),
+        FailureAction::Retry => None,
+    }
 }
 
 /// Whether the assembled context in `ctx` carries content that must pin the
@@ -1137,7 +1221,7 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
 fn to_proto_kind(kind: ProviderKind) -> ProtoProviderKind {
     match kind {
         ProviderKind::Local => ProtoProviderKind::Local,
-        ProviderKind::OpenAiCompatible => ProtoProviderKind::OpenaiCompatible,
+        ProviderKind::OpenaiCompatible => ProtoProviderKind::OpenaiCompatible,
         ProviderKind::Anthropic => ProtoProviderKind::Anthropic,
         ProviderKind::Custom => ProtoProviderKind::Custom,
     }
@@ -1146,7 +1230,7 @@ fn to_proto_kind(kind: ProviderKind) -> ProtoProviderKind {
 fn to_core_kind(kind: ProtoProviderKind) -> ProviderKind {
     match kind {
         ProtoProviderKind::Local => ProviderKind::Local,
-        ProtoProviderKind::OpenaiCompatible => ProviderKind::OpenAiCompatible,
+        ProtoProviderKind::OpenaiCompatible => ProviderKind::OpenaiCompatible,
         ProtoProviderKind::Anthropic => ProviderKind::Anthropic,
         ProtoProviderKind::Custom => ProviderKind::Custom,
     }
@@ -1389,7 +1473,7 @@ mod tests {
 
     #[test]
     fn openai_compatible_auth_uses_a_bearer_token() {
-        let headers = provider_auth_headers(ProviderKind::OpenAiCompatible, "sk-deepseek");
+        let headers = provider_auth_headers(ProviderKind::OpenaiCompatible, "sk-deepseek");
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "authorization");
         assert_eq!(headers[0].1, "Bearer sk-deepseek");
@@ -1431,7 +1515,7 @@ mod tests {
         // The e2e mock endpoints register no auth_ref; that path must still build
         // a transport, and it must inject nothing.
         let endpoint = "http://127.0.0.1:8080/v1/chat/completions";
-        let cfg = provider(ProviderKind::OpenAiCompatible, endpoint, None);
+        let cfg = provider(ProviderKind::OpenaiCompatible, endpoint, None);
         let transport = build_remote_transport(&cfg, &SecretResolver::with_default_backend())
             .expect("transport");
         let protocol = vec![("content-type".to_owned(), "application/json".to_owned())];
@@ -1462,5 +1546,98 @@ mod tests {
             }
             other => panic!("expected Credential error, got {other:?}"),
         }
+    }
+
+    // --- REQ-544 M-5: cross-turn provider health ---------------------------
+
+    /// A two-remote-provider config: Spec routes to `anthropic` with `deepseek`
+    /// as the fallback — the shape that exercises the health-driven failover.
+    fn two_provider_spec_config() -> Config {
+        Config {
+            pinned_local_model: None,
+            providers: vec![
+                ModelProvider {
+                    id: "anthropic".to_owned(),
+                    kind: ProviderKind::Anthropic,
+                    endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
+                    auth_ref: Some("keychain:anthropic".to_owned()),
+                    capabilities: ProviderCapabilities::default(),
+                },
+                ModelProvider {
+                    id: "deepseek".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
+                    auth_ref: Some("keychain:deepseek".to_owned()),
+                    capabilities: ProviderCapabilities::default(),
+                },
+            ],
+            routing: vec![RoutingPolicy {
+                phase: CorePhase::Spec,
+                provider_id: "anthropic".to_owned(),
+                fallback_id: Some("deepseek".to_owned()),
+            }],
+            boundaries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_failed_provider_is_seen_unavailable_on_the_next_turns_routing() {
+        // REQ-544 M-5: provider health persists across turns. `build_router` READS
+        // the daemon-wide health map, so a provider marked Unavailable after a
+        // failure on one turn fails over to its fallback on the NEXT turn instead
+        // of the router blindly reseeding it Healthy every turn.
+        use teton_core::policy::RouteOutcome;
+        let config = two_provider_spec_config();
+        let prices = PriceTable::bundled();
+
+        // Turn 1: no prior failures → the Spec primary (anthropic) is chosen.
+        let fresh = BTreeMap::new();
+        let route1 =
+            build_router(&config, false, &prices, &fresh).resolve_structured(CorePhase::Spec);
+        assert_eq!(route1.provider_id.as_ref().unwrap().0, "anthropic");
+        assert_eq!(route1.outcome, RouteOutcome::Primary);
+
+        // The primary failed with a persistent (fallback-class) error; the daemon
+        // derives and records its cross-turn health.
+        let downgrade = health_after_failure(FailureClass::MalformedResponse)
+            .expect("a persistent failure downgrades health");
+        assert_eq!(downgrade, ProviderHealth::Unavailable);
+        let mut persisted = BTreeMap::new();
+        persisted.insert("anthropic".to_owned(), downgrade);
+
+        // Turn 2: build_router seeds anthropic Unavailable from the map → policy
+        // fails over to the fallback deepseek. This is the cross-turn fallback that
+        // was previously dead because every turn reseeded Healthy.
+        let route2 =
+            build_router(&config, false, &prices, &persisted).resolve_structured(CorePhase::Spec);
+        assert_eq!(
+            route2.provider_id.as_ref().unwrap().0,
+            "deepseek",
+            "a provider that failed must be seen Unavailable on the next turn's routing"
+        );
+        assert_eq!(route2.outcome, RouteOutcome::Fallback);
+    }
+
+    #[test]
+    fn health_after_failure_only_downgrades_persistent_failures() {
+        // A retryable blip must not persist as Unavailable, or a healthy provider
+        // would be stranded after a single transient hiccup.
+        assert!(health_after_failure(FailureClass::Timeout).is_none());
+        assert!(health_after_failure(FailureClass::Transport).is_none());
+        assert!(health_after_failure(FailureClass::ServerError { status: 503 }).is_none());
+        // Weak tool-calling degrades (kept, reduced profile); auth / persistent
+        // client errors make the provider Unavailable for the next turn.
+        assert_eq!(
+            health_after_failure(FailureClass::MalformedToolCall),
+            Some(ProviderHealth::Degraded)
+        );
+        assert_eq!(
+            health_after_failure(FailureClass::ClientError { status: 401 }),
+            Some(ProviderHealth::Unavailable)
+        );
+        assert_eq!(
+            health_after_failure(FailureClass::MalformedResponse),
+            Some(ProviderHealth::Unavailable)
+        );
     }
 }

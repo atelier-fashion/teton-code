@@ -17,8 +17,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use teton_protocol::jsonrpc::error_code;
 use teton_protocol::methods::{
-    ConfigGetParams, ConfigSetParams, ConfigUpdate, PrivacyBoundaryConfig, PromptBlock,
-    PromptTurnParams, ProviderConfig, RoutingRule, SessionCreateParams,
+    ConfigGetParams, ConfigSetParams, ConfigUpdate, CostQueryParams, PrivacyBoundaryConfig,
+    PromptBlock, PromptTurnParams, ProviderConfig, RoutingRule, SessionCreateParams,
 };
 use teton_protocol::{Phase, PrivacyMode, ProviderId, ProviderKind, SessionMode};
 
@@ -29,15 +29,13 @@ mod keychain;
 mod prompt;
 mod render;
 mod session_ui;
-mod socket_path;
 
 use client::{Connection, UiContext};
-use cost_ui::Baseline;
 use keychain::Keychain;
 use prompt::{Prompter, StdinPrompter};
 use render::{stdout_surface, LineKind, Surface};
 use session_ui::SessionState;
-use socket_path::DaemonPaths;
+use teton_protocol::socket_path::{self, DaemonPaths};
 
 /// The `teton` command-line interface.
 #[derive(Debug, Parser)]
@@ -308,14 +306,51 @@ fn run_session(paths: &DaemonPaths) -> anyhow::Result<()> {
         }
     }
 
-    // Session-end cost summary (AC-4).
-    surface.line(
-        LineKind::Info,
-        &format!("recorded {} model call(s) this session.", state.cost.len()),
-    );
-    let summary = state.cost.report(&Baseline::default());
-    cost_ui::render_summary(&summary, &mut surface);
+    // Session-end cost summary (AC-4). Ask the daemon's authoritative `cost/query`
+    // RPC and render its report directly — the CLI recomputes no spend or savings
+    // (REQ-544 M-7). The live meter supplies only the session call count.
+    let session_line = if state.cost.is_empty() {
+        "no model calls were recorded this session.".to_owned()
+    } else {
+        format!("recorded {} model call(s) this session.", state.cost.len())
+    };
+    surface.line(LineKind::Info, &session_line);
+    query_and_render_cost(&mut conn, &mut surface, &mut state, &mut prompter)?;
     let _ = surface.flush();
+    Ok(())
+}
+
+/// Query the daemon's authoritative cost report (`cost/query`, BR-2 / AC-4) and
+/// render it, or print a graceful notice when the daemon does not expose the
+/// method or cannot answer. Every figure — totals, baseline, savings — comes from
+/// the daemon; the CLI computes none of it (REQ-544 M-7).
+fn query_and_render_cost(
+    conn: &mut Connection,
+    surface: &mut dyn Surface,
+    state: &mut SessionState,
+    prompter: &mut dyn Prompter,
+) -> anyhow::Result<()> {
+    let result = {
+        let mut ctx = UiContext {
+            surface: &mut *surface,
+            state: &mut *state,
+            prompter: &mut *prompter,
+            answer_permissions: false,
+        };
+        conn.call(CostQueryParams::default(), &mut ctx)?
+    };
+    match result {
+        Ok(res) => cost_ui::render_report_view(&res.report, surface),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => surface.line(
+            LineKind::Notice,
+            "this daemon build does not expose the cost/query method yet; no authoritative \
+             cost report is available.",
+        ),
+        Err(err) => surface.line(
+            LineKind::Error,
+            &format!("cost query failed: {}", err.message),
+        ),
+    }
     Ok(())
 }
 
@@ -383,33 +418,15 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `teton cost`: render whatever cost the live event stream reports (AC-4).
+/// `teton cost`: render the daemon's authoritative persisted cost report (AC-4,
+/// BR-2). Sources every figure from the daemon's `cost/query` RPC — no live-event
+/// draining, no client-side repricing (REQ-544 M-7).
 fn run_cost(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
-
-    {
-        let mut ctx = UiContext {
-            surface: &mut surface,
-            state: &mut state,
-            prompter: &mut prompter,
-            answer_permissions: false,
-        };
-        conn.drain_events(std::time::Duration::from_millis(300), &mut ctx)?;
-    }
-
-    let summary = state.cost.report(&Baseline::default());
-    cost_ui::render_summary(&summary, &mut surface);
-    if state.cost.is_empty() {
-        surface.line(
-            LineKind::Notice,
-            "no cost records observed in this window. `teton cost` reflects live-session spend; \
-             a persisted historical cost query needs a daemon `cost/query` method that is not in \
-             the protocol yet.",
-        );
-    }
+    query_and_render_cost(&mut conn, &mut surface, &mut state, &mut prompter)?;
     let _ = surface.flush();
     Ok(())
 }

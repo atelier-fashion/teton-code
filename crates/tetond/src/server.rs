@@ -168,9 +168,12 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
         let value: Value = match serde_json::from_str(trimmed) {
             Ok(value) => value,
             Err(_) => {
+                // A frame we cannot even parse has no recoverable id — reply with
+                // the spec's `null` id so it never collides with a real request
+                // (REQ-544 minor).
                 let _ = out_tx
                     .send(error_string(
-                        Id::Number(0),
+                        Id::Null,
                         error_code::PARSE_ERROR,
                         "invalid json",
                     ))
@@ -210,6 +213,11 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
         // method dispatches synchronously and replies immediately.
         if method == PromptTurnParams::METHOD {
             if let Some(handle) = spawn_prompt_turn(&daemon, id, params, &out_tx) {
+                // Prune completed turns before tracking a new one so the vector
+                // does not grow unbounded across a long-lived connection's turns
+                // (REQ-544 minor). Only still-running handles are kept, to be
+                // aborted at teardown.
+                prompt_tasks.retain(|h| !h.is_finished());
                 prompt_tasks.push(handle);
             }
             continue;
@@ -524,13 +532,17 @@ async fn write_loop(mut write_half: OwnedWriteHalf, mut out_rx: mpsc::Receiver<S
     }
 }
 
-/// Extracts the JSON-RPC id from a raw request, defaulting to `0` when absent
-/// or malformed (skeleton clients always send a concrete id).
+/// Extracts the JSON-RPC id from a raw request, falling back to the spec's
+/// `null` id when it is absent or malformed (REQ-544 minor).
+///
+/// A `null` fallback — rather than a `0` sentinel — means two malformed requests
+/// cannot produce colliding response ids (and neither can collide with a real
+/// pending request id `0`).
 fn extract_id(value: &Value) -> Id {
     match value.get("id") {
-        Some(Value::Number(n)) => n.as_i64().map_or(Id::Number(0), Id::Number),
+        Some(Value::Number(n)) => n.as_i64().map_or(Id::Null, Id::Number),
         Some(Value::String(s)) => Id::Str(s.clone()),
-        _ => Id::Number(0),
+        _ => Id::Null,
     }
 }
 
@@ -598,7 +610,13 @@ mod tests {
             extract_id(&serde_json::json!({"id": "abc"})),
             Id::Str("abc".to_owned())
         );
-        assert_eq!(extract_id(&serde_json::json!({})), Id::Number(0));
+        // REQ-544 minor: an absent or malformed id maps to the spec's `null` id,
+        // never a `0` sentinel that two bad requests would share.
+        assert_eq!(extract_id(&serde_json::json!({})), Id::Null);
+        assert_eq!(
+            extract_id(&serde_json::json!({"id": {"nested": true}})),
+            Id::Null
+        );
     }
 
     #[test]

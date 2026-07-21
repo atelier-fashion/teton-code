@@ -10,15 +10,20 @@ use serde::{Deserialize, Serialize};
 
 /// The transport/vendor family of a provider. Drives which adapter is used and
 /// whether an `endpoint` is required.
+///
+/// The variant name and `kebab-case` serde rule match
+/// [`teton_protocol::ProviderKind`] exactly, so the two crates share one casing
+/// and one technique — no per-variant `#[serde(rename)]` and no `OpenAi`/`Openai`
+/// drift across the wire boundary (REQ-544 minor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     /// The on-device model tier (llama.cpp / MLX). No network endpoint.
     Local,
     /// Any OpenAI-compatible chat/completions endpoint (DeepSeek, Kimi, Ollama,
-    /// vLLM, …). Registerable with no code change (BR-6).
-    #[serde(rename = "openai-compatible")]
-    OpenAiCompatible,
+    /// vLLM, …). Registerable with no code change (BR-6). Wire form:
+    /// `openai-compatible`.
+    OpenaiCompatible,
     /// The Anthropic Messages API.
     Anthropic,
     /// An operator-supplied custom remote adapter.
@@ -121,64 +126,6 @@ pub struct PrivacyBoundary {
     pub mode: BoundaryMode,
 }
 
-/// Whether a session runs freeform or under the structured ADLC gates
-/// (System Model: `Session.mode`). Freeform is the default (BR-3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionMode {
-    /// Default, ungated experience; heuristic routing permitted.
-    #[default]
-    Freeform,
-    /// ADLC-gated experience; routing determined by [`RoutingPolicy`].
-    Structured,
-}
-
-/// A live session (System Model: `Session`). `phase` is non-null only in
-/// structured mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Session {
-    /// Unique session id.
-    pub id: String,
-    /// Freeform or structured.
-    #[serde(default)]
-    pub mode: SessionMode,
-    /// Current phase; `Some` only when `mode == Structured`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase: Option<Phase>,
-}
-
-/// A single model-call cost record (System Model: `CostRecord`). The cost meter
-/// is derived only from these — no estimated spend shown as actual (BR-2).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CostRecord {
-    /// Session that incurred the call.
-    pub session_id: String,
-    /// Phase in effect; `None` for freeform calls.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase: Option<Phase>,
-    /// Provider that served the call.
-    pub provider_id: String,
-    /// Concrete model name.
-    pub model: String,
-    /// Prompt tokens.
-    pub input_tokens: u64,
-    /// Completion tokens.
-    pub output_tokens: u64,
-    /// Computed cost in USD from the provider price table.
-    pub usd: f64,
-}
-
-/// A structured-mode ADLC artifact reference (System Model: `TaskArtifact`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskArtifact {
-    /// Owning requirement id (e.g. `REQ-544`).
-    pub req_id: String,
-    /// Phase that produced/owns the artifact.
-    pub phase: Phase,
-    /// Repo-relative path to the artifact file.
-    pub path: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +133,7 @@ mod tests {
     #[test]
     fn provider_kind_remoteness() {
         assert!(!ProviderKind::Local.is_remote());
-        assert!(ProviderKind::OpenAiCompatible.is_remote());
+        assert!(ProviderKind::OpenaiCompatible.is_remote());
         assert!(ProviderKind::Anthropic.is_remote());
         assert!(ProviderKind::Custom.is_remote());
     }
@@ -194,7 +141,6 @@ mod tests {
     #[test]
     fn defaults_are_the_strict_and_ungated_choices() {
         assert_eq!(BoundaryMode::default(), BoundaryMode::LocalOnly);
-        assert_eq!(SessionMode::default(), SessionMode::Freeform);
         assert_eq!(ToolCallTier::default(), ToolCallTier::Native);
     }
 
@@ -205,12 +151,12 @@ mod tests {
             kind: ProviderKind,
         }
         let s = toml::to_string(&Wrap {
-            kind: ProviderKind::OpenAiCompatible,
+            kind: ProviderKind::OpenaiCompatible,
         })
         .unwrap();
         assert!(s.contains("openai-compatible"), "got: {s}");
         let back: Wrap = toml::from_str(&s).unwrap();
-        assert_eq!(back.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(back.kind, ProviderKind::OpenaiCompatible);
     }
 
     #[test]

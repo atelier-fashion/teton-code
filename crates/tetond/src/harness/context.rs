@@ -107,6 +107,50 @@ impl BlockRole {
     }
 }
 
+/// The speaker role of a [`StructuredMessage`] (REQ-544 M-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    /// A user turn: the end-user prompt, or a tool result fed back. The text
+    /// harness has no provider `tool_call_id` protocol, so tool results ride as
+    /// user content — the shape Anthropic folds tool results into anyway, and the
+    /// only one an OpenAI-compatible endpoint accepts without a preceding
+    /// assistant `tool_calls` entry.
+    User,
+    /// A prior assistant turn.
+    Assistant,
+}
+
+/// One role-typed message in the structured (chat) rendering of the context
+/// (REQ-544 M-8): the shape a remote provider actually wants, as opposed to one
+/// flattened user blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredMessage {
+    /// Speaker role.
+    pub role: MessageRole,
+    /// Message text.
+    pub text: String,
+}
+
+/// The assembled context in both shapes the completion sources consume
+/// (REQ-544 M-8): a flat string for the local text engine, plus a system prompt
+/// and alternating user/assistant messages for a remote chat provider.
+///
+/// A remote turn maps [`Self::system`] to `TurnRequest.system` and
+/// [`Self::messages`] to `TurnRequest.messages`, so it sends a real system field
+/// and role-typed turns rather than concatenating everything into one
+/// `Role::User` message (which degrades tool-calling and defeats prompt caching).
+#[derive(Debug, Clone)]
+pub struct PreparedPrompt {
+    /// Flat single-string rendering for a local text engine.
+    pub flat: String,
+    /// Top-level system prompt for a remote provider (non-empty whenever the
+    /// context carries a system prompt).
+    pub system: String,
+    /// The conversation as alternating user/assistant messages, starting with a
+    /// user turn.
+    pub messages: Vec<StructuredMessage>,
+}
+
 /// One block of conversation context with its provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBlock {
@@ -287,6 +331,61 @@ impl ContextManager {
         }
         out.push_str("Assistant:\n");
         out
+    }
+
+    /// Render the assembled context in **both** shapes the completion sources need
+    /// (REQ-544 M-8): the flat single-string form for a local text engine, and a
+    /// system prompt plus role-typed messages for a remote chat provider.
+    ///
+    /// The `hook` is invoked for the system block and every conversation block
+    /// exactly as [`ContextManager::assemble`] does (the egress seam) — `prepare`
+    /// delegates the flat rendering to it, so provenance tagging is unchanged.
+    ///
+    /// Tool results are carried as `User` turns and consecutive same-role blocks
+    /// are merged, so the messages always alternate user/assistant starting with a
+    /// user turn — the shape Anthropic requires and every OpenAI-compatible
+    /// endpoint accepts. This replaces the single-`User`-blob request that
+    /// collapsed system, history, and tool results together.
+    #[must_use]
+    pub fn prepare(&self, hook: &mut dyn ProvenanceHook) -> PreparedPrompt {
+        // Reuse assemble for the flat rendering AND the hook invocations, so the
+        // egress seam sees exactly the same blocks it always has.
+        let flat = self.assemble(hook);
+
+        let mut system = self.system.clone();
+        if self.truncated {
+            system.push_str("\n\n[earlier conversation was truncated to fit the context window]");
+        }
+
+        let mut messages: Vec<StructuredMessage> = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            let role = match block.role {
+                BlockRole::Assistant => MessageRole::Assistant,
+                BlockRole::User | BlockRole::Tool => MessageRole::User,
+            };
+            // Preserve the "(tool)" annotation the flat form carries so the model
+            // can still tell a tool result from a genuine user turn.
+            let text = match &block.provenance {
+                Provenance::Tool { tool, .. } => format!("[{tool} tool result]\n{}", block.text),
+                _ => block.text.clone(),
+            };
+            // Merge into the previous message when the role repeats, guaranteeing
+            // strict user/assistant alternation regardless of block order.
+            if let Some(last) = messages.last_mut() {
+                if last.role == role {
+                    last.text.push_str("\n\n");
+                    last.text.push_str(&text);
+                    continue;
+                }
+            }
+            messages.push(StructuredMessage { role, text });
+        }
+
+        PreparedPrompt {
+            flat,
+            system,
+            messages,
+        }
     }
 }
 

@@ -1,15 +1,20 @@
-//! Where the daemon's Unix socket lives, resolved identically to the daemon.
+//! Where the daemon's Unix socket and single-instance lock live.
 //!
-//! The CLI cannot depend on the `tetond` crate (binaries never depend on
-//! binaries), so this mirrors `tetond::socket_path` byte-for-byte: base directory
-//! is `$XDG_RUNTIME_DIR/teton` when set, else the macOS per-user location
-//! `~/Library/Application Support/teton`, else the OS temp dir. The two
-//! resolvers MUST agree or the client would look for the socket in the wrong
-//! place — the unit tests here pin the same precedence the daemon asserts.
+//! This lives in the shared `teton-protocol` crate (not in either binary) because
+//! the daemon and every client MUST resolve the socket to the *same* path — a
+//! binary cannot depend on another binary, so before REQ-544 both `tetond` and
+//! the `teton` CLI carried byte-identical copies of this logic that had to be
+//! kept in sync by hand. One shared resolver removes that drift risk.
+//!
+//! The base directory is `$XDG_RUNTIME_DIR/teton` when the variable is set
+//! (Linux, and anyone who opts in), else the macOS per-user location
+//! `~/Library/Application Support/teton`, else the OS temp dir. Both the socket
+//! and the lock file sit side by side under that directory so a single lock
+//! guards a single socket.
 
 use std::path::PathBuf;
 
-/// The concrete paths the client needs to reach (and, on autostart, to poll).
+/// The concrete socket and lock paths the daemon binds and every client dials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPaths {
     /// Path the daemon binds its `UnixListener` to.
@@ -34,7 +39,7 @@ pub fn daemon_paths() -> DaemonPaths {
 /// Chooses the base directory from the two environment inputs.
 ///
 /// Kept pure (no direct env reads) so the precedence rule is unit-testable
-/// without mutating process-global state — the same shape the daemon uses.
+/// without mutating process-global state.
 #[must_use]
 pub fn resolve_base_dir(xdg_runtime_dir: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
     if let Some(xdg) = xdg_runtime_dir {
@@ -43,6 +48,8 @@ pub fn resolve_base_dir(xdg_runtime_dir: Option<PathBuf>, home: Option<PathBuf>)
     if let Some(home) = home {
         return home.join("Library/Application Support/teton");
     }
+    // Neither variable is set (unusual); fall back to the OS temp dir so the
+    // daemon still has somewhere to bind rather than panicking.
     std::env::temp_dir().join("teton")
 }
 

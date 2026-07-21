@@ -9,7 +9,9 @@
 //! Module map:
 //! - [`phase`] — the ADLC [`Phase`] enum (decision D-4).
 //! - [`entities`] — the System Model data types (providers, policies,
-//!   boundaries, sessions, cost records, task artifacts).
+//!   boundaries). Session, cost-record, and task-artifact state live in the
+//!   daemon (`teton_protocol` wire types + `tetond` structured artifacts), so
+//!   this crate no longer duplicates them.
 //! - [`config`] — the TOML config schema and its validation, including the
 //!   BR-7 no-raw-credentials rule.
 //! - [`policy`] — pure routing-policy evaluation ([`policy::evaluate`]).
@@ -24,8 +26,8 @@ pub mod policy;
 pub use boundary::{match_boundary, BoundaryError, BoundaryMatcher};
 pub use config::{Config, ConfigError, LoadError};
 pub use entities::{
-    BoundaryMode, CostRecord, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
-    RoutingPolicy, Session, SessionMode, TaskArtifact, ToolCallTier,
+    BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
+    RoutingPolicy, ToolCallTier,
 };
 pub use phase::Phase;
 pub use policy::{evaluate, ProviderHealth, RouteDecision, RouteOutcome};

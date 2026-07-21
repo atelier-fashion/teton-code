@@ -15,9 +15,9 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use serde_json::Value;
@@ -30,7 +30,7 @@ use teton_protocol::{ClientKind, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
 use crate::prompt::Prompter;
 use crate::render::{LineKind, Surface};
 use crate::session_ui::{self, EventOutcome, SessionState};
-use crate::socket_path::DaemonPaths;
+use teton_protocol::socket_path::DaemonPaths;
 
 /// Diagnostic client name sent in the handshake.
 const CLIENT_NAME: &str = "teton-cli";
@@ -151,28 +151,6 @@ impl Connection {
                 Incoming::Response(_) => {} // stray ack (e.g. a permission reply)
                 Incoming::Event(env) => self.dispatch_event(&env, ctx)?,
                 Incoming::Lagged(err) => report_lag(&err, ctx.surface),
-            }
-        }
-    }
-
-    /// Render whatever events arrive within `window`, then return. Used by
-    /// `teton cost`, which has no request to await — it observes the live stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only if handling an event fails to serialize a reply.
-    pub fn drain_events(&mut self, window: Duration, ctx: &mut UiContext) -> anyhow::Result<()> {
-        let deadline = Instant::now() + window;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(());
-            }
-            match self.incoming.recv_timeout(deadline - now) {
-                Ok(Incoming::Event(env)) => self.dispatch_event(&env, ctx)?,
-                Ok(Incoming::Lagged(err)) => report_lag(&err, ctx.surface),
-                Ok(Incoming::Response(_)) => {}
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return Ok(()),
             }
         }
     }

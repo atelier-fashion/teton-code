@@ -39,7 +39,9 @@ use teton_providers::{
 use crate::cost::CostAttribution;
 use crate::egress::{Egress, EgressContext, Provenance};
 
-use super::context::{ContextManager, Provenance as CtxProvenance, ToolProvenance};
+use super::context::{
+    ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance, ToolProvenance,
+};
 use super::tools::ToolRegistry;
 use super::turn_loop::{parse_turn, HarnessConfig, HarnessError, ParsedTurn};
 
@@ -82,7 +84,9 @@ pub struct SourceTurn {
 
 /// A source of model turns for the turn loop: local engine or remote provider.
 ///
-/// `produce_turn` is handed the already-assembled `prompt`, the egress
+/// `produce_turn` is handed the already-assembled [`PreparedPrompt`] (both the
+/// flat string a local text engine consumes and the system-prompt + role-typed
+/// messages a remote chat provider consumes, REQ-544 M-8), the egress
 /// [`Provenance`] of the context it was assembled from (BR-1; ignored by the
 /// local path), the harness `config`, the tool set, the exposed tool names, and an
 /// `on_token` sink for streaming. It returns exactly one [`SourceTurn`]. Bound
@@ -97,7 +101,7 @@ pub trait CompletionSource: Send {
     /// surfaces here as a transport-level refusal — see [`RemoteProviderSource`]).
     async fn produce_turn(
         &mut self,
-        prompt: &str,
+        prompt: &PreparedPrompt,
         provenance: &Provenance,
         config: &HarnessConfig,
         tools: &ToolRegistry,
@@ -124,18 +128,19 @@ impl<'a> LocalEngineSource<'a> {
 impl CompletionSource for LocalEngineSource<'_> {
     async fn produce_turn(
         &mut self,
-        prompt: &str,
+        prompt: &PreparedPrompt,
         _provenance: &Provenance,
         config: &HarnessConfig,
         _tools: &ToolRegistry,
         exposed: &[&str],
         on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
     ) -> Result<SourceTurn, HarnessError> {
-        // The local engine completes synchronously; its output is atomic, so the
-        // turn is emitted as one chunk (unchanged from the local-first loop).
+        // The local text engine consumes the flat single-string rendering; its
+        // output is atomic, so the turn is emitted as one chunk (unchanged from
+        // the local-first loop).
         let completion = {
             let guard = self.engine.lock().expect("engine mutex poisoned");
-            guard.complete(prompt, &config.gen_params, &mut |_| {})?
+            guard.complete(&prompt.flat, &config.gen_params, &mut |_| {})?
         };
         let text = completion.text;
         on_token(&text);
@@ -207,23 +212,37 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
 impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
     async fn produce_turn(
         &mut self,
-        prompt: &str,
+        prompt: &PreparedPrompt,
         provenance: &Provenance,
         config: &HarnessConfig,
         tools: &ToolRegistry,
         _exposed: &[&str],
         on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
     ) -> Result<SourceTurn, HarnessError> {
-        // The assembled prompt already carries the system instructions and the
-        // whole conversation, so it travels as a single user message — the loop
-        // owns context assembly; the adapter only maps it to the wire body.
+        // REQ-544 M-8: map the structured context to a real system prompt plus
+        // role-typed user/assistant messages — NOT one collapsed `Role::User`
+        // blob. Preserving the system field and the assistant turns keeps
+        // tool-calling fidelity on weak providers and lets prompt caching hit.
+        let messages = prompt
+            .messages
+            .iter()
+            .map(|m| Message {
+                role: match m.role {
+                    MessageRole::User => Role::User,
+                    MessageRole::Assistant => Role::Assistant,
+                },
+                content: m.text.clone(),
+            })
+            .collect();
+        let system = if prompt.system.trim().is_empty() {
+            None
+        } else {
+            Some(prompt.system.clone())
+        };
         let request = TurnRequest {
             model: self.model.clone(),
-            system: None,
-            messages: vec![Message {
-                role: Role::User,
-                content: prompt.to_owned(),
-            }],
+            system,
+            messages,
             tools: exposed_tool_specs(tools, config.max_tools),
             max_tokens: config.gen_params.max_tokens,
         };
@@ -327,6 +346,17 @@ mod tests {
     use super::*;
     use teton_inference::MockEngine;
 
+    /// A [`PreparedPrompt`] with just a flat body — the shape the local source
+    /// consumes in these tests (the remote-shaping fields are exercised by the
+    /// integration tests and `prepared_prompt_carries_*` below).
+    fn flat_prompt(text: &str) -> PreparedPrompt {
+        PreparedPrompt {
+            flat: text.to_owned(),
+            system: String::new(),
+            messages: Vec::new(),
+        }
+    }
+
     #[test]
     fn exposed_tool_specs_respects_the_cap() {
         let tools = ToolRegistry::with_builtins();
@@ -397,9 +427,10 @@ mod tests {
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let mut streamed = String::new();
+        let prompt = flat_prompt("prompt");
         let turn = source
             .produce_turn(
-                "prompt",
+                &prompt,
                 &Provenance::empty(),
                 &HarnessConfig::default(),
                 &tools,
@@ -424,9 +455,10 @@ mod tests {
         let mut source = LocalEngineSource::new(&engine);
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
+        let prompt = flat_prompt("prompt");
         let turn = source
             .produce_turn(
-                "prompt",
+                &prompt,
                 &Provenance::empty(),
                 &HarnessConfig::default(),
                 &tools,
@@ -439,5 +471,56 @@ mod tests {
             TurnDecision::EndTurn { final_text } => assert!(final_text.contains("All done")),
             other => panic!("expected end of turn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prepared_prompt_carries_system_and_alternating_role_typed_messages() {
+        // REQ-544 M-8: the structured rendering a remote turn maps to the wire is
+        // a non-empty system prompt plus alternating user/assistant messages —
+        // NOT one collapsed user blob. Tool results ride as user turns; a model
+        // turn is preserved as an assistant turn.
+        let mut ctx = ContextManager::new("SYSTEM PROMPT", 10_000);
+        ctx.push_user("please edit the file");
+        ctx.push_model(r#"{"tool":"read","arguments":{"path":"a.rs"}}"#);
+        ctx.push_tool_result("read", Some("a.rs".to_owned()), "file body");
+
+        let mut hook = crate::harness::context::NoopProvenanceHook;
+        let prepared = ctx.prepare(&mut hook);
+
+        // A real, non-empty system field (not None).
+        assert_eq!(prepared.system, "SYSTEM PROMPT");
+
+        // Multiple role-typed messages, strictly alternating and starting with a
+        // user turn — proof the blob was not collapsed.
+        assert_eq!(prepared.messages.len(), 3);
+        assert_eq!(prepared.messages[0].role, MessageRole::User);
+        assert!(prepared.messages[0].text.contains("please edit the file"));
+        assert_eq!(prepared.messages[1].role, MessageRole::Assistant);
+        assert!(prepared.messages[1].text.contains("\"tool\":\"read\""));
+        // The tool result is folded into a user turn, annotated so the model knows
+        // it is tool output.
+        assert_eq!(prepared.messages[2].role, MessageRole::User);
+        assert!(prepared.messages[2].text.contains("read tool result"));
+        assert!(prepared.messages[2].text.contains("file body"));
+
+        // Alternation holds: no two adjacent messages share a role.
+        for pair in prepared.messages.windows(2) {
+            assert_ne!(pair[0].role, pair[1].role, "roles must alternate");
+        }
+    }
+
+    #[test]
+    fn prepared_prompt_merges_consecutive_same_role_blocks() {
+        // Two user turns in a row collapse into one message so alternation holds
+        // for a provider (Anthropic rejects two consecutive user messages).
+        let mut ctx = ContextManager::new("sys", 10_000);
+        ctx.push_user("first");
+        ctx.push_user("second");
+        let mut hook = crate::harness::context::NoopProvenanceHook;
+        let prepared = ctx.prepare(&mut hook);
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.messages[0].role, MessageRole::User);
+        assert!(prepared.messages[0].text.contains("first"));
+        assert!(prepared.messages[0].text.contains("second"));
     }
 }

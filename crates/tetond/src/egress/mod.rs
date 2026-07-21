@@ -4,9 +4,11 @@
 //! a remote MCP server — passes through here. This is the *only* place in the
 //! whole workspace that constructs a real HTTP client ([`HttpTransport`], built
 //! on `reqwest`); a CI deny-check ([`deny_http_client`]) fails the build if any
-//! other crate grows an HTTP-client dependency. Because the provider crate
-//! carries no client of its own and only ever holds a `&dyn Transport`, "an
-//! adapter cannot reach the network except through egress" is a compile-time
+//! other crate declares an HTTP-client crate among its **direct** manifest
+//! dependencies (it is a manifest-line scan, not a transitive `cargo tree`
+//! analysis — see that module's docs for the limitation). Because the provider
+//! crate carries no client of its own and only ever holds a `&dyn Transport`,
+//! "an adapter cannot reach the network except through egress" is a compile-time
 //! property, not a review convention.
 //!
 //! Three responsibilities converge here:
@@ -838,6 +840,19 @@ mod tests {
 /// CI deny-check: the egress choke point must be the workspace's *only* HTTP
 /// client (BR-1). Runs under `cargo test --workspace` — the same command CI's
 /// test step invokes — so a regression fails the build, not just review.
+///
+/// ## Scope and limitation (REQ-544 minor — honest docs)
+///
+/// This check reads each sibling crate's `Cargo.toml` and scans its **directly
+/// declared** shipping dependencies (`[dependencies]` / `[build-dependencies]`)
+/// for a known HTTP-client crate. It is a small hand parser, **not** a
+/// `cargo tree` / cargo-deny transitive analysis: it catches the realistic
+/// regression — someone adding `reqwest` to a crate that should stay
+/// transport-free — but it would **not** catch an HTTP client pulled in
+/// *transitively* by some other direct dependency. Closing that residual gap
+/// needs a real transitive check (e.g. `cargo deny` banned-crates, or parsing
+/// `cargo tree`) in CI; this in-tree test deliberately trades that coverage for
+/// zero extra dependencies and a fast, hermetic unit test.
 #[cfg(test)]
 mod deny_http_client {
     use std::path::{Path, PathBuf};

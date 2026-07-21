@@ -65,6 +65,17 @@ pub enum ConfigError {
     #[error("provider '{0}' is a remote provider and must set an `endpoint`")]
     MissingEndpoint(String),
 
+    /// A routing rule targets the `freeform` phase. Freeform prompts are routed
+    /// by heuristics (BR-5), not the phase→provider table, so such a rule can
+    /// never take effect — it is rejected rather than silently ignored (M-6).
+    #[error(
+        "routing policy for the freeform phase can never take effect: freeform prompts are \
+         routed by heuristics, not the phase→provider routing table. Remove the \
+         `phase = \"freeform\"` routing entry, or run the session in structured mode to route \
+         it by policy (BR-5)."
+    )]
+    FreeformRoutingPolicy,
+
     /// A routing rule references a provider id that no provider declares.
     #[error("routing policy for the {phase} phase references unknown provider '{provider_id}'")]
     UnknownProvider {
@@ -147,6 +158,12 @@ impl Config {
         }
 
         for rule in &self.routing {
+            // M-6: a freeform routing entry is inert — freeform prompts route by
+            // heuristics, never the policy table — so reject it with an actionable
+            // message rather than accepting a rule that can never fire.
+            if rule.phase == Phase::Freeform {
+                return Err(ConfigError::FreeformRoutingPolicy);
+            }
             if !ids.contains(rule.provider_id.as_str()) {
                 return Err(ConfigError::UnknownProvider {
                     phase: rule.phase,
@@ -244,7 +261,7 @@ mod tests {
                 },
                 ModelProvider {
                     id: "deepseek".to_owned(),
-                    kind: ProviderKind::OpenAiCompatible,
+                    kind: ProviderKind::OpenaiCompatible,
                     endpoint: Some("https://api.deepseek.com".to_owned()),
                     auth_ref: Some("keychain:deepseek".to_owned()),
                     capabilities: ProviderCapabilities::default(),
@@ -430,6 +447,27 @@ mod tests {
                 phase: Phase::Architect,
                 fallback_id: "ghost".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn routing_rule_for_the_freeform_phase_is_rejected() {
+        // REQ-544 M-6: a freeform routing entry can never fire (heuristics, not the
+        // policy table, route freeform prompts), so validation must reject it with a
+        // clear, actionable message instead of silently accepting an inert rule.
+        let mut cfg = sample_config();
+        cfg.routing.push(RoutingPolicy {
+            phase: Phase::Freeform,
+            provider_id: "deepseek".to_owned(),
+            fallback_id: None,
+        });
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err, ConfigError::FreeformRoutingPolicy);
+        let msg = err.to_string();
+        assert!(msg.contains("freeform"), "message: {msg}");
+        assert!(
+            msg.contains("heuristics") && msg.contains("structured"),
+            "message should explain why and how to fix: {msg}"
         );
     }
 
