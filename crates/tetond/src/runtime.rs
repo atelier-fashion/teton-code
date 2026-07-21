@@ -20,8 +20,13 @@
 //!   separated by a `---` line). When set, the local tier is a
 //!   [`ScriptedFileEngine`] rather than a real llama.cpp engine, so the offline
 //!   read→edit→verify path (AC-1) runs deterministically in CI.
-//! - `TETON_CONFIG` — the TOML config file (providers, routing, boundaries).
-//! - `TETON_MCP_CONFIG` — a JSON file of MCP server configs (ADR-003).
+//! - `TETON_CONFIG` — the TOML config file (providers, routing, boundaries, and
+//!   the `[[mcp_server]]` MCP registrations, ADR-003 / AC-9).
+//! - `TETON_MCP_CONFIG` — a JSON file of MCP server configs. This is a
+//!   **test/override** seam only: the main TOML is the source of truth for MCP
+//!   servers, but when this env var is set it *replaces* the TOML-declared
+//!   servers (used by the acceptance harness for isolation). Precedence:
+//!   `TETON_MCP_CONFIG` (when set) > `TETON_CONFIG`'s `[[mcp_server]]` table.
 //! - `TETON_REPO_ROOT` — the repo the tools are jailed to.
 //! - `TETON_PROBE_RAM_BYTES` / `TETON_PROBE_DISK_BYTES` / `TETON_PROBE_GPU` /
 //!   `TETON_PROBE_FORCE_SLOW_BENCH` — hardware-probe overrides (BR-9 / AC-8).
@@ -80,6 +85,36 @@ use crate::router::Router;
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
 const SCRIPT_SEPARATOR: &str = "---";
 
+/// A placeholder a scripted reply may contain to force its continuation to depend
+/// on the **real** tool output of the current turn's context.
+///
+/// When [`ScriptedFileEngine::complete`] sees this token in a reply block it
+/// substitutes the body of the most recent tool-result block found in the
+/// assembled prompt. If no tool result is present — e.g. because a
+/// tool-result-plumbing regression discarded it before it reached context — the
+/// token resolves to the empty string, so a reply written as `"…: {{LAST_TOOL_RESULT}}"`
+/// stops echoing that output and any assertion on it fails. This is what lets the
+/// AC-9 e2e prove the MCP tool's result actually reaches the model context, not
+/// merely that the tool was offered and gated.
+const LAST_TOOL_RESULT_PLACEHOLDER: &str = "{{LAST_TOOL_RESULT}}";
+
+/// The body of the most recent tool-result block in an assembled flat prompt.
+///
+/// The flat rendering ([`crate::harness::context::ContextManager::assemble`])
+/// separates blocks with a blank line and renders a tool result as
+/// `Tool (<name>):\n<body>`. This scans the blocks in reverse for the last such
+/// header and returns its body, or `""` when the context holds no tool result.
+fn last_tool_result_body(prompt: &str) -> &str {
+    prompt
+        .rsplit("\n\n")
+        .find_map(|block| {
+            let rest = block.strip_prefix("Tool (")?;
+            let (_tool, body) = rest.split_once(":\n")?;
+            Some(body)
+        })
+        .unwrap_or("")
+}
+
 /// A local [`Engine`] that replays a fixed script of replies, one per turn.
 ///
 /// This is the CI/offline stand-in for a real llama.cpp engine: the daemon ships
@@ -136,6 +171,14 @@ impl Engine for ScriptedFileEngine {
             .get(idx)
             .cloned()
             .unwrap_or_else(|| "Done.".to_owned());
+        // A reply may quote the current turn's real tool output via the
+        // placeholder, so the scripted continuation genuinely depends on the
+        // result reaching context (AC-9 execution proof).
+        let text = if text.contains(LAST_TOOL_RESULT_PLACEHOLDER) {
+            text.replace(LAST_TOOL_RESULT_PLACEHOLDER, last_tool_result_body(prompt))
+        } else {
+            text
+        };
 
         let mut completion_tokens = 0u32;
         for token in text.split_inclusive(' ') {
@@ -301,8 +344,9 @@ impl DaemonRuntime {
         let engine: Option<Arc<Mutex<dyn Engine>>> = build_local_engine(&probe);
         let local_available = engine.is_some() && !probe.disabled;
 
-        // --- MCP servers (ADR-003) ---
-        let mcp_servers = load_mcp_servers();
+        // --- MCP servers (ADR-003 / AC-9): the main TOML config is the source of
+        // truth; TETON_MCP_CONFIG is a test-only override (see `load_mcp_servers`).
+        let mcp_servers = load_mcp_servers(&config);
 
         Ok(Self {
             config: Mutex::new(config),
@@ -758,15 +802,22 @@ fn load_config(path: Option<&Path>) -> Config {
     }
 }
 
-/// Load MCP server configs from `TETON_MCP_CONFIG` (a JSON array), if set.
-fn load_mcp_servers() -> Vec<McpServerConfig> {
-    let Some(path) = std::env::var_os("TETON_MCP_CONFIG") else {
-        return Vec::new();
-    };
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => Vec::new(),
+/// Resolve the MCP servers this daemon serves (ADR-003 / AC-9).
+///
+/// The main config document (`[[mcp_server]]`, already validated by
+/// [`Config::validate`]) is the **source of truth** — a server registers in one
+/// place alongside providers and boundaries. `TETON_MCP_CONFIG`, a JSON array, is
+/// a **test/override** seam the acceptance harness uses for isolation: when it is
+/// set it *replaces* the TOML-declared servers. Precedence is therefore
+/// `TETON_MCP_CONFIG` (when set) > `config.mcp_server`.
+fn load_mcp_servers(config: &Config) -> Vec<McpServerConfig> {
+    if let Some(path) = std::env::var_os("TETON_MCP_CONFIG") {
+        return match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
     }
+    config.mcp_server.clone()
 }
 
 /// The result of the startup hardware probe (BR-9 / AC-8).
@@ -1315,6 +1366,51 @@ mod tests {
     }
 
     #[test]
+    fn last_tool_result_body_extracts_the_most_recent_tool_block() {
+        // The flat rendering shape the local engine is handed.
+        let prompt = "SYSTEM\n\nUser:\ndo it\n\nAssistant:\n{\"tool\":\"read\"}\n\n\
+                      Tool (read):\nfirst file body\n\nAssistant:\n\
+                      {\"tool\":\"mcp__demo__echo\"}\n\n\
+                      Tool (mcp__demo__echo):\nechoed from the demo MCP server\n\nAssistant:\n";
+        assert_eq!(
+            last_tool_result_body(prompt),
+            "echoed from the demo MCP server"
+        );
+        // No tool block at all → empty (the regression signal).
+        assert_eq!(
+            last_tool_result_body("SYSTEM\n\nUser:\nhi\n\nAssistant:\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn scripted_reply_substitutes_the_real_tool_result() {
+        // REQ-544 AC-9 execution proof: a reply that quotes {{LAST_TOOL_RESULT}}
+        // reflects the tool output actually present in the prompt, so discarding
+        // the result would change the reply.
+        let engine =
+            ScriptedFileEngine::from_script("m", "Done. The tool said: {{LAST_TOOL_RESULT}}");
+        let params = GenParams::default();
+        let mut sink = |_: &str| {};
+        let prompt =
+            "SYSTEM\n\nTool (mcp__demo__echo):\nechoed from the demo MCP server\n\nAssistant:\n";
+        let out = engine.complete(prompt, &params, &mut sink).unwrap().text;
+        assert_eq!(out, "Done. The tool said: echoed from the demo MCP server");
+
+        // With no tool result in context the placeholder resolves to empty — the
+        // sentinel is gone, which is exactly what fails the AC-9 assertion under a
+        // plumbing regression.
+        let engine2 =
+            ScriptedFileEngine::from_script("m", "Done. The tool said: {{LAST_TOOL_RESULT}}");
+        let bare = engine2
+            .complete("SYSTEM\n\nAssistant:\n", &params, &mut sink)
+            .unwrap()
+            .text;
+        assert_eq!(bare, "Done. The tool said: ");
+        assert!(!bare.contains("echoed from the demo MCP server"));
+    }
+
+    #[test]
     fn config_snapshot_round_trips_kinds_and_modes() {
         let mut config = Config::default();
         apply_update(
@@ -1577,6 +1673,7 @@ mod tests {
                 fallback_id: Some("deepseek".to_owned()),
             }],
             boundaries: Vec::new(),
+            mcp_server: Vec::new(),
         }
     }
 

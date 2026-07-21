@@ -344,7 +344,17 @@ fn exposed_tool_specs(tools: &ToolRegistry, max_tools: Option<u32>) -> Vec<ToolS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde_json::json;
     use teton_inference::MockEngine;
+    use teton_providers::{
+        CapabilityProfile, ProviderError, StopReason, ToolCall, TransportError, TransportRequest,
+        TransportResponse, TurnCompletion, TurnStream,
+    };
+
+    use crate::egress::NoopSink;
 
     /// A [`PreparedPrompt`] with just a flat body — the shape the local source
     /// consumes in these tests (the remote-shaping fields are exercised by the
@@ -355,6 +365,114 @@ mod tests {
             system: String::new(),
             messages: Vec::new(),
         }
+    }
+
+    /// A provider whose single turn streams some text and then **two** tool calls
+    /// — the parallel-tool-call turn the reduced MVP harness deliberately
+    /// collapses to just the first (documented in
+    /// [`RemoteProviderSource::produce_turn`]).
+    struct TwoToolProvider;
+
+    #[async_trait]
+    impl Provider for TwoToolProvider {
+        fn id(&self) -> &str {
+            "two-tool"
+        }
+        fn capabilities(&self) -> CapabilityProfile {
+            CapabilityProfile::default()
+        }
+        async fn stream_turn(
+            &self,
+            _request: TurnRequest,
+            _transport: &dyn Transport,
+        ) -> Result<TurnStream, ProviderError> {
+            let events: Vec<Result<TurnEvent, ProviderError>> = vec![
+                Ok(TurnEvent::TextDelta("planning two things ".to_owned())),
+                Ok(TurnEvent::ToolCall(ToolCall {
+                    id: "call-a".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({ "path": "first.rs" }),
+                })),
+                Ok(TurnEvent::ToolCall(ToolCall {
+                    id: "call-b".to_owned(),
+                    name: "edit".to_owned(),
+                    arguments: json!({ "path": "second.rs" }),
+                })),
+                Ok(TurnEvent::Completed(TurnCompletion {
+                    usage: TokenUsage {
+                        input_tokens: 11,
+                        output_tokens: 4,
+                    },
+                    stop_reason: StopReason::ToolUse,
+                })),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// A `Transport` that is never actually reached (the mock provider ignores it),
+    /// present only to satisfy [`Egress`]'s type parameter.
+    struct NullTransport;
+
+    #[async_trait]
+    impl Transport for NullTransport {
+        async fn execute(
+            &self,
+            _request: TransportRequest,
+        ) -> Result<TransportResponse, TransportError> {
+            Ok(TransportResponse {
+                status: 200,
+                body: Box::pin(futures::stream::empty()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_source_keeps_only_the_first_of_parallel_tool_calls() {
+        // REQ-544 (parallel-tool-drop coverage): the reduced harness runs one tool
+        // per turn, so when a provider emits TWO tool calls in a single turn the
+        // FIRST assembled call wins and the later one is dropped. This pins that
+        // documented behavior so a regression that keeps the *second* (or would
+        // double-execute) is caught.
+        let provider = TwoToolProvider;
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source =
+            RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-1");
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let prompt = flat_prompt("prompt");
+        let mut streamed = String::new();
+        let turn = source
+            .produce_turn(
+                &prompt,
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |t| streamed.push_str(t),
+            )
+            .await
+            .expect("remote turn");
+
+        match turn.decision {
+            TurnDecision::ToolCall { name, arguments } => {
+                assert_eq!(
+                    name, "read",
+                    "the FIRST parallel tool call must win, not the second"
+                );
+                assert_eq!(arguments, json!({ "path": "first.rs" }));
+            }
+            other => panic!("expected the first tool call to be kept, got {other:?}"),
+        }
+        // The turn's text streamed through and usage came from the terminal event.
+        assert!(streamed.contains("planning two things"));
+        assert_eq!(
+            turn.usage,
+            TokenUsage {
+                input_tokens: 11,
+                output_tokens: 4
+            }
+        );
     }
 
     #[test]

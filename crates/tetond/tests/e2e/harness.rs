@@ -781,7 +781,9 @@ pub fn write_mcp_stdio_server(root: &Path) -> PathBuf {
     path
 }
 
-/// The MCP config JSON registering the stdio `demo` server at `script`.
+/// The MCP config JSON registering the stdio `demo` server at `script`. This is
+/// the `TETON_MCP_CONFIG` **test-override** shape (see [`DaemonOptions::mcp`]); the
+/// main-TOML source of truth is [`mcp_stdio_toml`].
 pub fn mcp_stdio_config(script: &Path) -> String {
     json!([{
         "id": "demo",
@@ -790,11 +792,27 @@ pub fn mcp_stdio_config(script: &Path) -> String {
     .to_string()
 }
 
+/// The main config TOML registering the stdio `demo` MCP server at `script` via a
+/// `[[mcp_server]]` table — the single source of truth for MCP registration
+/// (AC-9). The daemon reads this from `TETON_CONFIG`, no side file.
+pub fn mcp_stdio_toml(script: &Path) -> String {
+    format!(
+        "[[mcp_server]]\nid = \"demo\"\n\n\
+         [mcp_server.transport]\nkind = \"stdio\"\ncommand = \"sh\"\nargs = [\"{}\"]\n",
+        script.to_string_lossy()
+    )
+}
+
 /// The local-engine script that calls the `demo` MCP server's `echo` tool (AC-9).
+///
+/// The final reply quotes the tool's real output via the `{{LAST_TOOL_RESULT}}`
+/// placeholder (see `ScriptedFileEngine`), so the scripted continuation genuinely
+/// depends on the MCP result reaching context — a plumbing regression that
+/// discarded the result would erase the sentinel and fail the AC-9 assertion.
 pub fn mcp_call_script() -> String {
     [
         "I'll use the knowledge base.\n{\"tool\": \"mcp__demo__echo\", \"arguments\": {\"text\": \"hello\"}}",
-        "Done. The MCP tool returned its result.",
+        "Done. The MCP tool returned: {{LAST_TOOL_RESULT}}",
     ]
     .join("\n---\n")
 }

@@ -11,9 +11,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::harness::{
-    anthropic_turn, assert_no_boundary_bytes, edit_answer_script, mcp_call_script,
-    mcp_stdio_config, openai_turn, write_mcp_stdio_server, Client, Daemon, DaemonOptions,
-    MockProvider, MockResponse, Workspace,
+    anthropic_turn, assert_no_boundary_bytes, edit_answer_script, mcp_call_script, mcp_stdio_toml,
+    openai_turn, write_mcp_stdio_server, Client, Daemon, DaemonOptions, MockProvider, MockResponse,
+    Workspace,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -285,35 +285,70 @@ fn ac4_cost_meter_reports_totals_phases_and_savings() {
 
     let report = client.cost_query();
 
-    // Totals over both calls.
-    assert!(report["total_calls"].as_u64().unwrap() >= 2, "{report}");
+    // EXACT arithmetic (not just direction) for the known scripted token counts
+    // against the bundled price table, so a math-corruption bug that still lands
+    // positive is caught. Both mocks report 1000 input / 200 output tokens.
+    //   spec  → anthropic/claude-opus-4  @ $15/$75 per Mtok:
+    //           1000*15 + 200*75          = 15_000 + 15_000 = 30_000 µ$
+    //   impl  → deepseek/deepseek-chat    @ $0.27/$1.10 per Mtok:
+    //           1000*0.27 + 200*1.10      =     270 +    220 =    490 µ$
+    // Baseline reprices BOTH priced calls' token volume (1000/200 each) at Opus:
+    //           2 * 30_000                                    = 60_000 µ$
+    //   savings = baseline - actual = 60_000 - 30_490         = 29_510 µ$
+    const SPEC_MICROS: i64 = 30_000;
+    const IMPLEMENT_MICROS: i64 = 490;
+    const TOTAL_MICROS: i64 = SPEC_MICROS + IMPLEMENT_MICROS; // 30_490
+    const BASELINE_MICROS: i64 = 60_000;
+    const SAVINGS_MICROS: i64 = BASELINE_MICROS - TOTAL_MICROS; // 29_510
 
-    // Per-phase attribution: both phases present.
-    let phases: Vec<&str> = report["per_phase"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|g| g["key"].as_str())
-        .collect();
-    assert!(phases.contains(&"spec"), "per-phase missing spec: {report}");
-    assert!(
-        phases.contains(&"implement"),
-        "per-phase missing implement: {report}"
+    assert_eq!(report["total_calls"].as_u64(), Some(2), "{report}");
+    assert_eq!(report["priced_calls"].as_u64(), Some(2), "{report}");
+    assert_eq!(report["unpriced_calls"].as_u64(), Some(0), "{report}");
+    assert_eq!(
+        report["total_usd_micros"].as_i64(),
+        Some(TOTAL_MICROS),
+        "{report}"
     );
 
-    // Savings vs the all-frontier baseline, with its methodology (never measured).
+    // Per-phase attribution: exact per-phase dollars and token volumes.
+    let phase_group = |name: &str| -> Value {
+        report["per_phase"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["key"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("per-phase missing {name}: {report}"))
+            .clone()
+    };
+    let spec = phase_group("spec");
+    assert_eq!(spec["calls"].as_u64(), Some(1), "{report}");
+    assert_eq!(spec["input_tokens"].as_u64(), Some(1000), "{report}");
+    assert_eq!(spec["output_tokens"].as_u64(), Some(200), "{report}");
+    assert_eq!(spec["usd_micros"].as_i64(), Some(SPEC_MICROS), "{report}");
+    let implement = phase_group("implement");
+    assert_eq!(implement["calls"].as_u64(), Some(1), "{report}");
+    assert_eq!(implement["input_tokens"].as_u64(), Some(1000), "{report}");
+    assert_eq!(implement["output_tokens"].as_u64(), Some(200), "{report}");
+    assert_eq!(
+        implement["usd_micros"].as_i64(),
+        Some(IMPLEMENT_MICROS),
+        "{report}"
+    );
+
+    // Savings vs the all-frontier baseline: exact figures, with its methodology.
     assert_eq!(
         report["baseline_model"].as_str(),
         Some("anthropic/claude-opus-4"),
         "{report}"
     );
-    assert!(
-        report["baseline_usd_micros"].as_i64().unwrap() > 0,
+    assert_eq!(
+        report["baseline_usd_micros"].as_i64(),
+        Some(BASELINE_MICROS),
         "{report}"
     );
-    // Cheap-tier work costs less than the frontier baseline for the same volume.
-    assert!(
-        report["savings_usd_micros"].as_i64().unwrap() > 0,
+    assert_eq!(
+        report["savings_usd_micros"].as_i64(),
+        Some(SAVINGS_MICROS),
         "{report}"
     );
     assert!(
@@ -566,12 +601,13 @@ fn ac8_probe_selects_benchmarks_and_steps_down() {
 #[test]
 fn ac9_mcp_tools_appear_and_run_under_permission() {
     let ws = Workspace::new("ac9");
-    ws.write_config("# mcp session (local tier)\n");
-    let script = ws.write_script(&mcp_call_script());
     let mcp_server = write_mcp_stdio_server(&ws.root);
-    let mcp_config = ws.write_mcp_config(&mcp_stdio_config(&mcp_server));
+    // AC-9: the MCP server is registered in the MAIN config TOML (`[[mcp_server]]`)
+    // — the single source of truth, read from `TETON_CONFIG` with no side file.
+    ws.write_config(&mcp_stdio_toml(&mcp_server));
+    let script = ws.write_script(&mcp_call_script());
 
-    let daemon = Daemon::spawn(&ws, probe_16gb().script(script).mcp(mcp_config));
+    let daemon = Daemon::spawn(&ws, probe_16gb().script(script));
     let mut client = daemon.connect();
 
     let session = client.create_session("freeform", None);
@@ -585,14 +621,29 @@ fn ac9_mcp_tools_appear_and_run_under_permission() {
     );
     client.drain_events(Duration::from_millis(200));
 
-    // The MCP tool surfaced under the standard permission model (asked, then run).
+    // (1) The MCP tool declared in the main TOML surfaced under the standard
+    // permission model (asked, then run) — proving the `[[mcp_server]]` table is
+    // registered and its tool is available.
     let prompted_for_mcp = client
         .events_named("permission_request")
         .iter()
         .any(|e| e["tool_name"].as_str() == Some("mcp__demo__echo"));
     assert!(
         prompted_for_mcp,
-        "the registered MCP tool should appear and be authorized under a permission prompt"
+        "the MCP tool declared in the main TOML config should appear and be gated"
+    );
+
+    // (2) EXECUTION, not just offered+gated: the MCP tool's actual RESULT must
+    // reach the model context and the final response. The scripted final reply
+    // quotes the tool output via {{LAST_TOOL_RESULT}}, so this sentinel appears in
+    // the streamed answer ONLY if the result was plumbed back into context. A
+    // tool-result-plumbing regression (discarding the result) erases it and fails
+    // here — the gap the old offered+gated-only assertion could not catch.
+    let answer = agent_message_text(&client);
+    assert!(
+        answer.contains("echoed from the demo MCP server"),
+        "the MCP tool's result must reach the model context / final response; \
+         streamed answer was: {answer:?}"
     );
 
     assert_no_boundary_bytes();
@@ -676,5 +727,23 @@ fn lifecycle_stages(client: &Client) -> Vec<String> {
         .events_named("model_lifecycle")
         .iter()
         .filter_map(|e| e["stage"]["stage"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The concatenation of every streamed assistant-message chunk this session — the
+/// model's visible answer text, used to prove a tool result reached the final
+/// response (AC-9 execution).
+fn agent_message_text(client: &Client) -> String {
+    client
+        .events_named("session_update")
+        .iter()
+        .filter_map(|e| {
+            let update = &e["update"];
+            if update["kind"].as_str() == Some("agent_message_chunk") {
+                update["text"].as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
         .collect()
 }

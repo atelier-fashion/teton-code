@@ -14,6 +14,7 @@
 
 use crate::boundary::BoundaryMatcher;
 use crate::entities::{ModelProvider, PrivacyBoundary, RoutingPolicy};
+use crate::mcp::{McpServerConfig, McpTransport};
 use crate::phase::Phase;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -37,6 +38,11 @@ pub struct Config {
     /// Privacy boundaries (repo-relative globs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boundaries: Vec<PrivacyBoundary>,
+    /// Registered MCP servers (ADR-003 / AC-9). Declared here — the main config
+    /// document — so a server registers in one place alongside providers,
+    /// routing, and boundaries, rather than in a separate side file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_server: Vec<McpServerConfig>,
 }
 
 /// A configuration validation failure. No variant carries a credential value,
@@ -102,6 +108,19 @@ pub enum ConfigError {
         /// The offending glob (user-authored, not a secret).
         glob: String,
     },
+
+    /// Two MCP servers share an id (AC-9). The id is the `<server>` namespace in
+    /// `mcp__<server>__<tool>`, so it must be unique.
+    #[error("mcp server '{0}' is defined more than once; mcp server ids must be unique")]
+    DuplicateMcpServer(String),
+
+    /// A `stdio` MCP server declares no `command` to spawn (AC-9).
+    #[error("mcp server '{0}' uses the stdio transport and must set a non-empty `command`")]
+    McpMissingCommand(String),
+
+    /// An `http` MCP server declares no `endpoint` to reach (AC-9).
+    #[error("mcp server '{0}' uses the http transport and must set a non-empty `endpoint`")]
+    McpMissingEndpoint(String),
 }
 
 impl Config {
@@ -184,6 +203,29 @@ impl Config {
         BoundaryMatcher::new(&self.boundaries)
             .map_err(|e| ConfigError::InvalidBoundaryGlob { glob: e.glob })?;
 
+        // MCP servers (AC-9): ids are the `mcp__<server>__<tool>` namespace, so
+        // they must be unique; each transport must carry the field it needs to be
+        // reachable (a stdio `command`, an http `endpoint`) or registration would
+        // silently fail at connect time instead of at load.
+        let mut mcp_ids: HashSet<&str> = HashSet::with_capacity(self.mcp_server.len());
+        for server in &self.mcp_server {
+            if !mcp_ids.insert(server.id.as_str()) {
+                return Err(ConfigError::DuplicateMcpServer(server.id.clone()));
+            }
+            match &server.transport {
+                McpTransport::Stdio { command, .. } => {
+                    if command.trim().is_empty() {
+                        return Err(ConfigError::McpMissingCommand(server.id.clone()));
+                    }
+                }
+                McpTransport::Http { endpoint } => {
+                    if endpoint.trim().is_empty() {
+                        return Err(ConfigError::McpMissingEndpoint(server.id.clone()));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -232,6 +274,7 @@ mod tests {
     use crate::entities::{
         BoundaryMode, ModelProvider, ProviderCapabilities, ProviderKind, ToolCallTier,
     };
+    use std::collections::BTreeMap;
 
     fn sample_config() -> Config {
         Config {
@@ -292,6 +335,22 @@ mod tests {
                 PrivacyBoundary {
                     path_glob: "docs/**".to_owned(),
                     mode: BoundaryMode::RedactThenRemote,
+                },
+            ],
+            mcp_server: vec![
+                McpServerConfig {
+                    id: "fs".to_owned(),
+                    transport: McpTransport::Stdio {
+                        command: "mcp-server-filesystem".to_owned(),
+                        args: vec!["--root".to_owned(), ".".to_owned()],
+                        env: BTreeMap::from([("MCP_LOG".to_owned(), "info".to_owned())]),
+                    },
+                },
+                McpServerConfig {
+                    id: "knowledge".to_owned(),
+                    transport: McpTransport::Http {
+                        endpoint: "https://mcp.example.com/rpc".to_owned(),
+                    },
                 },
             ],
         }
@@ -480,6 +539,71 @@ mod tests {
                 assert!(glob.contains("unterminated"), "glob: {glob}");
             }
             other => panic!("expected InvalidBoundaryGlob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_mcp_server_id_is_rejected() {
+        // AC-9: the server id is the `mcp__<server>__<tool>` namespace, so two
+        // servers may not share one.
+        let mut cfg = sample_config();
+        cfg.mcp_server[1].id = "fs".to_owned();
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::DuplicateMcpServer("fs".to_owned())
+        );
+    }
+
+    #[test]
+    fn stdio_mcp_server_without_a_command_is_rejected() {
+        let mut cfg = sample_config();
+        cfg.mcp_server[0].transport = McpTransport::Stdio {
+            command: "   ".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::McpMissingCommand("fs".to_owned())
+        );
+    }
+
+    #[test]
+    fn http_mcp_server_without_an_endpoint_is_rejected() {
+        let mut cfg = sample_config();
+        cfg.mcp_server[1].transport = McpTransport::Http {
+            endpoint: String::new(),
+        };
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::McpMissingEndpoint("knowledge".to_owned())
+        );
+    }
+
+    #[test]
+    fn load_accepts_an_mcp_server_config_from_the_main_toml() {
+        // AC-9: an MCP server declared in the main config document — the
+        // `[[mcp_server]]` table with a nested `[mcp_server.transport]` — parses,
+        // validates, and lands in `Config::mcp_server`. This is the single-source
+        // registration the daemon reads (no separate side file).
+        let toml_text = r#"
+[[mcp_server]]
+id = "demo"
+
+[mcp_server.transport]
+kind = "stdio"
+command = "sh"
+args = ["mcp_server.sh"]
+"#;
+        let cfg = Config::load(toml_text).expect("should load and validate");
+        assert_eq!(cfg.mcp_server.len(), 1);
+        assert_eq!(cfg.mcp_server[0].id, "demo");
+        match &cfg.mcp_server[0].transport {
+            McpTransport::Stdio { command, args, .. } => {
+                assert_eq!(command, "sh");
+                assert_eq!(args, &["mcp_server.sh".to_owned()]);
+            }
+            other => panic!("expected a stdio transport, got {other:?}"),
         }
     }
 

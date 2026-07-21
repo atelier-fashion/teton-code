@@ -15,66 +15,24 @@
 //! socket — while production wires [`DefaultConnector`] (stdio subprocess or
 //! egress-gated HTTP).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use teton_protocol::SessionId;
+
+// The MCP server declaration types live in `teton-core` (the pure-data config
+// layer) because they are part of the main config document (the `[[mcp_server]]`
+// table, AC-9). Re-exported here so the daemon's MCP module keeps a single import
+// site (`crate::mcp::{McpServerConfig, McpTransport}`).
+pub use teton_core::mcp::{McpServerConfig, McpTransport};
 
 use super::client::{
     namespaced_tool_name, parse_namespaced_tool_name, EgressGate, HttpConnection, McpClient,
     McpConnection, McpError, McpTool, McpToolResult, StdioConnection,
 };
-
-/// How a configured MCP server is reached.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum McpTransport {
-    /// A local subprocess speaking JSON-RPC over its stdio. Not egress.
-    Stdio {
-        /// The executable to spawn.
-        command: String,
-        /// Arguments passed to it.
-        #[serde(default)]
-        args: Vec<String>,
-        /// Extra environment variables this server declares. The child otherwise
-        /// gets only a minimal base environment (PATH/HOME/locale essentials) —
-        /// the daemon's provider keys are **never** inherited (REQ-544 MED-2,
-        /// BR-7). Declared vars are layered on top of that base.
-        #[serde(default)]
-        env: BTreeMap<String, String>,
-    },
-    /// A remote streamable-HTTP endpoint. Every call flows through egress (BR-1).
-    Http {
-        /// Absolute endpoint URL.
-        endpoint: String,
-    },
-}
-
-impl McpTransport {
-    /// Whether this transport reaches off the machine (and therefore flows through
-    /// the egress choke point).
-    #[must_use]
-    pub fn is_remote(&self) -> bool {
-        matches!(self, McpTransport::Http { .. })
-    }
-}
-
-/// A user-declared MCP server (System Model: an MCP tool provider, ADR-003).
-///
-/// These types are serde-ready so they can be lifted into the top-level config
-/// document; wiring them into `teton_core::config::Config` is a follow-up outside
-/// this task's crate scope.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpServerConfig {
-    /// Stable, unique server id — the `<server>` in `mcp__<server>__<tool>`.
-    pub id: String,
-    /// How to reach the server.
-    pub transport: McpTransport,
-}
 
 /// The health of a registered server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +282,7 @@ impl McpRegistry {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 

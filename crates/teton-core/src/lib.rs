@@ -14,12 +14,15 @@
 //!   this crate no longer duplicates them.
 //! - [`config`] — the TOML config schema and its validation, including the
 //!   BR-7 no-raw-credentials rule.
+//! - [`mcp`] — user-declared MCP servers (the `[[mcp_server]]` config table,
+//!   ADR-003 / AC-9).
 //! - [`policy`] — pure routing-policy evaluation ([`policy::evaluate`]).
 //! - [`boundary`] — pure privacy-boundary glob matching.
 
 pub mod boundary;
 pub mod config;
 pub mod entities;
+pub mod mcp;
 pub mod phase;
 pub mod policy;
 
@@ -29,6 +32,7 @@ pub use entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
     RoutingPolicy, ToolCallTier,
 };
+pub use mcp::{McpServerConfig, McpTransport};
 pub use phase::Phase;
 pub use policy::{evaluate, ProviderHealth, RouteDecision, RouteOutcome};
 
