@@ -269,12 +269,14 @@ async fn adapter_seam_is_enforced() {
         headers: vec![],
         body: SECRET_ENV.as_bytes().to_vec(),
     };
-    // An adapter only sees `&dyn Transport`; the block manifests as a transport
-    // refusal, and the request never reaches the wire.
+    // An adapter only sees `&dyn Transport`; the block manifests as the
+    // dedicated, non-retryable `PrivacyBlocked` signal (REQ-544 M-1) — never a
+    // connect refusal that could be misclassified as transient and retried — and
+    // the request never reaches the wire.
     let err = Transport::execute(&scoped, request)
         .await
         .expect_err("scoped transport must refuse");
-    assert_eq!(err, TransportError::Connect);
+    assert_eq!(err, TransportError::PrivacyBlocked);
     assert!(capture.captured().is_empty(), "nothing may reach the wire");
     assert_eq!(sink.events().len(), 1, "the block still emitted its event");
 }

@@ -405,6 +405,51 @@ async fn a_local_mcp_result_reading_a_boundary_path_is_blocked_from_later_remote
     assert!(capture.captured().is_empty(), "nothing may reach the wire");
 }
 
+/// REQ-544 C-1 (H-1 laundering): a local MCP result that read a boundary path
+/// passed under a **non-`path`** argument key must still be tagged and blocked —
+/// the old narrow "`path` argument only" tagging let this leak with empty
+/// provenance.
+#[tokio::test]
+async fn a_local_mcp_result_reading_a_boundary_path_under_an_arbitrary_key_is_blocked() {
+    // The server was called with the boundary path under `resource` — neither a
+    // path-like key nor a `path` arg. `call_provenance` still catches it because
+    // the value is path-shaped, so the result block carries that provenance.
+    let result = McpToolResult {
+        text: SECRET_ENV.to_owned(),
+        is_error: false,
+    };
+    let block = result_context_block(
+        "mcp__local_fs__fetch",
+        &json!({ "resource": "secrets/prod.env" }),
+        &result,
+    );
+    assert!(
+        block.provenance().contains("secrets/prod.env"),
+        "a boundary path under an arbitrary key must still be tagged"
+    );
+
+    // A later remote turn assembling that block is blocked at the real egress.
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let egress = Egress::new(capture.clone(), local_only_boundaries(), sink.clone());
+
+    let provenance = assembled_provenance(std::slice::from_ref(&block));
+    let request = TransportRequest {
+        method: HttpMethod::Post,
+        url: "https://api.anthropic.com/v1/messages".to_owned(),
+        headers: vec![],
+        body: block.content().as_bytes().to_vec(),
+    };
+    let ctx = EgressContext::new("anthropic").with_session("sess-h1");
+    let result = egress.send(request, &provenance, &ctx).await;
+    assert!(
+        matches!(result, Err(EgressError::PrivacyBlocked { ref path, .. }) if path == "secrets/prod.env"),
+        "an MCP result reading a non-`path`-keyed boundary path must be blocked, got {result:?}"
+    );
+    assert!(capture.captured().is_empty(), "nothing may reach the wire");
+    assert_eq!(sink.events().len(), 1, "exactly one privacy_block");
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle — a crashing server degrades only its own tools; session continues.
 // ---------------------------------------------------------------------------

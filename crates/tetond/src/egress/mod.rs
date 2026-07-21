@@ -32,19 +32,45 @@
 //! baked-in per-turn provenance, so an adapter that only knows `&dyn Transport`
 //! is still enforced.
 //!
-//! ## Residual limit (documented per the task, to be carried to spec Assumptions)
+//! ## Provenance is derived from files a tool TOUCHED (REQ-544 C-1)
+//!
+//! A tool result's provenance is the set of repo-relative paths the tool
+//! actually read or enumerated — the `read` path, `grep`'s matched files,
+//! `glob`'s enumerated files, an MCP call's path-shaped arguments — not a literal
+//! `path` argument. A tool whose touched files cannot be determined (`shell`
+//! runs an arbitrary command) reports **unknown** provenance, which this layer
+//! fail-closes: when any boundary is configured, a turn whose assembled context
+//! carries an unknown-provenance block is blocked from remote egress exactly like
+//! a boundary hit (see [`inspector::inspect`] and [`provenance::Provenance::is_unknown`]).
+//!
+//! ## The session-taint backstop (REQ-544 C-2)
 //!
 //! Provenance tracking is honest about *derived* content: a summary, snippet, or
 //! tool result computed from a `local-only` file inherits that file's provenance
-//! and is blocked ([`ContextBlock::derive`]). What it does **not** cover is a
-//! model-generated **paraphrase of boundary content emitted in a LATER turn**:
-//! once a local model has read a secret and the operator later routes a turn to a
-//! remote provider, text the model writes from its own memory carries no file
-//! provenance, so this layer cannot recognize it. Closing that gap needs
-//! turn-to-turn taint propagation through model output (out of scope for the
-//! MVP). Until then the mitigation is routing discipline — a session that has
-//! touched `local-only` content stays on the local tier — which the router
-//! enforces above this layer.
+//! and is blocked ([`ContextBlock::derive`]). What per-request provenance cannot
+//! by itself cover is a model-generated **paraphrase of boundary content emitted
+//! in a LATER turn**: once a local model has read a secret, text it writes from
+//! its own memory carries no file provenance.
+//!
+//! The daemon closes that gap with a real **per-session taint** backstop
+//! (`crate::runtime`): once any tool result's provenance intersects a
+//! `local-only` boundary **or** is unknown, the session is marked tainted and
+//! *pinned to the local tier for every subsequent turn* — the router forces
+//! local regardless of phase policy or heuristic. And when a remote turn is
+//! blocked here mid-session, the daemon does not retry the blocked provider: it
+//! taints the session and re-runs that turn on the local tier (REQ-544 M-1),
+//! emitting exactly one `privacy_block`. So the residual paraphrase path is
+//! held local, not merely hoped about.
+//!
+//! ## Residual limits that remain
+//!
+//! A black-box MCP server that reads a boundary file via an argument that is
+//! neither a path-like key nor path-shaped (e.g. an opaque record id) still
+//! produces an under-tagged result; the taint backstop only catches it once some
+//! *other* signal (a path-shaped arg, an unknown `shell`, a boundary read) taints
+//! the session. Machines with no local tier cannot serve a tainted session at
+//! all — that turn fails closed with a specific privacy error rather than
+//! degrading the guarantee.
 
 pub mod inspector;
 pub mod provenance;
@@ -106,15 +132,18 @@ pub enum EgressError {
 impl EgressError {
     /// Collapse to a [`TransportError`] for the object-safe `Transport` seam.
     ///
-    /// A privacy block manifests to an adapter as a refusal to connect — which is
-    /// literally true, no connection is attempted — while the authoritative,
-    /// typed signal (this error) and the `privacy_block` event carry the real
-    /// reason. Adapters must not treat this as a provider fault to retry.
+    /// A privacy block manifests to an adapter as the dedicated,
+    /// **non-retryable** [`TransportError::PrivacyBlocked`] — never a
+    /// connect refusal — so it cannot be misclassified as a transient transport
+    /// fault and retried against the blocked provider (REQ-544 M-1). The
+    /// authoritative typed signal (this error) and the `privacy_block` event
+    /// carry the real reason; the daemon reroutes the turn to the local tier.
     #[must_use]
     pub fn into_transport_error(self) -> TransportError {
         match self {
             EgressError::Transport(t) => t,
-            EgressError::PrivacyBlocked { .. } | EgressError::ClientInit => TransportError::Connect,
+            EgressError::PrivacyBlocked { .. } => TransportError::PrivacyBlocked,
+            EgressError::ClientInit => TransportError::Connect,
             EgressError::BoundaryCompile => TransportError::Io,
         }
     }
@@ -548,7 +577,9 @@ mod tests {
             .execute(a_request("secret"))
             .await
             .expect_err("scoped transport must refuse");
-        assert_eq!(err, TransportError::Connect);
+        // REQ-544 M-1: a block surfaces as the dedicated, non-retryable variant,
+        // never a connect refusal.
+        assert_eq!(err, TransportError::PrivacyBlocked);
         // The event still fired even though the adapter only saw a transport error.
         assert_eq!(sink.events.lock().unwrap().len(), 1);
     }
@@ -584,13 +615,21 @@ mod tests {
     }
 
     #[test]
-    fn privacy_blocked_maps_to_a_connect_refusal_for_adapters() {
+    fn privacy_blocked_maps_to_the_dedicated_non_retryable_transport_signal() {
+        // REQ-544 M-1: a privacy block must NOT collapse into TransportError::Connect
+        // (which would be classified transient and retried); it gets its own
+        // dedicated, non-retryable variant.
         let err = EgressError::PrivacyBlocked {
             path: "secrets/x".to_owned(),
             provider_id: ProviderId::from("p"),
             action: PrivacyAction::ReroutedToLocal,
         };
-        assert_eq!(err.into_transport_error(), TransportError::Connect);
+        assert_eq!(err.into_transport_error(), TransportError::PrivacyBlocked);
+        // ClientInit is unrelated and still a connect refusal.
+        assert_eq!(
+            EgressError::ClientInit.into_transport_error(),
+            TransportError::Connect
+        );
     }
 }
 

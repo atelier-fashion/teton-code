@@ -59,8 +59,12 @@ impl Tool for ReadTool {
         let limit = opt_u64_arg(args, "limit").map_or(DEFAULT_LINE_LIMIT, |n| n as usize);
 
         let lines: Vec<&str> = contents.lines().collect();
+        // BR-1 (REQ-544 C-1): the result surfaces this file's content, so tag the
+        // outcome with the path the model gave (repo-relative, the form
+        // boundaries match against). Egress blocks a later remote turn that
+        // carries this if `raw` is under a `local-only` boundary.
         if lines.is_empty() {
-            return ToolOutcome::ok(format!("`{raw}` is empty."));
+            return ToolOutcome::ok(format!("`{raw}` is empty.")).with_paths([raw]);
         }
 
         let start = offset.saturating_sub(1).min(lines.len());
@@ -78,7 +82,7 @@ impl Tool for ReadTool {
                 end + 1
             ));
         }
-        ToolOutcome::ok(out)
+        ToolOutcome::ok(out).with_paths([raw])
     }
 }
 
@@ -132,6 +136,20 @@ mod tests {
         let ctx = ToolContext::new(&root);
         let out = ReadTool.run(&ctx, &json!({ "path": "nope.txt" }));
         assert!(out.is_error);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_successful_read_reports_the_touched_path_as_provenance() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("prov");
+        std::fs::write(root.join("secrets.env"), "API_KEY=1\n").unwrap();
+        let ctx = ToolContext::new(&root);
+        let out = ReadTool.run(&ctx, &json!({ "path": "secrets.env" }));
+        assert!(!out.is_error);
+        // REQ-544 C-1: the result is tagged with the file it read, so a later
+        // remote turn carrying it is caught at egress.
+        assert_eq!(out.provenance, ToolProvenance::path("secrets.env"));
         std::fs::remove_dir_all(&root).ok();
     }
 }

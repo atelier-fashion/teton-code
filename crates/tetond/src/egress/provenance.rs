@@ -17,15 +17,33 @@
 
 use std::collections::BTreeSet;
 
+/// The sentinel "path" reported when a request is blocked because some content
+/// carried **unknown** provenance rather than a specific boundary source.
+///
+/// A tool whose touched files cannot be determined (notably `shell`, which runs
+/// an arbitrary command) reports [`Provenance::unknown`]; the egress inspector
+/// fail-closes on it (REQ-544 C-1). The block still needs a content-free `path`
+/// for its `privacy_block` event and typed error — this is it. It is not a real
+/// repo path, and by construction leaks no file content.
+pub const UNKNOWN_PROVENANCE_PATH: &str = "<unknown-provenance>";
+
 /// The set of repo-relative source paths a piece of content was derived from.
 ///
 /// A `BTreeSet` keeps the sources ordered so that inspection and any diagnostic
 /// output are deterministic (a property the egress-capture tests rely on). Paths
 /// are stored exactly as the reader supplied them; boundary matching normalizes
 /// them (see [`crate::egress::inspector`]).
+///
+/// Beyond the known sources, provenance carries an [`unknown`](Provenance::is_unknown)
+/// bit: content the daemon *could not attribute to a specific file set* (a
+/// `shell` result, say). Unknown provenance is **fail-closed** at egress — when
+/// any boundary is configured it is blocked exactly like a boundary hit, because
+/// the daemon cannot prove the content is boundary-free (REQ-544 C-1).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Provenance {
     sources: BTreeSet<String>,
+    /// Some contributing content had indeterminate origin: block fail-closed.
+    unknown: bool,
 }
 
 impl Provenance {
@@ -36,6 +54,7 @@ impl Provenance {
     pub fn empty() -> Self {
         Self {
             sources: BTreeSet::new(),
+            unknown: false,
         }
     }
 
@@ -44,13 +63,43 @@ impl Provenance {
     pub fn tainted_by(path: impl Into<String>) -> Self {
         let mut sources = BTreeSet::new();
         sources.insert(path.into());
-        Self { sources }
+        Self {
+            sources,
+            unknown: false,
+        }
     }
 
-    /// Whether this provenance has no sources.
+    /// Provenance for content whose origin cannot be determined — fail-closed.
+    ///
+    /// Egress treats this exactly like a boundary hit whenever any boundary is
+    /// configured (REQ-544 C-1): the daemon cannot prove the content is
+    /// boundary-free, so it refuses to send it remotely.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            sources: BTreeSet::new(),
+            unknown: true,
+        }
+    }
+
+    /// Mark this provenance as carrying content of indeterminate origin.
+    pub fn mark_unknown(&mut self) {
+        self.unknown = true;
+    }
+
+    /// Whether any contributing content had indeterminate origin (fail-closed).
+    #[must_use]
+    pub fn is_unknown(&self) -> bool {
+        self.unknown
+    }
+
+    /// Whether this provenance has no sources **and** is not unknown — i.e.
+    /// content that can carry no boundary material and needs no inspection. An
+    /// unknown provenance is deliberately *not* empty, so egress still inspects
+    /// (and fail-closes on) it.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sources.is_empty()
+        self.sources.is_empty() && !self.unknown
     }
 
     /// The source paths, in deterministic (sorted) order.
@@ -70,11 +119,14 @@ impl Provenance {
         self.sources.len()
     }
 
-    /// Fold `other`'s sources into this provenance in place.
+    /// Fold `other`'s sources (and its unknown bit) into this provenance in
+    /// place. Unknown is monotonic: once any contributor is unknown, the union is
+    /// unknown (fail-closed).
     pub fn merge(&mut self, other: &Provenance) {
         for s in &other.sources {
             self.sources.insert(s.clone());
         }
+        self.unknown |= other.unknown;
     }
 
     /// Consume two provenances into their union.
@@ -256,5 +308,38 @@ mod tests {
             ContextBlock::synthetic("developer"),
         ];
         assert!(assembled_provenance(&blocks).is_empty());
+    }
+
+    #[test]
+    fn unknown_provenance_is_not_empty_so_egress_still_inspects_it() {
+        // REQ-544 C-1: content of indeterminate origin (a shell result) must be
+        // inspected, not skipped — so `is_empty()` is false and `is_unknown()`
+        // is true.
+        let p = Provenance::unknown();
+        assert!(!p.is_empty(), "unknown provenance must not read as empty");
+        assert!(p.is_unknown());
+        assert_eq!(p.len(), 0, "unknown carries no specific sources");
+    }
+
+    #[test]
+    fn unknown_is_monotonic_under_merge() {
+        // Once any contributor is unknown, the union stays unknown (fail-closed).
+        let mut p = Provenance::tainted_by("src/main.rs");
+        assert!(!p.is_unknown());
+        p.merge(&Provenance::unknown());
+        assert!(p.is_unknown());
+        assert!(p.contains("src/main.rs"), "known sources are retained");
+        // Merging a clean provenance never clears the unknown bit.
+        p.merge(&Provenance::tainted_by("README.md"));
+        assert!(p.is_unknown());
+    }
+
+    #[test]
+    fn mark_unknown_flips_the_bit_in_place() {
+        let mut p = Provenance::empty();
+        assert!(p.is_empty());
+        p.mark_unknown();
+        assert!(p.is_unknown());
+        assert!(!p.is_empty());
     }
 }

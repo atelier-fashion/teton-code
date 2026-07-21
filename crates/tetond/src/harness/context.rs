@@ -17,12 +17,56 @@
 //! local-only path the hook is a no-op ([`NoopProvenanceHook`]) — there is no
 //! egress to guard.
 
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use teton_inference::{Engine, GenParams};
 
+/// The egress provenance of a tool result — the files a tool actually touched,
+/// or an explicit "cannot tell" state (REQ-544 C-1).
+///
+/// This is what makes BR-1 enforcement honest for tools beyond `read`: a tool
+/// reports the repo-relative paths it read/enumerated ([`ToolProvenance::Sources`]),
+/// or, when its touched files are unknowable (a `shell` command runs arbitrary
+/// code), it reports [`ToolProvenance::Unknown`], which egress fail-closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolProvenance {
+    /// The tool surfaced content derived from these repo-relative paths. An empty
+    /// set means it touched no repo file (a pure computation, a benign status).
+    Sources(BTreeSet<String>),
+    /// The tool's touched files cannot be determined (e.g. `shell`): fail-closed
+    /// at egress whenever any boundary is configured.
+    Unknown,
+}
+
+impl ToolProvenance {
+    /// No file provenance — content from no repo file.
+    #[must_use]
+    pub fn none() -> Self {
+        ToolProvenance::Sources(BTreeSet::new())
+    }
+
+    /// Provenance for a single touched `path`.
+    #[must_use]
+    pub fn path(path: impl Into<String>) -> Self {
+        let mut set = BTreeSet::new();
+        set.insert(path.into());
+        ToolProvenance::Sources(set)
+    }
+
+    /// Provenance for a set of touched paths.
+    #[must_use]
+    pub fn paths<I, S>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        ToolProvenance::Sources(paths.into_iter().map(Into::into).collect())
+    }
+}
+
 /// Where a piece of context came from — the basis for egress provenance tagging
-/// (BR-1, enforced by TASK-007).
+/// (BR-1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provenance {
     /// The daemon's own instructions.
@@ -31,13 +75,14 @@ pub enum Provenance {
     User,
     /// Model-generated text (assistant turn).
     Model,
-    /// A tool result. `path` is set when the result came from a specific file, so
-    /// egress can match it against a privacy boundary.
+    /// A tool result, tagged with the [`ToolProvenance`] of the files the tool
+    /// touched so egress can match them against a privacy boundary (or
+    /// fail-close on an unknown-provenance result).
     Tool {
         /// Tool that produced the result.
         tool: String,
-        /// Repo-relative path the result concerns, when applicable.
-        path: Option<String>,
+        /// The files the tool touched (or `Unknown`).
+        provenance: ToolProvenance,
     },
 }
 
@@ -148,19 +193,37 @@ impl ContextManager {
         });
     }
 
-    /// Append a tool result, tagged with the tool and (optionally) the file it
-    /// concerns.
+    /// Append a tool result, tagged with the tool and (optionally) the single
+    /// file it concerns. A convenience over [`ContextManager::push_tool_result_prov`]:
+    /// `None` → no file provenance, `Some(p)` → the single touched path `p`.
     pub fn push_tool_result(
         &mut self,
         tool: impl Into<String>,
         path: Option<String>,
         text: impl Into<String>,
     ) {
+        let provenance = match path {
+            Some(p) => ToolProvenance::path(p),
+            None => ToolProvenance::none(),
+        };
+        self.push_tool_result_prov(tool, provenance, text);
+    }
+
+    /// Append a tool result tagged with its full [`ToolProvenance`] — the set of
+    /// files the tool touched, or [`ToolProvenance::Unknown`] (REQ-544 C-1). This
+    /// is the loop's tagging path: a `shell` result folds in as `Unknown`, a
+    /// `grep`/`glob`/MCP result as the set of files it surfaced.
+    pub fn push_tool_result_prov(
+        &mut self,
+        tool: impl Into<String>,
+        provenance: ToolProvenance,
+        text: impl Into<String>,
+    ) {
         let tool = tool.into();
         self.blocks.push(ContextBlock {
             role: BlockRole::Tool,
             text: text.into(),
-            provenance: Provenance::Tool { tool, path },
+            provenance: Provenance::Tool { tool, provenance },
         });
     }
 
@@ -294,9 +357,24 @@ mod tests {
             hook.seen[3],
             Provenance::Tool {
                 tool: "read".to_owned(),
-                path: Some("a.rs".to_owned())
+                provenance: ToolProvenance::path("a.rs"),
             }
         );
+    }
+
+    #[test]
+    fn push_tool_result_prov_carries_unknown_provenance() {
+        // REQ-544 C-1: a shell-shaped result folds in as Unknown, distinct from
+        // the "no sources" state a benign result carries.
+        let mut ctx = ContextManager::new("sys", 10_000);
+        ctx.push_tool_result_prov("shell", ToolProvenance::Unknown, "ran a command");
+        match &ctx.blocks()[0].provenance {
+            Provenance::Tool { tool, provenance } => {
+                assert_eq!(tool, "shell");
+                assert_eq!(provenance, &ToolProvenance::Unknown);
+            }
+            other => panic!("expected a tool block, got {other:?}"),
+        }
     }
 
     #[test]

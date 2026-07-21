@@ -39,7 +39,7 @@ pub use completion::{
 };
 pub use context::{
     ContextBlock, ContextManager, NoopProvenanceHook, Provenance, ProvenanceHook,
-    RecordingProvenanceHook,
+    RecordingProvenanceHook, ToolProvenance,
 };
 pub use permissions::{
     PendingPermissions, PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,

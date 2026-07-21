@@ -263,6 +263,15 @@ pub enum ProviderError {
     /// has no [`FailureClass`].
     #[error("failed to build provider request: {0}")]
     Build(String),
+    /// The egress choke point refused the call because its content provenance
+    /// intersected a `local-only` privacy boundary (BR-1). This is **not** a
+    /// provider fault and is deliberately non-retryable: the authoritative
+    /// `privacy_block` event already fired at the choke point, and the daemon
+    /// must reroute the turn to the local tier rather than retry the blocked
+    /// provider (REQ-544 M-1). It has no [`FailureClass`] because it is not a
+    /// failure the retry/fallback/degrade machinery should ever act on.
+    #[error("egress refused: content is under a local-only privacy boundary")]
+    PrivacyBlocked,
 }
 
 impl ProviderError {
@@ -277,8 +286,19 @@ impl ProviderError {
             ProviderError::ServerError { status } => FailureClass::ServerError { status: *status },
             ProviderError::MalformedResponse => FailureClass::MalformedResponse,
             ProviderError::MalformedToolCall { .. } => FailureClass::MalformedToolCall,
-            ProviderError::Build(_) => return None,
+            // A privacy block is not a provider failure and must never be
+            // retried/fallen-back-on: the daemon handles it out-of-band by
+            // rerouting to the local tier (REQ-544 M-1).
+            ProviderError::Build(_) | ProviderError::PrivacyBlocked => return None,
         })
+    }
+
+    /// Whether this error is an egress privacy block (BR-1) — a distinct,
+    /// non-retryable signal the daemon reroutes to the local tier rather than
+    /// retrying the blocked provider (REQ-544 M-1).
+    #[must_use]
+    pub fn is_privacy_blocked(&self) -> bool {
+        matches!(self, ProviderError::PrivacyBlocked)
     }
 
     /// The retry / fallback / degrade decision for this error, or `None` for a
@@ -293,6 +313,9 @@ impl ProviderError {
         match err {
             TransportError::Timeout => ProviderError::Timeout,
             TransportError::Connect | TransportError::Io => ProviderError::Transport,
+            // Preserve the privacy-block signal end to end: it must NOT collapse
+            // into the retryable transport class (REQ-544 M-1).
+            TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
         }
     }
 }
@@ -368,6 +391,20 @@ mod tests {
         // Build is a local error, not a provider failure.
         assert_eq!(ProviderError::Build("x".into()).failure_class(), None);
         assert_eq!(ProviderError::Build("x".into()).decision(), None);
+    }
+
+    #[test]
+    fn privacy_block_is_a_distinct_non_retryable_signal() {
+        // REQ-544 M-1: a privacy block must NOT collapse into the retryable
+        // transport class, and it carries no FailureClass (the daemon reroutes to
+        // local out-of-band rather than retrying/falling back).
+        let err = ProviderError::from_transport(TransportError::PrivacyBlocked);
+        assert_eq!(err, ProviderError::PrivacyBlocked);
+        assert!(err.is_privacy_blocked());
+        assert_eq!(err.failure_class(), None);
+        assert_eq!(err.decision(), None);
+        // The other transport errors are unchanged.
+        assert!(!ProviderError::from_transport(TransportError::Connect).is_privacy_blocked());
     }
 
     #[test]

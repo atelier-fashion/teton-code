@@ -30,10 +30,12 @@
 //! weights itself); they exist so the whole daemon can be exercised end to end
 //! against mocks.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use teton_core::boundary::BoundaryMatcher;
 use teton_core::config::Config;
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind, RoutingPolicy,
@@ -45,7 +47,7 @@ use teton_inference::catalog::Catalog;
 use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GIB};
 use teton_inference::{Completion, Engine, EngineError, GenParams};
 
-use teton_protocol::events::{ModelLifecycle, ModelLifecycleStage};
+use teton_protocol::events::{ModelLifecycle, ModelLifecycleStage, PrivacyAction};
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     ConfigSnapshot, ConfigUpdate, CostGroupView, CostQueryResult, CostReportView,
@@ -62,8 +64,8 @@ use teton_providers::{
 
 use crate::broadcast::EventBus;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
-use crate::egress::{Egress, HttpTransport};
-use crate::harness::completion::RemoteProviderSource;
+use crate::egress::{inspect, Egress, HttpTransport};
+use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
@@ -150,6 +152,49 @@ impl Engine for ScriptedFileEngine {
     }
 }
 
+/// Per-session privacy taint — the BR-1 backstop (REQ-544 C-2).
+///
+/// Once any tool result's provenance intersects a `local-only` boundary **or** is
+/// unknown (a `shell` result), the session is marked tainted and pinned to the
+/// local tier for every subsequent turn: the daemon consults this before
+/// resolving a route and forces local regardless of phase policy or heuristic.
+/// This is what catches the residual the per-request provenance check cannot — a
+/// model paraphrasing boundary content it read on an earlier turn — because the
+/// whole session is held local once it has seen boundary/unknown content. Shared
+/// across turns via the [`DaemonRuntime`] `Arc`, so the pin lives as long as the
+/// session (BR-4).
+#[derive(Debug, Default)]
+pub struct SessionTaint {
+    tainted: Mutex<HashSet<SessionId>>,
+}
+
+impl SessionTaint {
+    /// An empty taint set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark `session` tainted — pinned to the local tier for all later turns
+    /// (idempotent).
+    pub fn mark(&self, session: &SessionId) {
+        self.tainted
+            .lock()
+            .expect("taint mutex poisoned")
+            .insert(session.clone());
+    }
+
+    /// Whether `session` is pinned to the local tier by a prior boundary/unknown
+    /// exposure.
+    #[must_use]
+    pub fn is_tainted(&self, session: &SessionId) -> bool {
+        self.tainted
+            .lock()
+            .expect("taint mutex poisoned")
+            .contains(session)
+    }
+}
+
 /// The assembled daemon runtime shared by every client task.
 pub struct DaemonRuntime {
     /// The live configuration (providers, routing, boundaries). Mutated by
@@ -178,6 +223,9 @@ pub struct DaemonRuntime {
     lifecycle: Vec<ModelLifecycle>,
     /// Monotonic turn-id source.
     turn_counter: AtomicU64,
+    /// Per-session privacy taint: sessions pinned to the local tier because their
+    /// context touched `local-only` or unknown-provenance content (REQ-544 C-2).
+    session_taint: SessionTaint,
 }
 
 impl DaemonRuntime {
@@ -201,6 +249,7 @@ impl DaemonRuntime {
             mcp_servers: Vec::new(),
             lifecycle: Vec::new(),
             turn_counter: AtomicU64::new(0),
+            session_taint: SessionTaint::new(),
         }
     }
 
@@ -252,6 +301,7 @@ impl DaemonRuntime {
             mcp_servers,
             lifecycle: probe.lifecycle,
             turn_counter: AtomicU64::new(0),
+            session_taint: SessionTaint::new(),
         })
     }
 
@@ -339,13 +389,24 @@ impl DaemonRuntime {
 
         // Resolve the initial route (BR-5): structured -> phase policy; freeform
         // -> heuristic. Emitting `route_decided` is the legibility promise.
+        //
+        // REQ-544 C-2: a session tainted by earlier boundary/unknown exposure is
+        // pinned to the local tier for every subsequent turn — the router forces
+        // local regardless of phase policy or heuristic. This is the backstop for
+        // the model-paraphrase residual BR-1 provenance alone cannot catch.
         let core_phase = phase.map(to_core_phase);
-        let mut route = match mode {
-            SessionMode::Structured => {
-                let ph = core_phase.unwrap_or(CorePhase::Implement);
-                router.resolve_structured(ph)
+        let mut route = if self.session_taint.is_tainted(&session_id) {
+            router.resolve_local_pin(
+                "session previously touched local-only content; pinned to the local tier (BR-1 backstop)",
+            )
+        } else {
+            match mode {
+                SessionMode::Structured => {
+                    let ph = core_phase.unwrap_or(CorePhase::Implement);
+                    router.resolve_structured(ph)
+                }
+                SessionMode::Freeform => router.resolve_freeform(&prompt),
             }
-            SessionMode::Freeform => router.resolve_freeform(&prompt),
         };
 
         // Assemble the harness context, tools, and the permission gate once; a
@@ -365,6 +426,7 @@ impl DaemonRuntime {
         ctx.push_user(prompt);
 
         let mut attempts = 0u32;
+        let mut rerouted_local = false;
         loop {
             router.emit_route_decided(events, Some(session_id.clone()), &route);
             let provider_id = route.provider_id.clone();
@@ -384,8 +446,50 @@ impl DaemonRuntime {
                 )
                 .await;
 
+            // REQ-544 M-1: a privacy block is NOT a transient failure. It must
+            // never be retried against the blocked provider (which would emit
+            // duplicate `privacy_block` events and never reroute). Taint the
+            // session and re-run this same turn on the local tier — reusing the
+            // C-2 taint→local mechanism — so there is exactly one block event and
+            // one reroute. The egress choke point already emitted the single
+            // authoritative `privacy_block`.
+            if let Err(err) = &result {
+                if err.is_privacy_block() {
+                    self.session_taint.mark(&session_id);
+                    if self.engine.is_none() {
+                        return Err(RpcError::new(
+                            error_code::PRIVACY_BLOCKED,
+                            "this turn's content is under a local-only privacy boundary \
+                             and no local tier is available to serve it",
+                        ));
+                    }
+                    if rerouted_local {
+                        // Already rerouted to local (which has no egress and so
+                        // cannot privacy-block) — never loop.
+                        return Err(RpcError::new(
+                            error_code::PRIVACY_BLOCKED,
+                            "privacy boundary blocked this turn and the local reroute \
+                             could not serve it",
+                        ));
+                    }
+                    route = router.resolve_local_pin(
+                        "remote egress blocked by a local-only boundary; rerouted to the \
+                         local tier (BR-1)",
+                    );
+                    rerouted_local = true;
+                    continue;
+                }
+            }
+
             match result {
                 Ok(outcome) => {
+                    // REQ-544 C-2: if this turn's context intersects a local-only
+                    // boundary or carries unknown provenance, pin the session to
+                    // the local tier for every subsequent turn (the backstop for
+                    // a later model paraphrase of what it read here).
+                    if context_is_sensitive(&ctx, &config.boundaries) {
+                        self.session_taint.mark(&session_id);
+                    }
                     return Ok(PromptTurnResult {
                         turn_id,
                         stop_reason: outcome.stop_reason,
@@ -817,6 +921,27 @@ fn build_router(config: &Config, local_available: bool, prices: &PriceTable) -> 
     router
 }
 
+/// Whether the assembled context in `ctx` carries content that must pin the
+/// session to the local tier (REQ-544 C-2): its egress provenance intersects a
+/// `local-only` boundary, or it carries unknown provenance (a `shell` result).
+///
+/// With no boundaries configured, nothing is sensitive — there is nothing to
+/// protect. Boundaries that fail to compile fail-closed (treated as sensitive),
+/// the same posture the egress choke point takes.
+fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBoundary]) -> bool {
+    if boundaries.is_empty() {
+        return false;
+    }
+    let provenance = context_provenance(ctx);
+    if provenance.is_empty() {
+        return false;
+    }
+    match BoundaryMatcher::new(boundaries) {
+        Ok(matcher) => inspect(&provenance, &matcher, PrivacyAction::ReroutedToLocal).is_blocked(),
+        Err(_) => true,
+    }
+}
+
 /// The model name a provider is billed under: the first price-table entry for
 /// that provider id, or the provider id itself when the table knows no model for
 /// it (an unpriced provider, recorded but never guessed a cost, BR-2).
@@ -1103,5 +1228,45 @@ mod tests {
         let catalog = Catalog::bundled();
         let decision = decide(&profile, &catalog, None);
         assert!(decision.is_disabled());
+    }
+
+    #[test]
+    fn session_taint_pins_a_session_idempotently() {
+        // REQ-544 C-2: once marked, a session stays tainted; other sessions are
+        // unaffected.
+        let taint = SessionTaint::new();
+        let s = SessionId::from("s1");
+        assert!(!taint.is_tainted(&s));
+        taint.mark(&s);
+        taint.mark(&s); // idempotent
+        assert!(taint.is_tainted(&s));
+        assert!(!taint.is_tainted(&SessionId::from("other")));
+    }
+
+    #[test]
+    fn context_sensitivity_flags_boundary_and_unknown_but_not_public() {
+        use crate::harness::context::ToolProvenance;
+        let boundaries = vec![PrivacyBoundary {
+            path_glob: "secrets/**".to_owned(),
+            mode: BoundaryMode::LocalOnly,
+        }];
+
+        // A read of a boundary file taints (REQ-544 C-2).
+        let mut ctx = ContextManager::new("sys", 10_000);
+        ctx.push_tool_result("read", Some("secrets/prod.env".to_owned()), "API_KEY=1");
+        assert!(context_is_sensitive(&ctx, &boundaries));
+
+        // An unknown-provenance shell result taints even with no boundary path.
+        let mut ctx_shell = ContextManager::new("sys", 10_000);
+        ctx_shell.push_tool_result_prov("shell", ToolProvenance::Unknown, "cmd output");
+        assert!(context_is_sensitive(&ctx_shell, &boundaries));
+
+        // A public-only context does not taint.
+        let mut ctx_public = ContextManager::new("sys", 10_000);
+        ctx_public.push_tool_result("read", Some("src/lib.rs".to_owned()), "code");
+        assert!(!context_is_sensitive(&ctx_public, &boundaries));
+
+        // With no boundaries configured, nothing is sensitive.
+        assert!(!context_is_sensitive(&ctx, &[]));
     }
 }

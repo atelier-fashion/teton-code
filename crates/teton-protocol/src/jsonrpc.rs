@@ -216,6 +216,11 @@ pub mod error_code {
     pub const UNKNOWN_PROVIDER: i64 = -32002;
     /// A configuration mutation was rejected (e.g. a raw key in `auth_ref`, BR-7).
     pub const CONFIG_REJECTED: i64 = -32003;
+    /// A turn could not complete because its content is under a `local-only`
+    /// privacy boundary (BR-1) and no local tier was available to serve it after
+    /// the remote egress was blocked (REQ-544 M-1). A specific, content-free
+    /// privacy signal — never a generic `INTERNAL_ERROR`.
+    pub const PRIVACY_BLOCKED: i64 = -32004;
 }
 
 #[cfg(test)]
@@ -301,6 +306,7 @@ mod tests {
             error_code::UNKNOWN_SESSION,
             error_code::UNKNOWN_PROVIDER,
             error_code::CONFIG_REJECTED,
+            error_code::PRIVACY_BLOCKED,
         ] {
             assert!(code <= error_code::SERVER_ERROR_START);
             assert!(code > -32100);

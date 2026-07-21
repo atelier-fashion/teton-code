@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use super::context::ToolProvenance;
+
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -107,35 +109,69 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// The result of running a tool: text folded back into the model's context, plus
-/// a flag distinguishing a failure from a success.
+/// The result of running a tool: text folded back into the model's context, a
+/// flag distinguishing a failure from a success, and the egress
+/// [`ToolProvenance`] of the files the tool touched (REQ-544 C-1).
 ///
 /// A failed tool call is a first-class outcome, not an exception: the loop folds
 /// `content` into context so the model can react. `is_error` lets the loop mark
 /// it visibly (and lets a verification step tell a real failure from a pass).
+/// `provenance` is what the loop stamps onto the context block so BR-1 egress
+/// enforcement sees the files a tool *actually* touched — the `read` path,
+/// `grep`/`glob`'s surfaced files, an MCP call's path arguments — or
+/// [`ToolProvenance::Unknown`] for `shell`, whose touched files are unknowable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
     /// Text shown to the model as the tool result.
     pub content: String,
     /// Whether the call failed (rejected edit, jail violation, timeout, …).
     pub is_error: bool,
+    /// The files this result was derived from (or `Unknown`). Defaults to no
+    /// provenance for tools that surface no repo-file content.
+    pub provenance: ToolProvenance,
 }
 
 impl ToolOutcome {
-    /// A successful outcome.
+    /// A successful outcome with no file provenance.
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: false,
+            provenance: ToolProvenance::none(),
         }
     }
 
-    /// A failed outcome the model must see and react to.
+    /// A failed outcome the model must see and react to (no file provenance).
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: true,
+            provenance: ToolProvenance::none(),
         }
+    }
+
+    /// Tag this outcome with the [`ToolProvenance`] of the files it touched.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: ToolProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    /// Tag this outcome with the set of repo-relative `paths` it read/enumerated.
+    #[must_use]
+    pub fn with_paths<I, S>(self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.with_provenance(ToolProvenance::paths(paths))
+    }
+
+    /// Tag this outcome as having indeterminate provenance (fail-closed at
+    /// egress) — the `shell` tool, whose touched files cannot be parsed.
+    #[must_use]
+    pub fn with_unknown_provenance(self) -> Self {
+        self.with_provenance(ToolProvenance::Unknown)
     }
 }
 

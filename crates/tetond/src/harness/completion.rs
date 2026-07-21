@@ -39,7 +39,7 @@ use teton_providers::{
 use crate::cost::CostAttribution;
 use crate::egress::{Egress, EgressContext, Provenance};
 
-use super::context::{ContextManager, Provenance as CtxProvenance};
+use super::context::{ContextManager, Provenance as CtxProvenance, ToolProvenance};
 use super::tools::ToolRegistry;
 use super::turn_loop::{parse_turn, HarnessConfig, HarnessError, ParsedTurn};
 
@@ -280,22 +280,28 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
 }
 
 /// The egress [`Provenance`] of the context currently assembled in `ctx`: the
-/// union of the source paths of every tool result it holds.
+/// union of every tool result's [`ToolProvenance`].
 ///
-/// This is the loop → egress bridge for BR-1. A tool result tagged with a file
-/// path (a `read` of that file, say) contributes that path; system/user/model
-/// blocks carry no file provenance. The remote source hands the result to
-/// [`Egress::scoped`], so a turn whose context touched a `local-only` file is
+/// This is the loop → egress bridge for BR-1 (REQ-544 C-1). A tool result tagged
+/// with the files it touched contributes those paths; a result with UNKNOWN
+/// provenance (a `shell` command) makes the whole context's provenance unknown,
+/// which egress fail-closes; system/user/model blocks carry no file provenance.
+/// The remote source hands the result to [`Egress::scoped`], so a turn whose
+/// context touched a `local-only` file — or ran an unparseable shell command — is
 /// blocked before a byte leaves.
 #[must_use]
 pub fn context_provenance(ctx: &ContextManager) -> Provenance {
     let mut prov = Provenance::empty();
     for block in ctx.blocks() {
-        if let CtxProvenance::Tool {
-            path: Some(path), ..
-        } = &block.provenance
-        {
-            prov.merge(&Provenance::tainted_by(path.clone()));
+        if let CtxProvenance::Tool { provenance, .. } = &block.provenance {
+            match provenance {
+                ToolProvenance::Sources(paths) => {
+                    for path in paths {
+                        prov.merge(&Provenance::tainted_by(path.clone()));
+                    }
+                }
+                ToolProvenance::Unknown => prov.mark_unknown(),
+            }
         }
     }
     prov
@@ -340,13 +346,37 @@ mod tests {
         ctx.push_model("{\"tool\":\"read\"}");
         ctx.push_tool_result("read", Some("src/lib.rs".to_owned()), "code");
         ctx.push_tool_result("read", Some("secrets/prod.env".to_owned()), "API_KEY=1");
-        // A tool result with no path (e.g. a shell command) contributes nothing.
+        // A tool result with no touched files (e.g. a benign status) contributes
+        // nothing and is not unknown.
         ctx.push_tool_result("shell", None, "ok");
 
         let prov = context_provenance(&ctx);
         assert_eq!(prov.len(), 2);
         assert!(prov.contains("src/lib.rs"));
         assert!(prov.contains("secrets/prod.env"));
+        assert!(!prov.is_unknown());
+    }
+
+    #[test]
+    fn context_provenance_is_unknown_when_any_result_is_unknown() {
+        // REQ-544 C-1: a `shell` result folds in as UNKNOWN, which makes the whole
+        // context's provenance unknown → egress fail-closes on it.
+        let mut ctx = ContextManager::new("system", 10_000);
+        ctx.push_tool_result("read", Some("src/lib.rs".to_owned()), "code");
+        ctx.push_tool_result_prov(
+            "shell",
+            ToolProvenance::Unknown,
+            "cat secrets/prod.env output",
+        );
+
+        let prov = context_provenance(&ctx);
+        assert!(
+            prov.is_unknown(),
+            "an unknown result must taint the context"
+        );
+        assert!(!prov.is_empty(), "unknown provenance is never empty");
+        // Known sources are still carried alongside the unknown bit.
+        assert!(prov.contains("src/lib.rs"));
     }
 
     #[test]

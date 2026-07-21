@@ -63,7 +63,10 @@ impl Tool for GlobTool {
         if truncated {
             out.push_str(&format!("\n... (capped at {MAX_RESULTS} results)"));
         }
-        ToolOutcome::ok(out)
+        // REQ-544 C-1: the enumerated files ARE the result's content, so tag the
+        // outcome with them — a glob that surfaces a `local-only` file blocks the
+        // next remote turn at egress.
+        ToolOutcome::ok(out).with_paths(matches)
     }
 }
 
@@ -179,6 +182,24 @@ mod tests {
         let out = GlobTool.run(&ctx, &json!({ "pattern": "*.zzz" }));
         assert!(!out.is_error);
         assert!(out.content.contains("no files match"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn provenance_is_the_set_of_enumerated_files() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("prov");
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/prod.env"), "API_KEY=1\n").unwrap();
+        std::fs::write(root.join("secrets/dev.env"), "API_KEY=2\n").unwrap();
+        let ctx = ToolContext::new(&root);
+        // REQ-544 C-1: enumerating boundary files tags the result with them.
+        let out = GlobTool.run(&ctx, &json!({ "pattern": "secrets/**" }));
+        assert!(!out.is_error);
+        assert_eq!(
+            out.provenance,
+            ToolProvenance::paths(["secrets/dev.env", "secrets/prod.env"])
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

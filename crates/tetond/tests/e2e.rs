@@ -17,3 +17,5 @@
 mod ac_matrix;
 #[path = "e2e/harness.rs"]
 mod harness;
+#[path = "e2e/privacy_fixes.rs"]
+mod privacy_fixes;

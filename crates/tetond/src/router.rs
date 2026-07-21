@@ -275,6 +275,29 @@ impl Router {
         }
     }
 
+    /// Force a route to the **local tier**, ignoring phase policy and heuristics
+    /// entirely (REQ-544 C-2 / M-1).
+    ///
+    /// This is the taint backstop for BR-1: a session whose context has touched
+    /// `local-only` content — or an unknown-provenance `shell` result — is pinned
+    /// here for every subsequent turn, and a remote turn blocked at egress is
+    /// re-run here rather than retried. Privacy trumps latency, so this pins local
+    /// even when the local tier is latency-degraded; the caller checks whether a
+    /// local engine actually exists (a remote-only machine cannot serve a tainted
+    /// session and fails closed instead).
+    #[must_use]
+    pub fn resolve_local_pin(&self, reason: impl Into<String>) -> Route {
+        let provider = self.local_provider.clone();
+        Route {
+            model: self.model_of(&provider),
+            harness: self.harness_config_for(&provider),
+            provider_id: Some(ProviderId::from(provider)),
+            phase: None,
+            reason: reason.into(),
+            outcome: RouteOutcome::Fallback,
+        }
+    }
+
     /// Handle a mid-session provider failure (AC-7).
     ///
     /// Classifies `class` ([`teton_providers::classify`]) and:
@@ -593,6 +616,27 @@ mod tests {
         assert_eq!(route.provider_id.as_ref().unwrap().0, "deepseek");
         assert!(route.phase.is_none());
         assert!(route.turn_route().is_some());
+    }
+
+    #[test]
+    fn local_pin_forces_the_local_tier_regardless_of_policy() {
+        // REQ-544 C-2 / M-1: the taint backstop pins a session to the local tier,
+        // naming a legible reason — independent of any phase policy that would
+        // otherwise route remote.
+        let route = router().resolve_local_pin("session touched local-only content");
+        assert_eq!(route.provider_id.as_ref().unwrap().0, "local");
+        assert!(route.phase.is_none());
+        assert_eq!(route.outcome, RouteOutcome::Fallback);
+        assert!(route.reason.contains("local-only"));
+        // The Spec phase policy would normally route to anthropic — the pin wins.
+        assert_ne!(
+            route.provider_id.as_ref().unwrap().0,
+            router()
+                .resolve_structured(CorePhase::Spec)
+                .provider_id
+                .unwrap()
+                .0
+        );
     }
 
     #[test]

@@ -74,6 +74,15 @@ pub enum TransportError {
     /// A lower-level I/O error while reading the stream.
     #[error("transport I/O error")]
     Io,
+    /// The egress choke point refused the request because its content provenance
+    /// intersected a `local-only` privacy boundary (BR-1). This is **not** a
+    /// network fault and must never be retried: no connection was attempted, and
+    /// the authoritative `privacy_block` event has already fired at the choke
+    /// point. Distinct from [`TransportError::Connect`] precisely so the daemon
+    /// can reroute the turn to the local tier rather than retry the blocked
+    /// provider (REQ-544 M-1).
+    #[error("egress refused: content is under a local-only privacy boundary")]
+    PrivacyBlocked,
 }
 
 /// The one seam through which adapters reach the network (D-2). Implemented by

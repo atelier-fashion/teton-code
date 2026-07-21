@@ -7,6 +7,7 @@
 //! `path:line: text`, capped for a small model's context.
 
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use super::glob::glob_match;
@@ -70,6 +71,11 @@ impl Tool for GrepTool {
         };
 
         let mut hits = Vec::new();
+        // REQ-544 C-1: the files whose *content* appears in the output. Only
+        // matched files surface content into context, so those are the paths the
+        // result's egress provenance must carry (a file that was scanned but had
+        // no match contributes nothing and is not tagged).
+        let mut matched_files = BTreeSet::new();
         search(
             &root,
             &root,
@@ -77,6 +83,7 @@ impl Tool for GrepTool {
             ignore_case,
             file_glob.as_deref(),
             &mut hits,
+            &mut matched_files,
         );
 
         if hits.is_empty() {
@@ -88,11 +95,14 @@ impl Tool for GrepTool {
         if truncated {
             out.push_str(&format!("\n... (capped at {MAX_MATCHES} matches)"));
         }
-        ToolOutcome::ok(out)
+        ToolOutcome::ok(out).with_paths(matched_files)
     }
 }
 
-/// Recursively search text files under `dir`.
+/// Recursively search text files under `dir`. `matched` accumulates the
+/// repo-relative paths of every file that produced at least one hit — the egress
+/// provenance of the result (REQ-544 C-1).
+#[allow(clippy::too_many_arguments)]
 fn search(
     root: &Path,
     dir: &Path,
@@ -100,6 +110,7 @@ fn search(
     ignore_case: bool,
     file_glob: Option<&str>,
     out: &mut Vec<String>,
+    matched: &mut BTreeSet<String>,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -120,7 +131,7 @@ fn search(
             if SKIP_DIRS.contains(&name.as_ref()) {
                 continue;
             }
-            search(root, &path, needle, ignore_case, file_glob, out);
+            search(root, &path, needle, ignore_case, file_glob, out, matched);
             continue;
         }
         let rel = match path.strip_prefix(root) {
@@ -145,6 +156,7 @@ fn search(
                 line.to_owned()
             };
             if haystack.contains(needle) {
+                matched.insert(rel.clone());
                 out.push(format!("{rel}:{}: {}", i + 1, line.trim_end()));
                 if out.len() > MAX_MATCHES {
                     return;
@@ -206,6 +218,22 @@ mod tests {
         let out = GrepTool.run(&ctx, &json!({ "pattern": "TODO", "glob": "**/*.rs" }));
         assert!(out.content.contains("a.rs"));
         assert!(!out.content.contains("b.txt"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn provenance_is_the_set_of_matched_files_only() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("prov");
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/prod.env"), "API_KEY=sk-live\n").unwrap();
+        std::fs::write(root.join("public.rs"), "// nothing to see\n").unwrap();
+        let ctx = ToolContext::new(&root);
+        // REQ-544 C-1: a grep whose only match is in a boundary file tags the
+        // result with that file — so the next remote turn is blocked at egress.
+        let out = GrepTool.run(&ctx, &json!({ "pattern": "sk-live" }));
+        assert!(!out.is_error);
+        assert_eq!(out.provenance, ToolProvenance::path("secrets/prod.env"));
         std::fs::remove_dir_all(&root).ok();
     }
 }

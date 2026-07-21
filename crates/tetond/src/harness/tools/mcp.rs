@@ -35,6 +35,7 @@ use tokio::runtime::Handle;
 
 use super::{Tool, ToolContext, ToolOutcome, ToolRegistry};
 use crate::egress::ContextBlock;
+use crate::harness::context::ToolProvenance;
 use crate::mcp::{
     call_provenance, parse_namespaced_tool_name, DiscoveredTool, McpRegistry, McpToolResult,
 };
@@ -140,19 +141,38 @@ impl Tool for McpToolHandle {
         let name = self.namespaced_name.clone();
         let args = args.clone();
         let registry = Arc::clone(&self.registry);
+        // REQ-544 C-1: a local MCP server may read a `local-only` file; its result
+        // must carry the provenance of any boundary-relevant path the *call*
+        // referenced ([`call_provenance`], honoring path-like keys and
+        // path-shaped values, not just a literal `path` arg), so a later remote
+        // turn assembling it is caught at egress. This is the same helper the
+        // remote MCP path already sends to egress — now wired into the live
+        // context-tagging path too, not only `result_context_block`'s tests.
+        let provenance = mcp_result_provenance(&args);
         // Cross the sync→async boundary on the multi-thread runtime the daemon
         // runs on (same blocking-tool shape as `shell`).
         let result =
             tokio::task::block_in_place(|| self.runtime.block_on(registry.call_tool(&name, args)));
         match result {
-            Ok(res) => frame_result(&self.namespaced_name, &res),
+            // The result is already wrapped in the untrusted-content envelope by
+            // `frame_result` (so `dispatch` returns framed content); the loop does
+            // not re-frame it.
+            Ok(res) => frame_result(&self.namespaced_name, &res).with_provenance(provenance),
             Err(e) => ToolOutcome::error(format!(
                 "MCP tool `{}` failed: {e}. Do not retry blindly; take a different \
                  approach or finish.",
                 self.namespaced_name
-            )),
+            ))
+            .with_provenance(provenance),
         }
     }
+}
+
+/// The [`ToolProvenance`] of an MCP tool result: the set of boundary-relevant
+/// paths the call's arguments referenced ([`call_provenance`]).
+#[must_use]
+fn mcp_result_provenance(args: &Value) -> ToolProvenance {
+    ToolProvenance::paths(call_provenance(args).sources())
 }
 
 /// Discover every configured server's tools and register them into `reg` as
@@ -248,5 +268,23 @@ mod tests {
         };
         let block = result_context_block("mcp__x__ping", &json!({ "n": 1 }), &result);
         assert!(block.provenance().is_empty());
+    }
+
+    #[test]
+    fn live_tool_provenance_tags_a_non_path_named_boundary_arg() {
+        // REQ-544 C-1 (H-1 laundering): the LIVE loop tags an MCP result via
+        // `mcp_result_provenance`, which uses `call_provenance` — so a boundary
+        // path passed under a non-`path` key (here `file`) is still tagged, not
+        // folded in with empty provenance the way the old narrow `path_arg` did.
+        let prov = mcp_result_provenance(&json!({ "file": "secrets/prod.env" }));
+        assert_eq!(prov, ToolProvenance::path("secrets/prod.env"));
+        // A path-shaped value under an arbitrary key is also caught.
+        let prov2 = mcp_result_provenance(&json!({ "whatever": "secrets/leak.txt" }));
+        assert_eq!(prov2, ToolProvenance::path("secrets/leak.txt"));
+        // No path-shaped args → no provenance.
+        assert_eq!(
+            mcp_result_provenance(&json!({ "q": "hello", "n": 3 })),
+            ToolProvenance::none()
+        );
     }
 }

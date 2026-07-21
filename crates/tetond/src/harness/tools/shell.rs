@@ -119,14 +119,21 @@ impl Tool for ShellTool {
             let _ = tx.send(child.wait_with_output());
         });
 
+        // BR-1 (REQ-544 C-1): a shell command runs arbitrary code, so the daemon
+        // cannot know which files its output was derived from. Every result of a
+        // command that actually started is therefore tagged UNKNOWN provenance,
+        // which egress fail-closes whenever a boundary is configured. (The
+        // pre-spawn argument/config errors above surface no command output and
+        // carry no provenance.)
         match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
             Ok(Ok(output)) => {
                 let _ = handle.join();
-                render_output(&command, &output)
+                render_output(&command, &output).with_unknown_provenance()
             }
             Ok(Err(e)) => {
                 let _ = handle.join();
                 ToolOutcome::error(format!("command failed to run: {}", e.kind()))
+                    .with_unknown_provenance()
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Kill by pid: wait_with_output moved the child into the watcher
@@ -140,10 +147,11 @@ impl Tool for ShellTool {
                 ToolOutcome::error(format!(
                     "command timed out after {timeout_ms}ms and was killed"
                 ))
+                .with_unknown_provenance()
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = handle.join();
-                ToolOutcome::error("command watcher disconnected")
+                ToolOutcome::error("command watcher disconnected").with_unknown_provenance()
             }
         }
     }
@@ -257,6 +265,23 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("marker.txt"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn any_shell_result_carries_unknown_provenance() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("prov");
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/prod.env"), "API_KEY=sk-live\n").unwrap();
+        let ctx = ToolContext::new(&root);
+        // REQ-544 C-1: `cat`-ing a boundary file cannot be parsed by the daemon,
+        // so the result is UNKNOWN provenance — fail-closed at egress.
+        let out = ShellTool::default().run(&ctx, &json!({ "command": "cat secrets/prod.env" }));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.provenance, ToolProvenance::Unknown);
+        // Even a boundary-free command is UNKNOWN — the daemon never parses it.
+        let out2 = ShellTool::default().run(&ctx, &json!({ "command": "echo hi" }));
+        assert_eq!(out2.provenance, ToolProvenance::Unknown);
     }
 
     #[test]

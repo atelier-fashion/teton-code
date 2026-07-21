@@ -22,7 +22,7 @@
 use teton_core::boundary::BoundaryMatcher;
 use teton_protocol::events::PrivacyAction;
 
-use crate::egress::provenance::Provenance;
+use crate::egress::provenance::{Provenance, UNKNOWN_PROVENANCE_PATH};
 
 /// The outcome of inspecting a request's provenance against the boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,12 +71,28 @@ pub struct Violation {
 /// path that any boundary covers. Sources are iterated in sorted order so the
 /// reported offender is stable across runs. An empty provenance — content from
 /// no file — is always [`Inspection::Allowed`].
+///
+/// ## Fail-closed on unknown provenance (REQ-544 C-1)
+///
+/// Content whose origin the daemon could not determine ([`Provenance::is_unknown`],
+/// e.g. a `shell` result) is blocked whenever this inspector runs — the choke
+/// point only inspects when boundaries are configured, so "unknown ⇒ blocked"
+/// takes effect exactly when at least one boundary exists. The daemon cannot
+/// prove the content is boundary-free, so it refuses to send it remotely rather
+/// than gamble. The reported offender is the content-free
+/// [`UNKNOWN_PROVENANCE_PATH`] sentinel (no real path, no file content).
 #[must_use]
 pub fn inspect(
     provenance: &Provenance,
     matcher: &BoundaryMatcher<'_>,
     action: PrivacyAction,
 ) -> Inspection {
+    if provenance.is_unknown() {
+        return Inspection::Blocked(Violation {
+            path: UNKNOWN_PROVENANCE_PATH.to_owned(),
+            action,
+        });
+    }
     for source in provenance.sources() {
         // Any matching boundary forbids egress in the MVP (fail-closed on every
         // mode; see the module docs). `match_path` already applies declaration
@@ -197,5 +213,32 @@ mod tests {
             inspect(&prov, &m, PrivacyAction::ReroutedToLocal),
             Inspection::Allowed
         );
+    }
+
+    #[test]
+    fn unknown_provenance_is_blocked_fail_closed() {
+        // REQ-544 C-1: content of indeterminate origin (a `shell` result) is
+        // blocked when boundaries are configured, reported against the
+        // content-free sentinel path.
+        use crate::egress::provenance::UNKNOWN_PROVENANCE_PATH;
+        let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
+        let m = matcher(&bs);
+        let out = inspect(&Provenance::unknown(), &m, PrivacyAction::ReroutedToLocal);
+        let v = out
+            .violation()
+            .expect("unknown provenance must fail closed");
+        assert_eq!(v.path, UNKNOWN_PROVENANCE_PATH);
+        assert_eq!(v.action, PrivacyAction::ReroutedToLocal);
+    }
+
+    #[test]
+    fn unknown_provenance_blocks_even_alongside_only_safe_sources() {
+        // A context that read a public file AND ran a shell command: the unknown
+        // shell contribution alone is enough to fail closed.
+        let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
+        let m = matcher(&bs);
+        let mut prov = Provenance::tainted_by("src/main.rs");
+        prov.mark_unknown();
+        assert!(inspect(&prov, &m, PrivacyAction::ReroutedToLocal).is_blocked());
     }
 }

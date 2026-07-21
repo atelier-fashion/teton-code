@@ -87,9 +87,15 @@ impl Tool for EditTool {
             1 => {
                 let updated = contents.replacen(old_string.as_str(), &new_string, 1);
                 match std::fs::write(&path, &updated) {
+                    // REQ-544 C-1: an edit touches a specific file. Tagging the
+                    // result with its path is harmless over-tagging (egress only
+                    // blocks *boundary* sources) and defends the case where the
+                    // model edits a `local-only` file then routes a later turn
+                    // remotely.
                     Ok(()) => ToolOutcome::ok(format!(
                         "edited `{raw}`: replaced 1 occurrence. Verify the change before finishing."
-                    )),
+                    ))
+                    .with_paths([raw]),
                     Err(e) => ToolOutcome::error(format!("could not write `{raw}`: {}", e.kind())),
                 }
             }
