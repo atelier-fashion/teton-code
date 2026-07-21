@@ -94,6 +94,40 @@ pub fn secure_socket_permissions(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
+/// Ensures the socket's parent directory exists and is owner-only (`0700`).
+///
+/// The load-bearing case is the directory the daemon creates for its own state:
+/// creating it with the restrictive mode from the start (rather than the
+/// umask-dependent default) closes the brief window in which the socket file
+/// could be group/other-*connectable* before its own `0600` lands (REQ-544 L-1)
+/// — with a `0700` parent, no other user can even traverse in to reach the
+/// socket. A pre-existing directory (e.g. `XDG_RUNTIME_DIR`, already `0700` by
+/// spec, or a shared temp dir we may not own) is tightened best-effort but never
+/// fails the bind. The peer-credential check ([`check_peer`]) still backstops
+/// authorization; this just removes the timing window.
+///
+/// # Errors
+///
+/// Returns the OS error only if a directory the daemon needed to create could
+/// not be created.
+pub fn secure_socket_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if dir.exists() {
+        // A directory we did not create: tighten if we can, but do not fail the
+        // bind over a parent we may not own.
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        return Ok(());
+    }
+    // Create every missing component owner-only from the start — the window L-1
+    // closes.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // Guarantee exactly 0700 regardless of the process umask.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +150,32 @@ mod tests {
                 expected: 501
             }
         ));
+    }
+
+    #[test]
+    fn secure_socket_dir_is_owner_only() {
+        // REQ-544 L-1: the socket's parent dir is created 0700 so the socket is
+        // never briefly group/other-connectable.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "teton-sockdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        secure_socket_dir(&dir).expect("create secure dir");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "socket dir must be owner-only");
+
+        // Tightening a pre-existing looser directory also works.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        secure_socket_dir(&dir).expect("tighten existing dir");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "pre-existing dir must be tightened to 0700");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

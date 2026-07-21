@@ -6,18 +6,23 @@
 //! - **cwd jail** — the command runs with the repo root as its working
 //!   directory. (Absolute paths a command constructs itself are outside the
 //!   tool's reach; the jail is the default surface an agent operates on.)
-//! - **env scrub** — every variable whose name ends `_KEY` or `_TOKEN`
-//!   (case-insensitive) is removed before the child starts, so an API key in the
-//!   daemon's environment can never leak into a model-driven `env`/`printenv`
-//!   (BR-7). `PATH`, `HOME`, and the rest pass through so ordinary commands still
-//!   work.
+//! - **env scrub** — every variable whose *name* matches a credential substring
+//!   (`SECRET`, `PASSWORD`, `PASSWD`, `TOKEN`, `KEY`, `CREDENTIAL`, or a `PAT`
+//!   token) or whose *value* is a credential-bearing URL (`scheme://user:pass@…`)
+//!   is removed before the child starts, so a secret in the daemon's environment
+//!   can never leak into a model-driven `env`/`printenv` (BR-7). `PATH`, `HOME`,
+//!   and the rest pass through so ordinary commands still work.
 //! - **timeout** — a runaway command is `SIGKILL`ed after the deadline and the
 //!   timeout is reported to the model, so a bad command can never hang the loop.
+//!   The child is spawned as its own process-group leader and the whole group is
+//!   killed, so a backgrounded grandchild cannot outlive the deadline (REQ-544
+//!   L-2).
 //!
 //! The command runs synchronously via `sh -c`; a watcher thread enforces the
 //! deadline. Output (stdout + stderr) is captured and capped.
 
 use std::io::Result as IoResult;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -104,6 +109,10 @@ impl Tool for ShellTool {
             .current_dir(&root)
             .env_clear()
             .envs(scrubbed)
+            // REQ-544 L-2: make the child its own process-group leader (pgid ==
+            // child pid) so that on timeout we can SIGKILL the whole group and no
+            // backgrounded grandchild survives the deadline.
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -136,12 +145,17 @@ impl Tool for ShellTool {
                     .with_unknown_provenance()
             }
             Err(RecvTimeoutError::Timeout) => {
-                // Kill by pid: wait_with_output moved the child into the watcher
-                // thread, so we cannot call Child::kill here. libc is already a
-                // daemon dependency (peer-cred / flock syscalls).
-                // SAFETY: kill(2) with a pid we just spawned and a valid signal.
+                // Kill the whole process group, not just the direct child:
+                // `wait_with_output` moved the child into the watcher thread, so
+                // we cannot call `Child::kill` here, and a bare `kill(pid)` would
+                // leave backgrounded grandchildren running (REQ-544 L-2). The
+                // child is its own group leader (`process_group(0)`), so its pgid
+                // equals its pid; a negative target signals the entire group.
+                // libc is already a daemon dependency (peer-cred / flock).
+                // SAFETY: kill(2) with the negated pgid of a group we just created
+                // and a valid signal.
                 unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                 }
                 let _ = handle.join();
                 ToolOutcome::error(format!(
@@ -157,22 +171,57 @@ impl Tool for ShellTool {
     }
 }
 
-/// Remove secret-bearing variables (`*_KEY`, `*_TOKEN`) from an environment,
-/// keeping everything else. Pure so it can be tested without mutating the
-/// process environment.
+/// Remove credential-bearing variables from an environment, keeping everything
+/// else. Pure so it can be tested without mutating the process environment.
 pub(crate) fn scrub<I>(vars: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
     vars.into_iter()
-        .filter(|(k, _)| !is_secret_key(k))
+        .filter(|(k, v)| !is_secret_var(k, v))
         .collect()
 }
 
+/// Whether an environment entry carries a credential and must be scrubbed before
+/// the model-driven `shell` child sees it (BR-7). Two signals: a secret-shaped
+/// *name*, or a credential-bearing *value* (a `scheme://user:pass@host` URL).
+pub(crate) fn is_secret_var(key: &str, value: &str) -> bool {
+    is_secret_key(key) || looks_like_credential_url(value)
+}
+
 /// Whether an environment variable name looks like it holds a credential.
+///
+/// A case-insensitive substring denylist (REQ-544 MED-1). The old suffix rule
+/// (`*_KEY` / `*_TOKEN`) missed `*_SECRET`, `*PASSWORD*`, `PGPASSWORD`, and the
+/// like. `PAT` (a GitHub personal-access token) is matched only as a whole,
+/// delimiter-bounded token, so essential names like `PATH` — and words like
+/// `COMPATIBLE` — are not swept up.
 pub(crate) fn is_secret_key(key: &str) -> bool {
+    const SECRET_SUBSTRINGS: &[&str] =
+        &["SECRET", "PASSWORD", "PASSWD", "TOKEN", "KEY", "CREDENTIAL"];
     let up = key.to_ascii_uppercase();
-    up.ends_with("_KEY") || up.ends_with("_TOKEN")
+    if SECRET_SUBSTRINGS.iter().any(|s| up.contains(s)) {
+        return true;
+    }
+    up.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == "PAT")
+}
+
+/// Whether `value` is a URL that embeds a credential in its userinfo, e.g.
+/// `postgres://user:pass@host/db` — the shape `DATABASE_URL` often takes, which
+/// a name-only check cannot catch (REQ-544 MED-1).
+fn looks_like_credential_url(value: &str) -> bool {
+    let Some((_scheme, after)) = value.split_once("://") else {
+        return false;
+    };
+    // The authority ends at the first '/', '?', or '#'.
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    match authority.split_once('@') {
+        // A ':' in the userinfo before the '@' is an embedded password
+        // (`user:pass@` or `:pass@`).
+        Some((userinfo, _host)) => userinfo.contains(':'),
+        None => false,
+    }
 }
 
 /// Render a finished command's output for the model, capped.
@@ -230,30 +279,67 @@ mod tests {
     }
 
     #[test]
-    fn scrub_removes_only_secret_shaped_keys() {
+    fn scrub_removes_credential_bearing_vars_and_keeps_essentials() {
         let input = vec![
             ("PATH".to_owned(), "/usr/bin".to_owned()),
             ("HOME".to_owned(), "/home/x".to_owned()),
             ("ANTHROPIC_API_KEY".to_owned(), "sk-secret".to_owned()),
             ("openai_api_key".to_owned(), "lower-secret".to_owned()),
             ("GITHUB_TOKEN".to_owned(), "ghp_secret".to_owned()),
-            ("MY_KEYBOARD".to_owned(), "not-a-secret".to_owned()),
+            // REQ-544 MED-1: the shapes the old suffix rule let through.
+            ("PGPASSWORD".to_owned(), "hunter2".to_owned()),
+            ("STRIPE_SECRET".to_owned(), "sk_live_x".to_owned()),
+            ("MY_CREDENTIAL".to_owned(), "c".to_owned()),
+            ("GITHUB_PAT".to_owned(), "ghp_x".to_owned()),
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:pass@db.example.com/app".to_owned(),
+            ),
         ];
         let kept: Vec<String> = scrub(input).into_iter().map(|(k, _)| k).collect();
+        // Essentials survive.
         assert!(kept.contains(&"PATH".to_owned()));
         assert!(kept.contains(&"HOME".to_owned()));
-        assert!(kept.contains(&"MY_KEYBOARD".to_owned())); // ends in KEYBOARD, not _KEY
-        assert!(!kept.contains(&"ANTHROPIC_API_KEY".to_owned()));
-        assert!(!kept.contains(&"openai_api_key".to_owned()));
-        assert!(!kept.contains(&"GITHUB_TOKEN".to_owned()));
+        // Every credential-bearing var is gone.
+        for scrubbed in [
+            "ANTHROPIC_API_KEY",
+            "openai_api_key",
+            "GITHUB_TOKEN",
+            "PGPASSWORD",
+            "STRIPE_SECRET",
+            "MY_CREDENTIAL",
+            "GITHUB_PAT",
+            "DATABASE_URL",
+        ] {
+            assert!(!kept.contains(&scrubbed.to_owned()), "leaked: {scrubbed}");
+        }
     }
 
     #[test]
-    fn is_secret_key_is_case_insensitive_and_suffix_anchored() {
+    fn is_secret_key_matches_substrings_but_not_essential_names() {
+        // Case-insensitive substrings.
         assert!(is_secret_key("FOO_KEY"));
         assert!(is_secret_key("foo_token"));
-        assert!(!is_secret_key("KEYRING"));
-        assert!(!is_secret_key("TOKENIZER"));
+        assert!(is_secret_key("PGPASSWORD"));
+        assert!(is_secret_key("db_passwd"));
+        assert!(is_secret_key("MY_SECRET_THING"));
+        assert!(is_secret_key("aws_credential_file"));
+        // `PAT` as a whole token, but not inside another word.
+        assert!(is_secret_key("GITHUB_PAT"));
+        assert!(!is_secret_key("PATH"));
+        assert!(!is_secret_key("COMPATIBLE"));
+        // A benign name with no secret substring survives.
+        assert!(!is_secret_key("EDITOR"));
+    }
+
+    #[test]
+    fn credential_urls_are_scrubbed_by_value() {
+        assert!(looks_like_credential_url("postgres://user:pass@host/db"));
+        assert!(looks_like_credential_url("redis://:password@host:6379"));
+        // No embedded credential -> kept.
+        assert!(!looks_like_credential_url("https://example.com/path"));
+        assert!(!looks_like_credential_url("postgres://host/db"));
+        assert!(!looks_like_credential_url("/usr/local/bin"));
     }
 
     #[test]
@@ -304,6 +390,32 @@ mod tests {
         assert!(out.content.contains("timed out"));
         // Killed promptly, nowhere near the 10s sleep.
         assert!(started.elapsed() < Duration::from_secs(3));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn timeout_kills_a_backgrounded_grandchild_too() {
+        // REQ-544 L-2: a backgrounded grandchild must not outlive the deadline.
+        // The command backgrounds a subshell that would `touch survivor.txt`
+        // after 2s, then blocks. On timeout the whole process group is SIGKILLed,
+        // so the marker is never created.
+        let root = temp_root("pgroup");
+        let ctx = ToolContext::new(&root);
+        let out = ShellTool::with_timeouts(200, 500).run(
+            &ctx,
+            &json!({
+                "command": "(sleep 2; touch survivor.txt) & echo started; sleep 10"
+            }),
+        );
+        assert!(out.is_error);
+        assert!(out.content.contains("timed out"));
+        // Wait past the grandchild's 2s delay; if it survived the group kill it
+        // would have created the marker by now.
+        std::thread::sleep(Duration::from_millis(2_800));
+        assert!(
+            !root.join("survivor.txt").exists(),
+            "backgrounded grandchild outlived the deadline"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

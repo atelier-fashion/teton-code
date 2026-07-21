@@ -1492,6 +1492,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rusqlite",
+ "security-framework",
  "serde",
  "serde_json",
  "teton-core",

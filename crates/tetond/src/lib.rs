@@ -35,6 +35,7 @@ pub mod cost;
 pub mod egress;
 pub mod harness;
 pub mod heuristics;
+pub mod keychain;
 pub mod mcp;
 pub mod router;
 pub mod runtime;

@@ -73,6 +73,12 @@ pub enum HarnessError {
     /// so this variant carries no boundary content.
     #[error("remote provider error: {0}")]
     Remote(#[from] ProviderError),
+    /// A remote provider's credential could not be resolved from its `auth_ref`
+    /// (BR-7, REQ-544 M-3). The message names the reference and reason but never
+    /// the secret value; the daemon surfaces it as a config-rejection RPC error
+    /// rather than retrying the same broken credential.
+    #[error("credential resolution failed: {0}")]
+    Credential(String),
 }
 
 impl HarnessError {

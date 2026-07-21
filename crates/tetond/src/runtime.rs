@@ -72,6 +72,7 @@ use crate::harness::{
     build_system_prompt, ContextManager, LocalEngineSource, PendingPermissions, PermissionConfig,
     PermissionGate, SessionEvents, ToolContext, ToolRegistry,
 };
+use crate::keychain::SecretResolver;
 use crate::mcp::{McpRegistry, McpServerConfig};
 use crate::router::Router;
 
@@ -226,6 +227,11 @@ pub struct DaemonRuntime {
     /// Per-session privacy taint: sessions pinned to the local tier because their
     /// context touched `local-only` or unknown-provenance content (REQ-544 C-2).
     session_taint: SessionTaint,
+    /// Resolves a provider's `auth_ref` to its secret at call time (BR-7, REQ-544
+    /// M-3). Holds the OS-keychain backend behind a trait; the secret is injected
+    /// as an endpoint-bound authorization header at the egress choke point and
+    /// never reaches a log, `CostRecord`, or telemetry.
+    secret_resolver: SecretResolver,
 }
 
 impl DaemonRuntime {
@@ -250,6 +256,7 @@ impl DaemonRuntime {
             lifecycle: Vec::new(),
             turn_counter: AtomicU64::new(0),
             session_taint: SessionTaint::new(),
+            secret_resolver: SecretResolver::with_default_backend(),
         }
     }
 
@@ -302,6 +309,7 @@ impl DaemonRuntime {
             lifecycle: probe.lifecycle,
             turn_counter: AtomicU64::new(0),
             session_taint: SessionTaint::new(),
+            secret_resolver: SecretResolver::with_default_backend(),
         })
     }
 
@@ -538,6 +546,13 @@ impl DaemonRuntime {
                         "local engine could not serve the turn",
                     ));
                 }
+                // REQ-544 M-3: a credential that will not resolve is a config
+                // problem, not a transient fault — surface it clearly (the
+                // message names the reference and reason, never the secret) and
+                // do not retry the same broken credential.
+                Err(HarnessError::Credential(msg)) => {
+                    return Err(RpcError::new(error_code::CONFIG_REJECTED, msg));
+                }
             }
         }
     }
@@ -633,8 +648,12 @@ impl DaemonRuntime {
         let caps = CapabilityProfile::from_core(provider_cfg.capabilities);
         let provider: Box<dyn Provider> = build_provider(provider_cfg, caps);
 
-        let transport = HttpTransport::new()
-            .map_err(|e| HarnessError::Engine(EngineError::Backend(e.to_string())))?;
+        // BR-7 / REQ-544 M-3: resolve the provider's credential from its
+        // `auth_ref` and bind it to this provider's endpoint. A provider with no
+        // `auth_ref` (e.g. a local mock endpoint) gets a credential-free
+        // transport, exactly as before. The injected header rides only requests
+        // to this endpoint's origin — never MCP, never another provider.
+        let transport = build_remote_transport(provider_cfg, &self.secret_resolver)?;
         let boundaries = config.boundaries.clone();
         let egress = Egress::new(transport, boundaries, events.clone())
             .with_cost_meter(Arc::new(self.ledger.clone()));
@@ -874,6 +893,61 @@ fn build_local_engine(probe: &ProbeResult) -> Option<Arc<Mutex<dyn Engine>>> {
         .unwrap_or_else(|| "scripted-local".to_owned());
     let engine = ScriptedFileEngine::from_file(model_id, Path::new(&script)).ok()?;
     Some(Arc::new(Mutex::new(engine)) as Arc<Mutex<dyn Engine>>)
+}
+
+/// The Anthropic Messages API version header value the credential layer injects
+/// alongside `x-api-key` (mirrors the adapter's protocol header; the injected
+/// copy wins so no duplicate reaches the wire).
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Build the endpoint-bound HTTP transport for a remote provider turn (BR-7,
+/// REQ-544 M-3).
+///
+/// A provider with no `auth_ref` gets a credential-free transport (the e2e mock
+/// endpoints and any keyless provider). Otherwise the `auth_ref` is resolved to a
+/// secret, turned into the provider-appropriate credential header(s), and bound
+/// to the provider's endpoint origin so the header can never ride an MCP or
+/// cross-provider request. A resolution failure is a typed
+/// [`HarnessError::Credential`] — never a panic, and its message never carries
+/// the secret.
+fn build_remote_transport(
+    provider: &ModelProvider,
+    resolver: &SecretResolver,
+) -> Result<HttpTransport, HarnessError> {
+    match provider.auth_ref.as_deref() {
+        None => HttpTransport::new()
+            .map_err(|e| HarnessError::Engine(EngineError::Backend(e.to_string()))),
+        Some(auth_ref) => {
+            let secret = resolver
+                .resolve(auth_ref)
+                .map_err(|e| HarnessError::Credential(e.to_string()))?;
+            let headers = provider_auth_headers(provider.kind, &secret);
+            let endpoint = provider.endpoint.clone().unwrap_or_default();
+            HttpTransport::with_endpoint_auth(&endpoint, headers)
+                .map_err(|e| HarnessError::Engine(EngineError::Backend(e.to_string())))
+        }
+    }
+}
+
+/// The provider-appropriate credential header(s) for a resolved `secret` (BR-7).
+///
+/// Anthropic authenticates with `x-api-key` (plus the `anthropic-version` the
+/// API requires); OpenAI-compatible and custom endpoints use a bearer token. The
+/// local tier never authenticates. Header *names* are safe to construct here; the
+/// secret value lives only in the returned headers and is dropped after the
+/// endpoint-bound transport is built — it never reaches a log or `CostRecord`.
+fn provider_auth_headers(kind: ProviderKind, secret: &str) -> Vec<(String, String)> {
+    match kind {
+        ProviderKind::Anthropic => vec![
+            ("x-api-key".to_owned(), secret.to_owned()),
+            ("anthropic-version".to_owned(), ANTHROPIC_VERSION.to_owned()),
+        ],
+        ProviderKind::OpenAiCompatible | ProviderKind::Custom => {
+            vec![("authorization".to_owned(), format!("Bearer {secret}"))]
+        }
+        // The local tier does not reach a remote transport, so it needs no auth.
+        ProviderKind::Local => Vec::new(),
+    }
 }
 
 /// Build a concrete [`Provider`] adapter from a config provider entry.
@@ -1268,5 +1342,125 @@ mod tests {
 
         // With no boundaries configured, nothing is sensitive.
         assert!(!context_is_sensitive(&ctx, &[]));
+    }
+
+    // --- REQ-544 M-3: endpoint-bound credential injection ------------------
+
+    use crate::keychain::{BackendError, KeychainBackend};
+
+    /// A keychain fake for the runtime tests — returns a canned secret so no
+    /// test touches the real OS keychain.
+    struct FakeBackend {
+        secret: String,
+    }
+
+    impl KeychainBackend for FakeBackend {
+        fn get(&self, _service: &str, _account: &str) -> Result<String, BackendError> {
+            Ok(self.secret.clone())
+        }
+    }
+
+    fn resolver_returning(secret: &str) -> SecretResolver {
+        SecretResolver::with_backend(Box::new(FakeBackend {
+            secret: secret.to_owned(),
+        }))
+    }
+
+    fn provider(kind: ProviderKind, endpoint: &str, auth_ref: Option<&str>) -> ModelProvider {
+        ModelProvider {
+            id: "p".to_owned(),
+            kind,
+            endpoint: Some(endpoint.to_owned()),
+            auth_ref: auth_ref.map(str::to_owned),
+            capabilities: ProviderCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn anthropic_auth_headers_carry_the_api_key_and_version() {
+        let headers = provider_auth_headers(ProviderKind::Anthropic, "sk-ant-SECRET");
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n == "x-api-key" && v == "sk-ant-SECRET"));
+        assert!(headers.iter().any(|(n, _)| n == "anthropic-version"));
+        // Never a bearer token for Anthropic.
+        assert!(!headers.iter().any(|(n, _)| n == "authorization"));
+    }
+
+    #[test]
+    fn openai_compatible_auth_uses_a_bearer_token() {
+        let headers = provider_auth_headers(ProviderKind::OpenAiCompatible, "sk-deepseek");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "authorization");
+        assert_eq!(headers[0].1, "Bearer sk-deepseek");
+    }
+
+    #[test]
+    fn the_local_tier_carries_no_credential() {
+        assert!(provider_auth_headers(ProviderKind::Local, "anything").is_empty());
+    }
+
+    #[test]
+    fn a_resolved_credential_binds_only_to_the_provider_endpoint() {
+        // REQ-544 M-3 end to end (network-free): resolve an auth_ref, build the
+        // endpoint-bound transport, and prove the credential rides the owning
+        // endpoint but never an MCP or cross-provider request.
+        let endpoint = "https://api.anthropic.com/v1/messages";
+        let cfg = provider(
+            ProviderKind::Anthropic,
+            endpoint,
+            Some("keychain://teton/anthropic"),
+        );
+        let transport = build_remote_transport(&cfg, &resolver_returning("sk-ant-INJECTED"))
+            .expect("transport");
+
+        let owning = transport.outbound_headers(endpoint, &[]);
+        assert!(owning
+            .iter()
+            .any(|(n, v)| n == "x-api-key" && v == "sk-ant-INJECTED"));
+
+        let mcp = transport.outbound_headers("https://mcp.example.com/rpc", &[]);
+        assert!(!mcp.iter().any(|(_, v)| v.contains("sk-ant-INJECTED")));
+
+        let other = transport.outbound_headers("https://api.deepseek.com/v1/chat/completions", &[]);
+        assert!(!other.iter().any(|(_, v)| v.contains("sk-ant-INJECTED")));
+    }
+
+    #[test]
+    fn a_keyless_provider_gets_a_credential_free_transport() {
+        // The e2e mock endpoints register no auth_ref; that path must still build
+        // a transport, and it must inject nothing.
+        let endpoint = "http://127.0.0.1:8080/v1/chat/completions";
+        let cfg = provider(ProviderKind::OpenAiCompatible, endpoint, None);
+        let transport = build_remote_transport(&cfg, &SecretResolver::with_default_backend())
+            .expect("transport");
+        let protocol = vec![("content-type".to_owned(), "application/json".to_owned())];
+        assert_eq!(transport.outbound_headers(endpoint, &protocol), protocol);
+    }
+
+    #[test]
+    fn an_unresolvable_credential_is_a_typed_error_not_a_panic() {
+        // A missing keychain entry surfaces HarnessError::Credential whose message
+        // names the reference (safe) but never the secret.
+        struct MissingBackend;
+        impl KeychainBackend for MissingBackend {
+            fn get(&self, _s: &str, _a: &str) -> Result<String, BackendError> {
+                Err(BackendError::NotFound)
+            }
+        }
+        let cfg = provider(
+            ProviderKind::Anthropic,
+            "https://api.anthropic.com/v1/messages",
+            Some("keychain://teton/anthropic"),
+        );
+        let resolver = SecretResolver::with_backend(Box::new(MissingBackend));
+        let err = build_remote_transport(&cfg, &resolver).unwrap_err();
+        match err {
+            HarnessError::Credential(msg) => {
+                assert!(msg.contains("keychain://teton/anthropic"), "{msg}");
+                assert!(!msg.contains("sk-"), "{msg}");
+            }
+            other => panic!("expected Credential error, got {other:?}"),
+        }
     }
 }

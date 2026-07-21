@@ -18,7 +18,9 @@
 //! - **BR-2 (cost)** — every *allowed* remote call is the hook where TASK-008
 //!   records a `CostRecord`. That seam is marked in [`Egress::send`].
 //! - **BR-7 (credentials)** — the adapter never sees a secret; the transport
-//!   attaches the resolved credential header ([`HttpTransport::with_injected_headers`]).
+//!   attaches the resolved credential header ([`HttpTransport::with_endpoint_auth`]),
+//!   bound to the owning provider's endpoint so it can never leak onto an MCP or
+//!   cross-provider request.
 //!
 //! ## How provenance reaches egress
 //!
@@ -372,37 +374,117 @@ impl<T: Transport> Transport for TurnTransport<'_, T> {
     }
 }
 
+/// A resolved credential bound to one provider endpoint (BR-7, REQ-544 M-3).
+///
+/// The credential headers are attached to an outbound request **only** when the
+/// request targets the bound origin. This is the cross-contamination guard: a
+/// provider's `x-api-key` / `Authorization: Bearer` can never ride along on an
+/// MCP request or a different provider's request, even if a transport were
+/// somehow reused across endpoints. The MCP egress path constructs a
+/// credential-free transport ([`HttpTransport::new`]) and so carries no auth at
+/// all.
+#[derive(Debug, Clone)]
+struct EndpointAuth {
+    /// The ASCII-serialized origin (`scheme://host[:port]`) the credential is
+    /// bound to, or `None` if the endpoint URL did not parse to a tuple origin
+    /// (in which case the credential is never attached — fail-closed).
+    origin: Option<String>,
+    /// The credential header(s) to attach for requests to `origin`.
+    headers: Vec<(String, String)>,
+}
+
+impl EndpointAuth {
+    fn new(endpoint: &str, headers: Vec<(String, String)>) -> Self {
+        Self {
+            origin: origin_of(endpoint),
+            headers,
+        }
+    }
+
+    /// The credential headers to attach for a request to `url`: the bound
+    /// headers when `url`'s origin matches, otherwise none.
+    fn headers_for(&self, url: &str) -> &[(String, String)] {
+        match (&self.origin, origin_of(url)) {
+            (Some(bound), Some(target)) if *bound == target => &self.headers,
+            _ => &[],
+        }
+    }
+}
+
+/// The ASCII origin (`scheme://host[:port]`) of `url`, or `None` when the URL
+/// does not parse to a tuple (network-addressable) origin.
+fn origin_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let origin = parsed.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
 /// The real, network-backed [`Transport`] — the sole HTTP client in the tree.
 ///
 /// Wraps a single `reqwest::Client` (connection-pooled, cheap to clone). Adapters
 /// never construct this; the daemon builds one and hands it to [`Egress`]. Auth
-/// is attached here, not by adapters (BR-7): resolved credential headers passed
-/// to [`HttpTransport::with_injected_headers`] are added to every outbound
-/// request on top of the adapter's protocol headers.
+/// is attached here, not by adapters (BR-7): a resolved credential passed to
+/// [`HttpTransport::with_endpoint_auth`] is bound to that provider's endpoint and
+/// injected onto — and only onto — requests to that endpoint's origin. A
+/// transport built with [`HttpTransport::new`] carries no credential (the MCP
+/// egress path uses it, so MCP requests stay header-free).
 #[derive(Debug, Clone)]
 pub struct HttpTransport {
     client: reqwest::Client,
-    injected_headers: Vec<(String, String)>,
+    injected: Option<EndpointAuth>,
 }
 
 impl HttpTransport {
-    /// Build a transport with a fresh HTTP client and no injected headers.
+    /// Build a transport with a fresh HTTP client and no injected credential.
+    /// This is the MCP egress path's transport — it never carries provider auth.
     pub fn new() -> Result<Self, EgressError> {
-        Self::with_injected_headers(Vec::new())
+        Self::build(None)
     }
 
-    /// Build a transport whose client injects `injected_headers` (e.g. a resolved
-    /// authorization header, BR-7) into every request.
-    pub fn with_injected_headers(
-        injected_headers: Vec<(String, String)>,
+    /// Build a transport that injects `headers` (a resolved provider credential,
+    /// BR-7) **only** onto requests whose URL targets `endpoint`'s origin. The
+    /// binding is what keeps a credential from leaking onto an MCP request or a
+    /// different provider's request (REQ-544 M-3).
+    pub fn with_endpoint_auth(
+        endpoint: &str,
+        headers: Vec<(String, String)>,
     ) -> Result<Self, EgressError> {
+        Self::build(Some(EndpointAuth::new(endpoint, headers)))
+    }
+
+    fn build(injected: Option<EndpointAuth>) -> Result<Self, EgressError> {
         let client = reqwest::Client::builder()
             .build()
             .map_err(|_| EgressError::ClientInit)?;
-        Ok(Self {
-            client,
-            injected_headers,
-        })
+        Ok(Self { client, injected })
+    }
+
+    /// The final outbound header list for a request to `url`: the adapter's
+    /// protocol headers plus the endpoint-bound credential headers, attached only
+    /// when `url` matches the bound origin. A credential header replaces any
+    /// protocol header of the same (case-insensitive) name, so injecting a header
+    /// the adapter also sets (e.g. `anthropic-version`) cannot produce a
+    /// duplicate. Exposed within the crate so the cross-contamination guarantee
+    /// (BR-7) is unit-testable without a network round-trip.
+    #[must_use]
+    pub(crate) fn outbound_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        let creds = self
+            .injected
+            .as_ref()
+            .map_or::<&[(String, String)], _>(&[], |a| a.headers_for(url));
+        let mut out = Vec::with_capacity(headers.len() + creds.len());
+        for (name, value) in headers {
+            let shadowed = creds.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
+            if !shadowed {
+                out.push((name.clone(), value.clone()));
+            }
+        }
+        out.extend(creds.iter().cloned());
+        out
     }
 }
 
@@ -416,7 +498,7 @@ impl Transport for HttpTransport {
             HttpMethod::Post => reqwest::Method::POST,
         };
         let mut builder = self.client.request(method, &request.url);
-        for (name, value) in request.headers.iter().chain(self.injected_headers.iter()) {
+        for (name, value) in self.outbound_headers(&request.url, &request.headers) {
             builder = builder.header(name.as_str(), value.as_str());
         }
         let response = builder
@@ -630,6 +712,126 @@ mod tests {
             EgressError::ClientInit.into_transport_error(),
             TransportError::Connect
         );
+    }
+
+    const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+    const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/v1/chat/completions";
+    const MCP_ENDPOINT: &str = "https://mcp.example.com/rpc";
+    const SECRET: &str = "sk-ant-SUPER-SECRET-xyzzy";
+
+    /// The auth header injected for the Anthropic provider (mirrors the daemon's
+    /// `provider_auth_headers`). The `anthropic-version` here is deliberately a
+    /// *different* value than the adapter's to prove the injected one wins.
+    fn anthropic_creds() -> Vec<(String, String)> {
+        vec![
+            ("x-api-key".to_owned(), SECRET.to_owned()),
+            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+        ]
+    }
+
+    /// The adapter's protocol headers for an Anthropic request.
+    fn anthropic_protocol_headers() -> Vec<(String, String)> {
+        vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("accept".to_owned(), "text/event-stream".to_owned()),
+            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+        ]
+    }
+
+    fn header_names(headers: &[(String, String)]) -> Vec<String> {
+        headers
+            .iter()
+            .map(|(n, _)| n.to_ascii_lowercase())
+            .collect()
+    }
+
+    #[test]
+    fn a_provider_credential_reaches_only_its_owning_endpoint() {
+        // REQ-544 M-3 / BR-7 cross-contamination guard: a credential bound to the
+        // Anthropic endpoint must appear on a request to that endpoint and NEVER
+        // on a request to an MCP endpoint or a different provider's endpoint.
+        let transport = HttpTransport::with_endpoint_auth(ANTHROPIC_ENDPOINT, anthropic_creds())
+            .expect("build endpoint-bound transport");
+
+        // 1. The owning endpoint receives the credential.
+        let owning = transport.outbound_headers(ANTHROPIC_ENDPOINT, &anthropic_protocol_headers());
+        assert!(
+            owning
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("x-api-key") && v == SECRET),
+            "the owning provider endpoint must carry x-api-key"
+        );
+
+        // 2. An MCP request through the same transport gets NO credential and no
+        //    trace of the secret anywhere.
+        let mcp = transport.outbound_headers(
+            MCP_ENDPOINT,
+            &[("content-type".to_owned(), "application/json".to_owned())],
+        );
+        assert!(
+            !header_names(&mcp).iter().any(|n| n == "x-api-key"),
+            "MCP request must never carry the provider credential header"
+        );
+        assert!(
+            !mcp.iter().any(|(_, v)| v.contains(SECRET)),
+            "the secret must never appear on an MCP request"
+        );
+
+        // 3. A different provider's endpoint likewise never sees the credential.
+        let other = transport.outbound_headers(
+            DEEPSEEK_ENDPOINT,
+            &[("content-type".to_owned(), "application/json".to_owned())],
+        );
+        assert!(
+            !other.iter().any(|(_, v)| v.contains(SECRET)),
+            "the secret must never appear on another provider's request"
+        );
+    }
+
+    #[test]
+    fn an_injected_header_replaces_a_duplicate_protocol_header() {
+        // Injecting `anthropic-version` (which the adapter also sets) must not
+        // produce two copies on the wire — the injected credential-layer header
+        // wins, case-insensitively.
+        let transport = HttpTransport::with_endpoint_auth(ANTHROPIC_ENDPOINT, anthropic_creds())
+            .expect("build transport");
+        let out = transport.outbound_headers(ANTHROPIC_ENDPOINT, &anthropic_protocol_headers());
+        let version_count = out
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("anthropic-version"))
+            .count();
+        assert_eq!(
+            version_count, 1,
+            "anthropic-version must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn a_credential_free_transport_never_injects_anything() {
+        // The MCP egress path builds this transport: it must add no headers of
+        // its own to any request, to any endpoint.
+        let transport = HttpTransport::new().expect("build credential-free transport");
+        let protocol = vec![("content-type".to_owned(), "application/json".to_owned())];
+        let out = transport.outbound_headers(MCP_ENDPOINT, &protocol);
+        assert_eq!(
+            out, protocol,
+            "no credential-free transport may inject headers"
+        );
+    }
+
+    #[test]
+    fn origin_matching_ignores_the_path_but_distinguishes_host() {
+        // Same origin, different path -> still the owning endpoint (a provider's
+        // base URL and its /v1/... path share an origin).
+        let transport =
+            HttpTransport::with_endpoint_auth("https://api.anthropic.com", anthropic_creds())
+                .expect("build transport");
+        let same_origin = transport.outbound_headers(ANTHROPIC_ENDPOINT, &[]);
+        assert!(same_origin.iter().any(|(n, _)| n == "x-api-key"));
+        // A look-alike host must not match.
+        let evil =
+            transport.outbound_headers("https://api-anthropic.com.evil.test/v1/messages", &[]);
+        assert!(!evil.iter().any(|(n, _)| n == "x-api-key"));
     }
 }
 

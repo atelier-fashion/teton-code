@@ -65,6 +65,14 @@ reqwest = { version = "0.12", default-features = false, features = [
 async-trait = "0.1"
 futures = { version = "0.3", features = ["std", "async-await"] }
 
+# Daemon-side keychain resolution (BR-7, REQ-544 M-3): the CLI stores a secret
+# and writes only an `auth_ref`; the daemon reads it back at call time and
+# injects the endpoint-bound authorization header at the egress choke point.
+# macOS-first, mirroring the CLI's `keychain.rs`; other targets get an
+# "unsupported" backend so CI (Linux) builds without a keychain.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2"
+
 [dev-dependencies]
 # Integration tests act as clients over the socket and need the test macro. The
 # MCP egress test (TASK-011) spawns a mock stdio server, so `process` here too.

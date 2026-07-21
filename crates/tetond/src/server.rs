@@ -90,7 +90,9 @@ impl Default for Daemon {
 }
 
 /// Binds a listener at `path`, replacing any stale socket file and locking the
-/// new one down to owner-only (`0600`).
+/// new one down to owner-only (`0600`). The parent directory is created (or
+/// tightened to) `0700` first, so the socket is never briefly reachable by
+/// group/other before its own mode lands (REQ-544 L-1).
 ///
 /// # Errors
 ///
@@ -98,7 +100,7 @@ impl Default for Daemon {
 /// change fails.
 pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        auth::secure_socket_dir(parent)?;
     }
     // Safe to remove: the caller holds the single-instance lock, so any socket
     // file here is stale (a previous run that did not clean up).

@@ -15,7 +15,7 @@
 //! socket — while production wires [`DefaultConnector`] (stdio subprocess or
 //! egress-gated HTTP).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -40,6 +40,12 @@ pub enum McpTransport {
         /// Arguments passed to it.
         #[serde(default)]
         args: Vec<String>,
+        /// Extra environment variables this server declares. The child otherwise
+        /// gets only a minimal base environment (PATH/HOME/locale essentials) —
+        /// the daemon's provider keys are **never** inherited (REQ-544 MED-2,
+        /// BR-7). Declared vars are layered on top of that base.
+        #[serde(default)]
+        env: BTreeMap<String, String>,
     },
     /// A remote streamable-HTTP endpoint. Every call flows through egress (BR-1).
     Http {
@@ -112,8 +118,8 @@ impl DefaultConnector {
 impl McpConnector for DefaultConnector {
     async fn connect(&self, config: &McpServerConfig) -> Result<Arc<dyn McpConnection>, McpError> {
         match &config.transport {
-            McpTransport::Stdio { command, args } => {
-                let conn = StdioConnection::spawn(&config.id, command, args)?;
+            McpTransport::Stdio { command, args, env } => {
+                let conn = StdioConnection::spawn(&config.id, command, args, env)?;
                 Ok(Arc::new(conn))
             }
             McpTransport::Http { endpoint } => {
@@ -441,6 +447,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "unused".to_owned(),
                 args: vec![],
+                env: BTreeMap::new(),
             },
         }
     }
@@ -543,6 +550,7 @@ mod tests {
                 transport: McpTransport::Stdio {
                     command: "mcp-server-filesystem".to_owned(),
                     args: vec!["--root".to_owned(), ".".to_owned()],
+                    env: BTreeMap::new(),
                 },
             },
             McpServerConfig {

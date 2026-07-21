@@ -137,6 +137,7 @@ fn stdio_cfg(id: &str) -> McpServerConfig {
         transport: McpTransport::Stdio {
             command: "unused-by-mock".to_owned(),
             args: vec![],
+            env: std::collections::BTreeMap::new(),
         },
     }
 }
@@ -511,9 +512,14 @@ async fn a_real_stdio_subprocess_speaks_the_protocol() {
     drop(f);
 
     // Spawn `sh <script>` as the local server.
-    let conn = StdioConnection::spawn("stdio-mock", "sh", &[script.to_string_lossy().into_owned()])
-        .expect("spawn stdio mock")
-        .with_request_timeout(std::time::Duration::from_secs(5));
+    let conn = StdioConnection::spawn(
+        "stdio-mock",
+        "sh",
+        &[script.to_string_lossy().into_owned()],
+        &std::collections::BTreeMap::new(),
+    )
+    .expect("spawn stdio mock")
+    .with_request_timeout(std::time::Duration::from_secs(5));
     let client = McpClient::new("stdio-mock", Arc::new(conn));
 
     let info = client.initialize().await.expect("initialize");

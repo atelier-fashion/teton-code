@@ -2,9 +2,11 @@
 //!
 //! The config file declares providers, the phase → provider routing table, and
 //! privacy boundaries. It never holds a raw credential (BR-7): providers carry
-//! an `auth_ref` — a reference into the OS keychain — and [`Config::validate`]
-//! rejects any `auth_ref` that looks like a raw API key or token, pointing the
-//! user at keychain references instead.
+//! an `auth_ref` — a reference into the OS keychain (or an `env:`/`op://`
+//! reference) — and [`Config::validate`] accepts an `auth_ref` only if it matches
+//! a recognized reference form (a positive scheme allowlist), rejecting anything
+//! else — a raw key or a fake-scheme value — so a credential can never be
+//! persisted to a plaintext config.
 //!
 //! Validation error messages deliberately **never echo the offending
 //! credential value** — only the provider id — so a config error can be logged
@@ -45,16 +47,17 @@ pub enum ConfigError {
     #[error("provider '{0}' is defined more than once; provider ids must be unique")]
     DuplicateProvider(String),
 
-    /// An `auth_ref` looks like a raw credential rather than a keychain
-    /// reference. The message names only the provider, never the value.
+    /// An `auth_ref` is not a recognized credential *reference*. The message
+    /// names only the provider and the accepted forms, never the value.
     #[error(
-        "provider '{provider_id}': auth_ref looks like a raw API key or token. \
-         Config files must store only an OS-keychain reference \
-         (for example auth_ref = \"keychain:{provider_id}\"), never the credential itself. \
-         Put the secret in your OS keychain and reference it here (BR-7)."
+        "provider '{provider_id}': auth_ref is not a recognized credential reference. \
+         Config files must store only a reference to the secret, never the credential itself: \
+         use a keychain reference (\"keychain://<service>/<account>\" or \"keychain:{provider_id}\"), \
+         an environment reference (\"env:<VAR>\"), or a 1Password reference (\"op://<vault>/<item>\"). \
+         Put the secret in your OS keychain with `teton provider add` (BR-7)."
     )]
-    RawKeyInAuthRef {
-        /// The provider whose `auth_ref` is malformed.
+    UnrecognizedAuthRef {
+        /// The provider whose `auth_ref` is not a recognized reference.
         provider_id: String,
     },
 
@@ -132,8 +135,8 @@ impl Config {
                 return Err(ConfigError::DuplicateProvider(p.id.clone()));
             }
             if let Some(auth_ref) = &p.auth_ref {
-                if looks_like_raw_key(auth_ref) {
-                    return Err(ConfigError::RawKeyInAuthRef {
+                if !is_recognized_auth_ref(auth_ref) {
+                    return Err(ConfigError::UnrecognizedAuthRef {
                         provider_id: p.id.clone(),
                     });
                 }
@@ -180,64 +183,30 @@ pub enum LoadError {
     Validate(#[from] ConfigError),
 }
 
-/// Heuristic: does `value` look like a raw credential rather than a keychain
-/// reference?
+/// Whether `value` is a recognized credential *reference* (BR-7).
 ///
-/// It is intentionally conservative in favor of *rejecting* — a false positive
-/// costs the user a rewording toward a keychain ref, while a false negative
-/// could leak a secret into a config file (BR-7). It matches on two signals:
-/// known secret prefixes, and long unbroken high-entropy tokens that carry no
-/// scheme (`keychain:`) or path separator.
-fn looks_like_raw_key(value: &str) -> bool {
+/// A **positive scheme allowlist**: an `auth_ref` is valid only if it names one
+/// of the reference forms the daemon can resolve —
+///
+/// - a keychain reference: `keychain://<service>/<account>` (what the CLI emits)
+///   or the `keychain:<account>` shorthand,
+/// - an environment reference: `env:<VAR>`, or
+/// - a 1Password reference: `op://<vault>/<item>`.
+///
+/// Everything else is rejected: a raw `sk-...` key, a bare high-entropy token, or
+/// any `scheme:value` whose scheme is not on the list (e.g. `foo:AKIA...`). This
+/// replaces the old negative heuristic, which any value shorter than 40 chars or
+/// containing a `:`/`/` slipped past — letting a raw key be persisted to a
+/// plaintext config (REQ-544 MED-3). The reference body after the scheme must be
+/// non-empty (a bare `keychain:` or `env:` is not a valid reference).
+fn is_recognized_auth_ref(value: &str) -> bool {
+    // `keychain:` also matches the `keychain://` form, so listing it once covers
+    // both. Order does not matter — a value has at most one of these schemes.
+    const RECOGNIZED_SCHEMES: &[&str] = &["keychain:", "env:", "op://"];
     let v = value.trim();
-    if v.is_empty() {
-        return false;
-    }
-
-    // 1. Well-known secret prefixes used by common providers/vendors.
-    const KEY_PREFIXES: &[&str] = &[
-        "sk-",         // OpenAI / DeepSeek / Kimi / many OpenAI-compatible
-        "sk_",         // Stripe-style secret keys
-        "sk-ant-",     // Anthropic
-        "sk-proj-",    // OpenAI project keys
-        "rk_",         // restricted keys
-        "pk_live_",    // publishable-live
-        "ghp_",        // GitHub personal access token (classic)
-        "gho_",        // GitHub OAuth
-        "ghs_",        // GitHub server-to-server
-        "github_pat_", // GitHub fine-grained PAT
-        "xoxb-",       // Slack bot token
-        "xoxp-",       // Slack user token
-        "xapp-",       // Slack app token
-        "akia",        // AWS access key id
-        "asia",        // AWS temporary access key id
-        "aiza",        // Google API key
-        "ya29.",       // Google OAuth access token
-        "hf_",         // Hugging Face
-        "gsk_",        // Groq
-        "bearer ",     // an inlined Authorization header value
-    ];
-    let lower = v.to_ascii_lowercase();
-    if KEY_PREFIXES.iter().any(|p| lower.starts_with(p)) {
-        return true;
-    }
-
-    // 2. A valid keychain reference is either scheme-qualified (contains ':')
-    //    or a short bare identifier. Treat a long, unbroken, mixed
-    //    letters-and-digits token with no scheme/path separator as a raw key.
-    let has_separator = v.contains(':') || v.contains('/');
-    if !has_separator && v.len() >= 40 {
-        let token_charset = v
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '='));
-        let has_alpha = v.chars().any(|c| c.is_ascii_alphabetic());
-        let has_digit = v.chars().any(|c| c.is_ascii_digit());
-        if token_charset && has_alpha && has_digit {
-            return true;
-        }
-    }
-
-    false
+    RECOGNIZED_SCHEMES
+        .iter()
+        .any(|scheme| v.strip_prefix(scheme).is_some_and(|rest| !rest.is_empty()))
 }
 
 #[cfg(test)]
@@ -341,7 +310,7 @@ mod tests {
         let err = cfg.validate().unwrap_err();
         assert_eq!(
             err,
-            ConfigError::RawKeyInAuthRef {
+            ConfigError::UnrecognizedAuthRef {
                 provider_id: "anthropic-prod".to_owned()
             }
         );
@@ -377,27 +346,35 @@ mod tests {
             "AIzaSyD-EXAMPLEkeymaterial1234567890abcd",
             // Long unbroken high-entropy token, no scheme separator:
             "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0",
+            // REQ-544 MED-3: the shapes the old heuristic let through —
+            // a short key (<40 chars), and a `scheme:value` whose scheme is not
+            // recognized (a raw key wearing a fake scheme).
+            "AKIAIOSFODNN7EX",
+            "foo:AKIAIOSFODNN7EXAMPLE",
+            "keychain", // a scheme name with no `:` is not a reference
+            "env",
+            "keychain:", // a bare scheme with no body is not a reference
+            "env:",
         ] {
             assert!(
-                looks_like_raw_key(raw),
-                "should be treated as a raw key: {raw}"
+                !is_recognized_auth_ref(raw),
+                "should be rejected as a raw key / unrecognized reference: {raw}"
             );
         }
     }
 
     #[test]
-    fn keychain_references_are_accepted() {
+    fn recognized_references_are_accepted() {
         for good in [
-            "keychain:anthropic-prod",
+            "keychain://teton/anthropic", // the shape the CLI emits
+            "keychain:anthropic-prod",    // shorthand
             "keychain:my-openai-key",
-            "anthropic-prod", // short bare identifier
-            "prod_key",       // short, has underscore
-            "env:OPENAI_KEY", // scheme-qualified
-            "1password://vault/item",
+            "env:OPENAI_KEY",
+            "op://vault/item", // 1Password
         ] {
             assert!(
-                !looks_like_raw_key(good),
-                "keychain reference should be accepted: {good}"
+                is_recognized_auth_ref(good),
+                "recognized reference should be accepted: {good}"
             );
         }
     }
@@ -479,10 +456,10 @@ endpoint = "https://api.anthropic.com"
 auth_ref = "sk-ant-api03-not-a-keychain-ref-000000"
 "#;
         match Config::load(toml_text) {
-            Err(LoadError::Validate(ConfigError::RawKeyInAuthRef { provider_id })) => {
+            Err(LoadError::Validate(ConfigError::UnrecognizedAuthRef { provider_id })) => {
                 assert_eq!(provider_id, "anthropic-prod");
             }
-            other => panic!("expected RawKeyInAuthRef, got {other:?}"),
+            other => panic!("expected UnrecognizedAuthRef, got {other:?}"),
         }
     }
 

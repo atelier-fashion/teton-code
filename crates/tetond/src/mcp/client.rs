@@ -22,6 +22,7 @@
 //! the result that enters context. Either way, a boundary path a tool touched is
 //! never laundered to a remote provider (BR-1).
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -566,6 +567,38 @@ impl McpConnection for HttpConnection {
 // stdio transport — local, no egress
 // ---------------------------------------------------------------------------
 
+/// The env var names a spawned MCP server may inherit from the daemon — a
+/// positive allowlist of the essentials a subprocess needs to run, and nothing
+/// that could carry a credential (REQ-544 MED-2, BR-7). Provider API keys are
+/// not on the list, so they are never passed on.
+const MCP_BASE_ENV_ALLOW: &[&str] = &[
+    "PATH", "HOME", "TMPDIR", "TZ", "TERM", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE",
+    "LC_ALL", "LC_CTYPE",
+];
+
+/// Compose the minimal environment a spawned MCP server receives: the allowlisted
+/// essentials drawn from `daemon_vars`, then the per-server `declared` vars
+/// layered on top (a declared var may override a base one). Nothing outside the
+/// allowlist and the declared set is passed on — so the daemon's provider keys
+/// never reach the child (REQ-544 MED-2). Pure, so it is testable without a
+/// subprocess.
+fn compose_child_env<I>(
+    daemon_vars: I,
+    declared: &BTreeMap<String, String>,
+) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut env: BTreeMap<String, String> = daemon_vars
+        .into_iter()
+        .filter(|(k, _)| MCP_BASE_ENV_ALLOW.contains(&k.as_str()))
+        .collect();
+    for (k, v) in declared {
+        env.insert(k.clone(), v.clone());
+    }
+    env.into_iter().collect()
+}
+
 /// A local MCP server spawned as a subprocess, speaking newline-delimited
 /// JSON-RPC over its stdio.
 ///
@@ -591,10 +624,13 @@ struct StdioIo {
 impl StdioConnection {
     /// Spawn `command args…` as a local MCP server and connect to its stdio.
     ///
-    /// The child inherits the daemon's environment (an MCP server is a
-    /// user-declared, trusted program, often needing its own credentials — unlike
-    /// the model-driven `shell` tool, which scrubs). Per-server env scoping is a
-    /// post-MVP refinement.
+    /// The child gets a **minimal** environment (REQ-544 MED-2, BR-7): only the
+    /// PATH/HOME/locale essentials from the daemon's environment, plus the
+    /// per-server `env` the config declares. The daemon's provider API keys are
+    /// **never** inherited — a third-party `npx`/`uvx` package cannot read them.
+    /// (This is stricter than the `shell` tool's denylist scrub: an MCP server is
+    /// a user-declared program, but it still has no business seeing provider
+    /// credentials it did not declare.)
     ///
     /// # Errors
     /// Returns [`McpError::Startup`] if the process cannot be spawned or its pipes
@@ -603,10 +639,13 @@ impl StdioConnection {
         server_id: impl Into<String>,
         command: &str,
         args: &[String],
+        env: &BTreeMap<String, String>,
     ) -> Result<Self, McpError> {
         let server_id = server_id.into();
         let mut child = tokio::process::Command::new(command)
             .args(args)
+            .env_clear()
+            .envs(compose_child_env(std::env::vars(), env))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -999,5 +1038,81 @@ mod tests {
         assert!(call.1.contains("secrets/prod.env"));
         let init = calls.iter().find(|(m, _)| m == "initialize").unwrap();
         assert!(init.1.is_empty());
+    }
+
+    // ---- MED-2: a spawned MCP server gets a minimal, key-free environment ----
+
+    #[test]
+    fn compose_child_env_drops_provider_keys_and_keeps_essentials() {
+        // REQ-544 MED-2: the daemon's provider key must not reach the child; the
+        // essentials (and a declared per-server var) must.
+        let daemon_vars = vec![
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("HOME".to_owned(), "/home/x".to_owned()),
+            (
+                "ANTHROPIC_API_KEY".to_owned(),
+                "sk-should-not-leak".to_owned(),
+            ),
+            ("OPENAI_API_KEY".to_owned(), "sk-also-secret".to_owned()),
+            ("RANDOM_DAEMON_VAR".to_owned(), "nope".to_owned()),
+        ];
+        let mut declared = BTreeMap::new();
+        declared.insert("MY_SERVER_SETTING".to_owned(), "on".to_owned());
+
+        let env = compose_child_env(daemon_vars, &declared);
+        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(names.contains(&"PATH"));
+        assert!(names.contains(&"HOME"));
+        assert!(names.contains(&"MY_SERVER_SETTING"));
+        // Provider keys and un-allowlisted daemon vars are gone.
+        assert!(!names.contains(&"ANTHROPIC_API_KEY"));
+        assert!(!names.contains(&"OPENAI_API_KEY"));
+        assert!(!names.contains(&"RANDOM_DAEMON_VAR"));
+        // And the secret value appears nowhere.
+        assert!(!env.iter().any(|(_, v)| v.contains("should-not-leak")));
+    }
+
+    #[test]
+    fn a_declared_var_overrides_a_base_var() {
+        let daemon_vars = vec![("TERM".to_owned(), "xterm".to_owned())];
+        let mut declared = BTreeMap::new();
+        declared.insert("TERM".to_owned(), "dumb".to_owned());
+        let env = compose_child_env(daemon_vars, &declared);
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "TERM")
+                .map(|(_, v)| v.as_str()),
+            Some("dumb")
+        );
+    }
+
+    #[test]
+    fn a_real_subprocess_does_not_receive_a_provider_key() {
+        // The genuine article: apply the composed env to a real child and prove a
+        // provider key present in the daemon-vars set is absent in the child.
+        use std::process::Command;
+        let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned());
+        let daemon_vars = vec![
+            ("PATH".to_owned(), path),
+            (
+                "ANTHROPIC_API_KEY".to_owned(),
+                "sk-leak-me-XYZZY".to_owned(),
+            ),
+        ];
+        let composed = compose_child_env(daemon_vars, &BTreeMap::new());
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf 'start:%s:end' \"$ANTHROPIC_API_KEY\"")
+            .env_clear()
+            .envs(composed)
+            .output()
+            .expect("run child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout, "start::end",
+            "provider key leaked into the child env"
+        );
+        assert!(!stdout.contains("sk-leak-me-XYZZY"));
     }
 }
