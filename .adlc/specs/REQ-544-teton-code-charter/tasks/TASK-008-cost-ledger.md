@@ -1,7 +1,7 @@
 ---
 id: TASK-008
 title: "tetond cost ledger: CostRecord per call, attribution, savings baseline"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17

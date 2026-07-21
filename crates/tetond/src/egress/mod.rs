@@ -1,0 +1,1020 @@
+//! The single egress choke point (architecture D-2).
+//!
+//! Every byte that leaves this machine for a remote provider — or, per ADR-003,
+//! a remote MCP server — passes through here. This is the *only* place in the
+//! whole workspace that constructs a real HTTP client ([`HttpTransport`], built
+//! on `reqwest`); a CI deny-check ([`deny_http_client`]) fails the build if any
+//! other crate declares an HTTP-client crate among its **direct** manifest
+//! dependencies (it is a manifest-line scan, not a transitive `cargo tree`
+//! analysis — see that module's docs for the limitation). Because the provider
+//! crate carries no client of its own and only ever holds a `&dyn Transport`,
+//! "an adapter cannot reach the network except through egress" is a compile-time
+//! property, not a review convention.
+//!
+//! Three responsibilities converge here:
+//! - **BR-1 (privacy boundary)** — a request whose content provenance intersects
+//!   a `local-only` boundary is blocked before a single byte leaves; a
+//!   `privacy_block` event is emitted with the offending path, the provider, and
+//!   the action taken. Enforcement is provenance-based, not string-scanning; see
+//!   [`provenance`] and [`inspector`].
+//! - **BR-2 (cost)** — every *allowed* remote call is the hook where TASK-008
+//!   records a `CostRecord`. That seam is marked in [`Egress::send`].
+//! - **BR-7 (credentials)** — the adapter never sees a secret; the transport
+//!   attaches the resolved credential header ([`HttpTransport::with_endpoint_auth`]),
+//!   bound to the owning provider's endpoint so it can never leak onto an MCP or
+//!   cross-provider request.
+//!
+//! ## How provenance reaches egress
+//!
+//! The [`Transport`] trait (owned by `teton-providers`, and deliberately not
+//! modified by this crate) carries only method/url/headers/body — it has no
+//! channel for provenance, because provenance is a property of the *assembled
+//! context*, not of the raw request bytes. So the daemon's turn loop calls the
+//! richer [`Egress::send`], passing the [`Provenance`] of the context it
+//! assembled for that turn. For the adapter seam, [`Egress::scoped`] hands back a
+//! [`TurnTransport`]: a `Transport` whose `execute` runs the same guard against a
+//! baked-in per-turn provenance, so an adapter that only knows `&dyn Transport`
+//! is still enforced.
+//!
+//! ## Provenance is derived from files a tool TOUCHED (REQ-544 C-1)
+//!
+//! A tool result's provenance is the set of repo-relative paths the tool
+//! actually read or enumerated — the `read` path, `grep`'s matched files,
+//! `glob`'s enumerated files, an MCP call's path-shaped arguments — not a literal
+//! `path` argument. A tool whose touched files cannot be determined (`shell`
+//! runs an arbitrary command) reports **unknown** provenance, which this layer
+//! fail-closes: when any boundary is configured, a turn whose assembled context
+//! carries an unknown-provenance block is blocked from remote egress exactly like
+//! a boundary hit (see [`inspector::inspect`] and [`provenance::Provenance::is_unknown`]).
+//!
+//! ## The session-taint backstop (REQ-544 C-2)
+//!
+//! Provenance tracking is honest about *derived* content: a summary, snippet, or
+//! tool result computed from a `local-only` file inherits that file's provenance
+//! and is blocked ([`ContextBlock::derive`]). What per-request provenance cannot
+//! by itself cover is a model-generated **paraphrase of boundary content emitted
+//! in a LATER turn**: once a local model has read a secret, text it writes from
+//! its own memory carries no file provenance.
+//!
+//! The daemon closes that gap with a real **per-session taint** backstop
+//! (`crate::runtime`): once any tool result's provenance intersects a
+//! `local-only` boundary **or** is unknown, the session is marked tainted and
+//! *pinned to the local tier for every subsequent turn* — the router forces
+//! local regardless of phase policy or heuristic. And when a remote turn is
+//! blocked here mid-session, the daemon does not retry the blocked provider: it
+//! taints the session and re-runs that turn on the local tier (REQ-544 M-1),
+//! emitting exactly one `privacy_block`. So the residual paraphrase path is
+//! held local, not merely hoped about.
+//!
+//! ## Residual limits that remain
+//!
+//! A black-box MCP server that reads a boundary file via an argument that is
+//! neither a path-like key nor path-shaped (e.g. an opaque record id) still
+//! produces an under-tagged result; the taint backstop only catches it once some
+//! *other* signal (a path-shaped arg, an unknown `shell`, a boundary read) taints
+//! the session. Machines with no local tier cannot serve a tainted session at
+//! all — that turn fails closed with a specific privacy error rather than
+//! degrading the guarantee.
+
+pub mod inspector;
+pub mod provenance;
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures::StreamExt;
+
+use teton_core::boundary::BoundaryMatcher;
+use teton_core::entities::PrivacyBoundary;
+use teton_protocol::events::{Event, PrivacyAction, PrivacyBlock};
+use teton_protocol::{ProviderId, SessionId};
+use teton_providers::transport::{
+    ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
+};
+
+use crate::broadcast::EventBus;
+use crate::cost::{CostAttribution, CostMeter};
+
+pub use inspector::{inspect, Inspection, Violation};
+pub use provenance::{assembled_provenance, ContextBlock, Provenance};
+
+/// A failure at the egress choke point.
+///
+/// Every variant is content-free by construction — it carries at most a
+/// config-authored path, a provider id, an action, or a transport failure class.
+/// That is what makes error and telemetry paths safe under BR-1: an `EgressError`
+/// may be logged, serialized, or surfaced to a client without leaking a byte of
+/// boundary content.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EgressError {
+    /// A `local-only` boundary was about to be crossed; the request was refused
+    /// before any network activity. The offending `path` is safe to surface (it
+    /// is the boundary glob's target, not file content).
+    #[error(
+        "privacy boundary blocked egress of `{path}` to provider `{provider_id}` ({action:?})"
+    )]
+    PrivacyBlocked {
+        /// Repo-relative path of the boundary source that would have leaked.
+        path: String,
+        /// Provider the content would have reached.
+        provider_id: ProviderId,
+        /// What the choke point did instead.
+        action: PrivacyAction,
+    },
+    /// The underlying transport failed (before any HTTP status was known).
+    #[error("transport error: {0}")]
+    Transport(#[from] TransportError),
+    /// The configured privacy boundaries did not compile. Egress refuses
+    /// fail-closed rather than send content it cannot classify.
+    #[error("privacy boundaries failed to compile; egress refused fail-closed")]
+    BoundaryCompile,
+    /// The real HTTP client could not be initialized.
+    #[error("failed to initialize the HTTP client")]
+    ClientInit,
+}
+
+impl EgressError {
+    /// Collapse to a [`TransportError`] for the object-safe `Transport` seam.
+    ///
+    /// A privacy block manifests to an adapter as the dedicated,
+    /// **non-retryable** [`TransportError::PrivacyBlocked`] — never a
+    /// connect refusal — so it cannot be misclassified as a transient transport
+    /// fault and retried against the blocked provider (REQ-544 M-1). The
+    /// authoritative typed signal (this error) and the `privacy_block` event
+    /// carry the real reason; the daemon reroutes the turn to the local tier.
+    #[must_use]
+    pub fn into_transport_error(self) -> TransportError {
+        match self {
+            EgressError::Transport(t) => t,
+            EgressError::PrivacyBlocked { .. } => TransportError::PrivacyBlocked,
+            EgressError::ClientInit => TransportError::Connect,
+            EgressError::BoundaryCompile => TransportError::Io,
+        }
+    }
+}
+
+/// A sink for `privacy_block` events emitted by the choke point.
+///
+/// Abstracted so the choke point does not depend on the concrete daemon event
+/// bus (and so tests can capture emitted events). The daemon wires its
+/// [`EventBus`]; a [`NoopSink`] is available where events are irrelevant.
+pub trait PrivacyEventSink: Send + Sync {
+    /// Publish a `privacy_block` event, scoped to `session_id` when known.
+    fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock);
+}
+
+/// The production sink: broadcast to attached clients over the daemon event bus.
+impl PrivacyEventSink for EventBus {
+    fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock) {
+        self.publish(session_id, Event::PrivacyBlock(block));
+    }
+}
+
+/// A sink that drops events — for contexts with no subscribers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopSink;
+
+impl PrivacyEventSink for NoopSink {
+    fn privacy_block(&self, _session_id: Option<SessionId>, _block: PrivacyBlock) {}
+}
+
+/// Per-call context the choke point needs but the [`TransportRequest`] cannot
+/// carry: which provider the call targets, which session it belongs to, and the
+/// action to record if it is blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressContext {
+    /// Provider the request targets (named in any `privacy_block` event).
+    pub provider_id: ProviderId,
+    /// Owning session, when the call is session-scoped.
+    pub session_id: Option<SessionId>,
+    /// The action a block should report. Defaults to
+    /// [`PrivacyAction::ReroutedToLocal`]: the remote call is prevented and the
+    /// turn is to be served on the local tier.
+    pub block_action: PrivacyAction,
+    /// Billing attribution for this call (TASK-008, BR-2). When present *and* the
+    /// choke point holds a cost meter, an allowed forward is recorded as one
+    /// `CostRecord`; when absent, the call forwards unmetered (e.g. a
+    /// non-billable probe). Carries the phase and model the choke point cannot
+    /// otherwise know.
+    pub cost: Option<CostAttribution>,
+}
+
+impl EgressContext {
+    /// Context for `provider_id`, defaulting the block action to
+    /// [`PrivacyAction::ReroutedToLocal`] and no session scope.
+    #[must_use]
+    pub fn new(provider_id: impl Into<ProviderId>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            session_id: None,
+            block_action: PrivacyAction::ReroutedToLocal,
+            cost: None,
+        }
+    }
+
+    /// Scope the context to `session_id`.
+    #[must_use]
+    pub fn with_session(mut self, session_id: impl Into<SessionId>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Override the action reported on a block.
+    #[must_use]
+    pub fn with_action(mut self, action: PrivacyAction) -> Self {
+        self.block_action = action;
+        self
+    }
+
+    /// Attach billing attribution so an allowed forward is recorded as a
+    /// `CostRecord` (TASK-008, BR-2).
+    #[must_use]
+    pub fn with_cost(mut self, attribution: CostAttribution) -> Self {
+        self.cost = Some(attribution);
+        self
+    }
+}
+
+/// The egress choke point: a privacy/cost guard wrapping an inner [`Transport`].
+///
+/// In production `T` is [`HttpTransport`]; tests substitute a capturing transport
+/// so the egress-capture harness can assert that no boundary content ever reaches
+/// the wire. The guard is `T`-generic precisely so the same enforcement runs in
+/// front of the real client and the test double.
+pub struct Egress<T: Transport> {
+    inner: T,
+    boundaries: Vec<PrivacyBoundary>,
+    sink: Arc<dyn PrivacyEventSink>,
+    cost: Option<Arc<dyn CostMeter>>,
+}
+
+impl<T: Transport> Egress<T> {
+    /// Build a choke point over `inner`, enforcing `boundaries`, emitting
+    /// `privacy_block` events through `sink`.
+    #[must_use]
+    pub fn new(
+        inner: T,
+        boundaries: Vec<PrivacyBoundary>,
+        sink: Arc<dyn PrivacyEventSink>,
+    ) -> Self {
+        Self {
+            inner,
+            boundaries,
+            sink,
+            cost: None,
+        }
+    }
+
+    /// Install the cost meter (TASK-008): every allowed forward carrying a
+    /// [`CostAttribution`] is recorded as one `CostRecord` (BR-2). Additive —
+    /// a choke point without a meter forwards exactly as before.
+    #[must_use]
+    pub fn with_cost_meter(mut self, meter: Arc<dyn CostMeter>) -> Self {
+        self.cost = Some(meter);
+        self
+    }
+
+    /// The configured boundaries (read-only).
+    #[must_use]
+    pub fn boundaries(&self) -> &[PrivacyBoundary] {
+        &self.boundaries
+    }
+
+    /// Dispatch `request` for the context assembled with `provenance`.
+    ///
+    /// This is the choke point's primary API and the daemon's turn loop calls it.
+    /// If `provenance` intersects a boundary, the request is refused before any
+    /// network activity: a `privacy_block` event is emitted and
+    /// [`EgressError::PrivacyBlocked`] is returned. The `request` — whose body may
+    /// contain boundary bytes — is dropped, never forwarded, never logged.
+    /// Otherwise the request is forwarded to the inner transport.
+    pub async fn send(
+        &self,
+        request: TransportRequest,
+        provenance: &Provenance,
+        ctx: &EgressContext,
+    ) -> Result<TransportResponse, EgressError> {
+        // Fast path: content from no file, or no boundaries configured, can never
+        // intersect a boundary — skip building a matcher entirely.
+        if !provenance.is_empty() && !self.boundaries.is_empty() {
+            let matcher =
+                BoundaryMatcher::new(&self.boundaries).map_err(|_| EgressError::BoundaryCompile)?;
+            if let Inspection::Blocked(violation) = inspect(provenance, &matcher, ctx.block_action)
+            {
+                let block = PrivacyBlock {
+                    path: violation.path.clone(),
+                    provider_id: ctx.provider_id.clone(),
+                    action: violation.action,
+                };
+                self.sink.privacy_block(ctx.session_id.clone(), block);
+                return Err(EgressError::PrivacyBlocked {
+                    path: violation.path,
+                    provider_id: ctx.provider_id.clone(),
+                    action: violation.action,
+                });
+            }
+        }
+
+        // Cleared. TASK-008 wraps this forward to record a CostRecord (BR-2) from
+        // the streamed usage — the single point where every remote call is billed.
+        let response = self
+            .inner
+            .execute(request)
+            .await
+            .map_err(EgressError::Transport)?;
+        // Bill the call iff the caller attached attribution and a meter is
+        // installed; the meter wraps the response so recording happens from the
+        // streamed usage when the body drains.
+        match (&self.cost, &ctx.cost) {
+            (Some(meter), Some(attribution)) => Ok(meter.meter_response(
+                response,
+                ctx.session_id.clone(),
+                ctx.provider_id.clone(),
+                attribution.clone(),
+            )),
+            _ => Ok(response),
+        }
+    }
+
+    /// A per-turn, provenance-scoped [`Transport`] view for the adapter seam.
+    ///
+    /// Hand the returned `&dyn Transport` to an adapter: its `execute` runs the
+    /// same guard as [`Egress::send`] against `provenance`, so an adapter that
+    /// only knows `&dyn Transport` cannot bypass BR-1.
+    #[must_use]
+    pub fn scoped(&self, provenance: Provenance, ctx: EgressContext) -> TurnTransport<'_, T> {
+        TurnTransport {
+            egress: self,
+            provenance,
+            ctx,
+        }
+    }
+}
+
+/// A provenance-scoped `Transport` produced by [`Egress::scoped`].
+///
+/// Bridges the object-safe [`Transport`] seam (which cannot carry provenance) to
+/// the guarded [`Egress::send`] by baking in the current turn's provenance. A
+/// block still emits its `privacy_block` event; the adapter observes a
+/// transport-level refusal (see [`EgressError::into_transport_error`]).
+pub struct TurnTransport<'a, T: Transport> {
+    egress: &'a Egress<T>,
+    provenance: Provenance,
+    ctx: EgressContext,
+}
+
+#[async_trait]
+impl<T: Transport> Transport for TurnTransport<'_, T> {
+    async fn execute(
+        &self,
+        request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
+        self.egress
+            .send(request, &self.provenance, &self.ctx)
+            .await
+            .map_err(EgressError::into_transport_error)
+    }
+}
+
+/// A resolved credential bound to one provider endpoint (BR-7, REQ-544 M-3).
+///
+/// The credential headers are attached to an outbound request **only** when the
+/// request targets the bound origin. This is the cross-contamination guard: a
+/// provider's `x-api-key` / `Authorization: Bearer` can never ride along on an
+/// MCP request or a different provider's request, even if a transport were
+/// somehow reused across endpoints. The MCP egress path constructs a
+/// credential-free transport ([`HttpTransport::new`]) and so carries no auth at
+/// all.
+#[derive(Debug, Clone)]
+struct EndpointAuth {
+    /// The ASCII-serialized origin (`scheme://host[:port]`) the credential is
+    /// bound to, or `None` if the endpoint URL did not parse to a tuple origin
+    /// (in which case the credential is never attached — fail-closed).
+    origin: Option<String>,
+    /// The credential header(s) to attach for requests to `origin`.
+    headers: Vec<(String, String)>,
+}
+
+impl EndpointAuth {
+    fn new(endpoint: &str, headers: Vec<(String, String)>) -> Self {
+        Self {
+            origin: origin_of(endpoint),
+            headers,
+        }
+    }
+
+    /// The credential headers to attach for a request to `url`: the bound
+    /// headers when `url`'s origin matches, otherwise none.
+    fn headers_for(&self, url: &str) -> &[(String, String)] {
+        match (&self.origin, origin_of(url)) {
+            (Some(bound), Some(target)) if *bound == target => &self.headers,
+            _ => &[],
+        }
+    }
+}
+
+/// The ASCII origin (`scheme://host[:port]`) of `url`, or `None` when the URL
+/// does not parse to a tuple (network-addressable) origin.
+///
+/// Exposed within the crate so the daemon can reject an `auth_ref` provider whose
+/// endpoint would not bind a credential (REQ-544): a `None` here means
+/// [`HttpTransport::with_endpoint_auth`] would silently attach the header to
+/// nothing.
+pub(crate) fn origin_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let origin = parsed.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+/// The real, network-backed [`Transport`] — the sole HTTP client in the tree.
+///
+/// Wraps a single `reqwest::Client` (connection-pooled, cheap to clone). Adapters
+/// never construct this; the daemon builds one and hands it to [`Egress`]. Auth
+/// is attached here, not by adapters (BR-7): a resolved credential passed to
+/// [`HttpTransport::with_endpoint_auth`] is bound to that provider's endpoint and
+/// injected onto — and only onto — requests to that endpoint's origin. A
+/// transport built with [`HttpTransport::new`] carries no credential (the MCP
+/// egress path uses it, so MCP requests stay header-free).
+#[derive(Debug, Clone)]
+pub struct HttpTransport {
+    client: reqwest::Client,
+    injected: Option<EndpointAuth>,
+}
+
+impl HttpTransport {
+    /// Build a transport with a fresh HTTP client and no injected credential.
+    /// This is the MCP egress path's transport — it never carries provider auth.
+    pub fn new() -> Result<Self, EgressError> {
+        Self::build(None)
+    }
+
+    /// Build a transport that injects `headers` (a resolved provider credential,
+    /// BR-7) **only** onto requests whose URL targets `endpoint`'s origin. The
+    /// binding is what keeps a credential from leaking onto an MCP request or a
+    /// different provider's request (REQ-544 M-3).
+    pub fn with_endpoint_auth(
+        endpoint: &str,
+        headers: Vec<(String, String)>,
+    ) -> Result<Self, EgressError> {
+        Self::build(Some(EndpointAuth::new(endpoint, headers)))
+    }
+
+    fn build(injected: Option<EndpointAuth>) -> Result<Self, EgressError> {
+        // REQ-544 security (Low): do NOT auto-follow redirects. The daemon POSTs to
+        // a single known provider/MCP endpoint and needs no redirect handling.
+        // reqwest strips `Authorization` on a cross-host redirect but NOT custom
+        // credential headers like `x-api-key`, so following a redirect could carry
+        // a provider secret to an attacker-influenced host. Refusing redirects
+        // outright closes that path (the caller sees the 3xx and stops).
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| EgressError::ClientInit)?;
+        Ok(Self { client, injected })
+    }
+
+    /// The final outbound header list for a request to `url`: the adapter's
+    /// protocol headers plus the endpoint-bound credential headers, attached only
+    /// when `url` matches the bound origin. A credential header replaces any
+    /// protocol header of the same (case-insensitive) name, so injecting a header
+    /// the adapter also sets (e.g. `anthropic-version`) cannot produce a
+    /// duplicate. Exposed within the crate so the cross-contamination guarantee
+    /// (BR-7) is unit-testable without a network round-trip.
+    #[must_use]
+    pub(crate) fn outbound_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        let creds = self
+            .injected
+            .as_ref()
+            .map_or::<&[(String, String)], _>(&[], |a| a.headers_for(url));
+        let mut out = Vec::with_capacity(headers.len() + creds.len());
+        for (name, value) in headers {
+            let shadowed = creds.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
+            if !shadowed {
+                out.push((name.clone(), value.clone()));
+            }
+        }
+        out.extend(creds.iter().cloned());
+        out
+    }
+}
+
+#[async_trait]
+impl Transport for HttpTransport {
+    async fn execute(
+        &self,
+        request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
+        let method = match request.method {
+            HttpMethod::Post => reqwest::Method::POST,
+        };
+        let mut builder = self.client.request(method, &request.url);
+        for (name, value) in self.outbound_headers(&request.url, &request.headers) {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        let response = builder
+            .body(request.body)
+            .send()
+            .await
+            .map_err(|e| classify_reqwest_error(&e))?;
+
+        let status = response.status().as_u16();
+        let body: ByteStream = Box::pin(response.bytes_stream().map(|chunk| {
+            chunk
+                .map(|b| b.to_vec())
+                .map_err(|e| classify_reqwest_error(&e))
+        }));
+        Ok(TransportResponse { status, body })
+    }
+}
+
+/// Map a `reqwest` failure to the transport's closed error taxonomy. Note this
+/// classifies the *failure class* only — no URL, header, or body content is
+/// carried into the error (BR-1 / conventions: nothing content-bearing in logs).
+fn classify_reqwest_error(error: &reqwest::Error) -> TransportError {
+    if error.is_timeout() {
+        TransportError::Timeout
+    } else if error.is_connect() {
+        TransportError::Connect
+    } else {
+        TransportError::Io
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A `Transport` that records what it was asked to send and returns an empty
+    /// 200 — the unit-level stand-in for the network. (The integration harness in
+    /// `tests/egress_capture.rs` uses a fuller version.) The record lives behind a
+    /// shared `Arc` so a test can hold a handle after the transport is moved into
+    /// the [`Egress`].
+    #[derive(Default, Clone)]
+    struct CaptureTransport {
+        sent: Arc<Mutex<Vec<TransportRequest>>>,
+    }
+
+    #[async_trait]
+    impl Transport for CaptureTransport {
+        async fn execute(
+            &self,
+            request: TransportRequest,
+        ) -> Result<TransportResponse, TransportError> {
+            self.sent.lock().unwrap().push(request);
+            Ok(TransportResponse {
+                status: 200,
+                body: Box::pin(futures::stream::empty()),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingSink {
+        events: Mutex<Vec<PrivacyBlock>>,
+    }
+
+    impl PrivacyEventSink for CapturingSink {
+        fn privacy_block(&self, _session_id: Option<SessionId>, block: PrivacyBlock) {
+            self.events.lock().unwrap().push(block);
+        }
+    }
+
+    fn boundaries() -> Vec<PrivacyBoundary> {
+        use teton_core::entities::BoundaryMode;
+        vec![PrivacyBoundary {
+            path_glob: "secrets/**".to_owned(),
+            mode: BoundaryMode::LocalOnly,
+        }]
+    }
+
+    fn a_request(body: &str) -> TransportRequest {
+        TransportRequest {
+            method: HttpMethod::Post,
+            url: "https://api.example.com/v1/messages".to_owned(),
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clean_request_reaches_the_inner_transport() {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()));
+        let prov = Provenance::tainted_by("src/main.rs");
+        let ctx = EgressContext::new("anthropic");
+        let resp = egress
+            .send(a_request("public code"), &prov, &ctx)
+            .await
+            .expect("clean request allowed");
+        assert_eq!(resp.status, 200);
+        // The inner transport received exactly the forwarded request.
+        let forwarded = sent.lock().unwrap();
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].body, b"public code");
+    }
+
+    #[tokio::test]
+    async fn boundary_provenance_is_blocked_and_never_forwarded() {
+        let egress = Egress::new(
+            CaptureTransport::default(),
+            boundaries(),
+            Arc::new(CapturingSink::default()),
+        );
+        let prov = Provenance::tainted_by("secrets/prod.env");
+        let ctx = EgressContext::new("anthropic");
+        let err = egress
+            .send(a_request("API_KEY=super-secret-xyzzy"), &prov, &ctx)
+            .await
+            .expect_err("must be blocked");
+        match err {
+            EgressError::PrivacyBlocked {
+                path,
+                provider_id,
+                action,
+            } => {
+                assert_eq!(path, "secrets/prod.env");
+                assert_eq!(provider_id, ProviderId::from("anthropic"));
+                assert_eq!(action, PrivacyAction::ReroutedToLocal);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_block_emits_a_privacy_block_event() {
+        let sink = Arc::new(CapturingSink::default());
+        let egress = Egress::new(CaptureTransport::default(), boundaries(), sink.clone());
+        let prov = Provenance::tainted_by("secrets/prod.env");
+        let ctx = EgressContext::new("deepseek").with_session("sess-1");
+        let _ = egress.send(a_request("secret"), &prov, &ctx).await;
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, "secrets/prod.env");
+        assert_eq!(events[0].provider_id, ProviderId::from("deepseek"));
+        assert_eq!(events[0].action, PrivacyAction::ReroutedToLocal);
+    }
+
+    #[tokio::test]
+    async fn the_scoped_transport_enforces_the_boundary() {
+        let sink = Arc::new(CapturingSink::default());
+        let egress = Egress::new(CaptureTransport::default(), boundaries(), sink.clone());
+        let scoped = egress.scoped(
+            Provenance::tainted_by("secrets/prod.env"),
+            EgressContext::new("anthropic"),
+        );
+        // Adapter-style call through the object-safe seam.
+        let err = scoped
+            .execute(a_request("secret"))
+            .await
+            .expect_err("scoped transport must refuse");
+        // REQ-544 M-1: a block surfaces as the dedicated, non-retryable variant,
+        // never a connect refusal.
+        assert_eq!(err, TransportError::PrivacyBlocked);
+        // The event still fired even though the adapter only saw a transport error.
+        assert_eq!(sink.events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_provenance_is_always_allowed() {
+        let egress = Egress::new(
+            CaptureTransport::default(),
+            boundaries(),
+            Arc::new(CapturingSink::default()),
+        );
+        let ctx = EgressContext::new("anthropic");
+        let resp = egress
+            .send(a_request("system prompt only"), &Provenance::empty(), &ctx)
+            .await
+            .expect("empty provenance allowed");
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn egress_error_display_carries_no_content() {
+        // AC-4: the typed error is safe to log — path + provider + action only.
+        let err = EgressError::PrivacyBlocked {
+            path: "secrets/prod.env".to_owned(),
+            provider_id: ProviderId::from("anthropic"),
+            action: PrivacyAction::ReroutedToLocal,
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("secrets/prod.env"));
+        assert!(rendered.contains("anthropic"));
+        // Never any content bytes.
+        assert!(!rendered.contains("API_KEY"));
+    }
+
+    #[test]
+    fn privacy_blocked_maps_to_the_dedicated_non_retryable_transport_signal() {
+        // REQ-544 M-1: a privacy block must NOT collapse into TransportError::Connect
+        // (which would be classified transient and retried); it gets its own
+        // dedicated, non-retryable variant.
+        let err = EgressError::PrivacyBlocked {
+            path: "secrets/x".to_owned(),
+            provider_id: ProviderId::from("p"),
+            action: PrivacyAction::ReroutedToLocal,
+        };
+        assert_eq!(err.into_transport_error(), TransportError::PrivacyBlocked);
+        // ClientInit is unrelated and still a connect refusal.
+        assert_eq!(
+            EgressError::ClientInit.into_transport_error(),
+            TransportError::Connect
+        );
+    }
+
+    const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+    const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/v1/chat/completions";
+    const MCP_ENDPOINT: &str = "https://mcp.example.com/rpc";
+    const SECRET: &str = "sk-ant-SUPER-SECRET-xyzzy";
+
+    /// The auth header injected for the Anthropic provider (mirrors the daemon's
+    /// `provider_auth_headers`). The `anthropic-version` here is deliberately a
+    /// *different* value than the adapter's to prove the injected one wins.
+    fn anthropic_creds() -> Vec<(String, String)> {
+        vec![
+            ("x-api-key".to_owned(), SECRET.to_owned()),
+            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+        ]
+    }
+
+    /// The adapter's protocol headers for an Anthropic request.
+    fn anthropic_protocol_headers() -> Vec<(String, String)> {
+        vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("accept".to_owned(), "text/event-stream".to_owned()),
+            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+        ]
+    }
+
+    fn header_names(headers: &[(String, String)]) -> Vec<String> {
+        headers
+            .iter()
+            .map(|(n, _)| n.to_ascii_lowercase())
+            .collect()
+    }
+
+    #[test]
+    fn a_provider_credential_reaches_only_its_owning_endpoint() {
+        // REQ-544 M-3 / BR-7 cross-contamination guard: a credential bound to the
+        // Anthropic endpoint must appear on a request to that endpoint and NEVER
+        // on a request to an MCP endpoint or a different provider's endpoint.
+        let transport = HttpTransport::with_endpoint_auth(ANTHROPIC_ENDPOINT, anthropic_creds())
+            .expect("build endpoint-bound transport");
+
+        // 1. The owning endpoint receives the credential.
+        let owning = transport.outbound_headers(ANTHROPIC_ENDPOINT, &anthropic_protocol_headers());
+        assert!(
+            owning
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("x-api-key") && v == SECRET),
+            "the owning provider endpoint must carry x-api-key"
+        );
+
+        // 2. An MCP request through the same transport gets NO credential and no
+        //    trace of the secret anywhere.
+        let mcp = transport.outbound_headers(
+            MCP_ENDPOINT,
+            &[("content-type".to_owned(), "application/json".to_owned())],
+        );
+        assert!(
+            !header_names(&mcp).iter().any(|n| n == "x-api-key"),
+            "MCP request must never carry the provider credential header"
+        );
+        assert!(
+            !mcp.iter().any(|(_, v)| v.contains(SECRET)),
+            "the secret must never appear on an MCP request"
+        );
+
+        // 3. A different provider's endpoint likewise never sees the credential.
+        let other = transport.outbound_headers(
+            DEEPSEEK_ENDPOINT,
+            &[("content-type".to_owned(), "application/json".to_owned())],
+        );
+        assert!(
+            !other.iter().any(|(_, v)| v.contains(SECRET)),
+            "the secret must never appear on another provider's request"
+        );
+    }
+
+    #[test]
+    fn an_injected_header_replaces_a_duplicate_protocol_header() {
+        // Injecting `anthropic-version` (which the adapter also sets) must not
+        // produce two copies on the wire — the injected credential-layer header
+        // wins, case-insensitively.
+        let transport = HttpTransport::with_endpoint_auth(ANTHROPIC_ENDPOINT, anthropic_creds())
+            .expect("build transport");
+        let out = transport.outbound_headers(ANTHROPIC_ENDPOINT, &anthropic_protocol_headers());
+        let version_count = out
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("anthropic-version"))
+            .count();
+        assert_eq!(
+            version_count, 1,
+            "anthropic-version must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn a_credential_free_transport_never_injects_anything() {
+        // The MCP egress path builds this transport: it must add no headers of
+        // its own to any request, to any endpoint.
+        let transport = HttpTransport::new().expect("build credential-free transport");
+        let protocol = vec![("content-type".to_owned(), "application/json".to_owned())];
+        let out = transport.outbound_headers(MCP_ENDPOINT, &protocol);
+        assert_eq!(
+            out, protocol,
+            "no credential-free transport may inject headers"
+        );
+    }
+
+    #[test]
+    fn origin_matching_ignores_the_path_but_distinguishes_host() {
+        // Same origin, different path -> still the owning endpoint (a provider's
+        // base URL and its /v1/... path share an origin).
+        let transport =
+            HttpTransport::with_endpoint_auth("https://api.anthropic.com", anthropic_creds())
+                .expect("build transport");
+        let same_origin = transport.outbound_headers(ANTHROPIC_ENDPOINT, &[]);
+        assert!(same_origin.iter().any(|(n, _)| n == "x-api-key"));
+        // A look-alike host must not match.
+        let evil =
+            transport.outbound_headers("https://api-anthropic.com.evil.test/v1/messages", &[]);
+        assert!(!evil.iter().any(|(n, _)| n == "x-api-key"));
+    }
+}
+
+/// CI deny-check: the egress choke point must be the workspace's *only* HTTP
+/// client (BR-1). Runs under `cargo test --workspace` — the same command CI's
+/// test step invokes — so a regression fails the build, not just review.
+///
+/// ## Scope and limitation (REQ-544 minor — honest docs)
+///
+/// This check reads each sibling crate's `Cargo.toml` and scans its **directly
+/// declared** shipping dependencies (`[dependencies]` / `[build-dependencies]`)
+/// for a known HTTP-client crate. It is a small hand parser, **not** a
+/// `cargo tree` / cargo-deny transitive analysis: it catches the realistic
+/// regression — someone adding `reqwest` to a crate that should stay
+/// transport-free — but it would **not** catch an HTTP client pulled in
+/// *transitively* by some other direct dependency. Closing that residual gap
+/// needs a real transitive check (e.g. `cargo deny` banned-crates, or parsing
+/// `cargo tree`) in CI; this in-tree test deliberately trades that coverage for
+/// zero extra dependencies and a fast, hermetic unit test.
+#[cfg(test)]
+mod deny_http_client {
+    use std::path::{Path, PathBuf};
+
+    /// Crate names that mean "this crate can open a network connection itself".
+    /// Only `tetond` (this crate) is permitted any of them.
+    const HTTP_CLIENT_CRATES: &[&str] = &[
+        "reqwest",
+        "hyper",
+        "hyper-util",
+        "isahc",
+        "ureq",
+        "curl",
+        "surf",
+        "attohttpc",
+        "http-client",
+        "actix-web",
+        "awc",
+    ];
+
+    /// `<workspace>/crates`, derived from this crate's manifest dir.
+    fn crates_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tetond lives under <workspace>/crates")
+            .to_path_buf()
+    }
+
+    /// The crate names a manifest lists as *shipping* dependencies — `[dependencies]`
+    /// and `[build-dependencies]`, inline or sub-table form. Comments and
+    /// `[dev-dependencies]` are ignored (test-only clients cannot ship). This is a
+    /// deliberately small hand parser so the check needs no toml dependency; it
+    /// covers the manifest shapes this workspace actually uses.
+    fn shipping_dependency_names(manifest: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut in_deps = false;
+        for raw in manifest.lines() {
+            let line = match raw.find('#') {
+                Some(i) => &raw[..i],
+                None => raw,
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let (Some(true), Some(true)) = (
+                line.chars().next().map(|c| c == '['),
+                line.chars().last().map(|c| c == ']'),
+            ) {
+                let section = line[1..line.len() - 1].trim();
+                in_deps = false;
+                if section == "dependencies" || section == "build-dependencies" {
+                    in_deps = true;
+                } else if let Some(crate_name) = section
+                    .strip_prefix("dependencies.")
+                    .or_else(|| section.strip_prefix("build-dependencies."))
+                {
+                    // Sub-table form `[dependencies.foo]` names one crate; its body
+                    // lines are that crate's fields, not new dependencies.
+                    names.push(crate_name.trim().to_owned());
+                }
+                continue;
+            }
+            if in_deps {
+                let key = line
+                    .split(['=', '.', ' ', '\t'])
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !key.is_empty() {
+                    names.push(key.to_owned());
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn only_tetond_may_depend_on_an_http_client() {
+        let dir = crates_dir();
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read crates dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "tetond" {
+                continue; // the one crate allowed to hold the client
+            }
+            let manifest_path = entry.path().join("Cargo.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let manifest = std::fs::read_to_string(&manifest_path).expect("read manifest");
+            for dep in shipping_dependency_names(&manifest) {
+                if HTTP_CLIENT_CRATES.contains(&dep.as_str()) {
+                    offenders.push(format!("crate `{name}` declares HTTP client `{dep}`"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "BR-1 requires the egress choke point be the ONLY HTTP client in the \
+             workspace. Move network access behind `tetond`'s egress. Offenders: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn tetond_itself_declares_the_sole_http_client() {
+        // Positive control: proves the client is actually wired here and that the
+        // deny-list would fire if `tetond` were not the skipped crate.
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let manifest = std::fs::read_to_string(manifest_path).expect("read tetond manifest");
+        let names = shipping_dependency_names(&manifest);
+        assert!(
+            names
+                .iter()
+                .any(|n| HTTP_CLIENT_CRATES.contains(&n.as_str())),
+            "tetond must construct the sole HTTP client (reqwest)"
+        );
+    }
+
+    #[test]
+    fn parser_finds_inline_dependencies_but_ignores_comments_and_dev_deps() {
+        let manifest = "\
+[package]
+name = \"x\"
+
+[dependencies]
+serde = \"1\"
+# reqwest = \"0.12\"  <- a comment, must be ignored
+teton-core = { path = \"../teton-core\" }
+
+[dependencies.tokio]
+version = \"1\"
+features = [\"macros\"]
+
+[dev-dependencies]
+reqwest = \"0.12\"
+";
+        let names = shipping_dependency_names(manifest);
+        assert!(names.contains(&"serde".to_owned()));
+        assert!(names.contains(&"teton-core".to_owned()));
+        assert!(names.contains(&"tokio".to_owned()));
+        // The commented and dev-only reqwest must NOT appear.
+        assert!(!names.contains(&"reqwest".to_owned()));
+    }
+
+    #[test]
+    fn parser_catches_a_planted_shipping_client() {
+        let manifest = "[dependencies]\nserde = \"1\"\nhyper = { version = \"1\" }\n";
+        let names = shipping_dependency_names(manifest);
+        assert!(names.contains(&"hyper".to_owned()));
+    }
+}

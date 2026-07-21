@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 title: "teton-providers: adapter trait, Anthropic + OpenAI-compatible"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17
@@ -26,11 +26,11 @@ failure-classified fallback (AC-7 groundwork).
 
 ## Acceptance Criteria
 
-- [ ] Both adapters pass a shared conformance test suite against recorded/mock transports (streaming deltas, tool-call assembly, usage extraction)
-- [ ] Adapters cannot perform I/O without a `Transport` (compile-time: no http client deps in this crate) (informed by D-2)
-- [ ] Malformed tool-call JSON from a provider is classified and surfaced, never panics
-- [ ] Fallback decision logic unit-tested per failure class (AC-7 backend)
-- [ ] Token usage populated on every completed turn (BR-2 dependency)
+- [x] Both adapters pass a shared conformance test suite against recorded/mock transports (streaming deltas, tool-call assembly, usage extraction)
+- [x] Adapters cannot perform I/O without a `Transport` (compile-time: no http client deps in this crate) (informed by D-2)
+- [x] Malformed tool-call JSON from a provider is classified and surfaced, never panics
+- [x] Fallback decision logic unit-tested per failure class (AC-7 backend)
+- [x] Token usage populated on every completed turn (BR-2 dependency)
 
 ## Technical Notes
 

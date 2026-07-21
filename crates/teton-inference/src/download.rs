@@ -1,0 +1,497 @@
+//! Resumable, checksum-verified GGUF download with progress events.
+//!
+//! The transport is abstracted behind [`RangeFetcher`] (a byte-range GET) so the
+//! resume/verify/retry orchestration is testable against in-memory fakes and the
+//! crate takes on no HTTP dependency — the daemon supplies the real fetcher.
+//!
+//! Guarantees exercised by the tests and required by the task ACs:
+//! - **Resume after interruption.** A partially-written file is continued from
+//!   its current length rather than restarted; progress is reported as
+//!   `downloaded_bytes` on a `model_lifecycle` `Download` event.
+//! - **Checksum verification.** After the file reaches its expected size its
+//!   SHA-256 is compared to the catalog value; a mismatch discards the file and
+//!   re-fetches from scratch, up to a bounded number of attempts.
+
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
+
+use crate::catalog::ModelEntry;
+use crate::hash;
+use crate::lifecycle::LifecycleEvent;
+
+/// A failure during download.
+#[derive(Debug, thiserror::Error)]
+pub enum DownloadError {
+    /// A local filesystem error.
+    #[error("download I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A recoverable transport interruption. Any bytes already handed to the
+    /// sink are durably written, so the download resumes from there.
+    #[error("transport error while fetching model: {0}")]
+    Transport(String),
+    /// The completed file's checksum did not match, even after re-fetching.
+    #[error("checksum mismatch after {attempts} attempt(s): expected {expected}, got {actual}")]
+    Checksum {
+        /// Expected lowercase-hex SHA-256.
+        expected: String,
+        /// Actual lowercase-hex SHA-256 of the last attempt.
+        actual: String,
+        /// How many full download attempts were made.
+        attempts: u32,
+    },
+    /// The transport made no progress across repeated resume attempts.
+    #[error("transport stalled after {attempts} resume attempts with no progress")]
+    Stalled {
+        /// Consecutive no-progress attempts before giving up.
+        attempts: u32,
+    },
+    /// The stream delivered more bytes than the catalog size — a corrupt source.
+    #[error("downloaded {actual} bytes exceeds the catalog size of {expected}")]
+    Oversized {
+        /// Catalog-declared size.
+        expected: u64,
+        /// Bytes written before the overflow was detected.
+        actual: u64,
+    },
+}
+
+impl DownloadError {
+    /// Whether this error is a resumable transport interruption.
+    fn is_resumable(&self) -> bool {
+        matches!(self, DownloadError::Transport(_))
+    }
+}
+
+/// A byte-range fetch transport.
+pub trait RangeFetcher {
+    /// Stream the bytes of `url` starting at byte `offset`, invoking `sink` for
+    /// each chunk in order.
+    ///
+    /// Returns the resource's total length. Returning
+    /// [`DownloadError::Transport`] models a mid-transfer interruption: any bytes
+    /// already passed to `sink` are considered durably written by the caller, and
+    /// a later call with a higher `offset` resumes.
+    ///
+    /// # Errors
+    /// Returns a [`DownloadError`] on transport failure or if `sink` errors.
+    fn fetch(
+        &self,
+        url: &str,
+        offset: u64,
+        sink: &mut dyn FnMut(&[u8]) -> Result<(), DownloadError>,
+    ) -> Result<u64, DownloadError>;
+}
+
+/// Tuning for the download orchestration.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadConfig {
+    /// How many times to re-fetch from scratch on a checksum mismatch before
+    /// giving up.
+    pub max_checksum_retries: u32,
+    /// How many consecutive no-progress transport interruptions to tolerate
+    /// before declaring the download stalled.
+    pub max_stall_retries: u32,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            max_checksum_retries: 2,
+            max_stall_retries: 5,
+        }
+    }
+}
+
+/// Orchestrates a resumable, verified download over a [`RangeFetcher`].
+pub struct Downloader<'a> {
+    fetcher: &'a dyn RangeFetcher,
+    config: DownloadConfig,
+}
+
+impl<'a> Downloader<'a> {
+    /// A downloader over `fetcher` with default tuning.
+    pub fn new(fetcher: &'a dyn RangeFetcher) -> Self {
+        Self {
+            fetcher,
+            config: DownloadConfig::default(),
+        }
+    }
+
+    /// A downloader over `fetcher` with explicit tuning.
+    pub fn with_config(fetcher: &'a dyn RangeFetcher, config: DownloadConfig) -> Self {
+        Self { fetcher, config }
+    }
+
+    /// Fetch `model` to `dest`, resuming any partial file, verifying its SHA-256,
+    /// and reporting progress through `on_event`.
+    ///
+    /// # Errors
+    /// Returns a [`DownloadError`] if the transport stalls, the checksum keeps
+    /// mismatching, the source oversends, or a filesystem error occurs.
+    pub fn fetch(
+        &self,
+        model: &ModelEntry,
+        dest: &Path,
+        on_event: &mut dyn FnMut(LifecycleEvent),
+    ) -> Result<(), DownloadError> {
+        let attempts = self.config.max_checksum_retries + 1;
+        for attempt in 1..=attempts {
+            self.download_once(model, dest, on_event)?;
+
+            let actual = hash::sha256_file(dest)?;
+            if actual == model.sha256 {
+                return Ok(());
+            }
+
+            // Corrupt download: discard and (if attempts remain) re-fetch clean.
+            std::fs::remove_file(dest).ok();
+            if attempt == attempts {
+                return Err(DownloadError::Checksum {
+                    expected: model.sha256.clone(),
+                    actual,
+                    attempts,
+                });
+            }
+        }
+        // Unreachable: the loop returns on the final attempt.
+        unreachable!("download retry loop always returns on the final attempt")
+    }
+
+    /// Fetch bytes until `dest` reaches `model.size_bytes`, resuming across
+    /// transport interruptions. Does not verify the checksum.
+    fn download_once(
+        &self,
+        model: &ModelEntry,
+        dest: &Path,
+        on_event: &mut dyn FnMut(LifecycleEvent),
+    ) -> Result<(), DownloadError> {
+        let mut written = current_len(dest)?;
+        // A partial file longer than expected is corrupt; start over.
+        if written > model.size_bytes {
+            std::fs::remove_file(dest).ok();
+            written = 0;
+        }
+
+        let mut stalls = 0u32;
+        while written < model.size_bytes {
+            let before = written;
+            let mut file = OpenOptions::new().create(true).append(true).open(dest)?;
+
+            let result = self.fetcher.fetch(&model.url, written, &mut |chunk| {
+                file.write_all(chunk)?;
+                written += chunk.len() as u64;
+                if written > model.size_bytes {
+                    return Err(DownloadError::Oversized {
+                        expected: model.size_bytes,
+                        actual: written,
+                    });
+                }
+                on_event(LifecycleEvent::Download {
+                    model_id: model.name.clone(),
+                    downloaded_bytes: written,
+                    total_bytes: Some(model.size_bytes),
+                });
+                Ok(())
+            });
+            file.flush()?;
+            drop(file);
+
+            match result {
+                Ok(_total) => {
+                    // The transport streamed to its end for this call. If that
+                    // still leaves us short (a truncated response), the loop will
+                    // resume from the new offset; if no progress was made, count
+                    // it as a stall to guarantee termination.
+                    if written == before {
+                        stalls += 1;
+                        if stalls > self.config.max_stall_retries {
+                            return Err(DownloadError::Stalled { attempts: stalls });
+                        }
+                    } else {
+                        stalls = 0;
+                    }
+                }
+                Err(err) if err.is_resumable() => {
+                    if written == before {
+                        stalls += 1;
+                        if stalls > self.config.max_stall_retries {
+                            return Err(DownloadError::Stalled { attempts: stalls });
+                        }
+                    } else {
+                        stalls = 0;
+                    }
+                    // Loop: resume from the durably-written offset.
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Current length of `path`, or `0` if it does not exist yet.
+fn current_len(path: &Path) -> Result<u64, DownloadError> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ModelEntry, TierBand};
+    use std::cell::Cell;
+
+    fn model_for(data: &[u8]) -> ModelEntry {
+        ModelEntry {
+            name: "test-model".to_owned(),
+            url: "https://example.test/model.gguf".to_owned(),
+            sha256: hash::sha256_hex(data),
+            size_bytes: data.len() as u64,
+            ram_floor_bytes: 0,
+            band: TierBand::Small,
+        }
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        // Unique per test + process to avoid cross-test collisions.
+        p.push(format!("teton-dl-{tag}-{}.part", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Streams the whole resource from `offset` in one shot.
+    struct WholeFetcher {
+        data: Vec<u8>,
+    }
+    impl RangeFetcher for WholeFetcher {
+        fn fetch(
+            &self,
+            _url: &str,
+            offset: u64,
+            sink: &mut dyn FnMut(&[u8]) -> Result<(), DownloadError>,
+        ) -> Result<u64, DownloadError> {
+            let start = offset as usize;
+            if start < self.data.len() {
+                sink(&self.data[start..])?;
+            }
+            Ok(self.data.len() as u64)
+        }
+    }
+
+    /// Streams `cutoff` bytes from `offset` then interrupts, once; thereafter
+    /// streams to the end. Models a dropped connection mid-transfer.
+    struct FlakyFetcher {
+        data: Vec<u8>,
+        cutoff: usize,
+        interrupted: Cell<bool>,
+    }
+    impl RangeFetcher for FlakyFetcher {
+        fn fetch(
+            &self,
+            _url: &str,
+            offset: u64,
+            sink: &mut dyn FnMut(&[u8]) -> Result<(), DownloadError>,
+        ) -> Result<u64, DownloadError> {
+            let start = offset as usize;
+            if !self.interrupted.get() {
+                self.interrupted.set(true);
+                let end = self.cutoff.min(self.data.len());
+                if start < end {
+                    sink(&self.data[start..end])?;
+                }
+                return Err(DownloadError::Transport(
+                    "simulated connection drop".to_owned(),
+                ));
+            }
+            if start < self.data.len() {
+                sink(&self.data[start..])?;
+            }
+            Ok(self.data.len() as u64)
+        }
+    }
+
+    /// Serves `corrupt` bytes on the first full download and `good` bytes after,
+    /// exercising the checksum-mismatch discard-and-refetch path.
+    struct CorruptThenGoodFetcher {
+        good: Vec<u8>,
+        corrupt: Vec<u8>,
+        calls: Cell<u32>,
+    }
+    impl RangeFetcher for CorruptThenGoodFetcher {
+        fn fetch(
+            &self,
+            _url: &str,
+            offset: u64,
+            sink: &mut dyn FnMut(&[u8]) -> Result<(), DownloadError>,
+        ) -> Result<u64, DownloadError> {
+            let first = self.calls.get() == 0;
+            self.calls.set(self.calls.get() + 1);
+            let data = if first { &self.corrupt } else { &self.good };
+            let start = offset as usize;
+            if start < data.len() {
+                sink(&data[start..])?;
+            }
+            Ok(data.len() as u64)
+        }
+    }
+
+    #[test]
+    fn downloads_and_verifies_checksum() {
+        let data: Vec<u8> = (0u8..251).cycle().take(4096).collect();
+        let model = model_for(&data);
+        let fetcher = WholeFetcher { data: data.clone() };
+        let dest = temp_path("whole");
+
+        let mut events = Vec::new();
+        Downloader::new(&fetcher)
+            .fetch(&model, &dest, &mut |e| events.push(e))
+            .expect("download succeeds");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, LifecycleEvent::Download { .. })));
+        // The final progress event reports the full size.
+        match events.last().unwrap() {
+            LifecycleEvent::Download {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => {
+                assert_eq!(*downloaded_bytes, data.len() as u64);
+                assert_eq!(*total_bytes, Some(data.len() as u64));
+            }
+            other => panic!("expected a Download event last, got {other:?}"),
+        }
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[test]
+    fn resumes_after_an_interruption() {
+        let data: Vec<u8> = (0u8..97).cycle().take(3000).collect();
+        let model = model_for(&data);
+        let fetcher = FlakyFetcher {
+            data: data.clone(),
+            cutoff: 1200,
+            interrupted: Cell::new(false),
+        };
+        let dest = temp_path("resume");
+
+        let mut max_seen = 0u64;
+        Downloader::new(&fetcher)
+            .fetch(&model, &dest, &mut |e| {
+                if let LifecycleEvent::Download {
+                    downloaded_bytes, ..
+                } = e
+                {
+                    max_seen = max_seen.max(downloaded_bytes);
+                }
+            })
+            .expect("download resumes and completes");
+
+        // The fetcher was interrupted once and the second call resumed.
+        assert!(fetcher.interrupted.get());
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert_eq!(max_seen, data.len() as u64);
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[test]
+    fn resume_continues_a_preexisting_partial_file() {
+        let data: Vec<u8> = (0u8..131).cycle().take(2500).collect();
+        let model = model_for(&data);
+        let dest = temp_path("preexisting");
+        // Simulate a prior run that wrote the first 1000 bytes.
+        std::fs::write(&dest, &data[..1000]).unwrap();
+
+        let fetcher = WholeFetcher { data: data.clone() };
+        let mut first_offset_seen = None;
+        Downloader::new(&fetcher)
+            .fetch(&model, &dest, &mut |e| {
+                if let LifecycleEvent::Download {
+                    downloaded_bytes, ..
+                } = e
+                {
+                    first_offset_seen.get_or_insert(downloaded_bytes);
+                }
+            })
+            .expect("download completes from the partial file");
+
+        // The very first progress report is already past the pre-existing bytes,
+        // proving the download resumed rather than restarted.
+        assert!(first_offset_seen.unwrap() > 1000);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[test]
+    fn checksum_mismatch_discards_and_refetches() {
+        let good: Vec<u8> = (0u8..211).cycle().take(2048).collect();
+        let corrupt: Vec<u8> = std::iter::repeat_n(0xFFu8, good.len()).collect();
+        let model = model_for(&good); // sha is of the good data
+        let fetcher = CorruptThenGoodFetcher {
+            good: good.clone(),
+            corrupt,
+            calls: Cell::new(0),
+        };
+        let dest = temp_path("checksum");
+
+        Downloader::new(&fetcher)
+            .fetch(&model, &dest, &mut |_| {})
+            .expect("second fetch produces a matching checksum");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), good);
+        // First (corrupt) + second (good) full downloads.
+        assert_eq!(fetcher.calls.get(), 2);
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[test]
+    fn persistent_checksum_mismatch_errors_out() {
+        let good: Vec<u8> = (0u8..251).cycle().take(1024).collect();
+        // A fetcher that always serves corrupt bytes.
+        struct AlwaysCorrupt {
+            len: usize,
+        }
+        impl RangeFetcher for AlwaysCorrupt {
+            fn fetch(
+                &self,
+                _url: &str,
+                offset: u64,
+                sink: &mut dyn FnMut(&[u8]) -> Result<(), DownloadError>,
+            ) -> Result<u64, DownloadError> {
+                let bytes = vec![0u8; self.len];
+                let start = offset as usize;
+                if start < bytes.len() {
+                    sink(&bytes[start..])?;
+                }
+                Ok(self.len as u64)
+            }
+        }
+        let model = model_for(&good);
+        let fetcher = AlwaysCorrupt { len: good.len() };
+        let dest = temp_path("always-corrupt");
+
+        let err = Downloader::with_config(
+            &fetcher,
+            DownloadConfig {
+                max_checksum_retries: 1,
+                max_stall_retries: 5,
+            },
+        )
+        .fetch(&model, &dest, &mut |_| {})
+        .unwrap_err();
+
+        match err {
+            DownloadError::Checksum { attempts, .. } => assert_eq!(attempts, 2),
+            other => panic!("expected Checksum error, got {other:?}"),
+        }
+        // The corrupt file is discarded, not left behind.
+        assert!(!dest.exists());
+    }
+}

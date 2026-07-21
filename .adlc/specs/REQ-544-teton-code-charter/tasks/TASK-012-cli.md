@@ -1,7 +1,7 @@
 ---
 id: TASK-012
 title: "teton CLI: interactive sessions, config, cost meter, first-run"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17
@@ -31,6 +31,7 @@ model download with progress). Front half of AC-1/AC-2/AC-4.
 - [ ] Session end prints cost summary; `teton cost` shows per-phase attribution and labeled savings estimate (AC-4)
 - [ ] Permission prompts render and round-trip; "always" grants are session-scoped
 - [ ] `route_decided`, `privacy_block`, `provider_degraded` events render as visible one-line notices (control = legibility)
+- [ ] Tests: rendering unit-tested via the rendering trait against scripted event streams (session, permission round-trip, cost summary, first-run progress); command tree covered by `clap` parse tests; keychain module behind a trait with a mock for CI (no real keychain in tests)
 
 ## Technical Notes
 

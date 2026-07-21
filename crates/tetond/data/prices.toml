@@ -1,0 +1,95 @@
+# Teton Code provider price table.
+#
+# Versioned *data*, not code (mirrors `teton-inference/data/models.toml`): the
+# daemon can drop in a newer table — bumping `version` — without a `tetond`
+# release. Each entry maps a (provider_id, model) pair to its per-million-token
+# price, expressed in integer micro-USD so money never rounds through a float.
+#
+#   input_usd_micros_per_mtok  = micro-USD charged per 1,000,000 input tokens
+#   output_usd_micros_per_mtok = micro-USD charged per 1,000,000 output tokens
+#
+# So a $15 / Mtok input rate is 15_000_000 micro-USD. A single call's cost is
+#   input_tokens  * input_rate  / 1_000_000
+# + output_tokens * output_rate / 1_000_000   (integer micro-USD).
+#
+# BR-2: a (provider, model) pair ABSENT from this table is *unpriced* — the
+# ledger records its token counts with a NULL cost and the report surfaces them
+# as "unpriced tokens". A price is NEVER guessed for an unknown model.
+#
+# `[baseline]` names the all-frontier comparator used for the AC-4 savings
+# estimate (OQ-6): the report reprices every priced call's token volume at this
+# model and reports the difference as an *estimate* (never as measured fact).
+#
+# NOTE: the rates below are representative public list prices at authoring time,
+# kept here as data so they can be corrected without a code change.
+
+version = 1
+
+# The all-frontier baseline for the savings estimate (AC-4 / OQ-6). Must name a
+# model that also appears in `[[models]]` below.
+[baseline]
+provider_id = "anthropic"
+model = "claude-opus-4"
+
+# --- Anthropic ---------------------------------------------------------------
+
+[[models]]
+provider_id = "anthropic"
+model = "claude-opus-4"
+input_usd_micros_per_mtok = 15_000_000
+output_usd_micros_per_mtok = 75_000_000
+
+[[models]]
+provider_id = "anthropic"
+model = "claude-sonnet-4"
+input_usd_micros_per_mtok = 3_000_000
+output_usd_micros_per_mtok = 15_000_000
+
+[[models]]
+provider_id = "anthropic"
+model = "claude-3-5-haiku"
+input_usd_micros_per_mtok = 800_000
+output_usd_micros_per_mtok = 4_000_000
+
+# --- OpenAI-compatible (DeepSeek, Kimi, …) -----------------------------------
+
+[[models]]
+provider_id = "deepseek"
+model = "deepseek-chat"
+input_usd_micros_per_mtok = 270_000
+output_usd_micros_per_mtok = 1_100_000
+
+[[models]]
+provider_id = "deepseek"
+model = "deepseek-reasoner"
+input_usd_micros_per_mtok = 550_000
+output_usd_micros_per_mtok = 2_190_000
+
+[[models]]
+provider_id = "moonshot"
+model = "kimi-k2"
+input_usd_micros_per_mtok = 600_000
+output_usd_micros_per_mtok = 2_500_000
+
+# --- Local tier --------------------------------------------------------------
+# On-device inference has no marginal API cost, so it is priced at zero. This is
+# what makes the routing-savings story honest: a local or cheap call genuinely
+# costs ~nothing, and the baseline reprices its token volume at the frontier.
+
+[[models]]
+provider_id = "local"
+model = "qwen2.5-coder-1.5b"
+input_usd_micros_per_mtok = 0
+output_usd_micros_per_mtok = 0
+
+[[models]]
+provider_id = "local"
+model = "qwen2.5-coder-3b"
+input_usd_micros_per_mtok = 0
+output_usd_micros_per_mtok = 0
+
+[[models]]
+provider_id = "local"
+model = "qwen2.5-coder-7b"
+input_usd_micros_per_mtok = 0
+output_usd_micros_per_mtok = 0

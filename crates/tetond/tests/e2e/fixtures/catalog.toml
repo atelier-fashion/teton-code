@@ -1,0 +1,28 @@
+# Canned local-model catalog (documentation fixture).
+#
+# The daemon uses its own bundled catalog (`teton_inference::Catalog::bundled`);
+# this file records the tier bands the acceptance suite's hardware-probe test
+# (AC-8) expects, so the fixture and the bundled data can be diffed by hand.
+#
+#   < 8 GiB RAM      -> local tier disabled (remote-only)
+#   8..=16 GiB RAM   -> qwen2.5-coder-1.5b .. qwen2.5-coder-3b
+#   16 < r <= 32 GiB -> qwen2.5-coder-7b
+#   > 32 GiB RAM     -> qwen3-coder-30b-a3b (optional)
+
+version = 1
+
+[[models]]
+name = "qwen2.5-coder-1.5b"
+band = "small"
+
+[[models]]
+name = "qwen2.5-coder-3b"
+band = "small"
+
+[[models]]
+name = "qwen2.5-coder-7b"
+band = "mid"
+
+[[models]]
+name = "qwen3-coder-30b-a3b"
+band = "large"

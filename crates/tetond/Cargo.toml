@@ -1,0 +1,99 @@
+[package]
+name = "tetond"
+description = "Teton Code daemon — session state, routing, cost, egress, inference."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The daemon is where all differentiating logic lives, so it depends on every
+# library crate. Binaries may depend on libs; libs never depend on binaries.
+# The `live` feature un-ignores the e2e suite's real-model / real-provider smoke
+# test (`tests/e2e`), which needs live endpoints and keys via `TETON_LIVE_*` env.
+# CI never enables it: the default acceptance run uses mocks only.
+[features]
+live = []
+
+[dependencies]
+teton-core = { path = "../teton-core" }
+teton-protocol = { path = "../teton-protocol" }
+teton-providers = { path = "../teton-providers" }
+teton-inference = { path = "../teton-inference" }
+
+# Async runtime + Unix-domain-socket transport (ADR-002). Only the features the
+# daemon actually uses, to keep the binary lean (ADR-001). `process` spawns local
+# stdio MCP servers (TASK-011, ADR-003); the child speaks JSON-RPC over its pipes.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "process",
+] }
+# JSON-RPC framing codec plus the cost module's own serde-derived report/price
+# types (TASK-008): `derive` covers both the shared wire types and the local
+# `PriceTable` / `CostReport` structs.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The cost price table (TASK-008) is a versioned TOML data file, mirroring the
+# local-model catalog in `teton-inference/data/models.toml`.
+toml = "0.8"
+# The cost ledger (TASK-008, BR-2) is an append-only SQLite store. `bundled`
+# compiles SQLite from source so the daemon needs no system libsqlite3 — the
+# same zero-system-dependency stance as `rustls-tls` above (ADR-001 lean binary).
+rusqlite = { version = "0.31", features = ["bundled"] }
+# anyhow at the binary edge; thiserror for typed daemon errors (conventions).
+anyhow = "1"
+thiserror = "2"
+# Peer-credential (`getpeereid`) and single-instance (`flock`) syscalls.
+libc = "0.2"
+# The single egress choke point (architecture D-2): `reqwest` is the ONE real
+# HTTP client in the whole workspace — a CI deny-check (egress::deny_http_client)
+# fails the build if any other crate grows a client. `rustls-tls` keeps the
+# daemon free of a system OpenSSL dependency (ADR-001 lean binary); `stream`
+# gives the streaming response body the `Transport` contract requires.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+# The egress module implements the object-safe `Transport` trait and maps a
+# streaming response body — same async plumbing the provider adapters use.
+async-trait = "0.1"
+futures = { version = "0.3", features = ["std", "async-await"] }
+
+# Daemon-side keychain resolution (BR-7, REQ-544 M-3): the CLI stores a secret
+# and writes only an `auth_ref`; the daemon reads it back at call time and
+# injects the endpoint-bound authorization header at the egress choke point.
+# macOS-first, mirroring the CLI's `keychain.rs`; other targets get an
+# "unsupported" backend so CI (Linux) builds without a keychain.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2"
+
+[dev-dependencies]
+# Integration tests act as clients over the socket and need the test macro. The
+# MCP egress test (TASK-011) spawns a mock stdio server, so `process` here too.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "process",
+] }
+serde_json = "1"
+# The egress-capture harness implements a mock `Transport` (async-trait) and
+# builds response byte streams (futures).
+async-trait = "0.1"
+futures = { version = "0.3", features = ["std", "async-await"] }
+# The offline-session harness test drives the local `Engine` (a scripted mock
+# implementing the trait) and asserts on protocol stop-reason / session ids.
+teton-inference = { path = "../teton-inference" }
+teton-protocol = { path = "../teton-protocol" }
+
+[lints]
+workspace = true

@@ -1,7 +1,7 @@
 ---
 id: TASK-009
 title: "tetond agent harness: tool loop, permissions, local-first sessions"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17

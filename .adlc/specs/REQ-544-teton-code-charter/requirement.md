@@ -1,7 +1,7 @@
 ---
 id: REQ-544
 title: "Teton Code — hybrid local/remote AI coding agent with workflow-aware model routing"
-status: approved
+status: complete
 deployable: true
 created: 2026-07-17
 updated: 2026-07-17
@@ -130,37 +130,37 @@ inference process.
 
 _MVP = daemon + CLI. Extension is phase 2 (see Out of Scope)._
 
-- [ ] AC-1: Fresh install on macOS reaches a working first session with zero
+- [x] AC-1: Fresh install on macOS reaches a working first session with zero
       config: binary installs slim, local model downloads on first run with
       progress UI, and a freeform session can read/edit/verify a file using only
       the local model (offline demo path).
-- [ ] AC-2: User can register at least two remote providers (one Anthropic, one
+- [x] AC-2: User can register at least two remote providers (one Anthropic, one
       arbitrary OpenAI-compatible endpoint) via CLI config and complete a
       freeform coding session routed to them.
-- [ ] AC-3: In structured mode, a demo requirement flows spec → architect →
+- [x] AC-3: In structured mode, a demo requirement flows spec → architect →
       implement → review with phase-based routing observable: `route_decided`
       events show frontier model on spec/architect/review and the configured
       cheap model on implement.
-- [ ] AC-4: Cost meter: at session end the CLI reports total spend, per-phase
+- [x] AC-4: Cost meter: at session end the CLI reports total spend, per-phase
       attribution, and estimated savings vs. an all-frontier baseline for the
       same token volume.
-- [ ] AC-5: Privacy boundary: with a directory marked `local-only`, a session
+- [x] AC-5: Privacy boundary: with a directory marked `local-only`, a session
       that touches files inside it completes with zero remote calls containing
       that content, and a deliberate attempt to route such content remotely
       produces a visible `privacy_block` event. Verified by an egress-capture
       test (proxy or mock transport), not by code inspection.
-- [ ] AC-6: Two clients (two CLI sessions) attach to one daemon concurrently and
+- [x] AC-6: Two clients (two CLI sessions) attach to one daemon concurrently and
       show consistent session lists; daemon survives client exit.
-- [ ] AC-7: A provider with degraded tool-calling (simulated flaky adapter)
+- [x] AC-7: A provider with degraded tool-calling (simulated flaky adapter)
       triggers `provider_degraded` and the session completes via the fallback
       provider rather than failing.
-- [ ] AC-8: First-run on a 16GB Apple Silicon machine selects a ≤3B model via
+- [x] AC-8: First-run on a 16GB Apple Silicon machine selects a ≤3B model via
       the hardware probe, the post-download micro-benchmark reports first-token
       latency and tokens/sec, and a simulated benchmark failure (forced slow
       inference) triggers automatic step-down to the next smaller model. On a
       simulated <8GB machine, the local tier is disabled and freeform sessions
       run remote-only without error.
-- [ ] AC-9: User can register an MCP server in config; its tools appear in a
+- [x] AC-9: User can register an MCP server in config; its tools appear in a
       session and execute under the standard permission prompts, and a
       `local-only` boundary blocks boundary content from reaching a remote MCP
       server (same egress-capture verification as AC-5). (informed by ADR-003)

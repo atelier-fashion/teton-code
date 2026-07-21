@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 title: "Cargo workspace scaffold + CI"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17

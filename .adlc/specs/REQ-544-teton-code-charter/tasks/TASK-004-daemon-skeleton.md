@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 title: "tetond skeleton: UDS server, sessions, event broadcast"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17

@@ -1,7 +1,7 @@
 ---
 id: TASK-010
 title: "tetond router: phase policy routing, remote wiring, degradation"
-status: draft
+status: complete
 parent: REQ-544
 created: 2026-07-17
 updated: 2026-07-17
@@ -24,11 +24,11 @@ profiles applied to the harness, and provider fallback on failure (AC-7).
 
 ## Acceptance Criteria
 
-- [ ] Structured-mode calls route per policy table; `route_decided` reason names the rule that fired (BR-5, AC-3 backend)
-- [ ] Freeform heuristic decisions also emit `route_decided` with reasons (BR-5)
-- [ ] Simulated provider failure mid-session falls back per failure class and completes (AC-7)
-- [ ] Local tier unavailable (pressure/benchmark-disabled) → router bypasses without blocking the loop (BR-8)
-- [ ] Weak-capability provider gets the degraded harness profile (reduced tools, shorter max-turns, mandatory verify) (BR-6)
+- [x] Structured-mode calls route per policy table; `route_decided` reason names the rule that fired (BR-5, AC-3 backend)
+- [x] Freeform heuristic decisions also emit `route_decided` with reasons (BR-5)
+- [x] Simulated provider failure mid-session falls back per failure class and completes (AC-7)
+- [x] Local tier unavailable (pressure/benchmark-disabled) → router bypasses without blocking the loop (BR-8)
+- [x] Weak-capability provider gets the degraded harness profile (reduced tools, shorter max-turns, mandatory verify) (BR-6)
 
 ## Technical Notes
 
