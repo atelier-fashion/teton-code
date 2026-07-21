@@ -1,7 +1,7 @@
 ---
 id: REQ-544
 title: "Teton Code — hybrid local/remote AI coding agent with workflow-aware model routing"
-status: approved
+status: complete
 deployable: true
 created: 2026-07-17
 updated: 2026-07-17
