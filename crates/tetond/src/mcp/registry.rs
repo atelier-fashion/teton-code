@@ -172,6 +172,18 @@ impl McpRegistry {
             .map(|s| s.health.clone())
     }
 
+    /// Whether `server_id`'s tool results must carry **`Unknown`** (fail-closed)
+    /// provenance rather than argument-derived provenance (REQ-544 security): a
+    /// local, untrusted stdio server, whose touched files cannot be seen. An
+    /// unknown server id defaults to fail-closed (`true`) — the safe posture.
+    pub async fn opaque_provenance(&self, server_id: &str) -> bool {
+        self.servers
+            .lock()
+            .await
+            .get(server_id)
+            .is_none_or(|s| s.config.opaque_provenance())
+    }
+
     /// Get the live client for `server_id`, connecting (or reconnecting after a
     /// crash) on demand. Marks the server [`ServerHealth::Degraded`] and returns
     /// the error on failure.
@@ -408,6 +420,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
             },
+            trusted: false,
         }
     }
 
@@ -511,12 +524,14 @@ mod tests {
                     args: vec!["--root".to_owned(), ".".to_owned()],
                     env: BTreeMap::new(),
                 },
+                trusted: false,
             },
             McpServerConfig {
                 id: "remote".to_owned(),
                 transport: McpTransport::Http {
                     endpoint: "https://mcp.example.com/rpc".to_owned(),
                 },
+                trusted: false,
             },
         ] {
             let json = serde_json::to_string(&cfg).expect("serialize");

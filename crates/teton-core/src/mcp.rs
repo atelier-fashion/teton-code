@@ -61,6 +61,34 @@ pub struct McpServerConfig {
     pub id: String,
     /// How to reach the server.
     pub transport: McpTransport,
+    /// Whether this server is declared **trusted** (REQ-544 security).
+    ///
+    /// Defaults to `false` — a conservative, privacy-first default. A local
+    /// (`stdio`) server that is NOT trusted has its tool results tagged with
+    /// `Unknown` egress provenance (fail-closed, exactly like `shell`),
+    /// because a black-box subprocess can read a `local-only` file via an opaque,
+    /// non-path argument the daemon cannot see — so its result cannot be proven
+    /// public and must not be laundered to a remote provider on a later turn.
+    /// Setting `trusted = true` keeps the precise, argument-derived provenance
+    /// (`call_provenance`) for that server's results. A remote (`http`) server
+    /// already routes every call through the egress choke point, so this flag does
+    /// not change its behavior (see [`Self::opaque_provenance`]).
+    #[serde(default)]
+    pub trusted: bool,
+}
+
+impl McpServerConfig {
+    /// Whether this server's tool results must carry **`Unknown`** (fail-closed)
+    /// provenance rather than argument-derived provenance (REQ-544 security).
+    ///
+    /// True only for a local (`stdio`) server that is not declared `trusted`: its
+    /// touched files cannot be derived from opaque arguments, so — like `shell` —
+    /// its result taints the session to the local tier. A `trusted` server, or any
+    /// remote (`http`) server (already egress-gated), keeps precise provenance.
+    #[must_use]
+    pub fn opaque_provenance(&self) -> bool {
+        !self.trusted && !self.transport.is_remote()
+    }
 }
 
 #[cfg(test)]
@@ -94,17 +122,73 @@ mod tests {
                     args: vec!["--root".to_owned(), ".".to_owned()],
                     env: BTreeMap::from([("MCP_LOG".to_owned(), "info".to_owned())]),
                 },
+                trusted: true,
             },
             McpServerConfig {
                 id: "remote".to_owned(),
                 transport: McpTransport::Http {
                     endpoint: "https://mcp.example.com/rpc".to_owned(),
                 },
+                trusted: false,
             },
         ] {
             let toml_text = toml::to_string(&cfg).expect("serialize");
             let back: McpServerConfig = toml::from_str(&toml_text).expect("deserialize");
             assert_eq!(cfg, back, "round-trip mismatch; toml was:\n{toml_text}");
         }
+    }
+
+    #[test]
+    fn trusted_defaults_to_false_when_omitted() {
+        // REQ-544 security: the privacy-first default. A `[[mcp_server]]` table that
+        // omits `trusted` deserializes as untrusted.
+        let toml_text = "\
+id = \"fs\"
+[transport]
+kind = \"stdio\"
+command = \"mcp-server-filesystem\"
+";
+        let cfg: McpServerConfig = toml::from_str(toml_text).expect("deserialize");
+        assert!(
+            !cfg.trusted,
+            "trusted must default to false (privacy-first)"
+        );
+    }
+
+    #[test]
+    fn only_an_untrusted_stdio_server_has_opaque_provenance() {
+        // REQ-544 security: fail-closed provenance applies to a local, untrusted
+        // stdio server; a trusted stdio server or any http server keeps precise
+        // arg-derived provenance.
+        let stdio = |trusted| McpServerConfig {
+            id: "fs".to_owned(),
+            transport: McpTransport::Stdio {
+                command: "x".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            trusted,
+        };
+        assert!(
+            stdio(false).opaque_provenance(),
+            "untrusted stdio is fail-closed"
+        );
+        assert!(
+            !stdio(true).opaque_provenance(),
+            "trusted stdio keeps provenance"
+        );
+
+        let http = |trusted| McpServerConfig {
+            id: "remote".to_owned(),
+            transport: McpTransport::Http {
+                endpoint: "https://mcp.example.com/rpc".to_owned(),
+            },
+            trusted,
+        };
+        assert!(
+            !http(false).opaque_provenance(),
+            "http is egress-gated, not opaque"
+        );
+        assert!(!http(true).opaque_provenance());
     }
 }

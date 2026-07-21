@@ -232,7 +232,7 @@ fn assert_blocked_and_clean(
     // (1) The turn was blocked as a privacy block — not a leak, not a generic
     // transport retry.
     match result {
-        Err(e) if e.is_privacy_block() => {}
+        Err(e) if e.is_privacy_blocked() => {}
         other => panic!("expected a privacy block, got {other:?}"),
     }
     // (2) Zero boundary bytes reached the wire in ANY captured request.

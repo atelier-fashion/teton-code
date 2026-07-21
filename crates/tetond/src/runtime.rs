@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use teton_core::boundary::BoundaryMatcher;
 use teton_core::config::Config;
@@ -70,7 +71,7 @@ use teton_providers::{
 
 use crate::broadcast::EventBus;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
-use crate::egress::{inspect, Egress, HttpTransport};
+use crate::egress::{inspect, origin_of, Egress, HttpTransport};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
@@ -240,6 +241,80 @@ impl SessionTaint {
     }
 }
 
+/// Default half-open cooldown for a provider marked [`ProviderHealth::Unavailable`]
+/// by a persistent failure (a malformed response, a repeated protocol break)
+/// (REQ-544 M-5). Once this window has elapsed the provider is re-probed on the
+/// next turn instead of being stranded until daemon restart.
+const PROVIDER_UNAVAILABLE_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Shorter half-open cooldown for a provider taken down by an auth-shaped client
+/// error (401/403) (REQ-544 M-5). A credential problem is the kind of fault an
+/// operator fixes out of band (rotating a key, fixing an `auth_ref`), so we
+/// re-probe sooner rather than stranding it for the full window — the "narrowed
+/// persistence" the hardening pass calls for.
+const PROVIDER_AUTH_COOLDOWN: Duration = Duration::from_secs(20);
+
+/// A provider's persisted cross-turn health plus, for an `Unavailable` provider,
+/// the instant it becomes eligible for a half-open re-probe (REQ-544 M-5).
+///
+/// This is the fix for the permanent-stranding regression: an `Unavailable`
+/// provider is never *selected* by the policy evaluator, so on its own it could
+/// never serve a turn, never reset to `Healthy`, and stay down daemon-wide until
+/// restart. Recording *when* it went down lets [`Self::effective_health`] present
+/// it as eligible again (half-open) once its cooldown elapses; the next turn
+/// re-probes it — success records [`Self::healthy`], a fresh failure records a new
+/// `Unavailable` with a new deadline.
+#[derive(Debug, Clone, Copy)]
+struct HealthRecord {
+    /// The persisted health state.
+    health: ProviderHealth,
+    /// For an `Unavailable` record, the instant it may be re-probed. `None` for
+    /// `Healthy`/`Degraded` (always eligible).
+    retry_at: Option<Instant>,
+}
+
+impl HealthRecord {
+    /// A healthy record (always eligible).
+    fn healthy() -> Self {
+        Self {
+            health: ProviderHealth::Healthy,
+            retry_at: None,
+        }
+    }
+
+    /// A degraded record — kept in rotation with a reduced profile (always
+    /// eligible; the half-open cooldown is only for `Unavailable`).
+    fn degraded() -> Self {
+        Self {
+            health: ProviderHealth::Degraded,
+            retry_at: None,
+        }
+    }
+
+    /// An `Unavailable` record that becomes eligible for a half-open re-probe at
+    /// `now + cooldown`.
+    fn unavailable(now: Instant, cooldown: Duration) -> Self {
+        Self {
+            health: ProviderHealth::Unavailable,
+            retry_at: Some(now + cooldown),
+        }
+    }
+
+    /// The health this record presents to routing at `now`, applying the half-open
+    /// cooldown: an `Unavailable` provider past its `retry_at` deadline is offered
+    /// as `Healthy` so the next turn re-probes it; every other state passes through
+    /// unchanged.
+    fn effective_health(self, now: Instant) -> ProviderHealth {
+        match self.health {
+            ProviderHealth::Unavailable => match self.retry_at {
+                Some(at) if now >= at => ProviderHealth::Healthy,
+                _ => ProviderHealth::Unavailable,
+            },
+            other => other,
+        }
+    }
+}
+
 /// The assembled daemon runtime shared by every client task.
 pub struct DaemonRuntime {
     /// The live configuration (providers, routing, boundaries). Mutated by
@@ -272,11 +347,14 @@ pub struct DaemonRuntime {
     /// context touched `local-only` or unknown-provenance content (REQ-544 C-2).
     session_taint: SessionTaint,
     /// Daemon-wide provider health, persisted across turns (REQ-544 M-5). Updated
-    /// by `on_provider_failure` / turn outcomes and READ by [`build_router`] when
-    /// it seeds the router each turn, so a provider observed `Unavailable` stays
-    /// `Unavailable` into the next turn's route resolution — activating the policy
-    /// layer's cross-turn health fallback. Absent id ⇒ `Healthy`.
-    provider_health: Mutex<BTreeMap<String, ProviderHealth>>,
+    /// by turn outcomes and READ by [`Self::run_prompt_turn`] when it seeds the
+    /// router each turn, so a provider observed `Unavailable` stays `Unavailable`
+    /// into the next turn's route resolution — activating the policy layer's
+    /// cross-turn health fallback. Each entry carries a [`HealthRecord`] so an
+    /// `Unavailable` provider becomes eligible for a half-open re-probe once its
+    /// cooldown elapses (rather than being stranded until daemon restart). Absent
+    /// id ⇒ `Healthy`.
+    provider_health: Mutex<BTreeMap<String, HealthRecord>>,
     /// Resolves a provider's `auth_ref` to its secret at call time (BR-7, REQ-544
     /// M-3). Holds the OS-keychain backend behind a trait; the secret is injected
     /// as an endpoint-bound authorization header at the egress choke point and
@@ -422,12 +500,13 @@ impl DaemonRuntime {
 
     /// Record a provider's observed health so it persists into the next turn's
     /// routing (REQ-544 M-5). Downgrades survive across turns: a provider seen
-    /// `Unavailable` stays `Unavailable` until it serves a turn again.
-    fn record_provider_health(&self, provider_id: &str, health: ProviderHealth) {
+    /// `Unavailable` stays `Unavailable` until either it serves a turn again or its
+    /// half-open cooldown elapses (see [`HealthRecord`]).
+    fn record_health(&self, provider_id: &str, record: HealthRecord) {
         self.provider_health
             .lock()
             .expect("provider_health mutex poisoned")
-            .insert(provider_id.to_owned(), health);
+            .insert(provider_id.to_owned(), record);
     }
 
     /// Run one prompt turn for `session`, streaming events over `events` and
@@ -457,12 +536,18 @@ impl DaemonRuntime {
 
         let config = self.config.lock().expect("config mutex poisoned").clone();
         // REQ-544 M-5: seed the router from the daemon-wide health map so a
-        // provider marked Unavailable on an earlier turn stays Unavailable here.
-        let health_snapshot = self
+        // provider marked Unavailable on an earlier turn stays Unavailable here —
+        // UNLESS its half-open cooldown has elapsed, in which case it is offered as
+        // Healthy so this turn re-probes it (the recovery path that keeps a single
+        // transient failure from stranding a provider daemon-wide until restart).
+        let now = Instant::now();
+        let health_snapshot: BTreeMap<String, ProviderHealth> = self
             .provider_health
             .lock()
             .expect("provider_health mutex poisoned")
-            .clone();
+            .iter()
+            .map(|(id, record)| (id.clone(), record.effective_health(now)))
+            .collect();
         let router = build_router(
             &config,
             self.local_available,
@@ -552,7 +637,7 @@ impl DaemonRuntime {
             // one reroute. The egress choke point already emitted the single
             // authoritative `privacy_block`.
             if let Err(err) = &result {
-                if err.is_privacy_block() {
+                if err.is_privacy_blocked() {
                     self.session_taint.mark(&session_id);
                     if self.engine.is_none() {
                         return Err(RpcError::new(
@@ -582,10 +667,11 @@ impl DaemonRuntime {
             match result {
                 Ok(outcome) => {
                     // REQ-544 M-5: a provider that just served a turn is healthy
-                    // again — clear any earlier downgrade so a recovered provider
-                    // returns to rotation on the next turn.
+                    // again — clear any earlier downgrade (including a half-open
+                    // re-probe that just succeeded) so a recovered provider returns
+                    // to full rotation on the next turn.
                     if let Some(pid) = route.provider_id.as_ref() {
-                        self.record_provider_health(&pid.0, ProviderHealth::Healthy);
+                        self.record_health(&pid.0, HealthRecord::healthy());
                     }
                     // REQ-544 C-2: if this turn's context intersects a local-only
                     // boundary or carries unknown provenance, pin the session to
@@ -615,9 +701,10 @@ impl DaemonRuntime {
                     };
                     // REQ-544 M-5: persist the failed provider's health so the
                     // downgrade survives into the next turn's routing. A transient
-                    // failure (Retry) leaves health untouched.
-                    if let Some(h) = health_after_failure(class) {
-                        self.record_provider_health(&pid.0, h);
+                    // failure (Retry) leaves health untouched; a persistent one is
+                    // stamped with a half-open cooldown so it recovers on its own.
+                    if let Some(record) = health_record_after_failure(class, Instant::now()) {
+                        self.record_health(&pid.0, record);
                     }
                     let fo = router.on_provider_failure(core_phase, &pid.0, class);
                     if let Some(degraded) = fo.degraded {
@@ -1027,11 +1114,27 @@ fn build_remote_transport(
         None => HttpTransport::new()
             .map_err(|e| HarnessError::Engine(EngineError::Backend(e.to_string()))),
         Some(auth_ref) => {
+            // BR-7 / REQ-544 M-3: an `auth_ref` provider MUST have an endpoint that
+            // parses to a tuple (network-addressable) origin, or the resolved
+            // credential can never be bound to it — `with_endpoint_auth` would
+            // attach the header to nothing (`origin_of` is `None`), the call would
+            // 401, and there would be no sign the auth was silently stripped.
+            // Reject it loudly as a config/credential error instead. Checked before
+            // the keychain is touched, and the message names only the reference
+            // (config, safe) — never the secret.
+            let endpoint = provider.endpoint.clone().unwrap_or_default();
+            if origin_of(&endpoint).is_none() {
+                return Err(HarnessError::Credential(format!(
+                    "provider `{}` declares auth_ref `{auth_ref}` but its endpoint does not \
+                     parse to a network origin; the credential cannot be bound and would be \
+                     silently dropped",
+                    provider.id
+                )));
+            }
             let secret = resolver
                 .resolve(auth_ref)
                 .map_err(|e| HarnessError::Credential(e.to_string()))?;
             let headers = provider_auth_headers(provider.kind, &secret);
-            let endpoint = provider.endpoint.clone().unwrap_or_default();
             HttpTransport::with_endpoint_auth(&endpoint, headers)
                 .map_err(|e| HarnessError::Engine(EngineError::Backend(e.to_string())))
         }
@@ -1127,6 +1230,34 @@ fn health_after_failure(class: FailureClass) -> Option<ProviderHealth> {
         FailureAction::Fallback | FailureAction::Fail => Some(ProviderHealth::Unavailable),
         FailureAction::Degrade => Some(ProviderHealth::Degraded),
         FailureAction::Retry => None,
+    }
+}
+
+/// The half-open cooldown a provider marked `Unavailable` by `class` should carry
+/// (REQ-544 M-5). An auth-shaped client error (401/403) recovers on the shorter
+/// [`PROVIDER_AUTH_COOLDOWN`] — an operator-fixed credential should be re-probed
+/// sooner — while every other persistent failure uses the default
+/// [`PROVIDER_UNAVAILABLE_COOLDOWN`].
+fn cooldown_for(class: FailureClass) -> Duration {
+    match class {
+        FailureClass::ClientError { status: 401 | 403 } => PROVIDER_AUTH_COOLDOWN,
+        _ => PROVIDER_UNAVAILABLE_COOLDOWN,
+    }
+}
+
+/// The persisted [`HealthRecord`] a provider should carry after a failure of
+/// `class` at `now` (REQ-544 M-5). Layers the half-open cooldown ([`cooldown_for`])
+/// onto the health decision ([`health_after_failure`]): a persistent failure
+/// becomes `Unavailable` with a recovery deadline, a weak-tool-calling failure
+/// degrades (no deadline — kept in rotation), and a transient failure records
+/// nothing (`None`).
+fn health_record_after_failure(class: FailureClass, now: Instant) -> Option<HealthRecord> {
+    match health_after_failure(class)? {
+        ProviderHealth::Unavailable => Some(HealthRecord::unavailable(now, cooldown_for(class))),
+        ProviderHealth::Degraded => Some(HealthRecord::degraded()),
+        // `health_after_failure` only ever yields Unavailable/Degraded/None; a
+        // Healthy downgrade is not a thing.
+        ProviderHealth::Healthy => Some(HealthRecord::healthy()),
     }
 }
 
@@ -1619,6 +1750,50 @@ mod tests {
     }
 
     #[test]
+    fn an_auth_ref_provider_with_an_unparseable_endpoint_is_rejected_not_silently_stripped() {
+        // REQ-544 minor: an auth_ref provider whose endpoint does not parse to a
+        // network origin cannot bind its credential — `with_endpoint_auth` would
+        // attach the header to nothing and the call would 401 with no sign the auth
+        // was dropped. Reject it loudly (typed Credential error) instead. The
+        // keychain is never touched — a resolver that would PANIC if called proves
+        // the endpoint is validated first.
+        struct PanicBackend;
+        impl KeychainBackend for PanicBackend {
+            fn get(&self, _s: &str, _a: &str) -> Result<String, BackendError> {
+                panic!("the keychain must not be consulted for a broken endpoint");
+            }
+        }
+        let resolver = SecretResolver::with_backend(Box::new(PanicBackend));
+
+        for bad_endpoint in ["", "not-a-url", "/only/a/path", "mailto:x@y.z"] {
+            let cfg = provider(
+                ProviderKind::Anthropic,
+                bad_endpoint,
+                Some("keychain://teton/x"),
+            );
+            let err = build_remote_transport(&cfg, &resolver).unwrap_err();
+            match err {
+                HarnessError::Credential(msg) => {
+                    assert!(
+                        msg.contains("keychain://teton/x") && msg.contains("endpoint"),
+                        "message must name the reference and the endpoint problem: {msg}"
+                    );
+                    assert!(!msg.contains("sk-"), "never leak a secret: {msg}");
+                }
+                other => panic!("expected a Credential error for `{bad_endpoint}`, got {other:?}"),
+            }
+        }
+
+        // A missing endpoint (None) with an auth_ref is likewise rejected.
+        let mut no_endpoint = provider(ProviderKind::Anthropic, "", Some("keychain://teton/x"));
+        no_endpoint.endpoint = None;
+        assert!(matches!(
+            build_remote_transport(&no_endpoint, &resolver),
+            Err(HarnessError::Credential(_))
+        ));
+    }
+
+    #[test]
     fn an_unresolvable_credential_is_a_typed_error_not_a_panic() {
         // A missing keychain entry surfaces HarnessError::Credential whose message
         // names the reference (safe) but never the secret.
@@ -1736,5 +1911,105 @@ mod tests {
             health_after_failure(FailureClass::MalformedResponse),
             Some(ProviderHealth::Unavailable)
         );
+    }
+
+    #[test]
+    fn an_unavailable_provider_becomes_eligible_again_after_its_cooldown() {
+        // REQ-544 M-5 regression: without a half-open recovery an Unavailable
+        // provider is never selected, so it can never serve a turn, so it never
+        // resets to Healthy — stranded daemon-wide until restart. The cooldown
+        // makes it eligible again once the window elapses. The clock is injected so
+        // the test is deterministic (no real 60s sleep).
+        let t0 = Instant::now();
+        let cooldown = Duration::from_secs(60);
+        let record = HealthRecord::unavailable(t0, cooldown);
+
+        // Right after the failure it is still Unavailable (stranded, correctly).
+        assert_eq!(record.effective_health(t0), ProviderHealth::Unavailable);
+        // One second short of the deadline: still Unavailable.
+        assert_eq!(
+            record.effective_health(t0 + Duration::from_secs(59)),
+            ProviderHealth::Unavailable
+        );
+        // At/after the deadline: offered as Healthy for a half-open re-probe.
+        assert_eq!(
+            record.effective_health(t0 + cooldown),
+            ProviderHealth::Healthy
+        );
+        assert_eq!(
+            record.effective_health(t0 + Duration::from_secs(120)),
+            ProviderHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn a_successful_reprobe_clears_a_provider_back_to_healthy() {
+        // The success path records `HealthRecord::healthy()`, which is eligible at
+        // any instant regardless of any prior Unavailable deadline — proving a
+        // recovered provider returns to full rotation.
+        let healthy = HealthRecord::healthy();
+        assert_eq!(
+            healthy.effective_health(Instant::now()),
+            ProviderHealth::Healthy
+        );
+        // A degraded record is likewise always eligible (kept in rotation).
+        assert_eq!(
+            HealthRecord::degraded().effective_health(Instant::now()),
+            ProviderHealth::Degraded
+        );
+    }
+
+    #[test]
+    fn an_auth_error_strands_for_a_shorter_window_than_a_malformed_response() {
+        // REQ-544 M-5 "narrowed persistence": a 401 recovers sooner than a
+        // malformed response, since an operator-fixed credential should re-probe
+        // fast rather than be held down for the full default window.
+        assert_eq!(
+            cooldown_for(FailureClass::ClientError { status: 401 }),
+            PROVIDER_AUTH_COOLDOWN
+        );
+        assert_eq!(
+            cooldown_for(FailureClass::ClientError { status: 403 }),
+            PROVIDER_AUTH_COOLDOWN
+        );
+        assert_eq!(
+            cooldown_for(FailureClass::MalformedResponse),
+            PROVIDER_UNAVAILABLE_COOLDOWN
+        );
+        assert!(
+            PROVIDER_AUTH_COOLDOWN < PROVIDER_UNAVAILABLE_COOLDOWN,
+            "an auth error must strand for a shorter window"
+        );
+
+        // End to end through the record builder: a 401 becomes eligible again at the
+        // shorter deadline while a malformed response is still stranded there.
+        let t0 = Instant::now();
+        let auth = health_record_after_failure(FailureClass::ClientError { status: 401 }, t0)
+            .expect("a 401 downgrades");
+        let malformed = health_record_after_failure(FailureClass::MalformedResponse, t0)
+            .expect("a malformed response downgrades");
+        let probe_at = t0 + PROVIDER_AUTH_COOLDOWN;
+        assert_eq!(auth.effective_health(probe_at), ProviderHealth::Healthy);
+        assert_eq!(
+            malformed.effective_health(probe_at),
+            ProviderHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn a_transient_failure_records_no_health_downgrade() {
+        // A retryable blip must not produce a HealthRecord at all (health untouched).
+        assert!(health_record_after_failure(FailureClass::Timeout, Instant::now()).is_none());
+        assert!(health_record_after_failure(FailureClass::Transport, Instant::now()).is_none());
+        assert!(health_record_after_failure(
+            FailureClass::ServerError { status: 503 },
+            Instant::now()
+        )
+        .is_none());
+        // A weak tool-calling failure degrades (kept in rotation, no deadline).
+        let degraded = health_record_after_failure(FailureClass::MalformedToolCall, Instant::now())
+            .expect("weak tool-calling degrades");
+        assert_eq!(degraded.health, ProviderHealth::Degraded);
+        assert!(degraded.retry_at.is_none());
     }
 }

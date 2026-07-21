@@ -142,13 +142,28 @@ impl Connection {
         let id = self.send(params)?;
         loop {
             match self.recv()? {
-                Incoming::Response(resp) if resp.id == id => {
-                    return Ok(match resp.error {
-                        Some(err) => Err(err),
-                        None => Ok(serde_json::from_value(resp.result.unwrap_or(Value::Null))?),
-                    });
+                Incoming::Response(resp) => {
+                    match route_response(&id, &resp.id, resp.error.is_some()) {
+                        RespRoute::Match => {
+                            return Ok(match resp.error {
+                                Some(err) => Err(err),
+                                None => {
+                                    Ok(serde_json::from_value(resp.result.unwrap_or(Value::Null))?)
+                                }
+                            });
+                        }
+                        // REQ-544 minor: an uncorrelatable `Id::Null` parse-error
+                        // frame belongs to this — the only — in-flight request;
+                        // surface it rather than looping forever for a numeric-id
+                        // reply the daemon can never send.
+                        RespRoute::Surface => {
+                            return Ok(Err(resp
+                                .error
+                                .expect("a surfaced response carries an error")));
+                        }
+                        RespRoute::Ignore => {} // stray ack (e.g. a permission reply)
+                    }
                 }
-                Incoming::Response(_) => {} // stray ack (e.g. a permission reply)
                 Incoming::Event(env) => self.dispatch_event(&env, ctx)?,
                 Incoming::Lagged(err) => report_lag(&err, ctx.surface),
             }
@@ -205,6 +220,35 @@ impl Connection {
         self.incoming
             .recv()
             .map_err(|_| anyhow!("connection to the daemon closed"))
+    }
+}
+
+/// How a received [`Response`] correlates against the single in-flight request a
+/// caller is awaiting (REQ-544 minor).
+#[derive(Debug, PartialEq, Eq)]
+enum RespRoute {
+    /// The correlated reply for the pending id — resolve the call.
+    Match,
+    /// An uncorrelatable `Id::Null` error frame (a parse error the daemon could
+    /// not attribute to an id). Because the synchronous client has exactly one
+    /// request in flight, it belongs to that request — surface its error and end
+    /// the wait, so the caller does not stall forever awaiting a numeric-id reply
+    /// that will never come.
+    Surface,
+    /// A stray/uncorrelated frame (a different id, or a non-error null id) — skip.
+    Ignore,
+}
+
+/// Decide how a response frame with id `resp_id` (carrying an error iff
+/// `has_error`) routes for a caller awaiting `pending`. Pure so the null-id
+/// anti-stall rule is unit-testable without a live socket (REQ-544 minor).
+fn route_response(pending: &Id, resp_id: &Id, has_error: bool) -> RespRoute {
+    if resp_id == pending {
+        RespRoute::Match
+    } else if *resp_id == Id::Null && has_error {
+        RespRoute::Surface
+    } else {
+        RespRoute::Ignore
     }
 }
 
@@ -382,6 +426,41 @@ mod tests {
     fn classify_ignores_unknown_notifications_and_junk() {
         assert!(classify(r#"{"jsonrpc":"2.0","method":"mystery","params":{}}"#).is_none());
         assert!(classify("not json at all").is_none());
+    }
+
+    #[test]
+    fn a_null_id_error_frame_is_surfaced_so_a_caller_never_stalls() {
+        // REQ-544 minor: the daemon answers an unparseable request with an
+        // `Id::Null` error frame. A synchronous caller awaiting its numeric id must
+        // NOT loop forever — the null-id error belongs to the single in-flight
+        // request and is surfaced to end the wait.
+        let pending = Id::Number(7);
+        // The correlated reply matches regardless of whether it carries an error.
+        assert_eq!(
+            route_response(&pending, &Id::Number(7), false),
+            RespRoute::Match
+        );
+        assert_eq!(
+            route_response(&pending, &Id::Number(7), true),
+            RespRoute::Match
+        );
+        // A null-id ERROR frame ends the wait (the anti-stall path).
+        assert_eq!(
+            route_response(&pending, &Id::Null, true),
+            RespRoute::Surface
+        );
+        // A null-id WITHOUT an error is not actionable (never issued in practice) —
+        // ignore rather than surface a non-existent error.
+        assert_eq!(
+            route_response(&pending, &Id::Null, false),
+            RespRoute::Ignore
+        );
+        // A stray ack for a different numeric id is ignored (e.g. a permission
+        // reply), matching the prior behavior.
+        assert_eq!(
+            route_response(&pending, &Id::Number(99), false),
+            RespRoute::Ignore
+        );
     }
 
     #[test]

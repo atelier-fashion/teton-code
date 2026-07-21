@@ -108,18 +108,32 @@ pub struct McpToolHandle {
     input_schema: Value,
     registry: Arc<McpRegistry>,
     runtime: Handle,
+    /// Whether this server's results must be tagged `Unknown` provenance
+    /// (fail-closed) instead of argument-derived provenance — a local, untrusted
+    /// stdio server (REQ-544 security). Resolved once at registration from the
+    /// server config, which does not change for the life of a session.
+    opaque_provenance: bool,
 }
 
 impl McpToolHandle {
     /// A handle for `discovered`, dispatching through `registry` on `runtime`.
+    ///
+    /// `opaque_provenance` marks a local, untrusted stdio server whose results must
+    /// fail-closed to `Unknown` provenance (REQ-544 security).
     #[must_use]
-    pub fn new(discovered: &DiscoveredTool, registry: Arc<McpRegistry>, runtime: Handle) -> Self {
+    pub fn new(
+        discovered: &DiscoveredTool,
+        registry: Arc<McpRegistry>,
+        runtime: Handle,
+        opaque_provenance: bool,
+    ) -> Self {
         Self {
             namespaced_name: discovered.namespaced_name(),
             description: discovered.tool.description.clone(),
             input_schema: discovered.tool.input_schema.clone(),
             registry,
             runtime,
+            opaque_provenance,
         }
     }
 }
@@ -141,14 +155,15 @@ impl Tool for McpToolHandle {
         let name = self.namespaced_name.clone();
         let args = args.clone();
         let registry = Arc::clone(&self.registry);
-        // REQ-544 C-1: a local MCP server may read a `local-only` file; its result
-        // must carry the provenance of any boundary-relevant path the *call*
-        // referenced ([`call_provenance`], honoring path-like keys and
-        // path-shaped values, not just a literal `path` arg), so a later remote
-        // turn assembling it is caught at egress. This is the same helper the
-        // remote MCP path already sends to egress — now wired into the live
-        // context-tagging path too, not only `result_context_block`'s tests.
-        let provenance = mcp_result_provenance(&args);
+        // REQ-544 C-1 / security: a local MCP server may read a `local-only` file.
+        // For a TRUSTED server its result carries the provenance of any
+        // boundary-relevant path the *call* referenced ([`call_provenance`],
+        // honoring path-like keys and path-shaped values, not just a literal `path`
+        // arg), so a later remote turn assembling it is caught at egress. For an
+        // UNTRUSTED local stdio server the touched files cannot be seen — an opaque,
+        // non-path argument could name a boundary file — so the result fail-closes
+        // to `Unknown`, exactly like `shell` ([`result_provenance`]).
+        let provenance = result_provenance(self.opaque_provenance, &args);
         // Cross the sync→async boundary on the multi-thread runtime the daemon
         // runs on (same blocking-tool shape as `shell`).
         let result =
@@ -175,6 +190,24 @@ fn mcp_result_provenance(args: &Value) -> ToolProvenance {
     ToolProvenance::paths(call_provenance(args).sources())
 }
 
+/// The provenance an MCP result must carry given whether its server is
+/// **opaque** (a local, untrusted stdio server — REQ-544 security) and the call
+/// `args`.
+///
+/// An opaque server fail-closes to [`ToolProvenance::Unknown`] (like `shell`),
+/// because a black-box subprocess can read a `local-only` file via an argument the
+/// daemon cannot interpret as a path — so its result cannot be proven public and
+/// must not be laundered to a remote provider on a later turn. A trusted (or
+/// remote, egress-gated) server keeps the precise argument-derived provenance.
+#[must_use]
+fn result_provenance(opaque: bool, args: &Value) -> ToolProvenance {
+    if opaque {
+        ToolProvenance::Unknown
+    } else {
+        mcp_result_provenance(args)
+    }
+}
+
 /// Discover every configured server's tools and register them into `reg` as
 /// namespaced [`Tool`]s.
 ///
@@ -189,7 +222,12 @@ pub async fn register_mcp_tools(
     let discovered = registry.list_tools().await;
     let mut names = Vec::with_capacity(discovered.len());
     for tool in &discovered {
-        let handle = McpToolHandle::new(tool, Arc::clone(&registry), runtime.clone());
+        // REQ-544 security: resolve the server's provenance posture once, at
+        // registration. A local, untrusted stdio server's results fail-close to
+        // Unknown provenance (like `shell`); a trusted or remote server keeps
+        // precise arg-derived provenance.
+        let opaque = registry.opaque_provenance(&tool.server_id).await;
+        let handle = McpToolHandle::new(tool, Arc::clone(&registry), runtime.clone(), opaque);
         names.push(handle.namespaced_name.clone());
         reg.register(Arc::new(handle));
     }
@@ -268,6 +306,39 @@ mod tests {
         };
         let block = result_context_block("mcp__x__ping", &json!({ "n": 1 }), &result);
         assert!(block.provenance().is_empty());
+    }
+
+    #[test]
+    fn an_untrusted_stdio_server_result_is_unknown_even_with_no_path_args() {
+        // REQ-544 security: a local, untrusted stdio server fail-closes to Unknown
+        // provenance regardless of its arguments — so its result taints the session
+        // to local and blocks a subsequent remote turn, exactly like `shell`, even
+        // when the call named no path the daemon could see.
+        assert_eq!(
+            result_provenance(true, &json!({ "record_id": "opaque-123" })),
+            ToolProvenance::Unknown
+        );
+        // Even an obviously public-looking query fail-closes for an opaque server.
+        assert_eq!(
+            result_provenance(true, &json!({ "q": "hello" })),
+            ToolProvenance::Unknown
+        );
+    }
+
+    #[test]
+    fn a_trusted_server_keeps_arg_derived_provenance() {
+        // REQ-544 security: a trusted (or remote, egress-gated) server keeps the
+        // precise argument-derived provenance — Unknown is NOT forced.
+        assert_eq!(
+            result_provenance(false, &json!({ "file": "secrets/prod.env" })),
+            ToolProvenance::path("secrets/prod.env")
+        );
+        // No path-shaped args → empty provenance (a genuinely public result), not
+        // Unknown — so it does NOT needlessly taint the session.
+        assert_eq!(
+            result_provenance(false, &json!({ "q": "hello", "n": 3 })),
+            ToolProvenance::none()
+        );
     }
 
     #[test]

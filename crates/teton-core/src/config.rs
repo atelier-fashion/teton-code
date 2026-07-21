@@ -345,12 +345,14 @@ mod tests {
                         args: vec!["--root".to_owned(), ".".to_owned()],
                         env: BTreeMap::from([("MCP_LOG".to_owned(), "info".to_owned())]),
                     },
+                    trusted: true,
                 },
                 McpServerConfig {
                     id: "knowledge".to_owned(),
                     transport: McpTransport::Http {
                         endpoint: "https://mcp.example.com/rpc".to_owned(),
                     },
+                    trusted: false,
                 },
             ],
         }

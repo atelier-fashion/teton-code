@@ -87,7 +87,7 @@ impl HarnessError {
     /// turn on the local tier rather than retrying the blocked provider
     /// (REQ-544 M-1).
     #[must_use]
-    pub fn is_privacy_block(&self) -> bool {
+    pub fn is_privacy_blocked(&self) -> bool {
         matches!(self, HarnessError::Remote(e) if e.is_privacy_blocked())
     }
 }

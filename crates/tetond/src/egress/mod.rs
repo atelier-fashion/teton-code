@@ -415,7 +415,12 @@ impl EndpointAuth {
 
 /// The ASCII origin (`scheme://host[:port]`) of `url`, or `None` when the URL
 /// does not parse to a tuple (network-addressable) origin.
-fn origin_of(url: &str) -> Option<String> {
+///
+/// Exposed within the crate so the daemon can reject an `auth_ref` provider whose
+/// endpoint would not bind a credential (REQ-544): a `None` here means
+/// [`HttpTransport::with_endpoint_auth`] would silently attach the header to
+/// nothing.
+pub(crate) fn origin_of(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let origin = parsed.origin();
     origin.is_tuple().then(|| origin.ascii_serialization())
@@ -455,7 +460,14 @@ impl HttpTransport {
     }
 
     fn build(injected: Option<EndpointAuth>) -> Result<Self, EgressError> {
+        // REQ-544 security (Low): do NOT auto-follow redirects. The daemon POSTs to
+        // a single known provider/MCP endpoint and needs no redirect handling.
+        // reqwest strips `Authorization` on a cross-host redirect but NOT custom
+        // credential headers like `x-api-key`, so following a redirect could carry
+        // a provider secret to an attacker-influenced host. Refusing redirects
+        // outright closes that path (the caller sees the 3xx and stops).
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| EgressError::ClientInit)?;
         Ok(Self { client, injected })

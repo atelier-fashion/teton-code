@@ -139,6 +139,7 @@ fn stdio_cfg(id: &str) -> McpServerConfig {
             args: vec![],
             env: std::collections::BTreeMap::new(),
         },
+        trusted: false,
     }
 }
 
@@ -302,6 +303,7 @@ async fn a_remote_mcp_call_touching_a_boundary_path_is_blocked_at_egress() {
             transport: McpTransport::Http {
                 endpoint: "https://mcp.example.com/rpc".to_owned(),
             },
+            trusted: false,
         }],
     );
 

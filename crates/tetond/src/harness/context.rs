@@ -381,6 +381,25 @@ impl ContextManager {
             messages.push(StructuredMessage { role, text });
         }
 
+        // REQ-544 M-8: guarantee the sequence is non-empty and starts with a user
+        // turn. Truncation can evict the oldest user turn(s), leaving an assistant
+        // turn first (which alternation-merging cannot fix — there is nothing
+        // before it to merge into); an empty context yields no messages at all.
+        // Either would make a remote request start with role "assistant" or carry
+        // an empty `messages` array — both are hard Anthropic 400s. Prepend a
+        // single synthetic user turn when needed; the surviving assistant content
+        // is preserved, and alternation still holds afterward.
+        let needs_leading_user = messages.first().is_none_or(|m| m.role != MessageRole::User);
+        if needs_leading_user {
+            messages.insert(
+                0,
+                StructuredMessage {
+                    role: MessageRole::User,
+                    text: CONTINUATION_USER_TURN.to_owned(),
+                },
+            );
+        }
+
         PreparedPrompt {
             flat,
             system,
@@ -388,6 +407,17 @@ impl ContextManager {
         }
     }
 }
+
+/// The synthetic leading user turn injected when the structured messages would
+/// otherwise be empty or start with an assistant turn (REQ-544 M-8).
+///
+/// Anthropic (and, less strictly, OpenAI-compatible endpoints) reject a request
+/// whose `messages` are empty or do not begin with a `user` turn. Truncation can
+/// evict the oldest user turn and leave an assistant turn first; a context with no
+/// blocks at all yields no messages. Prepending this turn makes the sequence valid
+/// in both cases **without discarding** the surviving assistant content.
+const CONTINUATION_USER_TURN: &str =
+    "Continue from the conversation so far (earlier turns may have been truncated).";
 
 /// Approximate token count by whitespace splitting (matches the mock engine's
 /// prompt-token heuristic, so budgets are consistent end to end).
@@ -488,6 +518,94 @@ mod tests {
         assert!(ctx.blocks().len() < 20);
         let mut hook = NoopProvenanceHook;
         assert!(ctx.assemble(&mut hook).contains("truncated"));
+    }
+
+    #[test]
+    fn prepare_guarantees_a_leading_user_turn_when_first_block_is_assistant() {
+        // REQ-544 M-8 regression: after truncation the oldest surviving block can be
+        // an assistant turn. `prepare` must still emit messages that START with a
+        // user turn (else Anthropic 400s: "first message must use the 'user' role"),
+        // and it must preserve — not discard — the surviving assistant content.
+        let mut ctx = ContextManager::new("SYS", 10_000);
+        ctx.push_model("assistant speaks first");
+        ctx.push_user("then the user replies");
+
+        let mut hook = NoopProvenanceHook;
+        let prepared = ctx.prepare(&mut hook);
+
+        assert_eq!(prepared.messages.first().unwrap().role, MessageRole::User);
+        // The assistant content survives (was prepended-to, not dropped).
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .any(|m| m.role == MessageRole::Assistant
+                    && m.text.contains("assistant speaks first"))
+        );
+        // Alternation still holds after the synthetic prepend.
+        for pair in prepared.messages.windows(2) {
+            assert_ne!(pair[0].role, pair[1].role, "roles must alternate");
+        }
+    }
+
+    #[test]
+    fn a_truncated_context_whose_oldest_survivor_is_assistant_still_starts_with_user() {
+        // Drive the leading-assistant state through real truncation: a tiny budget
+        // evicts the oldest (user) block, leaving an assistant block first.
+        let mut ctx = ContextManager::new("s", 8);
+        ctx.push_user("aaa aaa aaa aaa aaa"); // 5 tokens — the oldest, evicted first
+        ctx.push_model("bbb bbb bbb bbb bbb"); // 5 tokens
+        ctx.push_user("ccc"); // 1 token — most recent, always preserved
+        ctx.truncate_to_budget();
+
+        assert!(ctx.was_truncated());
+        assert_eq!(
+            ctx.blocks().first().unwrap().role,
+            BlockRole::Assistant,
+            "the oldest surviving block must be the assistant turn for this regression"
+        );
+
+        let mut hook = NoopProvenanceHook;
+        let prepared = ctx.prepare(&mut hook);
+        assert_eq!(
+            prepared.messages.first().unwrap().role,
+            MessageRole::User,
+            "a truncated context whose oldest survivor is assistant must still lead with user"
+        );
+    }
+
+    #[test]
+    fn prepare_never_yields_empty_messages() {
+        // REQ-544 M-8: an empty-ish context (no conversation blocks) must still
+        // produce a non-empty user message — Anthropic 400s on an empty `messages`.
+        let ctx = ContextManager::new("SYS", 10_000);
+        let mut hook = NoopProvenanceHook;
+        let prepared = ctx.prepare(&mut hook);
+
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.messages[0].role, MessageRole::User);
+        assert!(
+            !prepared.messages[0].text.is_empty(),
+            "the synthetic leading user turn must be non-empty"
+        );
+    }
+
+    #[test]
+    fn prepare_leaves_the_flat_rendering_unchanged_by_the_leading_user_guard() {
+        // The local `flat` path must be identical to `assemble`'s output regardless
+        // of the structured-messages leading-role fixup (REQ-544 M-8).
+        let mut ctx = ContextManager::new("SYS", 10_000);
+        ctx.push_model("assistant first");
+        ctx.push_user("user second");
+
+        let mut hook_assemble = NoopProvenanceHook;
+        let flat_direct = ctx.assemble(&mut hook_assemble);
+        let mut hook_prepare = NoopProvenanceHook;
+        let prepared = ctx.prepare(&mut hook_prepare);
+        assert_eq!(
+            prepared.flat, flat_direct,
+            "flat rendering must be untouched"
+        );
     }
 
     #[test]
