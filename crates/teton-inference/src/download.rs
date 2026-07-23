@@ -245,10 +245,15 @@ mod tests {
     use crate::catalog::{ModelEntry, TierBand};
     use std::cell::Cell;
 
+    /// A 40-hex stand-in commit SHA, so the fixture satisfies the BR-15
+    /// revision-pinning invariant that `Catalog::validate` enforces.
+    const TEST_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+
     fn model_for(data: &[u8]) -> ModelEntry {
         ModelEntry {
             name: "test-model".to_owned(),
-            url: "https://example.test/model.gguf".to_owned(),
+            url: format!("https://example.test/acme/models/resolve/{TEST_REVISION}/model.gguf"),
+            revision: TEST_REVISION.to_owned(),
             sha256: hash::sha256_hex(data),
             size_bytes: data.len() as u64,
             ram_floor_bytes: 0,

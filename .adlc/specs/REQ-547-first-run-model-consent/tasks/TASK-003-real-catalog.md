@@ -1,10 +1,10 @@
 ---
 id: TASK-003
 title: "Real catalog: HF repos, pinned revisions, true digests, base-URL override"
-status: draft
+status: complete
 parent: REQ-547
 created: 2026-07-21
-updated: 2026-07-21
+updated: 2026-07-23
 dependencies: [TASK-001]
 ---
 
@@ -21,12 +21,12 @@ the LFS metadata API (D-1) — no multi-GB download required.
 
 ## Acceptance Criteria
 
-- [ ] Every entry names a real, public, **ungated** HF repo and pins a 40-hex commit SHA (never `main`)
-- [ ] Each entry's `sha256`/`size_bytes` equal the repo's `lfs.oid`/`lfs.size` for that exact file+revision
-- [ ] `validate()` rejects a moving-ref URL and a non-hex/short revision with a clear message (AC-12 partial)
-- [ ] A configured base-URL override rewrites the host while preserving repo/revision/file path (BR-16)
-- [ ] The refresh tool regenerates the committed TOML byte-identically from the live API (proves the data is derived, not hand-edited)
-- [ ] Tests: revision validation table, base-URL rewrite, catalog parse round-trip
+- [x] Every entry names a real, public, **ungated** HF repo and pins a 40-hex commit SHA (never `main`)
+- [x] Each entry's `sha256`/`size_bytes` equal the repo's `lfs.oid`/`lfs.size` for that exact file+revision
+- [x] `validate()` rejects a moving-ref URL and a non-hex/short revision with a clear message (AC-12 partial)
+- [x] A configured base-URL override rewrites the host while preserving repo/revision/file path (BR-16)
+- [x] The refresh tool regenerates the committed TOML byte-identically from the live API (proves the data is derived, not hand-edited)
+- [x] Tests: revision validation table, base-URL rewrite, catalog parse round-trip
 
 ## Technical Notes
 
