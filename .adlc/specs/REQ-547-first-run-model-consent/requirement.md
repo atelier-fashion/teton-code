@@ -121,6 +121,15 @@ looking like a regression.
       proposal payload, its events, or download error text. (informed by
       LESSON-432 — the leak surface is whatever data rides an outbound or logged
       structure, so it is constrained at the payload definition, not by habit)
+      Boundary note: `InstallState.path` MAY be rendered by a local CLI command
+      (`teton model status`) since that is a local display, never an event or
+      outbound payload. The install path MUST NOT appear in any protocol event.
+- [ ] BR-12: First run MUST behave sanely with no network. The proposal renders
+      from the bundled catalog (which requires no network), and if the user
+      accepts while offline the failure is a clear, actionable network error —
+      never a partial install, never a silent hang. The session continues
+      remote-only-or-unavailable per BR-1 and the decision is NOT recorded as
+      declined, so the user is re-prompted once connectivity returns.
 
 ## Acceptance Criteria
 
@@ -152,9 +161,14 @@ looking like a regression.
       machine, and the current selection; `teton model set <name>` changes it
       post-first-run (subject to BR-3's warning) and `teton model status` reports
       install state.
-- [ ] AC-10: A real end-to-end install of at least one catalog model succeeds on
-      a developer machine (manual/`--features live` verification — this is the
-      claim CI's mocks cannot make). (informed by LESSON-433)
+- [ ] AC-10: Accepting the proposal with no network produces a clear network
+      error, leaves no partial install, and does not record a "declined"
+      decision — a later run with connectivity re-prompts and succeeds (BR-12).
+- [ ] AC-11 **[MANUAL GATE — not CI-enforceable]**: A real end-to-end install of
+      at least one catalog model succeeds on a developer machine
+      (manual/`--features live` verification — this is the claim CI's mocks
+      cannot make, and it must be signed off by a human rather than silently
+      checked). (informed by LESSON-433)
 
 ## External Dependencies
 

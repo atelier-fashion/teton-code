@@ -134,6 +134,13 @@ _MVP = daemon + CLI. Extension is phase 2 (see Out of Scope)._
       config: binary installs slim, local model downloads on first run with
       progress UI, and a freeform session can read/edit/verify a file using only
       the local model (offline demo path).
+      **AMENDED BY REQ-547 (2026-07-21)**: the silent auto-download this AC
+      describes is superseded by an explicit consent gate — the probe's pick is
+      shown to the user, who accepts/overrides/declines before any bytes are
+      fetched. "Zero config" becomes "one confirmation, then zero config"; the
+      zero-touch path survives as explicit opt-in (REQ-547 BR-5). This AC's `[x]`
+      reflects verification as-built at REQ-544 merge; REQ-547 supersedes the
+      first-run behavior. See `.adlc/specs/REQ-547-first-run-model-consent/`.
 - [x] AC-2: User can register at least two remote providers (one Anthropic, one
       arbitrary OpenAI-compatible endpoint) via CLI config and complete a
       freeform coding session routed to them.
