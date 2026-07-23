@@ -131,6 +131,14 @@ pub fn render_event(
             EventOutcome::Rendered
         }
         Event::PermissionRequest(pr) => EventOutcome::Permission(Box::new(pr.clone())),
+        // REQ-547 TASK-001 defines the consent round-trip's wire types; TASK-007
+        // wires the CLI surface that renders a proposal and collects the answer.
+        // Until then the session renderer deliberately ignores both events rather
+        // than half-rendering a prompt no code can yet answer — the daemon does
+        // not emit them yet either (TASK-004).
+        Event::ModelSelectionProposed(_) | Event::ModelSelectionDecided(_) => {
+            EventOutcome::Rendered
+        }
     }
 }
 

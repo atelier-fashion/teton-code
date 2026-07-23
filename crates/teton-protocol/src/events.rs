@@ -10,7 +10,9 @@
 //! `provider_degraded`, `daemon_client_attach`. Three further events —
 //! `session_update`, `permission_request`, `model_lifecycle` — carry the
 //! streaming turn, permission prompts, and local-model lifecycle (BR-9); the
-//! first two borrow ACP vocabulary.
+//! first two borrow ACP vocabulary. REQ-547 adds
+//! `model_selection_proposed`/`model_selection_decided`, the consent round-trip
+//! that gates the local tier before any weights are fetched.
 
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +70,10 @@ pub enum Event {
     ProviderDegraded(ProviderDegraded),
     /// Local-model lifecycle progress: download / benchmark / step-down (BR-9).
     ModelLifecycle(ModelLifecycle),
+    /// The daemon proposes a local model and awaits an answer (REQ-547 BR-1).
+    ModelSelectionProposed(ModelSelectionProposed),
+    /// A model-selection decision was recorded (REQ-547 BR-4/BR-10).
+    ModelSelectionDecided(ModelSelectionDecided),
     /// The harness needs a permission decision. ACP: `session/request_permission`.
     PermissionRequest(PermissionRequest),
     /// A structured-mode phase gate passed (spec: `phase_transition`).
@@ -87,6 +93,8 @@ impl Event {
             Event::CostRecorded(_) => "cost_recorded",
             Event::ProviderDegraded(_) => "provider_degraded",
             Event::ModelLifecycle(_) => "model_lifecycle",
+            Event::ModelSelectionProposed(_) => "model_selection_proposed",
+            Event::ModelSelectionDecided(_) => "model_selection_decided",
             Event::PermissionRequest(_) => "permission_request",
             Event::PhaseTransition(_) => "phase_transition",
             Event::DaemonClientAttach(_) => "daemon_client_attach",
@@ -354,6 +362,209 @@ pub enum ModelLifecycleStage {
 }
 
 // ---------------------------------------------------------------------------
+// model_selection_proposed / model_selection_decided (REQ-547)
+// ---------------------------------------------------------------------------
+//
+// The consent round-trip that gates the local tier. It mirrors
+// `permission_request` → `permission/respond` exactly (REQ-547 D-3): the daemon
+// *broadcasts* the proposal as an event carrying a `request_id`, and the
+// deciding client answers with a typed method
+// ([`crate::methods::ModelConfirmParams`]) keyed by that id. Nothing downloads
+// until the answer arrives (BR-1).
+//
+// Every shape here is a *projection*, not the daemon's internal record: no URL,
+// no digest, no install path, no credential (BR-11). The types in this section
+// are shared with [`crate::methods`], which reads them for the `model/*` results.
+
+/// GPU acceleration class detected by the first-run probe.
+///
+/// Variant names and the `snake_case` rule mirror
+/// `teton_inference::probe::GpuClass` exactly, so projecting the probe onto the
+/// wire is a total map with no room for casing drift — the same technique
+/// `teton_core::ProviderKind` uses against [`crate::ProviderKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuClass {
+    /// Apple Silicon unified memory + Metal (the MVP first-class target).
+    AppleSilicon,
+    /// An NVIDIA CUDA GPU.
+    Cuda,
+    /// No supported accelerator; CPU inference only.
+    Cpu,
+}
+
+/// The hardware band a catalog model targets (REQ-544's OQ-3 table).
+///
+/// Ordered smallest-to-largest, mirroring `teton_inference::catalog::TierBand`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierBand {
+    /// 1.5B-3B class, for 8-16 GiB machines.
+    Small,
+    /// 7B class, for 16-32 GiB machines.
+    Mid,
+    /// 30B-A3B class, for 32 GiB+ machines (optional).
+    Large,
+}
+
+/// The band the probe chose for this machine, including "no local tier".
+///
+/// A distinct type from [`TierBand`] because the *machine's* band has a fourth
+/// state the *catalog's* band does not: `none`, for a machine below the RAM
+/// floor. Sent as an explicit `"none"` rather than an absent field so a client
+/// can never confuse "below the floor" with "an older daemon omitted this".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChosenBand {
+    /// The machine is below the hardware floor; sessions run remote-only.
+    None,
+    /// The small band.
+    Small,
+    /// The mid band.
+    Mid,
+    /// The large band.
+    Large,
+}
+
+impl ChosenBand {
+    /// The concrete catalog band, or `None` when the machine has no local tier.
+    #[must_use]
+    pub fn band(self) -> Option<TierBand> {
+        match self {
+            ChosenBand::None => Option::None,
+            ChosenBand::Small => Some(TierBand::Small),
+            ChosenBand::Mid => Some(TierBand::Mid),
+            ChosenBand::Large => Some(TierBand::Large),
+        }
+    }
+}
+
+impl From<Option<TierBand>> for ChosenBand {
+    fn from(band: Option<TierBand>) -> Self {
+        match band {
+            Option::None => ChosenBand::None,
+            Some(TierBand::Small) => ChosenBand::Small,
+            Some(TierBand::Mid) => ChosenBand::Mid,
+            Some(TierBand::Large) => ChosenBand::Large,
+        }
+    }
+}
+
+/// The probe's reasoning, rendered to the user before anything is fetched.
+///
+/// BR-2 is the whole point of this shape: a bare model name is not sufficient,
+/// so the detected hardware and a plain-language `reason` travel with every
+/// proposal. It carries machine *facts* only — never a path, a credential, or
+/// file content (BR-11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeReportView {
+    /// Total physical RAM in bytes.
+    pub total_ram_bytes: u64,
+    /// Free disk in bytes, on the volume the weights would land on.
+    pub free_disk_bytes: u64,
+    /// Detected accelerator class.
+    pub gpu_class: GpuClass,
+    /// The band the decision table picked for this machine.
+    pub chosen_band: ChosenBand,
+    /// User-facing sentence explaining the band choice (BR-2 legibility).
+    pub reason: String,
+}
+
+/// A catalog entry as offered to the user.
+///
+/// A deliberate projection of the catalog row: `url` and `sha256` are daemon-side
+/// download mechanics the user is not choosing between, and no install path ever
+/// appears (BR-11). What is left is what a person needs in order to choose — the
+/// name, the band it serves, what it costs in disk, and what it needs in RAM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogEntryView {
+    /// Catalog id, e.g. `qwen2.5-coder-3b`.
+    pub name: String,
+    /// The hardware band this model serves.
+    pub band: TierBand,
+    /// Download size in bytes.
+    pub size_bytes: u64,
+    /// Minimum system RAM required to load it. Choosing an entry whose floor
+    /// exceeds [`ProbeReportView::total_ram_bytes`] is permitted but needs a
+    /// second, explicit confirmation (BR-3).
+    pub ram_floor_bytes: u64,
+}
+
+/// The entry the daemon proposes, plus what installing it will take.
+///
+/// The two travel together so a proposal can never carry a disk requirement
+/// belonging to no model, or a model with no stated cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposedModel {
+    /// The proposed catalog entry.
+    pub entry: CatalogEntryView,
+    /// Free disk the install needs: the download size plus the working margin
+    /// the preflight check applies before fetching a byte (BR-7).
+    pub required_disk_bytes: u64,
+}
+
+/// The daemon proposes a local model and waits (spec: `model_selection_proposed`).
+///
+/// Emitted after the probe and **before any download** (BR-1). The client answers
+/// with [`crate::methods::ModelConfirmParams`], keyed by `request_id` — the same
+/// correlation [`PermissionRequest`] uses. While the answer is outstanding
+/// sessions still work; they simply run remote-only (D-3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelectionProposed {
+    /// Correlates with the client's later `model/confirm`.
+    pub request_id: RequestId,
+    /// The hardware reasoning that produced this proposal (BR-2).
+    pub probe: ProbeReportView,
+    /// The proposal, or `None` when no catalog entry fits this machine — in
+    /// which case `probe.chosen_band` is `none` and the user may still override
+    /// to an entry from `alternatives` (BR-3).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub proposed: Option<ProposedModel>,
+    /// Every other entry the user may choose instead (BR-3). Excludes the
+    /// proposed entry; may include entries above this machine's RAM floor, which
+    /// the client must flag rather than hide.
+    pub alternatives: Vec<CatalogEntryView>,
+}
+
+/// Where a model-selection decision came from (spec entity `ModelSelection.source`).
+///
+/// Mirrors `teton_core::entities::SelectionSource` variant-for-variant, so the
+/// daemon's persisted record and this wire form cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionSource {
+    /// The probe's proposal, accepted as offered.
+    Probe,
+    /// The user chose a different catalog entry, or declined (BR-3/BR-4).
+    UserOverride,
+    /// A `[local_model] pinned` config key decided it, with no prompt (BR-9).
+    ConfigPin,
+    /// The explicit opt-in auto-accept path took it unattended (BR-5).
+    AutoAccept,
+}
+
+/// A model-selection decision was recorded (spec: `model_selection_decided`).
+///
+/// Emitted for *every* decision, including the ones no human answered
+/// (`config_pin`, `auto_accept`), so an attached client always learns why the
+/// local tier is in the state it is in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelectionDecided {
+    /// The proposal this answers; `None` when no prompt was shown (a config pin
+    /// or the auto-accept path).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub request_id: Option<RequestId>,
+    /// The chosen catalog model name; `None` exactly when `declined_local`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model_name: Option<String>,
+    /// True when the local tier was declined: run remote-only and do not
+    /// re-prompt on later starts (BR-4).
+    pub declined_local: bool,
+    /// How the decision was reached.
+    pub source: SelectionSource,
+}
+
+// ---------------------------------------------------------------------------
 // permission_request (ACP: session/request_permission)
 // ---------------------------------------------------------------------------
 
@@ -451,6 +662,36 @@ mod tests {
         let json = serde_json::to_string(value).unwrap();
         let back: T = serde_json::from_str(&json).unwrap();
         assert_eq!(&back, value);
+    }
+
+    /// A representative first-run proposal: a 32 GiB Apple Silicon machine, a
+    /// mid-band pick, and one smaller alternative.
+    fn sample_proposal() -> ModelSelectionProposed {
+        ModelSelectionProposed {
+            request_id: RequestId::from("m1"),
+            probe: ProbeReportView {
+                total_ram_bytes: 32 * 1024 * 1024 * 1024,
+                free_disk_bytes: 200 * 1024 * 1024 * 1024,
+                gpu_class: GpuClass::AppleSilicon,
+                chosen_band: ChosenBand::Mid,
+                reason: "32 GB of RAM clears the 7B band's floor with headroom to spare".to_owned(),
+            },
+            proposed: Some(ProposedModel {
+                entry: CatalogEntryView {
+                    name: "qwen2.5-coder-7b".to_owned(),
+                    band: TierBand::Mid,
+                    size_bytes: 4_700_000_000,
+                    ram_floor_bytes: 12_884_901_888,
+                },
+                required_disk_bytes: 5_700_000_000,
+            }),
+            alternatives: vec![CatalogEntryView {
+                name: "qwen2.5-coder-3b".to_owned(),
+                band: TierBand::Small,
+                size_bytes: 2_000_000_000,
+                ram_floor_bytes: 5_368_709_120,
+            }],
+        }
     }
 
     /// Wraps an event, round-trips the envelope, and returns the wire object so
@@ -560,6 +801,19 @@ mod tests {
                     stage: ModelLifecycleStage::Ready,
                 }),
                 "model_lifecycle",
+            ),
+            (
+                Event::ModelSelectionProposed(sample_proposal()),
+                "model_selection_proposed",
+            ),
+            (
+                Event::ModelSelectionDecided(ModelSelectionDecided {
+                    request_id: Some(RequestId::from("m1")),
+                    model_name: Some("qwen2.5-coder-3b".to_owned()),
+                    declined_local: false,
+                    source: SelectionSource::Probe,
+                }),
+                "model_selection_decided",
             ),
         ];
 
@@ -686,6 +940,134 @@ mod tests {
     }
 
     #[test]
+    fn model_selection_proposed_round_trips() {
+        round_trip(&sample_proposal());
+    }
+
+    #[test]
+    fn model_selection_proposed_below_the_floor_omits_the_proposal() {
+        // A machine under the RAM floor still gets a proposal event — with no
+        // pick, band `none`, and the full alternatives list so the user can
+        // still override (BR-3). The absent `proposed` must not become `null`.
+        let below_floor = ModelSelectionProposed {
+            request_id: RequestId::from("m2"),
+            probe: ProbeReportView {
+                total_ram_bytes: 4 * 1024 * 1024 * 1024,
+                free_disk_bytes: 10 * 1024 * 1024 * 1024,
+                gpu_class: GpuClass::Cpu,
+                chosen_band: ChosenBand::None,
+                reason: "4 GB of RAM is below the 8 GB floor; sessions run remote-only".to_owned(),
+            },
+            proposed: None,
+            alternatives: vec![CatalogEntryView {
+                name: "qwen2.5-coder-1.5b".to_owned(),
+                band: TierBand::Small,
+                size_bytes: 1_100_000_000,
+                ram_floor_bytes: 3_221_225_472,
+            }],
+        };
+        round_trip(&below_floor);
+
+        let json = serde_json::to_string(&below_floor).unwrap();
+        assert!(!json.contains("proposed"), "wire: {json}");
+        let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(wire["probe"]["chosen_band"], "none");
+    }
+
+    #[test]
+    fn model_selection_decided_round_trips_every_source() {
+        for source in [
+            SelectionSource::Probe,
+            SelectionSource::UserOverride,
+            SelectionSource::ConfigPin,
+            SelectionSource::AutoAccept,
+        ] {
+            round_trip(&ModelSelectionDecided {
+                request_id: Some(RequestId::from("m1")),
+                model_name: Some("qwen2.5-coder-3b".to_owned()),
+                declined_local: false,
+                source,
+            });
+        }
+        // A decline carries no model name (BR-4)…
+        round_trip(&ModelSelectionDecided {
+            request_id: Some(RequestId::from("m1")),
+            model_name: None,
+            declined_local: true,
+            source: SelectionSource::UserOverride,
+        });
+        // …and an unprompted decision carries no request id (BR-5 auto-accept).
+        round_trip(&ModelSelectionDecided {
+            request_id: None,
+            model_name: Some("qwen2.5-coder-7b".to_owned()),
+            declined_local: false,
+            source: SelectionSource::AutoAccept,
+        });
+    }
+
+    #[test]
+    fn selection_source_uses_the_spec_wire_names() {
+        for (source, expected) in [
+            (SelectionSource::Probe, "\"probe\""),
+            (SelectionSource::UserOverride, "\"user_override\""),
+            (SelectionSource::ConfigPin, "\"config_pin\""),
+            (SelectionSource::AutoAccept, "\"auto_accept\""),
+        ] {
+            assert_eq!(serde_json::to_string(&source).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn chosen_band_round_trips_through_the_optional_catalog_band() {
+        // The `Option<TierBand>` ↔ `ChosenBand` map is total in both directions,
+        // so no caller has to hand-roll the "below the floor" case.
+        for band in [
+            None,
+            Some(TierBand::Small),
+            Some(TierBand::Mid),
+            Some(TierBand::Large),
+        ] {
+            assert_eq!(ChosenBand::from(band).band(), band);
+        }
+        assert_eq!(
+            serde_json::to_string(&ChosenBand::None).unwrap(),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TierBand::Large).unwrap(),
+            "\"large\""
+        );
+    }
+
+    #[test]
+    fn gpu_class_mirrors_the_probe_wire_names() {
+        // Same strings `teton_inference::probe::GpuClass` emits, so the daemon's
+        // projection can never drift in casing.
+        for (class, expected) in [
+            (GpuClass::AppleSilicon, "\"apple_silicon\""),
+            (GpuClass::Cuda, "\"cuda\""),
+            (GpuClass::Cpu, "\"cpu\""),
+        ] {
+            assert_eq!(serde_json::to_string(&class).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn a_proposal_never_carries_a_url_digest_or_path() {
+        // BR-11: the leak surface is whatever rides the outbound structure, so it
+        // is constrained at the payload definition. `CatalogEntryView` is a
+        // projection precisely so a catalog `url`/`sha256` and the daemon's
+        // install path cannot ride along.
+        let json = serde_json::to_string(&sample_proposal()).unwrap();
+        for forbidden in ["url", "sha256", "path", "http", "/Users/", "auth"] {
+            assert!(
+                !json.contains(forbidden),
+                "proposal payload leaked `{forbidden}`: {json}"
+            );
+        }
+    }
+
+    #[test]
     fn permission_request_round_trips() {
         round_trip(&PermissionRequest {
             request_id: RequestId::from("r1"),
@@ -759,6 +1141,50 @@ mod tests {
         assert_eq!(env.event_name(), "route_decided");
         match env.event {
             Event::RouteDecided(rd) => assert_eq!(rd.provider_id, ProviderId::from("anthropic")),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_fields_in_a_model_proposal_are_tolerated() {
+        // Forward compatibility for the consent payloads specifically: a newer
+        // daemon that adds a field to the probe report or a catalog entry must
+        // not break a client built against this shape.
+        let json = r#"{
+            "seq": 7,
+            "event": "model_selection_proposed",
+            "request_id": "m1",
+            "probe": {
+                "total_ram_bytes": 34359738368,
+                "free_disk_bytes": 214748364800,
+                "gpu_class": "apple_silicon",
+                "chosen_band": "mid",
+                "reason": "32 GB clears the 7B band",
+                "future_probe_field": {"thermal_headroom": 0.8}
+            },
+            "proposed": {
+                "entry": {
+                    "name": "qwen2.5-coder-7b",
+                    "band": "mid",
+                    "size_bytes": 4700000000,
+                    "ram_floor_bytes": 12884901888,
+                    "future_entry_field": "quant"
+                },
+                "required_disk_bytes": 5700000000
+            },
+            "alternatives": [],
+            "future_top_level_field": true
+        }"#;
+        let env: EventEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.event_name(), "model_selection_proposed");
+        match env.event {
+            Event::ModelSelectionProposed(p) => {
+                assert_eq!(p.probe.chosen_band, ChosenBand::Mid);
+                assert_eq!(
+                    p.proposed.expect("proposal present").entry.name,
+                    "qwen2.5-coder-7b"
+                );
+            }
             other => panic!("unexpected event: {other:?}"),
         }
     }

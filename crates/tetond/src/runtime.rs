@@ -1826,6 +1826,7 @@ mod tests {
     fn two_provider_spec_config() -> Config {
         Config {
             pinned_local_model: None,
+            local_model: teton_core::LocalModelConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),

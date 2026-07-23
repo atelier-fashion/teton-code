@@ -9,6 +9,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::events::{CatalogEntryView, ProbeReportView, SelectionSource};
 use crate::jsonrpc::{Id, Request};
 use crate::{
     Phase, PrivacyMode, ProviderId, ProviderKind, RequestId, SessionId, SessionMode, TurnId,
@@ -205,6 +206,215 @@ impl RpcMethod for PermissionRespondParams {
 }
 
 // ---------------------------------------------------------------------------
+// local model selection (REQ-547)
+// ---------------------------------------------------------------------------
+//
+// `model/confirm` is to `model_selection_proposed` what `permission/respond` is
+// to `permission_request` (D-3): the daemon broadcasts, the deciding client
+// answers by `request_id`. `model/list` / `model/set` / `model/status` are the
+// post-first-run surface behind `teton model …` (AC-9).
+//
+// The payload projections these results carry ([`CatalogEntryView`],
+// [`ProbeReportView`], [`SelectionSource`]) are defined in [`crate::events`]
+// alongside the proposal that introduces them, so the event and the method
+// results are literally the same types and cannot drift.
+
+/// The client's answer to a `model_selection_proposed` event.
+///
+/// The daemon *broadcasts* the proposal as an event (multiple clients may be
+/// attached) and the deciding client replies with this method, keyed by
+/// `request_id` — deliberately the same shape as [`PermissionRespondParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConfirmParams {
+    /// Correlates with the `model_selection_proposed` event's `request_id`.
+    pub request_id: RequestId,
+    /// The chosen outcome.
+    pub outcome: ModelConfirmOutcome,
+}
+
+/// The three — and only three — answers to a model proposal.
+///
+/// A **closed** enum with no `#[serde(other)]` catch-all and no `Default`: an
+/// `outcome` this build does not know is a deserialization *error* (which the
+/// daemon returns as [`crate::jsonrpc::error_code::INVALID_PARAMS`]), never a
+/// silent fallback. That is load-bearing rather than stylistic — BR-1 says
+/// nothing downloads without an explicit decision, so an answer that cannot be
+/// understood must fail loudly instead of being read as "accept".
+///
+/// Note the asymmetry with the rest of this crate: unknown *fields* are
+/// tolerated for forward compatibility, but an unknown *variant tag* is not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ModelConfirmOutcome {
+    /// Install the proposed model as offered.
+    Accept,
+    /// Install a different catalog entry instead (BR-3).
+    Choose {
+        /// The catalog name to install; must name an entry the daemon offered.
+        name: String,
+        /// Set only after the user answered a *second*, explicit confirmation
+        /// that this entry's RAM floor exceeds the machine's RAM (BR-3). The
+        /// daemon refuses such a choice while this is false, so an over-sized
+        /// pick can never happen by accident — and the guard lives here, in the
+        /// protocol, rather than as a convention each client re-implements.
+        #[serde(default)]
+        confirmed_above_ram_floor: bool,
+    },
+    /// Decline the local tier; the machine runs remote-only and is not
+    /// re-prompted (BR-4).
+    Decline,
+}
+
+/// Result of [`ModelConfirmParams`].
+///
+/// Deliberately empty, like [`PermissionRespondResult`]: the authoritative
+/// outcome reaches *every* attached client as a `model_selection_decided` event,
+/// so echoing it here would duplicate the record in two places that could
+/// disagree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConfirmResult {}
+
+impl RpcMethod for ModelConfirmParams {
+    const METHOD: &'static str = "model/confirm";
+    type Result = ModelConfirmResult;
+}
+
+/// A wire projection of the recorded decision (spec entity `ModelSelection`).
+///
+/// Mirrors `teton_core::entities::ModelSelection` field-for-field **except** the
+/// install path, which never appears in a protocol payload (BR-11); a client
+/// that wants to show the path resolves it locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelectionView {
+    /// The chosen catalog model name; `None` exactly when `declined_local`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model_name: Option<String>,
+    /// How the decision was reached.
+    pub source: SelectionSource,
+    /// True when the local tier was declined (BR-4).
+    pub declined_local: bool,
+    /// When the decision was recorded, in Unix epoch milliseconds.
+    pub decided_at_ms: u64,
+}
+
+/// Install state of a model's weights (spec entity `InstallState.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallStatus {
+    /// Nothing on disk.
+    Absent,
+    /// A partial download exists; resumable, never loadable (BR-9).
+    Partial,
+    /// Present and verified against the catalog digest (BR-6).
+    Verified,
+    /// Present but failed verification; must be discarded, never installed.
+    Corrupt,
+}
+
+/// Install state of the selected model (spec entity `InstallState`).
+///
+/// Carries no `path`: BR-11 keeps absolute filesystem paths out of every
+/// protocol payload, and the daemon's state directory is a convention the client
+/// already knows, so `teton model status` can render a path without one ever
+/// crossing the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallStateView {
+    /// The model these weights belong to.
+    pub model_name: String,
+    /// Current state of the weights on disk.
+    pub status: InstallStatus,
+}
+
+/// List the catalog with each entry's fit for this machine (AC-9).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelListParams {}
+
+/// One row of [`ModelListResult`]: a catalog entry plus its fit.
+///
+/// `fits_ram` / `fits_disk` are computed daemon-side against the probe so every
+/// client renders the same verdict, rather than each re-deriving it (and
+/// disagreeing about the working margin).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelListEntry {
+    /// The catalog entry.
+    pub entry: CatalogEntryView,
+    /// Whether this machine clears the entry's RAM floor. `false` entries are
+    /// still selectable, with the BR-3 second confirmation.
+    pub fits_ram: bool,
+    /// Whether there is enough free disk to install it right now (BR-7).
+    pub fits_disk: bool,
+}
+
+/// Result of [`ModelListParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelListResult {
+    /// The machine the fits were computed against (BR-2 legibility).
+    pub probe: ProbeReportView,
+    /// Every catalog entry, in catalog order.
+    pub models: Vec<ModelListEntry>,
+    /// The current selection, or `None` when no decision has been recorded yet.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub selection: Option<ModelSelectionView>,
+}
+
+impl RpcMethod for ModelListParams {
+    const METHOD: &'static str = "model/list";
+    type Result = ModelListResult;
+}
+
+/// Change the selected model after first run (AC-9: `teton model set <name>`).
+///
+/// A user-only action, like every config mutation (spec Permissions table) —
+/// never inferable from model output or file content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSetParams {
+    /// The catalog name to switch to.
+    pub name: String,
+    /// The BR-3 second confirmation, exactly as on
+    /// [`ModelConfirmOutcome::Choose`]: required before an entry above this
+    /// machine's RAM floor is accepted.
+    #[serde(default)]
+    pub confirmed_above_ram_floor: bool,
+}
+
+/// Result of [`ModelSetParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSetResult {
+    /// The selection now in force.
+    pub selection: ModelSelectionView,
+}
+
+impl RpcMethod for ModelSetParams {
+    const METHOD: &'static str = "model/set";
+    type Result = ModelSetResult;
+}
+
+/// Report the current selection and install state (AC-9: `teton model status`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStatusParams {}
+
+/// Result of [`ModelStatusParams`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStatusResult {
+    /// The recorded decision, or `None` when none has been made.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub selection: Option<ModelSelectionView>,
+    /// Install state of the selected weights, or `None` when nothing is selected.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub install: Option<InstallStateView>,
+    /// A proposal awaiting an answer, if one is outstanding. Lets a client that
+    /// attached after the broadcast still find and answer the open prompt
+    /// instead of waiting forever for an event it already missed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pending_request_id: Option<RequestId>,
+}
+
+impl RpcMethod for ModelStatusParams {
+    const METHOD: &'static str = "model/status";
+    type Result = ModelStatusResult;
+}
+
+// ---------------------------------------------------------------------------
 // config operations
 // ---------------------------------------------------------------------------
 
@@ -379,6 +589,7 @@ impl RpcMethod for CostQueryParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{ChosenBand, GpuClass, TierBand};
 
     /// Serializes then deserializes `value`, asserting the round-trip is exact.
     fn round_trip<T>(value: &T)
@@ -462,6 +673,239 @@ mod tests {
             outcome: PermissionOutcome::Cancelled,
         });
         round_trip(&PermissionRespondResult::default());
+    }
+
+    fn sample_probe() -> ProbeReportView {
+        ProbeReportView {
+            total_ram_bytes: 32 * 1024 * 1024 * 1024,
+            free_disk_bytes: 200 * 1024 * 1024 * 1024,
+            gpu_class: GpuClass::AppleSilicon,
+            chosen_band: ChosenBand::Mid,
+            reason: "32 GB of RAM clears the 7B band".to_owned(),
+        }
+    }
+
+    fn sample_entry() -> CatalogEntryView {
+        CatalogEntryView {
+            name: "qwen2.5-coder-7b".to_owned(),
+            band: TierBand::Mid,
+            size_bytes: 4_700_000_000,
+            ram_floor_bytes: 12_884_901_888,
+        }
+    }
+
+    fn sample_selection() -> ModelSelectionView {
+        ModelSelectionView {
+            model_name: Some("qwen2.5-coder-7b".to_owned()),
+            source: SelectionSource::Probe,
+            declined_local: false,
+            decided_at_ms: 1_771_200_000_000,
+        }
+    }
+
+    #[test]
+    fn model_confirm_round_trips_every_outcome() {
+        for outcome in [
+            ModelConfirmOutcome::Accept,
+            ModelConfirmOutcome::Choose {
+                name: "qwen2.5-coder-3b".to_owned(),
+                confirmed_above_ram_floor: false,
+            },
+            ModelConfirmOutcome::Choose {
+                name: "qwen2.5-coder-30b-a3b".to_owned(),
+                confirmed_above_ram_floor: true,
+            },
+            ModelConfirmOutcome::Decline,
+        ] {
+            round_trip(&ModelConfirmParams {
+                request_id: RequestId::from("m1"),
+                outcome,
+            });
+        }
+        round_trip(&ModelConfirmResult::default());
+    }
+
+    #[test]
+    fn model_confirm_outcome_is_a_closed_enum() {
+        // BR-1: nothing downloads without an explicit decision, so an outcome
+        // this build does not know must be a typed error — never a silent
+        // fallback to "accept". No `#[serde(other)]`, no `Default`.
+        let json = r#"{"request_id": "m1", "outcome": {"outcome": "install_later"}}"#;
+        let err = serde_json::from_str::<ModelConfirmParams>(json)
+            .expect_err("an unknown outcome must not deserialize");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown variant"), "message: {msg}");
+        // The error names what *is* accepted, so the failure is actionable.
+        for expected in ["accept", "choose", "decline"] {
+            assert!(
+                msg.contains(expected),
+                "message should list `{expected}`: {msg}"
+            );
+        }
+
+        // A missing outcome is likewise an error, not a default.
+        serde_json::from_str::<ModelConfirmParams>(r#"{"request_id": "m1"}"#)
+            .expect_err("a missing outcome must not default");
+        // …and `choose` without a name cannot degrade into a bare accept.
+        serde_json::from_str::<ModelConfirmParams>(
+            r#"{"request_id": "m1", "outcome": {"outcome": "choose"}}"#,
+        )
+        .expect_err("`choose` without a name must not deserialize");
+    }
+
+    #[test]
+    fn model_confirm_tolerates_unknown_fields_but_not_unknown_outcomes() {
+        // The two forward-compat axes are deliberately different: an added field
+        // is tolerated, an unrecognized decision is not.
+        let json = r#"{
+            "request_id": "m1",
+            "outcome": {
+                "outcome": "choose",
+                "name": "qwen2.5-coder-3b",
+                "future_knob": {"reason": "user preference"}
+            },
+            "future_top_level": true
+        }"#;
+        let parsed: ModelConfirmParams = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.outcome,
+            ModelConfirmOutcome::Choose {
+                name: "qwen2.5-coder-3b".to_owned(),
+                // Absent on the wire ⇒ the *safe* value: not confirmed (BR-3).
+                confirmed_above_ram_floor: false,
+            }
+        );
+    }
+
+    #[test]
+    fn the_br3_second_confirmation_defaults_to_not_confirmed() {
+        // An omitted confirmation must never read as "the user confirmed".
+        let choose: ModelConfirmOutcome =
+            serde_json::from_str(r#"{"outcome": "choose", "name": "big"}"#).unwrap();
+        match choose {
+            ModelConfirmOutcome::Choose {
+                confirmed_above_ram_floor,
+                ..
+            } => assert!(!confirmed_above_ram_floor),
+            other => panic!("expected choose, got {other:?}"),
+        }
+        let set: ModelSetParams = serde_json::from_str(r#"{"name":"big"}"#).unwrap();
+        assert!(!set.confirmed_above_ram_floor);
+    }
+
+    #[test]
+    fn model_list_round_trips() {
+        round_trip(&ModelListParams::default());
+        round_trip(&ModelListResult {
+            probe: sample_probe(),
+            models: vec![
+                ModelListEntry {
+                    entry: sample_entry(),
+                    fits_ram: true,
+                    fits_disk: true,
+                },
+                ModelListEntry {
+                    entry: CatalogEntryView {
+                        name: "qwen2.5-coder-30b-a3b".to_owned(),
+                        band: TierBand::Large,
+                        size_bytes: 18_000_000_000,
+                        ram_floor_bytes: 51_539_607_552,
+                    },
+                    fits_ram: false,
+                    fits_disk: true,
+                },
+            ],
+            selection: Some(sample_selection()),
+        });
+        // A first run has no selection yet; the field must vanish, not go null.
+        let unselected = ModelListResult {
+            probe: sample_probe(),
+            models: vec![],
+            selection: None,
+        };
+        round_trip(&unselected);
+        assert!(!serde_json::to_string(&unselected)
+            .unwrap()
+            .contains("selection"));
+    }
+
+    #[test]
+    fn model_set_round_trips() {
+        round_trip(&ModelSetParams {
+            name: "qwen2.5-coder-3b".to_owned(),
+            confirmed_above_ram_floor: false,
+        });
+        round_trip(&ModelSetResult {
+            selection: ModelSelectionView {
+                model_name: Some("qwen2.5-coder-3b".to_owned()),
+                source: SelectionSource::UserOverride,
+                declined_local: false,
+                decided_at_ms: 1_771_200_000_001,
+            },
+        });
+    }
+
+    #[test]
+    fn model_status_round_trips() {
+        round_trip(&ModelStatusParams::default());
+        for status in [
+            InstallStatus::Absent,
+            InstallStatus::Partial,
+            InstallStatus::Verified,
+            InstallStatus::Corrupt,
+        ] {
+            round_trip(&ModelStatusResult {
+                selection: Some(sample_selection()),
+                install: Some(InstallStateView {
+                    model_name: "qwen2.5-coder-7b".to_owned(),
+                    status,
+                }),
+                pending_request_id: None,
+            });
+        }
+        // A declined machine: a selection with no model and no install.
+        round_trip(&ModelStatusResult {
+            selection: Some(ModelSelectionView {
+                model_name: None,
+                source: SelectionSource::UserOverride,
+                declined_local: true,
+                decided_at_ms: 1_771_200_000_002,
+            }),
+            install: None,
+            pending_request_id: None,
+        });
+        // A first run with a prompt still outstanding (BR-1).
+        round_trip(&ModelStatusResult {
+            selection: None,
+            install: None,
+            pending_request_id: Some(RequestId::from("m1")),
+        });
+        // The empty status must be a bare object, not three nulls.
+        assert_eq!(
+            serde_json::to_string(&ModelStatusResult::default()).unwrap(),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn model_results_never_carry_an_install_path() {
+        // BR-11: no absolute filesystem path in any protocol payload. The install
+        // path is CLI-local; `InstallStateView` has no field to smuggle it in.
+        let status = ModelStatusResult {
+            selection: Some(sample_selection()),
+            install: Some(InstallStateView {
+                model_name: "qwen2.5-coder-7b".to_owned(),
+                status: InstallStatus::Verified,
+            }),
+            pending_request_id: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        for forbidden in ["path", "/Users/", "/home/", "url", "sha256"] {
+            assert!(
+                !json.contains(forbidden),
+                "status leaked `{forbidden}`: {json}"
+            );
+        }
     }
 
     #[test]
@@ -551,6 +995,14 @@ mod tests {
         assert_eq!(PromptTurnParams::METHOD, "session/prompt");
         assert_eq!(ConfigSetParams::METHOD, "config/set");
         assert_eq!(CostQueryParams::METHOD, "cost/query");
+        assert_eq!(ModelConfirmParams::METHOD, "model/confirm");
+        assert_eq!(ModelListParams::METHOD, "model/list");
+        assert_eq!(ModelSetParams::METHOD, "model/set");
+        assert_eq!(ModelStatusParams::METHOD, "model/status");
+        assert_eq!(
+            request(Id::Number(2), ModelStatusParams::default()).method,
+            "model/status"
+        );
     }
 
     #[test]

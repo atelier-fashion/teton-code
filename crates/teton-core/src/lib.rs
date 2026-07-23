@@ -27,10 +27,10 @@ pub mod phase;
 pub mod policy;
 
 pub use boundary::{match_boundary, BoundaryError, BoundaryMatcher};
-pub use config::{Config, ConfigError, LoadError};
+pub use config::{Config, ConfigError, LoadError, LocalModelConfig};
 pub use entities::{
-    BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
-    RoutingPolicy, ToolCallTier,
+    BoundaryMode, ModelProvider, ModelSelection, PrivacyBoundary, ProviderCapabilities,
+    ProviderKind, RoutingPolicy, SelectionSource, ToolCallTier,
 };
 pub use mcp::{McpServerConfig, McpTransport};
 pub use phase::Phase;
