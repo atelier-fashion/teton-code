@@ -51,7 +51,7 @@ looking like a regression.
 |--------|-------|------|-------------|
 | ProbeReport | total_ram_bytes | number | required; from the existing probe |
 | ProbeReport | free_disk_bytes | number | required |
-| ProbeReport | gpu_class | enum(metal, cuda, cpu) | required |
+| ProbeReport | gpu_class | enum(apple_silicon, cuda, cpu) | required; mirrors the shipped `teton_inference::probe::GpuClass` verbatim — the spec originally said `metal`, which was wrong; one spelling per concept |
 | ProbeReport | chosen_band | enum(none, small, mid, large) | required |
 | ProbeReport | reason | string | required; user-facing sentence explaining the band choice |
 | ModelSelection | model_name | string | null when the local tier is declined |
