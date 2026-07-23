@@ -131,6 +131,36 @@ looking like a regression.
       remote-only-or-unavailable per BR-1 and the decision is NOT recorded as
       declined, so the user is re-prompted once connectivity returns.
 
+_The following follow from ADR-004 (HuggingFace hosting) and from two gaps found
+during validation: `RangeFetcher` has only `#[cfg(test)]` implementors and the
+daemon contains no production wiring for `Downloader` at all._
+
+- [ ] BR-13: A production `RangeFetcher` MUST exist. Today the trait is
+      implemented only by test doubles and the daemon never constructs a
+      `Downloader`, so no real download can occur. The implementation MUST live
+      in `tetond` (the only crate permitted an HTTP client by the
+      `deny_http_client` invariant, ADR/D-2) and satisfy the existing resume +
+      byte-range contract the library already tests.
+- [ ] BR-14: The model downloader MUST use its own credential-free HTTP client,
+      separate from the provider/MCP egress client, and that client MAY follow
+      redirects (HuggingFace `resolve` URLs 302 to their CDN). The egress
+      client's `redirect::Policy::none()` MUST NOT be relaxed — it exists
+      because reqwest strips `Authorization` but not custom headers like
+      `x-api-key` across hosts. A model fetch carries no user content and no
+      provider credential, so it is a distinct trust context and must be kept
+      one. Enforced by a test asserting the download client carries no auth
+      headers and the egress client still refuses redirects.
+- [ ] BR-15: Every catalog URL MUST pin an immutable revision (a commit SHA in
+      the HuggingFace `.../resolve/<sha>/<file>` form), never a moving ref like
+      `main`. A moving ref would silently invalidate the pinned `sha256` and
+      turn BR-6's integrity check into spurious corruption failures.
+- [ ] BR-16: The catalog base URL MUST be overridable by configuration (an
+      `HF_ENDPOINT`-style key) so users behind a firewall or corporate mirror can
+      redirect fetches, and so a future move off HuggingFace does not require a
+      release. HTTP 429/503 from the host MUST be retried with backoff and
+      surfaced as a rate-limit/availability message, distinct from a corrupt
+      download.
+
 ## Acceptance Criteria
 
 - [ ] AC-1: On a machine with no installed weights, starting a session shows the
@@ -164,6 +194,15 @@ looking like a regression.
 - [ ] AC-10: Accepting the proposal with no network produces a clear network
       error, leaves no partial install, and does not record a "declined"
       decision — a later run with connectivity re-prompts and succeeds (BR-12).
+- [ ] AC-12: The download client is credential-free and follows redirects (a
+      HuggingFace `resolve` → CDN 302 completes), while the provider/MCP egress
+      client still refuses redirects — asserted by a test covering both halves,
+      so relaxing one never silently relaxes the other (BR-14).
+- [ ] AC-13: A catalog entry whose URL pins a moving ref (e.g. `/resolve/main/`)
+      fails the catalog-integrity check with an actionable message (BR-15); a
+      configured base-URL override redirects fetches to the mirror (BR-16); an
+      HTTP 429 is retried with backoff and reported as rate-limiting, not as a
+      corrupt download.
 - [ ] AC-11 **[MANUAL GATE — not CI-enforceable]**: A real end-to-end install of
       at least one catalog model succeeds on a developer machine
       (manual/`--features live` verification — this is the claim CI's mocks
@@ -172,8 +211,11 @@ looking like a regression.
 
 ## External Dependencies
 
-- A hosting location for GGUF artifacts — HuggingFace direct vs. self-hosted
-  `models.tetoncode.ai` (OQ-1).
+- **HuggingFace** as the GGUF host (ADR-004): anonymous downloads of public
+  repos, `https://huggingface.co/<repo>/resolve/<commit-sha>/<file>.gguf`, which
+  302-redirects to their CDN for LFS artifacts. No API token for public,
+  ungated repos; a gated repo would require one and should be avoided when
+  choosing entries (OQ-2).
 - Real SHA-256 digests and byte sizes for each chosen quantization.
 - Existing REQ-544 machinery: `teton-inference` probe/download/benchmark/
   pressure, the `model_lifecycle` event, the `teton` CLI's unwired
@@ -198,10 +240,12 @@ looking like a regression.
 
 ## Open Questions
 
-- [ ] OQ-1: Where do the weights live — HuggingFace direct (zero infra, inherits
-      their rate limits/availability/naming churn) or self-hosted
-      `models.tetoncode.ai` (stable URLs and control, at real bandwidth cost —
-      the large entry is ~18 GB per download)?
+- [x] OQ-1: ~~Where do the weights live?~~ **RESOLVED 2026-07-21: HuggingFace
+      direct.** Zero infra and no bandwidth cost (self-hosting an ~18 GB artifact
+      per download is not justifiable pre-alpha). Recorded as ADR-004 in
+      `.adlc/context/architecture.md`. Consequences are captured as BR-13..BR-16
+      below; `models.tetoncode.ai` remains available as a future mirror if HF
+      rate limits or availability become a real problem.
 - [ ] OQ-2: Which exact quantization per band ships as the default (`q4_k_m`
       assumed today), and are the four current Qwen picks confirmed? Blocked on
       REQ-544 OQ-3's real benchmark.

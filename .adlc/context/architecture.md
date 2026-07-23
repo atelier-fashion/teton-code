@@ -107,6 +107,37 @@ shim exists; protocol versioning, socket auth (filesystem permissions +
 peer-credential check), and backpressure are ours to design — to be specified
 in the protocol child REQ at decomposition time.
 
+### ADR-004: Local model weights are hosted on HuggingFace (2026-07-21)
+
+**Decision**: GGUF artifacts are fetched directly from HuggingFace public repos
+(`https://huggingface.co/<repo>/resolve/<commit-sha>/<file>.gguf`) rather than
+self-hosted on `models.tetoncode.ai`. Catalog URLs pin an immutable commit SHA,
+never a moving ref.
+
+**Rationale**: zero infrastructure and zero bandwidth cost. Self-hosting the
+large catalog entry (~18 GB) per download is not justifiable pre-alpha, and HF
+is where these artifacts already live and are updated.
+
+**Consequences**:
+- HF `resolve` URLs 302-redirect to their CDN, so the model downloader needs a
+  redirect-following client. It MUST be a **separate, credential-free client**
+  from the provider/MCP egress client — the egress client's
+  `redirect::Policy::none()` exists to stop a custom credential header
+  (`x-api-key`, which reqwest does not strip cross-host) riding a redirect to
+  an attacker-influenced host, and must not be relaxed. A model fetch carries no
+  user content and no credential, so it is a distinct trust context.
+- We inherit HF availability, rate limits (429/503 → backoff, reported
+  distinctly from corruption), and repo/naming churn. Mitigated by pinning
+  commit SHAs and by a configurable base URL (`HF_ENDPOINT`-style) that also
+  serves firewalled/mirrored users and makes a future host move a config change
+  rather than a release.
+- `models.tetoncode.ai` stays available as a fallback mirror if HF becomes a
+  real constraint.
+
+**Alternatives rejected**: self-hosted CDN (control and stable URLs, but real
+bandwidth cost and ops burden for a pre-alpha with no users); bundling weights
+in the installer (rejected at charter time — a 4–8 GB installer).
+
 ### ADR-003: MCP server consumption is first-class (2026-07-17)
 
 **Decision**: Teton Code consumes MCP (Model Context Protocol) servers as tool
