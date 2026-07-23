@@ -194,16 +194,16 @@ daemon contains no production wiring for `Downloader` at all._
 - [ ] AC-10: Accepting the proposal with no network produces a clear network
       error, leaves no partial install, and does not record a "declined"
       decision — a later run with connectivity re-prompts and succeeds (BR-12).
-- [ ] AC-12: The download client is credential-free and follows redirects (a
+- [ ] AC-11: The download client is credential-free and follows redirects (a
       HuggingFace `resolve` → CDN 302 completes), while the provider/MCP egress
       client still refuses redirects — asserted by a test covering both halves,
       so relaxing one never silently relaxes the other (BR-14).
-- [ ] AC-13: A catalog entry whose URL pins a moving ref (e.g. `/resolve/main/`)
+- [ ] AC-12: A catalog entry whose URL pins a moving ref (e.g. `/resolve/main/`)
       fails the catalog-integrity check with an actionable message (BR-15); a
       configured base-URL override redirects fetches to the mirror (BR-16); an
       HTTP 429 is retried with backoff and reported as rate-limiting, not as a
       corrupt download.
-- [ ] AC-11 **[MANUAL GATE — not CI-enforceable]**: A real end-to-end install of
+- [ ] AC-13 **[MANUAL GATE — not CI-enforceable]**: A real end-to-end install of
       at least one catalog model succeeds on a developer machine
       (manual/`--features live` verification — this is the claim CI's mocks
       cannot make, and it must be signed off by a human rather than silently
