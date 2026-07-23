@@ -1,0 +1,59 @@
+{
+  "req": "REQ-547",
+  "branch": "feat/REQ-547-first-run-model-consent",
+  "startedAt": "2026-07-23T23:23:20Z",
+  "completed": false,
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Step 0 worktree+preflight",
+      "completedAt": "2026-07-23T23:27:15Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-07-23T23:27:15Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-07-23T23:27:15Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Arch & Tasks",
+      "completedAt": "2026-07-23T23:27:15Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-547",
+      "branch": "feat/REQ-547-first-run-model-consent",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": "TASK-001",
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
