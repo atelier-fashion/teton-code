@@ -1072,13 +1072,49 @@ impl ModelConsentGate {
         // here — no `ModelSelectionProposed` is published, because there is no one
         // to answer it; the flow still emits `model_selection_decided` so an
         // attached client learns why the tier is in the state it is in.
+        //
+        // BR-3 holds unattended (decision 2026-07-24, reversing the earlier
+        // "judged deliberate" gap): `auto_accept` is one flag, not two answers —
+        // the same rule `teton --yes` applies client-side. The probe's own pick
+        // fits this machine by construction, so the only way an above-RAM-floor
+        // entry reaches this branch is a `[local_model] pinned` override — and
+        // committing it here would be an unattended multi-gigabyte fetch *and*,
+        // since the engine wiring, an unattended load of a model this machine
+        // cannot hold. An above-floor pick therefore falls through to the
+        // ordinary proposal below, which names the entry with its warning; a
+        // human answers it with BR-3's explicit confirmation, or nobody does
+        // and sessions stay remote-only (D-3).
         if self.config.auto_accept {
-            return match self.catalog.get(decision.model().unwrap_or_default()) {
-                Some(entry) => self.commit(entry, SelectionSource::AutoAccept, None).await,
-                None => ConsentOutcome::Unavailable {
-                    reason: disabled_reason(&decision),
-                },
-            };
+            match validate_choice(
+                &self.catalog,
+                &self.profile,
+                decision.model().unwrap_or_default(),
+                false,
+            ) {
+                Ok(entry) => {
+                    return self.commit(entry, SelectionSource::AutoAccept, None).await;
+                }
+                Err(ChoiceRefusal::AboveRamFloor {
+                    name,
+                    needed,
+                    available,
+                }) => {
+                    // Operator-facing: the unattended run should say why it did
+                    // not complete unattended. Names the entry and the figures,
+                    // no path (BR-11).
+                    eprintln!(
+                        "tetond: [local_model] auto_accept will not install '{name}' \
+                         unattended: it needs {needed} of RAM and this machine has \
+                         {available} (BR-3). Leaving the proposal open for an \
+                         explicit, confirmed answer."
+                    );
+                }
+                Err(_) => {
+                    return ConsentOutcome::Unavailable {
+                        reason: disabled_reason(&decision),
+                    };
+                }
+            }
         }
 
         // --- the gate itself ---

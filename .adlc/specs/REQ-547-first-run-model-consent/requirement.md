@@ -346,6 +346,20 @@ daemon contains no production wiring for `Downloader` at all._
   `approved|in-progress|deployed`) but is the direct parent of this work and was
   fully in authoring context; the filter gap is noted rather than worked around.
 
+## Post-close decisions (2026-07-24, Brett)
+
+Two items surfaced by the engine wiring, decided:
+
+- **MCP `trusted` defaults to `false` — stays.** Deliberate, recorded as an
+  addendum to ADR-003: untrusted stdio provenance taints the session to a local
+  tier that now genuinely serves.
+- **`[local_model] auto_accept` gains the BR-3 RAM-floor check** (reversing the
+  earlier "judged deliberate" review disposition): an above-floor pick — only
+  reachable via a `pinned` override — is no longer committed unattended; the
+  flow falls through to the ordinary proposal for an explicit, confirmed
+  answer. Carried by
+  `model_consent::auto_accept_refuses_an_above_floor_pin_and_leaves_the_proposal_open`.
+
 ## Deferred (engine-wiring close, 2026-07-24)
 
 The AC-2/AC-13 engine wiring (PR #3) deliberately left these for their own
