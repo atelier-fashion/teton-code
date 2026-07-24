@@ -288,11 +288,14 @@ impl SessionEvents {
 /// into the context for the model to handle.
 ///
 /// # Blocking
-/// Tool dispatch (notably `shell`) runs synchronously; a production caller on a
-/// multi-thread runtime should wrap this in `spawn_blocking` for the tool phase.
+/// The model call itself rides the blocking pool (E-3, see
+/// [`LocalEngineSource`] and [`summarize_if_large`]), so a slow local inference
+/// never parks the async worker. Tool dispatch (notably `shell`) still runs
+/// synchronously; a production caller on a multi-thread runtime should wrap this
+/// in `spawn_blocking` for the tool phase.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_session_turn(
-    engine: &Mutex<dyn Engine>,
+    engine: &Arc<Mutex<dyn Engine>>,
     tools: &ToolRegistry,
     tool_ctx: &ToolContext,
     gate: &PermissionGate,
@@ -301,7 +304,7 @@ pub async fn run_session_turn(
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
 ) -> Result<TurnOutcome, HarnessError> {
-    let mut source = LocalEngineSource::new(engine);
+    let mut source = LocalEngineSource::new(Arc::clone(engine));
     run_session_turn_with_source(
         &mut source,
         tools,
@@ -311,7 +314,7 @@ pub async fn run_session_turn(
         ctx,
         config,
         hook,
-        Some(engine),
+        Some(Arc::clone(engine)),
     )
     .await
 }
@@ -345,7 +348,7 @@ pub async fn run_session_turn_with_source(
     ctx: &mut ContextManager,
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
-    summarizer: Option<&Mutex<dyn Engine>>,
+    summarizer: Option<Arc<Mutex<dyn Engine>>>,
 ) -> Result<TurnOutcome, HarnessError> {
     let exposed = tools.exposed_names(config.max_tools);
     let mut turns = 0u32;
@@ -485,14 +488,15 @@ pub async fn run_session_turn_with_source(
                         // summarizer engine failure is never silent: the duty
                         // guards the context window, so the fallback (mechanical
                         // truncation) is logged with the error that forced it.
-                        let folded = match summarizer {
+                        let folded = match &summarizer {
                             Some(engine) => {
                                 let outcome = summarize_if_large(
                                     engine,
                                     &name,
                                     &folded,
                                     config.summarize_threshold_tokens,
-                                );
+                                )
+                                .await;
                                 if let Some(error) = &outcome.engine_error {
                                     eprintln!(
                                         "tetond: local summarizer failed on a `{name}` \
@@ -541,7 +545,7 @@ pub async fn run_session_turn_with_source(
 /// Propagates [`HarnessError`] from the underlying [`run_session_turn`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_routed_session_turn(
-    engine: &Mutex<dyn Engine>,
+    engine: &Arc<Mutex<dyn Engine>>,
     tools: &ToolRegistry,
     tool_ctx: &ToolContext,
     gate: &PermissionGate,
