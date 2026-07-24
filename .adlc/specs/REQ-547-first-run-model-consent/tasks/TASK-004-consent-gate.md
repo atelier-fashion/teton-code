@@ -1,10 +1,10 @@
 ---
 id: TASK-004
 title: "Consent gate + decision persistence in the daemon"
-status: draft
+status: complete
 parent: REQ-547
 created: 2026-07-21
-updated: 2026-07-21
+updated: 2026-07-23
 dependencies: [TASK-001]
 ---
 
@@ -23,13 +23,13 @@ The heart of the REQ (BR-1..BR-5, BR-10, BR-12): probe → propose → await ans
 
 ## Acceptance Criteria
 
-- [ ] **Zero download requests are issued before a decision** — asserted with a fetcher double that records every call (AC-1); a session started while undecided completes remote-only rather than blocking (BR-1)
-- [ ] Accepting proceeds to install; choosing an alternative installs that entry instead (AC-2/AC-3 backend)
-- [ ] Declining persists and a subsequent daemon start does NOT re-prompt (AC-4)
-- [ ] `auto_accept` completes the flow with no proposal emitted (AC-5)
-- [ ] Offline accept → clear network error, no partial install, and the decision is **not** recorded as declined; a later run re-prompts (AC-10, BR-12)
-- [ ] A recorded decision is not re-litigated; re-prompt occurs only when weights are missing/corrupt or `model/set` is called (BR-10)
-- [ ] Proposal payload carries no absolute path or credential (BR-11)
+- [x] **Zero download requests are issued before a decision** — asserted with a fetcher double that records every call (AC-1); a session started while undecided completes remote-only rather than blocking (BR-1)
+- [x] Accepting proceeds to install; choosing an alternative installs that entry instead (AC-2/AC-3 backend)
+- [x] Declining persists and a subsequent daemon start does NOT re-prompt (AC-4)
+- [x] `auto_accept` completes the flow with no proposal emitted (AC-5)
+- [x] Offline accept → clear network error, no partial install, and the decision is **not** recorded as declined; a later run re-prompts (AC-10, BR-12)
+- [x] A recorded decision is not re-litigated; re-prompt occurs only when weights are missing/corrupt or `model/set` is called (BR-10)
+- [x] Proposal payload carries no absolute path or credential (BR-11)
 
 ## Technical Notes
 

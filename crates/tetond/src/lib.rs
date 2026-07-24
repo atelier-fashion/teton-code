@@ -27,6 +27,11 @@
 //!   artifact gates, `.teton/` artifact storage, and bundled generic templates.
 //! - [`heuristics`] — freeform-mode routing (BR-5): local for auxiliary duties,
 //!   the configured default for coding turns, with a BR-8 local-tier bypass.
+//! - [`model_consent`] — the first-run consent gate (REQ-547 BR-1): probe →
+//!   propose → await an answer → only then download. Gates the local *tier*,
+//!   never the session (D-3).
+//! - [`selection_store`] — the recorded decision as machine state (REQ-547 D-4),
+//!   which is what makes "a decision is not re-litigated" a state read.
 //! - [`mcp`] — user-registered MCP servers as egress-gated tool providers
 //!   (ADR-003): the protocol client, the server registry, and the tool bridge.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
@@ -44,8 +49,10 @@ pub mod harness;
 pub mod heuristics;
 pub mod keychain;
 pub mod mcp;
+pub mod model_consent;
 pub mod router;
 pub mod runtime;
+pub mod selection_store;
 pub mod server;
 pub mod sessions;
 pub mod single_instance;

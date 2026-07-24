@@ -72,6 +72,18 @@ fn main() -> anyhow::Result<ExitCode> {
         // events reach attached clients.
         let events = Arc::new(EventBus::new());
         let daemon_runtime = Arc::new(DaemonRuntime::from_env(&base_dir, &events)?);
+
+        // REQ-547 BR-1/D-3: drive the first-run consent flow on its own task. It
+        // may await a client's `model/confirm` indefinitely, and while it does
+        // the daemon must keep serving sessions remote-only — so it is spawned
+        // beside `serve`, never awaited before it.
+        if daemon_runtime.first_run_consent_applies() {
+            let consent_runtime = Arc::clone(&daemon_runtime);
+            tokio::spawn(async move {
+                consent_runtime.run_model_consent().await;
+            });
+        }
+
         let daemon = Arc::new(Daemon::with_runtime(events, daemon_runtime));
         server::serve(listener, daemon).await?;
         Ok::<(), anyhow::Error>(())

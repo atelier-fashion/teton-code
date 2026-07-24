@@ -37,12 +37,12 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use teton_core::boundary::BoundaryMatcher;
-use teton_core::config::Config;
+use teton_core::config::{Config, LocalModelConfig};
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind, RoutingPolicy,
 };
@@ -57,7 +57,8 @@ use teton_protocol::events::{ModelLifecycle, ModelLifecycleStage, PrivacyAction}
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     ConfigSnapshot, ConfigUpdate, CostGroupView, CostQueryResult, CostReportView,
-    PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, RoutingRule,
+    ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult, ModelSetResult,
+    ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, RoutingRule,
 };
 use teton_protocol::{
     Phase as ProtoPhase, PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId,
@@ -71,6 +72,7 @@ use teton_providers::{
 
 use crate::broadcast::EventBus;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
+use crate::download::HttpRangeFetcher;
 use crate::egress::{inspect, origin_of, Egress, HttpTransport};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
@@ -81,7 +83,12 @@ use crate::harness::{
 };
 use crate::keychain::SecretResolver;
 use crate::mcp::{McpRegistry, McpServerConfig};
+use crate::model_consent::{
+    list_entries, probe_view, selection_view, ConsentOutcome, FetcherInstaller, ModelConsentGate,
+    NoInstaller, PendingModelDecisions, WeightsInstaller,
+};
 use crate::router::Router;
+use crate::selection_store::SelectionStore;
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
 const SCRIPT_SEPARATOR: &str = "---";
@@ -329,6 +336,19 @@ pub struct DaemonRuntime {
     engine: Option<Arc<Mutex<dyn Engine>>>,
     /// Whether the local tier can meet its BR-8 latency duty right now.
     local_available: bool,
+    /// The REQ-547 first-run consent gate: the probe, the catalog, the recorded
+    /// decision, the pending-answer registry, and the installer.
+    consent: Arc<ModelConsentGate>,
+    /// Whether the local tier is **withheld pending a consent decision** (D-3).
+    ///
+    /// Separate from `local_available`, which answers "can the tier meet its
+    /// latency duty"; this answers "has the user agreed to install it at all".
+    /// Held as an atomic because the decision arrives asynchronously, long after
+    /// the runtime was assembled, and every client task shares one runtime.
+    ///
+    /// The gate withholds the **tier**, never the session: while it is set,
+    /// sessions still run — they route remote-only (BR-1).
+    local_gated: AtomicBool,
     /// The append-only cost ledger (BR-2). Recorded at the egress choke point.
     ledger: CostLedger,
     /// Daemon-wide registry of in-flight permission prompts (the
@@ -371,12 +391,30 @@ impl DaemonRuntime {
         let ledger =
             CostLedger::open_in_memory(PriceTable::bundled(), Arc::new(crate::cost::NoopCostSink))
                 .expect("in-memory ledger");
+        // A minimal runtime has no local tier at all, so its consent gate records
+        // in memory, installs nothing, and probes a machine below the floor —
+        // there is nothing for a decision to be about.
+        let consent = Arc::new(ModelConsentGate::new(
+            HardwareProfile {
+                ram_bytes: 0,
+                free_disk_bytes: 0,
+                gpu: GpuClass::Cpu,
+            },
+            Catalog::bundled(),
+            LocalModelConfig::default(),
+            Arc::new(EventBus::new()),
+            Arc::new(PendingModelDecisions::new()),
+            Arc::new(SelectionStore::in_memory()),
+            Arc::new(NoInstaller),
+        ));
         Self {
             config: Mutex::new(Config::default()),
             config_path: None,
             repo_root: std::env::temp_dir(),
             engine: None,
             local_available: false,
+            consent,
+            local_gated: AtomicBool::new(false),
             ledger,
             pending: Arc::new(PendingPermissions::new()),
             permission_config: PermissionConfig::coding_defaults(),
@@ -417,10 +455,37 @@ impl DaemonRuntime {
                 .or_else(|_| CostLedger::open_in_memory(PriceTable::bundled(), events.clone()))?;
 
         // --- local tier: hardware probe (BR-9 / AC-8) + scripted engine ---
-        let pinned = config.pinned_local_model.clone();
-        let probe = probe_local_tier(pinned.as_deref());
+        let profile = probe_profile();
+        let catalog = Catalog::bundled();
+        // `[local_model] pinned` supersedes the legacy top-level key; resolving it
+        // once here means the probe, the consent gate, and `model/list` cannot
+        // disagree about which pin is in force.
+        let pinned = config.effective_pinned_local_model().map(str::to_owned);
+        let probe = probe_local_tier(&profile, &catalog, pinned.as_deref());
         let engine: Option<Arc<Mutex<dyn Engine>>> = build_local_engine(&probe);
         let local_available = engine.is_some() && !probe.disabled;
+
+        // --- first-run consent (REQ-547) ---
+        //
+        // Assembled but NOT run here: `from_env` must return promptly so the
+        // daemon can serve sessions while a proposal is outstanding (D-3). The
+        // flow is driven by `run_model_consent`, which `main` spawns.
+        let mut local_model = config.local_model.clone();
+        local_model.pinned = pinned;
+        let consent = Arc::new(ModelConsentGate::new(
+            profile,
+            catalog,
+            local_model,
+            Arc::clone(events),
+            Arc::new(PendingModelDecisions::new()),
+            Arc::new(SelectionStore::open(base_dir)),
+            build_installer(base_dir, config.local_model.base_url.clone()),
+        ));
+        // The gate governs weights the daemon would have to **download**. A
+        // `TETON_LOCAL_SCRIPT` engine is canned replies from a file: nothing is
+        // fetched, so there is nothing to consent to and gating it would only
+        // break the offline test path.
+        let local_gated = AtomicBool::new(engine.is_none() && consent.consent_required());
 
         // --- MCP servers (ADR-003 / AC-9): the main TOML config is the source of
         // truth; TETON_MCP_CONFIG is a test-only override (see `load_mcp_servers`).
@@ -432,6 +497,8 @@ impl DaemonRuntime {
             repo_root,
             engine,
             local_available,
+            consent,
+            local_gated,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
             permission_config: PermissionConfig::coding_defaults(),
@@ -444,10 +511,173 @@ impl DaemonRuntime {
         })
     }
 
+    /// A runtime wired for the local-tier consent flow and nothing else.
+    ///
+    /// The `model/*` handlers read only the consent gate, so this is what the
+    /// consent tests stand a [`crate::server::Daemon`] up on — a full
+    /// [`Self::from_env`] would drag in the environment, the real state
+    /// directory, and the bundled catalog's real digests.
+    ///
+    /// The tier is marked *capable* (`local_available`) so that the consent gate
+    /// is the only thing that can withhold it: a test asserting "undecided ⇒
+    /// remote-only" must be observing the gate, not a machine that had no local
+    /// tier to begin with.
+    #[must_use]
+    pub fn with_consent(consent: Arc<ModelConsentGate>) -> Self {
+        let gated = consent.consent_required();
+        Self {
+            local_available: true,
+            local_gated: AtomicBool::new(gated),
+            consent,
+            ..Self::minimal()
+        }
+    }
+
     /// The daemon-wide pending-permission registry (the `permission/respond` seam).
     #[must_use]
     pub fn pending(&self) -> &Arc<PendingPermissions> {
         &self.pending
+    }
+
+    /// The first-run consent gate for the local tier (REQ-547).
+    #[must_use]
+    pub fn consent(&self) -> &Arc<ModelConsentGate> {
+        &self.consent
+    }
+
+    /// Whether the local tier may serve a turn right now.
+    ///
+    /// Two independent conditions: the tier must be *capable* (`local_available`,
+    /// BR-8's latency duty) and it must be *consented to* (REQ-547 BR-1). A
+    /// machine awaiting an answer routes remote-only rather than blocking — the
+    /// gate withholds the tier, never the session (D-3).
+    #[must_use]
+    pub fn local_tier_available(&self) -> bool {
+        self.local_available && !self.local_gated.load(Ordering::SeqCst)
+    }
+
+    /// Whether the first-run consent flow applies to this daemon at all.
+    ///
+    /// It does not when the local tier's engine was supplied out of band — a
+    /// `TETON_LOCAL_SCRIPT` stand-in replays canned replies from a file and
+    /// downloads nothing, so proposing a download would prompt the user for
+    /// something that is never going to happen. Consent gates *fetching weights*;
+    /// where there are no weights to fetch there is nothing to consent to.
+    #[must_use]
+    pub fn first_run_consent_applies(&self) -> bool {
+        self.engine.is_none()
+    }
+
+    /// Drive the first-run consent flow to a decision (REQ-547 BR-1).
+    ///
+    /// Awaits a client's `model/confirm` when a proposal is needed, so callers
+    /// must run it off the path that serves requests — `main` spawns it. On a
+    /// decided-and-installed outcome the local tier is un-gated for every
+    /// subsequent turn.
+    pub async fn run_model_consent(self: &Arc<Self>) -> ConsentOutcome {
+        let outcome = self.consent.resolve().await;
+        self.apply_consent_outcome(&outcome);
+        outcome
+    }
+
+    /// Install the weights for the decision already recorded (`model/set`).
+    pub async fn install_selected_model(self: &Arc<Self>) -> ConsentOutcome {
+        let outcome = self.consent.install_recorded().await;
+        self.apply_consent_outcome(&outcome);
+        outcome
+    }
+
+    /// Open or close the tier gate according to a consent outcome.
+    ///
+    /// Only a `Ready` outcome opens it. A refusal, a failed install, and an
+    /// unanswered proposal all leave the tier withheld and the session
+    /// remote-only, which is the BR-1 default rather than a special case.
+    fn apply_consent_outcome(&self, outcome: &ConsentOutcome) {
+        self.local_gated
+            .store(!outcome.local_tier_ready(), Ordering::SeqCst);
+    }
+
+    /// The catalog with each entry's fit for this machine (`model/list`, AC-9).
+    #[must_use]
+    pub fn model_list(&self) -> ModelListResult {
+        let consent = &self.consent;
+        let decision = consent.probe_decision();
+        ModelListResult {
+            probe: probe_view(consent.profile(), &decision),
+            models: list_entries(consent.profile(), consent.catalog()),
+            selection: consent.current_selection().as_ref().map(selection_view),
+        }
+    }
+
+    /// The recorded decision, the weights' install state, and any outstanding
+    /// proposal (`model/status`, AC-9).
+    ///
+    /// `pending_request_id` is what lets a client that attached *after* the
+    /// proposal was broadcast still answer it, instead of waiting forever for an
+    /// event it already missed.
+    #[must_use]
+    pub fn model_status(&self) -> ModelStatusResult {
+        ModelStatusResult {
+            selection: self
+                .consent
+                .current_selection()
+                .as_ref()
+                .map(selection_view),
+            install: self.consent.current_install(),
+            pending_request_id: self.consent.pending().outstanding(),
+        }
+    }
+
+    /// Change the selected model after first run (`model/set`, AC-9 / BR-3).
+    ///
+    /// # Errors
+    /// Returns a [`RpcError`] (`INVALID_PARAMS`) naming an unknown catalog entry,
+    /// or an above-RAM-floor pick that has not been confirmed a second time.
+    pub fn set_model(
+        &self,
+        name: &str,
+        confirmed_above_ram_floor: bool,
+    ) -> Result<ModelSetResult, RpcError> {
+        let selection = self
+            .consent
+            .set_model(name, confirmed_above_ram_floor)
+            .map_err(|refusal| RpcError::new(error_code::INVALID_PARAMS, refusal.to_string()))?;
+        Ok(ModelSetResult {
+            selection: selection_view(&selection),
+        })
+    }
+
+    /// Deliver a client's answer to an outstanding proposal (`model/confirm`).
+    ///
+    /// A `choose` is validated **before** the waiter is resolved, so a bad answer
+    /// comes back as an RPC error the client can correct while the proposal stays
+    /// open — a mistyped model name must not cost the user their prompt (BR-3).
+    ///
+    /// # Errors
+    /// Returns a [`RpcError`] (`INVALID_PARAMS`) for a refused choice.
+    pub fn confirm_model(
+        &self,
+        params: ModelConfirmParams,
+    ) -> Result<ModelConfirmResult, RpcError> {
+        if let ModelConfirmOutcome::Choose {
+            name,
+            confirmed_above_ram_floor,
+        } = &params.outcome
+        {
+            crate::model_consent::validate_choice(
+                self.consent.catalog(),
+                self.consent.profile(),
+                name,
+                *confirmed_above_ram_floor,
+            )
+            .map_err(|refusal| RpcError::new(error_code::INVALID_PARAMS, refusal.to_string()))?;
+        }
+        // Idempotent, like `permission/respond`: a late or duplicate answer for a
+        // proposal that already resolved simply finds no waiter.
+        self.consent
+            .pending()
+            .resolve(&params.request_id, params.outcome);
+        Ok(ModelConfirmResult {})
     }
 
     /// The startup model-lifecycle events (BR-9), replayed to attaching clients.
@@ -550,7 +780,10 @@ impl DaemonRuntime {
             .collect();
         let router = build_router(
             &config,
-            self.local_available,
+            // REQ-547 BR-1/D-3: a tier awaiting a consent decision is withheld
+            // here, so this turn routes remote-only instead of blocking on the
+            // answer.
+            self.local_tier_available(),
             self.ledger.prices(),
             &health_snapshot,
         );
@@ -907,6 +1140,29 @@ fn load_mcp_servers(config: &Config) -> Vec<McpServerConfig> {
     config.mcp_server.clone()
 }
 
+/// Subdirectory of the daemon state directory the model weights install into.
+///
+/// Beside the cost ledger and the decision record: machine state, not project
+/// state (REQ-547 D-4). The path is local-display-only and never crosses the
+/// protocol boundary (BR-11).
+const WEIGHTS_DIR: &str = "models";
+
+/// The installer the consent gate hands a decided model to.
+///
+/// The download client is credential-free and redirect-following (D-2, TASK-002).
+/// If it cannot be built at all, the daemon still runs — it just cannot install
+/// weights, and says so rather than reporting them as merely absent.
+fn build_installer(base_dir: &Path, base_url: Option<String>) -> Arc<dyn WeightsInstaller> {
+    match HttpRangeFetcher::new() {
+        Ok(fetcher) => Arc::new(FetcherInstaller::new(
+            Arc::new(fetcher),
+            base_dir.join(WEIGHTS_DIR),
+            base_url,
+        )),
+        Err(_) => Arc::new(NoInstaller),
+    }
+}
+
 /// The result of the startup hardware probe (BR-9 / AC-8).
 struct ProbeResult {
     /// The selected local model id, or `None` when disabled.
@@ -917,13 +1173,19 @@ struct ProbeResult {
     lifecycle: Vec<ModelLifecycle>,
 }
 
-/// Run the first-run hardware probe against real or env-overridden hardware and
-/// synthesize the model-lifecycle event sequence (probe → download → benchmark →
-/// ready / stepped-down / disabled).
-fn probe_local_tier(pinned: Option<&str>) -> ProbeResult {
-    let profile = probe_profile();
-    let catalog = Catalog::bundled();
-    let decision = decide(&profile, &catalog, pinned);
+/// Run the first-run hardware probe against `profile` and synthesize the
+/// model-lifecycle event sequence (probe → download → benchmark → ready /
+/// stepped-down / disabled).
+///
+/// The profile and catalog are passed in rather than resolved here so the probe
+/// and the REQ-547 consent gate describe the *same* machine and the *same*
+/// catalog — re-detecting would let the two disagree.
+fn probe_local_tier(
+    profile: &HardwareProfile,
+    catalog: &Catalog,
+    pinned: Option<&str>,
+) -> ProbeResult {
+    let decision = decide(profile, catalog, pinned);
 
     let above_floor = profile.ram_bytes >= 8 * GIB;
     let mut lifecycle = Vec::new();
@@ -976,7 +1238,7 @@ fn probe_local_tier(pinned: Option<&str>) -> ProbeResult {
                         tokens_per_sec: 2.0,
                     },
                 });
-                let smaller = step_down_target(&catalog, &model);
+                let smaller = step_down_target(catalog, &model);
                 match smaller {
                     Some(to_model) => {
                         lifecycle.push(ModelLifecycle {

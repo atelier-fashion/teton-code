@@ -24,6 +24,7 @@ use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
 use teton_protocol::methods::{
     ConfigGetParams, ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams,
+    ModelConfirmParams, ModelListParams, ModelSetParams, ModelStatusParams,
     PermissionRespondParams, PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod,
     SessionAttachParams, SessionAttachResult, SessionCreateParams, SessionCreateResult,
     SessionListParams, SessionListResult,
@@ -386,6 +387,10 @@ fn dispatch(daemon: &Daemon, id: Id, method: &str, params: Value) -> Option<Stri
         }
         SessionAttachParams::METHOD => Some(handle_session_attach(daemon, id, params)),
         PermissionRespondParams::METHOD => Some(handle_permission_respond(daemon, id, params)),
+        ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, id, params)),
+        ModelListParams::METHOD => Some(ok_string(id, &daemon.runtime.model_list())),
+        ModelSetParams::METHOD => Some(handle_model_set(daemon, id, params)),
+        ModelStatusParams::METHOD => Some(ok_string(id, &daemon.runtime.model_status())),
         ConfigGetParams::METHOD => Some(handle_config_get(daemon, id)),
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, id)),
@@ -410,6 +415,58 @@ fn handle_permission_respond(daemon: &Daemon, id: Id, params: Value) -> String {
         .pending()
         .resolve(&params.request_id, params.outcome);
     ok_string(id, &PermissionRespondResult {})
+}
+
+/// Deliver a client's `model/confirm` to the waiting consent flow (REQ-547 BR-1).
+///
+/// The counterpart to [`handle_permission_respond`], and deliberately the same
+/// shape: the daemon broadcast a proposal carrying a `request_id`, and the
+/// deciding client answers by that id while this reader loop stays free to keep
+/// reading. That is what makes the round-trip deadlock-free — the consent flow
+/// awaits on its own task, never on this one.
+///
+/// Unlike a permission answer, a model choice can be *wrong* in a way the client
+/// can fix (an unknown catalog name, an above-RAM-floor pick with no second
+/// confirmation, BR-3). Those come back as `INVALID_PARAMS` with the proposal
+/// still open, rather than silently consuming the user's one chance to answer.
+fn handle_model_confirm(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: ModelConfirmParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        // A closed enum by design (TASK-001): an `outcome` this build does not
+        // understand is an error, never a silent fallback to "accept".
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    match daemon.runtime.confirm_model(params) {
+        Ok(result) => ok_string(id, &result),
+        Err(err) => error_from(id, err),
+    }
+}
+
+/// Change the selected model after first run (`model/set`, AC-9).
+///
+/// Records and announces the decision synchronously so the client gets an
+/// immediate answer, then installs the newly chosen weights on its own task —
+/// a multi-gigabyte download must not hold the reader loop.
+fn handle_model_set(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: ModelSetParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    match daemon
+        .runtime
+        .set_model(&params.name, params.confirmed_above_ram_floor)
+    {
+        Ok(result) => {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let runtime = Arc::clone(&daemon.runtime);
+                tokio::spawn(async move {
+                    runtime.install_selected_model().await;
+                });
+            }
+            ok_string(id, &result)
+        }
+        Err(err) => error_from(id, err),
+    }
 }
 
 /// Serve the current configuration snapshot (`config/get`).
