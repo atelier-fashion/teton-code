@@ -80,6 +80,11 @@
       "phase": 8,
       "name": "Post-close: cross-process AC-2 e2e (deferred item) merged via PR #6 \u2014 TETON_FAKE_ENGINE_LOADER seam",
       "completedAt": "2026-07-24T22:33:49Z"
+    },
+    {
+      "phase": 8,
+      "name": "Post-close: deprecated llama-cpp-2 API (stream-lifetime UTF-8 decoder) merged via PR #7",
+      "completedAt": "2026-07-24T22:55:00Z"
     }
   ],
   "integrationBranch": "main",

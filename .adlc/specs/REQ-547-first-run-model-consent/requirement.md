@@ -387,5 +387,11 @@ sessions; the first three are chipped as background tasks:
 - **Startup re-benchmark policy** — every boot re-measures (~44 s tier-open
   latency for the 18.6 GB model); consider caching with an explicit re-measure
   trigger.
-- **Deprecated llama-cpp-2 API** — `token_to_str`/`Special::Tokenize` should
-  migrate to `token_to_piece` with a stateful UTF-8 decoder.
+- **Deprecated llama-cpp-2 API** — ~~`token_to_str`/`Special::Tokenize` should
+  migrate to `token_to_piece` with a stateful UTF-8 decoder.~~
+  **Resolved 2026-07-24 (PR #7, `c9813b9`)**: one `encoding_rs` decoder now
+  lives for the whole generation loop (the deprecated per-call shim dropped
+  partial multi-byte sequences at token boundaries — a real streaming bug for
+  CJK/emoji, not just a deprecation); stream end flushes the decoder so a
+  dangling partial surfaces as U+FFFD instead of vanishing. `--features llama`
+  builds warning-free; real-engine smoke passes (LESSON-452).
