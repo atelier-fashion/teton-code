@@ -205,7 +205,7 @@ mod llama {
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
-    use llama_cpp_2::model::{AddBos, LlamaModel, Special};
+    use llama_cpp_2::model::{AddBos, LlamaModel};
     use llama_cpp_2::sampling::LlamaSampler;
 
     /// The process-wide llama.cpp backend.
@@ -331,6 +331,13 @@ mod llama {
             let mut text = String::new();
             let mut completion_tokens = 0u32;
             let mut n_cur = i32::try_from(tokens.len()).unwrap_or(i32::MAX);
+            // ONE decoder for the whole stream: a single BPE token can end
+            // mid-way through a multi-byte UTF-8 character, and the decoder is
+            // what carries the partial bytes across to the next token. The
+            // deprecated per-token `token_to_str` constructed a fresh decoder
+            // per call and dropped it — silently losing any held partial
+            // sequence, which garbled streamed CJK/emoji at token boundaries.
+            let mut decoder = encoding_rs::UTF_8.new_decoder();
 
             while completion_tokens < params.max_tokens {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -340,10 +347,15 @@ mod llama {
                 }
                 let piece = self
                     .model
-                    .token_to_str(token, Special::Tokenize)
+                    .token_to_piece(token, &mut decoder, true, None)
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
-                on_token(&piece);
-                text.push_str(&piece);
+                // A token that only *starts* a multi-byte character yields an
+                // empty piece (its bytes are held in the decoder) — nothing to
+                // stream yet, but it still counts as a generated token.
+                if !piece.is_empty() {
+                    on_token(&piece);
+                    text.push_str(&piece);
+                }
                 completion_tokens += 1;
 
                 batch.clear();
@@ -353,6 +365,16 @@ mod llama {
                 n_cur += 1;
                 ctx.decode(&mut batch)
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
+            }
+
+            // The stream can end (EOG or max_tokens) while the decoder holds an
+            // incomplete sequence; `last = true` flushes it as U+FFFD rather
+            // than dropping the bytes silently.
+            let mut tail = String::new();
+            let _ = decoder.decode_to_string(&[], &mut tail, true);
+            if !tail.is_empty() {
+                on_token(&tail);
+                text.push_str(&tail);
             }
 
             Ok(Completion {
