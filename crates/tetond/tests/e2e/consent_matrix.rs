@@ -384,16 +384,23 @@ fn ac1_proposal_event_reaches_an_attached_client() {
 }
 
 // ===========================================================================
-// AC-2 — accept → download → verify → atomic install → ready, with progress.
+// AC-2 — accept → download → verify → atomic install, with honest progress.
 // ===========================================================================
 
 /// Accepting reaches installed, verified weights, and the client can watch it
-/// happen on the `model_lifecycle` stream.
+/// happen — download, then *verify*, then the honest terminal state — on the
+/// `model_lifecycle` stream.
 ///
-/// The last clause of AC-2 — "reaches a working local session" — is **not**
-/// asserted here and cannot be: these bytes are not a model and `--features
-/// llama` is not built in CI. That claim is AC-13's, and it is signed off by a
-/// human in `docs/manual-verification.md`, not by this test.
+/// The daemon under test is a **no-engine build** (no `TETON_LOCAL_SCRIPT`, which
+/// is what makes it propose at all — see `consent_env`). So the install genuinely
+/// succeeds, but nothing here can *load* the GGUF, and the honest terminal stage
+/// is `disabled` with the no-engine reason — **not** `ready` (M-1). A daemon that
+/// claimed `ready` here would be lying exactly as `startup_lifecycle` refuses to,
+/// so this test now fails if the daemon claims a readiness it cannot deliver.
+///
+/// The last clause of AC-2 — "reaches a working local session" — is a different
+/// claim still: it needs a real engine (`--features llama`, not built in CI) and
+/// is AC-13's, signed off by a human in `docs/manual-verification.md`.
 #[test]
 fn ac2_accepting_downloads_verifies_and_installs_atomically() {
     let models = fixture_models();
@@ -457,13 +464,32 @@ fn ac2_accepting_downloads_verifies_and_installs_atomically() {
         ),
         "the transfer's completion must be observable; saw {downloads:?}"
     );
+
+    // Verify is its own stage, distinguishable from a wedged 100% download (M-1):
+    // the client can tell "confirming the bytes" apart from "the transfer hung".
     assert!(
         client
             .events_named("model_lifecycle")
             .iter()
-            .any(|e| e["stage"]["stage"].as_str() == Some("ready")),
-        "the install must announce `ready`; saw {:?}",
-        client.events_named("model_lifecycle")
+            .any(|e| e["stage"]["stage"].as_str() == Some("verifying")),
+        "verification must be observable as its own stage; saw {:?}",
+        lifecycle_stages(&client)
+    );
+
+    // M-1 — the honesty assertion, and the mutation guard. A no-engine build that
+    // just installed weights it cannot load must say so; it must NOT claim `ready`.
+    assert!(
+        !lifecycle_stages(&client).contains(&"ready".to_owned()),
+        "a build with no local inference engine must not claim `ready` after an \
+         install it cannot load; saw {:?}",
+        lifecycle_stages(&client)
+    );
+    let reasons = lifecycle_reasons(&client);
+    assert!(
+        reasons.contains("installed and verified") && reasons.contains("no local inference engine"),
+        "the terminal stage must be the honest no-engine `disabled`, not `ready`; \
+         saw stages {:?} reasons {reasons:?}",
+        lifecycle_stages(&client)
     );
 }
 

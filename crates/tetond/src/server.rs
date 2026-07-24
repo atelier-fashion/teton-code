@@ -463,7 +463,13 @@ fn handle_model_set(daemon: &Daemon, id: Id, params: Value) -> String {
         .set_model(&params.name, params.confirmed_above_ram_floor)
     {
         Ok(result) => {
-            if tokio::runtime::Handle::try_current().is_ok() {
+            // M-2: only spawn an install task when one for this entry is not
+            // already running. Without this check every `model/set` spawns an
+            // unbounded task; the in-flight guard would make the duplicate no-op,
+            // but not spawning it at all is cheaper and keeps the task count bounded.
+            if tokio::runtime::Handle::try_current().is_ok()
+                && !daemon.runtime.consent().install_in_flight(&params.name)
+            {
                 let runtime = Arc::clone(&daemon.runtime);
                 tokio::spawn(async move {
                     runtime.install_selected_model().await;

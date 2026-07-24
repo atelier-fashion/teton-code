@@ -217,12 +217,14 @@ impl InstallProgress for SilentProgress {
 
 /// Publishes install progress as `model_lifecycle` events (AC-2).
 ///
-/// The wire vocabulary ([`ModelLifecycleStage`]) has a `download` stage and no
-/// `verifying`/`installing` stage, so those two steps are projected onto the
-/// transfer's completion tick rather than inventing a stage the clients of this
-/// milestone cannot render. The install's *completion* already has a wire
-/// signal: the consent gate publishes `ready` once the installer returns, and
-/// [`InstallStep::Installed`] would only duplicate it.
+/// Each step maps to the wire stage that is *true* while it runs:
+/// [`InstallStep::Downloading`] to `download`, and [`InstallStep::Verifying`] to
+/// the `verifying` stage — its own stage rather than a `download` frozen at 100%,
+/// because the multi-minute SHA-256 over an 18 GiB artifact is honest work a
+/// client must be able to tell apart from a wedged transfer (M-1). The install's
+/// *completion* has its own wire signal: the consent gate publishes the terminal
+/// stage once the installer returns (`ready` when an engine can load the weights,
+/// otherwise `disabled`), so [`InstallStep::Installed`] would only duplicate it.
 pub struct LifecycleProgress {
     events: Arc<EventBus>,
 }
@@ -249,12 +251,11 @@ impl InstallProgress for LifecycleProgress {
                 downloaded_bytes: *downloaded_bytes,
                 total_bytes: Some(*total_bytes),
             },
-            InstallStep::Verifying { total_bytes } => ModelLifecycleStage::Download {
-                downloaded_bytes: *total_bytes,
-                total_bytes: Some(*total_bytes),
+            InstallStep::Verifying { total_bytes } => ModelLifecycleStage::Verifying {
+                total_bytes: *total_bytes,
             },
-            // The gate's `ready` is the install-complete signal; a second event
-            // here would say the same thing twice.
+            // The gate's terminal stage (`ready`/`disabled`) is the
+            // install-complete signal; a second event here would say it twice.
             InstallStep::Installed { .. } => return,
         };
         self.events.publish(
@@ -418,6 +419,15 @@ impl WeightsInstall {
             return InstallError::Corrupt;
         }
         match self.cause.as_ref().and_then(|cause| cause.last_cause()) {
+            // HTTP 416 (Range Not Satisfiable) on a resume means the offset our
+            // `.part` reached is past the resource's actual end: the catalog size
+            // drifted from the artifact, or the partial is oversized. That is a
+            // catalog/corruption fault, not a transient network one — re-fetching
+            // from scratch (not resuming) is the recovery, so it must not read as
+            // `Network` and send the user chasing their connection.
+            Some(FetchError::Http { status: 416 }) | Some(FetchError::BadRange) => {
+                InstallError::Corrupt
+            }
             Some(cause) if cause.is_rate_limited() => InstallError::RateLimited {
                 detail: cause.to_string(),
             },
@@ -491,9 +501,15 @@ impl WeightsInstaller for WeightsInstall {
             detail: err.kind().to_string(),
         })?;
 
+        let partial = self.partial_path(entry);
+
         // Already installed and still attested: nothing to fetch, and no reason
         // to hold the install to a disk requirement it has already met.
         if self.status(entry) == InstallStatus::Verified {
+            // A `.part` left over from an interrupted attempt that a *later* run
+            // completed some other way is now dead weight beside verified
+            // weights — nothing will ever resume it. Reclaim the space.
+            let _ = std::fs::remove_file(&partial);
             self.progress.report(
                 &entry.name,
                 &InstallStep::Installed {
@@ -506,7 +522,6 @@ impl WeightsInstaller for WeightsInstall {
         // BR-7 / AC-6: before the fetcher exists in this call's world.
         self.preflight(entry)?;
 
-        let partial = self.partial_path(entry);
         self.progress.report(
             &entry.name,
             &InstallStep::DownloadStarted {
@@ -521,7 +536,16 @@ impl WeightsInstaller for WeightsInstall {
         let mut target = entry.clone();
         target.url = entry.download_url(self.base_url.as_deref());
 
-        self.transfer(&target, &partial)?;
+        if let Err(err) = self.transfer(&target, &partial) {
+            if err == InstallError::Corrupt {
+                // A corrupt/oversized/416 partial must not be resumed: a byte
+                // count that is right-but-wrong, or a resume offset past the
+                // resource's end (catalog size drift), would fail the same way
+                // on every retry. Discard it so the next attempt starts clean.
+                let _ = std::fs::remove_file(&partial);
+            }
+            return Err(err);
+        }
 
         // BR-9: the file reaches its final name only after the library verified
         // its SHA-256, and `rename` within one directory is atomic — there is no
@@ -530,7 +554,12 @@ impl WeightsInstaller for WeightsInstall {
         std::fs::rename(&partial, &installed).map_err(|err| InstallError::Io {
             detail: err.kind().to_string(),
         })?;
-        write_receipt(&self.receipt_path(entry), &installed, entry);
+        write_receipt(
+            &self.receipt_path(entry),
+            &installed,
+            entry,
+            ReceiptVerdict::Verified,
+        );
         self.progress.report(
             &entry.name,
             &InstallStep::Installed {
@@ -554,19 +583,46 @@ impl WeightsInstaller for WeightsInstall {
 // Install state (spec entity `InstallState`)
 // ---------------------------------------------------------------------------
 
-/// What a successful install attests about the file it left behind.
+/// The verdict a digest check reached about a file — cached so it is paid for
+/// once, not on every daemon attach (M-3).
 ///
-/// Size and mtime together answer "is this still the file we verified?" without
-/// re-reading gigabytes; the digest answers "verified against *what*?", so a
-/// catalog whose entry changed underneath an installed file is caught rather
-/// than inherited.
+/// Caching *both* verdicts is the point. A right-size-but-corrupt file has no
+/// positive receipt to match, so without a negative receipt it is re-hashed on
+/// every `status()` call — and `status()` is reached inline from the handshake,
+/// so the multi-gigabyte hash runs on a runtime thread on every client attach,
+/// forever. Recording `corrupt` too means the expensive answer is reached once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReceiptVerdict {
+    /// The file's SHA-256 matched the catalog digest.
+    Verified,
+    /// The file was the right size but its SHA-256 did not match.
+    Corrupt,
+}
+
+impl Default for ReceiptVerdict {
+    /// A receipt written by an older build carried no verdict field because it
+    /// was only ever written on success; such a receipt means `verified`.
+    fn default() -> Self {
+        Self::Verified
+    }
+}
+
+/// What a digest check attests about the file it examined.
+///
+/// Size and mtime together answer "is this still the file we checked?" without
+/// re-reading gigabytes; the digest answers "checked against *what*?", so a
+/// catalog whose entry changed underneath an installed file is re-checked rather
+/// than inheriting the stale verdict; the verdict answers "and what did the check
+/// conclude?", so a corrupt file is not re-hashed on every attach (M-3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VerificationReceipt {
-    /// The digest that was verified — compared against the catalog's.
+    /// The catalog digest the file was checked against — compared against the
+    /// catalog's current digest so a re-pinned entry re-opens the question.
     sha256: String,
-    /// Size of the file at the moment it was verified.
+    /// Size of the file at the moment it was checked.
     size_bytes: u64,
-    /// Modification time of the file at the moment it was verified, in
+    /// Modification time of the file at the moment it was checked, in
     /// nanoseconds since the epoch. `None` when the platform would not report
     /// one.
     ///
@@ -574,6 +630,10 @@ struct VerificationReceipt {
     /// replacement that happened moments after the install, not merely one that
     /// happened on a later day.
     modified_ns: Option<u64>,
+    /// What the check concluded. Defaulted for receipts from an older build,
+    /// which only ever recorded a success.
+    #[serde(default)]
+    verdict: ReceiptVerdict,
 }
 
 /// The install state implied by what is on disk (absent/partial/verified/corrupt).
@@ -581,7 +641,9 @@ struct VerificationReceipt {
 /// `verified` is never reported on a hopeful signal. A wrong-sized file is
 /// `corrupt` outright; a right-sized one is `verified` only when a receipt still
 /// describes it, and otherwise is re-digested — the honest answer, paid for only
-/// when the cheap attestation is missing or stale.
+/// when the cheap attestation is missing or stale. The re-digest's *result* —
+/// `verified` or `corrupt` — is then written back as a receipt (M-3), so neither
+/// answer is recomputed on the next attach.
 fn install_status_at(
     installed: &Path,
     partial: &Path,
@@ -597,18 +659,32 @@ fn install_status_at(
     };
     if meta.len() != entry.size_bytes {
         // Truncated, or something outside the daemon replaced it. Either way the
-        // bytes are not the catalog's bytes (AC-7).
+        // bytes are not the catalog's bytes (AC-7). Cheap: no hash.
         return InstallStatus::Corrupt;
     }
-    if receipt_describes(receipt, &meta, entry) {
-        return InstallStatus::Verified;
+    if let Some(cached) = cached_verdict(receipt, &meta, entry) {
+        // The receipt still describes this file and was checked against this
+        // catalog digest: return its verdict — verified *or* corrupt — without
+        // re-reading a single gigabyte (M-3).
+        return cached;
     }
     let status = deep_status_at(installed, partial, entry);
-    if status == InstallStatus::Verified {
-        // Attest what was just proven, so the next read is cheap again.
-        write_receipt(receipt, installed, entry);
+    if matches!(status, InstallStatus::Verified | InstallStatus::Corrupt) {
+        // Attest what was just proven — including a corrupt verdict — so the
+        // next read is cheap again rather than re-hashing the same bytes.
+        write_receipt(receipt, installed, entry, receipt_verdict(status));
     }
     status
+}
+
+/// The receipt verdict corresponding to a just-computed deep status. Only the
+/// two verdicts a digest check can reach are cacheable; the caller guards the
+/// `Absent`/`Partial` cases out before this is reached.
+fn receipt_verdict(status: InstallStatus) -> ReceiptVerdict {
+    match status {
+        InstallStatus::Corrupt => ReceiptVerdict::Corrupt,
+        _ => ReceiptVerdict::Verified,
+    }
 }
 
 /// The install state read from the bytes themselves, with no receipt involved.
@@ -629,23 +705,37 @@ fn deep_status_at(installed: &Path, partial: &Path, entry: &ModelEntry) -> Insta
     }
 }
 
-/// Whether `receipt` still describes the file `meta` came from.
-fn receipt_describes(receipt: &Path, meta: &std::fs::Metadata, entry: &ModelEntry) -> bool {
-    let Ok(text) = std::fs::read_to_string(receipt) else {
-        return false;
-    };
-    let Ok(receipt) = serde_json::from_str::<VerificationReceipt>(&text) else {
-        return false;
-    };
-    receipt.sha256 == entry.sha256
+/// The cached verdict for the file `meta` came from, when `receipt` still
+/// describes it and was reached against this catalog digest.
+///
+/// `None` — meaning "re-check the bytes" — when there is no receipt, when the
+/// file's size or mtime has moved since it was written, or when the catalog has
+/// re-pinned the entry to a different digest (a corrupt verdict against the old
+/// digest says nothing about the new one, and a verified verdict must not carry
+/// the old file into the new identity).
+fn cached_verdict(
+    receipt: &Path,
+    meta: &std::fs::Metadata,
+    entry: &ModelEntry,
+) -> Option<InstallStatus> {
+    let text = std::fs::read_to_string(receipt).ok()?;
+    let receipt = serde_json::from_str::<VerificationReceipt>(&text).ok()?;
+    let describes = receipt.sha256 == entry.sha256
         && receipt.size_bytes == meta.len()
-        && receipt.modified_ns == modified_ns(meta)
+        && receipt.modified_ns == modified_ns(meta);
+    if !describes {
+        return None;
+    }
+    Some(match receipt.verdict {
+        ReceiptVerdict::Verified => InstallStatus::Verified,
+        ReceiptVerdict::Corrupt => InstallStatus::Corrupt,
+    })
 }
 
-/// Write the receipt for a just-verified `installed` file. Best-effort: a
-/// receipt that cannot be written costs a re-digest on the next read, never
-/// correctness.
-fn write_receipt(receipt: &Path, installed: &Path, entry: &ModelEntry) {
+/// Write the receipt for a just-checked `installed` file, recording `verdict`.
+/// Best-effort: a receipt that cannot be written costs a re-digest on the next
+/// read, never correctness.
+fn write_receipt(receipt: &Path, installed: &Path, entry: &ModelEntry, verdict: ReceiptVerdict) {
     let Ok(meta) = std::fs::metadata(installed) else {
         return;
     };
@@ -653,6 +743,7 @@ fn write_receipt(receipt: &Path, installed: &Path, entry: &ModelEntry) {
         sha256: entry.sha256.clone(),
         size_bytes: meta.len(),
         modified_ns: modified_ns(&meta),
+        verdict,
     };
     if let Ok(text) = serde_json::to_string(&record) {
         let _ = std::fs::write(receipt, text);
@@ -866,7 +957,7 @@ mod tests {
         let partial = dir.join("m.gguf.part");
         let receipt = dir.join("m.gguf.verified");
         std::fs::write(&installed, &body).unwrap();
-        write_receipt(&receipt, &installed, &model);
+        write_receipt(&receipt, &installed, &model, ReceiptVerdict::Verified);
         assert_eq!(
             install_status_at(&installed, &partial, &receipt, &model),
             InstallStatus::Verified
@@ -880,6 +971,87 @@ mod tests {
             install_status_at(&installed, &partial, &receipt, &moved),
             InstallStatus::Corrupt
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M-3: a right-size-but-corrupt file is hashed **once**. The first read
+    /// re-digests and records a *negative* receipt; every read after that returns
+    /// `corrupt` from the receipt without touching the bytes — the difference
+    /// between hashing gigabytes on one attach and hashing them on every attach.
+    #[test]
+    fn a_corrupt_file_is_hashed_once_then_answered_from_a_negative_receipt() {
+        let dir = temp_dir("corrupt-cache");
+        let model = entry();
+        let installed = dir.join("m.gguf");
+        let partial = dir.join("m.gguf.part");
+        let receipt = dir.join("m.gguf.verified");
+
+        // Right length, wrong bytes: corrupt, and no positive receipt exists.
+        let wrong: Vec<u8> = BODY.iter().map(|b| b ^ 0xFF).collect();
+        std::fs::write(&installed, &wrong).unwrap();
+        assert_eq!(
+            install_status_at(&installed, &partial, &receipt, &model),
+            InstallStatus::Corrupt
+        );
+        // The expensive answer was written down — including that it was corrupt.
+        assert!(
+            receipt.exists(),
+            "a corrupt read must persist its verdict so it is not recomputed"
+        );
+        let stored: VerificationReceipt =
+            serde_json::from_str(&std::fs::read_to_string(&receipt).unwrap()).unwrap();
+        assert_eq!(stored.verdict, ReceiptVerdict::Corrupt);
+
+        // Prove the negative receipt short-circuits the hash: put the *correct*
+        // bytes on disk (which would digest to `verified`) but keep a corrupt
+        // receipt keyed to their size+mtime. A read that re-hashed would flip to
+        // `verified`; one that trusts the receipt stays `corrupt`.
+        std::fs::write(&installed, BODY).unwrap();
+        write_receipt(&receipt, &installed, &model, ReceiptVerdict::Corrupt);
+        assert_eq!(
+            install_status_at(&installed, &partial, &receipt, &model),
+            InstallStatus::Corrupt,
+            "the corrupt verdict must be answered from the receipt, not re-hashed"
+        );
+        // The receipt-free deep read, by contrast, always reads the bytes — and
+        // therefore sees the truth of what is now on disk.
+        assert_eq!(
+            deep_status_at(&installed, &partial, &model),
+            InstallStatus::Verified
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_416_range_error_reads_as_corruption_not_network() {
+        let dir = temp_dir("range-416");
+
+        // A 416 on resume means our `.part` offset is past the resource's end —
+        // catalog size drift, not a broken connection.
+        let install = WeightsInstall::new(Arc::new(NoFetcher), dir.clone(), None)
+            .with_cause(Arc::new(FixedCause(Some(FetchError::Http { status: 416 }))));
+        assert_eq!(
+            install.classify(&DownloadError::Io(std::io::Error::other("range"))),
+            InstallError::Corrupt
+        );
+
+        // `BadRange` is the same fault surfaced from a malformed `Content-Range`;
+        // it classifies the same way.
+        let install = WeightsInstall::new(Arc::new(NoFetcher), dir.clone(), None)
+            .with_cause(Arc::new(FixedCause(Some(FetchError::BadRange))));
+        assert_eq!(
+            install.classify(&DownloadError::Io(std::io::Error::other("range"))),
+            InstallError::Corrupt
+        );
+
+        // A different permanent status is still a network fault: only 416 carries
+        // the catalog-drift meaning.
+        let install = WeightsInstall::new(Arc::new(NoFetcher), dir.clone(), None)
+            .with_cause(Arc::new(FixedCause(Some(FetchError::Http { status: 404 }))));
+        assert!(matches!(
+            install.classify(&DownloadError::Io(std::io::Error::other("nope"))),
+            InstallError::Network { .. }
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -963,7 +1135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_progress_projects_steps_onto_download_stages() {
+    async fn lifecycle_progress_projects_each_step_onto_its_own_stage() {
         let bus = Arc::new(EventBus::new());
         let mut sub = bus.subscribe(8);
         let progress = LifecycleProgress::new(Arc::clone(&bus));
@@ -975,10 +1147,12 @@ mod tests {
                 total_bytes: 10,
             },
         );
+        // Verify is its own stage now, not a `download` frozen at 100% (M-1): a
+        // client can tell the multi-minute hash apart from a wedged transfer.
         progress.report("m", &InstallStep::Verifying { total_bytes: 10 });
-        // Deliberately silent: the gate's `ready` already says this.
+        // Deliberately silent: the gate's terminal stage already says this.
         progress.report("m", &InstallStep::Installed { total_bytes: 10 });
-        // A third, distinguishable event proves the `Installed` step published
+        // A fourth, distinguishable event proves the `Installed` step published
         // nothing rather than merely publishing late.
         progress.report(
             "m",
@@ -1002,10 +1176,7 @@ mod tests {
                     downloaded_bytes: 0,
                     total_bytes: Some(10),
                 },
-                ModelLifecycleStage::Download {
-                    downloaded_bytes: 10,
-                    total_bytes: Some(10),
-                },
+                ModelLifecycleStage::Verifying { total_bytes: 10 },
                 ModelLifecycleStage::Download {
                     downloaded_bytes: 7,
                     total_bytes: Some(10),

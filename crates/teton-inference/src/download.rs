@@ -89,9 +89,27 @@ pub struct DownloadConfig {
     /// How many times to re-fetch from scratch on a checksum mismatch before
     /// giving up.
     pub max_checksum_retries: u32,
-    /// How many consecutive no-progress transport interruptions to tolerate
-    /// before declaring the download stalled.
+    /// How many consecutive under-`min_progress_bytes` transport interruptions to
+    /// tolerate before declaring the download stalled.
     pub max_stall_retries: u32,
+    /// The least a single fetch attempt must durably add for that attempt to
+    /// count as progress and reset the stall counter (M-5).
+    ///
+    /// The bug this closes: an attempt that added *any* bytes reset the stall
+    /// counter, so a host dribbling one byte per connection resets it forever —
+    /// an unbounded loop that spins up a fresh OS thread and tokio runtime each
+    /// iteration. Charging a below-threshold attempt as a stall makes a trickle
+    /// terminate through `max_stall_retries` instead. A real connection delivers
+    /// far more than this per fetch before it drops, so a legitimate resume is
+    /// never charged; the count still tolerates `max_stall_retries` short reads
+    /// in a row before giving up. An attempt that *completes* the file is exempt —
+    /// a final sub-threshold tail is not a stall.
+    pub min_progress_bytes: u64,
+    /// A hard ceiling on fetch attempts within one `download_once`, regardless of
+    /// progress (M-5). The principled bound is `min_progress_bytes`; this is a
+    /// backstop that guarantees termination even against an adversary that stays
+    /// exactly at the threshold. Set well above any healthy transfer's needs.
+    pub max_total_attempts: u32,
 }
 
 impl Default for DownloadConfig {
@@ -99,6 +117,14 @@ impl Default for DownloadConfig {
         Self {
             max_checksum_retries: 2,
             max_stall_retries: 5,
+            // A single real fetch delivers kilobytes-to-gigabytes before it ends
+            // or drops; 4 KiB is comfortably below that and comfortably above a
+            // pathological trickle.
+            min_progress_bytes: 4096,
+            // Even an 18 GiB artifact resumed in 4 KiB increments (the smallest
+            // increment that still counts as progress) needs far fewer than this;
+            // anything hitting it is not a transfer, it is an attack.
+            max_total_attempts: 100_000,
         }
     }
 }
@@ -174,7 +200,15 @@ impl<'a> Downloader<'a> {
         }
 
         let mut stalls = 0u32;
+        let mut total_attempts = 0u32;
         while written < model.size_bytes {
+            // M-5: a hard ceiling on attempts, checked before the attempt so no
+            // pathological source can spin here unbounded.
+            total_attempts += 1;
+            if total_attempts > self.config.max_total_attempts {
+                return Err(DownloadError::Stalled { attempts: stalls });
+            }
+
             let before = written;
             let mut file = OpenOptions::new().create(true).append(true).open(dest)?;
 
@@ -197,33 +231,33 @@ impl<'a> Downloader<'a> {
             file.flush()?;
             drop(file);
 
+            // A `Result` this loop can inspect: only a resumable transport
+            // interruption may continue; a permanent error stops immediately.
             match result {
-                Ok(_total) => {
-                    // The transport streamed to its end for this call. If that
-                    // still leaves us short (a truncated response), the loop will
-                    // resume from the new offset; if no progress was made, count
-                    // it as a stall to guarantee termination.
-                    if written == before {
-                        stalls += 1;
-                        if stalls > self.config.max_stall_retries {
-                            return Err(DownloadError::Stalled { attempts: stalls });
-                        }
-                    } else {
-                        stalls = 0;
-                    }
-                }
+                Ok(_total) => {}
                 Err(err) if err.is_resumable() => {
-                    if written == before {
-                        stalls += 1;
-                        if stalls > self.config.max_stall_retries {
-                            return Err(DownloadError::Stalled { attempts: stalls });
-                        }
-                    } else {
-                        stalls = 0;
-                    }
-                    // Loop: resume from the durably-written offset.
+                    // Loop: resume from the durably-written offset — after the
+                    // stall accounting below.
                 }
                 Err(err) => return Err(err),
+            }
+
+            // M-5: reset the stall counter only on *meaningful* progress. An
+            // attempt that completed the file needs no accounting (the `while`
+            // exits); one that ended still short must have added at least
+            // `min_progress_bytes`, or it is charged as a stall — a host trickling
+            // a byte at a time trips `max_stall_retries` instead of looping
+            // forever, even though every one of those bytes was technically
+            // "progress".
+            if written < model.size_bytes {
+                if written.saturating_sub(before) < self.config.min_progress_bytes {
+                    stalls += 1;
+                    if stalls > self.config.max_stall_retries {
+                        return Err(DownloadError::Stalled { attempts: stalls });
+                    }
+                } else {
+                    stalls = 0;
+                }
             }
         }
         Ok(())
@@ -456,6 +490,60 @@ mod tests {
         std::fs::remove_file(&dest).ok();
     }
 
+    /// A host that hands back a single byte per connection makes progress on
+    /// every attempt — the exact case that used to reset the stall counter and
+    /// loop forever (M-5). It must terminate.
+    #[test]
+    fn a_trickle_host_terminates_rather_than_looping() {
+        /// Delivers exactly one byte per `fetch`, from the requested offset, and
+        /// counts how many times it was asked. Never completes a real artifact.
+        struct TrickleFetcher {
+            data: Vec<u8>,
+            calls: Cell<u32>,
+        }
+        impl RangeFetcher for TrickleFetcher {
+            fn fetch(
+                &self,
+                _url: &str,
+                offset: u64,
+                sink: &mut dyn FnMut(&[u8]) -> Result<(), DownloadError>,
+            ) -> Result<u64, DownloadError> {
+                self.calls.set(self.calls.get() + 1);
+                let start = offset as usize;
+                if start < self.data.len() {
+                    sink(&self.data[start..start + 1])?;
+                }
+                Ok(self.data.len() as u64)
+            }
+        }
+
+        // A large-enough artifact that a byte-at-a-time transfer would take
+        // effectively forever to finish honestly.
+        let data: Vec<u8> = (0u8..=250).cycle().take(1_000_000).collect();
+        let model = model_for(&data);
+        let fetcher = TrickleFetcher {
+            data,
+            calls: Cell::new(0),
+        };
+        let dest = temp_path("trickle");
+
+        let err = Downloader::new(&fetcher)
+            .fetch(&model, &dest, &mut |_| {})
+            .expect_err("a trickle host must not download a million bytes one at a time");
+        assert!(
+            matches!(err, DownloadError::Stalled { .. }),
+            "expected the trickle to be declared stalled, got {err:?}"
+        );
+        // It gave up after a handful of sub-threshold attempts, not after a
+        // million: `max_stall_retries` (5) plus the first attempt.
+        assert!(
+            fetcher.calls.get() <= DownloadConfig::default().max_stall_retries + 2,
+            "the trickle was allowed {} attempts before terminating",
+            fetcher.calls.get()
+        );
+        std::fs::remove_file(&dest).ok();
+    }
+
     #[test]
     fn persistent_checksum_mismatch_errors_out() {
         let good: Vec<u8> = (0u8..251).cycle().take(1024).collect();
@@ -486,7 +574,7 @@ mod tests {
             &fetcher,
             DownloadConfig {
                 max_checksum_retries: 1,
-                max_stall_retries: 5,
+                ..DownloadConfig::default()
             },
         )
         .fetch(&model, &dest, &mut |_| {})

@@ -41,7 +41,7 @@ use teton_inference::catalog::{Catalog, ModelEntry, TierBand};
 use teton_inference::download::{DownloadError, RangeFetcher};
 use teton_inference::probe::{GpuClass, HardwareProfile, GIB};
 
-use teton_protocol::events::Event;
+use teton_protocol::events::{Event, ModelLifecycleStage};
 use teton_protocol::methods::{InstallStatus, ModelConfirmOutcome, ModelConfirmParams};
 use teton_protocol::RequestId;
 
@@ -215,13 +215,31 @@ impl Harness {
 
     /// A harness on a machine other than the default 16 GiB one.
     fn on(tag: &str, profile: HardwareProfile, fetcher: RecordingFetcher) -> Self {
-        Self::build(temp_dir(tag), profile, fetcher, LocalModelConfig::default())
+        Self::build(
+            temp_dir(tag),
+            profile,
+            fetcher,
+            LocalModelConfig::default(),
+            true,
+        )
     }
 
     /// A harness over an existing state directory — how "a later daemon start"
     /// is modelled: same directory, brand-new gate, store, and event bus.
     fn in_dir(dir: PathBuf, fetcher: RecordingFetcher, config: LocalModelConfig) -> Self {
-        Self::build(dir, machine(), fetcher, config)
+        Self::build(dir, machine(), fetcher, config, true)
+    }
+
+    /// A harness modelling the production **no-engine** build: the install can
+    /// succeed but nothing can load the weights (M-1).
+    fn no_engine(tag: &str, fetcher: RecordingFetcher) -> Self {
+        Self::build(
+            temp_dir(tag),
+            machine(),
+            fetcher,
+            LocalModelConfig::default(),
+            false,
+        )
     }
 
     fn build(
@@ -229,6 +247,7 @@ impl Harness {
         profile: HardwareProfile,
         fetcher: RecordingFetcher,
         config: LocalModelConfig,
+        engine_present: bool,
     ) -> Self {
         let bus = Arc::new(EventBus::new());
         let pending = Arc::new(PendingModelDecisions::new());
@@ -247,15 +266,23 @@ impl Harness {
             )
             .with_free_space(Arc::new(FixedFreeSpace(Some(u64::MAX))) as Arc<dyn FreeSpace>),
         );
-        let gate = Arc::new(ModelConsentGate::new(
-            profile,
-            test_catalog(),
-            config,
-            Arc::clone(&bus),
-            Arc::clone(&pending),
-            Arc::clone(&store),
-            installer,
-        ));
+        let gate = Arc::new(
+            ModelConsentGate::new(
+                profile,
+                test_catalog(),
+                config,
+                Arc::clone(&bus),
+                Arc::clone(&pending),
+                Arc::clone(&store),
+                installer,
+            )
+            // Most tests here are about the *decision*, and they assert the tier
+            // reaches `ready` — which is only honest on a machine that can load
+            // the weights. So they model one: engine present (M-1). The no-engine
+            // `disabled`-on-success path has its own coverage
+            // (`a_successful_install_on_a_no_engine_build_is_disabled_not_ready`).
+            .with_local_engine(engine_present),
+        );
         Self {
             dir,
             bus,
@@ -1029,6 +1056,126 @@ async fn installing_with_no_recorded_decision_is_undecided_and_fetches_nothing()
     h.store.record(&ModelSelection::declined(3)).unwrap();
     assert_eq!(h.gate.install_recorded().await, ConsentOutcome::Declined);
     assert_eq!(h.fetcher.call_count(), 0);
+    h.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// M-1 — a successful install on a no-engine build is honest about it
+// ---------------------------------------------------------------------------
+
+/// The install succeeds — the bytes on disk are the catalog's bytes — but the
+/// production build has no engine to load them, so the daemon publishes the
+/// no-engine `disabled`, not `ready`. Saying `ready` here would be the exact
+/// untruth `startup_lifecycle` refuses to tell; the gate refuses it too (M-1).
+#[tokio::test]
+async fn a_successful_install_on_a_no_engine_build_is_disabled_not_ready() {
+    let h = Harness::no_engine("no-engine", RecordingFetcher::serving());
+    let mut sub = h.subscribe();
+
+    h.gate
+        .set_model("small-fit", false)
+        .expect("small-fit fits");
+    let outcome = h.gate.install_recorded().await;
+
+    // Not Ready, and — crucially — not InstallFailed: the install *did* succeed.
+    assert_eq!(
+        outcome,
+        ConsentOutcome::InstalledNoEngine {
+            model_name: "small-fit".to_owned(),
+        },
+        "{outcome:?}"
+    );
+    assert!(!outcome.local_tier_ready());
+    assert_eq!(
+        h.gate
+            .current_install()
+            .expect("a model is selected")
+            .status,
+        InstallStatus::Verified,
+        "the weights really are installed and verified"
+    );
+
+    // The lifecycle event a client sees is the honest no-engine `disabled`.
+    let stages: Vec<ModelLifecycleStage> = drain(&mut sub)
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::ModelLifecycle(lifecycle) => Some(lifecycle.stage),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        stages.iter().any(|stage| matches!(
+            stage,
+            ModelLifecycleStage::Disabled { reason }
+                if reason.contains("no local inference engine")
+        )),
+        "expected the no-engine disabled stage; got {stages:?}"
+    );
+    assert!(
+        !stages
+            .iter()
+            .any(|stage| matches!(stage, ModelLifecycleStage::Ready)),
+        "a no-engine build must not publish `ready`; got {stages:?}"
+    );
+    h.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// M-2 — concurrent installs of one entry serialize on the shared `.part`
+// ---------------------------------------------------------------------------
+
+/// Two installs of the same entry race for one shared `.part`. If both ran they
+/// would append into it concurrently, interleaving bytes so the digest fails and
+/// the user is told "corrupt" when nothing upstream was wrong. The M-2 guard lets
+/// exactly one touch it; the other no-ops.
+#[tokio::test]
+async fn two_concurrent_installs_of_one_entry_do_not_both_fetch_or_corrupt() {
+    let h = Harness::new(
+        "concurrent-install",
+        RecordingFetcher::serving(),
+        LocalModelConfig::default(),
+    );
+    h.gate
+        .set_model("small-fit", false)
+        .expect("small-fit fits");
+
+    // Both target the recorded entry, concurrently.
+    let (a, b) = tokio::join!(h.gate.install_recorded(), h.gate.install_recorded());
+    let outcomes = [a, b];
+
+    // Exactly one fetched — the shared `.part` was written by one install only.
+    assert_eq!(
+        h.fetcher.call_count(),
+        1,
+        "both installs fetched, racing on the shared .part: {:?}",
+        h.fetcher.calls()
+    );
+    assert_eq!(
+        outcomes.iter().filter(|o| o.local_tier_ready()).count(),
+        1,
+        "exactly one install should reach Ready: {outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, ConsentOutcome::AlreadyInstalling { .. })),
+        "the deferred install must report AlreadyInstalling: {outcomes:?}"
+    );
+
+    // And the weights on disk are exactly the artifact, uncorrupted.
+    assert_eq!(
+        h.gate
+            .current_install()
+            .expect("a model is selected")
+            .status,
+        InstallStatus::Verified
+    );
+    assert_eq!(std::fs::read(h.installed("small-fit")).unwrap(), SMALL_BODY);
+
+    // The claim is released once the installs finish — a later install is free
+    // to run rather than being wedged by a stale in-flight marker.
+    assert!(!h.gate.install_in_flight("small-fit"));
     h.cleanup();
 }
 

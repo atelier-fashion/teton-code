@@ -40,6 +40,7 @@
 //! connectivity re-prompts and succeeds". One mechanism covers both a failed
 //! install and a crash mid-download.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -573,10 +574,35 @@ pub fn validate_choice<'a>(
 /// The outcome of resolving the local tier's consent state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsentOutcome {
-    /// A model is decided and its weights are installed: the local tier may run.
+    /// A model is decided, its weights are installed and verified, **and** this
+    /// build has a local engine that can load them: the local tier may run.
     Ready {
         /// The decision in force.
         selection: ModelSelection,
+    },
+    /// A model is decided and its weights are installed and verified, but this
+    /// build has no local inference engine to load them (M-1).
+    ///
+    /// The install genuinely succeeded — the bytes on disk are the catalog's
+    /// bytes — so this is emphatically **not** an [`InstallFailed`](Self::InstallFailed).
+    /// But the tier cannot serve, so it must not be reported as
+    /// [`Ready`](Self::Ready): that is the same untruth `startup_lifecycle`
+    /// refuses to tell, and the lifecycle event this drives is `disabled`, not
+    /// `ready`. The tier stays withheld; sessions run remote-only.
+    InstalledNoEngine {
+        /// The model whose weights are installed.
+        model_name: String,
+    },
+    /// An install for this entry was already in flight, so this attempt did
+    /// nothing (M-2).
+    ///
+    /// The shared `.part` is not this task's to touch: two installs of the same
+    /// entry appending to one partial file would interleave bytes and fail the
+    /// digest. The in-flight install is the authority on the tier gate, so this
+    /// no-op leaves the gate exactly as it found it — like [`Superseded`](Self::Superseded).
+    AlreadyInstalling {
+        /// The model whose install is already running.
+        model_name: String,
     },
     /// The user declined the local tier (BR-4): remote-only, never re-proposed.
     Declined,
@@ -636,6 +662,18 @@ pub struct ModelConsentGate {
     store: Arc<SelectionStore>,
     installer: Arc<dyn WeightsInstaller>,
     counter: AtomicU64,
+    /// Whether this build has a local inference engine that can load installed
+    /// weights (M-1). Gates the `Ready` publish onto the SAME signal
+    /// `startup_lifecycle` uses (`engine.is_some()`): a successful install on a
+    /// build with no engine publishes `disabled`, not a `ready` it cannot honour.
+    /// Defaults to `false` — the honest default for the production build, which
+    /// ships no GGUF loader.
+    local_engine_present: bool,
+    /// Model names whose install is in flight (M-2). Claimed under the lock
+    /// before an install begins and released when it ends, so two installs of
+    /// the same entry can never both open the shared `.part` — the second finds
+    /// the name claimed and no-ops rather than interleaving bytes into it.
+    installing: Arc<Mutex<HashSet<String>>>,
 }
 
 impl ModelConsentGate {
@@ -661,7 +699,34 @@ impl ModelConsentGate {
             store,
             installer,
             counter: AtomicU64::new(0),
+            local_engine_present: false,
+            installing: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Declare whether this build has a local inference engine that can load
+    /// installed weights (M-1).
+    ///
+    /// This is the SAME signal `startup_lifecycle` reads (`engine.is_some()`),
+    /// threaded into the gate so a completed install publishes `ready` only when
+    /// the tier can actually serve. Left `false` (the constructor default), a
+    /// successful install publishes `disabled` with the no-engine reason — the
+    /// truth for the production build, which has no GGUF loader.
+    #[must_use]
+    pub fn with_local_engine(mut self, present: bool) -> Self {
+        self.local_engine_present = present;
+        self
+    }
+
+    /// Whether an install for `model_name` is currently in flight (M-2). Lets a
+    /// caller skip spawning a duplicate install task rather than spawning one
+    /// that would immediately no-op.
+    #[must_use]
+    pub fn install_in_flight(&self, model_name: &str) -> bool {
+        self.installing
+            .lock()
+            .expect("install-in-flight mutex poisoned")
+            .contains(model_name)
     }
 
     /// The machine this gate proposes for.
@@ -976,21 +1041,23 @@ impl ModelConsentGate {
 
     /// Run the (blocking) installer off the async executor and classify the result.
     async fn run_install(&self, entry: &ModelEntry, selection: ModelSelection) -> ConsentOutcome {
+        // M-2: claim this entry before touching its `.part`. If another install
+        // of the same entry already holds the claim, this one does nothing — two
+        // installs appending to one shared partial file would interleave bytes
+        // and fail the digest. The claim is released when `_guard` drops, so a
+        // panic in the blocking task cannot strand it.
+        let Some(_guard) = self.claim_install(&entry.name) else {
+            return ConsentOutcome::AlreadyInstalling {
+                model_name: entry.name.clone(),
+            };
+        };
+
         let installer = Arc::clone(&self.installer);
         let target = entry.clone();
         let result = tokio::task::spawn_blocking(move || installer.install(&target)).await;
 
         match result {
-            Ok(Ok(())) => {
-                self.events.publish(
-                    None,
-                    Event::ModelLifecycle(ModelLifecycle {
-                        model_id: entry.name.clone(),
-                        stage: ModelLifecycleStage::Ready,
-                    }),
-                );
-                ConsentOutcome::Ready { selection }
-            }
+            Ok(Ok(())) => self.report_install_success(entry, selection),
             Ok(Err(error)) => self.report_install_failure(entry, error),
             // The blocking task panicked or was cancelled. Report it as an
             // install failure rather than swallowing it: the tier is not ready.
@@ -1000,6 +1067,66 @@ impl ModelConsentGate {
                     detail: "the install task did not complete".to_owned(),
                 },
             ),
+        }
+    }
+
+    /// Claim the install slot for `name`, or `None` when one is already claimed.
+    ///
+    /// The claim is a single entry in [`Self::installing`]; the returned guard
+    /// removes it on drop. Holding it across the whole install is what serializes
+    /// same-entry installs (M-2).
+    fn claim_install(&self, name: &str) -> Option<InFlightGuard> {
+        let mut installing = self
+            .installing
+            .lock()
+            .expect("install-in-flight mutex poisoned");
+        if installing.insert(name.to_owned()) {
+            Some(InFlightGuard {
+                installing: Arc::clone(&self.installing),
+                name: name.to_owned(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Announce a successful install and return its outcome (M-1).
+    ///
+    /// The install succeeded — the bytes on disk are the catalog's bytes — but
+    /// whether the tier can *run* depends on something the install cannot provide:
+    /// a local inference engine to load the GGUF. So the terminal lifecycle stage
+    /// is gated on the SAME `engine.is_some()` signal `startup_lifecycle` uses.
+    /// With an engine, `ready` is a fact; without one, saying `ready` would be
+    /// "the exact untruth this function exists to stop", so the daemon publishes
+    /// `disabled` with the no-engine reason instead — matching what a later attach
+    /// would independently report.
+    fn report_install_success(
+        &self,
+        entry: &ModelEntry,
+        selection: ModelSelection,
+    ) -> ConsentOutcome {
+        if self.local_engine_present {
+            self.events.publish(
+                None,
+                Event::ModelLifecycle(ModelLifecycle {
+                    model_id: entry.name.clone(),
+                    stage: ModelLifecycleStage::Ready,
+                }),
+            );
+            ConsentOutcome::Ready { selection }
+        } else {
+            self.events.publish(
+                None,
+                Event::ModelLifecycle(ModelLifecycle {
+                    model_id: entry.name.clone(),
+                    stage: ModelLifecycleStage::Disabled {
+                        reason: no_local_engine_reason(&entry.name),
+                    },
+                }),
+            );
+            ConsentOutcome::InstalledNoEngine {
+                model_name: entry.name.clone(),
+            }
         }
     }
 
@@ -1037,6 +1164,38 @@ impl ModelConsentGate {
             }),
         );
     }
+}
+
+/// Releases an install claim (M-2) when it drops.
+///
+/// A guard rather than an explicit remove at each `run_install` return so that a
+/// panic in the blocking install task — or any early return — cannot leave the
+/// entry marked in-flight forever, which would wedge every future install of it.
+struct InFlightGuard {
+    installing: Arc<Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut installing) = self.installing.lock() {
+            installing.remove(&self.name);
+        }
+    }
+}
+
+/// The reason a completed install still leaves the tier disabled: the weights are
+/// present and verified, but this build cannot load them (M-1).
+///
+/// The single source of this sentence, shared with `startup_lifecycle` so the
+/// install-time event and a later attach's event cannot drift into two different
+/// explanations of the same state. Names the model but no path (BR-11).
+#[must_use]
+pub fn no_local_engine_reason(model_id: &str) -> String {
+    format!(
+        "{model_id}'s weights are installed and verified, but this build has no local \
+         inference engine to load them; sessions run remote-only."
+    )
 }
 
 /// Surface a decision-persistence failure on stderr (M-6).

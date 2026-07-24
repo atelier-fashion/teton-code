@@ -102,8 +102,8 @@ use crate::install::{FetchCause, FixedFreeSpace, LifecycleProgress, WeightsInsta
 use crate::keychain::SecretResolver;
 use crate::mcp::{McpRegistry, McpServerConfig};
 use crate::model_consent::{
-    list_entries, probe_view, selection_view, ConsentOutcome, ModelConsentGate, NoInstaller,
-    PendingModelDecisions, WeightsInstaller,
+    list_entries, no_local_engine_reason, probe_view, selection_view, ConsentOutcome,
+    ModelConsentGate, NoInstaller, PendingModelDecisions, WeightsInstaller,
 };
 use crate::router::Router;
 use crate::selection_store::SelectionStore;
@@ -502,15 +502,22 @@ impl DaemonRuntime {
         // flow is driven by `run_model_consent`, which `main` spawns.
         let mut local_model = config.local_model.clone();
         local_model.pinned = pinned;
-        let consent = Arc::new(ModelConsentGate::new(
-            profile,
-            catalog,
-            local_model,
-            Arc::clone(events),
-            Arc::new(PendingModelDecisions::new()),
-            Arc::new(SelectionStore::open(base_dir)),
-            build_installer(base_dir, config.local_model.base_url.clone(), events),
-        ));
+        let consent = Arc::new(
+            ModelConsentGate::new(
+                profile,
+                catalog,
+                local_model,
+                Arc::clone(events),
+                Arc::new(PendingModelDecisions::new()),
+                Arc::new(SelectionStore::open(base_dir)),
+                build_installer(base_dir, config.local_model.base_url.clone(), events),
+            )
+            // M-1: gate the gate's `ready` publish on the presence of an engine
+            // that can load the weights — the same signal `startup_lifecycle`
+            // uses — so a completed install on a no-engine build says `disabled`,
+            // not `ready`.
+            .with_local_engine(engine.is_some()),
+        );
         // The gate governs weights the daemon would have to **download**. A
         // `TETON_LOCAL_SCRIPT` engine is canned replies from a file: nothing is
         // fetched, so there is nothing to consent to and gating it would only
@@ -623,13 +630,18 @@ impl DaemonRuntime {
     /// unanswered proposal all leave the tier withheld and the session
     /// remote-only, which is the BR-1 default rather than a special case.
     ///
-    /// A `Superseded` outcome (M-4) is the one case that must NOT touch the gate:
-    /// the `model/set` that superseded the first-run proposal drives its own
-    /// install on a separate task and is the authority on the gate, so this
-    /// abandoned flow leaves it exactly as it found it rather than racing the
-    /// set-path's decision.
+    /// A `Superseded` outcome (M-4) and an `AlreadyInstalling` outcome (M-2) are
+    /// the two cases that must NOT touch the gate: in both, another task is the
+    /// authority on the tier — the `model/set` that superseded the first-run
+    /// proposal, or the in-flight install this attempt deferred to — so this
+    /// abandoned flow leaves the gate exactly as it found it rather than racing
+    /// the authoritative decision (an `AlreadyInstalling` no-op that re-gated the
+    /// tier would fight the running install that is about to un-gate it).
     fn apply_consent_outcome(&self, outcome: &ConsentOutcome) {
-        if matches!(outcome, ConsentOutcome::Superseded) {
+        if matches!(
+            outcome,
+            ConsentOutcome::Superseded | ConsentOutcome::AlreadyInstalling { .. }
+        ) {
             return;
         }
         self.local_gated
@@ -1554,12 +1566,10 @@ fn startup_lifecycle(
         // Decided, downloaded, verified — and unloadable, because nothing in this
         // build constructs a local engine from installed weights (REQ-544 debt,
         // tracked as AC-2). Saying `ready` here would be the exact untruth this
-        // function exists to stop.
+        // function exists to stop. The reason is shared with the consent gate's
+        // install-time event (M-1) so the two can never drift apart.
         ModelLifecycleStage::Disabled {
-            reason: format!(
-                "{model_id}'s weights are installed and verified, but this build has no local \
-                 inference engine to load them; sessions run remote-only."
-            ),
+            reason: no_local_engine_reason(&model_id),
         }
     };
     lifecycle.push(ModelLifecycle { model_id, stage });

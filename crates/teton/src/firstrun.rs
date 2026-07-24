@@ -51,6 +51,9 @@ pub fn render_lifecycle(model_id: &str, stage: &ModelLifecycleStage, surface: &m
                 progress_bar(*downloaded_bytes, *total_bytes)
             )
         }
+        ModelLifecycleStage::Verifying { total_bytes } => {
+            format!("verifying {model_id} ({total_bytes} bytes)")
+        }
         ModelLifecycleStage::Benchmark {
             first_token_ms,
             tokens_per_sec,
@@ -351,6 +354,7 @@ mod tests {
                 downloaded_bytes: 250,
                 total_bytes: Some(1000),
             },
+            ModelLifecycleStage::Verifying { total_bytes: 1000 },
             ModelLifecycleStage::Benchmark {
                 first_token_ms: 250,
                 tokens_per_sec: 42.5,
@@ -375,6 +379,7 @@ mod tests {
         assert!(surface.any_line_contains(LineKind::Notice, "16.0 GB"));
         assert!(surface.any_line_contains(LineKind::Notice, "awaiting your decision"));
         assert!(surface.any_line_contains(LineKind::Notice, "download"));
+        assert!(surface.any_line_contains(LineKind::Notice, "verifying"));
         assert!(surface.any_line_contains(LineKind::Notice, "first token 250 ms"));
         assert!(surface.any_line_contains(LineKind::Notice, "ready"));
         assert!(surface.any_line_contains(LineKind::Notice, "stepped down 7b → 3b"));

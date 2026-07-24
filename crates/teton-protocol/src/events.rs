@@ -350,6 +350,16 @@ pub enum ModelLifecycleStage {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         total_bytes: Option<u64>,
     },
+    /// The whole artifact is on disk and its SHA-256 is being checked (BR-6).
+    ///
+    /// A stage of its own rather than a `download` pinned at 100%: verifying an
+    /// 18 GiB file is a multi-minute hash, and a client that could not tell it
+    /// apart from a wedged transfer would read the honest work as a hang. This
+    /// says "the bytes are here; I am confirming they are the catalog's bytes".
+    Verifying {
+        /// Bytes being hashed.
+        total_bytes: u64,
+    },
     /// Post-download micro-benchmark result (validates the BR-8 latency duty).
     Benchmark {
         /// Measured time to first token, in milliseconds.
