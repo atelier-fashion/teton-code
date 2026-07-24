@@ -85,6 +85,11 @@
       "phase": 8,
       "name": "Post-close: deprecated llama-cpp-2 API (stream-lifetime UTF-8 decoder) merged via PR #7",
       "completedAt": "2026-07-24T22:55:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Post-close: PR #7 decode corrected via PR #9 \u2014 PieceDecoder owns the piece decode (no-op flush, wrapper byte loss)",
+      "completedAt": "2026-07-24T23:41:36Z"
     }
   ],
   "integrationBranch": "main",
