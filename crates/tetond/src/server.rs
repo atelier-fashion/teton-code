@@ -360,7 +360,7 @@ fn do_handshake(
     };
     let _ = out_tx.try_send(ok_string(id, &result));
 
-    // Replay the local-model lifecycle (BR-9 / AC-8) to the just-subscribed
+    // Replay the local-model lifecycle (REQ-544 BR-9 / AC-8) to the just-subscribed
     // client, so it learns the state of the local tier on this machine: probed,
     // then awaiting a decision / disabled / ready. Published after the subscribe
     // above, so this client receives it; a machine with no local tier has an

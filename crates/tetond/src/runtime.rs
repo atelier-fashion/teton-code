@@ -29,7 +29,8 @@
 //!   `TETON_MCP_CONFIG` (when set) > `TETON_CONFIG`'s `[[mcp_server]]` table.
 //! - `TETON_REPO_ROOT` — the repo the tools are jailed to.
 //! - `TETON_PROBE_RAM_BYTES` / `TETON_PROBE_DISK_BYTES` / `TETON_PROBE_GPU` /
-//!   `TETON_PROBE_FORCE_SLOW_BENCH` — hardware-probe overrides (BR-9 / AC-8).
+//!   `TETON_PROBE_FORCE_SLOW_BENCH` — hardware-probe overrides (REQ-544 BR-9 /
+//!   AC-8).
 //! - `TETON_CATALOG` — a model-catalog TOML replacing [`Catalog::bundled`]. The
 //!   REQ-547 acceptance suite needs a catalog whose artifact is small enough to
 //!   actually download in CI *and* whose `sha256`/`size_bytes` are the genuine
@@ -465,7 +466,10 @@ impl DaemonRuntime {
         let config_path = std::env::var_os("TETON_CONFIG")
             .map(PathBuf::from)
             .or_else(|| Some(base_dir.join("config.toml")));
-        let config = load_config(config_path.as_deref());
+        // H-1: a present-but-invalid config refuses to start rather than failing
+        // open to an empty default that would drop every declared privacy
+        // boundary. A genuinely absent file still defaults.
+        let config = load_config(config_path.as_deref())?;
 
         // --- repo root (the tool jail) ---
         let repo_root = std::env::var_os("TETON_REPO_ROOT")
@@ -479,10 +483,11 @@ impl DaemonRuntime {
             CostLedger::open(base_dir.join("cost.db"), PriceTable::bundled(), cost_sink)
                 .or_else(|_| CostLedger::open_in_memory(PriceTable::bundled(), events.clone()))?;
 
-        // --- local tier: hardware probe (BR-9 / AC-8) + scripted engine ---
+        // --- local tier: hardware probe (REQ-544 BR-9 / AC-8) + scripted engine ---
         let profile = probe_profile();
         let catalog = load_catalog();
-        // `[local_model] pinned` supersedes the legacy top-level key; resolving it
+        // The effective pin is `[local_model] pinned` (REQ-544's top-level key is
+        // hard-deprecated and rejected by validation — Decision 2). Resolving it
         // once here means the probe, the consent gate, and `model/list` cannot
         // disagree about which pin is in force.
         let pinned = config.effective_pinned_local_model().map(str::to_owned);
@@ -617,7 +622,16 @@ impl DaemonRuntime {
     /// Only a `Ready` outcome opens it. A refusal, a failed install, and an
     /// unanswered proposal all leave the tier withheld and the session
     /// remote-only, which is the BR-1 default rather than a special case.
+    ///
+    /// A `Superseded` outcome (M-4) is the one case that must NOT touch the gate:
+    /// the `model/set` that superseded the first-run proposal drives its own
+    /// install on a separate task and is the authority on the gate, so this
+    /// abandoned flow leaves it exactly as it found it rather than racing the
+    /// set-path's decision.
     fn apply_consent_outcome(&self, outcome: &ConsentOutcome) {
+        if matches!(outcome, ConsentOutcome::Superseded) {
+            return;
+        }
         self.local_gated
             .store(!outcome.local_tier_ready(), Ordering::SeqCst);
     }
@@ -687,18 +701,39 @@ impl DaemonRuntime {
         &self,
         params: ModelConfirmParams,
     ) -> Result<ModelConfirmResult, RpcError> {
-        if let ModelConfirmOutcome::Choose {
-            name,
-            confirmed_above_ram_floor,
-        } = &params.outcome
-        {
-            crate::model_consent::validate_choice(
-                self.consent.catalog(),
-                self.consent.profile(),
+        match &params.outcome {
+            ModelConfirmOutcome::Choose {
                 name,
-                *confirmed_above_ram_floor,
-            )
-            .map_err(|refusal| RpcError::new(error_code::INVALID_PARAMS, refusal.to_string()))?;
+                confirmed_above_ram_floor,
+            } => {
+                crate::model_consent::validate_choice(
+                    self.consent.catalog(),
+                    self.consent.profile(),
+                    name,
+                    *confirmed_above_ram_floor,
+                )
+                .map_err(|refusal| {
+                    RpcError::new(error_code::INVALID_PARAMS, refusal.to_string())
+                })?;
+            }
+            // Pre-validate an `accept` the same way a `choose` is pre-validated: if
+            // the outstanding proposal offered no model (this machine has no
+            // fitting catalog entry), there is nothing to accept. Reject it as
+            // INVALID_PARAMS with the proposal left open, rather than letting the
+            // accept resolve the waiter and then fail *inside* the flow as
+            // `NothingToAccept` — which would permanently consume the user's one
+            // chance to answer and leave the tier dead for the daemon's lifetime.
+            ModelConfirmOutcome::Accept => {
+                if let Some(open) = self.consent.pending().outstanding() {
+                    if open.proposed.is_none() {
+                        return Err(RpcError::new(
+                            error_code::INVALID_PARAMS,
+                            crate::model_consent::ChoiceRefusal::NothingToAccept.to_string(),
+                        ));
+                    }
+                }
+            }
+            ModelConfirmOutcome::Decline => {}
         }
         // Idempotent, like `permission/respond`: a late or duplicate answer for a
         // proposal that already resolved simply finds no waiter.
@@ -708,7 +743,8 @@ impl DaemonRuntime {
         Ok(ModelConfirmResult {})
     }
 
-    /// The startup model-lifecycle events (BR-9), replayed to attaching clients.
+    /// The startup model-lifecycle events (REQ-544 BR-9), replayed to attaching
+    /// clients.
     ///
     /// Derived per call, from the probe *and* the consent state as it stands
     /// right now — see [`startup_lifecycle`]. A client attaching before the user
@@ -1148,14 +1184,46 @@ impl DaemonRuntime {
 // Construction helpers
 // ---------------------------------------------------------------------------
 
-/// Load the config from `path`, falling back to defaults on any read/parse error.
-fn load_config(path: Option<&Path>) -> Config {
+/// Load the config from `path`.
+///
+/// A *genuinely absent* config file defaults — a fresh install has none, and
+/// defaulting there is correct. But a config that **exists** and fails to parse
+/// or validate must NOT be silently replaced by [`Config::default`] (H-1): the
+/// default carries `boundaries: vec![]`, so failing open would drop every
+/// declared privacy boundary, provider, routing rule and MCP server on the floor
+/// and bring the daemon up with a security posture the user never chose — a typo
+/// in one field silently disabling every `local-only` boundary. A present-but-
+/// invalid config is refused instead, with a diagnostic naming the failure, so
+/// the operator fixes it rather than unknowingly running wide open.
+///
+/// # Errors
+/// Returns an error when a config file is present but cannot be read, parsed, or
+/// validated. The message names the validation failure but no filesystem path
+/// (BR-11).
+fn load_config(path: Option<&Path>) -> anyhow::Result<Config> {
     let Some(path) = path else {
-        return Config::default();
+        return Ok(Config::default());
     };
     match std::fs::read_to_string(path) {
-        Ok(text) => Config::load(&text).unwrap_or_default(),
-        Err(_) => Config::default(),
+        // Present and readable: it MUST parse and validate. Refusing here is the
+        // whole point — a fail-open default would drop the user's boundaries.
+        Ok(text) => Config::load(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "the daemon configuration is present but invalid, so it was NOT loaded. \
+                 Refusing to start rather than fall back to an empty config that would \
+                 silently drop your privacy boundaries, providers, routing, and MCP servers. \
+                 Fix the config and restart. Cause: {e}"
+            )
+        }),
+        // Genuinely absent (a fresh install): defaulting is correct.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        // Present but unreadable (permissions, I/O): surface it rather than
+        // defaulting — the operator has a config they meant to apply.
+        Err(err) => Err(anyhow::anyhow!(
+            "the daemon configuration file exists but could not be read ({}); \
+             refusing to start rather than silently ignore it.",
+            err.kind()
+        )),
     }
 }
 
@@ -1271,7 +1339,7 @@ fn load_catalog() -> Catalog {
     }
 }
 
-/// The result of the startup hardware probe (BR-9 / AC-8).
+/// The result of the startup hardware probe (REQ-544 BR-9 / AC-8).
 ///
 /// Facts only. What the *client* is told about them is
 /// [`startup_lifecycle`]'s job, because the honest answer depends on state this
@@ -1926,6 +1994,94 @@ fn env_flag(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway directory under the system temp dir, unique per test.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "teton-loadcfg-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_absent_config_file_defaults() {
+        // A fresh install has no config; defaulting there is correct.
+        let dir = scratch_dir("absent");
+        let missing = dir.join("config.toml");
+        assert_eq!(
+            load_config(Some(&missing)).expect("an absent file defaults"),
+            Config::default()
+        );
+        // No path at all also defaults.
+        assert_eq!(
+            load_config(None).expect("no path defaults"),
+            Config::default()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_present_but_invalid_config_refuses_rather_than_dropping_boundaries() {
+        // H-1: a config that EXISTS but fails validation must NOT be silently
+        // replaced by `Config::default()` (which has `boundaries: vec![]`). Here a
+        // one-character mistake — a `base_url` with no scheme — sits beside a
+        // declared `local-only` privacy boundary. Failing open would drop that
+        // boundary on the floor with nothing logged; instead the load refuses.
+        let dir = scratch_dir("invalid");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[local_model]\nbase_url = \"hf-mirror.corp.internal\"\n\n\
+             [[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n",
+        )
+        .unwrap();
+
+        let err = load_config(Some(&path))
+            .expect_err("a present-but-invalid config must refuse, not fail open");
+        let message = err.to_string();
+        // The refusal explains itself and names the offending field's rule, so an
+        // operator can fix it rather than unknowingly running with no boundaries.
+        assert!(
+            message.contains("invalid") && message.contains("boundaries"),
+            "diagnostic should explain the fail-open it prevented: {message}"
+        );
+
+        // The proof it did not fail open: the very same file, with only the
+        // base_url corrected, loads AND still carries the privacy boundary. So the
+        // refusal above was the invalidity, never a dropped boundary.
+        std::fs::write(
+            &path,
+            "[local_model]\nbase_url = \"https://hf-mirror.corp.internal\"\n\n\
+             [[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n",
+        )
+        .unwrap();
+        let loaded = load_config(Some(&path)).expect("the corrected config loads");
+        assert_eq!(
+            loaded.boundaries.len(),
+            1,
+            "a valid config keeps its declared privacy boundaries"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_with_the_deprecated_legacy_pin_refuses_to_start() {
+        // Decision 2 + H-1 together: the legacy `pinned_local_model` key now fails
+        // validation, and `load_config` surfaces that as a refusal rather than
+        // defaulting past it.
+        let dir = scratch_dir("legacy-pin");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "pinned_local_model = \"qwen2.5-coder-3b\"\n").unwrap();
+        let err = load_config(Some(&path)).expect_err("a deprecated legacy pin must refuse");
+        assert!(err.to_string().contains("invalid"), "diagnostic: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn scripted_engine_replays_blocks_then_ends() {

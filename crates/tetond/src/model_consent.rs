@@ -62,7 +62,7 @@ use teton_protocol::methods::{
 use teton_protocol::RequestId;
 
 use crate::broadcast::EventBus;
-use crate::selection_store::{now_ms, SelectionStore};
+use crate::selection_store::{now_ms, SelectionStore, SelectionStoreError};
 
 /// Free disk required *above* a model's download size before any bytes are
 /// fetched (BR-7).
@@ -155,6 +155,29 @@ impl PendingModelDecisions {
             Some(tx) => tx.send(outcome).is_ok(),
             None => false,
         }
+    }
+
+    /// Cancel the outstanding proposal (if any), dropping its answer channel so
+    /// the parked consent flow observes the decision was made elsewhere (M-4).
+    ///
+    /// This is how a `model/set` supersedes a first-run proposal: dropping the
+    /// [`oneshot::Sender`] makes the flow's `rx.await` resolve to `Err(RecvError)`,
+    /// which [`ModelConsentGate::resolve`] treats as "abandon — an explicit
+    /// decision is now on record", rather than letting a later `Accept` overwrite
+    /// the user's `model/set` choice. A stale `model/confirm` that arrives after
+    /// the cancel finds no waiter and is a harmless no-op, exactly like a duplicate
+    /// answer. Returns the cancelled proposal (at most one is ever outstanding) for
+    /// the caller to inspect or log.
+    pub fn cancel(&self) -> Option<ModelSelectionProposed> {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .expect("pending model decisions mutex poisoned");
+        let cancelled = waiters.first().map(|open| open.proposal.clone());
+        // Clearing drops every `OpenProposal` — and with it every answer sender —
+        // so any parked flow wakes with `Err`.
+        waiters.clear();
+        cancelled
     }
 
     /// The proposal currently awaiting an answer, if any — **in full**.
@@ -397,8 +420,8 @@ pub fn probe_view(profile: &HardwareProfile, decision: &TierDecision) -> ProbeRe
             gpu_phrase(profile.gpu),
             // The *machine's* band, which is what the sentence is about. It can
             // differ from the selected model's band when a config pin overrode
-            // the probe (BR-9); the model's own band is the honest fallback for
-            // a machine that has no band of its own.
+            // the probe (REQ-544 BR-9); the model's own band is the honest
+            // fallback for a machine that has no band of its own.
             machine_band.map_or(band_phrase(*band), band_phrase),
         ),
     };
@@ -470,9 +493,16 @@ pub fn list_entries(profile: &HardwareProfile, catalog: &Catalog) -> Vec<ModelLi
 
 /// Why the daemon refuses to act on a client's model choice.
 ///
-/// Both variants are *recoverable*: the client fixes the name, or re-sends with
-/// the second confirmation. Neither consumes the outstanding proposal, so the
-/// user is not locked out of answering by one bad answer.
+/// `UnknownModel` and `AboveRamFloor` are *recoverable at the RPC boundary*: the
+/// client fixes the name, or re-sends with the second confirmation, and the
+/// outstanding proposal is left open — `model/confirm` validates them *before*
+/// resolving the waiter, so a bad answer never costs the user their one chance to
+/// answer (BR-3). `NothingToAccept` is different in kind: it means an `accept`
+/// was sent for a proposal that offered no model at all, which `model/confirm`
+/// now also rejects up front (an `INVALID_PARAMS` with the proposal left open)
+/// for the same reason — reached inside the gate it *would* consume the waiter,
+/// and guessing which model "accept" meant would be exactly the autonomous
+/// download this REQ exists to stop.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChoiceRefusal {
     /// The named entry is not in this daemon's catalog.
@@ -575,6 +605,12 @@ pub enum ConsentOutcome {
     /// shutting down. The tier stays unavailable and the next start re-proposes
     /// (BR-1: absent a decision, sessions proceed remote-only).
     Undecided,
+    /// The outstanding proposal was superseded by an explicit `model/set` while
+    /// this flow was parked (M-4). The `model/set` recorded the decision and
+    /// drives its own install, so this flow abandons without recording anything
+    /// and — crucially — without touching the tier gate, leaving that to the
+    /// authoritative `model/set` install path.
+    Superseded,
 }
 
 impl ConsentOutcome {
@@ -641,7 +677,7 @@ impl ModelConsentGate {
     }
 
     /// The probe's decision for this machine, honouring a `[local_model] pinned`
-    /// key (BR-9).
+    /// key (REQ-544 BR-9: a pin overrides the probe's pick).
     ///
     /// The single place the decision is computed, so the proposal, `model/list`,
     /// and the probe reasoning can never describe different pictures of the same
@@ -729,16 +765,15 @@ impl ModelConsentGate {
 
         let decision = self.probe_decision();
 
-        // BR-9: a `[local_model] pinned` key is the user deciding in advance, so
-        // it is honoured with no prompt and recorded as `config_pin`.
-        if let Some(entry) = self
-            .config
-            .pinned
-            .as_deref()
-            .and_then(|name| self.catalog.get(name))
-        {
-            return self.commit(entry, SelectionSource::ConfigPin, None).await;
-        }
+        // C-1 (REQ-547 review): a `[local_model] pinned` key is NOT consent to a
+        // download. It already feeds `probe_decision()` above (REQ-544 BR-9: a
+        // pin overrides the probe's pick), so the pinned model is simply the one
+        // the proposal below NAMES — and the user still answers that proposal
+        // before a single byte is fetched. There is deliberately no early
+        // `commit` for a pin here: a pin changes *which* model is proposed, never
+        // *whether* consent is required (BR-1). Silently committing a pin was the
+        // one path that let an existing REQ-544 `pinned` key trigger an unprompted
+        // multi-gigabyte fetch on first REQ-547 start.
 
         // BR-5 / AC-5: the explicit opt-in unattended path. Note what is *absent*
         // here — no `ModelSelectionProposed` is published, because there is no one
@@ -775,20 +810,47 @@ impl ModelConsentGate {
             .proposed
             .as_ref()
             .map(|proposed| proposed.entry.name.clone());
+        // M-4: snapshot the recorded decision as it stands the instant before we
+        // publish and park. A concurrent `model/set` records an explicit decision
+        // and cancels this proposal; if the recorded decision has changed by the
+        // time we wake, this answer is stale and must not overwrite the newer,
+        // explicit choice.
+        let decision_before = self.store.current();
         let rx = self.pending.register(proposal.clone());
         self.events
             .publish(None, Event::ModelSelectionProposed(proposal));
 
         let Ok(outcome) = rx.await else {
-            // The client detached without answering. D-3: the tier stays
-            // unavailable, the session is untouched, the next start re-proposes.
-            return ConsentOutcome::Undecided;
+            // No answer arrived on this channel. Either the client detached / the
+            // daemon is shutting down (D-3: the tier stays unavailable, the
+            // session is untouched, the next start re-proposes), OR a concurrent
+            // `model/set` cancelled this proposal (M-4). Distinguish by whether the
+            // recorded decision changed under us: if it did, that `model/set` is
+            // authoritative and drives its own install — abandon this flow without
+            // touching the tier gate.
+            return if self.store.current() != decision_before {
+                ConsentOutcome::Superseded
+            } else {
+                ConsentOutcome::Undecided
+            };
         };
+
+        // M-4: an answer *did* arrive, but a `model/set` may still have raced in
+        // and recorded an explicit decision while we were parked. Honour that
+        // decision rather than overwriting it with this now-stale answer.
+        if self.store.current() != decision_before {
+            return ConsentOutcome::Superseded;
+        }
 
         match outcome {
             ModelConfirmOutcome::Decline => {
                 let selection = ModelSelection::declined(now_ms());
-                let _ = self.store.record(&selection);
+                // M-6 / BR-4: a decline that cannot be persisted must not vanish
+                // silently — the user would be re-prompted forever with no signal.
+                // Surface it; the in-memory record still holds for this process.
+                if let Err(err) = self.store.record(&selection) {
+                    report_persist_failure("declined-local decision", &err);
+                }
                 self.announce(&selection, Some(request_id));
                 ConsentOutcome::Declined
             }
@@ -847,9 +909,19 @@ impl ModelConsentGate {
             name,
             confirmed_above_ram_floor,
         )?;
+        // M-4 / BR-10: a `model/set` is an explicit decision that supersedes any
+        // outstanding first-run proposal. Cancel it *before* recording, so a
+        // late `Accept` for the old proposal finds no waiter and cannot overwrite
+        // this choice with a different model.
+        self.pending.cancel();
         let selection =
             ModelSelection::accepted(entry.name.clone(), SelectionSource::UserOverride, now_ms());
-        let _ = self.store.record(&selection);
+        // M-6: a decision the daemon could not persist must not vanish silently —
+        // surface it (the message names no path, BR-11). The in-memory record is
+        // still updated, so the choice holds for this process either way.
+        if let Err(err) = self.store.record(&selection) {
+            report_persist_failure("model/set selection", &err);
+        }
         self.announce(&selection, None);
         Ok(selection)
     }
@@ -890,7 +962,13 @@ impl ModelConsentGate {
         request_id: Option<RequestId>,
     ) -> ConsentOutcome {
         let selection = ModelSelection::accepted(entry.name.clone(), source, now_ms());
-        let _ = self.store.record(&selection);
+        // M-6 / BR-12: recording precedes the install so a crash mid-download
+        // cannot lose the answer; a record that could not be written is surfaced
+        // rather than discarded (the in-memory record still holds, so the install
+        // below still proceeds against this decision).
+        if let Err(err) = self.store.record(&selection) {
+            report_persist_failure("accepted selection", &err);
+        }
         self.announce(&selection, request_id);
         let entry = entry.clone();
         self.run_install(&entry, selection).await
@@ -959,6 +1037,18 @@ impl ModelConsentGate {
             }),
         );
     }
+}
+
+/// Surface a decision-persistence failure on stderr (M-6).
+///
+/// The consent gate updates its in-memory record before attempting the write, so
+/// a failed persist does not lose the decision for the running daemon — but it
+/// *would* silently lose it across a restart, re-prompting the user forever with
+/// no signal (BR-4). Reporting it is the minimum: the daemon's other
+/// fallback conditions warn the same way. The [`SelectionStoreError`] message
+/// names no filesystem path (BR-11), so it is safe to log.
+fn report_persist_failure(what: &str, err: &SelectionStoreError) {
+    eprintln!("tetond: could not persist the {what}: {err}. It holds for this daemon run but may not survive a restart.");
 }
 
 /// The probe's own sentence for a machine with no usable local tier.

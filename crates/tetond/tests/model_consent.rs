@@ -657,7 +657,13 @@ async fn auto_accept_completes_the_flow_with_no_proposal_emitted() {
 }
 
 #[tokio::test]
-async fn a_config_pin_decides_without_a_prompt_and_installs_the_pinned_entry() {
+async fn a_config_pin_proposes_the_pinned_entry_and_downloads_nothing_until_answered() {
+    // C-1 (REQ-547 review): a `[local_model] pinned` key changes WHICH model is
+    // proposed — it never bypasses consent. The pinned entry is the proposal's
+    // pick, and ZERO download requests are issued until the user answers, exactly
+    // like the unpinned path. This is the failure this REQ exists to close: an
+    // existing REQ-544 user who pinned a large model must not get an unprompted
+    // multi-gigabyte fetch on first REQ-547 start.
     let h = Harness::new(
         "pin",
         RecordingFetcher::serving(),
@@ -668,20 +674,50 @@ async fn a_config_pin_decides_without_a_prompt_and_installs_the_pinned_entry() {
     );
     let mut sub = h.subscribe();
 
-    let outcome = timeout(Duration::from_secs(5), h.gate.resolve())
-        .await
-        .expect("a config pin must not wait for an answer");
+    // Nothing has run yet.
+    assert_eq!(h.fetcher.call_count(), 0);
 
+    let resolve = h.gate.resolve();
+    let answer = async {
+        let proposal = next_proposal(&mut sub).await;
+
+        // The pin drives the proposal's pick — but nothing has been fetched.
+        assert_eq!(
+            proposal.proposed.as_ref().unwrap().entry.name,
+            "alt-fit",
+            "the pin should name the proposed entry"
+        );
+        assert_eq!(
+            h.fetcher.call_count(),
+            0,
+            "a pin must not trigger a download before the user answers: {:?}",
+            h.fetcher.calls()
+        );
+        assert!(!h.installed("alt-fit").exists());
+
+        // Wait a beat and re-check: the gate is awaiting an answer, not racing
+        // ahead of one just because a pin is configured.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(h.fetcher.call_count(), 0);
+
+        assert!(h
+            .pending
+            .resolve(&proposal.request_id, ModelConfirmOutcome::Accept));
+    };
+    let (outcome, ()) = tokio::join!(resolve, answer);
+
+    // Answered: now — and only now — the pinned entry installs.
     assert!(
         matches!(outcome, ConsentOutcome::Ready { .. }),
         "{outcome:?}"
     );
     assert!(h.installed("alt-fit").exists());
     assert!(!h.installed("small-fit").exists());
-    let events = drain(&mut sub).await;
-    assert!(!events
-        .iter()
-        .any(|e| matches!(e, Event::ModelSelectionProposed(_))));
+    assert!(
+        h.fetcher.calls().iter().all(|url| url.contains("alt-fit")),
+        "the daemon fetched something other than the pinned entry: {:?}",
+        h.fetcher.calls()
+    );
     h.cleanup();
 }
 
@@ -1162,6 +1198,221 @@ async fn model_status_exposes_the_open_proposal_so_a_late_client_can_answer() {
     assert!(status.pending_proposal.is_none());
     assert!(status.selection.unwrap().declined_local);
     assert!(status.install.is_none(), "a decline installs nothing");
+    h.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// M-4 — a `model/set` supersedes an outstanding proposal
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_model_set_during_an_outstanding_proposal_supersedes_it_and_a_late_accept_is_ignored() {
+    // M-4 / BR-10: a `model/set` while a first-run proposal is outstanding is an
+    // explicit decision. It cancels the proposal, so (a) the parked consent flow
+    // abandons rather than overwriting the choice, (b) a late `Accept` for the old
+    // proposal finds no waiter and installs nothing, and (c) the set choice is
+    // what stands and is not re-prompted on a later start.
+    let h = Harness::new(
+        "m4-set-cancels",
+        RecordingFetcher::serving(),
+        LocalModelConfig::default(),
+    );
+    let runtime = Arc::new(DaemonRuntime::with_consent(Arc::clone(&h.gate)));
+    let mut sub = h.subscribe();
+
+    let drive = {
+        let runtime = Arc::clone(&runtime);
+        async move { runtime.run_model_consent().await }
+    };
+    let interject = async {
+        let proposal = next_proposal(&mut sub).await;
+        assert_eq!(proposal.proposed.as_ref().unwrap().entry.name, "small-fit");
+        assert_eq!(h.pending.pending_count(), 1);
+
+        // A `model/set` for a DIFFERENT model lands mid-proposal.
+        let set = runtime
+            .set_model("alt-fit", false)
+            .expect("the set is valid");
+        assert_eq!(set.selection.model_name.as_deref(), Some("alt-fit"));
+
+        // It cancelled the proposal: no waiter remains, so a late Accept for the
+        // old proposal is a no-op and cannot install small-fit over the set choice.
+        assert_eq!(
+            h.pending.pending_count(),
+            0,
+            "the set must cancel the outstanding proposal"
+        );
+        assert!(
+            !h.pending
+                .resolve(&proposal.request_id, ModelConfirmOutcome::Accept),
+            "a late Accept for the superseded proposal must find no waiter"
+        );
+    };
+    let (outcome, ()) = tokio::join!(drive, interject);
+
+    // The parked flow abandoned as superseded: it recorded nothing of its own.
+    assert_eq!(
+        outcome,
+        ConsentOutcome::Superseded,
+        "the parked flow must abandon, not overwrite: {outcome:?}"
+    );
+    let recorded = SelectionStore::open(&h.dir).current().unwrap();
+    assert_eq!(
+        recorded.model_name.as_deref(),
+        Some("alt-fit"),
+        "the explicit set choice must stand"
+    );
+    assert_eq!(recorded.source, SelectionSource::UserOverride);
+    assert!(!recorded.declined_local);
+
+    // A later start is NOT re-prompted: with the weights in place the set choice
+    // is settled (BR-10). (The set-path drives its own install; this asserts the
+    // decision, not the tier gate.)
+    let later = Harness::in_dir(
+        h.dir.clone(),
+        RecordingFetcher::serving(),
+        LocalModelConfig::default(),
+    );
+    std::fs::create_dir_all(&later.weights_dir).unwrap();
+    std::fs::write(later.installed("alt-fit"), ALT_BODY).unwrap();
+    let mut sub2 = later.subscribe();
+    let outcome = later.gate.resolve().await;
+    assert!(
+        matches!(outcome, ConsentOutcome::Ready { .. }),
+        "a settled set choice must not re-prompt: {outcome:?}"
+    );
+    assert_eq!(later.pending.pending_count(), 0);
+    assert!(!drain(&mut sub2)
+        .await
+        .iter()
+        .any(|e| matches!(e, Event::ModelSelectionProposed(_))));
+    later.cleanup();
+    h.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// M-6 — a decision that cannot be persisted is surfaced, not swallowed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_decline_whose_persistence_fails_is_surfaced_and_does_not_vanish_in_memory() {
+    // M-6 / BR-4: if the decline cannot be written to disk, it must not silently
+    // vanish — the daemon surfaces it (a diagnostic on stderr) and still honours
+    // it for this process, so the user is not re-prompted mid-session. The disk
+    // failure is modelled by a store whose parent path is a FILE, so the atomic
+    // write can never create its directory.
+    let base = temp_dir("decline-persist-fail");
+    let wall = base.join("wall");
+    std::fs::write(&wall, b"not a directory").unwrap();
+    let unwritable = wall.join("state"); // parent (`wall`) is a file
+    let store = Arc::new(SelectionStore::open(&unwritable));
+
+    // Sanity: this store genuinely cannot persist.
+    assert!(
+        store.record(&ModelSelection::declined(1)).is_err(),
+        "the failing store must actually fail to persist"
+    );
+    store.clear(); // reset the in-memory view to undecided for the gate below
+
+    let bus = Arc::new(EventBus::new());
+    let pending = Arc::new(PendingModelDecisions::new());
+    let installer = Arc::new(
+        WeightsInstall::new(
+            Arc::new(RecordingFetcher::serving()) as Arc<dyn RangeFetcher + Send + Sync>,
+            base.join("models"),
+            None,
+        )
+        .with_free_space(Arc::new(FixedFreeSpace(Some(u64::MAX))) as Arc<dyn FreeSpace>),
+    );
+    let gate = Arc::new(ModelConsentGate::new(
+        machine(),
+        test_catalog(),
+        LocalModelConfig::default(),
+        Arc::clone(&bus),
+        Arc::clone(&pending),
+        Arc::clone(&store),
+        installer,
+    ));
+    let mut sub = bus.subscribe(32);
+
+    let resolve = gate.resolve();
+    let answer = async {
+        let proposal = next_proposal(&mut sub).await;
+        pending.resolve(&proposal.request_id, ModelConfirmOutcome::Decline);
+    };
+    let (outcome, ()) = tokio::join!(resolve, answer);
+
+    // The decline still takes effect for this daemon run: the outcome is Declined
+    // and the in-memory decision is the decline, not an absence (BR-4). The
+    // persistence failure was surfaced, not swallowed — the old `let _ = record`
+    // would have discarded it silently.
+    assert_eq!(outcome, ConsentOutcome::Declined);
+    let current = store
+        .current()
+        .expect("the decline is held in memory even though the disk write failed");
+    assert!(
+        current.declined_local,
+        "the decline must not vanish in memory"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// Minor — `accept` with no proposed model is pre-validated at the RPC boundary
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn confirm_model_pre_validates_an_accept_with_no_proposed_model() {
+    // An `accept` for a proposal that offered no model is rejected up front as
+    // INVALID_PARAMS with the proposal left OPEN — rather than resolving the
+    // waiter and failing inside the flow as `NothingToAccept`, which would
+    // permanently consume the user's one chance to answer and leave the tier dead.
+    let h = Harness::on(
+        "accept-prevalidate",
+        HardwareProfile {
+            ram_bytes: 4 * GIB,
+            free_disk_bytes: 400 * GIB,
+            gpu: GpuClass::Cpu,
+        },
+        RecordingFetcher::serving(),
+    );
+    let runtime = Arc::new(DaemonRuntime::with_consent(Arc::clone(&h.gate)));
+    let mut sub = h.subscribe();
+
+    let resolve = h.gate.resolve();
+    let probe = async {
+        let proposal = next_proposal(&mut sub).await;
+        assert!(
+            proposal.proposed.is_none(),
+            "a below-floor machine proposes nothing to accept"
+        );
+
+        // The accept is rejected without consuming the waiter.
+        let err = runtime
+            .confirm_model(ModelConfirmParams {
+                request_id: proposal.request_id.clone(),
+                outcome: ModelConfirmOutcome::Accept,
+            })
+            .expect_err("accept with no proposed model must be INVALID_PARAMS");
+        assert!(
+            err.message.contains("no fitting catalog model"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            h.pending.pending_count(),
+            1,
+            "the proposal must stay open so the user can still answer"
+        );
+        assert_eq!(h.fetcher.call_count(), 0);
+
+        // The user can still answer for real — here, by declining.
+        h.pending
+            .resolve(&proposal.request_id, ModelConfirmOutcome::Decline);
+    };
+    let (outcome, ()) = tokio::join!(resolve, probe);
+    assert_eq!(outcome, ConsentOutcome::Declined);
     h.cleanup();
 }
 

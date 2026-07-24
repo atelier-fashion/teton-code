@@ -27,8 +27,15 @@ use std::collections::HashSet;
 /// checkout should not carry another machine's install decision.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LocalModelConfig {
-    /// A pinned catalog model name. When set it overrides the hardware probe
-    /// (BR-9) and the decision is recorded with source `config_pin`.
+    /// A pinned catalog model name. When set it overrides the hardware probe's
+    /// pick (REQ-544 BR-9), so the pinned model is the one the daemon *proposes*
+    /// on first run.
+    ///
+    /// It does **not** bypass consent (REQ-547 BR-1): the user still answers the
+    /// proposal before a single byte is downloaded. A pin changes *which* model is
+    /// proposed, never *whether* a decision is required — so an operator who pins
+    /// a large model does not get an unprompted multi-gigabyte fetch on first
+    /// start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<String>,
     /// Accept the proposed model without prompting — the unattended/CI path
@@ -65,14 +72,15 @@ impl LocalModelConfig {
 /// the emitted TOML is valid.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// User-pinned local model id; when set it overrides the hardware probe
-    /// (BR-9).
+    /// **Deprecated (REQ-547):** REQ-544's top-level spelling of the local-model
+    /// pin.
     ///
-    /// Superseded by [`LocalModelConfig::pinned`], which groups the pin with the
-    /// rest of the local-model inputs; this top-level key is REQ-544's original
-    /// spelling and still honoured. Setting both to *different* models is a
-    /// validation error rather than a silently-resolved precedence puzzle — see
-    /// [`Config::effective_pinned_local_model`].
+    /// It is no longer honoured — [`Config::validate`] now *rejects* a config that
+    /// sets it (see [`ConfigError::DeprecatedLegacyPin`]) and points the user at
+    /// `[local_model] pinned` instead. It is never promoted into the effective
+    /// pin: silently honouring it post-REQ-547 would mean downloading a model the
+    /// probe never proposed. The field is retained only so its presence can be
+    /// *detected* and reported, not so it can take effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_local_model: Option<String>,
     /// Local-model tier inputs (`[local_model]`): the pin, the auto-accept
@@ -185,19 +193,22 @@ pub enum ConfigError {
         name: String,
     },
 
-    /// The two pins disagree. Rejected rather than silently resolved, so a user
-    /// who edited the wrong key learns it instead of wondering why their pin had
-    /// no effect (the same posture as [`ConfigError::FreeformRoutingPolicy`]).
+    /// The hard-deprecated top-level `pinned_local_model` key is set (REQ-547
+    /// Decision 2). The pin moved into the `[local_model]` table; the old key is
+    /// no longer honoured — a config that still sets it is rejected with a
+    /// migration instruction rather than silently promoted (which, post-REQ-547,
+    /// would mean an unprompted download the probe never proposed). Same posture
+    /// as [`ConfigError::FreeformRoutingPolicy`]: reject the inert key loudly
+    /// instead of ignoring it.
     #[error(
-        "the local model is pinned twice, to different models: pinned_local_model = \"{legacy}\" \
-         and [local_model] pinned = \"{current}\". Keep one — `[local_model] pinned` is the \
-         current key; delete the top-level `pinned_local_model`."
+        "the top-level `pinned_local_model` key is no longer supported (it was REQ-544's \
+         spelling). Move it into the local-model table: replace `pinned_local_model = \"{name}\"` \
+         with a `[local_model]` section containing `pinned = \"{name}\"`."
     )]
-    ConflictingPinnedModel {
-        /// The value of the top-level `pinned_local_model` key.
-        legacy: String,
-        /// The value of `[local_model] pinned`.
-        current: String,
+    DeprecatedLegacyPin {
+        /// The value found under the deprecated key (user-authored, never a
+        /// credential).
+        name: String,
     },
 
     /// `[local_model] base_url` is not a usable catalog base URL (BR-16).
@@ -328,19 +339,24 @@ impl Config {
     /// and leaves "is there such a model?" to the daemon, which has the catalog
     /// and can list the alternatives.
     fn validate_local_model(&self) -> Result<(), ConfigError> {
+        // Decision 2 (REQ-547 review): the legacy top-level `pinned_local_model`
+        // is hard-deprecated. Reject it before anything else touches a pin, so no
+        // path can promote an unvalidated legacy value (M-7). An operator who
+        // pinned under the old spelling is told to migrate rather than having the
+        // key silently ignored — or, worse, silently honoured as a download the
+        // probe would never have proposed.
+        if let Some(legacy) = &self.pinned_local_model {
+            return Err(ConfigError::DeprecatedLegacyPin {
+                name: legacy.clone(),
+            });
+        }
+
+        // Shape-check the effective pin (now only `[local_model] pinned`).
         if let Some(pinned) = &self.local_model.pinned {
             if !is_model_name_shaped(pinned) {
                 return Err(ConfigError::InvalidPinnedModel {
                     name: pinned.clone(),
                 });
-            }
-            if let Some(legacy) = &self.pinned_local_model {
-                if legacy != pinned {
-                    return Err(ConfigError::ConflictingPinnedModel {
-                        legacy: legacy.clone(),
-                        current: pinned.clone(),
-                    });
-                }
             }
         }
 
@@ -355,18 +371,17 @@ impl Config {
         Ok(())
     }
 
-    /// The model the user pinned, from either spelling of the key.
+    /// The model the user pinned, from the `[local_model] pinned` key.
     ///
-    /// `[local_model] pinned` is the current home for the pin and wins;
-    /// `pinned_local_model` is REQ-544's top-level key. Validation rejects the
-    /// two disagreeing, so preferring one here can never quietly discard the
-    /// other's value.
+    /// REQ-544's top-level `pinned_local_model` is hard-deprecated — a config that
+    /// sets it fails validation (see [`ConfigError::DeprecatedLegacyPin`]), so it
+    /// is *never* promoted into the effective pin. This is now simply the current
+    /// key, kept as a named accessor because the daemon resolves the effective pin
+    /// in one place and hands it to the probe, the consent gate, and `model/list`
+    /// so they cannot disagree about which pin is in force.
     #[must_use]
     pub fn effective_pinned_local_model(&self) -> Option<&str> {
-        self.local_model
-            .pinned
-            .as_deref()
-            .or(self.pinned_local_model.as_deref())
+        self.local_model.pinned.as_deref()
     }
 }
 
@@ -923,36 +938,58 @@ base_url = "https://hf-mirror.example.com"
     }
 
     #[test]
-    fn two_pins_that_disagree_are_rejected() {
-        // A silently-ignored duplicate key is the failure mode where the user
-        // edits one spelling and never learns the other won.
-        let mut cfg = sample_config();
-        cfg.pinned_local_model = Some("qwen2.5-coder-7b".to_owned());
-        cfg.local_model.pinned = Some("qwen2.5-coder-3b".to_owned());
+    fn the_legacy_top_level_pin_key_is_hard_deprecated() {
+        // Decision 2 (REQ-547 review): a config that still sets REQ-544's top-level
+        // `pinned_local_model` must FAIL validation with a migration instruction,
+        // rather than being silently promoted into the effective pin — which, post
+        // REQ-547, would mean an unprompted download the probe never proposed.
+        let mut cfg = Config {
+            pinned_local_model: Some("qwen2.5-coder-7b".to_owned()),
+            ..Config::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert_eq!(
             err,
-            ConfigError::ConflictingPinnedModel {
-                legacy: "qwen2.5-coder-7b".to_owned(),
-                current: "qwen2.5-coder-3b".to_owned(),
+            ConfigError::DeprecatedLegacyPin {
+                name: "qwen2.5-coder-7b".to_owned(),
             }
         );
+        // The message names the migration: the old key, the new table, and the new
+        // key spelled out with the same value.
         let msg = err.to_string();
         assert!(msg.contains("pinned_local_model"), "message: {msg}");
-        assert!(msg.contains("[local_model] pinned"), "message: {msg}");
+        assert!(
+            msg.contains("[local_model]"),
+            "message must name the new home: {msg}"
+        );
+        assert!(
+            msg.contains("pinned = \"qwen2.5-coder-7b\""),
+            "message must show the migrated key: {msg}"
+        );
 
-        // Agreeing pins are merely redundant, not an error.
-        cfg.pinned_local_model = Some("qwen2.5-coder-3b".to_owned());
-        cfg.validate().expect("identical pins are fine");
+        // It is rejected even when it agrees with the new key — the old spelling is
+        // gone, not merely superseded by a disagreeing one.
+        cfg.local_model.pinned = Some("qwen2.5-coder-7b".to_owned());
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::DeprecatedLegacyPin { .. }
+        ));
+
+        // The new key alone validates cleanly.
+        cfg.pinned_local_model = None;
+        cfg.validate()
+            .expect("the [local_model] pinned key alone is valid");
     }
 
     #[test]
-    fn the_effective_pin_prefers_the_current_key() {
+    fn the_effective_pin_reads_only_the_current_key() {
         let mut cfg = Config::default();
         assert_eq!(cfg.effective_pinned_local_model(), None);
 
+        // The deprecated legacy key is never promoted into the effective pin
+        // (validation rejects it outright; the accessor does not resurrect it).
         cfg.pinned_local_model = Some("legacy-model".to_owned());
-        assert_eq!(cfg.effective_pinned_local_model(), Some("legacy-model"));
+        assert_eq!(cfg.effective_pinned_local_model(), None);
 
         cfg.local_model.pinned = Some("current-model".to_owned());
         assert_eq!(cfg.effective_pinned_local_model(), Some("current-model"));
@@ -1014,7 +1051,8 @@ base_url = "https://hf-mirror.example.com"
     #[test]
     fn load_accepts_a_keychain_ref_config() {
         let toml_text = r#"
-pinned_local_model = "qwen2.5-coder-3b"
+[local_model]
+pinned = "qwen2.5-coder-3b"
 
 [[providers]]
 id = "anthropic-prod"
@@ -1031,7 +1069,7 @@ path_glob = "secrets/**"
 mode = "local-only"
 "#;
         let cfg = Config::load(toml_text).expect("should load and validate");
-        assert_eq!(cfg.pinned_local_model.as_deref(), Some("qwen2.5-coder-3b"));
+        assert_eq!(cfg.local_model.pinned.as_deref(), Some("qwen2.5-coder-3b"));
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.routing[0].phase, Phase::Architect);
     }
