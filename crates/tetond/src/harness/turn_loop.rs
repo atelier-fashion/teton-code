@@ -45,7 +45,7 @@ use crate::broadcast::EventBus;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
-use super::context::{summarize_if_large, ContextManager, ProvenanceHook};
+use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN};
 use super::permissions::{PermissionDecision, PermissionGate};
 use super::tools::{ToolContext, ToolOutcome, ToolRegistry};
 
@@ -98,9 +98,22 @@ impl HarnessError {
 pub struct HarnessConfig {
     /// Hard ceiling on model calls in one turn.
     pub max_turns: u32,
-    /// Token budget for the assembled context.
+    /// Token budget for the assembled context, in whitespace-approximated
+    /// tokens ([`super::context::approx_tokens`]).
     pub context_budget_tokens: usize,
-    /// Tool results larger than this (in approx tokens) are summarized locally.
+    /// Byte budget for the assembled context — the engine-window currency.
+    ///
+    /// The whitespace-token budget undercounts dense content (a minified
+    /// single-line file is a handful of "words" but tens of thousands of real
+    /// BPE tokens), so the context is bounded in bytes too: bytes are a
+    /// conservative proxy for BPE tokens (code averages ≳2 bytes per token).
+    /// The default, `context_budget_tokens` × [`super::context::APPROX_BYTES_PER_TOKEN`],
+    /// keeps a full assembled prompt within the local engine's 16,384-token
+    /// window (`LOCAL_ENGINE_N_CTX` in the daemon's runtime) with headroom;
+    /// size it to `n_ctx` when configuring a different engine.
+    pub context_budget_bytes: usize,
+    /// Tool results larger than this (in approx tokens, or its byte twin) are
+    /// summarized locally.
     pub summarize_threshold_tokens: usize,
     /// Cap on tools exposed to the model (`None` = all).
     pub max_tools: Option<u32>,
@@ -113,9 +126,11 @@ pub struct HarnessConfig {
 impl Default for HarnessConfig {
     fn default() -> Self {
         // The weak-model native shape.
+        let context_budget_tokens = 4_096;
         Self {
             max_turns: 12,
-            context_budget_tokens: 4_096,
+            context_budget_tokens,
+            context_budget_bytes: context_budget_tokens * APPROX_BYTES_PER_TOKEN,
             summarize_threshold_tokens: 1_500,
             max_tools: Some(5),
             require_verification: true,
@@ -466,14 +481,27 @@ pub async fn run_session_turn_with_source(
                             content
                         };
                         // Summarize oversized results on the local tier when one is
-                        // present; a remote-only machine folds them verbatim.
+                        // present; a remote-only machine folds them verbatim. A
+                        // summarizer engine failure is never silent: the duty
+                        // guards the context window, so the fallback (mechanical
+                        // truncation) is logged with the error that forced it.
                         let folded = match summarizer {
-                            Some(engine) => summarize_if_large(
-                                engine,
-                                &name,
-                                &folded,
-                                config.summarize_threshold_tokens,
-                            ),
+                            Some(engine) => {
+                                let outcome = summarize_if_large(
+                                    engine,
+                                    &name,
+                                    &folded,
+                                    config.summarize_threshold_tokens,
+                                );
+                                if let Some(error) = &outcome.engine_error {
+                                    eprintln!(
+                                        "tetond: local summarizer failed on a `{name}` \
+                                         result ({error}); folded a mechanically \
+                                         truncated result instead"
+                                    );
+                                }
+                                outcome.text
+                            }
                             None => folded,
                         };
                         // REQ-544 M-2: frame built-in file/command output as
