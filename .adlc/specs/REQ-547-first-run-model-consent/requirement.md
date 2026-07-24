@@ -210,10 +210,17 @@ daemon contains no production wiring for `Downloader` at all._
 - [x] AC-7: A corrupted/mismatched download is discarded, never installed, and
       surfaces a clear error; the engine never loads a partial file (assert
       `InstallState` never reports `verified` for a truncated artifact).
-- [x] AC-8: An automated catalog-integrity check verifies every entry's URL
-      resolves and its advertised `size_bytes` matches the real artifact; a
-      full-digest verification mode exists and is runnable on demand (see OQ-3
-      for whether it gates CI or only releases).
+- [x] AC-8: An automated catalog-integrity check verifies every entry against
+      HuggingFace's LFS metadata at its pinned, immutable revision — the
+      advertised `size_bytes` matches `lfs.size` and the `sha256` matches
+      `lfs.oid` — over an anonymous, ungated request (architecture D-1). That is
+      metadata only, no artifact is downloaded, so it verifies in seconds and
+      gates every CI run (`tools/refresh-catalog.py --check`). The artifact's own
+      bytes are still hashed against that same `sha256` at download time by the
+      downloader (BR-6); the two checks answer different questions and neither
+      replaces the other. (There is no separate `--deep` artifact-download gate:
+      the download-time digest already provides full-byte verification — see
+      OQ-3.)
 - [x] AC-9: `teton model list` shows the catalog, each entry's fit for this
       machine, and the current selection; `teton model set <name>` changes it
       post-first-run (subject to BR-3's warning) and `teton model status` reports
@@ -279,9 +286,13 @@ daemon contains no production wiring for `Downloader` at all._
 - [ ] OQ-2: Which exact quantization per band ships as the default (`q4_k_m`
       assumed today), and are the four current Qwen picks confirmed? Blocked on
       REQ-544 OQ-3's real benchmark.
-- [ ] OQ-3: Does AC-8's full-digest verification gate every CI run (expensive —
+- [x] OQ-3: ~~Does AC-8's full-digest verification gate every CI run (expensive —
       it downloads real artifacts) or only a release job, with CI limited to a
-      cheap URL/size check?
+      cheap URL/size check?~~ **RESOLVED 2026-07-24: neither.** Architecture D-1's
+      metadata check (HuggingFace LFS `oid`/`size` at the pinned revision) gates
+      every CI run with no downloads, and the full-byte digest is verified at
+      download time by the downloader (BR-6); no standalone deep-download gate
+      exists or is needed.
 - [ ] OQ-4: If the user declines the local tier but has no remote provider
       configured, what is the correct first-run experience — refuse with guidance
       to add a provider, or proceed and fail at first turn?

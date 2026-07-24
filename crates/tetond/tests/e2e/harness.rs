@@ -777,6 +777,50 @@ impl Client {
         }
     }
 
+    /// Pump events until one named `name` **satisfies `pred`** (or `window`
+    /// elapses), returning that event.
+    ///
+    /// [`Self::wait_for_event`] returns on the *first* event of a name; a
+    /// lifecycle stream sends many `model_lifecycle` events and a test usually
+    /// waits for a *particular* stage. Polling for the stage the assertions
+    /// depend on — rather than draining a fixed duration and hoping it arrived —
+    /// is what keeps the suite from flaking on a loaded runner where the replayed
+    /// lifecycle can land after any guessed window. Events already observed are
+    /// considered first, so a stage that arrived before the call is not missed.
+    pub fn wait_for_event_where(
+        &mut self,
+        name: &str,
+        mut pred: impl FnMut(&Value) -> bool,
+        window: Duration,
+    ) -> Option<Value> {
+        for ev in &self.events {
+            if ev.get("event").and_then(Value::as_str) == Some(name) && pred(ev) {
+                return Some(ev.clone());
+            }
+        }
+        let deadline = Instant::now() + window;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                return None;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(Incoming::Event(ev)) => {
+                    let matched =
+                        ev.get("event").and_then(Value::as_str) == Some(name) && pred(&ev);
+                    self.on_event(ev);
+                    if matched {
+                        return self.events.last().cloned();
+                    }
+                }
+                Ok(Incoming::Response(_)) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Await the first-run proposal *as an event*
     /// (`model_selection_proposed`).
     ///
@@ -1343,7 +1387,7 @@ impl TestModel {
     /// The genuine SHA-256 of [`Self::payload`] — computed, never pinned, so the
     /// fixture cannot drift away from the bytes it describes.
     pub fn sha256(&self) -> String {
-        teton_inference::hash::sha256_hex(&self.payload)
+        teton_inference::sha256_hex(&self.payload)
     }
 }
 

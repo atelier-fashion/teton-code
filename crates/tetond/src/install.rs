@@ -68,8 +68,8 @@ use serde::{Deserialize, Serialize};
 
 use teton_inference::catalog::ModelEntry;
 use teton_inference::download::{DownloadError, Downloader, RangeFetcher};
-use teton_inference::hash::sha256_file;
 use teton_inference::lifecycle::LifecycleEvent;
+use teton_inference::sha256_file;
 
 use teton_protocol::events::{Event, ModelLifecycle, ModelLifecycleStage};
 use teton_protocol::methods::InstallStatus;
@@ -384,7 +384,8 @@ impl WeightsInstall {
     /// crosses the protocol boundary (BR-11).
     #[must_use]
     pub fn installed_path(&self, entry: &ModelEntry) -> PathBuf {
-        self.weights_dir.join(format!("{}.gguf", entry.name))
+        self.weights_dir
+            .join(teton_protocol::weights::weights_file_name(&entry.name))
     }
 
     /// The in-progress download path for `entry` (resumable, never loadable).
@@ -892,7 +893,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use teton_inference::catalog::TierBand;
-    use teton_inference::hash::sha256_hex;
+    use teton_inference::sha256_hex;
 
     const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
     /// A stand-in artifact and its real SHA-256, so every verification in this

@@ -36,12 +36,7 @@ pub mod benchmark;
 pub mod catalog;
 pub mod download;
 pub mod engine;
-/// SHA-256 over files and byte slices — the integrity primitive behind BR-6.
-///
-/// Public because the daemon's install pipeline re-verifies an already-installed
-/// artifact (REQ-547 BR-9's `InstallState`), and a second SHA-256 implementation
-/// in the workspace would be a second thing to keep correct.
-pub mod hash;
+mod hash;
 pub mod lifecycle;
 pub mod pressure;
 pub mod probe;
@@ -53,6 +48,13 @@ pub use benchmark::{
 pub use catalog::{Catalog, ModelEntry, TierBand};
 pub use download::{DownloadConfig, DownloadError, Downloader, RangeFetcher};
 pub use engine::{Completion, Engine, EngineError, GenParams, MockEngine};
+/// SHA-256 over files and byte slices — the integrity primitive behind BR-6.
+///
+/// Re-exported (rather than the whole `hash` module made public) so the daemon's
+/// install pipeline can re-verify an already-installed artifact against the same
+/// implementation this crate uses (REQ-547 BR-9's `InstallState`) without
+/// exposing the hand-rolled streaming `Sha256` internals as public crate API.
+pub use hash::{sha256_file, sha256_hex};
 pub use lifecycle::LifecycleEvent;
 pub use pressure::{MemoryPressure, PressureController};
 pub use probe::{band_for_ram, decide, probe, GpuClass, HardwareProfile, TierDecision};

@@ -1273,13 +1273,6 @@ fn load_mcp_servers(config: &Config) -> Vec<McpServerConfig> {
     config.mcp_server.clone()
 }
 
-/// Subdirectory of the daemon state directory the model weights install into.
-///
-/// Beside the cost ledger and the decision record: machine state, not project
-/// state (REQ-547 D-4). The path is local-display-only and never crosses the
-/// protocol boundary (BR-11).
-const WEIGHTS_DIR: &str = "models";
-
 /// The `model_id` a lifecycle event carries when the machine has no model to
 /// name — a below-the-floor probe, or a catalog with nothing that fits.
 const LOCAL_TIER_ID: &str = "local";
@@ -1308,9 +1301,13 @@ fn build_installer(
         Ok(fetcher) => {
             let fetcher = Arc::new(fetcher);
             let cause: Arc<dyn FetchCause> = fetcher.clone();
-            let mut install = WeightsInstall::new(fetcher, base_dir.join(WEIGHTS_DIR), base_url)
-                .with_cause(cause)
-                .with_progress(Arc::new(LifecycleProgress::new(Arc::clone(events))));
+            let mut install = WeightsInstall::new(
+                fetcher,
+                base_dir.join(teton_protocol::weights::WEIGHTS_DIR),
+                base_url,
+            )
+            .with_cause(cause)
+            .with_progress(Arc::new(LifecycleProgress::new(Arc::clone(events))));
             // AC-6's claim is about behaviour on a full volume, which no CI
             // machine will provide on demand. DECISION 3 + M-8: a test seam,
             // honoured only in a debug build with the master switch, and it may

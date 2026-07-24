@@ -139,7 +139,13 @@ pub enum SelectionSource {
     /// The user chose a different catalog entry, or declined the local tier
     /// (REQ-547 BR-3/BR-4).
     UserOverride,
-    /// A `[local_model] pinned` config key decided it with no prompt (BR-9).
+    /// A `[local_model] pinned` config key named the model the proposal offered.
+    ///
+    /// The pin overrides the probe's pick (REQ-544 BR-9) but does **not** decide
+    /// on the user's behalf: post-C-1 (REQ-547 review) a pin proposes and the user
+    /// still answers, so an accepted pin is recorded as [`Self::Probe`]. Retained
+    /// for wire/state compatibility; the daemon no longer records a selection with
+    /// this source.
     ConfigPin,
     /// The explicit opt-in auto-accept path took the decision unattended
     /// (REQ-547 BR-5) — the CI/unattended route.

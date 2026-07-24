@@ -127,14 +127,15 @@ impl TierDecision {
 
 /// Decide the local-model tier for `profile` against `catalog`.
 ///
-/// A user pin (`pinned`) that names a known catalog model always wins, per BR-9
-/// ("User-pinned model choice in config always overrides the probe"). An unknown
+/// A user pin (`pinned`) that names a known catalog model always wins, per
+/// REQ-544 BR-9 ("User-pinned model choice in config always overrides the
+/// probe"). An unknown
 /// pin is ignored and the probe proceeds. Otherwise the machine's RAM picks a
 /// band, and the largest model in that band (or below) that fits RAM *and* free
 /// disk is chosen; if nothing fits, the tier is disabled.
 #[must_use]
 pub fn decide(profile: &HardwareProfile, catalog: &Catalog, pinned: Option<&str>) -> TierDecision {
-    // BR-9: an explicit, valid pin overrides the probe unconditionally.
+    // REQ-544 BR-9: an explicit, valid pin overrides the probe unconditionally.
     if let Some(name) = pinned {
         if let Some(model) = catalog.get(name) {
             return TierDecision::Selected {

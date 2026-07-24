@@ -18,12 +18,15 @@
 //! - [`handshake`] — protocol-version negotiation.
 //! - [`socket_path`] — the shared socket/lock path resolution both the daemon and
 //!   every client must agree on.
+//! - [`weights`] — the shared on-disk weights directory/filename convention (a
+//!   path is never sent over the wire, but both sides derive the same one).
 
 pub mod events;
 pub mod handshake;
 pub mod jsonrpc;
 pub mod methods;
 pub mod socket_path;
+pub mod weights;
 
 use std::fmt;
 
@@ -33,6 +36,30 @@ use serde::{Deserialize, Serialize};
 #[must_use]
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Human-readable byte size with one decimal place, in **binary** units
+/// (`B`/`KiB`/`MiB`/`GiB`/`TiB`).
+///
+/// Disk and RAM are conventionally binary, and the daemon's fixed-unit GiB
+/// sentences (the probe reason, the insufficient-disk refusal) already use that
+/// convention. Sharing one scaling formatter keeps a proposal from labelling the
+/// same 1024-based figure two different ways — a client that renders `4.4 GB`
+/// beside a daemon reason that says `16 GiB` on the adjacent line.
+#[must_use]
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Wire protocol version.
@@ -178,6 +205,14 @@ mod tests {
     #[test]
     fn version_is_reported() {
         assert!(!version().is_empty());
+    }
+
+    #[test]
+    fn format_bytes_scales_in_binary_units() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1_572_864), "1.5 MiB");
+        assert_eq!(format_bytes(16 * 1024 * 1024 * 1024), "16.0 GiB");
     }
 
     #[test]

@@ -99,22 +99,13 @@ pub fn progress_bar(downloaded: u64, total: Option<u64>) -> String {
     }
 }
 
-/// Human-readable byte size with one decimal place (binary units).
-#[must_use]
-pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[0])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
+/// Human-readable byte size with one decimal place, in binary units.
+///
+/// Re-exported from `teton-protocol` so the client renders bytes with the same
+/// `GiB`/`MiB`/`KiB` labels the daemon's own sentences use — a single formatter
+/// rather than a hand-copied one that once printed `GB` for the same 1024-based
+/// number the daemon called `GiB`.
+pub use teton_protocol::format_bytes;
 
 /// Render a `model_selection_proposed` event in full (BR-2).
 ///
@@ -372,9 +363,9 @@ mod tests {
     #[test]
     fn format_bytes_scales_units() {
         assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1_572_864), "1.5 MB");
-        assert_eq!(format_bytes(16 * 1024 * 1024 * 1024), "16.0 GB");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1_572_864), "1.5 MiB");
+        assert_eq!(format_bytes(16 * 1024 * 1024 * 1024), "16.0 GiB");
     }
 
     #[test]
@@ -427,7 +418,7 @@ mod tests {
         let notices = surface.lines_of(LineKind::Notice);
         assert_eq!(notices.len(), stages.len());
         assert!(surface.any_line_contains(LineKind::Notice, "probe:"));
-        assert!(surface.any_line_contains(LineKind::Notice, "16.0 GB"));
+        assert!(surface.any_line_contains(LineKind::Notice, "16.0 GiB"));
         assert!(surface.any_line_contains(LineKind::Notice, "awaiting your decision"));
         assert!(surface.any_line_contains(LineKind::Notice, "download"));
         assert!(surface.any_line_contains(LineKind::Notice, "verifying"));
@@ -447,8 +438,8 @@ mod tests {
         let text = surface.lines_of(LineKind::Info).join("\n");
 
         // Detected hardware: RAM, free disk, GPU class.
-        assert!(text.contains("16.0 GB"), "detected RAM missing: {text}");
-        assert!(text.contains("120.0 GB"), "free disk missing: {text}");
+        assert!(text.contains("16.0 GiB"), "detected RAM missing: {text}");
+        assert!(text.contains("120.0 GiB"), "free disk missing: {text}");
         assert!(text.contains("apple-silicon"), "gpu class missing: {text}");
         // The chosen band and the plain-language reason.
         assert!(
@@ -464,9 +455,9 @@ mod tests {
             text.contains("qwen2.5-coder-7b"),
             "proposed model missing: {text}"
         );
-        assert!(text.contains("4.4 GB"), "download size missing: {text}");
+        assert!(text.contains("4.4 GiB"), "download size missing: {text}");
         assert!(
-            text.contains("needs 8.0 GB RAM"),
+            text.contains("needs 8.0 GiB RAM"),
             "RAM floor missing: {text}"
         );
         // Every selectable alternative, numbered, with its own fit.

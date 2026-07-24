@@ -124,6 +124,38 @@ fn await_install_outcome(client: &mut Client, window: Duration) -> (String, Valu
     }
 }
 
+/// Pump the event stream until a `model_lifecycle` event reaches `stage` (and,
+/// when `reason_contains` is given, whose reason includes that text), or `window`
+/// elapses. Returns whether it arrived.
+///
+/// This is the polling replacement for the fixed-duration `drain_events` waits
+/// this suite used to sprinkle before asserting on the lifecycle stream: on a
+/// loaded runner the replayed sequence can arrive after any fixed sleep, so we
+/// wait for the specific stage the assertions below depend on. Because the stream
+/// is ordered, waiting for a terminal stage (e.g. `disabled`) also guarantees the
+/// earlier `download`/`verifying` stages are already buffered.
+fn wait_for_lifecycle(
+    client: &mut Client,
+    stage: &str,
+    reason_contains: Option<&str>,
+    window: Duration,
+) -> bool {
+    client
+        .wait_for_event_where(
+            "model_lifecycle",
+            |e| {
+                e["stage"]["stage"].as_str() == Some(stage)
+                    && reason_contains.is_none_or(|needle| {
+                        e["stage"]["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains(needle))
+                    })
+            },
+            window,
+        )
+        .is_some()
+}
+
 /// A TCP port with nothing listening on it: bound to learn a free number, then
 /// released. The honest stand-in for "the model host cannot be reached" (AC-10)
 /// — a refused connection, not a slow one.
@@ -445,8 +477,19 @@ fn ac2_accepting_downloads_verifies_and_installs_atomically() {
         "the partial download must be gone once it is installed"
     );
 
-    // AC-2: progress is rendered from `model_lifecycle`, not inferred.
-    client.drain_events(Duration::from_millis(200));
+    // AC-2: progress is rendered from `model_lifecycle`, not inferred. Wait for
+    // the terminal no-engine `disabled` stage; the ordered stream guarantees the
+    // download and verify stages asserted below are buffered by the time it lands.
+    assert!(
+        wait_for_lifecycle(
+            &mut client,
+            "disabled",
+            Some("installed and verified"),
+            INSTALL_WINDOW
+        ),
+        "the install must reach its terminal no-engine lifecycle stage; saw {:?}",
+        lifecycle_stages(&client)
+    );
     let downloads: Vec<&Value> = client
         .events_named("model_lifecycle")
         .into_iter()
@@ -626,7 +669,13 @@ fn ac4_declining_is_remote_only_persisted_and_never_re_prompted() {
     // A second daemon over the same state directory: the question is settled.
     let daemon = Daemon::spawn(&ws, consent_env(&catalog));
     let mut client = daemon.connect();
-    client.drain_events(Duration::from_millis(500));
+    // Wait for the replayed settled lifecycle (the daemon's "this is decided, and
+    // here is why") before asserting the negative: once it has told this client
+    // the tier is disabled-because-declined, a re-prompt would already be visible.
+    assert!(
+        wait_for_lifecycle(&mut client, "disabled", Some("declined"), PROPOSAL_WINDOW),
+        "a declined machine must replay its settled lifecycle to a fresh client"
+    );
     assert!(
         !client.saw_event("model_selection_proposed"),
         "BR-4 VIOLATION: a declined machine was re-prompted on the next start"
@@ -677,7 +726,17 @@ fn ac5_auto_accept_completes_a_first_run_unattended() {
         "auto-accept must leave no prompt outstanding; got {status}"
     );
 
-    client.drain_events(Duration::from_millis(200));
+    // Wait for the terminal lifecycle stage so the whole unattended sequence is
+    // buffered; a proposal, had one wrongly been published, would precede it.
+    assert!(
+        wait_for_lifecycle(
+            &mut client,
+            "disabled",
+            Some("installed and verified"),
+            INSTALL_WINDOW
+        ),
+        "the unattended install must reach its terminal lifecycle stage"
+    );
     assert!(
         !client.saw_event("model_selection_proposed"),
         "BR-5 VIOLATION: auto-accept published a proposal there was nobody to answer"
@@ -1216,7 +1275,10 @@ fn the_startup_lifecycle_claims_only_what_actually_happened() {
     let daemon = Daemon::spawn(&ws, consent_env(&catalog));
     let mut client = daemon.connect();
     client.await_outstanding_proposal(PROPOSAL_WINDOW);
-    client.drain_events(Duration::from_millis(200));
+    assert!(
+        wait_for_lifecycle(&mut client, "awaiting_decision", None, PROPOSAL_WINDOW),
+        "an undecided machine must report awaiting-decision on its lifecycle stream"
+    );
 
     let stages = lifecycle_stages(&client);
     assert!(
@@ -1245,7 +1307,10 @@ fn the_startup_lifecycle_claims_only_what_actually_happened() {
 
     let daemon = Daemon::spawn(&ws, consent_env(&catalog));
     let mut client = daemon.connect();
-    client.drain_events(Duration::from_millis(400));
+    assert!(
+        wait_for_lifecycle(&mut client, "disabled", Some("declined"), PROPOSAL_WINDOW),
+        "a declined machine must replay its settled lifecycle"
+    );
     let stages = lifecycle_stages(&client);
     assert!(
         stages.contains(&"probed".to_owned()),
@@ -1289,7 +1354,15 @@ fn the_startup_lifecycle_claims_only_what_actually_happened() {
     // at startup would still be telling this client to answer a prompt that was
     // answered minutes ago — stale in exactly the way the synthetic sequence was.
     let mut late = daemon.connect();
-    late.drain_events(Duration::from_millis(300));
+    assert!(
+        wait_for_lifecycle(
+            &mut late,
+            "disabled",
+            Some("installed and verified"),
+            INSTALL_WINDOW
+        ),
+        "the replayed lifecycle must reach this late client through its terminal stage"
+    );
     let stages = lifecycle_stages(&late);
     assert!(
         stages.contains(&"probed".to_owned()),
@@ -1312,7 +1385,15 @@ fn the_startup_lifecycle_claims_only_what_actually_happened() {
     // pretending otherwise.
     let daemon = Daemon::spawn(&ws, consent_env(&catalog));
     let mut client = daemon.connect();
-    client.drain_events(Duration::from_millis(400));
+    assert!(
+        wait_for_lifecycle(
+            &mut client,
+            "disabled",
+            Some("installed and verified"),
+            INSTALL_WINDOW
+        ),
+        "a settled machine with verified weights must replay its terminal lifecycle"
+    );
     let stages = lifecycle_stages(&client);
     assert!(
         !stages.contains(&"awaiting_decision".to_owned()),

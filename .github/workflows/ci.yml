@@ -94,7 +94,7 @@ jobs:
           exit "$status"
 
   e2e:
-    name: acceptance suite (AC-1..AC-9)
+    name: acceptance suite (REQ-544 + REQ-547)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -109,7 +109,48 @@ jobs:
 
       # The end-to-end acceptance suite (TASK-014) spawns the real `tetond`
       # binary and drives every AC against mock transports/engines — no model
-      # weights and no live API keys. It gates every PR. The `--features live`
-      # real-provider smoke test stays ignored here by design.
+      # weights and no live API keys. It gates every PR, covering REQ-544's
+      # `ac_matrix` and REQ-547's `consent_matrix` (AC-1..AC-12). The
+      # `--features live` real-provider smoke test stays ignored here by design.
       - name: Acceptance suite
         run: cargo test -p tetond --test e2e
+
+  audit:
+    name: dependency advisories (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # The daemon now ships a production HTTP client that fetches multi-GB
+      # third-party artifacts, so a dependency-advisory gate belongs beside the
+      # catalog-integrity job. The RustSec advisory DB fetch is split from the
+      # check so the two failure modes cannot be confused — the same taxonomy the
+      # catalog job uses:
+      #
+      #   * a transient DB-fetch outage teaches nothing about our dependencies,
+      #     so it warns and passes rather than reding the build on GitHub's
+      #     availability;
+      #   * a real advisory in the resolved tree fails the job.
+      - name: Fetch advisory database
+        id: advisory_db
+        continue-on-error: true
+        run: git clone --depth 1 https://github.com/RustSec/advisory-db "$HOME/.cargo/advisory-db"
+
+      - name: Audit dependencies for security advisories
+        run: |
+          if [ ! -d "$HOME/.cargo/advisory-db/.git" ]; then
+            echo "::warning title=cargo audit UNVERIFIED::The RustSec advisory database could not be fetched, so dependencies were NOT audited this run. This is a transient outage, not a vulnerability — re-run when GitHub is reachable."
+            exit 0
+          fi
+          cargo audit --no-fetch --db "$HOME/.cargo/advisory-db"

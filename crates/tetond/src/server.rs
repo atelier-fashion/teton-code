@@ -463,10 +463,19 @@ fn handle_model_set(daemon: &Daemon, id: Id, params: Value) -> String {
         .set_model(&params.name, params.confirmed_above_ram_floor)
     {
         Ok(result) => {
-            // M-2: only spawn an install task when one for this entry is not
-            // already running. Without this check every `model/set` spawns an
-            // unbounded task; the in-flight guard would make the duplicate no-op,
-            // but not spawning it at all is cheaper and keeps the task count bounded.
+            // The selection is already recorded by `set_model` above; the install
+            // runs as a spawned task, gated by two guards:
+            //
+            // * `try_current().is_ok()` — `tokio::spawn` panics with no runtime.
+            //   Production dispatch always runs inside the daemon's runtime, so
+            //   this is only ever false in the synchronous dispatch unit tests
+            //   that call `handle_model_set` directly with no runtime; the guard
+            //   exists solely so those tests do not panic. Because the selection
+            //   is already persisted, skipping the spawn loses nothing a test
+            //   relies on.
+            // * M-2 in-flight guard — only spawn when an install for this entry is
+            //   not already running, so repeated `model/set` calls cannot pile up
+            //   unbounded install tasks.
             if tokio::runtime::Handle::try_current().is_ok()
                 && !daemon.runtime.consent().install_in_flight(&params.name)
             {

@@ -167,9 +167,17 @@ impl Connection {
                         // surface it rather than looping forever for a numeric-id
                         // reply the daemon can never send.
                         RespRoute::Surface => {
-                            return Ok(Err(resp
-                                .error
-                                .expect("a surfaced response carries an error")));
+                            // `route_response` only surfaces a frame it saw an
+                            // error on, so `error` is `Some` here — but this runs
+                            // on the production event pump, so a malformed frame
+                            // must fail the call, not panic the CLI.
+                            let err = resp.error.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "daemon returned an uncorrelatable error frame with no \
+                                     error payload"
+                                )
+                            })?;
+                            return Ok(Err(err));
                         }
                         RespRoute::Ignore => {} // stray ack (e.g. a permission reply)
                     }
@@ -684,8 +692,8 @@ mod tests {
             1,
             "the proposal is rendered once, by name: {text}"
         );
-        assert!(text.contains("2.0 GB download"), "{text}");
-        assert!(text.contains("needs 5.0 GB RAM"), "{text}");
+        assert!(text.contains("2.0 GiB download"), "{text}");
+        assert!(text.contains("needs 5.0 GiB RAM"), "{text}");
         // Proof that both sightings really happened and the *event* was the one
         // that prompted: the late-attach path prints its own notice, and it is
         // absent because `claim_model_proposal` had already taken this id.

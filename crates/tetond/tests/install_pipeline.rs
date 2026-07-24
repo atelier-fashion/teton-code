@@ -30,7 +30,7 @@ use tokio::time::timeout;
 
 use teton_inference::catalog::{ModelEntry, TierBand};
 use teton_inference::download::{DownloadError, RangeFetcher};
-use teton_inference::hash::sha256_hex;
+use teton_inference::sha256_hex;
 
 use teton_protocol::events::{Event, ModelLifecycleStage};
 use teton_protocol::methods::InstallStatus;

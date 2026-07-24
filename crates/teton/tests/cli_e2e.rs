@@ -293,7 +293,7 @@ fn teton_renders_the_first_run_proposal_and_accepts_it_interactively() {
         "the CLI must surface the outstanding proposal; output:\n{session}"
     );
     assert!(
-        session.contains("hardware:") && session.contains("16.0 GB RAM"),
+        session.contains("hardware:") && session.contains("16.0 GiB RAM"),
         "the CLI must render the detected hardware; output:\n{session}"
     );
     assert!(
@@ -312,7 +312,7 @@ fn teton_renders_the_first_run_proposal_and_accepts_it_interactively() {
         "the CLI must name the proposed model, not its band; output:\n{session}"
     );
     assert!(
-        session.contains("2.0 GB download") && session.contains("needs 5.0 GB RAM"),
+        session.contains("2.0 GiB download") && session.contains("needs 5.0 GiB RAM"),
         "the proposed model must carry its download size and RAM floor; output:\n{session}"
     );
     assert!(
@@ -415,7 +415,7 @@ fn teton_model_list_renders_the_catalog_and_each_entry_fit() {
         assert!(list.contains(name), "{name} missing from output:\n{list}");
     }
     assert!(
-        list.contains("hardware:") && list.contains("16.0 GB RAM"),
+        list.contains("hardware:") && list.contains("16.0 GiB RAM"),
         "model list must describe the machine the fits were computed for; output:\n{list}"
     );
     assert!(

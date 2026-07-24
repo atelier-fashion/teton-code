@@ -39,14 +39,6 @@ use crate::firstrun;
 use crate::prompt::Prompter;
 use crate::render::{LineKind, Surface};
 
-/// Subdirectory of the daemon state directory the weights install into.
-///
-/// Mirrors `tetond`'s own `WEIGHTS_DIR`. The duplication is deliberate and is the
-/// price of BR-11: [`teton_protocol::methods::InstallStateView`] carries no path,
-/// so a client that wants to *show* the path derives it from the same state-dir
-/// convention it already uses to find the socket, rather than having one sent.
-const WEIGHTS_DIR: &str = "models";
-
 /// The message shown whenever the user backs out without answering.
 const LEFT_OPEN: &str =
     "left the proposal open — nothing was sent; sessions run remote-only until you answer.";
@@ -430,12 +422,12 @@ fn install_label(status: InstallStatus) -> &'static str {
 ///
 /// BR-11 keeps absolute paths out of every protocol payload, so the path shown by
 /// `teton model status` is computed here from the same convention the client uses
-/// to find the socket — never received over the wire.
+/// to find the socket — never received over the wire. The convention itself
+/// (`models/<name>.gguf`) lives in `teton-protocol` so the daemon and the client
+/// cannot drift.
 #[must_use]
 pub fn weights_path(base_dir: &Path, model_name: &str) -> PathBuf {
-    base_dir
-        .join(WEIGHTS_DIR)
-        .join(format!("{model_name}.gguf"))
+    teton_protocol::weights::weights_path(base_dir, model_name)
 }
 
 /// Scripted protocol payloads shared by this module's tests and `firstrun`'s.
@@ -617,7 +609,7 @@ mod tests {
         // "n" to the proposal, alternative 2 (over-sized), then an explicit yes.
         let (reply, surface, prompter) = answer(&["n", "2", "y"], false);
         assert!(
-            surface.any_line_contains(LineKind::Notice, "warning: qwen3-coder-30b needs 32.0 GB"),
+            surface.any_line_contains(LineKind::Notice, "warning: qwen3-coder-30b needs 32.0 GiB"),
             "the over-sized pick must warn explicitly: {:?}",
             surface.lines_of(LineKind::Notice)
         );
@@ -765,15 +757,15 @@ mod tests {
             text.contains("proposed: qwen2.5-coder-7b"),
             "the proposed entry must be named: {text}"
         );
-        assert!(text.contains("4.4 GB download"), "download size: {text}");
-        assert!(text.contains("needs 8.0 GB RAM"), "RAM floor: {text}");
+        assert!(text.contains("4.4 GiB download"), "download size: {text}");
+        assert!(text.contains("needs 8.0 GiB RAM"), "RAM floor: {text}");
         // And nothing may describe the pick by its band any more.
         assert!(
             !text.contains("the daemon's own pick"),
             "the band-only stand-in must be gone: {text}"
         );
         // The hardware reasoning and the alternatives are there too (BR-2/BR-3).
-        assert!(text.contains("16.0 GB RAM"), "{text}");
+        assert!(text.contains("16.0 GiB RAM"), "{text}");
         assert!(text.contains("band:     mid"), "{text}");
         assert!(text.contains("1. qwen2.5-coder-3b"), "{text}");
         assert!(surface.any_line_contains(LineKind::Notice, "before this client attached"));
@@ -849,7 +841,7 @@ mod tests {
         render_list(&list, &mut surface);
         let text = surface.lines_of(LineKind::Info).join("\n");
 
-        assert!(text.contains("16.0 GB RAM"), "{text}");
+        assert!(text.contains("16.0 GiB RAM"), "{text}");
         assert!(text.contains("qwen2.5-coder-3b"), "{text}");
         assert!(
             text.contains("* 2. qwen2.5-coder-7b"),
@@ -927,8 +919,8 @@ mod tests {
         let notice = surface.lines_of(LineKind::Notice).join("\n");
         assert!(notice.contains("req-open-1"), "{notice}");
         assert!(notice.contains("qwen2.5-coder-7b"), "{notice}");
-        assert!(notice.contains("4.4 GB download"), "{notice}");
-        assert!(notice.contains("needs 8.0 GB RAM"), "{notice}");
+        assert!(notice.contains("4.4 GiB download"), "{notice}");
+        assert!(notice.contains("needs 8.0 GiB RAM"), "{notice}");
     }
 
     #[test]
