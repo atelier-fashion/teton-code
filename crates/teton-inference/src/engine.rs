@@ -276,14 +276,19 @@ mod llama {
                     .unwrap_or(bytes.len().saturating_mul(3) + 16),
             );
             let (_result, read, _replaced) = self.decoder.decode_to_string(bytes, &mut out, false);
-            debug_assert_eq!(read, bytes.len(), "a max_utf8_buffer_length'd decode consumes all input");
+            debug_assert_eq!(
+                read,
+                bytes.len(),
+                "a max_utf8_buffer_length'd decode consumes all input"
+            );
             out
         }
 
         /// End the stream: an incomplete sequence still held becomes U+FFFD
         /// rather than silently vanishing.
         fn finish(mut self) -> String {
-            let mut out = String::with_capacity(self.decoder.max_utf8_buffer_length(0).unwrap_or(16));
+            let mut out =
+                String::with_capacity(self.decoder.max_utf8_buffer_length(0).unwrap_or(16));
             let _ = self.decoder.decode_to_string(&[], &mut out, true);
             out
         }
