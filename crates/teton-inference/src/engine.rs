@@ -207,6 +207,8 @@ mod llama {
     use llama_cpp_2::model::params::LlamaModelParams;
     use llama_cpp_2::model::{AddBos, LlamaModel};
     use llama_cpp_2::sampling::LlamaSampler;
+    use llama_cpp_2::token::LlamaToken;
+    use llama_cpp_2::TokenToStringError;
 
     /// The process-wide llama.cpp backend.
     ///
@@ -232,6 +234,85 @@ mod llama {
     /// with a process-aborting `GGML_ASSERT`, not a returnable error. Matches
     /// llama.cpp's own default logical batch size.
     const N_BATCH: u32 = 2048;
+
+    /// Streaming token-piece decoder: raw llama.cpp piece bytes in, valid
+    /// UTF-8 out.
+    ///
+    /// ONE decoder lives for the whole generation stream, because a single BPE
+    /// token can end midway through a multi-byte UTF-8 character — the decoder
+    /// is what carries the partial bytes across to the next token. The
+    /// deprecated per-token `token_to_str` this replaced constructed a fresh
+    /// decoder per call and dropped it, losing any held partial sequence and
+    /// garbling streamed CJK/emoji at token boundaries.
+    ///
+    /// The bytes are decoded here rather than through the non-deprecated
+    /// `LlamaModel::token_to_piece` wrapper because that wrapper under-reserves
+    /// its output buffer (`bytes.len()`, while a *completing* multi-byte
+    /// character emits up to 3 more bytes than this token carried, and each
+    /// malformed byte becomes a 3-byte U+FFFD) — and `decode_to_string` writes
+    /// only into spare capacity, so on overflow the wrapper silently discards
+    /// the undecoded input. [`encoding_rs::Decoder::max_utf8_buffer_length`]
+    /// is the contract for "the whole input will be consumed", so this type
+    /// reserves that instead.
+    struct PieceDecoder {
+        decoder: encoding_rs::Decoder,
+    }
+
+    impl PieceDecoder {
+        fn new() -> Self {
+            Self {
+                decoder: encoding_rs::UTF_8.new_decoder(),
+            }
+        }
+
+        /// Decode one token's piece bytes, returning whatever printable text
+        /// they complete. Empty when the token only *starts* a multi-byte
+        /// character — its bytes are held for the next call. Malformed bytes
+        /// become U+FFFD; they are never an error and never dropped.
+        fn push(&mut self, bytes: &[u8]) -> String {
+            let mut out = String::with_capacity(
+                self.decoder
+                    .max_utf8_buffer_length(bytes.len())
+                    .unwrap_or(bytes.len().saturating_mul(3) + 16),
+            );
+            let (_result, read, _replaced) = self.decoder.decode_to_string(bytes, &mut out, false);
+            debug_assert_eq!(
+                read,
+                bytes.len(),
+                "a max_utf8_buffer_length'd decode consumes all input"
+            );
+            out
+        }
+
+        /// End the stream: an incomplete sequence still held becomes U+FFFD
+        /// rather than silently vanishing.
+        fn finish(mut self) -> String {
+            let mut out =
+                String::with_capacity(self.decoder.max_utf8_buffer_length(0).unwrap_or(16));
+            let _ = self.decoder.decode_to_string(&[], &mut out, true);
+            out
+        }
+    }
+
+    /// One sampled token's raw piece bytes, with special tokens rendered as
+    /// their text (the behavior the old `Special::Tokenize` selected).
+    ///
+    /// Mirrors the upstream wrapper's retry contract: an 8-byte first guess,
+    /// then the exact size llama.cpp reports back when that was short. A
+    /// nonsensical reported size falls through to the second call's own typed
+    /// error rather than panicking on a worker thread.
+    fn piece_bytes(model: &LlamaModel, token: LlamaToken) -> Result<Vec<u8>, EngineError> {
+        match model.token_to_piece_bytes(token, 8, true, None) {
+            Err(TokenToStringError::InsufficientBufferSpace(need)) => model.token_to_piece_bytes(
+                token,
+                usize::try_from(need.unsigned_abs()).unwrap_or(0),
+                true,
+                None,
+            ),
+            got => got,
+        }
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
 
     /// A llama.cpp-backed [`Engine`]. Metal is used automatically on Apple
     /// Silicon by offloading all layers to the GPU.
@@ -331,13 +412,9 @@ mod llama {
             let mut text = String::new();
             let mut completion_tokens = 0u32;
             let mut n_cur = i32::try_from(tokens.len()).unwrap_or(i32::MAX);
-            // ONE decoder for the whole stream: a single BPE token can end
-            // mid-way through a multi-byte UTF-8 character, and the decoder is
-            // what carries the partial bytes across to the next token. The
-            // deprecated per-token `token_to_str` constructed a fresh decoder
-            // per call and dropped it — silently losing any held partial
-            // sequence, which garbled streamed CJK/emoji at token boundaries.
-            let mut decoder = encoding_rs::UTF_8.new_decoder();
+            // One [`PieceDecoder`] for the whole stream — see its docs for why
+            // the decoder must outlive every token.
+            let mut decoder = PieceDecoder::new();
 
             while completion_tokens < params.max_tokens {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -345,10 +422,7 @@ mod llama {
                 if self.model.is_eog_token(token) {
                     break;
                 }
-                let piece = self
-                    .model
-                    .token_to_piece(token, &mut decoder, true, None)
-                    .map_err(|e| EngineError::Backend(e.to_string()))?;
+                let piece = decoder.push(&piece_bytes(&self.model, token)?);
                 // A token that only *starts* a multi-byte character yields an
                 // empty piece (its bytes are held in the decoder) — nothing to
                 // stream yet, but it still counts as a generated token.
@@ -368,10 +442,9 @@ mod llama {
             }
 
             // The stream can end (EOG or max_tokens) while the decoder holds an
-            // incomplete sequence; `last = true` flushes it as U+FFFD rather
-            // than dropping the bytes silently.
-            let mut tail = String::new();
-            let _ = decoder.decode_to_string(&[], &mut tail, true);
+            // incomplete sequence; the flush turns it into U+FFFD rather than
+            // dropping the bytes silently.
+            let tail = decoder.finish();
             if !tail.is_empty() {
                 on_token(&tail);
                 text.push_str(&tail);
@@ -382,6 +455,60 @@ mod llama {
                 prompt_tokens,
                 completion_tokens,
             })
+        }
+    }
+
+    /// [`PieceDecoder`] needs no model, so its contract — the one the old
+    /// per-token `token_to_str` broke — is pinned here and runs under any
+    /// `--features llama` test invocation.
+    #[cfg(test)]
+    mod tests {
+        use super::PieceDecoder;
+
+        /// The regression the migration exists for: a multi-byte character
+        /// split across token pieces must come out whole, which requires the
+        /// decoder to survive between pieces.
+        #[test]
+        fn a_character_split_across_pieces_is_reassembled() {
+            let mut decoder = PieceDecoder::new();
+            // "日" (E6 97 A5) one byte per piece; "🦀" (F0 9F A6 80) split 2+2.
+            assert_eq!(decoder.push(&[0xE6]), "");
+            assert_eq!(decoder.push(&[0x97]), "");
+            assert_eq!(decoder.push(&[0xA5]), "日");
+            assert_eq!(decoder.push(&[0xF0, 0x9F]), "");
+            assert_eq!(decoder.push(&[0xA6, 0x80]), "🦀");
+            assert_eq!(decoder.finish(), "", "a clean stream has nothing to flush");
+        }
+
+        /// A completing multi-byte character emits MORE bytes than the final
+        /// piece carried — the exact case the upstream `token_to_piece`
+        /// wrapper's `with_capacity(bytes.len())` under-reserves for and then
+        /// silently drops.
+        #[test]
+        fn a_completing_character_larger_than_its_final_piece_is_not_dropped() {
+            let mut decoder = PieceDecoder::new();
+            assert_eq!(decoder.push(&[0xF0, 0x9F, 0xA6]), "");
+            // One input byte, four output bytes.
+            assert_eq!(decoder.push(&[0x80]), "🦀");
+        }
+
+        /// A stream that ends mid-character flushes U+FFFD — the bytes are
+        /// accounted for, never silently vanished.
+        #[test]
+        fn a_truncated_stream_flushes_a_replacement_character() {
+            let mut decoder = PieceDecoder::new();
+            assert_eq!(decoder.push(&[0xE6, 0x97]), "");
+            assert_eq!(decoder.finish(), "\u{FFFD}");
+        }
+
+        /// Malformed bytes become U+FFFD inline and the stream keeps going —
+        /// never an error, never dropped.
+        #[test]
+        fn malformed_bytes_are_replaced_and_the_stream_continues() {
+            let mut decoder = PieceDecoder::new();
+            assert_eq!(decoder.push(&[0xFF, b'o', b'k']), "\u{FFFD}ok");
+            assert_eq!(decoder.push("日".as_bytes()), "日");
+            assert_eq!(decoder.finish(), "");
         }
     }
 }
