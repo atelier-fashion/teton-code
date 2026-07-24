@@ -15,6 +15,9 @@
 //!   (BR-1), the sole HTTP client, and the cost-recording hook (BR-2).
 //! - [`cost`] — the append-only cost ledger, price table, and report (BR-2): one
 //!   `CostRecord` per remote call, recorded at the egress hook.
+//! - [`download`] — the model-download HTTP client (REQ-547 D-2): the *second*
+//!   trust context — credential-free and redirect-following, deliberately
+//!   separate from [`egress`]'s credentialed, redirect-refusing client.
 //! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
 //! - [`router`] — phase-policy routing (BR-5), BR-6 degradation, remote wiring
 //!   through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
@@ -35,6 +38,7 @@
 pub mod auth;
 pub mod broadcast;
 pub mod cost;
+pub mod download;
 pub mod egress;
 pub mod harness;
 pub mod heuristics;

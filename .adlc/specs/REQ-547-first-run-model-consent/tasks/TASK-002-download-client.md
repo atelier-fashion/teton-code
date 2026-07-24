@@ -1,10 +1,10 @@
 ---
 id: TASK-002
 title: "Production download client: credential-free, redirect-following RangeFetcher"
-status: draft
+status: complete
 parent: REQ-547
 created: 2026-07-21
-updated: 2026-07-21
+updated: 2026-07-23
 dependencies: [TASK-001]
 ---
 
@@ -24,12 +24,12 @@ egress (D-2).
 
 ## Acceptance Criteria
 
-- [ ] Implements the existing `teton_inference::RangeFetcher` byte-range contract; the library's resume/verify tests pass against it via a local test server
-- [ ] The download client sends **no** `Authorization`/`x-api-key`/any auth header on any request — asserted, not assumed
-- [ ] The download client follows a 302 to a different host (mimicking HF → CDN); the egress client still **refuses** redirects — both asserted in one test module so relaxing one fails the other (AC-11)
-- [ ] HTTP 429 and 503 retry with backoff and are reported as rate-limit/availability, distinct from a corrupt-download error (AC-12 partial)
-- [ ] `deny_http_client` still passes (this client lives in tetond, the only permitted crate)
-- [ ] Tests: local server exercising range/resume, redirect-follow, auth-header absence, 429 backoff, and the egress-still-refuses counterpart
+- [x] Implements the existing `teton_inference::RangeFetcher` byte-range contract; the library's resume/verify tests pass against it via a local test server
+- [x] The download client sends **no** `Authorization`/`x-api-key`/any auth header on any request — asserted, not assumed
+- [x] The download client follows a 302 to a different host (mimicking HF → CDN); the egress client still **refuses** redirects — both asserted in one test module so relaxing one fails the other (AC-11)
+- [x] HTTP 429 and 503 retry with backoff and are reported as rate-limit/availability, distinct from a corrupt-download error (AC-12 partial)
+- [x] `deny_http_client` still passes (this client lives in tetond, the only permitted crate)
+- [x] Tests: local server exercising range/resume, redirect-follow, auth-header absence, 429 backoff, and the egress-still-refuses counterpart
 
 ## Technical Notes
 
