@@ -203,10 +203,19 @@ daemon contains no production wiring for `Downloader` at all._
       and the runtime slot/gate unit tests — and, end to end with real weights,
       by the AC-13 dogfood run: accept → 18.6 GB pinned download → verify →
       load → benchmark (195 ms first token, 87.9 tok/s) → `ready` → a session
-      turn routed local and completed, one daemon run, on this machine. The
-      "working local session" clause is CI-unverifiable by design (CI builds no
-      llama.cpp); its evidence lives in `docs/manual-verification.md`'s
-      sign-off._
+      turn routed local and completed, one daemon run, on this machine.
+      Cross-process (2026-07-24), the same chain is exercised over the real
+      socket by `consent_matrix`'s engine-leg tests via the gated
+      `TETON_FAKE_ENGINE_LOADER` seam — a `MockEngine` staged and committed
+      through the daemon's real serving-slot path — asserting the `benchmark`
+      stage carries the loader's reported figures, `ready` follows it, the
+      tier opens on the slot's fact, a turn is served by the committed engine,
+      and the BR-10 restart leg re-loads without re-prompting
+      (`ac2_with_a_loader_accept_benchmarks_reaches_ready_and_serves_a_local_turn`,
+      `a_restart_with_verified_weights_and_a_loader_reopens_the_tier_without_reprompting`).
+      The "working local session on real weights" clause remains
+      CI-unverifiable by design (CI builds no llama.cpp); its evidence lives
+      in `docs/manual-verification.md`'s sign-off._
 - [x] AC-3: Overriding to a different catalog entry downloads that entry instead
       of the proposed one; choosing an entry above the machine's RAM floor emits
       an explicit warning and is only applied after a second confirmation.

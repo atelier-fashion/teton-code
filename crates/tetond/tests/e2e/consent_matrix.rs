@@ -16,6 +16,7 @@
 //! | the model host | [`MockHf`] on localhost (no network to huggingface.co) |
 //! | the artifact | a ~64–128 KiB fixture whose `sha256` is **computed from the bytes served** |
 //! | hardware, free disk, retry delays | env seams (`TETON_PROBE_*`, `TETON_DISK_FREE_BYTES`, `TETON_DOWNLOAD_RETRY_BASE_MS`) |
+//! | the weights loader (engine-leg tests only) | the gated `TETON_FAKE_ENGINE_LOADER` seam: a `MockEngine`, staged and committed through the daemon's **real** serving-slot path |
 //!
 //! The digest being computed rather than pinned is what keeps the verify path
 //! honest: point the host at different bytes (AC-7) and the check fails for the
@@ -24,10 +25,14 @@
 //! ## What this file deliberately does **not** claim
 //!
 //! That inference runs on the installed weights. No GGUF here is a model, and
-//! `--features llama` is not built in CI. "A real end-to-end install of a real
-//! catalog model, benchmarked on a developer machine" is AC-13, a manual gate
-//! with a human sign-off (`docs/manual-verification.md`, LESSON-433). Nothing in
-//! this file may be read as evidence for it.
+//! `--features llama` is not built in CI. The engine-leg tests prove the
+//! *chain* — accept → install → post-verify load → `benchmark` → `ready` →
+//! the tier opening on the slot's fact → a turn served by the committed
+//! engine — but the engine behind them is a stand-in that never reads the
+//! installed bytes. "A real end-to-end install of a real catalog model,
+//! benchmarked on a developer machine" is AC-13, a manual gate with a human
+//! sign-off (`docs/manual-verification.md`, LESSON-433). Nothing in this file
+//! may be read as evidence for it.
 
 use std::net::TcpListener;
 use std::path::Path;
@@ -201,6 +206,33 @@ fn wait_for_replayed_lifecycle(
             window,
         )
         .is_some()
+}
+
+/// Connect fresh clients until one is replayed a lifecycle ending in `ready` —
+/// that is, until the local tier is genuinely open server-side.
+///
+/// The replayed `ready` is derived per attach from `local_tier_available()`
+/// **and** the engine slot's own fact, so this is the over-the-socket wait for
+/// the availability flip itself. The retry exists because the flip lands a
+/// beat *after* the live `ready` publish (the gate publishes, returns, and
+/// only then does the runtime apply the outcome): a client attaching in that
+/// gap is truthfully replayed "still loading" and will never see more events
+/// on its own connection, so the honest move is to attach again, not wait.
+fn connect_when_tier_open(daemon: &Daemon, window: Duration) -> Client {
+    let deadline = Instant::now() + window;
+    loop {
+        let mut fresh = daemon.connect();
+        if wait_for_replayed_lifecycle(&mut fresh, "ready", None, Duration::from_secs(2)) {
+            return fresh;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the local tier never opened: a fresh client's replay must \
+             eventually end in `ready`; last saw {:?} (reasons: {})",
+            lifecycle_stages(&fresh),
+            lifecycle_reasons(&fresh)
+        );
+    }
 }
 
 /// Poll `model/status` until the selected weights report `verified`, and fail
@@ -604,6 +636,207 @@ fn ac2_accepting_downloads_verifies_and_installs_atomically() {
         "the terminal stage must be the honest no-engine `disabled`, not `ready`; \
          saw stages {:?} reasons {reasons:?}",
         lifecycle_stages(&client)
+    );
+}
+
+// ===========================================================================
+// AC-2, engine leg — with a loader present, an accepted install proceeds past
+// `verified`: post-verify load, a `benchmark` stage carrying the loader's own
+// measurement, `ready` only after it, the tier opening, and a session turn
+// served by the committed engine. The loader is the gated
+// TETON_FAKE_ENGINE_LOADER seam — a MockEngine staged and committed through
+// the daemon's REAL serving-slot path — because the default build carries no
+// GGUF loader and a scripted engine skips the consent flow entirely; without
+// the seam this chain is observable only in the AC-13 manual dogfood.
+// ===========================================================================
+
+/// The fixed measurement the seam loader reports (`FAKE_LOADER_*` in
+/// `runtime.rs`). Asserted exactly: these figures reaching the wire is what
+/// proves the `benchmark` stage carries the loader's reported numbers, not a
+/// default and not a fabrication of the event layer.
+const FAKE_FIRST_TOKEN_MS: u64 = 42;
+const FAKE_TOKENS_PER_SEC: f64 = 512.5;
+
+#[test]
+fn ac2_with_a_loader_accept_benchmarks_reaches_ready_and_serves_a_local_turn() {
+    let models = fixture_models();
+    let hf = MockHf::serving(&models);
+
+    let ws = Workspace::new("c-ac2-eng");
+    let catalog = ws.write_catalog(&fixture_catalog_toml(&models));
+    ws.write_config(&local_model_block(&hf.base_url(), false));
+
+    let daemon = Daemon::spawn(
+        &ws,
+        consent_env(&catalog).env("TETON_FAKE_ENGINE_LOADER", "1"),
+    );
+    let mut client = daemon.connect();
+
+    // Before the answer the tier is withheld (BR-1): this provider-less daemon
+    // has nothing to serve a turn with, and must say so rather than block.
+    let starved_session = client.create_session("freeform", None);
+    let starved = client.prompt(&starved_session, "Summarize the last change.");
+    assert!(
+        starved.get("error").is_some(),
+        "before consent the local tier must be withheld, so this remote-less \
+         daemon must refuse the turn: {starved}"
+    );
+
+    let id = client.await_pending_proposal(PROPOSAL_WINDOW);
+    client.confirm_model(&id, json!({ "outcome": "accept" }));
+
+    // With a loader, the chain runs past `verified` all the way to `ready`.
+    assert!(
+        wait_for_lifecycle(&mut client, "ready", None, INSTALL_WINDOW),
+        "an accepted install must reach `ready` when a loader is present; \
+         saw {:?} (reasons: {})",
+        lifecycle_stages(&client),
+        lifecycle_reasons(&client)
+    );
+
+    // The `benchmark` stage carries the loader's own reported figures.
+    let benchmarks: Vec<&Value> = client
+        .events_named("model_lifecycle")
+        .into_iter()
+        .filter(|e| e["stage"]["stage"].as_str() == Some("benchmark"))
+        .collect();
+    assert!(
+        benchmarks.iter().any(|e| {
+            e["stage"]["first_token_ms"].as_u64() == Some(FAKE_FIRST_TOKEN_MS)
+                && e["stage"]["tokens_per_sec"]
+                    .as_f64()
+                    .is_some_and(|v| (v - FAKE_TOKENS_PER_SEC).abs() < 1e-3)
+        }),
+        "the benchmark stage must carry the loader's reported measurement; \
+         saw {benchmarks:?}"
+    );
+
+    // Ordering: the digest check precedes the load's benchmark, and `ready` is
+    // published only after the benchmark — the AC-2 sequence, not a lucky
+    // interleaving. The stream is per-connection ordered, so positions in the
+    // observed stage list are publish order.
+    let stages = lifecycle_stages(&client);
+    let verifying_at = stages.iter().position(|s| s == "verifying");
+    let benchmark_at = stages.iter().position(|s| s == "benchmark");
+    let ready_at = stages.iter().position(|s| s == "ready");
+    match (verifying_at, benchmark_at, ready_at) {
+        (Some(v), Some(b), Some(r)) => assert!(
+            v < b && b < r,
+            "expected verifying < benchmark < ready; saw {stages:?}"
+        ),
+        _ => panic!("expected verifying, benchmark and ready stages; saw {stages:?}"),
+    }
+    assert!(
+        !stages.contains(&"disabled".to_owned()),
+        "a duty-passing load must never publish `disabled`; saw {stages:?}"
+    );
+
+    // The availability flip, observed from outside: a fresh client's replayed
+    // lifecycle claims `ready` only from `local_tier_available()` AND the
+    // slot's own fact, so this wait is the flip reaching the wire.
+    let mut serving = connect_when_tier_open(&daemon, INSTALL_WINDOW);
+
+    // The turn the whole chain exists for: routed to the local tier and served
+    // by the engine the loader committed. The mock names the model it serves
+    // in every reply, which only an engine actually answering can do.
+    let session = serving.create_session("freeform", None);
+    let turn = serving.prompt(&session, "Classify the intent of this request.");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "the post-install local turn must complete: {turn}"
+    );
+    serving.drain_events(Duration::from_millis(200));
+    assert!(
+        serving
+            .events_named("route_decided")
+            .iter()
+            .any(|e| e["provider_id"].as_str() == Some("local")),
+        "the post-install turn must be routed to the local tier; events: {:?}",
+        serving.events_named("route_decided")
+    );
+    let answer = agent_message_text(&serving);
+    assert!(
+        answer.contains("via tiny-small"),
+        "the turn must be served by the committed engine, which names its \
+         model in the reply; saw {answer:?}"
+    );
+}
+
+#[test]
+fn a_restart_with_verified_weights_and_a_loader_reopens_the_tier_without_reprompting() {
+    let models = fixture_models();
+    let hf = MockHf::serving(&models);
+
+    let ws = Workspace::new("c-restart-eng");
+    let catalog = ws.write_catalog(&fixture_catalog_toml(&models));
+    ws.write_config(&local_model_block(&hf.base_url(), false));
+
+    // First run: accept and reach `ready` (asserted in detail above).
+    {
+        let daemon = Daemon::spawn(
+            &ws,
+            consent_env(&catalog).env("TETON_FAKE_ENGINE_LOADER", "1"),
+        );
+        let mut client = daemon.connect();
+        let id = client.await_pending_proposal(PROPOSAL_WINDOW);
+        client.confirm_model(&id, json!({ "outcome": "accept" }));
+        assert!(
+            wait_for_lifecycle(&mut client, "ready", None, INSTALL_WINDOW),
+            "the first run must reach `ready`; saw {:?} (reasons: {})",
+            lifecycle_stages(&client),
+            lifecycle_reasons(&client)
+        );
+    }
+
+    // Second run, same state dir, nothing pre-seeded: the startup flow finds
+    // the recorded decision, deep-verifies the installed bytes, re-loads and
+    // re-benchmarks (BR-10) — and never proposes. `ready` may arrive live or
+    // in this client's replay depending on who wins the startup race; both
+    // are the same claim.
+    let daemon = Daemon::spawn(
+        &ws,
+        consent_env(&catalog).env("TETON_FAKE_ENGINE_LOADER", "1"),
+    );
+    let mut client = daemon.connect();
+    assert!(
+        wait_for_lifecycle(&mut client, "ready", None, INSTALL_WINDOW),
+        "a restart with verified weights and a loader must re-load to `ready` \
+         (BR-10); saw {:?} (reasons: {})",
+        lifecycle_stages(&client),
+        lifecycle_reasons(&client)
+    );
+    assert!(
+        !client.saw_event("model_selection_proposed"),
+        "a restart with a recorded decision and verified weights must not \
+         re-prompt (BR-10)"
+    );
+    let status = client.model_status();
+    assert!(
+        status["pending_proposal"].is_null(),
+        "no proposal may be outstanding after the restart: {status}"
+    );
+
+    // And the re-opened tier serves, same as the first run.
+    let mut serving = connect_when_tier_open(&daemon, INSTALL_WINDOW);
+    let session = serving.create_session("freeform", None);
+    let turn = serving.prompt(&session, "Summarize this diff in one sentence.");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "the post-restart local turn must complete: {turn}"
+    );
+    serving.drain_events(Duration::from_millis(200));
+    assert!(
+        serving
+            .events_named("route_decided")
+            .iter()
+            .any(|e| e["provider_id"].as_str() == Some("local")),
+        "the post-restart turn must be routed to the local tier"
+    );
+    assert!(
+        agent_message_text(&serving).contains("via tiny-small"),
+        "the post-restart turn must be served by the re-loaded engine"
     );
 }
 
@@ -1554,6 +1787,24 @@ fn lifecycle_stages(client: &Client) -> Vec<String> {
         .events_named("model_lifecycle")
         .iter()
         .filter_map(|e| e["stage"]["stage"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The concatenation of every streamed assistant-message chunk this client has
+/// seen — the model's visible answer text, used to prove a turn was served by
+/// the engine that produced it (the mock names its model in every reply).
+fn agent_message_text(client: &Client) -> String {
+    client
+        .events_named("session_update")
+        .iter()
+        .filter_map(|e| {
+            let update = &e["update"];
+            if update["kind"].as_str() == Some("agent_message_chunk") {
+                update["text"].as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
