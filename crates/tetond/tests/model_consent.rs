@@ -780,6 +780,55 @@ async fn auto_accept_completes_the_flow_with_no_proposal_emitted() {
     h.cleanup();
 }
 
+/// BR-3 holds unattended: `auto_accept` may not install an above-RAM-floor pick
+/// (only reachable via a `[local_model] pinned` override — the probe's own pick
+/// always fits). The flow falls through to the ordinary proposal, so a human
+/// gives the explicit confirmation — or nobody does and nothing is fetched.
+#[tokio::test]
+async fn auto_accept_refuses_an_above_floor_pin_and_leaves_the_proposal_open() {
+    let h = Harness::new(
+        "ac5-floor",
+        RecordingFetcher::serving(),
+        LocalModelConfig {
+            auto_accept: true,
+            pinned: Some("oversized".to_owned()),
+            ..LocalModelConfig::default()
+        },
+    );
+    let mut sub = h.subscribe();
+
+    let resolve = h.gate.resolve();
+    let answer = async {
+        // The refusal must surface as the interactive proposal, naming the
+        // pinned entry — with zero bytes fetched and nothing recorded while
+        // it waits.
+        let proposal = next_proposal(&mut sub).await;
+        assert_eq!(
+            proposal.proposed.as_ref().map(|p| p.entry.name.as_str()),
+            Some("oversized"),
+            "the pinned pick must be proposed, not silently installed or dropped"
+        );
+        assert_eq!(
+            h.fetcher.call_count(),
+            0,
+            "an unattended above-floor pick fetched bytes: {:?}",
+            h.fetcher.calls()
+        );
+        assert!(
+            h.store.current().is_none(),
+            "nothing may be recorded before the human answers"
+        );
+        h.pending
+            .resolve(&proposal.request_id, ModelConfirmOutcome::Decline);
+    };
+    let (outcome, ()) = tokio::join!(resolve, answer);
+
+    assert_eq!(outcome, ConsentOutcome::Declined);
+    assert_eq!(h.fetcher.call_count(), 0);
+    assert!(!h.installed("oversized").exists());
+    h.cleanup();
+}
+
 #[tokio::test]
 async fn a_config_pin_proposes_the_pinned_entry_and_downloads_nothing_until_answered() {
     // C-1 (REQ-547 review): a `[local_model] pinned` key changes WHICH model is

@@ -155,6 +155,15 @@ boundary never reaches a remote MCP server. Tool-result content entering
 context is data, not instructions (prompt-injection posture to be detailed in
 the harness child REQ).
 
+**Addendum (2026-07-24)**: `[[mcp_server]] trusted` **stays `false` by
+default** — confirmed as a deliberate decision (Brett), not an oversight, after
+the engine wiring made its consequence concrete: an untrusted stdio server's
+opaque-provenance results taint the session to the local tier, and that tier
+now really serves (a working local model handles the tainted turns) rather
+than merely blocking. Fail-closed provenance with a functioning local fallback
+is the intended posture; operators opt individual servers into `trusted = true`
+knowingly.
+
 ### ADR-005: The large-band catalog entry trusts a third-party quantizer (2026-07-24)
 
 **Decision**: the `large` band ships `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`
