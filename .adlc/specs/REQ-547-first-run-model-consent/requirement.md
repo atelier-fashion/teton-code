@@ -4,7 +4,7 @@ title: "First-run local model consent: show the hardware-based pick, let the use
 status: complete
 deployable: true
 created: 2026-07-21
-updated: 2026-07-21
+updated: 2026-07-24
 component: "inference/probe"
 domain: "inference"
 stack: ["rust", "daemon", "cli", "gguf", "json-rpc"]
@@ -336,3 +336,27 @@ daemon contains no production wiring for `Downloader` at all._
 - REQ-544 (spec): excluded by the retrieval status filter (`complete` is not in
   `approved|in-progress|deployed`) but is the direct parent of this work and was
   fully in authoring context; the filter gap is noted rather than worked around.
+
+## Deferred (engine-wiring close, 2026-07-24)
+
+The AC-2/AC-13 engine wiring (PR #3) deliberately left these for their own
+sessions; the first three are chipped as background tasks:
+
+- **Local inference off tokio workers** — `LocalEngineSource::produce_turn` and
+  `summarize_if_large` call the engine synchronously inside async tasks; with a
+  real `LlamaEngine` a few concurrent local turns can stall the whole daemon.
+- **Token-currency mismatch** — harness context budgets are whitespace-approx
+  tokens, the engine window is BPE (~2.5–4× denser for code); the summarizer's
+  input is unbounded and its engine-failure fallback is silent. The 16,384
+  window covers the default budget's worst case but is a sizing, not a fix.
+- **Cross-process AC-2 e2e** — the socket-level suite cannot exercise
+  install → load → benchmark → ready → local session without a
+  `TETON_TEST_SEAMS`-gated fake loader.
+- **AC-13 Linux leg** — unrun; the recorded sign-off is macOS-only
+  (LESSON-433), and the AC-13 tick carries an agent-ran annotation awaiting
+  Brett's countersignature.
+- **Startup re-benchmark policy** — every boot re-measures (~44 s tier-open
+  latency for the 18.6 GB model); consider caching with an explicit re-measure
+  trigger.
+- **Deprecated llama-cpp-2 API** — `token_to_str`/`Special::Tokenize` should
+  migrate to `token_to_piece` with a stateful UTF-8 decoder.

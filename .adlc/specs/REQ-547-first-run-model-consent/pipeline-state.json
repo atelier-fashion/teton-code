@@ -60,6 +60,11 @@
       "phase": 8,
       "name": "Wrapup (merge + knowledge)",
       "completedAt": "2026-07-24T17:24:22Z"
+    },
+    {
+      "phase": 8,
+      "name": "Post-close: engine wiring (AC-2/AC-13) merged via PR #3",
+      "completedAt": "2026-07-24T20:13:37Z"
     }
   ],
   "integrationBranch": "main",

@@ -198,3 +198,34 @@ comment on the entry so the trust boundary is visible at the point of use.
 **Consequences**: revisit if Qwen (or another first party) publishes an official
 GGUF for this model — prefer it. Any future move to sandbox the GGUF loader would
 retire the parser-surface residual risk recorded here.
+
+### ADR-006: A real engine enters only through the consent gate's post-verify loader (2026-07-24)
+
+**Decision**: `tetond` constructs a real inference engine (`LlamaEngine`, behind
+the non-default `llama` cargo feature) in exactly one way: the consent flow hands
+digest-verified weights to a `LocalEngineLoader`, which loads on the blocking
+pool, benchmarks against the BR-8 duty, and **stages** the engine per model; the
+gate **commits** it into the daemon's model-tagged engine slot only after
+re-checking that the model is still the recorded selection (abandoning it
+otherwise), and only then publishes `ready`. The load phase holds the same
+in-flight claim as the download. The only other engine source is the ungated
+`TETON_LOCAL_SCRIPT` scripted stand-in, which is present from construction and
+whose install outcomes never touch the tier gate (E-5).
+
+**Rationale**: (a) unverified bytes must never reach the GGUF parser — ADR-005
+accepts that parser as unsandboxed attack surface, so verification-before-load is
+the compensating control, on the install path *and* on every startup (deep
+digest, then load). (b) The load takes minutes, so its authorizing decision can
+change mid-flight; stage → re-check → commit is what keeps a superseded flow from
+making a stale engine live or evicting a successor's (LESSON-445). (c) `ready`
+remains a fact: the tier opens on the slot's state, not a loader's claim, and a
+failed load or missed duty publishes its reason (`EngineLoadFailed`) instead.
+llama.cpp's process-global backend is initialized once per process and shared by
+every engine the daemon ever loads; inputs are chunked/guarded so no C-side
+assert is reachable (LESSON-444).
+
+**Consequences**: every boot re-verifies and re-benchmarks before the tier opens
+(~tens of seconds for large models — a caching policy is deferred); the harness's
+context budgets and the engine window must be kept currency-compatible
+(LESSON-446); default/CI builds compile none of this and keep the loaderless
+honest-`disabled` behavior.
