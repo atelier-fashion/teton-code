@@ -2,8 +2,8 @@
   "req": "REQ-547",
   "branch": "feat/REQ-547-first-run-model-consent",
   "startedAt": "2026-07-23T23:23:20Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -48,6 +50,16 @@
       "phase": 6,
       "name": "Create PR",
       "completedAt": "2026-07-24T17:18:36Z"
+    },
+    {
+      "phase": 7,
+      "name": "CI green",
+      "completedAt": "2026-07-24T17:24:22Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup (merge + knowledge)",
+      "completedAt": "2026-07-24T17:24:22Z"
     }
   ],
   "integrationBranch": "main",
@@ -61,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/2",
       "prNumber": 2,
       "prCreatedAt": "2026-07-24T17:18:36Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
