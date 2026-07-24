@@ -264,10 +264,13 @@ Notes / findings :
 AC-13 sign-off
 --------------
 Verified by      :  Claude (Fable 5 agent), running the procedure end to end at
-                    Brett Luelling's direction in a supervised session. The
-                    runbook asks for a human runner; Brett should countersign
-                    here (or re-run) to satisfy that letter — every observation
-                    below is from the real daemon on his machine, not a mock.
+                    Brett Luelling's direction in a supervised session. Every
+                    observation below is from the real daemon on his machine,
+                    not a mock.
+Countersigned    :  Brett Luelling, 2026-07-24 — reviewed the run and its
+                    evidence and accepts this sign-off. (Stated in session;
+                    recorded here by the agent at his instruction. He directed
+                    the run but did not re-execute the procedure by hand.)
 Date             :  2026-07-24
 Platform / OS    :  macOS (Darwin 25.5.0), Apple M5 Max, 48 GB
 Model installed  :  qwen3-coder-30b-a3b (accepted the daemon's own proposal;

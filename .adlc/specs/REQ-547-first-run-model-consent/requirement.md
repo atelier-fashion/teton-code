@@ -269,9 +269,9 @@ daemon contains no production wiring for `Downloader` at all._
       session served locally) and its sign-off block is filled. Full
       transparency against the rule above: the run and this tick were performed
       by the Claude agent **at Brett's explicit direction in a supervised
-      session** — Brett should countersign the sign-off block (or re-run and
-      replace it) to satisfy the human-runner letter of this gate. macOS only;
-      the Linux leg is unrun and unclaimed (LESSON-433)._
+      session**, and Brett countersigned the sign-off block on 2026-07-24 after
+      reviewing the run and its evidence. macOS only; the Linux leg is unrun
+      and unclaimed (LESSON-433)._
 
 ## External Dependencies
 
@@ -374,8 +374,7 @@ sessions; the first three are chipped as background tasks:
   install → load → benchmark → ready → local session without a
   `TETON_TEST_SEAMS`-gated fake loader.
 - **AC-13 Linux leg** — unrun; the recorded sign-off is macOS-only
-  (LESSON-433), and the AC-13 tick carries an agent-ran annotation awaiting
-  Brett's countersignature.
+  (LESSON-433). The macOS block is countersigned by Brett (2026-07-24).
 - **Startup re-benchmark policy** — every boot re-measures (~44 s tier-open
   latency for the 18.6 GB model); consider caching with an explicit re-measure
   trigger.
