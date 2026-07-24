@@ -13,8 +13,14 @@ authors.workspace = true
 # The `live` feature un-ignores the e2e suite's real-model / real-provider smoke
 # test (`tests/e2e`), which needs live endpoints and keys via `TETON_LIVE_*` env.
 # CI never enables it: the default acceptance run uses mocks only.
+#
+# `llama` — NON-DEFAULT — compiles the real llama.cpp engine into the daemon
+# (forwarding `teton-inference/llama`), so verified installed weights can be
+# loaded, benchmarked, and served (REQ-547 AC-2). Builds llama.cpp from source
+# and needs cmake; default builds and CI never compile it.
 [features]
 live = []
+llama = ["teton-inference/llama"]
 
 [dependencies]
 teton-core = { path = "../teton-core" }

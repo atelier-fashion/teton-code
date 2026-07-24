@@ -49,6 +49,7 @@ use tokio::sync::oneshot;
 use teton_core::config::LocalModelConfig;
 use teton_core::entities::{ModelSelection, SelectionSource};
 
+use teton_inference::benchmark::{BenchmarkResult, DutyOutcome};
 use teton_inference::catalog::{url_host, Catalog, ModelEntry, TierBand};
 use teton_inference::probe::{band_for_ram, decide, GpuClass, HardwareProfile, TierDecision, GIB};
 
@@ -661,6 +662,63 @@ pub fn validate_choice<'a>(
 // The gate
 // ---------------------------------------------------------------------------
 
+/// What a [`LocalEngineLoader`] measured after loading verified weights.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineLoadReport {
+    /// The post-load micro-benchmark (AC-2's "benchmarks" clause).
+    pub benchmark: BenchmarkResult,
+    /// The BR-8 latency-duty judgement of that measurement.
+    pub duty: DutyOutcome,
+}
+
+/// Loads a local inference engine from installed weights and reports how it
+/// measures against the BR-8 latency duty.
+///
+/// The gate calls this in exactly two places, both **after** the bytes have been
+/// digest-verified against the catalog `sha256`: on a fresh install
+/// ([`ModelConsentGate::report_install_success`]) and on a startup that finds a
+/// recorded decision with verified weights ([`ModelConsentGate::resolve`]'s
+/// `deep_status` path). Unverified bytes never reach a loader — the GGUF parser
+/// is attack surface this build does not sandbox (architecture ADR-005).
+///
+/// On a duty-passing load the implementation makes the engine live for the
+/// serving path (the daemon's engine slot); on a load error or a failed duty it
+/// must leave the serving path engineless. `load` may take minutes (weights
+/// mapping plus a real benchmark) and is always dispatched to the blocking pool.
+pub trait LocalEngineLoader: Send + Sync {
+    /// Load the installed, verified weights for `model_name` and **stage** the
+    /// resulting engine — measured, but not yet serving.
+    ///
+    /// Staging exists because the gate re-checks the recorded decision *after*
+    /// the minutes-long load (M-4), and only then decides whether this flow
+    /// still holds the authority to make its engine live. An implementation
+    /// that made the engine live in here would hand a superseded flow a side
+    /// effect the re-check cannot undo — a stale engine overwriting (or, keyed
+    /// naively, evicting) a successor's. Staging must be per-model, so
+    /// concurrent flows for different models can never clobber each other's
+    /// staged engines.
+    ///
+    /// # Errors
+    /// Returns a user-facing reason when the weights cannot be loaded. The
+    /// message must name no filesystem path or URL (BR-11).
+    fn load(&self, model_name: &str) -> Result<EngineLoadReport, String>;
+
+    /// Make `model_name`'s staged engine live. Called only after the post-load
+    /// re-check confirmed the model is still the recorded selection. A no-op if
+    /// nothing is staged under that name (e.g. a same-model race already
+    /// committed it). The default is a no-op for loaders that stage nothing.
+    fn commit(&self, model_name: &str) {
+        let _ = model_name;
+    }
+
+    /// Discard `model_name`'s staged engine, if any — the flow was superseded
+    /// while it loaded, or its measurement failed the duty. Keyed by name, so
+    /// it can never touch another flow's staged work or anything already live.
+    fn abandon(&self, model_name: &str) {
+        let _ = model_name;
+    }
+}
+
 /// The outcome of resolving the local tier's consent state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsentOutcome {
@@ -682,6 +740,22 @@ pub enum ConsentOutcome {
     InstalledNoEngine {
         /// The model whose weights are installed.
         model_name: String,
+    },
+    /// A model is decided, its weights are installed and verified, and this
+    /// build **can** load them — but the load failed, or the loaded engine
+    /// missed the BR-8 latency duty. `reason` says which.
+    ///
+    /// Like [`InstalledNoEngine`](Self::InstalledNoEngine), the install itself
+    /// genuinely succeeded, so this is not an
+    /// [`InstallFailed`](Self::InstallFailed) — the bytes on disk are the
+    /// catalog's bytes, and a restart retries the load without re-fetching
+    /// anything (BR-10 re-proposes only on *missing or corrupt* weights). The
+    /// tier stays withheld; sessions run remote-only.
+    EngineLoadFailed {
+        /// The model whose weights could not be served.
+        model_name: String,
+        /// The load error, or the failed duty's own sentence.
+        reason: String,
     },
     /// An install for this entry was already in flight, so this attempt did
     /// nothing (M-2).
@@ -752,13 +826,14 @@ pub struct ModelConsentGate {
     store: Arc<SelectionStore>,
     installer: Arc<dyn WeightsInstaller>,
     counter: AtomicU64,
-    /// Whether this build has a local inference engine that can load installed
-    /// weights (M-1). Gates the `Ready` publish onto the SAME signal
-    /// `startup_lifecycle` uses (`engine.is_some()`): a successful install on a
-    /// build with no engine publishes `disabled`, not a `ready` it cannot honour.
-    /// Defaults to `false` — the honest default for the production build, which
-    /// ships no GGUF loader.
-    local_engine_present: bool,
+    /// How this build loads installed weights into a serving engine, or `None`
+    /// when it cannot (M-1). Gates the `Ready` publish on an engine having
+    /// **actually loaded**: a successful install on a loaderless build publishes
+    /// `disabled`, not a `ready` it cannot honour, and even with a loader,
+    /// `ready` is published only after the load and its BR-8 benchmark succeed.
+    /// Defaults to `None` — the honest default for a build without the `llama`
+    /// feature, which ships no GGUF loader.
+    loader: Option<Arc<dyn LocalEngineLoader>>,
     /// Whether the catalog is a non-bundled override (`TETON_CATALOG`, H-2).
     /// Feeds the proposal's [`FetchNotice`] so the consent screen says the
     /// entries are not from the shipped catalog. Defaults to `false`.
@@ -793,7 +868,7 @@ impl ModelConsentGate {
             store,
             installer,
             counter: AtomicU64::new(0),
-            local_engine_present: false,
+            loader: None,
             catalog_overridden: false,
             installing: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -811,18 +886,29 @@ impl ModelConsentGate {
         self
     }
 
-    /// Declare whether this build has a local inference engine that can load
-    /// installed weights (M-1).
+    /// Provide the loader this build uses to turn installed weights into a
+    /// serving engine (M-1).
     ///
-    /// This is the SAME signal `startup_lifecycle` reads (`engine.is_some()`),
-    /// threaded into the gate so a completed install publishes `ready` only when
-    /// the tier can actually serve. Left `false` (the constructor default), a
-    /// successful install publishes `disabled` with the no-engine reason — the
-    /// truth for the production build, which has no GGUF loader.
+    /// With a loader, a verified install proceeds to load + benchmark and
+    /// publishes `ready` only when both succeed — `ready` remains a fact, not a
+    /// hope. Without one (the constructor default), a successful install
+    /// publishes `disabled` with the no-engine reason — the truth for a build
+    /// without the `llama` feature, which has no GGUF loader.
     #[must_use]
-    pub fn with_local_engine(mut self, present: bool) -> Self {
-        self.local_engine_present = present;
+    pub fn with_engine_loader(mut self, loader: Arc<dyn LocalEngineLoader>) -> Self {
+        self.loader = Some(loader);
         self
+    }
+
+    /// [`Self::with_engine_loader`], tolerant of an absent loader — the shape
+    /// the daemon assembly actually has in hand (`None` on a build without the
+    /// `llama` feature, or for a scripted tier).
+    #[must_use]
+    pub fn maybe_with_loader(self, loader: Option<Arc<dyn LocalEngineLoader>>) -> Self {
+        match loader {
+            Some(loader) => self.with_engine_loader(loader),
+            None => self,
+        }
     }
 
     /// Whether an install for `model_name` is currently in flight (M-2). Lets a
@@ -951,9 +1037,12 @@ impl ModelConsentGate {
                     // the tier may serve depends on something the bytes cannot
                     // supply — an engine to load them — so this reports exactly
                     // what `report_install_success` reports for the same state,
-                    // rather than a `Ready` the daemon could not honour.
-                    return if self.local_engine_present {
-                        ConsentOutcome::Ready { selection }
+                    // rather than a `Ready` the daemon could not honour. With a
+                    // loader, "an engine to load them" is settled by actually
+                    // loading (and re-benchmarking: BR-8 is a duty about this
+                    // boot's machine, not a past one's).
+                    return if self.loader.is_some() {
+                        self.activate_engine(&entry.name, selection).await
                     } else {
                         ConsentOutcome::InstalledNoEngine {
                             model_name: entry.name.clone(),
@@ -1243,7 +1332,7 @@ impl ModelConsentGate {
         .await;
 
         match result {
-            Ok(Ok(())) => self.report_install_success(entry, selection),
+            Ok(Ok(())) => self.report_install_success(entry, selection).await,
             Ok(Err(error)) => self.report_install_failure(entry, error),
             // The blocking task panicked or was cancelled. Report it as an
             // install failure rather than swallowing it: the tier is not ready.
@@ -1294,7 +1383,7 @@ impl ModelConsentGate {
     /// decision nobody holds. That is the same "another task is the authority
     /// here" shape as [`ConsentOutcome::Superseded`], so it is reported the same
     /// way — leaving the gate to the `model/set` install that now owns it.
-    fn report_install_success(
+    async fn report_install_success(
         &self,
         entry: &ModelEntry,
         selection: ModelSelection,
@@ -1307,15 +1396,8 @@ impl ModelConsentGate {
         if !still_selected {
             return ConsentOutcome::Superseded;
         }
-        if self.local_engine_present {
-            self.events.publish(
-                None,
-                Event::ModelLifecycle(ModelLifecycle {
-                    model_id: entry.name.clone(),
-                    stage: ModelLifecycleStage::Ready,
-                }),
-            );
-            ConsentOutcome::Ready { selection }
+        if self.loader.is_some() {
+            self.activate_engine(&entry.name, selection).await
         } else {
             self.events.publish(
                 None,
@@ -1329,6 +1411,123 @@ impl ModelConsentGate {
             ConsentOutcome::InstalledNoEngine {
                 model_name: entry.name.clone(),
             }
+        }
+    }
+
+    /// Load the verified weights into a serving engine, benchmark it, and
+    /// publish what actually happened (AC-2's load + benchmark clauses).
+    ///
+    /// Reached only with a loader configured, and only after the bytes were
+    /// digest-verified — the fresh-install path arrives here through the
+    /// installer's own BR-6 digest, the startup path through `deep_status`. The
+    /// published sequence mirrors the work: a `benchmark` stage with the real
+    /// measurement whenever a load completed, then `ready` only if the BR-8 duty
+    /// passed, else `disabled` with the duty's (or the load error's) own
+    /// sentence. Loading maps gigabytes and the benchmark runs real inference,
+    /// so the work rides the blocking pool like the install itself (E-3).
+    async fn activate_engine(&self, model_name: &str, selection: ModelSelection) -> ConsentOutcome {
+        // The load phase claims the model exactly as the download phase does
+        // (M-2): mapping an 18 GB GGUF twice concurrently — a startup resolve
+        // racing a `model/set` of the same name, or two rapid `model/set`s — is
+        // a memory-doubling the catalog never sized the machine for. The claim
+        // guard rides inside the blocking closure (E-9) so a cancelled future
+        // cannot release it while the load still runs.
+        let Some(guard) = self.claim_install(model_name) else {
+            return ConsentOutcome::AlreadyInstalling {
+                model_name: model_name.to_owned(),
+            };
+        };
+        let loader = Arc::clone(
+            self.loader
+                .as_ref()
+                .expect("activate_engine is only reachable with a loader"),
+        );
+        let loaded = {
+            let loader = Arc::clone(&loader);
+            let name = model_name.to_owned();
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                loader.load(&name)
+            })
+            .await
+        };
+
+        // M-4, re-checked AFTER the load: mapping gigabytes and benchmarking
+        // takes minutes, and a `model/set` is allowed at any moment — so the
+        // decision this flow is executing may no longer be the recorded one by
+        // the time its engine is staged. A superseded flow publishes nothing,
+        // leaves the gate to the authority that superseded it, and abandons its
+        // staged engine (keyed by name, so it can never touch a successor's
+        // staged or live engine). Nothing was made live: `load` only *stages*,
+        // and the commit below happens strictly after this check. The
+        // check-then-act window this leaves is the same one
+        // `report_install_success`'s pre-existing check accepts — microseconds,
+        // not the minutes the load added.
+        let still_selected = self
+            .store
+            .current()
+            .and_then(|current| current.model_name)
+            .is_some_and(|name| name == model_name);
+        if !still_selected {
+            loader.abandon(model_name);
+            return ConsentOutcome::Superseded;
+        }
+
+        let failure = match loaded {
+            Ok(Ok(report)) => {
+                self.events.publish(
+                    None,
+                    Event::ModelLifecycle(ModelLifecycle {
+                        model_id: model_name.to_owned(),
+                        stage: ModelLifecycleStage::Benchmark {
+                            first_token_ms: report.benchmark.first_token_ms,
+                            tokens_per_sec: report.benchmark.tokens_per_sec,
+                        },
+                    }),
+                );
+                match report.duty {
+                    DutyOutcome::Pass => {
+                        // The engine goes live here — after the re-check, before
+                        // the `ready` claim — so `ready` is published only for a
+                        // slot that actually holds this flow's engine.
+                        loader.commit(model_name);
+                        self.events.publish(
+                            None,
+                            Event::ModelLifecycle(ModelLifecycle {
+                                model_id: model_name.to_owned(),
+                                stage: ModelLifecycleStage::Ready,
+                            }),
+                        );
+                        return ConsentOutcome::Ready { selection };
+                    }
+                    DutyOutcome::Fail { reason } => {
+                        loader.abandon(model_name);
+                        reason
+                    }
+                }
+            }
+            Ok(Err(reason)) => reason,
+            // The blocking task panicked or was cancelled: the tier is not
+            // serving, and saying anything more specific would be a guess. A
+            // panicking loader may have staged before it died — discard.
+            Err(_) => {
+                loader.abandon(model_name);
+                "the engine load task did not complete".to_owned()
+            }
+        };
+
+        self.events.publish(
+            None,
+            Event::ModelLifecycle(ModelLifecycle {
+                model_id: model_name.to_owned(),
+                stage: ModelLifecycleStage::Disabled {
+                    reason: failure.clone(),
+                },
+            }),
+        );
+        ConsentOutcome::EngineLoadFailed {
+            model_name: model_name.to_owned(),
+            reason: failure,
         }
     }
 

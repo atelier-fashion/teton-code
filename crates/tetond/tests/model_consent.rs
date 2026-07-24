@@ -47,10 +47,13 @@ use teton_protocol::RequestId;
 
 use teton_providers::CapabilityProfile;
 
+use teton_inference::benchmark::{BenchmarkResult, DutyOutcome};
+
 use tetond::broadcast::{EventBus, Subscription};
 use tetond::install::{FixedFreeSpace, FreeSpace, WeightsInstall};
 use tetond::model_consent::{
-    ConsentOutcome, InstallError, ModelConsentGate, PendingModelDecisions,
+    ConsentOutcome, EngineLoadReport, InstallError, LocalEngineLoader, ModelConsentGate,
+    PendingModelDecisions,
 };
 use tetond::router::Router;
 use tetond::runtime::DaemonRuntime;
@@ -111,6 +114,77 @@ fn machine() -> HardwareProfile {
         ram_bytes: 16 * GIB,
         free_disk_bytes: 400 * GIB,
         gpu: GpuClass::AppleSilicon,
+    }
+}
+
+/// A loader whose load succeeds instantly and passes the BR-8 duty — the
+/// stand-in for "a machine that can load the weights" (M-1).
+struct InstantLoader;
+
+impl LocalEngineLoader for InstantLoader {
+    fn load(&self, _model_name: &str) -> Result<EngineLoadReport, String> {
+        Ok(EngineLoadReport {
+            benchmark: BenchmarkResult {
+                first_token_ms: 5,
+                tokens_per_sec: 120.0,
+            },
+            duty: DutyOutcome::Pass,
+        })
+    }
+}
+
+/// A loader that cannot load the weights (e.g. an incompatible GGUF).
+struct FailingLoader;
+
+impl LocalEngineLoader for FailingLoader {
+    fn load(&self, model_name: &str) -> Result<EngineLoadReport, String> {
+        Err(format!(
+            "{model_name}'s weights could not be loaded: test refusal"
+        ))
+    }
+}
+
+/// A loader slow enough for the decision to move while it runs, recording which
+/// models it was asked to abandon (the M-4 supersede-during-load case). It
+/// signals load entry on `entered`, so the test can move the decision at a
+/// synchronized point inside the load window rather than trusting a sleep.
+struct RecordingSlowLoader {
+    entered: Arc<tokio::sync::Notify>,
+    abandoned: Mutex<Vec<String>>,
+}
+
+impl LocalEngineLoader for RecordingSlowLoader {
+    fn load(&self, _model_name: &str) -> Result<EngineLoadReport, String> {
+        self.entered.notify_one();
+        // On the blocking pool by contract, so a real sleep is honest here.
+        std::thread::sleep(Duration::from_millis(200));
+        Ok(EngineLoadReport {
+            benchmark: BenchmarkResult {
+                first_token_ms: 5,
+                tokens_per_sec: 120.0,
+            },
+            duty: DutyOutcome::Pass,
+        })
+    }
+
+    fn abandon(&self, model_name: &str) {
+        self.abandoned.lock().unwrap().push(model_name.to_owned());
+    }
+}
+
+/// A loader whose engine loads but misses the BR-8 latency duty.
+struct SlowLoader;
+
+impl LocalEngineLoader for SlowLoader {
+    fn load(&self, _model_name: &str) -> Result<EngineLoadReport, String> {
+        let benchmark = BenchmarkResult {
+            first_token_ms: 4_000,
+            tokens_per_sec: 1.5,
+        };
+        Ok(EngineLoadReport {
+            duty: teton_inference::DutySpec::default().evaluate(&benchmark),
+            benchmark,
+        })
     }
 }
 
@@ -220,14 +294,20 @@ impl Harness {
             profile,
             fetcher,
             LocalModelConfig::default(),
-            true,
+            Some(Arc::new(InstantLoader)),
         )
     }
 
     /// A harness over an existing state directory — how "a later daemon start"
     /// is modelled: same directory, brand-new gate, store, and event bus.
     fn in_dir(dir: PathBuf, fetcher: RecordingFetcher, config: LocalModelConfig) -> Self {
-        Self::build(dir, machine(), fetcher, config, true)
+        Self::build(
+            dir,
+            machine(),
+            fetcher,
+            config,
+            Some(Arc::new(InstantLoader)),
+        )
     }
 
     /// A harness modelling the production **no-engine** build: the install can
@@ -238,7 +318,23 @@ impl Harness {
             machine(),
             fetcher,
             LocalModelConfig::default(),
-            false,
+            None,
+        )
+    }
+
+    /// A harness whose loader is the given one — the load-failure and BR-8
+    /// duty-fail cases.
+    fn with_loader(
+        tag: &str,
+        fetcher: RecordingFetcher,
+        loader: Arc<dyn LocalEngineLoader>,
+    ) -> Self {
+        Self::build(
+            temp_dir(tag),
+            machine(),
+            fetcher,
+            LocalModelConfig::default(),
+            Some(loader),
         )
     }
 
@@ -247,7 +343,7 @@ impl Harness {
         profile: HardwareProfile,
         fetcher: RecordingFetcher,
         config: LocalModelConfig,
-        engine_present: bool,
+        loader: Option<Arc<dyn LocalEngineLoader>>,
     ) -> Self {
         let bus = Arc::new(EventBus::new());
         let pending = Arc::new(PendingModelDecisions::new());
@@ -278,10 +374,11 @@ impl Harness {
             )
             // Most tests here are about the *decision*, and they assert the tier
             // reaches `ready` — which is only honest on a machine that can load
-            // the weights. So they model one: engine present (M-1). The no-engine
+            // the weights. So they model one: a loader whose load succeeds
+            // instantly and passes the BR-8 duty (M-1). The loaderless
             // `disabled`-on-success path has its own coverage
             // (`a_successful_install_on_a_no_engine_build_is_disabled_not_ready`).
-            .with_local_engine(engine_present),
+            .maybe_with_loader(loader),
         );
         Self {
             dir,
@@ -1343,6 +1440,217 @@ async fn a_successful_install_on_a_no_engine_build_is_disabled_not_ready() {
             .iter()
             .any(|stage| matches!(stage, ModelLifecycleStage::Ready)),
         "a no-engine build must not publish `ready`; got {stages:?}"
+    );
+    h.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// AC-2 — a verified install proceeds to load + benchmark before `ready`
+// ---------------------------------------------------------------------------
+
+/// Collect the lifecycle stages currently on `sub`.
+async fn lifecycle_stages(sub: &mut Subscription) -> Vec<ModelLifecycleStage> {
+    drain(sub)
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::ModelLifecycle(lifecycle) => Some(lifecycle.stage),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_accepted_install_benchmarks_then_reports_ready_in_that_order() {
+    let h = Harness::new(
+        "ac2-order",
+        RecordingFetcher::serving(),
+        LocalModelConfig::default(),
+    );
+    let mut sub = h.subscribe();
+
+    h.gate
+        .set_model("small-fit", false)
+        .expect("small-fit fits");
+    let outcome = h.gate.install_recorded().await;
+    assert!(
+        matches!(outcome, ConsentOutcome::Ready { .. }),
+        "{outcome:?}"
+    );
+
+    let stages = lifecycle_stages(&mut sub).await;
+    let benchmark_at = stages
+        .iter()
+        .position(|stage| {
+            matches!(
+                stage,
+                ModelLifecycleStage::Benchmark {
+                    first_token_ms: 5,
+                    ..
+                }
+            )
+        })
+        .unwrap_or_else(|| panic!("no benchmark stage with the loader's measurement: {stages:?}"));
+    let ready_at = stages
+        .iter()
+        .position(|stage| matches!(stage, ModelLifecycleStage::Ready))
+        .unwrap_or_else(|| panic!("no ready stage: {stages:?}"));
+    assert!(
+        benchmark_at < ready_at,
+        "AC-2's order is install → benchmark → ready; got {stages:?}"
+    );
+    h.cleanup();
+}
+
+#[tokio::test]
+async fn a_load_failure_after_a_verified_install_is_disabled_with_its_reason_not_ready() {
+    let h = Harness::with_loader(
+        "load-fail",
+        RecordingFetcher::serving(),
+        Arc::new(FailingLoader),
+    );
+    let mut sub = h.subscribe();
+
+    h.gate
+        .set_model("small-fit", false)
+        .expect("small-fit fits");
+    let outcome = h.gate.install_recorded().await;
+
+    // Not Ready, and not InstallFailed either: the bytes on disk are good, the
+    // *load* failed. A restart retries the load without re-fetching (BR-10).
+    assert_eq!(
+        outcome,
+        ConsentOutcome::EngineLoadFailed {
+            model_name: "small-fit".to_owned(),
+            reason: "small-fit's weights could not be loaded: test refusal".to_owned(),
+        },
+        "{outcome:?}"
+    );
+    assert!(!outcome.local_tier_ready());
+    assert_eq!(
+        h.gate
+            .current_install()
+            .expect("a model is selected")
+            .status,
+        InstallStatus::Verified,
+        "a failed load must not disturb the verified install"
+    );
+
+    let stages = lifecycle_stages(&mut sub).await;
+    assert!(
+        stages.iter().any(|stage| matches!(
+            stage,
+            ModelLifecycleStage::Disabled { reason }
+                if reason.contains("could not be loaded")
+        )),
+        "expected the load-failure disabled stage; got {stages:?}"
+    );
+    assert!(
+        !stages
+            .iter()
+            .any(|stage| matches!(stage, ModelLifecycleStage::Ready)),
+        "a failed load must not publish `ready`; got {stages:?}"
+    );
+    h.cleanup();
+}
+
+#[tokio::test]
+async fn an_engine_that_misses_the_latency_duty_is_benchmarked_then_disabled_not_ready() {
+    let h = Harness::with_loader(
+        "duty-fail",
+        RecordingFetcher::serving(),
+        Arc::new(SlowLoader),
+    );
+    let mut sub = h.subscribe();
+
+    h.gate
+        .set_model("small-fit", false)
+        .expect("small-fit fits");
+    let outcome = h.gate.install_recorded().await;
+
+    assert!(
+        matches!(
+            &outcome,
+            ConsentOutcome::EngineLoadFailed { model_name, reason }
+                if model_name == "small-fit" && reason.contains("first-token latency")
+        ),
+        "{outcome:?}"
+    );
+    assert!(!outcome.local_tier_ready());
+
+    // The measurement is published — the user sees WHY the tier is withheld —
+    // and `ready` never is (BR-8: a tier that cannot meet its duty must not
+    // claim it can).
+    let stages = lifecycle_stages(&mut sub).await;
+    assert!(
+        stages.iter().any(|stage| matches!(
+            stage,
+            ModelLifecycleStage::Benchmark {
+                first_token_ms: 4_000,
+                ..
+            }
+        )),
+        "expected the real (failing) benchmark measurement; got {stages:?}"
+    );
+    assert!(
+        stages.iter().any(|stage| matches!(
+            stage,
+            ModelLifecycleStage::Disabled { reason }
+                if reason.contains("first-token latency")
+        )),
+        "expected the duty-fail disabled stage; got {stages:?}"
+    );
+    assert!(
+        !stages
+            .iter()
+            .any(|stage| matches!(stage, ModelLifecycleStage::Ready)),
+        "a duty-missing engine must not publish `ready`; got {stages:?}"
+    );
+    h.cleanup();
+}
+
+/// The decision moves while the engine load runs: the flow must supersede
+/// itself — publish nothing, leave the gate to the new authority, and withdraw
+/// the engine it loaded for the deselected model.
+#[tokio::test]
+async fn a_model_set_during_the_engine_load_supersedes_it_and_abandons_the_engine() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let loader = Arc::new(RecordingSlowLoader {
+        entered: Arc::clone(&entered),
+        abandoned: Mutex::new(Vec::new()),
+    });
+    let h = Harness::with_loader(
+        "supersede-load",
+        RecordingFetcher::serving(),
+        Arc::clone(&loader) as Arc<dyn LocalEngineLoader>,
+    );
+    let mut sub = h.subscribe();
+
+    h.gate
+        .set_model("small-fit", false)
+        .expect("small-fit fits");
+    let install = h.gate.install_recorded();
+    let switch = async {
+        // Land inside the load window: the loader signals entry, which is by
+        // construction after the install's own pre-check and 200 ms before the
+        // post-load re-check.
+        entered.notified().await;
+        h.gate.set_model("alt-fit", false).expect("alt-fit fits");
+    };
+    let (outcome, ()) = tokio::join!(install, switch);
+
+    assert_eq!(outcome, ConsentOutcome::Superseded, "{outcome:?}");
+    assert_eq!(
+        loader.abandoned.lock().unwrap().as_slice(),
+        ["small-fit".to_owned()],
+        "the superseded flow must abandon exactly the engine it staged"
+    );
+    let stages = lifecycle_stages(&mut sub).await;
+    assert!(
+        !stages
+            .iter()
+            .any(|stage| matches!(stage, ModelLifecycleStage::Ready)),
+        "a superseded load must not publish `ready`; got {stages:?}"
     );
     h.cleanup();
 }

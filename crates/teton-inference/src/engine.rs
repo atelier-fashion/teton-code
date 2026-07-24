@@ -199,6 +199,7 @@ impl Engine for MockEngine {
 mod llama {
     use super::{Completion, Engine, EngineError, GenParams};
     use std::path::Path;
+    use std::sync::OnceLock;
 
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_backend::LlamaBackend;
@@ -207,11 +208,36 @@ mod llama {
     use llama_cpp_2::model::{AddBos, LlamaModel, Special};
     use llama_cpp_2::sampling::LlamaSampler;
 
+    /// The process-wide llama.cpp backend.
+    ///
+    /// `LlamaBackend::init` is once-per-process by construction (a global
+    /// `compare_exchange` that errors on the second call), so an engine cannot
+    /// own its backend: the first model switch of a daemon's lifetime would
+    /// find the flag already set and report perfectly good weights as
+    /// unloadable. One initialization, shared by every engine this process
+    /// ever loads, held in a static so it is never freed while any engine
+    /// could still be using it.
+    fn shared_backend() -> Result<&'static LlamaBackend, EngineError> {
+        static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
+        BACKEND
+            .get_or_init(|| LlamaBackend::init().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(|reason| EngineError::Backend(reason.clone()))
+    }
+
+    /// The logical batch ceiling for one `decode` call, in tokens.
+    ///
+    /// Passed to the context as `n_batch` and used to chunk prompt decoding, so
+    /// the two can never disagree — llama.cpp enforces `n_tokens <= n_batch`
+    /// with a process-aborting `GGML_ASSERT`, not a returnable error. Matches
+    /// llama.cpp's own default logical batch size.
+    const N_BATCH: u32 = 2048;
+
     /// A llama.cpp-backed [`Engine`]. Metal is used automatically on Apple
     /// Silicon by offloading all layers to the GPU.
     pub struct LlamaEngine {
         model_id: String,
-        backend: LlamaBackend,
+        backend: &'static LlamaBackend,
         model: LlamaModel,
         n_ctx: u32,
     }
@@ -229,9 +255,9 @@ mod llama {
             gpu_layers: u32,
             n_ctx: u32,
         ) -> Result<Self, EngineError> {
-            let backend = LlamaBackend::init().map_err(|e| EngineError::Backend(e.to_string()))?;
+            let backend = shared_backend()?;
             let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
-            let model = LlamaModel::load_from_file(&backend, path, &model_params)
+            let model = LlamaModel::load_from_file(backend, path, &model_params)
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
             Ok(Self {
                 model_id: model_id.into(),
@@ -253,11 +279,12 @@ mod llama {
             params: &GenParams,
             on_token: &mut dyn FnMut(&str),
         ) -> Result<Completion, EngineError> {
-            let ctx_params =
-                LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(self.n_ctx));
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(std::num::NonZeroU32::new(self.n_ctx))
+                .with_n_batch(N_BATCH);
             let mut ctx = self
                 .model
-                .new_context(&self.backend, ctx_params)
+                .new_context(self.backend, ctx_params)
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
 
             let tokens = self
@@ -266,15 +293,39 @@ mod llama {
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
             let prompt_tokens = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
 
-            let mut batch = LlamaBatch::new(self.n_ctx as usize, 1);
-            let last = tokens.len().saturating_sub(1);
-            for (i, token) in tokens.iter().enumerate() {
-                batch
-                    .add(*token, i as i32, &[0], i == last)
-                    .map_err(|e| EngineError::Backend(e.to_string()))?;
+            // Refuse an over-window prompt with a typed error BEFORE any llama.cpp
+            // call sees it. llama.cpp enforces its limits with GGML_ASSERT — an
+            // `abort()`, not a catchable error — so feeding it an input that
+            // cannot fit would take down the whole daemon process, as the first
+            // dogfooded over-window turn did.
+            let budget = self.n_ctx.saturating_sub(params.max_tokens);
+            if prompt_tokens > budget {
+                return Err(EngineError::Backend(format!(
+                    "prompt of {prompt_tokens} tokens exceeds this engine's window \
+                     ({budget} = {} context minus {} generation)",
+                    self.n_ctx, params.max_tokens
+                )));
             }
-            ctx.decode(&mut batch)
-                .map_err(|e| EngineError::Backend(e.to_string()))?;
+
+            // Decode the prompt in `n_batch`-sized chunks: one `decode` may not
+            // exceed the context's logical batch size (GGML_ASSERT, as above).
+            // Only the final token of the final chunk requests logits — that is
+            // where generation starts.
+            let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
+            let last = tokens.len().saturating_sub(1);
+            let mut pos = 0usize;
+            for chunk in tokens.chunks(N_BATCH as usize) {
+                batch.clear();
+                for (i, token) in chunk.iter().enumerate() {
+                    let index = pos + i;
+                    batch
+                        .add(*token, index as i32, &[0], index == last)
+                        .map_err(|e| EngineError::Backend(e.to_string()))?;
+                }
+                ctx.decode(&mut batch)
+                    .map_err(|e| EngineError::Backend(e.to_string()))?;
+                pos += chunk.len();
+            }
 
             let mut sampler = LlamaSampler::greedy();
             let mut text = String::new();

@@ -76,6 +76,9 @@
 //! session path is exercised at all.
 
 use std::collections::{BTreeMap, HashSet};
+// The loader's staging map exists only when a loader can (the `llama` feature).
+#[cfg(feature = "llama")]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -91,7 +94,7 @@ use teton_core::policy::ProviderHealth;
 
 use teton_inference::catalog::Catalog;
 use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GIB};
-use teton_inference::{Completion, Engine, EngineError, GenParams};
+use teton_inference::{Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{ModelLifecycle, ModelLifecycleStage, PrivacyAction};
 use teton_protocol::jsonrpc::{error_code, RpcError};
@@ -372,11 +375,22 @@ pub struct DaemonRuntime {
     config_path: Option<PathBuf>,
     /// The repo the built-in tools are jailed to.
     repo_root: PathBuf,
-    /// The local tier, or `None` on a machine below the hardware floor / with no
-    /// scripted engine (remote-only operation).
-    engine: Option<Arc<Mutex<dyn Engine>>>,
-    /// Whether the local tier can meet its BR-8 latency duty right now.
-    local_available: bool,
+    /// The local tier's engine slot: empty on a machine below the hardware floor
+    /// or with nothing loaded (remote-only operation). A slot rather than a bare
+    /// `Option` because a real engine arrives **mid-run** — the consent flow's
+    /// post-verify loader fills it after an accepted install — while a scripted
+    /// engine is present from construction.
+    engine: Arc<EngineSlot>,
+    /// Whether the local tier can meet its BR-8 latency duty right now. Atomic
+    /// because a post-install engine load flips it long after assembly
+    /// ([`Self::apply_consent_outcome`]), on a runtime every client task shares.
+    local_available: AtomicBool,
+    /// Whether this build carries a weights loader (the `llama` feature) for a
+    /// non-scripted tier. **Display only**: it feeds `startup_lifecycle`'s
+    /// explanation of installed-but-not-yet-serving weights and must never feed
+    /// a gate condition — the gate keys on `scripted_engine` and the consent
+    /// state alone (LESSON-443).
+    weights_loader_present: bool,
     /// The REQ-547 first-run consent gate: the probe, the catalog, the recorded
     /// decision, the pending-answer registry, and the installer.
     consent: Arc<ModelConsentGate>,
@@ -473,8 +487,9 @@ impl DaemonRuntime {
             config: Mutex::new(Config::default()),
             config_path: None,
             repo_root: std::env::temp_dir(),
-            engine: None,
-            local_available: false,
+            engine: EngineSlot::empty(),
+            local_available: AtomicBool::new(false),
+            weights_loader_present: false,
             consent,
             local_gated: AtomicBool::new(false),
             scripted_engine: false,
@@ -534,8 +549,19 @@ impl DaemonRuntime {
         // exempts this daemon from the consent flow, and only because it fetches
         // nothing — not because an engine happens to exist.
         let scripted_engine = local.as_ref().is_some_and(|local| local.scripted);
-        let engine: Option<Arc<Mutex<dyn Engine>>> = local.map(|local| local.engine);
-        let local_available = engine.is_some() && !probe.disabled;
+        let engine = EngineSlot::empty();
+        if let Some(local) = local {
+            engine.install(local.model_id, local.engine);
+        }
+        let local_available = AtomicBool::new(engine.present() && !probe.disabled);
+
+        // The weights loader (`llama` feature): how verified installed bytes
+        // become a serving engine. Built here so it shares this runtime's engine
+        // slot and the probe's GPU class; handed to the consent gate, which calls
+        // it only after digest verification. A scripted tier gets none — its
+        // engine is already live and the consent flow does not apply to it (E-5).
+        let engine_loader = build_engine_loader(&engine, &profile, base_dir, scripted_engine);
+        let weights_loader_present = engine_loader.is_some();
 
         // --- first-run consent (REQ-547) ---
         //
@@ -544,25 +570,22 @@ impl DaemonRuntime {
         // flow is driven by `run_model_consent`, which `main` spawns.
         let mut local_model = config.local_model.clone();
         local_model.pinned = pinned;
-        let consent = Arc::new(
-            ModelConsentGate::new(
-                profile,
-                catalog,
-                local_model,
-                Arc::clone(events),
-                Arc::new(PendingModelDecisions::new()),
-                Arc::new(SelectionStore::open(base_dir)),
-                build_installer(base_dir, config.local_model.base_url.clone(), events),
-            )
-            // M-1: gate the gate's `ready` publish on the presence of an engine
-            // that can load the weights — the same signal `startup_lifecycle`
-            // uses — so a completed install on a no-engine build says `disabled`,
-            // not `ready`.
-            .with_local_engine(engine.is_some())
-            // H-2: a non-bundled catalog is a redirected source; the proposal's
-            // `fetch_notice` tells the user so before they answer.
-            .with_catalog_override(catalog_overridden),
-        );
+        let consent = ModelConsentGate::new(
+            profile,
+            catalog,
+            local_model,
+            Arc::clone(events),
+            Arc::new(PendingModelDecisions::new()),
+            Arc::new(SelectionStore::open(base_dir)),
+            build_installer(base_dir, config.local_model.base_url.clone(), events),
+        )
+        // H-2: a non-bundled catalog is a redirected source; the proposal's
+        // `fetch_notice` tells the user so before they answer.
+        .with_catalog_override(catalog_overridden);
+        // M-1: gate the gate's `ready` publish on an engine actually loading the
+        // weights. On a build with no loader the gate has none to call, so a
+        // completed install says `disabled`, not `ready`.
+        let consent = Arc::new(consent.maybe_with_loader(engine_loader));
         let local_gated = AtomicBool::new(local_tier_gated(
             scripted_engine,
             consent.consent_required(),
@@ -578,6 +601,7 @@ impl DaemonRuntime {
             repo_root,
             engine,
             local_available,
+            weights_loader_present,
             consent,
             local_gated,
             scripted_engine,
@@ -603,12 +627,20 @@ impl DaemonRuntime {
     /// The tier is marked *capable* (`local_available`) so that the consent gate
     /// is the only thing that can withhold it: a test asserting "undecided ⇒
     /// remote-only" must be observing the gate, not a machine that had no local
-    /// tier to begin with.
+    /// tier to begin with. Capability is backed by a fact, not a flag: a mock
+    /// engine occupies the slot, because a `Ready` consent outcome re-derives
+    /// `local_available` from the slot's own state.
     #[must_use]
     pub fn with_consent(consent: Arc<ModelConsentGate>) -> Self {
         let gated = local_tier_gated(false, consent.consent_required());
+        let engine = EngineSlot::empty();
+        engine.install(
+            "consent-test-local".to_owned(),
+            Arc::new(Mutex::new(MockEngine::new("consent-test-local"))) as Arc<Mutex<dyn Engine>>,
+        );
         Self {
-            local_available: true,
+            engine,
+            local_available: AtomicBool::new(true),
             local_gated: AtomicBool::new(gated),
             consent,
             ..Self::minimal()
@@ -635,7 +667,7 @@ impl DaemonRuntime {
     /// gate withholds the tier, never the session (D-3).
     #[must_use]
     pub fn local_tier_available(&self) -> bool {
-        self.local_available && !self.local_gated.load(Ordering::SeqCst)
+        self.local_available.load(Ordering::SeqCst) && !self.local_gated.load(Ordering::SeqCst)
     }
 
     /// Whether the first-run consent flow applies to this daemon at all.
@@ -692,6 +724,34 @@ impl DaemonRuntime {
             ConsentOutcome::Superseded | ConsentOutcome::AlreadyInstalling { .. }
         ) {
             return;
+        }
+        // E-5: a scripted tier's engine is live from construction and owes
+        // nothing to the weights-install flow, so no install outcome may touch
+        // its gate. Without this, a `model/set` on a scripted daemon (whose
+        // build has no loader for the downloaded weights) would resolve to
+        // `InstalledNoEngine` and close a tier that is serving — permanently.
+        // Keyed on the *named* scripted flag, never on engine presence
+        // (LESSON-443).
+        if self.scripted_engine {
+            return;
+        }
+        // A `Ready` outcome *claims* the loader put a live, duty-passing engine
+        // in the slot — but the tier opens on the slot's own fact, not the
+        // claim. A loader that reported `Pass` without actually installing
+        // (LESSON-443's shape: a predicate that is only incidentally true)
+        // would otherwise latch `local_available` over an empty slot and wedge
+        // every local turn until restart. Only set here — `local_available`
+        // answers BR-8's "can it serve", which no other outcome establishes.
+        if outcome.local_tier_ready() {
+            self.local_available
+                .store(self.engine.present(), Ordering::SeqCst);
+        }
+        // A terminal load failure is memoized on the slot so the lifecycle
+        // replay reports "failed: <reason>" rather than a forever-"loading".
+        // Recorded here — not in the loader — so a loader that panicked (whose
+        // own recording code never ran) still leaves the truth behind.
+        if let ConsentOutcome::EngineLoadFailed { reason, .. } = outcome {
+            self.engine.record_load_failure(reason.clone());
         }
         self.local_gated
             .store(!outcome.local_tier_ready(), Ordering::SeqCst);
@@ -838,7 +898,17 @@ impl DaemonRuntime {
     #[must_use]
     pub fn lifecycle_events(&self) -> Vec<ModelLifecycle> {
         match &self.probe {
-            Some(probe) => startup_lifecycle(probe, self.engine.is_some(), &self.consent),
+            Some(probe) => startup_lifecycle(
+                probe,
+                // `ready` is claimed only for the model actually in the slot,
+                // and only while the tier would genuinely serve a turn — an
+                // engine that is live but gated (a later decision's install or
+                // load failed) must not be replayed as ready.
+                self.engine.model().filter(|_| self.local_tier_available()),
+                self.weights_loader_present,
+                self.engine.load_failure(),
+                &self.consent,
+            ),
             None => Vec::new(),
         }
     }
@@ -1029,7 +1099,7 @@ impl DaemonRuntime {
             if let Err(err) = &result {
                 if err.is_privacy_blocked() {
                     self.session_taint.mark(&session_id);
-                    if self.engine.is_none() {
+                    if !self.engine.present() {
                         return Err(RpcError::new(
                             error_code::PRIVACY_BLOCKED,
                             "this turn's content is under a local-only privacy boundary \
@@ -1189,14 +1259,18 @@ impl DaemonRuntime {
             .as_ref()
             .and_then(|pid| config.providers.iter().find(|p| p.id == pid.0));
 
+        // One read of the slot for the whole attempt: the engine this turn runs
+        // on is the engine that was live when the turn started, even if a
+        // consent outcome swaps the slot mid-turn.
+        let local_engine = self.engine.get();
         let is_local = match provider_cfg {
             Some(p) => matches!(p.kind, ProviderKind::Local),
             // No provider selected: fall back to the local tier if present.
-            None => self.engine.is_some(),
+            None => local_engine.is_some(),
         };
 
         if is_local {
-            let Some(engine) = self.engine.as_ref() else {
+            let Some(engine) = local_engine.as_ref() else {
                 return Err(HarnessError::Engine(EngineError::unavailable(
                     "no local tier configured",
                 )));
@@ -1248,7 +1322,7 @@ impl DaemonRuntime {
             source = source.with_phase(ph);
         }
 
-        let summarizer = self.engine.as_deref();
+        let summarizer = local_engine.as_deref();
         run_session_turn_with_source(
             &mut source,
             tools,
@@ -1635,7 +1709,9 @@ fn probe_local_tier(
 /// as they actually move.
 fn startup_lifecycle(
     probe: &ProbeResult,
-    engine_present: bool,
+    serving_model: Option<String>,
+    loader_present: bool,
+    load_failure: Option<String>,
     consent: &ModelConsentGate,
 ) -> Vec<ModelLifecycle> {
     let model_id = probe
@@ -1696,12 +1772,15 @@ fn startup_lifecycle(
         return lifecycle;
     }
 
-    // An engine is loaded and answering: `ready` is a fact, not a hope. Today
-    // that means a `TETON_LOCAL_SCRIPT` engine — which downloads nothing, which
-    // is exactly why it is not gated on a consent decision.
-    if engine_present {
+    // An engine is loaded, the tier will serve, and the caller named the model
+    // the slot actually holds: `ready` is a fact, not a hope — about that
+    // model, not the probe's boot-time pick, which a `model/set` may since
+    // have moved off. An engine that is live but *gated* arrives here as
+    // `None` and falls through to the consent-state branches, which describe
+    // the outstanding decision truthfully.
+    if let Some(serving) = serving_model {
         lifecycle.push(ModelLifecycle {
-            model_id,
+            model_id: serving,
             stage: ModelLifecycleStage::Ready,
         });
         return lifecycle;
@@ -1725,12 +1804,25 @@ fn startup_lifecycle(
                      until you answer; sessions run remote-only until then."
                 .to_owned(),
         }
+    } else if loader_present {
+        // Decided, downloaded, verified, and this build CAN load the weights —
+        // but the engine is not live yet. Either the startup load (deep verify →
+        // load → benchmark) is still in flight, or it already failed and left
+        // its reason behind. Both are "not serving right now", and each is
+        // reported as itself rather than as the loaderless build's untruth.
+        match load_failure {
+            Some(reason) => ModelLifecycleStage::Disabled { reason },
+            None => ModelLifecycleStage::Disabled {
+                reason: loading_local_engine_reason(&model_id),
+            },
+        }
     } else {
         // Decided, downloaded, verified — and unloadable, because nothing in this
-        // build constructs a local engine from installed weights (REQ-544 debt,
-        // tracked as AC-2). Saying `ready` here would be the exact untruth this
-        // function exists to stop. The reason is shared with the consent gate's
-        // install-time event (M-1) so the two can never drift apart.
+        // build constructs a local engine from installed weights (closing that
+        // gap is the `llama` feature, absent from this build). Saying `ready`
+        // here would be the exact untruth this function exists to stop. The
+        // reason is shared with the consent gate's install-time event (M-1) so
+        // the two can never drift apart.
         ModelLifecycleStage::Disabled {
             reason: no_local_engine_reason(&model_id),
         }
@@ -1812,12 +1904,113 @@ fn local_tier_gated(scripted_engine: bool, consent_required: bool) -> bool {
     consent_required && !scripted_engine
 }
 
+/// The daemon's one engine slot, shared between the runtime's serving path and
+/// the consent flow's post-verify loader.
+///
+/// A scripted engine occupies it from construction; a real weights engine
+/// arrives whenever the loader finishes — possibly minutes into the run, after
+/// an accepted install. The slot also remembers a failed load's reason, so the
+/// lifecycle replay can tell an attaching client what actually happened rather
+/// than guessing between "still loading" and "failed".
+/// A live engine tagged with the model id it serves.
+type TaggedEngine = (String, Arc<Mutex<dyn Engine>>);
+
+struct EngineSlot {
+    /// The live engine, tagged with the model it serves. The tag is what lets a
+    /// superseded flow evict **its own** engine without ever being able to evict
+    /// a successor's ([`Self::remove_if`]), and what lets the lifecycle replay
+    /// name the model actually loaded rather than the probe's boot-time pick.
+    engine: Mutex<Option<TaggedEngine>>,
+    load_failure: Mutex<Option<String>>,
+}
+
+impl EngineSlot {
+    /// An empty slot.
+    fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            engine: Mutex::new(None),
+            load_failure: Mutex::new(None),
+        })
+    }
+
+    /// Make `engine` the live engine serving `model_id`, clearing any recorded
+    /// load failure.
+    fn install(&self, model_id: String, engine: Arc<Mutex<dyn Engine>>) {
+        *self
+            .load_failure
+            .lock()
+            .expect("load-failure mutex poisoned") = None;
+        *self.engine.lock().expect("engine slot mutex poisoned") = Some((model_id, engine));
+    }
+
+    /// The live engine, if any.
+    fn get(&self) -> Option<Arc<Mutex<dyn Engine>>> {
+        self.engine
+            .lock()
+            .expect("engine slot mutex poisoned")
+            .as_ref()
+            .map(|(_, engine)| Arc::clone(engine))
+    }
+
+    /// The model the live engine serves, if one is live.
+    fn model(&self) -> Option<String> {
+        self.engine
+            .lock()
+            .expect("engine slot mutex poisoned")
+            .as_ref()
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Whether an engine is live.
+    fn present(&self) -> bool {
+        self.engine
+            .lock()
+            .expect("engine slot mutex poisoned")
+            .is_some()
+    }
+
+    /// Record why a load attempt left the slot empty.
+    ///
+    /// Single writer: [`DaemonRuntime::apply_consent_outcome`], on an
+    /// `EngineLoadFailed` outcome. Recording at the outcome rather than inside
+    /// the loader covers every failure shape the same way — a load error, a
+    /// failed duty, and a loader that panicked (whose own recording code never
+    /// ran) — so the replay can never claim "still loading" for a load that
+    /// terminally failed.
+    fn record_load_failure(&self, reason: String) {
+        *self
+            .load_failure
+            .lock()
+            .expect("load-failure mutex poisoned") = Some(reason);
+    }
+
+    /// The recorded reason the last load attempt failed, if one did.
+    fn load_failure(&self) -> Option<String> {
+        self.load_failure
+            .lock()
+            .expect("load-failure mutex poisoned")
+            .clone()
+    }
+}
+
+/// The replay-time explanation for verified weights whose load has not finished:
+/// the startup flow (deep verify → load → benchmark) is still in flight. Names
+/// the model but no path (BR-11).
+fn loading_local_engine_reason(model_id: &str) -> String {
+    format!(
+        "{model_id}'s weights are installed and verified; the daemon is loading and \
+         benchmarking them now — the local tier opens when that completes."
+    )
+}
+
 /// A constructed local engine, and what kind of engine it is (E-5).
 ///
 /// The kind travels with the engine because the consent flow's one exemption is
 /// about the *kind* — a scripted engine downloads nothing — and inferring it from
 /// "an engine exists" silently becomes wrong the day a real GGUF loader lands.
 struct LocalEngine {
+    /// The model id the engine serves (the slot's tag).
+    model_id: String,
     /// The engine the router will call.
     engine: Arc<Mutex<dyn Engine>>,
     /// Whether it replays canned replies from `TETON_LOCAL_SCRIPT` rather than
@@ -1828,9 +2021,10 @@ struct LocalEngine {
 /// Build the local engine when a scripted engine is configured and the probe did
 /// not disable the tier.
 ///
-/// A real weights-loading engine would be constructed here too, and would carry
-/// `scripted: false` — which is what would (correctly) keep the consent flow and
-/// its deep verification switched on for it.
+/// A real weights-loading engine is deliberately NOT constructed here: it enters
+/// through the consent flow's post-verify loader (`build_engine_loader`), so its
+/// bytes are digest-verified before the GGUF parser ever sees them — and so the
+/// consent flow and its deep verification stay switched on for it (E-5).
 fn build_local_engine(probe: &ProbeResult) -> Option<LocalEngine> {
     if probe.disabled {
         return None;
@@ -1840,11 +2034,154 @@ fn build_local_engine(probe: &ProbeResult) -> Option<LocalEngine> {
         .model
         .clone()
         .unwrap_or_else(|| "scripted-local".to_owned());
-    let engine = ScriptedFileEngine::from_file(model_id, Path::new(&script)).ok()?;
+    let engine = ScriptedFileEngine::from_file(model_id.clone(), Path::new(&script)).ok()?;
     Some(LocalEngine {
+        model_id,
         engine: Arc::new(Mutex::new(engine)) as Arc<Mutex<dyn Engine>>,
         scripted: true,
     })
+}
+
+/// Build the weights loader this build carries, or `None` when it carries none.
+///
+/// The `llama` feature is what makes verified installed bytes loadable at all;
+/// without it there is nothing to construct, and the consent gate's loaderless
+/// default keeps publishing the honest `disabled` after an install. A scripted
+/// tier also gets no loader: its engine is already live, and the consent flow —
+/// the only caller of a loader — does not apply to it (E-5). Neither condition
+/// feeds a gate: the gate stays keyed on `scripted_engine` and the consent
+/// state alone (LESSON-443).
+#[cfg(feature = "llama")]
+fn build_engine_loader(
+    slot: &Arc<EngineSlot>,
+    profile: &HardwareProfile,
+    base_dir: &Path,
+    scripted_engine: bool,
+) -> Option<Arc<dyn crate::model_consent::LocalEngineLoader>> {
+    if scripted_engine {
+        return None;
+    }
+    Some(Arc::new(LlamaEngineLoader {
+        slot: Arc::clone(slot),
+        base_dir: base_dir.to_owned(),
+        gpu: profile.gpu,
+        staged: Mutex::new(HashMap::new()),
+    }))
+}
+
+/// The loaderless build: no `llama` feature, nothing can load a GGUF.
+#[cfg(not(feature = "llama"))]
+fn build_engine_loader(
+    _slot: &Arc<EngineSlot>,
+    _profile: &HardwareProfile,
+    _base_dir: &Path,
+    _scripted_engine: bool,
+) -> Option<Arc<dyn crate::model_consent::LocalEngineLoader>> {
+    None
+}
+
+/// Generation context window for the local tier's engine, in **BPE tokens**.
+///
+/// Sized to cover the harness's context budget, which is denominated in a
+/// different currency: `HarnessConfig::context_budget_tokens` (4,096 for the
+/// weak-model profile) counts *whitespace-approximated* tokens
+/// ([`crate::harness::context`]'s `approx_tokens`), and source code tokenizes
+/// at roughly 2.5–4 BPE tokens per whitespace word. A window equal to the
+/// budget's number therefore overflows on exactly the inputs the tier exists
+/// for — a folded `read` of a real file killed the first dogfooded turn with
+/// "local engine could not serve the turn" — so the window is the budget's
+/// worst-case BPE expansion (~4×) plus generation headroom. Pathological
+/// content (minified single-line files) can still exceed it; the engine then
+/// returns a typed backend error rather than serving a truncated fiction.
+#[cfg(feature = "llama")]
+const LOCAL_ENGINE_N_CTX: u32 = 16_384;
+
+/// The real weights loader: llama.cpp behind the [`Engine`] trait (AC-2).
+///
+/// Called by the consent gate only after digest verification, on the blocking
+/// pool. Loads the GGUF from the shared install path convention, runs the BR-8
+/// micro-benchmark, and **stages** the duty-passing engine per model; the gate
+/// makes it live (`commit`) only after its post-load supersede re-check, or
+/// discards it (`abandon`). Staging is a per-model map so concurrent flows for
+/// different models can never clobber each other's staged engines, and only a
+/// committed flow ever touches the serving slot.
+#[cfg(feature = "llama")]
+struct LlamaEngineLoader {
+    slot: Arc<EngineSlot>,
+    base_dir: PathBuf,
+    gpu: GpuClass,
+    /// Loaded-and-measured engines awaiting the gate's commit/abandon verdict.
+    staged: Mutex<HashMap<String, Arc<Mutex<dyn Engine>>>>,
+}
+
+/// Strip any rendering of `path` out of a third-party error message (BR-11).
+///
+/// llama-cpp-2's load errors can echo the path they were given (e.g. its
+/// non-UTF-8 `PathToStrError` displays the full `PathBuf`), and this message is
+/// published on the event bus and memoized for replay — a resolved weights path
+/// must never ride either. Both the plain and the `Debug`-quoted renderings are
+/// scrubbed.
+#[cfg(feature = "llama")]
+fn without_path(message: &str, path: &Path) -> String {
+    message
+        .replace(&format!("{path:?}"), "<weights file>")
+        .replace(&path.display().to_string(), "<weights file>")
+}
+
+#[cfg(feature = "llama")]
+impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
+    fn load(&self, model_name: &str) -> Result<crate::model_consent::EngineLoadReport, String> {
+        use teton_inference::{default_prompts, run_benchmark, DutySpec, LlamaEngine};
+
+        let path = teton_protocol::weights::weights_path(&self.base_dir, model_name);
+        // Offload every layer on a GPU-classed machine (Metal / CUDA); CPU-only
+        // machines run all layers on the CPU.
+        let gpu_layers = match self.gpu {
+            GpuClass::AppleSilicon | GpuClass::Cuda => u32::MAX,
+            GpuClass::Cpu => 0,
+        };
+        let engine =
+            LlamaEngine::load(model_name, &path, gpu_layers, LOCAL_ENGINE_N_CTX).map_err(|e| {
+                format!(
+                    "{model_name}'s weights could not be loaded: {}",
+                    without_path(&e.to_string(), &path)
+                )
+            })?;
+
+        let benchmark = run_benchmark(&engine, &default_prompts(), &GenParams::default())
+            .map_err(|e| format!("{model_name} loaded but failed its benchmark: {e}"))?;
+        let duty = DutySpec::default().evaluate(&benchmark);
+
+        // A passing engine is STAGED, not made live: the gate re-checks the
+        // recorded decision after this returns and only then commits. A failing
+        // one is dropped here (unmapping the weights); the failure memo is
+        // recorded by `apply_consent_outcome` from the outcome this becomes.
+        if duty.is_pass() {
+            self.staged.lock().expect("staged map poisoned").insert(
+                model_name.to_owned(),
+                Arc::new(Mutex::new(engine)) as Arc<Mutex<dyn Engine>>,
+            );
+        }
+        Ok(crate::model_consent::EngineLoadReport { benchmark, duty })
+    }
+
+    fn commit(&self, model_name: &str) {
+        let staged = self
+            .staged
+            .lock()
+            .expect("staged map poisoned")
+            .remove(model_name);
+        if let Some(engine) = staged {
+            self.slot.install(model_name.to_owned(), engine);
+        }
+    }
+
+    fn abandon(&self, model_name: &str) {
+        self.staged
+            .lock()
+            .expect("staged map poisoned")
+            .remove(model_name);
+    }
 }
 
 /// The Anthropic Messages API version header value the credential layer injects
@@ -2466,6 +2803,52 @@ mod tests {
             local_tier_gated(false, true),
             "a real engine must not un-gate the tier before the user has decided"
         );
+    }
+
+    /// A `Ready` outcome opens the tier on the slot's *fact*, not the loader's
+    /// claim: with nothing actually live, `local_available` must stay false —
+    /// a loader that reported `Pass` without installing would otherwise wedge
+    /// every local turn against an empty slot until restart.
+    #[test]
+    fn a_ready_outcome_with_an_empty_slot_does_not_open_the_tier() {
+        use teton_core::entities::{ModelSelection, SelectionSource};
+        let runtime = DaemonRuntime::minimal();
+        assert!(
+            !runtime.engine.present(),
+            "minimal starts with an empty slot"
+        );
+        runtime.apply_consent_outcome(&ConsentOutcome::Ready {
+            selection: ModelSelection::accepted("m", SelectionSource::Probe, 1),
+        });
+        assert!(
+            !runtime.local_available.load(Ordering::SeqCst),
+            "an empty slot must not be reported capable, whatever the outcome claims"
+        );
+        assert!(!runtime.local_tier_available());
+    }
+
+    /// E-5: a scripted tier's engine owes nothing to the weights-install flow,
+    /// so no install outcome may close (or open) its gate — a `model/set` on a
+    /// scripted daemon resolving to `InstalledNoEngine` must leave the live
+    /// tier serving.
+    #[test]
+    fn install_outcomes_never_touch_a_scripted_tier_s_gate() {
+        let mut runtime = DaemonRuntime::minimal();
+        runtime.scripted_engine = true;
+        let outcome = ConsentOutcome::InstalledNoEngine {
+            model_name: "m".to_owned(),
+        };
+        runtime.apply_consent_outcome(&outcome);
+        assert!(
+            !runtime.local_gated.load(Ordering::SeqCst),
+            "an install outcome closed a scripted tier's gate"
+        );
+
+        // The contrast case: the same outcome on a non-scripted runtime keeps
+        // the tier withheld, exactly as before.
+        let plain = DaemonRuntime::minimal();
+        plain.apply_consent_outcome(&outcome);
+        assert!(plain.local_gated.load(Ordering::SeqCst));
     }
 
     /// DECISION 3 / E-6: the master switch is a debug-build affordance, and a
