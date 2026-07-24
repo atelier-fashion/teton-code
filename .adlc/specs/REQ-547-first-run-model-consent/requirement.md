@@ -345,10 +345,15 @@ sessions; the first three are chipped as background tasks:
 - **Local inference off tokio workers** — `LocalEngineSource::produce_turn` and
   `summarize_if_large` call the engine synchronously inside async tasks; with a
   real `LlamaEngine` a few concurrent local turns can stall the whole daemon.
-- **Token-currency mismatch** — harness context budgets are whitespace-approx
+- **Token-currency mismatch** — ~~harness context budgets are whitespace-approx
   tokens, the engine window is BPE (~2.5–4× denser for code); the summarizer's
   input is unbounded and its engine-failure fallback is silent. The 16,384
-  window covers the default budget's worst case but is a sizing, not a fix.
+  window covers the default budget's worst case but is a sizing, not a fix.~~
+  **Resolved 2026-07-24 (PR #5, `505775b`)**: the assembled context and the
+  summarizer input are now bounded in bytes (the conservative BPE proxy —
+  `HarnessConfig::context_budget_bytes`, `SUMMARIZER_INPUT_MAX_BYTES`); the
+  summarizer's engine-failure fallback is mechanical truncation, reported on
+  `SummarizeOutcome` and logged by the turn loop, never silent raw folding.
 - **Cross-process AC-2 e2e** — the socket-level suite cannot exercise
   install → load → benchmark → ready → local session without a
   `TETON_TEST_SEAMS`-gated fake loader.

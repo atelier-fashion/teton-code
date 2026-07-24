@@ -65,6 +65,11 @@
       "phase": 8,
       "name": "Post-close: engine wiring (AC-2/AC-13) merged via PR #3",
       "completedAt": "2026-07-24T20:13:37Z"
+    },
+    {
+      "phase": 8,
+      "name": "Post-close: harness byte-bounding (deferred token-currency item) merged via PR #5",
+      "completedAt": "2026-07-24T20:27:00Z"
     }
   ],
   "integrationBranch": "main",

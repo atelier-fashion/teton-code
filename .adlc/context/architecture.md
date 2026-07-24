@@ -227,5 +227,9 @@ assert is reachable (LESSON-444).
 **Consequences**: every boot re-verifies and re-benchmarks before the tier opens
 (~tens of seconds for large models — a caching policy is deferred); the harness's
 context budgets and the engine window must be kept currency-compatible
-(LESSON-446); default/CI builds compile none of this and keep the loaderless
+(LESSON-446) — enforced since PR #5 by byte-denominated twins on every harness
+budget (`HarnessConfig::context_budget_bytes`, `SUMMARIZER_INPUT_MAX_BYTES`),
+with the summarizer's engine-failure fallback degrading to bounded mechanical
+truncation, reported and logged, never a silent raw fold (LESSON-447);
+default/CI builds compile none of this and keep the loaderless
 honest-`disabled` behavior.
