@@ -1,7 +1,7 @@
 ---
 id: REQ-547
 title: "First-run local model consent: show the hardware-based pick, let the user override, then install"
-status: approved
+status: complete
 deployable: true
 created: 2026-07-21
 updated: 2026-07-21
