@@ -27,6 +27,8 @@ use teton_protocol::jsonrpc::{Id, Response, RpcError};
 use teton_protocol::methods::{self, RpcMethod};
 use teton_protocol::{ClientKind, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
 
+use crate::firstrun;
+use crate::model_ui;
 use crate::prompt::Prompter;
 use crate::render::{LineKind, Surface};
 use crate::session_ui::{self, EventOutcome, SessionState};
@@ -58,6 +60,14 @@ pub struct UiContext<'a> {
     /// only render them — the daemon broadcasts a permission request to every
     /// attached client, but only the owning interactive session should reply.
     pub answer_permissions: bool,
+    /// Whether this command should answer a local-model proposal (REQ-547 BR-1).
+    /// Same rule as `answer_permissions`, and for the same reason: the proposal
+    /// is broadcast to every attached client, but only an interactive session
+    /// asks the user. Other commands render it and leave it alone.
+    pub answer_model_proposals: bool,
+    /// Explicit opt-in auto-accept (BR-5 / AC-5): answer a proposal with `accept`
+    /// and read no user input at all. Off unless `--yes` was passed.
+    pub auto_accept_model: bool,
 }
 
 /// One message read off the socket.
@@ -197,6 +207,84 @@ impl Connection {
                         "permission requested for tool `{}` in another session",
                         req.tool_name
                     ),
+                );
+            }
+            EventOutcome::ModelProposal(proposal) if ctx.answer_model_proposals => {
+                if ctx.state.claim_model_proposal(&proposal.request_id) {
+                    if let Some(reply) = model_ui::resolve_proposal(
+                        &proposal,
+                        ctx.auto_accept_model,
+                        &mut *ctx.surface,
+                        &mut *ctx.prompter,
+                    ) {
+                        // Fire-and-forget, exactly like a permission answer: the
+                        // ack returns later as a stray response and is ignored.
+                        // Awaiting it here would re-enter the event pump from
+                        // inside an event dispatch.
+                        self.send(reply)?;
+                    }
+                }
+            }
+            EventOutcome::ModelProposal(proposal) => {
+                // Not our prompt to answer, but very much worth seeing: this is
+                // why the local tier is unavailable (BR-1/BR-2).
+                firstrun::render_proposal(&proposal, &mut *ctx.surface);
+                ctx.surface.line(
+                    LineKind::Notice,
+                    "answer this prompt from an interactive `teton` session.",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Find and answer a proposal that was raised before this client attached.
+    ///
+    /// TASK-004 broadcasts `model_selection_proposed` exactly once and never
+    /// replays it, so a client that connects afterwards would wait forever for an
+    /// event it already missed. `model/status` is the recovery path: it reports
+    /// `pending_request_id` for any proposal still outstanding, and `model/list`
+    /// supplies the machine and catalog needed to render a real choice.
+    ///
+    /// Failures are deliberately quiet — an older daemon without the methods, or
+    /// a status call that errors, must not stop a session from starting; the
+    /// local tier simply stays gated (BR-1).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the connection drops.
+    pub fn answer_outstanding_model_proposal(&mut self, ctx: &mut UiContext) -> anyhow::Result<()> {
+        if !ctx.answer_model_proposals {
+            return Ok(());
+        }
+        let Ok(status) = self.call(methods::ModelStatusParams::default(), ctx)? else {
+            return Ok(());
+        };
+        let Some(request_id) = status.pending_request_id else {
+            return Ok(());
+        };
+        // The live event may have arrived first; a proposal is answered once.
+        if !ctx.state.claim_model_proposal(&request_id) {
+            return Ok(());
+        }
+        let Ok(list) = self.call(methods::ModelListParams::default(), ctx)? else {
+            return Ok(());
+        };
+        let reply = model_ui::resolve_outstanding(
+            &request_id,
+            &list,
+            ctx.auto_accept_model,
+            &mut *ctx.surface,
+            &mut *ctx.prompter,
+        );
+        if let Some(reply) = reply {
+            // Not inside an event dispatch here, so the answer is sent as a real
+            // call: a refusal (an unknown name, or a missing second confirmation)
+            // leaves the proposal open and deserves to be shown, not swallowed.
+            if let Err(err) = self.call(reply, ctx)? {
+                ctx.surface.line(
+                    LineKind::Error,
+                    &format!("the daemon refused the model choice: {}", err.message),
                 );
             }
         }

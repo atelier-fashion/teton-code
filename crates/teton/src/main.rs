@@ -17,8 +17,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use teton_protocol::jsonrpc::error_code;
 use teton_protocol::methods::{
-    ConfigGetParams, ConfigSetParams, ConfigUpdate, CostQueryParams, PrivacyBoundaryConfig,
-    PromptBlock, PromptTurnParams, ProviderConfig, RoutingRule, SessionCreateParams,
+    ConfigGetParams, ConfigSetParams, ConfigUpdate, CostQueryParams, ModelListParams,
+    ModelSetParams, ModelStatusParams, PrivacyBoundaryConfig, PromptBlock, PromptTurnParams,
+    ProviderConfig, RoutingRule, SessionCreateParams,
 };
 use teton_protocol::{Phase, PrivacyMode, ProviderId, ProviderKind, SessionMode};
 
@@ -26,6 +27,7 @@ mod client;
 mod cost_ui;
 mod firstrun;
 mod keychain;
+mod model_ui;
 mod prompt;
 mod render;
 mod session_ui;
@@ -46,6 +48,13 @@ use teton_protocol::socket_path::{self, DaemonPaths};
     long_about = None,
 )]
 struct Cli {
+    /// Answer the first-run local-model prompt with "accept" and read no input
+    /// (REQ-547 BR-5): the explicit opt-in for unattended/CI runs. Also supplies
+    /// the second confirmation `teton model set` needs for a model above this
+    /// machine's RAM floor (BR-3).
+    #[arg(long, short = 'y', global = true)]
+    yes: bool,
+
     /// The subcommand to run; omit to open an interactive session.
     #[command(subcommand)]
     command: Option<Command>,
@@ -72,10 +81,31 @@ enum Command {
         #[command(subcommand)]
         action: PolicyAction,
     },
+    /// Inspect and change the local model (AC-9).
+    Model {
+        /// The model action.
+        #[command(subcommand)]
+        action: ModelAction,
+    },
     /// Show the cost meter: total, per-phase attribution, and savings estimate.
     Cost,
     /// Diagnose the daemon, socket, model state, and providers.
     Doctor,
+}
+
+/// `teton model …` (AC-9)
+#[derive(Debug, Subcommand)]
+enum ModelAction {
+    /// Show the catalog, each entry's fit for this machine, and the selection.
+    List,
+    /// Change the selected model. A model above this machine's RAM floor needs a
+    /// second confirmation (BR-3) — interactively, or with `--yes`.
+    Set {
+        /// Catalog name to switch to (see `teton model list`).
+        name: String,
+    },
+    /// Report the recorded decision and the weights' install state.
+    Status,
 }
 
 /// `teton provider …`
@@ -206,9 +236,14 @@ fn main() -> ExitCode {
     let paths = socket_path::daemon_paths();
 
     let result = match cli.command {
-        None => run_session(&paths),
+        None => run_session(&paths, cli.yes),
         Some(Command::Doctor) => run_doctor(&paths),
         Some(Command::Cost) => run_cost(&paths),
+        Some(Command::Model { action }) => match action {
+            ModelAction::List => run_model_list(&paths),
+            ModelAction::Set { name } => run_model_set(&paths, &name, cli.yes),
+            ModelAction::Status => run_model_status(&paths),
+        },
         Some(Command::Provider { action }) => match action {
             ProviderAction::Add { id, kind, endpoint } => {
                 run_provider_add(&paths, &id, kind.into(), endpoint)
@@ -239,7 +274,11 @@ fn main() -> ExitCode {
 }
 
 /// The default experience: an interactive freeform session (AC-1).
-fn run_session(paths: &DaemonPaths) -> anyhow::Result<()> {
+///
+/// This is the client that owns the first-run model prompt: it answers permission
+/// requests and model proposals, and `auto_accept` (`--yes`) makes the latter
+/// unattended (BR-5).
+fn run_session(paths: &DaemonPaths, auto_accept: bool) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
@@ -251,7 +290,14 @@ fn run_session(paths: &DaemonPaths) -> anyhow::Result<()> {
             state: &mut state,
             prompter: &mut prompter,
             answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: auto_accept,
         };
+
+        // A proposal raised before this client attached is never replayed as an
+        // event (REQ-547 TASK-004), so look for one before doing anything else —
+        // otherwise the local tier would stay gated with no visible reason.
+        conn.answer_outstanding_model_proposal(&mut ctx)?;
 
         let created = conn.call(
             SessionCreateParams {
@@ -331,12 +377,7 @@ fn query_and_render_cost(
     prompter: &mut dyn Prompter,
 ) -> anyhow::Result<()> {
     let result = {
-        let mut ctx = UiContext {
-            surface: &mut *surface,
-            state: &mut *state,
-            prompter: &mut *prompter,
-            answer_permissions: false,
-        };
+        let mut ctx = passive_ctx(&mut *surface, &mut *state, &mut *prompter);
         conn.call(CostQueryParams::default(), &mut ctx)?
     };
     match result {
@@ -349,6 +390,182 @@ fn query_and_render_cost(
         Err(err) => surface.line(
             LineKind::Error,
             &format!("cost query failed: {}", err.message),
+        ),
+    }
+    Ok(())
+}
+
+/// A context for a one-shot command: it renders the daemon's broadcasts but
+/// answers nothing. Permission requests and model proposals belong to whichever
+/// interactive session owns them — a `teton cost` running in another terminal
+/// must not silently answer a prompt the user is looking at elsewhere.
+fn passive_ctx<'a>(
+    surface: &'a mut dyn Surface,
+    state: &'a mut SessionState,
+    prompter: &'a mut dyn Prompter,
+) -> UiContext<'a> {
+    UiContext {
+        surface,
+        state,
+        prompter,
+        answer_permissions: false,
+        answer_model_proposals: false,
+        auto_accept_model: false,
+    }
+}
+
+/// `teton model list`: the catalog, each entry's fit, and the selection (AC-9).
+fn run_model_list(paths: &DaemonPaths) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    match conn.call(ModelListParams::default(), &mut ctx)? {
+        Ok(list) => model_ui::render_list(&list, ctx.surface),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
+            LineKind::Notice,
+            "this daemon build does not expose model/list yet.",
+        ),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("could not read the model catalog: {}", err.message),
+        ),
+    }
+    Ok(())
+}
+
+/// `teton model set <name>`: change the selection post-first-run (AC-9).
+///
+/// The BR-3 second confirmation is applied here too, and for the same reason it
+/// exists in the first-run prompt: an above-RAM-floor pick is the user's call but
+/// must never happen by accident. The fit comes from `model/list` (the daemon
+/// computes it), and the daemon independently refuses the change unless
+/// `confirmed_above_ram_floor` is set — this is the legible half of that guard,
+/// not the guard itself.
+fn run_model_set(paths: &DaemonPaths, name: &str, assume_yes: bool) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+
+    let list = match conn.call(ModelListParams::default(), &mut ctx)? {
+        Ok(list) => list,
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
+            ctx.surface.line(
+                LineKind::Notice,
+                "this daemon build does not expose model/list yet, so the choice cannot be \
+                 checked against this machine.",
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!("could not read the model catalog: {}", err.message),
+            );
+            return Ok(());
+        }
+    };
+
+    let Some(model) = list.models.iter().find(|m| m.entry.name == name) else {
+        let names: Vec<&str> = list.models.iter().map(|m| m.entry.name.as_str()).collect();
+        ctx.surface.line(
+            LineKind::Error,
+            &format!(
+                "no catalog entry named `{name}`. Available: {}",
+                names.join(", ")
+            ),
+        );
+        return Ok(());
+    };
+
+    // BR-3: above this machine's RAM floor needs an explicit second answer.
+    let above_floor = model.entry.ram_floor_bytes > list.probe.total_ram_bytes;
+    if above_floor && !assume_yes {
+        let confirmed = model_ui::confirm_above_ram_floor(
+            name,
+            model.entry.ram_floor_bytes,
+            list.probe.total_ram_bytes,
+            &mut *ctx.surface,
+            &mut *ctx.prompter,
+        );
+        if !confirmed {
+            ctx.surface.line(
+                LineKind::Notice,
+                &format!("selection unchanged; `{name}` was not sent."),
+            );
+            return Ok(());
+        }
+    } else if above_floor {
+        ctx.surface.line(
+            LineKind::Notice,
+            &format!(
+                "`{name}` needs more RAM than this machine has; --yes supplies the second \
+                 confirmation (BR-3)."
+            ),
+        );
+    }
+
+    let params = ModelSetParams {
+        name: name.to_owned(),
+        confirmed_above_ram_floor: above_floor,
+    };
+    match conn.call(params, &mut ctx)? {
+        Ok(result) => {
+            let source = firstrun::source_label(result.selection.source);
+            ctx.surface.line(
+                LineKind::Info,
+                &format!(
+                    "selection: {} ({source}) — the daemon installs the weights if they are \
+                     missing.",
+                    result.selection.model_name.as_deref().unwrap_or(name)
+                ),
+            );
+        }
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
+            LineKind::Notice,
+            "this daemon build does not expose model/set yet.",
+        ),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("the daemon refused the change: {}", err.message),
+        ),
+    }
+    Ok(())
+}
+
+/// `teton model status`: the decision, the install state, and where the weights
+/// live (AC-9).
+///
+/// The path is derived here from the daemon state directory rather than received:
+/// `InstallStateView` carries no path, because BR-11 keeps absolute filesystem
+/// paths out of every protocol payload. Showing it locally is explicitly allowed.
+fn run_model_status(paths: &DaemonPaths) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    match conn.call(ModelStatusParams::default(), &mut ctx)? {
+        Ok(status) => {
+            let base_dir = paths.socket.parent();
+            let path = match (base_dir, status.install.as_ref()) {
+                (Some(base), Some(install)) => {
+                    Some(model_ui::weights_path(base, &install.model_name))
+                }
+                _ => None,
+            };
+            model_ui::render_status(&status, path.as_deref(), ctx.surface);
+        }
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
+            LineKind::Notice,
+            "this daemon build does not expose model/status yet.",
+        ),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("could not read the model status: {}", err.message),
         ),
     }
     Ok(())
@@ -376,12 +593,7 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
                 );
                 let mut state = SessionState::new();
                 let mut prompter = StdinPrompter::new();
-                let mut ctx = UiContext {
-                    surface: &mut surface,
-                    state: &mut state,
-                    prompter: &mut prompter,
-                    answer_permissions: false,
-                };
+                let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
                 match conn.call(ConfigGetParams::default(), &mut ctx)? {
                     Ok(cfg) => render_config(&cfg.snapshot.providers, ctx.surface),
                     Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
@@ -453,12 +665,7 @@ fn run_provider_add(
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
-    let mut ctx = UiContext {
-        surface: &mut surface,
-        state: &mut state,
-        prompter: &mut prompter,
-        answer_permissions: false,
-    };
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
 
     let params = ConfigSetParams {
         update: ConfigUpdate::RegisterProvider(config),
@@ -497,12 +704,7 @@ fn run_provider_list(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
-    let mut ctx = UiContext {
-        surface: &mut surface,
-        state: &mut state,
-        prompter: &mut prompter,
-        answer_permissions: false,
-    };
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
     match conn.call(ConfigGetParams::default(), &mut ctx)? {
         Ok(cfg) => render_config(&cfg.snapshot.providers, ctx.surface),
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
@@ -523,12 +725,7 @@ fn run_boundary_add(paths: &DaemonPaths, glob: String, mode: PrivacyMode) -> any
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
-    let mut ctx = UiContext {
-        surface: &mut surface,
-        state: &mut state,
-        prompter: &mut prompter,
-        answer_permissions: false,
-    };
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
     let params = ConfigSetParams {
         update: ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
             path_glob: glob.clone(),
@@ -561,12 +758,7 @@ fn run_boundary_list(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
-    let mut ctx = UiContext {
-        surface: &mut surface,
-        state: &mut state,
-        prompter: &mut prompter,
-        answer_permissions: false,
-    };
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
     match conn.call(ConfigGetParams::default(), &mut ctx)? {
         Ok(cfg) => {
             if cfg.snapshot.privacy.is_empty() {
@@ -611,12 +803,7 @@ fn run_policy_set(
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
-    let mut ctx = UiContext {
-        surface: &mut surface,
-        state: &mut state,
-        prompter: &mut prompter,
-        answer_permissions: false,
-    };
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
     let params = ConfigSetParams {
         update: ConfigUpdate::SetRoutingRule(RoutingRule {
             phase,
@@ -651,12 +838,7 @@ fn run_policy_show(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
-    let mut ctx = UiContext {
-        surface: &mut surface,
-        state: &mut state,
-        prompter: &mut prompter,
-        answer_permissions: false,
-    };
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
     match conn.call(ConfigGetParams::default(), &mut ctx)? {
         Ok(cfg) => {
             if cfg.snapshot.routing.is_empty() {
@@ -801,6 +983,47 @@ mod tests {
             parse(&["teton", "cost"]).command,
             Some(Command::Cost)
         ));
+    }
+
+    #[test]
+    fn auto_accept_is_off_by_default_and_settable_on_either_side_of_a_subcommand() {
+        // BR-5: prompting is the default for an interactive client; the
+        // unattended path is explicit opt-in.
+        assert!(!parse(&["teton"]).yes);
+        assert!(parse(&["teton", "--yes"]).yes);
+        assert!(parse(&["teton", "-y"]).yes);
+        // `global = true` so it works after a subcommand too (`teton model set
+        // <name> --yes` is where BR-3's second confirmation is supplied).
+        assert!(parse(&["teton", "model", "set", "qwen2.5-coder-7b", "--yes"]).yes);
+        assert!(!parse(&["teton", "model", "list"]).yes);
+    }
+
+    #[test]
+    fn model_subcommands_parse() {
+        assert!(matches!(
+            parse(&["teton", "model", "list"]).command,
+            Some(Command::Model {
+                action: ModelAction::List
+            })
+        ));
+        assert!(matches!(
+            parse(&["teton", "model", "status"]).command,
+            Some(Command::Model {
+                action: ModelAction::Status
+            })
+        ));
+        match parse(&["teton", "model", "set", "qwen2.5-coder-3b"]).command {
+            Some(Command::Model {
+                action: ModelAction::Set { name },
+            }) => assert_eq!(name, "qwen2.5-coder-3b"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_set_requires_a_name_and_rejects_unknown_actions() {
+        assert!(Cli::try_parse_from(["teton", "model", "set"]).is_err());
+        assert!(Cli::try_parse_from(["teton", "model", "nonsense"]).is_err());
     }
 
     #[test]

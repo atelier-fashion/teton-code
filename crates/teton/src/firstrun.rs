@@ -1,16 +1,26 @@
-//! The zero-config first-run experience (AC-1, AC-8 visibility).
+//! The first-run experience: the consent proposal and the model lifecycle.
 //!
-//! On a fresh machine the daemon runs the local-model lifecycle — hardware
-//! probe, model download, post-download micro-benchmark, ready/step-down — and
-//! broadcasts each step as a `model_lifecycle` event (BR-9). The CLI's whole job
-//! here is to make that legible: render the probe summary, a live download
-//! progress bar, and the benchmark result, so the user watches the machine set
-//! itself up rather than staring at a silent prompt.
+//! On a fresh machine the daemon probes the hardware, proposes a local model,
+//! and **waits** (REQ-547 BR-1) — nothing is downloaded until a client answers.
+//! This module renders that proposal with every element BR-2 demands (detected
+//! RAM, free disk, GPU class, the chosen band, the plain-language reason, and the
+//! proposed model's download size and RAM floor, plus the selectable
+//! alternatives), because a bare model name is not consent. Collecting the answer
+//! is [`crate::model_ui`]'s job; this module is rendering plus the accept/reject
+//! question itself.
 //!
-//! The rendering is a pure function of the [`ModelLifecycleStage`], so it is
-//! table-tested against scripted stages with no daemon and no model.
+//! Once a decision is in, the daemon runs the rest of the lifecycle — download,
+//! post-download micro-benchmark, ready/step-down — and broadcasts each step as a
+//! `model_lifecycle` event (REQ-544 BR-9), which is made legible here too.
+//!
+//! Every function is a pure function of a protocol payload rendered through the
+//! [`Surface`] seam, so all of it is table-tested against scripted events with no
+//! daemon and no model.
 
-use teton_protocol::events::ModelLifecycleStage;
+use teton_protocol::events::{
+    CatalogEntryView, ChosenBand, GpuClass, ModelLifecycleStage, ModelSelectionDecided,
+    ModelSelectionProposed, ProbeReportView, SelectionSource, TierBand,
+};
 
 use crate::prompt::Prompter;
 use crate::render::{LineKind, Surface};
@@ -100,11 +110,188 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Ask the user to confirm a proposed model download. Zero-config first run
-/// (AC-1) auto-proceeds without a gate, so this backs an opt-in confirm flow
-/// that activates once a daemon download-consent hook exists; it is exercised by
-/// tests today. An empty answer or a leading `y` means yes; EOF means no.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Render a `model_selection_proposed` event in full (BR-2).
+///
+/// Every element the rule names is shown — the detected hardware, the band and
+/// the sentence explaining it, the proposed model with its download size and RAM
+/// floor, and every alternative the user may pick instead — because legibility
+/// *is* the consent: a user cannot meaningfully accept a multi-gigabyte download
+/// they were shown only the name of.
+pub fn render_proposal(proposal: &ModelSelectionProposed, surface: &mut dyn Surface) {
+    surface.line(
+        LineKind::Prompt,
+        "a local model is proposed for this machine:",
+    );
+    render_probe(&proposal.probe, surface);
+
+    match &proposal.proposed {
+        Some(proposed) => {
+            let entry = &proposed.entry;
+            surface.line(
+                LineKind::Info,
+                &format!(
+                    "  proposed: {} [{}] — {} download, needs {} RAM, {} free disk to install",
+                    entry.name,
+                    tier_label(entry.band),
+                    format_bytes(entry.size_bytes),
+                    format_bytes(entry.ram_floor_bytes),
+                    format_bytes(proposed.required_disk_bytes),
+                ),
+            );
+        }
+        None => surface.line(
+            LineKind::Info,
+            "  proposed: none — no catalog entry fits this machine; you may still pick one below.",
+        ),
+    }
+
+    render_alternatives(
+        &proposal.alternatives,
+        proposal.probe.total_ram_bytes,
+        surface,
+    );
+    surface.line(
+        LineKind::Notice,
+        "nothing is downloaded until you answer (BR-1).",
+    );
+}
+
+/// Render the probe's reasoning: the hardware it measured, the band it chose,
+/// and the plain-language sentence explaining the choice (BR-2).
+///
+/// Shared by the proposal and by `teton model list`, so the machine is described
+/// the same way wherever it is described.
+pub fn render_probe(probe: &ProbeReportView, surface: &mut dyn Surface) {
+    surface.line(
+        LineKind::Info,
+        &format!(
+            "  hardware: {} RAM, {} free disk, {} acceleration",
+            format_bytes(probe.total_ram_bytes),
+            format_bytes(probe.free_disk_bytes),
+            gpu_label(probe.gpu_class),
+        ),
+    );
+    surface.line(
+        LineKind::Info,
+        &format!(
+            "  band:     {} — {}",
+            band_label(probe.chosen_band),
+            probe.reason
+        ),
+    );
+}
+
+/// Render the numbered list of entries the user may choose instead (BR-3).
+pub fn render_alternatives(
+    alternatives: &[CatalogEntryView],
+    total_ram_bytes: u64,
+    surface: &mut dyn Surface,
+) {
+    if alternatives.is_empty() {
+        surface.line(
+            LineKind::Info,
+            "  alternatives: none — the catalog offers nothing else.",
+        );
+        return;
+    }
+    surface.line(LineKind::Info, "  alternatives:");
+    for (index, entry) in alternatives.iter().enumerate() {
+        surface.line(
+            LineKind::Info,
+            &format!(
+                "    {}. {}",
+                index + 1,
+                entry_summary(entry, total_ram_bytes)
+            ),
+        );
+    }
+}
+
+/// One catalog entry as a single line, annotated with its fit for this machine.
+///
+/// An entry above the machine's RAM is shown rather than hidden (BR-3: the user's
+/// machine is the user's call) but is labelled so the extra confirmation it needs
+/// is never a surprise.
+#[must_use]
+pub fn entry_summary(entry: &CatalogEntryView, total_ram_bytes: u64) -> String {
+    let fit = if entry.ram_floor_bytes > total_ram_bytes {
+        " — ABOVE this machine's RAM"
+    } else {
+        ""
+    };
+    format!(
+        "{} [{}] — {} download, needs {} RAM{fit}",
+        entry.name,
+        tier_label(entry.band),
+        format_bytes(entry.size_bytes),
+        format_bytes(entry.ram_floor_bytes),
+    )
+}
+
+/// One-line summary of a recorded decision (`model_selection_decided`).
+#[must_use]
+pub fn format_decided(decided: &ModelSelectionDecided) -> String {
+    let source = source_label(decided.source);
+    if decided.declined_local {
+        return format!("local tier declined ({source}) — sessions run remote-only.");
+    }
+    match &decided.model_name {
+        Some(name) => format!("local model {name} selected ({source})."),
+        // `model_name` is `None` exactly when declined, so this is a daemon that
+        // sent neither — say so plainly rather than inventing a model.
+        None => format!("model selection recorded with no model ({source})."),
+    }
+}
+
+/// Wire-name label for a detected accelerator class.
+#[must_use]
+pub fn gpu_label(class: GpuClass) -> &'static str {
+    match class {
+        GpuClass::AppleSilicon => "apple-silicon",
+        GpuClass::Cuda => "cuda",
+        GpuClass::Cpu => "cpu",
+    }
+}
+
+/// Wire-name label for the band the probe chose for this machine.
+#[must_use]
+pub fn band_label(band: ChosenBand) -> &'static str {
+    match band {
+        ChosenBand::None => "none (below the local-tier floor)",
+        ChosenBand::Small => "small",
+        ChosenBand::Mid => "mid",
+        ChosenBand::Large => "large",
+    }
+}
+
+/// Wire-name label for the band a catalog entry serves.
+#[must_use]
+pub fn tier_label(band: TierBand) -> &'static str {
+    match band {
+        TierBand::Small => "small",
+        TierBand::Mid => "mid",
+        TierBand::Large => "large",
+    }
+}
+
+/// Wire-name label for where a decision came from.
+#[must_use]
+pub fn source_label(source: SelectionSource) -> &'static str {
+    match source {
+        SelectionSource::Probe => "accepted the proposal",
+        SelectionSource::UserOverride => "user override",
+        SelectionSource::ConfigPin => "config pin",
+        SelectionSource::AutoAccept => "auto-accept",
+    }
+}
+
+/// Ask the user to confirm the proposed model (BR-1's explicit decision).
+///
+/// Written for REQ-544 and left unwired until REQ-547 gave the daemon a consent
+/// hook to answer; [`crate::model_ui::resolve_proposal`] now drives it. An empty
+/// answer or a leading `y` means yes; EOF means no — and a "no" here opens the
+/// override menu rather than declining the local tier, so backing out of the
+/// default can never be misread as declining local inference altogether.
 #[must_use]
 pub fn confirm_model(model_id: &str, size: Option<u64>, prompter: &mut dyn Prompter) -> bool {
     let size_hint = size.map_or_else(String::new, |b| format!(" ({})", format_bytes(b)));
@@ -121,6 +308,7 @@ pub fn confirm_model(model_id: &str, size: Option<u64>, prompter: &mut dyn Promp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_ui::testing::{entry, proposal};
     use crate::prompt::ScriptedPrompter;
     use crate::render::{LineKind, RecordingSurface};
 
@@ -184,6 +372,125 @@ mod tests {
         assert!(surface.any_line_contains(LineKind::Notice, "ready"));
         assert!(surface.any_line_contains(LineKind::Notice, "stepped down 7b → 3b"));
         assert!(surface.any_line_contains(LineKind::Notice, "disabled"));
+    }
+
+    /// BR-2 in full: every element the rule names must be on screen. Asserted
+    /// against a scripted proposal event through the rendering seam — the point
+    /// is that a person can see *why* this model, not that a string was printed.
+    #[test]
+    fn render_proposal_shows_every_br2_element() {
+        let mut surface = RecordingSurface::new();
+        render_proposal(&proposal(), &mut surface);
+        let text = surface.lines_of(LineKind::Info).join("\n");
+
+        // Detected hardware: RAM, free disk, GPU class.
+        assert!(text.contains("16.0 GB"), "detected RAM missing: {text}");
+        assert!(text.contains("120.0 GB"), "free disk missing: {text}");
+        assert!(text.contains("apple-silicon"), "gpu class missing: {text}");
+        // The chosen band and the plain-language reason.
+        assert!(
+            text.contains("band:     mid"),
+            "chosen band missing: {text}"
+        );
+        assert!(
+            text.contains("16 GiB of RAM clears the mid band's floor"),
+            "reason missing: {text}"
+        );
+        // The proposed model with its download size and RAM floor.
+        assert!(
+            text.contains("qwen2.5-coder-7b"),
+            "proposed model missing: {text}"
+        );
+        assert!(text.contains("4.4 GB"), "download size missing: {text}");
+        assert!(
+            text.contains("needs 8.0 GB RAM"),
+            "RAM floor missing: {text}"
+        );
+        // Every selectable alternative, numbered, with its own fit.
+        assert!(
+            text.contains("1. qwen2.5-coder-3b"),
+            "alternative 1 missing: {text}"
+        );
+        assert!(
+            text.contains("2. qwen3-coder-30b"),
+            "alternative 2 missing: {text}"
+        );
+        assert!(
+            text.contains("ABOVE this machine's RAM"),
+            "an over-sized alternative must be labelled, not hidden: {text}"
+        );
+        // And the BR-1 promise itself.
+        assert!(surface.any_line_contains(LineKind::Notice, "nothing is downloaded"));
+    }
+
+    #[test]
+    fn render_proposal_without_a_fitting_entry_says_so_and_still_offers_alternatives() {
+        let mut proposal = proposal();
+        proposal.proposed = None;
+        proposal.probe.chosen_band = ChosenBand::None;
+        let mut surface = RecordingSurface::new();
+        render_proposal(&proposal, &mut surface);
+        let text = surface.lines_of(LineKind::Info).join("\n");
+        assert!(text.contains("proposed: none"), "{text}");
+        assert!(text.contains("below the local-tier floor"), "{text}");
+        assert!(text.contains("1. qwen2.5-coder-3b"), "{text}");
+    }
+
+    #[test]
+    fn render_proposal_with_no_alternatives_says_so_rather_than_rendering_an_empty_list() {
+        let mut proposal = proposal();
+        proposal.alternatives.clear();
+        let mut surface = RecordingSurface::new();
+        render_proposal(&proposal, &mut surface);
+        assert!(surface.any_line_contains(LineKind::Info, "alternatives: none"));
+    }
+
+    #[test]
+    fn entry_summary_flags_only_entries_above_this_machines_ram() {
+        let fits = entry(
+            "qwen2.5-coder-3b",
+            TierBand::Small,
+            2_104_932_800,
+            5_368_709_120,
+        );
+        let over = entry(
+            "qwen3-coder-30b",
+            TierBand::Large,
+            18_000_000_000,
+            34_359_738_368,
+        );
+        let ram = 16 * 1024 * 1024 * 1024;
+        assert!(!entry_summary(&fits, ram).contains("ABOVE"));
+        assert!(entry_summary(&over, ram).contains("ABOVE this machine's RAM"));
+    }
+
+    #[test]
+    fn format_decided_covers_choice_and_decline() {
+        let chosen = format_decided(&ModelSelectionDecided {
+            request_id: None,
+            model_name: Some("qwen2.5-coder-7b".to_owned()),
+            declined_local: false,
+            source: SelectionSource::Probe,
+        });
+        assert!(chosen.contains("qwen2.5-coder-7b"), "{chosen}");
+        assert!(chosen.contains("accepted the proposal"), "{chosen}");
+
+        let declined = format_decided(&ModelSelectionDecided {
+            request_id: None,
+            model_name: None,
+            declined_local: true,
+            source: SelectionSource::UserOverride,
+        });
+        assert!(declined.contains("declined"), "{declined}");
+        assert!(declined.contains("remote-only"), "{declined}");
+
+        let auto = format_decided(&ModelSelectionDecided {
+            request_id: None,
+            model_name: Some("qwen2.5-coder-1.5b".to_owned()),
+            declined_local: false,
+            source: SelectionSource::AutoAccept,
+        });
+        assert!(auto.contains("auto-accept"), "{auto}");
     }
 
     #[test]
