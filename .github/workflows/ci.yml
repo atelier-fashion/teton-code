@@ -44,6 +44,55 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  catalog:
+    name: catalog integrity (BR-8/AC-8)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Verifies that the *catalog* is honest: every entry's `sha256` and
+      # `size_bytes` are compared against HuggingFace's `lfs.oid`/`lfs.size` at
+      # the pinned revision, the revision is an immutable 40-hex commit SHA, and
+      # the repo answers an anonymous, ungated request (REQ-547 architecture
+      # D-1). That is metadata only — no artifact is downloaded, so the whole
+      # catalog verifies in a couple of seconds and can gate every run.
+      #
+      # The artifact's own bytes are still hashed against these digests at
+      # download time by the downloader (BR-6). The two checks answer different
+      # questions; neither replaces the other.
+      #
+      # Exit codes are a taxonomy, not a boolean, because an upstream outage
+      # must never be mistakable for corruption — nor pass unnoticed:
+      #
+      #   0   VERIFIED    green.
+      #   1   MISMATCH    red, ::error::. A genuine integrity failure. Do not
+      #                   merge; a digest disagrees with the artifact, a repo
+      #                   went gated, or the file was hand-edited.
+      #   75  UNVERIFIED  red, ::warning::. HuggingFace was unreachable after
+      #                   retries. Nothing was learned about the catalog either
+      #                   way — this is NOT corruption. Re-run the job once
+      #                   upstream recovers. It fails rather than passes so an
+      #                   outage cannot quietly waive the gate.
+      - name: Catalog integrity (HuggingFace LFS metadata, no downloads)
+        run: |
+          set +e
+          python3 tools/refresh-catalog.py --check
+          status=$?
+          set -e
+          case "$status" in
+            0)
+              echo "::notice title=Catalog integrity::VERIFIED — every entry matches HuggingFace's LFS metadata at its pinned revision."
+              ;;
+            75)
+              echo "::warning title=Catalog integrity UNVERIFIED::HuggingFace was unreachable, so the catalog could NOT be verified. This is NOT a digest mismatch and NOT evidence of corruption. Re-run this job when upstream is reachable."
+              ;;
+            *)
+              echo "::error title=Catalog integrity MISMATCH::The catalog disagrees with HuggingFace at a pinned revision. This is a genuine integrity failure, not a network problem — see the log for the offending entry and field."
+              ;;
+          esac
+          exit "$status"
+
   e2e:
     name: acceptance suite (AC-1..AC-9)
     runs-on: ubuntu-latest

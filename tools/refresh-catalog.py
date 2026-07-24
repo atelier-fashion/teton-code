@@ -21,11 +21,23 @@ download integrity check into spurious corruption failures.
 Usage
 -----
     python3 tools/refresh-catalog.py --check
-        Re-derive the catalog *at the revisions already pinned in the committed
-        TOML* and assert the result is byte-identical. This is the proof that
-        the committed file is generated rather than hand-edited, and it doubles
-        as an upstream-tamper check: a rewritten artifact at a pinned revision
-        fails here. Exits non-zero on any difference.
+        The BR-8/AC-8 catalog integrity gate. For every catalog entry it
+        asserts, without downloading a single artifact byte:
+
+          * the pinned `revision` is an immutable 40-hex commit SHA, never a
+            moving ref like `main` (BR-15/AC-12) — checked before any network
+            call, so a moving ref fails fast and locally;
+          * the repository is public and ungated, from an *anonymous* request
+            (a gated repo answers metadata but refuses the weights, so this is
+            checked explicitly rather than inferred from a 200);
+          * `sha256` equals HuggingFace's `lfs.oid` at that revision;
+          * `size_bytes` equals HuggingFace's `lfs.size` at that revision;
+          * the whole file is byte-identical to what this generator emits, so
+            no hand-edit anywhere in it survives.
+
+        This verifies that the *catalog is honest*. Byte-level verification of
+        the artifact itself still happens at download time against this
+        `sha256` (BR-6) — the two checks answer different questions.
 
     python3 tools/refresh-catalog.py --update
         Re-resolve each repository's `main` to its current commit SHA, re-derive
@@ -35,6 +47,20 @@ Usage
 
     python3 tools/refresh-catalog.py --print
         Write the regenerated catalog to stdout instead of the file.
+
+Exit codes
+----------
+A network failure and a digest mismatch are *categorically different events*
+and never share an exit code, because an upstream outage must never be
+mistakable for corruption (nor be silently ignored):
+
+    0   VERIFIED    — every entry matches upstream at its pinned revision.
+    1   MISMATCH    — a genuine integrity failure: a digest/size disagrees, the
+                      revision is not pinned, the repo went gated/private, the
+                      file or revision is gone, or the file was hand-edited.
+    75  UNVERIFIED  — HuggingFace could not be reached (DNS/TCP/TLS/timeout, or
+                      429/5xx after retries). Nothing is claimed about the
+                      catalog either way. 75 is EX_TEMPFAIL: retry later.
 
 Requires only the Python 3 standard library (no Rust dependency is added to the
 workspace, so the tool cannot drag an HTTP client into `teton-inference`, which
@@ -60,6 +86,31 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CATALOG_PATH = os.path.join(
     REPO_ROOT, "crates", "teton-inference", "data", "models.toml"
 )
+
+# Exit codes. See the module docstring: MISMATCH and UNVERIFIED must never be
+# conflated, so they never share a code and never share a message vocabulary.
+EXIT_VERIFIED = 0
+EXIT_MISMATCH = 1
+EXIT_UNVERIFIED = 75  # EX_TEMPFAIL
+
+# HTTP statuses that mean "upstream is unwell", as opposed to "the catalog is
+# wrong". Retried first; if they persist the result is UNVERIFIED, never a
+# mismatch.
+TRANSIENT_STATUSES = (408, 425, 429, 500, 502, 503, 504)
+
+COMMIT_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
+
+# Mirrors `MOVING_REFS` in crates/teton-inference/src/catalog.rs, so a moving
+# ref gets an error naming the specific hazard rather than "not 40 hex chars".
+MOVING_REFS = ("main", "master", "head", "latest", "dev", "develop")
+
+
+class Unverified(Exception):
+    """Upstream could not be reached. Says nothing about catalog correctness."""
+
+
+class Mismatch(Exception):
+    """The catalog disagrees with upstream, or with its own invariants."""
 
 # ---------------------------------------------------------------------------
 # The picks. Everything here is human judgement; everything else is derived.
@@ -155,7 +206,14 @@ HEADER = """\
 
 
 def http_get_json(url: str, attempts: int = 4):
-    """GET `url` and parse JSON, backing off on 429/503 (BR-16's rate limits)."""
+    """GET `url` and parse JSON.
+
+    Anonymous by design: sending no credential is what proves the repository is
+    public and ungated (D-1 / BR-15). Transient statuses back off and retry;
+    what survives is classified — `Unverified` for "upstream is unreachable or
+    unwell", `Mismatch` for "upstream answered, and the answer says the catalog
+    is wrong". A caller must never have to guess which happened.
+    """
     delay = 1.0
     last = None
     for attempt in range(1, attempts + 1):
@@ -167,41 +225,98 @@ def http_get_json(url: str, attempts: int = 4):
                 return json.load(response)
         except urllib.error.HTTPError as err:
             last = err
-            if err.code in (429, 503) and attempt < attempts:
+            if err.code in TRANSIENT_STATUSES and attempt < attempts:
                 time.sleep(delay)
                 delay *= 2
                 continue
-            if err.code in (401, 403, 404):
-                raise SystemExit(
-                    f"error: {url} returned HTTP {err.code}. The repository is "
-                    f"missing, private, or gated — the catalog may only name "
-                    f"public, ungated repositories. Not inventing a value."
-                )
-            raise SystemExit(f"error: GET {url} failed with HTTP {err.code}")
-        except urllib.error.URLError as err:
+            if err.code in TRANSIENT_STATUSES:
+                raise Unverified(
+                    f"{url} kept returning HTTP {err.code} after {attempts} "
+                    f"attempts. HuggingFace is rate-limiting or unwell."
+                ) from err
+            if err.code in (401, 403):
+                raise Mismatch(
+                    f"{url} returned HTTP {err.code} to an anonymous request. "
+                    f"The repository is private or gated, and the catalog may "
+                    f"only name public, ungated repositories — a user with no "
+                    f"HuggingFace account must be able to fetch every entry. "
+                    f"Drop the entry or pick a public repo."
+                ) from err
+            if err.code in (404, 410):
+                raise Mismatch(
+                    f"{url} returned HTTP {err.code}. The repository was "
+                    f"renamed or deleted, or the pinned revision was garbage "
+                    f"collected upstream. The catalog now points at nothing; "
+                    f"re-pin with --update after checking what happened."
+                ) from err
+            raise Mismatch(f"GET {url} failed with HTTP {err.code}") from err
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as err:
             last = err
             if attempt < attempts:
                 time.sleep(delay)
                 delay *= 2
                 continue
-    raise SystemExit(
-        f"error: could not reach {url} ({last}). Refusing to emit a catalog "
-        f"with unverified digests."
+    raise Unverified(
+        f"could not reach {url} after {attempts} attempts ({last}). This is a "
+        f"transport failure, NOT evidence about the catalog's contents."
     )
+
+
+def assert_public_and_ungated(repo: str) -> dict:
+    """Assert `repo` is anonymously fetchable, and return its metadata.
+
+    A *gated* repository still serves its metadata to anonymous callers and
+    only refuses the weights, so a 200 here is not on its own proof that the
+    artifact is fetchable. The `gated`/`private`/`disabled` flags are therefore
+    checked explicitly rather than inferred from the status code.
+    """
+    info = http_get_json(f"{HF_API}/{repo}")
+    blocked = [
+        flag for flag in ("gated", "private", "disabled") if info.get(flag)
+    ]
+    if blocked:
+        raise Mismatch(
+            f"{repo} is {'/'.join(blocked)} ({', '.join(f'{f}={info.get(f)!r}' for f in blocked)}). "
+            f"The catalog may only name public, ungated repositories: a user "
+            f"with no HuggingFace account and no token must be able to fetch "
+            f"every entry. Drop the entry or pick a public repo."
+        )
+    return info
 
 
 def resolve_main(repo: str) -> str:
     """The current commit SHA of `repo`'s default branch."""
-    info = http_get_json(f"{HF_API}/{repo}")
+    info = assert_public_and_ungated(repo)
     sha = info.get("sha")
-    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
-        raise SystemExit(f"error: {repo} reported a non-commit revision {sha!r}")
-    if info.get("gated") or info.get("private") or info.get("disabled"):
-        raise SystemExit(
-            f"error: {repo} is gated/private/disabled; the catalog may only "
-            f"name public, ungated repositories."
-        )
+    if not isinstance(sha, str) or not COMMIT_SHA.match(sha):
+        raise Mismatch(f"{repo} reported a non-commit revision {sha!r}")
     return sha
+
+
+def assert_pinned(name: str, revision) -> str:
+    """Assert `revision` is an immutable 40-hex commit SHA (BR-15/AC-12).
+
+    Checked before any network call: a moving ref is a local, structural fault
+    and must not need HuggingFace to be reachable to be reported.
+    """
+    if not isinstance(revision, str):
+        raise Mismatch(f"catalog entry {name!r} has no revision at all")
+    if revision.lower() in MOVING_REFS or revision.startswith("refs/"):
+        raise Mismatch(
+            f"catalog entry {name!r} pins the moving ref {revision!r} instead "
+            f"of a commit SHA. A moving ref lets the artifact change while "
+            f"`sha256` stays put, which surfaces as spurious corruption "
+            f"failures on download (BR-15). Resolve it to an immutable commit "
+            f"SHA with `python3 tools/refresh-catalog.py --update`."
+        )
+    if not COMMIT_SHA.match(revision):
+        raise Mismatch(
+            f"catalog entry {name!r} has revision {revision!r}, which is not a "
+            f"commit SHA: a revision must be exactly 40 lowercase hex "
+            f"characters (BR-15). Regenerate with "
+            f"`python3 tools/refresh-catalog.py --update`."
+        )
+    return revision
 
 
 def lfs_metadata(repo: str, revision: str, path: str):
@@ -212,15 +327,17 @@ def lfs_metadata(repo: str, revision: str, path: str):
             continue
         lfs = entry.get("lfs")
         if not lfs or "oid" not in lfs or "size" not in lfs:
-            raise SystemExit(
-                f"error: {repo}@{revision}:{path} carries no LFS metadata, so "
-                f"its SHA-256 cannot be read without downloading it. Refusing "
-                f"to guess."
+            raise Mismatch(
+                f"{repo}@{revision}:{path} carries no LFS metadata, so its "
+                f"SHA-256 cannot be read without downloading it. Refusing to "
+                f"guess. (An upstream repo that stopped using LFS for this "
+                f"file needs a new pin, not a hand-typed digest.)"
             )
         return lfs["oid"], int(lfs["size"])
-    raise SystemExit(
-        f"error: {repo}@{revision} has no file {path!r}. Pick a file that "
-        f"actually exists; do not invent a URL."
+    raise Mismatch(
+        f"{repo}@{revision} has no file {path!r}. The file was renamed or "
+        f"removed upstream at the pinned revision. Pick a file that actually "
+        f"exists; do not invent a URL."
     )
 
 
@@ -262,36 +379,59 @@ def render(rows: list) -> str:
     return "\n".join(out).rstrip("\n") + "\n"
 
 
-def pinned_revisions(text: str) -> dict:
-    """Map catalog `name` -> pinned `revision` by reading the committed TOML."""
-    revisions = {}
-    name = None
+def committed_entries(text: str) -> dict:
+    """Map catalog `name` -> its committed fields, by reading the TOML text.
+
+    Deliberately a line reader rather than a TOML parser: the standard library
+    has no TOML reader before 3.11, and the check must run on whatever Python a
+    CI image happens to ship. It reads only the scalar fields it compares.
+    """
+    entries = {}
+    current = None
     for line in text.splitlines():
-        match = re.match(r'^name = "([^"]+)"$', line)
-        if match:
-            name = match.group(1)
+        if line.strip() == "[[models]]":
+            current = {}
             continue
-        match = re.match(r'^revision = "([^"]+)"$', line)
-        if match and name is not None:
-            revisions[name] = match.group(1)
-            name = None
-    return revisions
+        if current is None:
+            continue
+        match = re.match(r'^(\w+) = "([^"]*)"$', line)
+        if match:
+            current[match.group(1)] = match.group(2)
+        else:
+            match = re.match(r"^(\w+) = ([0-9_]+)$", line)
+            if match:
+                current[match.group(1)] = int(match.group(2).replace("_", ""))
+        # `current` is stored by reference, so later fields of the same block
+        # land in the entry already registered under its name.
+        if "name" in current:
+            entries.setdefault(current["name"], current)
+    return entries
 
 
-def derive(update: bool, existing: str) -> str:
-    """Derive the catalog, either at upstream's current main or at the pins."""
-    pins = {} if update else pinned_revisions(existing)
+def derive_rows(update: bool, existing: str) -> list:
+    """Derive every catalog row from the API, at `main` or at the pins.
+
+    In pinned mode each revision is asserted immutable *before* it is used in a
+    URL, so a moving ref is rejected locally rather than silently re-derived
+    into a catalog that would drift the next time upstream moves.
+    """
+    pins = (
+        {}
+        if update
+        else {name: e.get("revision") for name, e in committed_entries(existing).items()}
+    )
     rows = []
     for pick in PICKS:
         if update:
             revision = resolve_main(pick["repo"])
         else:
-            revision = pins.get(pick["name"])
-            if revision is None:
-                raise SystemExit(
-                    f"error: {CATALOG_PATH} pins no revision for "
-                    f"{pick['name']!r}; run --update to author it."
+            if pick["name"] not in pins:
+                raise Mismatch(
+                    f"{CATALOG_PATH} pins no revision for {pick['name']!r}; "
+                    f"run --update to author it."
                 )
+            revision = assert_pinned(pick["name"], pins[pick["name"]])
+        assert_public_and_ungated(pick["repo"])
         sha256, size_bytes = lfs_metadata(pick["repo"], revision, pick["file"])
         rows.append(
             {
@@ -305,7 +445,100 @@ def derive(update: bool, existing: str) -> str:
                 "note": pick["note"],
             }
         )
-    return render(rows)
+    return rows
+
+
+def derive(update: bool, existing: str) -> str:
+    """Derive the catalog, either at upstream's current main or at the pins."""
+    return render(derive_rows(update=update, existing=existing))
+
+
+def field_mismatches(existing: str, rows: list) -> list:
+    """Per-field disagreements between the committed catalog and upstream.
+
+    Reported field by field, naming both values and their provenance, so a
+    failure is diagnosable from the log alone — "which byte of which entry is
+    wrong, and what does HuggingFace actually say" — rather than requiring the
+    reader to interpret a whole-file diff.
+    """
+    committed = committed_entries(existing)
+    problems = []
+    for row in rows:
+        entry = committed.get(row["name"])
+        if entry is None:
+            problems.append(
+                f"MISMATCH  {row['name']}\n"
+                f"    the generator emits this entry but the committed catalog "
+                f"has no entry by that name."
+            )
+            continue
+        for field, provenance in (
+            ("sha256", "lfs.oid"),
+            ("size_bytes", "lfs.size"),
+            ("revision", "the pinned revision"),
+            ("url", "the derived URL"),
+        ):
+            if entry.get(field) != row[field]:
+                problems.append(
+                    f"MISMATCH  {row['name']}  {field}\n"
+                    f"    catalog     : {entry.get(field)!r}\n"
+                    f"    HuggingFace : {row[field]!r}\n"
+                    f"    ({provenance} for {row['name']} at revision "
+                    f"{row['revision']})"
+                )
+    return problems
+
+
+def check(existing: str) -> int:
+    """Run the integrity gate. Returns an exit code; never raises `Mismatch`."""
+    rows = derive_rows(update=False, existing=existing)
+    problems = field_mismatches(existing, rows)
+    generated = render(rows)
+
+    if problems:
+        sys.stderr.write("\n\n".join(problems) + "\n\n")
+        sys.stderr.write(
+            f"error: CATALOG MISMATCH — {len(problems)} field(s) disagree with "
+            f"HuggingFace's LFS metadata at the pinned revision(s). This is a "
+            f"genuine integrity failure, NOT a network problem. Either the "
+            f"catalog was hand-edited (revert it, or re-derive with --update), "
+            f"or an artifact changed under a pinned revision (investigate "
+            f"before adopting).\n"
+        )
+        return EXIT_MISMATCH
+
+    if generated != existing:
+        sys.stderr.writelines(
+            difflib.unified_diff(
+                existing.splitlines(keepends=True),
+                generated.splitlines(keepends=True),
+                fromfile="committed",
+                tofile="derived",
+            )
+        )
+        sys.stderr.write(
+            "\nerror: CATALOG MISMATCH — every digest matches upstream, but the "
+            "committed file is not byte-identical to what the generator emits "
+            "(see the diff above: a comment, an ordering, or a non-derived "
+            "field was hand-edited). Regenerate with --update rather than "
+            "editing the file by hand.\n"
+        )
+        return EXIT_MISMATCH
+
+    for row in rows:
+        print(
+            f"verified  {row['name']:<22} "
+            f"sha256={row['sha256'][:12]}… size={row['size_bytes']:,} "
+            f"@{row['revision'][:12]}…"
+        )
+    print(
+        f"\nok: VERIFIED — {len(rows)} catalog entries match HuggingFace's LFS "
+        f"metadata at their pinned revisions, and {CATALOG_PATH} is "
+        f"byte-identical to the derived catalog.\n"
+        f"note: this proves the *catalog* is honest. The artifact's own bytes "
+        f"are verified against these digests at download time (BR-6)."
+    )
+    return EXIT_VERIFIED
 
 
 def main() -> int:
@@ -314,7 +547,10 @@ def main() -> int:
     mode.add_argument(
         "--check",
         action="store_true",
-        help="re-derive at the pinned revisions and require a byte-identical file",
+        help=(
+            "verify the catalog against HuggingFace at its pinned revisions "
+            "(exit 0 verified, 1 mismatch, 75 unverified/unreachable)"
+        ),
     )
     mode.add_argument(
         "--update",
@@ -332,36 +568,35 @@ def main() -> int:
     except FileNotFoundError:
         existing = ""
 
-    generated = derive(update=args.update, existing=existing)
+    try:
+        if args.check:
+            return check(existing)
+
+        generated = derive(update=args.update, existing=existing)
+    except Unverified as err:
+        # The one outcome that says nothing about the catalog. It gets its own
+        # exit code and its own vocabulary so no reader — human or CI — can
+        # mistake an outage for corruption, and so it cannot pass unnoticed.
+        sys.stderr.write(
+            f"UNVERIFIED: {err}\n"
+            f"\nThe catalog was NOT verified. This is NOT a digest mismatch "
+            f"and NOT evidence of corruption — nothing was learned about the "
+            f"catalog's contents either way. Re-run when HuggingFace is "
+            f"reachable (exit {EXIT_UNVERIFIED} = EX_TEMPFAIL).\n"
+        )
+        return EXIT_UNVERIFIED
+    except Mismatch as err:
+        sys.stderr.write(f"error: CATALOG MISMATCH — {err}\n")
+        return EXIT_MISMATCH
 
     if args.to_stdout:
         sys.stdout.write(generated)
-        return 0
-
-    if args.check:
-        if generated == existing:
-            print(f"ok: {CATALOG_PATH} is byte-identical to the derived catalog")
-            return 0
-        sys.stderr.writelines(
-            difflib.unified_diff(
-                existing.splitlines(keepends=True),
-                generated.splitlines(keepends=True),
-                fromfile="committed",
-                tofile="derived",
-            )
-        )
-        sys.stderr.write(
-            "\nerror: the committed catalog is not what the HuggingFace API "
-            "yields at its pinned revisions. Either it was hand-edited (run "
-            "--update, or revert), or an upstream artifact changed under a "
-            "pinned revision (investigate before adopting).\n"
-        )
-        return 1
+        return EXIT_VERIFIED
 
     with open(CATALOG_PATH, "w", encoding="utf-8") as handle:
         handle.write(generated)
     print(f"wrote {CATALOG_PATH}")
-    return 0
+    return EXIT_VERIFIED
 
 
 if __name__ == "__main__":
