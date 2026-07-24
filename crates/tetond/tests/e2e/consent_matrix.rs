@@ -890,8 +890,10 @@ fn ac8_the_catalog_integrity_check_passes_on_truth_and_fails_on_drift() {
     assert_eq!(
         mismatch.code,
         Some(1),
-        "AC-8 VIOLATION: the gate accepted a catalog whose digest disagrees with \
-         upstream.\nstdout:\n{}\nstderr:\n{}",
+        "AC-8 VIOLATION: the gate did not report MISMATCH for a catalog whose \
+         digest disagrees with upstream (75 here would mean the mock host was \
+         unreachable, which is a harness failure, not an AC-8 one).\
+         \nstdout:\n{}\nstderr:\n{}",
         mismatch.stdout,
         mismatch.stderr
     );
@@ -901,6 +903,54 @@ fn ac8_the_catalog_integrity_check_passes_on_truth_and_fails_on_drift() {
             && mismatch.stderr.contains("sha256"),
         "the failure must name the entry and the field; stderr:\n{}",
         mismatch.stderr
+    );
+}
+
+/// AC-8's other half: the gate must **not** cry corruption when it simply could
+/// not look.
+///
+/// A gate that reports an outage as a MISMATCH is worse than no gate — the first
+/// time HuggingFace has a bad minute, CI says the catalog was tampered with, and
+/// after the second false alarm nobody reads its output again. So the two
+/// verdicts get different exit codes *and* different vocabulary, and this pins
+/// the boundary from the transport side: a host that accepts connections and
+/// answers nothing is UNVERIFIED (75, EX_TEMPFAIL), never MISMATCH (1).
+///
+/// This is also the regression guard for the flake that motivated it. The mock
+/// host used to drop the occasional connection under parallel load, the tool let
+/// the resulting `ConnectionResetError` escape unclassified, and Python's exit
+/// code for an uncaught exception is 1 — the same 1 that means "the catalog is
+/// provably wrong".
+#[test]
+fn ac8_an_unreachable_host_is_unverified_not_a_catalog_mismatch() {
+    if !python3_available() {
+        eprintln!("skipping AC-8 (unreachable): python3 is not on PATH");
+        return;
+    }
+    let dead = MockHf::start(MockHfConfig {
+        drop_connections: true,
+        ..MockHfConfig::default()
+    });
+    let run = run_catalog_check(&dead.base_url(), None);
+
+    assert_eq!(
+        run.code,
+        Some(75),
+        "AC-8 VIOLATION: an unreachable host must be UNVERIFIED (75 = \
+         EX_TEMPFAIL), never a verdict about the catalog.\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("UNVERIFIED") && !run.stderr.contains("MISMATCH"),
+        "an outage must not borrow corruption's vocabulary; stderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("Traceback"),
+        "a broken transport is an expected outcome and must be classified, not \
+         crash the gate; stderr:\n{}",
+        run.stderr
     );
 }
 
@@ -1463,12 +1513,17 @@ struct CheckRun {
 
 /// Run the real integrity gate against `endpoint`, optionally over a fixture
 /// catalog instead of the committed one.
+///
+/// The retry ladder is shortened to 20 ms (timing only — the attempt count and
+/// the classification are the tool's, untouched), so the unreachable-host case
+/// walks the whole ladder in milliseconds instead of seven seconds.
 fn run_catalog_check(endpoint: &str, catalog: Option<&Path>) -> CheckRun {
     let mut command = Command::new("python3");
     command
         .arg(repo_root().join("tools/refresh-catalog.py"))
         .arg("--check")
-        .env("HF_ENDPOINT", endpoint);
+        .env("HF_ENDPOINT", endpoint)
+        .env("TETON_CATALOG_RETRY_BASE_MS", "20");
     if let Some(path) = catalog {
         command.arg("--catalog").arg(path);
     }

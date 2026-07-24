@@ -177,6 +177,46 @@ pub fn anthropic_turn(
 }
 
 // ---------------------------------------------------------------------------
+// Mock HTTP servers: accepting a connection
+// ---------------------------------------------------------------------------
+
+/// How long a mock server will wait on one accepted connection's I/O.
+///
+/// Generous — every fixture request and response is a few KiB — but finite, so a
+/// client that connects and then says nothing cannot wedge a single-threaded
+/// accept loop (and with it the server's `Drop`) forever.
+const ACCEPTED_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hand back an accepted connection in **blocking** mode, with bounded I/O
+/// timeouts.
+///
+/// Both mock servers call `TcpListener::set_nonblocking(true)` so their accept
+/// loop can poll a shutdown flag instead of blocking forever. On macOS and the
+/// BSDs, though, the socket returned by `accept(2)` *inherits* the listener's
+/// `O_NONBLOCK` — so without this, the very first read of the request returns
+/// `WouldBlock` whenever the client's bytes have not landed yet. Both readers
+/// treat a failed read as "no request": [`read_hf_request`] returns `None` and
+/// drops the stream unanswered, and [`read_http_body`] records an empty body.
+///
+/// The client did nothing wrong — it just got descheduled between `connect` and
+/// `send`, which on a loaded machine is common — and sees a `Connection reset by
+/// peer` for a request the server never read. Putting the accepted socket back
+/// into blocking mode makes the read wait for the bytes, which is what every one
+/// of these handlers already assumes it does.
+fn accepted(stream: TcpStream) -> TcpStream {
+    stream
+        .set_nonblocking(false)
+        .expect("accepted socket returns to blocking mode");
+    stream
+        .set_read_timeout(Some(ACCEPTED_IO_TIMEOUT))
+        .expect("accepted socket takes a read timeout");
+    stream
+        .set_write_timeout(Some(ACCEPTED_IO_TIMEOUT))
+        .expect("accepted socket takes a write timeout");
+    stream
+}
+
+// ---------------------------------------------------------------------------
 // Mock provider HTTP server (also the egress-capture proxy)
 // ---------------------------------------------------------------------------
 
@@ -217,7 +257,7 @@ impl MockProvider {
                                 .unwrap()
                                 .pop_front()
                                 .unwrap_or_else(|| default.clone());
-                            handle_http(stream, &requests, &response);
+                            handle_http(accepted(stream), &requests, &response);
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(5));
@@ -1063,6 +1103,14 @@ pub struct MockHfConfig {
     pub fail_status: u16,
     /// `Retry-After` sent alongside them.
     pub fail_retry_after_secs: Option<u64>,
+    /// Accept every connection and close it without answering — a dead proxy, a
+    /// half-closed keep-alive, a peer that resets mid-response.
+    ///
+    /// Distinct from [`HfArtifact::Status`] on purpose: a 503 is upstream
+    /// *speaking*, this is the conversation breaking. Neither is evidence about
+    /// the catalog, and a client that cannot tell them apart from a digest
+    /// disagreement will eventually report an outage as corruption.
+    pub drop_connections: bool,
 }
 
 impl Default for MockHfConfig {
@@ -1074,6 +1122,7 @@ impl Default for MockHfConfig {
             fail_first: 0,
             fail_status: 429,
             fail_retry_after_secs: Some(0),
+            drop_connections: false,
         }
     }
 }
@@ -1113,7 +1162,7 @@ impl MockHf {
             thread::spawn(move || {
                 while running.load(Ordering::SeqCst) {
                     match listener.accept() {
-                        Ok((stream, _)) => serve_hf(stream, &state),
+                        Ok((stream, _)) => serve_hf(accepted(stream), &state),
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(5));
                         }
@@ -1182,6 +1231,11 @@ impl Drop for MockHf {
 
 /// Serve one mock-HF request.
 fn serve_hf(mut stream: TcpStream, state: &Arc<HfState>) {
+    if state.config.drop_connections {
+        // Closing with the request still unread is what makes the peer see a
+        // reset rather than a clean EOF — the real shape of a broken transport.
+        return;
+    }
     let Some((path, range_from)) = read_hf_request(&mut stream) else {
         return;
     };

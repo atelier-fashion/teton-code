@@ -68,6 +68,11 @@ Environment
         own behaviour — pass on agreement, MISMATCH on drift — is exercised
         hermetically, with the real network run remaining the CI job's job.
 
+    TETON_CATALOG_RETRY_BASE_MS
+        The first retry delay in milliseconds (default 1000). Timing only; the
+        acceptance suite shortens it so the retry ladder for an unreachable host
+        can be walked without spending its seconds.
+
 Exit codes
 ----------
 A network failure and a digest mismatch are *categorically different events*
@@ -78,9 +83,15 @@ mistakable for corruption (nor be silently ignored):
     1   MISMATCH    — a genuine integrity failure: a digest/size disagrees, the
                       revision is not pinned, the repo went gated/private, the
                       file or revision is gone, or the file was hand-edited.
-    75  UNVERIFIED  — HuggingFace could not be reached (DNS/TCP/TLS/timeout, or
-                      429/5xx after retries). Nothing is claimed about the
+    75  UNVERIFIED  — HuggingFace could not be reached (DNS/TCP/TLS/timeout, a
+                      reset or half-closed connection, a truncated body, or
+                      429/5xx after retries), or this tool crashed before it
+                      could reach a verdict. Nothing is claimed about the
                       catalog either way. 75 is EX_TEMPFAIL: retry later.
+
+Note that 1 is also Python's exit code for an uncaught exception, so "anything
+unexpected" must be routed to 75 deliberately (see the `__main__` guard) — the
+default would report a bug in this tool, or an outage, as corruption.
 
 Requires only the Python 3 standard library (no Rust dependency is added to the
 workspace, so the tool cannot drag an HTTP client into `teton-inference`, which
@@ -91,11 +102,13 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import http.client
 import json
 import os
 import re
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -157,6 +170,26 @@ EXIT_UNVERIFIED = 75  # EX_TEMPFAIL
 # wrong". Retried first; if they persist the result is UNVERIFIED, never a
 # mismatch.
 TRANSIENT_STATUSES = (408, 425, 429, 500, 502, 503, 504)
+
+# Everything that means "the conversation with upstream broke", as opposed to
+# "upstream answered and the answer indicts the catalog". These are retried and,
+# if they persist, reported as UNVERIFIED — never as a MISMATCH.
+#
+# The membership here is load-bearing, and wider than it first looks:
+#
+#   * `OSError` covers `urllib.error.URLError` (DNS/TCP/TLS refusals),
+#     `TimeoutError`, and — the one that used to escape — `ConnectionResetError`
+#     and `BrokenPipeError`. A peer that resets mid-response raises the bare
+#     `OSError` out of the socket layer; `urlopen` only wraps what happens while
+#     it is *sending*, so a reset during `getresponse()` arrives unwrapped.
+#   * `http.client.HTTPException` covers `RemoteDisconnected` (a proxy or LB
+#     closing an idle connection), `IncompleteRead`, and `BadStatusLine`.
+#   * `json.JSONDecodeError` covers a truncated or non-JSON body.
+#
+# Ordering matters: `urllib.error.HTTPError` is itself an `OSError`, so its own
+# `except` clause has to come first — a 404 is evidence about the catalog and
+# must stay a MISMATCH.
+TRANSPORT_ERRORS = (OSError, http.client.HTTPException, json.JSONDecodeError)
 
 COMMIT_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 
@@ -265,6 +298,25 @@ HEADER = """\
 """
 
 
+def _retry_base_seconds() -> float:
+    """The first backoff delay, in seconds.
+
+    A test seam, mirroring the daemon's `TETON_DOWNLOAD_RETRY_BASE_MS`: it moves
+    the *clock* only. The number of attempts, the doubling, and above all the
+    classification of what survives them are not adjustable, so a test that
+    shortens the ladder still exercises the same ladder. Anything unparseable
+    falls back to the production value rather than failing the run — a bad
+    environment variable must not be able to turn a check into an error.
+    """
+    raw = os.environ.get("TETON_CATALOG_RETRY_BASE_MS")
+    if raw is None:
+        return 1.0
+    try:
+        return max(0.0, int(raw) / 1000.0)
+    except ValueError:
+        return 1.0
+
+
 def http_get_json(url: str, attempts: int = 4):
     """GET `url` and parse JSON.
 
@@ -273,8 +325,14 @@ def http_get_json(url: str, attempts: int = 4):
     what survives is classified — `Unverified` for "upstream is unreachable or
     unwell", `Mismatch` for "upstream answered, and the answer says the catalog
     is wrong". A caller must never have to guess which happened.
+
+    Nothing may leave this function unclassified. An exception that escapes it
+    would end the process on Python's default exit code — 1, which *is*
+    EXIT_MISMATCH — and so would report a dropped connection as catalog
+    corruption. `TRANSPORT_ERRORS` exists to make that impossible; the
+    `__main__` guard is the backstop for anything it still misses.
     """
-    delay = 1.0
+    delay = _retry_base_seconds()
     last = None
     for attempt in range(1, attempts + 1):
         try:
@@ -310,7 +368,7 @@ def http_get_json(url: str, attempts: int = 4):
                     f"re-pin with --update after checking what happened."
                 ) from err
             raise Mismatch(f"GET {url} failed with HTTP {err.code}") from err
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as err:
+        except TRANSPORT_ERRORS as err:
             last = err
             if attempt < attempts:
                 time.sleep(delay)
@@ -722,4 +780,20 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:  # noqa: BLE001 — deliberate: see below
+        # Python exits 1 on an uncaught exception, and 1 is EXIT_MISMATCH: "the
+        # catalog is provably wrong". A crash proves nothing about the catalog,
+        # so that collision has to be broken explicitly or every unforeseen bug
+        # in this tool reads to CI as catalog corruption. The traceback is kept
+        # (it is the only way to fix the crash) but the verdict is UNVERIFIED.
+        traceback.print_exc()
+        sys.stderr.write(
+            f"\nUNVERIFIED: {sys.argv[0]} failed unexpectedly (traceback above).\n"
+            f"The catalog was NOT verified. This is NOT a digest mismatch and "
+            f"NOT evidence of corruption — the tool crashed before it could "
+            f"learn anything about the catalog's contents "
+            f"(exit {EXIT_UNVERIFIED} = EX_TEMPFAIL).\n"
+        )
+        sys.exit(EXIT_UNVERIFIED)
