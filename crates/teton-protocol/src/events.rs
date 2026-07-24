@@ -318,6 +318,13 @@ pub struct ModelLifecycle {
 }
 
 /// A stage in the local-model lifecycle.
+///
+/// Every variant is a claim about something that **actually happened** on this
+/// machine. That is load-bearing rather than stylistic: a daemon whose whole
+/// pitch is legibility may not announce a `download`, a `benchmark` or a `ready`
+/// it did not perform, so [`AwaitingDecision`](Self::AwaitingDecision) exists to
+/// give the honest pre-consent state a name of its own instead of borrowing a
+/// later stage's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum ModelLifecycleStage {
@@ -327,6 +334,13 @@ pub enum ModelLifecycleStage {
         ram_bytes: u64,
         /// Whether the machine cleared the hardware floor for a local tier.
         above_floor: bool,
+    },
+    /// A model has been proposed and the daemon is **waiting for an answer**
+    /// (REQ-547 BR-1): nothing has been downloaded, benchmarked, or loaded, and
+    /// sessions run remote-only until the user decides.
+    AwaitingDecision {
+        /// User-facing sentence naming what is being waited on.
+        reason: String,
     },
     /// Download progress for the selected model.
     Download {
@@ -913,6 +927,9 @@ mod tests {
             ModelLifecycleStage::Probed {
                 ram_bytes: 16 * 1024 * 1024 * 1024,
                 above_floor: true,
+            },
+            ModelLifecycleStage::AwaitingDecision {
+                reason: "awaiting your answer to the local-model proposal".to_owned(),
             },
             ModelLifecycleStage::Download {
                 downloaded_bytes: 100,

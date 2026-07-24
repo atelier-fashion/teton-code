@@ -86,15 +86,34 @@ pub fn required_disk_bytes(entry: &ModelEntry) -> u64 {
 // The pending-decision registry (mirrors `PendingPermissions`)
 // ---------------------------------------------------------------------------
 
+/// One outstanding proposal: the payload a client must be able to *render*, and
+/// the channel its answer comes back on.
+///
+/// The two are held together deliberately. Keeping only the `request_id` here
+/// would let a client answer a prompt it could not describe — which is how the
+/// proposal came to be undeliverable *and* unnameable in the first place.
+#[derive(Debug)]
+struct OpenProposal {
+    /// The full proposal, exactly as broadcast.
+    proposal: ModelSelectionProposed,
+    /// Where the deciding client's answer is delivered.
+    answer: oneshot::Sender<ModelConfirmOutcome>,
+}
+
 /// The registry of outstanding model proposals, keyed by request id.
 ///
 /// The consent flow registers a waiter and awaits it; a client's `model/confirm`
 /// calls [`Self::resolve`]. Registration happens **before** the proposal is
 /// published, so a client that answers the instant it sees the event always finds
 /// a waiter — the same ordering [`crate::harness::PendingPermissions`] relies on.
+///
+/// It is also the daemon's *retrieval* path: because the whole proposal is
+/// registered, `model/status` can hand a late-attaching client the same payload
+/// the event carried ([`Self::outstanding`]), so delivery does not depend on
+/// having been attached at the instant of the broadcast.
 #[derive(Debug, Default)]
 pub struct PendingModelDecisions {
-    waiters: Mutex<Vec<(RequestId, oneshot::Sender<ModelConfirmOutcome>)>>,
+    waiters: Mutex<Vec<OpenProposal>>,
 }
 
 impl PendingModelDecisions {
@@ -104,13 +123,17 @@ impl PendingModelDecisions {
         Self::default()
     }
 
-    /// Register a waiter and return the receiver the consent flow awaits.
-    fn register(&self, id: RequestId) -> oneshot::Receiver<ModelConfirmOutcome> {
+    /// Register a waiter for `proposal` and return the receiver the consent flow
+    /// awaits. The proposal is retained so `model/status` can serve it.
+    fn register(&self, proposal: ModelSelectionProposed) -> oneshot::Receiver<ModelConfirmOutcome> {
         let (tx, rx) = oneshot::channel();
         self.waiters
             .lock()
             .expect("pending model decisions mutex poisoned")
-            .push((id, tx));
+            .push(OpenProposal {
+                proposal,
+                answer: tx,
+            });
         rx
     }
 
@@ -125,8 +148,8 @@ impl PendingModelDecisions {
                 .expect("pending model decisions mutex poisoned");
             waiters
                 .iter()
-                .position(|(waiting, _)| waiting == id)
-                .map(|index| waiters.swap_remove(index).1)
+                .position(|open| &open.proposal.request_id == id)
+                .map(|index| waiters.swap_remove(index).answer)
         };
         match sender {
             Some(tx) => tx.send(outcome).is_ok(),
@@ -134,19 +157,22 @@ impl PendingModelDecisions {
         }
     }
 
-    /// The proposal currently awaiting an answer, if any.
+    /// The proposal currently awaiting an answer, if any — **in full**.
     ///
     /// At most one proposal is ever outstanding: the decision is machine-wide,
     /// not per-session, so there is nothing to disambiguate. This is what lets a
-    /// client that attached *after* the broadcast find the open prompt through
-    /// `model/status` instead of waiting forever for an event it already missed.
+    /// client that attached *after* the broadcast render and answer the open
+    /// prompt through `model/status` instead of waiting forever for an event it
+    /// already missed — and because it returns the whole payload, that client can
+    /// name the proposed entry, its download size, and its RAM floor (BR-2)
+    /// rather than describing the band and guessing.
     #[must_use]
-    pub fn outstanding(&self) -> Option<RequestId> {
+    pub fn outstanding(&self) -> Option<ModelSelectionProposed> {
         self.waiters
             .lock()
             .expect("pending model decisions mutex poisoned")
             .first()
-            .map(|(id, _)| id.clone())
+            .map(|open| open.proposal.clone())
     }
 
     /// Number of proposals currently awaiting an answer.
@@ -733,6 +759,13 @@ impl ModelConsentGate {
         // instant it sees the event always finds a waiter; then await. Nothing
         // above this point has touched the installer, and nothing below it runs
         // until an answer arrives (BR-1 / AC-1).
+        //
+        // Registration takes the **whole** proposal, not just its id: the event
+        // is broadcast once and never replayed, and this flow is spawned beside
+        // `serve` (D-3) so it may publish before the daemon accepts its first
+        // connection. The registry is therefore the retrieval path a client of
+        // any attach timing reads through `model/status` — see
+        // [`PendingModelDecisions::outstanding`].
         let request_id = RequestId::from(format!(
             "model-{}",
             self.counter.fetch_add(1, Ordering::SeqCst)
@@ -742,7 +775,7 @@ impl ModelConsentGate {
             .proposed
             .as_ref()
             .map(|proposed| proposed.entry.name.clone());
-        let rx = self.pending.register(request_id.clone());
+        let rx = self.pending.register(proposal.clone());
         self.events
             .publish(None, Event::ModelSelectionProposed(proposal));
 
@@ -955,14 +988,50 @@ mod tests {
     fn a_resolved_waiter_is_removed_and_a_duplicate_answer_is_a_noop() {
         let pending = PendingModelDecisions::new();
         let id = RequestId::from("model-0");
-        let _rx = pending.register(id.clone());
+        let _rx = pending.register(sample_proposal(id.clone()));
         assert_eq!(pending.pending_count(), 1);
-        assert_eq!(pending.outstanding(), Some(id.clone()));
+        assert_eq!(
+            pending.outstanding().map(|p| p.request_id),
+            Some(id.clone())
+        );
 
         assert!(pending.resolve(&id, ModelConfirmOutcome::Accept));
         assert_eq!(pending.pending_count(), 0);
+        assert!(
+            pending.outstanding().is_none(),
+            "an answered proposal is no longer outstanding, so a client that \
+             polls afterwards is not re-prompted"
+        );
         // Idempotent, exactly like `permission/respond`.
         assert!(!pending.resolve(&id, ModelConfirmOutcome::Accept));
+    }
+
+    /// The registry retains the payload a client has to *render*, not just the id
+    /// it has to answer with — the difference between "there is a prompt" and
+    /// "here is what it proposes" (BR-2).
+    #[test]
+    fn the_outstanding_proposal_is_retrievable_in_full_and_names_the_pick() {
+        let pending = PendingModelDecisions::new();
+        let _rx = pending.register(sample_proposal(RequestId::from("model-0")));
+
+        let open = pending.outstanding().expect("a proposal is outstanding");
+        let proposed = open.proposed.expect("the small machine gets a pick");
+        assert_eq!(proposed.entry.name, "small");
+        assert_eq!(proposed.entry.size_bytes, 2 * GIB);
+        assert_eq!(proposed.entry.ram_floor_bytes, 8 * GIB);
+        assert_eq!(
+            proposed.required_disk_bytes,
+            2 * GIB + DISK_WORKING_MARGIN_BYTES
+        );
+        assert!(open.probe.reason.contains("16.0 GiB"), "{:?}", open.probe);
+        assert_eq!(
+            open.alternatives
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["big"],
+            "every other entry stays selectable on the retrieved payload (BR-3)"
+        );
     }
 
     #[test]
@@ -1019,6 +1088,14 @@ mod tests {
     }
 
     // --- shared fixtures -------------------------------------------------
+
+    /// The proposal a 16 GiB machine gets from [`test_catalog`].
+    fn sample_proposal(request_id: RequestId) -> ModelSelectionProposed {
+        let profile = small_machine();
+        let catalog = test_catalog();
+        let decision = decide(&profile, &catalog, None);
+        build_proposal(request_id, &profile, &catalog, &decision)
+    }
 
     pub(super) fn small_machine() -> HardwareProfile {
         HardwareProfile {

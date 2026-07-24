@@ -9,7 +9,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::events::{CatalogEntryView, ProbeReportView, SelectionSource};
+use crate::events::{CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource};
 use crate::jsonrpc::{Id, Request};
 use crate::{
     Phase, PrivacyMode, ProviderId, ProviderKind, RequestId, SessionId, SessionMode, TurnId,
@@ -402,11 +402,24 @@ pub struct ModelStatusResult {
     /// Install state of the selected weights, or `None` when nothing is selected.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub install: Option<InstallStateView>,
-    /// A proposal awaiting an answer, if one is outstanding. Lets a client that
-    /// attached after the broadcast still find and answer the open prompt
-    /// instead of waiting forever for an event it already missed.
+    /// The proposal awaiting an answer, if one is outstanding — **the whole
+    /// payload**, byte-for-byte what the [`ModelSelectionProposed`] event
+    /// carried.
+    ///
+    /// This is what makes delivery independent of attach timing (REQ-547). The
+    /// daemon publishes the proposal on its own task, possibly before it accepts
+    /// its first connection, so an event-only design leaves a client that
+    /// attached a moment later with no way to learn *which* entry was proposed —
+    /// and BR-2 requires naming it, with its download size and RAM floor. A bare
+    /// `request_id` would let such a client *answer* a prompt it could not
+    /// *render*, which is consent in name only.
+    ///
+    /// It carries the `request_id` itself rather than duplicating it in a
+    /// sibling field, so the id a client answers with and the proposal it
+    /// rendered cannot disagree. A client that sees both this and the live event
+    /// de-duplicates on that id and prompts exactly once.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub pending_request_id: Option<RequestId>,
+    pub pending_proposal: Option<ModelSelectionProposed>,
 }
 
 impl RpcMethod for ModelStatusParams {
@@ -694,6 +707,23 @@ mod tests {
         }
     }
 
+    fn sample_proposal() -> ModelSelectionProposed {
+        ModelSelectionProposed {
+            request_id: RequestId::from("m1"),
+            probe: sample_probe(),
+            proposed: Some(crate::events::ProposedModel {
+                entry: sample_entry(),
+                required_disk_bytes: 4_700_000_000 + 1_073_741_824,
+            }),
+            alternatives: vec![CatalogEntryView {
+                name: "qwen2.5-coder-3b".to_owned(),
+                band: TierBand::Small,
+                size_bytes: 2_104_932_800,
+                ram_floor_bytes: 8_589_934_592,
+            }],
+        }
+    }
+
     fn sample_selection() -> ModelSelectionView {
         ModelSelectionView {
             model_name: Some("qwen2.5-coder-7b".to_owned()),
@@ -860,7 +890,7 @@ mod tests {
                     model_name: "qwen2.5-coder-7b".to_owned(),
                     status,
                 }),
-                pending_request_id: None,
+                pending_proposal: None,
             });
         }
         // A declined machine: a selection with no model and no install.
@@ -872,14 +902,29 @@ mod tests {
                 decided_at_ms: 1_771_200_000_002,
             }),
             install: None,
-            pending_request_id: None,
+            pending_proposal: None,
         });
-        // A first run with a prompt still outstanding (BR-1).
-        round_trip(&ModelStatusResult {
+        // A first run with a prompt still outstanding (BR-1): the *whole*
+        // proposal rides the status, so a client that missed the event renders
+        // the same named pick the event would have shown.
+        let outstanding = ModelStatusResult {
             selection: None,
             install: None,
-            pending_request_id: Some(RequestId::from("m1")),
-        });
+            pending_proposal: Some(sample_proposal()),
+        };
+        round_trip(&outstanding);
+        let json = serde_json::to_string(&outstanding).unwrap();
+        for named in [
+            "qwen2.5-coder-7b",
+            "size_bytes",
+            "ram_floor_bytes",
+            "required_disk_bytes",
+        ] {
+            assert!(
+                json.contains(named),
+                "status must name the proposal: {json}"
+            );
+        }
         // The empty status must be a bare object, not three nulls.
         assert_eq!(
             serde_json::to_string(&ModelStatusResult::default()).unwrap(),
@@ -897,7 +942,7 @@ mod tests {
                 model_name: "qwen2.5-coder-7b".to_owned(),
                 status: InstallStatus::Verified,
             }),
-            pending_request_id: None,
+            pending_proposal: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         for forbidden in ["path", "/Users/", "/home/", "url", "sha256"] {

@@ -240,11 +240,13 @@ impl Connection {
 
     /// Find and answer a proposal that was raised before this client attached.
     ///
-    /// TASK-004 broadcasts `model_selection_proposed` exactly once and never
-    /// replays it, so a client that connects afterwards would wait forever for an
-    /// event it already missed. `model/status` is the recovery path: it reports
-    /// `pending_request_id` for any proposal still outstanding, and `model/list`
-    /// supplies the machine and catalog needed to render a real choice.
+    /// The daemon broadcasts `model_selection_proposed` exactly once, never
+    /// replays it, and runs the consent flow on a task spawned *beside* the
+    /// server (D-3) — so it can publish the proposal before the socket accepts
+    /// anyone. A client that waited only for the event would wait forever.
+    /// `model/status` is therefore the delivery path, not a fallback: it carries
+    /// the entire proposal, so what is rendered here is what the event would have
+    /// rendered, named pick and all (BR-2).
     ///
     /// Failures are deliberately quiet — an older daemon without the methods, or
     /// a status call that errors, must not stop a session from starting; the
@@ -260,19 +262,17 @@ impl Connection {
         let Ok(status) = self.call(methods::ModelStatusParams::default(), ctx)? else {
             return Ok(());
         };
-        let Some(request_id) = status.pending_request_id else {
+        let Some(proposal) = status.pending_proposal else {
             return Ok(());
         };
-        // The live event may have arrived first; a proposal is answered once.
-        if !ctx.state.claim_model_proposal(&request_id) {
+        // The live event may have arrived first (the event pump inside the
+        // `model/status` call above could even have delivered it). A proposal is
+        // prompted exactly once, and the shared `request_id` is what says so.
+        if !ctx.state.claim_model_proposal(&proposal.request_id) {
             return Ok(());
         }
-        let Ok(list) = self.call(methods::ModelListParams::default(), ctx)? else {
-            return Ok(());
-        };
         let reply = model_ui::resolve_outstanding(
-            &request_id,
-            &list,
+            &proposal,
             ctx.auto_accept_model,
             &mut *ctx.surface,
             &mut *ctx.prompter,
@@ -458,6 +458,8 @@ fn resolve_daemon_binary(exe_dir: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufWriter;
+    use std::os::unix::net::UnixListener;
     use teton_protocol::jsonrpc::error_code;
 
     #[test]
@@ -548,6 +550,144 @@ mod tests {
         assert_eq!(
             route_response(&pending, &Id::Number(99), false),
             RespRoute::Ignore
+        );
+    }
+
+    /// A stub daemon that hands the *same* proposal to a client twice — once as
+    /// the broadcast event, once on the `model/status` it answers next — and
+    /// records every request the client sent back.
+    ///
+    /// Deliberately over a real `UnixStream` with the real framing: the de-dup
+    /// this proves lives in the seam between the event pump and the status call,
+    /// and a hand-fed `SessionState` would not exercise that seam at all.
+    fn serve_a_doubly_delivered_proposal(socket: PathBuf) -> thread::JoinHandle<Vec<Value>> {
+        let listener = UnixListener::bind(&socket).expect("bind the stub daemon socket");
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("a client connects");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = BufWriter::new(stream);
+            let proposal = serde_json::json!({
+                "request_id": "model-0",
+                "probe": {
+                    "total_ram_bytes": 17_179_869_184u64,
+                    "free_disk_bytes": 536_870_912_000u64,
+                    "gpu_class": "apple_silicon",
+                    "chosen_band": "small",
+                    "reason": "16 GiB of RAM puts this machine in the small band",
+                },
+                "proposed": {
+                    "entry": {
+                        "name": "qwen2.5-coder-3b",
+                        "band": "small",
+                        "size_bytes": 2_147_483_648u64,
+                        "ram_floor_bytes": 5_368_709_120u64,
+                    },
+                    "required_disk_bytes": 3_221_225_472u64,
+                },
+                "alternatives": [],
+            });
+            let mut seen = Vec::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let request: Value = match serde_json::from_str(line.trim()) {
+                    Ok(value) => value,
+                    Err(_) => break,
+                };
+                line.clear();
+                let id = request["id"].clone();
+                let method = request["method"].as_str().unwrap_or_default().to_owned();
+                seen.push(request);
+                if method == methods::ModelStatusParams::METHOD {
+                    // The event first — the client is mid-call when it lands, so
+                    // it is dispatched by the pump before the status reply.
+                    let event = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": EVENT_METHOD,
+                        "params": {
+                            "seq": 1,
+                            "event": "model_selection_proposed",
+                            "request_id": proposal["request_id"],
+                            "probe": proposal["probe"],
+                            "proposed": proposal["proposed"],
+                            "alternatives": proposal["alternatives"],
+                        },
+                    });
+                    writeln!(writer, "{event}").unwrap();
+                    writer.flush().unwrap();
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "pending_proposal": proposal },
+                    });
+                    writeln!(writer, "{response}").unwrap();
+                } else {
+                    let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}});
+                    writeln!(writer, "{response}").unwrap();
+                }
+                writer.flush().unwrap();
+            }
+            seen
+        })
+    }
+
+    /// REQ-547: seeing a proposal twice must ask a human once.
+    ///
+    /// Both delivery paths are live now — the daemon broadcasts the proposal
+    /// *and* serves it from `model/status` — so the client meets it twice
+    /// whenever it attaches in time to catch the event. Prompting twice would be
+    /// a worse failure than the missed event this fixed: the second prompt would
+    /// be answered into a waiter that no longer exists.
+    #[test]
+    fn a_proposal_seen_as_an_event_and_on_model_status_prompts_exactly_once() {
+        let socket = std::env::temp_dir().join(format!("tcl{:x}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let server = serve_a_doubly_delivered_proposal(socket.clone());
+
+        let mut conn = Connection::connect(&socket).expect("connect to the stub daemon");
+        let mut surface = crate::render::RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&["y"]);
+        let mut ctx = UiContext {
+            surface: &mut surface,
+            state: &mut state,
+            prompter: &mut prompter,
+            answer_permissions: false,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+        };
+        conn.answer_outstanding_model_proposal(&mut ctx)
+            .expect("the round-trip completes");
+        drop(conn);
+
+        let requests = server.join().expect("the stub daemon thread");
+        let _ = std::fs::remove_file(&socket);
+
+        assert_eq!(
+            prompter.asked, 1,
+            "the user must be asked exactly once, however many times the \
+             proposal was delivered"
+        );
+        let confirms = requests
+            .iter()
+            .filter(|r| r["method"].as_str() == Some(methods::ModelConfirmParams::METHOD))
+            .count();
+        assert_eq!(confirms, 1, "exactly one answer reaches the daemon");
+        // And the one prompt named the pick, its size, and its RAM floor (BR-2).
+        let text = surface.lines_of(crate::render::LineKind::Info).join("\n");
+        assert_eq!(
+            text.matches("proposed: qwen2.5-coder-3b").count(),
+            1,
+            "the proposal is rendered once, by name: {text}"
+        );
+        assert!(text.contains("2.0 GB download"), "{text}");
+        assert!(text.contains("needs 5.0 GB RAM"), "{text}");
+        // Proof that both sightings really happened and the *event* was the one
+        // that prompted: the late-attach path prints its own notice, and it is
+        // absent because `claim_model_proposal` had already taken this id.
+        let notices = surface.lines_of(crate::render::LineKind::Notice).join("\n");
+        assert!(
+            !notices.contains("before this client attached"),
+            "the status sighting must have been suppressed, not re-prompted: {notices}"
         );
     }
 

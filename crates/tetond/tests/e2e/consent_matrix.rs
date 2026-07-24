@@ -85,11 +85,17 @@ fn request_id(proposal: &Value) -> String {
         .to_owned()
 }
 
-/// Every `model_lifecycle` reason text this client has seen, joined.
+/// Every `model_lifecycle` **disabled** reason this client has seen, joined.
+///
+/// Only `disabled`: that is the daemon's "this did not happen, and here is why".
+/// `awaiting_decision` also carries a reason, but it is the *opening* state of
+/// every un-answered machine — reading it as an outcome would make every wait
+/// below return before the thing it is waiting for had a chance to occur.
 fn lifecycle_reasons(client: &Client) -> String {
     client
         .events_named("model_lifecycle")
         .iter()
+        .filter(|e| e["stage"]["stage"].as_str() == Some("disabled"))
         .filter_map(|e| e["stage"]["reason"].as_str())
         .collect::<Vec<_>>()
         .join(" | ")
@@ -140,11 +146,9 @@ fn closed_port() -> u16 {
 /// prompt turn completes against a live provider **while the proposal is still
 /// outstanding**. The gate withholds the tier, never the session.
 ///
-/// The legibility half is asserted through `model/status` + `model/list` rather
-/// than through the `model_selection_proposed` event, because that is the only
-/// path a real client has — see
-/// [`ac1_proposal_event_reaches_an_attached_client`], which is ignored and says
-/// why.
+/// The legibility half is asserted here through `model/list` (the catalog and the
+/// machine); that the *proposal itself* reaches a client, naming the pick, is
+/// [`ac1_proposal_event_reaches_an_attached_client`].
 #[test]
 fn ac1_nothing_downloads_before_the_answer_and_the_machine_is_legible() {
     let models = fixture_models();
@@ -263,29 +267,28 @@ fn ac1_nothing_downloads_before_the_answer_and_the_machine_is_legible() {
     assert_no_boundary_bytes();
 }
 
-/// **KNOWN GAP — the `model_selection_proposed` event is unreachable in the
-/// current wiring, so this test is ignored rather than deleted or faked.**
+/// **The proposal reaches an attached client, whenever it attached, and names
+/// the pick.** (Was ignored: the event is published before the daemon accepts
+/// connections, so no client could ever receive it and no client could name what
+/// was proposed — see TASK-009.)
 ///
-/// `tetond`'s `main` spawns the consent flow *before* calling `server::serve`,
-/// so the proposal is published before the daemon accepts its first connection.
-/// No client can be subscribed in time; the event has no receiver, ever. Every
-/// shipped client therefore recovers the prompt from
-/// `model/status.pending_request_id` plus `model/list` (`teton`'s
-/// `resolve_outstanding`) — which carries the probe and every catalog entry, but
-/// **cannot name which entry the daemon proposed**, nor its size and RAM floor
-/// as *the proposal*. That is the half of AC-1 this suite cannot claim.
+/// The fix was not to make the client attach earlier. The consent flow is spawned
+/// *beside* `server::serve` on purpose (D-3), so an outstanding proposal can never
+/// hold the socket shut; making the event's delivery a race the client had to win
+/// would have traded one defect for a flakier one. Instead the outstanding
+/// proposal is **retrievable**: `model/status` carries the whole payload — probe
+/// report, proposed entry, alternatives, required disk — so delivery does not
+/// depend on attach timing at all.
 ///
-/// The payload itself is correct and unit-tested (`model_consent::build_proposal`,
-/// and the protocol round-trip in `teton-protocol::events`); what is missing is
-/// delivery. Fixing it needs a daemon-side replay of the outstanding proposal to
-/// an attaching client *and* client-side de-duplication against the
-/// `model/status` path, or the prompt would be raised twice — a change to
-/// TASK-004/TASK-007's design, not something to smuggle in under an acceptance
-/// suite. Un-ignore this the day that lands.
+/// What this asserts is therefore the thing AC-1/BR-2 actually promise: a client
+/// that attached *after* the proposal was raised can still render it naming the
+/// proposed model, its download size, and its RAM floor — over a real socket,
+/// from the real daemon — and answer it by the id it carries. The shipped CLI's
+/// rendering of that same payload is asserted in `teton`'s `cli_e2e`
+/// (`teton_renders_the_first_run_proposal_and_accepts_it_interactively`), and the
+/// prompt-exactly-once rule across both delivery paths in `teton`'s
+/// `client::tests`.
 #[test]
-#[ignore = "the daemon publishes model_selection_proposed before it accepts \
-            connections, so no client can receive it (REQ-547 gap; see the doc \
-            comment)"]
 fn ac1_proposal_event_reaches_an_attached_client() {
     let models = fixture_models();
     let hf = MockHf::serving(&models);
@@ -295,9 +298,12 @@ fn ac1_proposal_event_reaches_an_attached_client() {
     ws.write_config(&local_model_block(&hf.base_url(), false));
 
     let daemon = Daemon::spawn(&ws, consent_env(&catalog));
+    // This client connects only now — after the daemon started, and therefore
+    // possibly after the proposal was published. That is the whole point.
     let mut client = daemon.connect();
-    let proposal = client.await_proposal(PROPOSAL_WINDOW);
+    let proposal = client.await_outstanding_proposal(PROPOSAL_WINDOW);
 
+    // --- BR-2: the proposal names its pick, with size and RAM floor ---
     let small = &models[0];
     assert_eq!(proposed_name(&proposal), Some(small.name), "{proposal}");
     let entry = &proposal["proposed"]["entry"];
@@ -316,6 +322,22 @@ fn ac1_proposal_event_reaches_an_attached_client() {
         Some(small.payload.len() as u64 + GIB),
         "the proposal must quote the disk the install needs, margin included"
     );
+
+    // --- the hardware reasoning rides with it, not on a second call ---
+    let probe = &proposal["probe"];
+    assert_eq!(probe["total_ram_bytes"].as_u64(), Some(16 * GIB), "{probe}");
+    assert_eq!(
+        probe["gpu_class"].as_str(),
+        Some("apple_silicon"),
+        "{probe}"
+    );
+    assert_eq!(probe["chosen_band"].as_str(), Some("small"), "{probe}");
+    assert!(
+        !probe["reason"].as_str().unwrap_or_default().is_empty(),
+        "{probe}"
+    );
+
+    // --- BR-3: every other entry is selectable from the retrieved payload ---
     let alternatives: Vec<&str> = proposal["alternatives"]
         .as_array()
         .expect("alternatives array")
@@ -326,10 +348,39 @@ fn ac1_proposal_event_reaches_an_attached_client() {
         alternatives.contains(&"tiny-mid") && alternatives.contains(&"tiny-large"),
         "every other catalog entry must be selectable; got {alternatives:?}"
     );
+
+    // --- it deserializes as the protocol type a client actually uses ---
+    //
+    // A client does not read this with `serde_json::Value`; asserting on the
+    // typed form is what proves the daemon's wire shape is the one `teton`
+    // renders from, rather than a JSON blob that merely looks right.
+    let typed: teton_protocol::events::ModelSelectionProposed =
+        serde_json::from_value(proposal.clone()).expect("the payload is a ModelSelectionProposed");
+    let typed_pick = typed.proposed.expect("a pick for this machine");
+    assert_eq!(typed_pick.entry.name, small.name);
+
+    // --- and the id it carries is the id that answers it ---
+    let id = request_id(&proposal);
+    assert_eq!(typed.request_id.to_string(), id);
     assert_eq!(
-        request_id(&proposal),
-        client.await_pending_proposal(PROPOSAL_WINDOW)
+        hf.artifact_request_count(),
+        0,
+        "retrieving the proposal must fetch nothing (AC-1)"
     );
+
+    client.confirm_model(&id, json!({ "outcome": "accept" }));
+    let installed = client.wait_for_install_status("verified", INSTALL_WINDOW);
+    assert_eq!(
+        installed["selection"]["model_name"].as_str(),
+        Some(small.name),
+        "answering the retrieved proposal must install the entry it named; got {installed}"
+    );
+    assert!(
+        client.model_status()["pending_proposal"].is_null(),
+        "an answered proposal is no longer outstanding"
+    );
+
+    assert_no_boundary_bytes();
 }
 
 // ===========================================================================
@@ -486,7 +537,7 @@ fn ac3_override_installs_the_chosen_entry_and_warns_above_the_ram_floor() {
             "a refused choice must fetch nothing"
         );
         assert!(
-            client.model_status()["pending_request_id"].is_string(),
+            client.model_status()["pending_proposal"].is_object(),
             "a refused choice must leave the proposal open to answer again"
         );
 
@@ -561,7 +612,7 @@ fn ac4_declining_is_remote_only_persisted_and_never_re_prompted() {
         "the decline must survive a restart; got {status}"
     );
     assert!(
-        status["pending_request_id"].is_null(),
+        status["pending_proposal"].is_null(),
         "no proposal may be outstanding on a declined machine; got {status}"
     );
     assert_eq!(hf.artifact_request_count(), 0);
@@ -596,7 +647,7 @@ fn ac5_auto_accept_completes_a_first_run_unattended() {
         "the decision must be recorded as auto-accepted, not as a user answer; got {status}"
     );
     assert!(
-        status["pending_request_id"].is_null(),
+        status["pending_proposal"].is_null(),
         "auto-accept must leave no prompt outstanding; got {status}"
     );
 
@@ -1106,6 +1157,173 @@ fn ac12_moving_ref_rejected_base_url_mirrored_and_rate_limit_backed_off() {
             hf.artifact_request_count()
         );
     }
+}
+
+// ===========================================================================
+// The startup lifecycle tells the truth (TASK-009, BR-1/BR-4)
+// ===========================================================================
+
+/// **No `model_lifecycle` stage claims a download, a benchmark, or a readiness
+/// that did not occur** — asserted on the three machine states a first run can
+/// actually be in.
+///
+/// The sequence this replaced published `download …`, `benchmark …` and `local
+/// model … ready` to every attaching client, on every start, including on a
+/// machine with no weights and no answer. It was decoration. A client cannot
+/// tell a decorative `ready` from a real one, which makes every real one
+/// worthless — and this REQ's whole claim is that the daemon is legible about
+/// what it is doing with someone's disk and network.
+///
+/// The three states are asserted against one workspace, in order, because they
+/// are the same machine moving through them: undecided → declined, and (in a
+/// second workspace) undecided → installed.
+#[test]
+fn the_startup_lifecycle_claims_only_what_actually_happened() {
+    let models = fixture_models();
+    let hf = MockHf::serving(&models);
+
+    // --- state 1: undecided, no weights on disk -----------------------------
+    let ws = Workspace::new("c-life");
+    let catalog = ws.write_catalog(&fixture_catalog_toml(&models));
+    ws.write_config(&local_model_block(&hf.base_url(), false));
+
+    let daemon = Daemon::spawn(&ws, consent_env(&catalog));
+    let mut client = daemon.connect();
+    client.await_outstanding_proposal(PROPOSAL_WINDOW);
+    client.drain_events(Duration::from_millis(200));
+
+    let stages = lifecycle_stages(&client);
+    assert!(
+        stages.contains(&"probed".to_owned()),
+        "the probe did run, and says so: {stages:?}"
+    );
+    assert!(
+        stages.contains(&"awaiting_decision".to_owned()),
+        "an undecided machine must report awaiting-decision; got {stages:?}"
+    );
+    assert_no_unearned_claims(&client, "undecided, no weights");
+    assert_eq!(
+        hf.artifact_request_count(),
+        0,
+        "and the events are not lying: nothing was fetched"
+    );
+
+    // --- state 2: declined --------------------------------------------------
+    let id = client.await_pending_proposal(PROPOSAL_WINDOW);
+    client.confirm_model(&id, json!({ "outcome": "decline" }));
+    client
+        .wait_for_event("model_selection_decided", Duration::from_secs(5))
+        .expect("the decline is announced");
+    drop(client);
+    drop(daemon);
+
+    let daemon = Daemon::spawn(&ws, consent_env(&catalog));
+    let mut client = daemon.connect();
+    client.drain_events(Duration::from_millis(400));
+    let stages = lifecycle_stages(&client);
+    assert!(
+        stages.contains(&"probed".to_owned()),
+        "the sequence must have been replayed at all; got {stages:?}"
+    );
+    assert!(
+        stages.contains(&"disabled".to_owned()),
+        "a declined machine must report the local tier absent; got {stages:?}"
+    );
+    assert!(
+        !stages.contains(&"awaiting_decision".to_owned()),
+        "a decline is settled (BR-4), not a prompt still pending; got {stages:?}"
+    );
+    assert!(
+        lifecycle_reasons(&client).contains("declined"),
+        "the disabled reason must say *why*: {}",
+        lifecycle_reasons(&client)
+    );
+    assert_no_unearned_claims(&client, "declined");
+    drop(client);
+    drop(daemon);
+
+    // --- state 3: installed, verified weights -------------------------------
+    let ws = Workspace::new("c-life2");
+    let catalog = ws.write_catalog(&fixture_catalog_toml(&models));
+    ws.write_config(&local_model_block(&hf.base_url(), false));
+
+    let daemon = Daemon::spawn(&ws, consent_env(&catalog));
+    let mut client = daemon.connect();
+    let id = client.await_pending_proposal(PROPOSAL_WINDOW);
+    client.confirm_model(&id, json!({ "outcome": "accept" }));
+    let installed = client.wait_for_install_status("verified", INSTALL_WINDOW);
+    assert_eq!(
+        installed["install"]["status"].as_str(),
+        Some("verified"),
+        "the state under test is 'weights installed'; got {installed}"
+    );
+
+    // A second client on the *same* daemon: the replayed sequence is derived when
+    // it is replayed, so it describes the machine as it is now. A snapshot taken
+    // at startup would still be telling this client to answer a prompt that was
+    // answered minutes ago — stale in exactly the way the synthetic sequence was.
+    let mut late = daemon.connect();
+    late.drain_events(Duration::from_millis(300));
+    let stages = lifecycle_stages(&late);
+    assert!(
+        stages.contains(&"probed".to_owned()),
+        "the sequence must actually have been replayed to this client, or the \
+         assertions below prove nothing; got {stages:?}"
+    );
+    assert!(
+        !stages.contains(&"awaiting_decision".to_owned()),
+        "the decision is made and the weights are installed; nothing is awaited: {stages:?}"
+    );
+    assert_no_unearned_claims(&late, "installed, same daemon");
+    drop(late);
+    drop(client);
+    drop(daemon);
+
+    // A fresh daemon over those installed weights. The download *did* happen —
+    // on the previous run, published as it happened — so this start replays no
+    // download of its own, and claims no readiness either: nothing in this build
+    // loads a GGUF (the AC-2 gap), and the sequence says that rather than
+    // pretending otherwise.
+    let daemon = Daemon::spawn(&ws, consent_env(&catalog));
+    let mut client = daemon.connect();
+    client.drain_events(Duration::from_millis(400));
+    let stages = lifecycle_stages(&client);
+    assert!(
+        !stages.contains(&"awaiting_decision".to_owned()),
+        "a settled machine with verified weights is not awaiting anything; got {stages:?}"
+    );
+    let reasons = lifecycle_reasons(&client);
+    assert!(
+        reasons.contains("installed and verified") && reasons.contains("no local inference engine"),
+        "the daemon must say the weights are there and that it cannot load them; got {reasons:?}"
+    );
+    assert_no_unearned_claims(&client, "installed");
+
+    assert_no_boundary_bytes();
+}
+
+/// Assert that this client has seen no startup `download`, `benchmark`, or
+/// `ready` stage — the three claims that cost a user bytes, time, or trust.
+///
+/// Called on a client that has done no install on *this* connection, so any such
+/// stage could only be a synthesized one.
+fn assert_no_unearned_claims(client: &Client, state: &str) {
+    for unearned in ["download", "benchmark", "ready"] {
+        assert!(
+            !lifecycle_stages(client).contains(&unearned.to_owned()),
+            "a machine that is {state} must not claim `{unearned}`; got {:?}",
+            lifecycle_stages(client)
+        );
+    }
+}
+
+/// The `stage` name of every `model_lifecycle` event this client has seen.
+fn lifecycle_stages(client: &Client) -> Vec<String> {
+    client
+        .events_named("model_lifecycle")
+        .iter()
+        .filter_map(|e| e["stage"]["stage"].as_str().map(str::to_owned))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

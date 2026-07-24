@@ -775,28 +775,27 @@ impl Client {
     /// Await the first-run proposal *as an event*
     /// (`model_selection_proposed`).
     ///
-    /// Note the daemon publishes its proposal before `server::serve` begins
-    /// accepting connections, so in the current wiring no client can be
-    /// subscribed in time to receive it — see the ignored
-    /// `ac1_proposal_event_reaches_an_attached_client`. Every other consent test
-    /// therefore finds the open proposal the way a real client does, through
-    /// [`Self::await_pending_proposal`].
+    /// Note the daemon publishes its proposal on a task spawned beside
+    /// `server::serve` (D-3), so it may be published before this client is
+    /// subscribed and the event may never arrive. Delivery does not depend on
+    /// that race: [`Self::await_outstanding_proposal`] retrieves the same payload
+    /// whenever the client shows up, and is what every shipped client uses.
     pub fn await_proposal(&mut self, window: Duration) -> Value {
         self.wait_for_event("model_selection_proposed", window)
             .expect("the daemon should have proposed a model")
     }
 
-    /// Poll `model/status` until a proposal is outstanding, returning the
-    /// `request_id` it must be answered with.
+    /// Poll `model/status` until a proposal is outstanding, returning it **in
+    /// full** — the same payload the `model_selection_proposed` event carries.
     ///
     /// This is the path every shipped client takes (`teton`'s
     /// `answer_outstanding_model_proposal`).
-    pub fn await_pending_proposal(&mut self, window: Duration) -> String {
+    pub fn await_outstanding_proposal(&mut self, window: Duration) -> Value {
         let deadline = Instant::now() + window;
         loop {
             let status = self.model_status();
-            if let Some(id) = status["pending_request_id"].as_str() {
-                return id.to_owned();
+            if status["pending_proposal"].is_object() {
+                return status["pending_proposal"].clone();
             }
             assert!(
                 Instant::now() < deadline,
@@ -804,6 +803,16 @@ impl Client {
             );
             thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// Poll `model/status` until a proposal is outstanding, returning the
+    /// `request_id` it must be answered with.
+    pub fn await_pending_proposal(&mut self, window: Duration) -> String {
+        let proposal = self.await_outstanding_proposal(window);
+        proposal["request_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an outstanding proposal carries a request_id: {proposal}"))
+            .to_owned()
     }
 
     /// Answer an outstanding proposal (`model/confirm`).

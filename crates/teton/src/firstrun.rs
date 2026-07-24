@@ -59,6 +59,9 @@ pub fn render_lifecycle(model_id: &str, stage: &ModelLifecycleStage, surface: &m
                 "benchmark {model_id}: first token {first_token_ms} ms, {tokens_per_sec:.1} tok/s"
             )
         }
+        ModelLifecycleStage::AwaitingDecision { reason } => {
+            format!("local model {model_id} awaiting your decision: {reason}")
+        }
         ModelLifecycleStage::Ready => format!("local model {model_id} ready"),
         ModelLifecycleStage::SteppedDown {
             from_model,
@@ -341,6 +344,9 @@ mod tests {
                 ram_bytes: 16 * 1024 * 1024 * 1024,
                 above_floor: true,
             },
+            ModelLifecycleStage::AwaitingDecision {
+                reason: "nothing is downloaded until you answer".to_owned(),
+            },
             ModelLifecycleStage::Download {
                 downloaded_bytes: 250,
                 total_bytes: Some(1000),
@@ -367,6 +373,7 @@ mod tests {
         assert_eq!(notices.len(), stages.len());
         assert!(surface.any_line_contains(LineKind::Notice, "probe:"));
         assert!(surface.any_line_contains(LineKind::Notice, "16.0 GB"));
+        assert!(surface.any_line_contains(LineKind::Notice, "awaiting your decision"));
         assert!(surface.any_line_contains(LineKind::Notice, "download"));
         assert!(surface.any_line_contains(LineKind::Notice, "first token 250 ms"));
         assert!(surface.any_line_contains(LineKind::Notice, "ready"));

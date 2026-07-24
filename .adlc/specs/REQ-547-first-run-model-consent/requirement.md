@@ -163,30 +163,41 @@ daemon contains no production wiring for `Downloader` at all._
 
 ## Acceptance Criteria
 
-- [ ] AC-1: On a machine with no installed weights, starting a session shows the
+- [x] AC-1: On a machine with no installed weights, starting a session shows the
       probe result (RAM, free disk, GPU class, band, reason), the proposed model
       with its download size and RAM floor, and the selectable alternatives — and
       **zero bytes of model data are fetched** until the user answers. Verified by
       asserting no download request is issued before the decision.
-      _Unchecked after TASK-008. The named verification passes end to end
-      (`consent_matrix::ac1_…`), as do the probe reasoning and every selectable
-      entry with its size and RAM floor. What does **not** hold is "the proposed
-      model": `model_selection_proposed` is published before the daemon accepts
-      connections, so no client ever receives it and the CLI can name only the
-      band, not the pick. Ignored test
-      `consent_matrix::ac1_proposal_event_reaches_an_attached_client` un-ignores
-      the day that is fixed._
+      _Checked at TASK-009, which closed the "the proposed model" gap TASK-008
+      found. The outstanding proposal is now retrievable in full from
+      `model/status.pending_proposal`, so delivery no longer depends on a client
+      having been attached at the instant of the broadcast. Three tests carry it:
+      `consent_matrix::ac1_nothing_downloads_before_the_answer_and_the_machine_is_legible`
+      (zero artifact requests before the answer, asserted against the mock host;
+      probe reasoning; every selectable entry with size and RAM floor),
+      `consent_matrix::ac1_proposal_event_reaches_an_attached_client` (no longer
+      ignored — a client attaching after the daemon started retrieves the named
+      pick with its size, RAM floor and required disk over a real socket, and
+      answers it), and `teton`'s
+      `cli_e2e::teton_renders_the_first_run_proposal_and_accepts_it_interactively`
+      (the shipped CLI, starting a session against a real daemon, printing
+      `proposed: qwen2.5-coder-3b [small] — 2.0 GB download, needs 5.0 GB RAM`)._
 - [ ] AC-2: Accepting the proposal downloads, verifies the SHA-256, installs
       atomically, benchmarks, and reaches a working local session, with progress
       rendered from `model_lifecycle` events.
-      _Unchecked after TASK-008. Download, SHA-256 verification, atomic install
-      and `model_lifecycle` progress are verified end to end
-      (`consent_matrix::ac2_…`). Two clauses are **not** met: the consent flow
-      runs no post-install benchmark (the `benchmark` event is REQ-544's
-      synthetic startup sequence), and nothing in `tetond` ever builds a
-      `LlamaEngine` from the installed weights — `tetond` has no `llama` feature
-      — so no local session can be served from them. See
-      `docs/manual-verification.md` "Known gaps"._
+      _Unchecked after TASK-008, and still unchecked after TASK-009 (which was
+      scoped to AC-1's delivery gap and the lifecycle's untruths). Download,
+      SHA-256 verification, atomic install and `model_lifecycle` progress are
+      verified end to end (`consent_matrix::ac2_…`). Two clauses are **not** met:
+      the consent flow runs no post-install benchmark, and nothing in `tetond`
+      ever builds a `LlamaEngine` from the installed weights — `tetond` has no
+      `llama` feature — so no local session can be served from them. TASK-009 did
+      make that state legible rather than papered over: a daemon holding verified
+      weights it cannot load now says so on `model_lifecycle`
+      (`disabled: … installed and verified, but this build has no local inference
+      engine`) instead of announcing a synthetic `ready`. Closing AC-2 is REQ-544
+      debt and a separate scope decision. See `docs/manual-verification.md`
+      "Known gaps" 1–2._
 - [x] AC-3: Overriding to a different catalog entry downloads that entry instead
       of the proposed one; choosing an entry above the machine's RAM floor emits
       an explicit warning and is only applied after a second confirmation.

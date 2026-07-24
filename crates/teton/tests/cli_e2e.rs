@@ -280,9 +280,9 @@ fn teton_renders_the_first_run_proposal_and_accepts_it_interactively() {
     let daemon = TestDaemon::spawn(&tetond);
     let teton = teton_bin();
 
-    // `a` answers the proposal ("accept as offered"); the closed stdin that
-    // follows ends the session loop.
-    let session = daemon.run_cli_with_stdin(&teton, &[], "a\n");
+    // `y` accepts the model the CLI just named; the closed stdin that follows
+    // ends the session loop.
+    let session = daemon.run_cli_with_stdin(&teton, &[], "y\n");
 
     // BR-2: the hardware reasoning is on screen before the question is asked.
     assert!(
@@ -297,14 +297,57 @@ fn teton_renders_the_first_run_proposal_and_accepts_it_interactively() {
         session.contains("band:") && session.contains("small"),
         "the CLI must render the band and the reason for it; output:\n{session}"
     );
+
+    // BR-2's load-bearing half, and the REQ's whole premise: the CLI names the
+    // *proposed* entry, with its download size and its RAM floor — over a real
+    // socket, from a daemon that published the proposal before this process
+    // existed. Before TASK-009 the shipped CLI could only offer "the daemon's own
+    // pick for the small band", because the delivery path carried a request id
+    // and nothing else.
+    assert!(
+        session.contains("proposed: qwen2.5-coder-3b"),
+        "the CLI must name the proposed model, not its band; output:\n{session}"
+    );
+    assert!(
+        session.contains("2.0 GB download") && session.contains("needs 5.0 GB RAM"),
+        "the proposed model must carry its download size and RAM floor; output:\n{session}"
+    );
+    assert!(
+        session.contains("Download local model qwen2.5-coder-3b"),
+        "the question itself must name what it is asking to download; output:\n{session}"
+    );
+    assert!(
+        !session.contains("the daemon's own pick"),
+        "the band-only stand-in must be gone; output:\n{session}"
+    );
+    // The proposal is prompted exactly once, however it was delivered: a client
+    // that both receives the event and polls `model/status` de-duplicates on the
+    // shared request id.
+    assert_eq!(
+        session.matches("Download local model").count(),
+        1,
+        "the proposal must be prompted exactly once; output:\n{session}"
+    );
     // BR-3: every selectable entry, with its download size and RAM floor.
     assert!(
-        session.contains("qwen2.5-coder-3b") && session.contains("needs"),
+        session.contains("qwen2.5-coder-7b") && session.contains("needs"),
         "the CLI must render the selectable catalog entries; output:\n{session}"
     );
     assert!(
-        session.contains("above this machine's RAM"),
+        session.to_lowercase().contains("above this machine's ram"),
         "an entry the machine cannot hold must be shown as such, not hidden; output:\n{session}"
+    );
+
+    // The honest startup lifecycle (TASK-009): a machine that has not answered
+    // has downloaded nothing, benchmarked nothing, and loaded nothing — and the
+    // daemon says exactly that instead of replaying a synthetic ready sequence.
+    assert!(
+        session.contains("awaiting your decision"),
+        "an undecided machine must report awaiting-decision; output:\n{session}"
+    );
+    assert!(
+        !session.contains("local model qwen2.5-coder-3b ready"),
+        "nothing may claim readiness before the weights exist; output:\n{session}"
     );
 
     // AC-1/AC-3: the answer reached the daemon and was recorded — asserted from

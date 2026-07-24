@@ -1131,7 +1131,7 @@ async fn model_status_exposes_the_open_proposal_so_a_late_client_can_answer() {
     );
     let runtime = Arc::new(DaemonRuntime::with_consent(Arc::clone(&h.gate)));
 
-    assert!(runtime.model_status().pending_request_id.is_none());
+    assert!(runtime.model_status().pending_proposal.is_none());
 
     let mut sub = h.subscribe();
     let resolve = h.gate.resolve();
@@ -1140,7 +1140,18 @@ async fn model_status_exposes_the_open_proposal_so_a_late_client_can_answer() {
         // A client that attached after the broadcast finds the open prompt here
         // rather than waiting forever for an event it already missed.
         let status = runtime.model_status();
-        assert_eq!(status.pending_request_id, Some(proposal.request_id.clone()));
+        // Not just "a prompt is open" — the whole proposal, so the client can
+        // render the pick by name with its size and RAM floor (BR-2).
+        let pending = status
+            .pending_proposal
+            .expect("the open proposal is retrievable from model/status");
+        assert_eq!(
+            pending, proposal,
+            "the retrieved payload IS the broadcast one"
+        );
+        let proposed = pending.proposed.expect("this machine has a pick");
+        assert_eq!(proposed.entry.name, "small-fit");
+        assert!(proposed.entry.size_bytes > 0 && proposed.entry.ram_floor_bytes > 0);
         assert!(status.selection.is_none());
         h.pending
             .resolve(&proposal.request_id, ModelConfirmOutcome::Decline);
@@ -1148,7 +1159,7 @@ async fn model_status_exposes_the_open_proposal_so_a_late_client_can_answer() {
     let (_outcome, ()) = tokio::join!(resolve, late_client);
 
     let status = runtime.model_status();
-    assert!(status.pending_request_id.is_none());
+    assert!(status.pending_proposal.is_none());
     assert!(status.selection.unwrap().declined_local);
     assert!(status.install.is_none(), "a decline installs nothing");
     h.cleanup();
@@ -1301,7 +1312,9 @@ async fn the_reader_loop_serves_sessions_while_a_proposal_is_outstanding() {
     client.send(4, "model/status", json!({})).await;
     let status = client.read_response(4).await;
     assert_eq!(
-        status["result"]["pending_request_id"].as_str().unwrap(),
+        status["result"]["pending_proposal"]["request_id"]
+            .as_str()
+            .unwrap(),
         request_id
     );
 

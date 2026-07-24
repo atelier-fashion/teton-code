@@ -85,9 +85,11 @@ impl SessionState {
     /// Claim a model proposal, returning `true` the first time only.
     ///
     /// A client can meet the same proposal twice — once as a broadcast event and
-    /// once through `model/status`'s `pending_request_id` on the late-attach path
+    /// once through `model/status`'s `pending_proposal` on the late-attach path
     /// (the daemon does not replay the event, so the client must ask). Both must
     /// not prompt, so the id is claimed once and the second sighting is dropped.
+    /// Both carry the same `request_id`, which is what makes the two sightings
+    /// recognisable as one.
     pub fn claim_model_proposal(&mut self, request_id: &RequestId) -> bool {
         self.model_seen.insert(request_id.clone())
     }

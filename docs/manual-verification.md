@@ -48,14 +48,16 @@ observe each one, and record anything that differs from this list.
    install returns; it never runs `teton_inference::benchmark::run_benchmark`.
    The `benchmark …` line you see at startup is REQ-544's *synthetic* probe
    sequence and describes no measurement.
-3. **The startup lifecycle overstates reality.** That same synthetic sequence
-   prints `download …`, `benchmark …` and `local model … ready` on every client
-   attach — including before you have answered the proposal, and on a machine
-   with no weights at all.
-4. **The proposal event never reaches a client.** `model_selection_proposed` is
-   published before the daemon accepts connections, so every client reconstructs
-   the prompt from `model/status` + `model/list` and cannot name *which* entry
-   was proposed — only its band.
+3. ~~**The startup lifecycle overstates reality.**~~ **FIXED (TASK-009.)** The
+   startup sequence now emits only stages that are true of this machine: `probed`
+   always, then `awaiting_decision` while a proposal is unanswered, `disabled`
+   when the tier was declined or the weights cannot be loaded, and `ready` only
+   when an engine is actually loaded. No `download` or `benchmark` is claimed at
+   startup; the `download` lines you see during step 3 are the real transfer.
+4. ~~**The proposal event never reaches a client.**~~ **FIXED (TASK-009.)** The
+   outstanding proposal is retrievable in full from `model/status`
+   (`pending_proposal`), so a client of any attach timing renders the *named*
+   pick with its download size and RAM floor. Expect step 2 to name the model.
 
 ---
 
@@ -117,11 +119,16 @@ it with `--no-default-features` or a prebuilt binary.
       ls -la "${XDG_RUNTIME_DIR:-/tmp}/teton/models" 2>/dev/null   # expect: absent or empty
       ```
 
-Then answer `a` (accept as offered).
+Then answer `y` (accept the model it named).
 
-> Expect known gaps 3 and 4 above to be visible here: the synthetic `… ready`
-> lines before you answer, and a prompt that names the *band* rather than the
-> proposed model. Note whether you see them; they are not AC-13 failures.
+- [ ] the prompt **names** the proposed model, with its download size and RAM
+      floor (`proposed: <model> [<band>] — … download, needs … RAM`)
+- [ ] before you answer, the only lifecycle lines are `probe:` and
+      `awaiting your decision` — no `download`, no `benchmark`, no `ready`
+
+> Known gaps 1 and 2 remain visible after you answer: no post-install benchmark
+> runs, and nothing loads the installed weights. Note whether you see them; they
+> are not AC-13 failures.
 
 ### 3. Watch the real transfer
 
@@ -224,7 +231,8 @@ Completion coherent : yes / no
 Session served from these weights : no  (known gap 1 — leave as `no` unless the
                                          daemon has since been wired to load them)
 Restart re-prompt:  none / observed
-Known gaps 1–4 observed as described :  yes / no  (list any differences)
+Known gaps 1–2 observed as described :  yes / no  (list any differences)
+Gaps 3–4 confirmed fixed (named proposal, honest lifecycle) : yes / no
 Notes / findings :
 ```
 

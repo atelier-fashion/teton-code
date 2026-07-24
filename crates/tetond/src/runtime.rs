@@ -375,9 +375,17 @@ pub struct DaemonRuntime {
     permission_config: PermissionConfig,
     /// Registered MCP servers (ADR-003), or `None` when none are configured.
     mcp_servers: Vec<McpServerConfig>,
-    /// The startup model-lifecycle event sequence (BR-9 / AC-8), replayed to each
-    /// newly attached client so it can observe probe → benchmark → ready.
-    lifecycle: Vec<ModelLifecycle>,
+    /// The startup hardware probe's *facts*, or `None` for a runtime with no
+    /// local tier at all (the minimal/consent-only runtimes).
+    ///
+    /// Deliberately the facts and not a rendered event list: the sequence is
+    /// replayed to every client that attaches, at whatever time it attaches, so
+    /// it is derived fresh from the probe **and the current consent state**
+    /// ([`Self::lifecycle_events`]). A stored list would go stale the moment the
+    /// user answered — a client attaching after an install would be told the
+    /// daemon was still awaiting a decision, which is the same class of untruth
+    /// the synthetic `download`/`ready` sequence was.
+    probe: Option<ProbeResult>,
     /// Monotonic turn-id source.
     turn_counter: AtomicU64,
     /// Per-session privacy taint: sessions pinned to the local tier because their
@@ -436,7 +444,7 @@ impl DaemonRuntime {
             pending: Arc::new(PendingPermissions::new()),
             permission_config: PermissionConfig::coding_defaults(),
             mcp_servers: Vec::new(),
-            lifecycle: Vec::new(),
+            probe: None,
             turn_counter: AtomicU64::new(0),
             session_taint: SessionTaint::new(),
             provider_health: Mutex::new(BTreeMap::new()),
@@ -520,7 +528,7 @@ impl DaemonRuntime {
             pending: Arc::new(PendingPermissions::new()),
             permission_config: PermissionConfig::coding_defaults(),
             mcp_servers,
-            lifecycle: probe.lifecycle,
+            probe: Some(probe),
             turn_counter: AtomicU64::new(0),
             session_taint: SessionTaint::new(),
             provider_health: Mutex::new(BTreeMap::new()),
@@ -629,9 +637,12 @@ impl DaemonRuntime {
     /// The recorded decision, the weights' install state, and any outstanding
     /// proposal (`model/status`, AC-9).
     ///
-    /// `pending_request_id` is what lets a client that attached *after* the
-    /// proposal was broadcast still answer it, instead of waiting forever for an
-    /// event it already missed.
+    /// `pending_proposal` carries the proposal **in full** — the same payload the
+    /// `model_selection_proposed` event carries. That is what lets a client which
+    /// attached *after* the broadcast render the pick by name, with its download
+    /// size and RAM floor (BR-2), and answer it — rather than waiting forever for
+    /// an event it already missed, or answering a prompt it could only describe
+    /// as "the daemon's own pick".
     #[must_use]
     pub fn model_status(&self) -> ModelStatusResult {
         ModelStatusResult {
@@ -641,7 +652,7 @@ impl DaemonRuntime {
                 .as_ref()
                 .map(selection_view),
             install: self.consent.current_install(),
-            pending_request_id: self.consent.pending().outstanding(),
+            pending_proposal: self.consent.pending().outstanding(),
         }
     }
 
@@ -698,9 +709,18 @@ impl DaemonRuntime {
     }
 
     /// The startup model-lifecycle events (BR-9), replayed to attaching clients.
+    ///
+    /// Derived per call, from the probe *and* the consent state as it stands
+    /// right now — see [`startup_lifecycle`]. A client attaching before the user
+    /// answers is told the daemon is awaiting a decision; one attaching after an
+    /// install is told what is actually on disk. Both are true when they are
+    /// said, which a snapshot taken at startup could not be.
     #[must_use]
-    pub fn lifecycle_events(&self) -> &[ModelLifecycle] {
-        &self.lifecycle
+    pub fn lifecycle_events(&self) -> Vec<ModelLifecycle> {
+        match &self.probe {
+            Some(probe) => startup_lifecycle(probe, self.engine.is_some(), &self.consent),
+            None => Vec::new(),
+        }
     }
 
     /// A snapshot of the current configuration for `config/get`.
@@ -1164,6 +1184,10 @@ fn load_mcp_servers(config: &Config) -> Vec<McpServerConfig> {
 /// protocol boundary (BR-11).
 const WEIGHTS_DIR: &str = "models";
 
+/// The `model_id` a lifecycle event carries when the machine has no model to
+/// name — a below-the-floor probe, or a catalog with nothing that fits.
+const LOCAL_TIER_ID: &str = "local";
+
 /// The installer the consent gate hands a decided model to.
 ///
 /// The download client is credential-free and redirect-following (D-2, TASK-002).
@@ -1248,18 +1272,45 @@ fn load_catalog() -> Catalog {
 }
 
 /// The result of the startup hardware probe (BR-9 / AC-8).
+///
+/// Facts only. What the *client* is told about them is
+/// [`startup_lifecycle`]'s job, because the honest answer depends on state this
+/// function cannot see — whether a decision has been made, whether weights are
+/// on disk, and whether anything in this build can load them.
 struct ProbeResult {
-    /// The selected local model id, or `None` when disabled.
+    /// The local model id in force after any step-down, or `None` when disabled.
     model: Option<String>,
+    /// The model the probe itself picked, before a simulated step-down moved off
+    /// it. What the `probed` stage names, because that is what was probed.
+    probed_model: Option<String>,
     /// Whether the local tier is disabled (below floor / resource-starved).
     disabled: bool,
-    /// The lifecycle event sequence to replay to attaching clients.
-    lifecycle: Vec<ModelLifecycle>,
+    /// Why the local tier is disabled, when it is — the probe's own sentence.
+    disabled_reason: Option<String>,
+    /// Detected system RAM, as quoted in the `probed` stage.
+    ram_bytes: u64,
+    /// Whether the machine cleared the local-tier RAM floor.
+    above_floor: bool,
+    /// The `TETON_PROBE_FORCE_SLOW_BENCH` simulation, when it was asked for.
+    forced_bench: Option<ForcedBench>,
 }
 
-/// Run the first-run hardware probe against `profile` and synthesize the
-/// model-lifecycle event sequence (probe → download → benchmark → ready /
-/// stepped-down / disabled).
+/// A benchmark ladder the operator explicitly asked to have *simulated*
+/// (`TETON_PROBE_FORCE_SLOW_BENCH`), so REQ-544's auto-step-down duty is
+/// exercisable end to end without a real model.
+///
+/// It is the one place a `benchmark` stage is published without a measurement,
+/// and it exists only when that env flag is set: a daemon nobody asked to
+/// simulate anything never emits one.
+struct ForcedBench {
+    /// The model whose simulated benchmark missed the latency duty.
+    from_model: String,
+    /// The smaller model it stepped down to, or `None` when nothing smaller
+    /// clears the duty and the tier is disabled instead.
+    to_model: Option<String>,
+}
+
+/// Run the first-run hardware probe against `profile`.
 ///
 /// The profile and catalog are passed in rather than resolved here so the probe
 /// and the REQ-547 consent gate describe the *same* machine and the *same*
@@ -1270,122 +1321,181 @@ fn probe_local_tier(
     pinned: Option<&str>,
 ) -> ProbeResult {
     let decision = decide(profile, catalog, pinned);
-
     let above_floor = profile.ram_bytes >= 8 * GIB;
-    let mut lifecycle = Vec::new();
 
     match decision {
-        TierDecision::Disabled { reason } => {
-            let model_id = "local".to_owned();
-            lifecycle.push(ModelLifecycle {
-                model_id: model_id.clone(),
-                stage: ModelLifecycleStage::Probed {
-                    ram_bytes: profile.ram_bytes,
-                    above_floor,
-                },
-            });
-            lifecycle.push(ModelLifecycle {
-                model_id,
-                stage: ModelLifecycleStage::Disabled { reason },
-            });
-            ProbeResult {
-                model: None,
-                disabled: true,
-                lifecycle,
-            }
-        }
+        TierDecision::Disabled { reason } => ProbeResult {
+            model: None,
+            probed_model: None,
+            disabled: true,
+            disabled_reason: Some(reason),
+            ram_bytes: profile.ram_bytes,
+            above_floor,
+            forced_bench: None,
+        },
         TierDecision::Selected { model, .. } => {
-            lifecycle.push(ModelLifecycle {
-                model_id: model.clone(),
-                stage: ModelLifecycleStage::Probed {
-                    ram_bytes: profile.ram_bytes,
-                    above_floor,
-                },
-            });
-            lifecycle.push(ModelLifecycle {
-                model_id: model.clone(),
-                stage: ModelLifecycleStage::Download {
-                    downloaded_bytes: 0,
-                    total_bytes: None,
-                },
-            });
-
             // A forced-slow micro-benchmark trips the BR-8 latency duty and
             // auto-steps-down to the next smaller catalog model (AC-8).
-            let force_slow = env_flag("TETON_PROBE_FORCE_SLOW_BENCH");
-            if force_slow {
-                let first_token_ms = 2_500;
-                lifecycle.push(ModelLifecycle {
-                    model_id: model.clone(),
-                    stage: ModelLifecycleStage::Benchmark {
-                        first_token_ms,
-                        tokens_per_sec: 2.0,
-                    },
-                });
-                let smaller = step_down_target(catalog, &model);
-                match smaller {
-                    Some(to_model) => {
-                        lifecycle.push(ModelLifecycle {
-                            model_id: model.clone(),
-                            stage: ModelLifecycleStage::SteppedDown {
-                                from_model: model.clone(),
-                                to_model: to_model.clone(),
-                                reason: "benchmark exceeded the 1s first-token latency duty"
-                                    .to_owned(),
-                            },
-                        });
-                        lifecycle.push(ModelLifecycle {
-                            model_id: to_model.clone(),
-                            stage: ModelLifecycleStage::Benchmark {
-                                first_token_ms: 600,
-                                tokens_per_sec: 30.0,
-                            },
-                        });
-                        lifecycle.push(ModelLifecycle {
-                            model_id: to_model.clone(),
-                            stage: ModelLifecycleStage::Ready,
-                        });
-                        return ProbeResult {
-                            model: Some(to_model),
-                            disabled: false,
-                            lifecycle,
-                        };
-                    }
-                    None => {
-                        lifecycle.push(ModelLifecycle {
-                            model_id: model.clone(),
-                            stage: ModelLifecycleStage::Disabled {
-                                reason: "no smaller model clears the latency duty; remote-only"
-                                    .to_owned(),
-                            },
-                        });
-                        return ProbeResult {
-                            model: None,
-                            disabled: true,
-                            lifecycle,
-                        };
-                    }
-                }
+            if env_flag("TETON_PROBE_FORCE_SLOW_BENCH") {
+                let to_model = step_down_target(catalog, &model);
+                return ProbeResult {
+                    model: to_model.clone(),
+                    probed_model: Some(model.clone()),
+                    disabled: to_model.is_none(),
+                    disabled_reason: to_model.is_none().then(|| {
+                        "no smaller model clears the latency duty; remote-only".to_owned()
+                    }),
+                    ram_bytes: profile.ram_bytes,
+                    above_floor,
+                    forced_bench: Some(ForcedBench {
+                        from_model: model,
+                        to_model,
+                    }),
+                };
             }
 
-            lifecycle.push(ModelLifecycle {
-                model_id: model.clone(),
-                stage: ModelLifecycleStage::Benchmark {
-                    first_token_ms: 350,
-                    tokens_per_sec: 40.0,
-                },
-            });
-            lifecycle.push(ModelLifecycle {
-                model_id: model.clone(),
-                stage: ModelLifecycleStage::Ready,
-            });
             ProbeResult {
-                model: Some(model),
+                model: Some(model.clone()),
+                probed_model: Some(model),
                 disabled: false,
-                lifecycle,
+                disabled_reason: None,
+                ram_bytes: profile.ram_bytes,
+                above_floor,
+                forced_bench: None,
             }
         }
     }
+}
+
+/// The startup `model_lifecycle` sequence replayed to every attaching client.
+///
+/// **Every stage here is a claim about something that actually happened.** The
+/// sequence this replaced announced `download …`, `benchmark …` and `local model
+/// … ready` on every attach — before the user had answered the proposal, and on
+/// a machine with no weights at all. In a daemon whose thesis is legibility that
+/// is worse than saying nothing: a client cannot distinguish a real readiness
+/// from a decorative one, so the honest states have to be nameable.
+///
+/// What this daemon can truthfully say at startup:
+///
+/// | State | Stage |
+/// |---|---|
+/// | the probe ran | `probed` (always) |
+/// | below the floor / no fitting entry | `disabled`, with the probe's reason |
+/// | a proposal is open, or weights are missing | `awaiting_decision` |
+/// | the tier was declined (BR-4) | `disabled`, saying so |
+/// | weights installed, nothing in this build can load them | `disabled`, saying so |
+/// | an engine is loaded and serving | `ready` |
+///
+/// Nothing here claims a download: the only `download` stages that reach a
+/// client come from [`crate::install::LifecycleProgress`], which publishes bytes
+/// as they actually move.
+fn startup_lifecycle(
+    probe: &ProbeResult,
+    engine_present: bool,
+    consent: &ModelConsentGate,
+) -> Vec<ModelLifecycle> {
+    let model_id = probe
+        .model
+        .clone()
+        .unwrap_or_else(|| LOCAL_TIER_ID.to_owned());
+    let mut lifecycle = vec![ModelLifecycle {
+        // The model the *probe* chose, which a simulated step-down may since have
+        // moved off.
+        model_id: probe
+            .probed_model
+            .clone()
+            .unwrap_or_else(|| LOCAL_TIER_ID.to_owned()),
+        stage: ModelLifecycleStage::Probed {
+            ram_bytes: probe.ram_bytes,
+            above_floor: probe.above_floor,
+        },
+    }];
+
+    // The explicitly-requested simulation, and only when requested.
+    if let Some(bench) = &probe.forced_bench {
+        lifecycle.push(ModelLifecycle {
+            model_id: bench.from_model.clone(),
+            stage: ModelLifecycleStage::Benchmark {
+                first_token_ms: 2_500,
+                tokens_per_sec: 2.0,
+            },
+        });
+        if let Some(to_model) = &bench.to_model {
+            lifecycle.push(ModelLifecycle {
+                model_id: bench.from_model.clone(),
+                stage: ModelLifecycleStage::SteppedDown {
+                    from_model: bench.from_model.clone(),
+                    to_model: to_model.clone(),
+                    reason: "benchmark exceeded the 1s first-token latency duty".to_owned(),
+                },
+            });
+            lifecycle.push(ModelLifecycle {
+                model_id: to_model.clone(),
+                stage: ModelLifecycleStage::Benchmark {
+                    first_token_ms: 600,
+                    tokens_per_sec: 30.0,
+                },
+            });
+        }
+    }
+
+    if probe.disabled {
+        lifecycle.push(ModelLifecycle {
+            model_id,
+            stage: ModelLifecycleStage::Disabled {
+                reason: probe
+                    .disabled_reason
+                    .clone()
+                    .unwrap_or_else(|| "the local tier is unavailable on this machine".to_owned()),
+            },
+        });
+        return lifecycle;
+    }
+
+    // An engine is loaded and answering: `ready` is a fact, not a hope. Today
+    // that means a `TETON_LOCAL_SCRIPT` engine — which downloads nothing, which
+    // is exactly why it is not gated on a consent decision.
+    if engine_present {
+        lifecycle.push(ModelLifecycle {
+            model_id,
+            stage: ModelLifecycleStage::Ready,
+        });
+        return lifecycle;
+    }
+
+    let declined = consent
+        .current_selection()
+        .is_some_and(|selection| selection.declined_local);
+    let stage = if declined {
+        // BR-4: a settled, deliberate absence. Not a failure and not a prompt.
+        ModelLifecycleStage::Disabled {
+            reason: "the local tier was declined; sessions run remote-only. \
+                     `teton model set <name>` changes that."
+                .to_owned(),
+        }
+    } else if consent.consent_required() {
+        // BR-1: proposed and unanswered, or answered but the weights are gone.
+        // Nothing has been fetched, measured, or loaded, and the sequence says so.
+        ModelLifecycleStage::AwaitingDecision {
+            reason: "proposed for this machine — nothing is downloaded, benchmarked, or loaded \
+                     until you answer; sessions run remote-only until then."
+                .to_owned(),
+        }
+    } else {
+        // Decided, downloaded, verified — and unloadable, because nothing in this
+        // build constructs a local engine from installed weights (REQ-544 debt,
+        // tracked as AC-2). Saying `ready` here would be the exact untruth this
+        // function exists to stop.
+        ModelLifecycleStage::Disabled {
+            reason: format!(
+                "{model_id}'s weights are installed and verified, but this build has no local \
+                 inference engine to load them; sessions run remote-only."
+            ),
+        }
+    };
+    lifecycle.push(ModelLifecycle { model_id, stage });
+    lifecycle
 }
 
 /// The hardware profile to probe: env overrides when present, else detected.

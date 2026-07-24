@@ -19,7 +19,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use teton_protocol::events::{DaemonClientAttach, Event, ModelLifecycle, PhaseTransition};
+use teton_protocol::events::{DaemonClientAttach, Event, PhaseTransition};
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
 use teton_protocol::methods::{
@@ -361,14 +361,20 @@ fn do_handshake(
     let _ = out_tx.try_send(ok_string(id, &result));
 
     // Replay the local-model lifecycle (BR-9 / AC-8) to the just-subscribed
-    // client so it can observe probe → benchmark → ready (or disabled /
-    // stepped-down). Published after the subscribe above, so this client receives
-    // it; a machine with no local tier has an empty sequence and emits nothing.
+    // client, so it learns the state of the local tier on this machine: probed,
+    // then awaiting a decision / disabled / ready. Published after the subscribe
+    // above, so this client receives it; a machine with no local tier has an
+    // empty sequence and emits nothing.
+    //
+    // Because it is replayed on *every* attach, every stage in it must be true of
+    // the machine right now — see `runtime::startup_lifecycle`. A replayed
+    // `download` or `ready` that described nothing would be repeated to every
+    // client that ever connects, which is how a decorative sequence becomes a
+    // daemon-wide lie.
     for lifecycle in daemon.runtime.lifecycle_events() {
-        daemon.events.publish(
-            None,
-            Event::ModelLifecycle(ModelLifecycle::clone(lifecycle)),
-        );
+        daemon
+            .events
+            .publish(None, Event::ModelLifecycle(lifecycle));
     }
 
     Some(subscription)

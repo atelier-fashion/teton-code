@@ -13,12 +13,14 @@
 //!   itself. Declining the warning sends **nothing**: the proposal stays open.
 //! - **BR-5 (unattended).** `--yes` answers without asking anything at all,
 //!   proven by a test that asserts the prompter was never called.
-//! - **Late attach.** The proposal event is broadcast once and never replayed, so
-//!   a client that attaches afterwards finds the open prompt through
-//!   `model/status`'s `pending_request_id` and answers it from `model/list` —
-//!   [`resolve_outstanding`]. That path claims only what it can see: `model/list`
-//!   does not name the daemon's proposed entry, so it is offered as "accept as
-//!   offered" rather than being guessed at and mis-named.
+//! - **Late attach.** The proposal event is broadcast once and never replayed —
+//!   and the daemon may publish it before it accepts its first connection — so a
+//!   client that attaches afterwards retrieves the *whole* proposal from
+//!   `model/status.pending_proposal` and renders it through the very same
+//!   [`resolve_proposal`] the live event takes. One rendering path, so the pick
+//!   is named with its download size and RAM floor (BR-2) no matter when the
+//!   client showed up. A client that sees both the event and the polled proposal
+//!   de-duplicates on the shared `request_id` and prompts exactly once.
 //!
 //! Everything is a pure function of a protocol payload plus a [`Prompter`], so
 //! every path above — including the double-confirm and the abort — is unit-tested
@@ -85,7 +87,6 @@ pub fn resolve_proposal(
         request_id,
         &proposal.alternatives,
         proposal.probe.total_ram_bytes,
-        false,
         surface,
         prompter,
     )
@@ -93,50 +94,27 @@ pub fn resolve_proposal(
 
 /// Answer a proposal that was raised *before* this client attached.
 ///
-/// The daemon broadcasts a proposal once; a late-attaching client learns of it
-/// from `model/status.pending_request_id` and gets the machine and the catalog
-/// from `model/list`. What `model/list` cannot say is which entry the daemon
-/// proposed, so this renders the hardware reasoning it *does* have and offers
-/// "accept as offered" alongside every explicitly named alternative.
+/// Deliberately **not** a second rendering of the proposal: it prints the one
+/// thing that differs — that this prompt predates the connection — and then hands
+/// the identical payload to [`resolve_proposal`]. A late-attaching client and a
+/// live one therefore see the same named pick, the same size, the same RAM floor
+/// and the same menu, because they run the same code over the same bytes.
+///
+/// The previous shape reconstructed the prompt from `model/list`, which knows the
+/// catalog but not the daemon's choice within it, so it could only offer "the
+/// daemon's own pick for the <band> band". That is not the consent BR-2 asks for,
+/// and no amount of careful wording made it one.
 pub fn resolve_outstanding(
-    request_id: &RequestId,
-    list: &ModelListResult,
+    proposal: &ModelSelectionProposed,
     auto_accept: bool,
     surface: &mut dyn Surface,
     prompter: &mut dyn Prompter,
 ) -> Option<ModelConfirmParams> {
     surface.line(
-        LineKind::Prompt,
+        LineKind::Notice,
         "a local-model proposal raised before this client attached is still awaiting an answer:",
     );
-    firstrun::render_probe(&list.probe, surface);
-    surface.line(
-        LineKind::Info,
-        &format!(
-            "  proposed: the daemon's own pick for the {} band — accept it as offered, or name \
-             one of these instead:",
-            firstrun::band_label(list.probe.chosen_band)
-        ),
-    );
-    render_catalog_rows(
-        &list.models,
-        selected_name(list.selection.as_ref()),
-        surface,
-    );
-
-    if auto_accept {
-        return auto_accepted(request_id, true, surface);
-    }
-
-    let entries: Vec<CatalogEntryView> = list.models.iter().map(|m| m.entry.clone()).collect();
-    choose_from(
-        request_id,
-        &entries,
-        list.probe.total_ram_bytes,
-        true,
-        surface,
-        prompter,
-    )
+    resolve_proposal(proposal, auto_accept, surface, prompter)
 }
 
 /// The BR-5 unattended answer: accept without asking anything.
@@ -170,24 +148,19 @@ fn choose_from(
     request_id: &RequestId,
     entries: &[CatalogEntryView],
     total_ram_bytes: u64,
-    offer_accept: bool,
     surface: &mut dyn Surface,
     prompter: &mut dyn Prompter,
 ) -> Option<ModelConfirmParams> {
-    if !offer_accept {
-        surface.line(LineKind::Prompt, "choose a local model instead:");
-        firstrun::render_alternatives(entries, total_ram_bytes, surface);
-    }
-    let question = match (offer_accept, entries.is_empty()) {
-        (true, _) => {
-            "  [a]ccept as offered, a number to install that model, [d]ecline the local tier, \
-             or [q] to leave it open: "
-        }
-        (false, false) => {
-            "  a number to install that model, [d]ecline the local tier, or [q] to leave it \
-             open: "
-        }
-        (false, true) => "  [d]ecline the local tier, or [q] to leave the proposal open: ",
+    surface.line(LineKind::Prompt, "choose a local model instead:");
+    firstrun::render_alternatives(entries, total_ram_bytes, surface);
+    // No "[a]ccept as offered" here: this menu is only reached after the user
+    // has already declined the proposal's own question, which named the pick.
+    // (It used to be offered on the late-attach path, which could not name what
+    // "as offered" meant — that path is gone.)
+    let question = if entries.is_empty() {
+        "  [d]ecline the local tier, or [q] to leave the proposal open: "
+    } else {
+        "  a number to install that model, [d]ecline the local tier, or [q] to leave it open: "
     };
 
     loop {
@@ -198,9 +171,6 @@ fn choose_from(
             return None;
         };
         match answer.trim().to_lowercase().as_str() {
-            "a" | "accept" if offer_accept => {
-                return Some(confirm(request_id, ModelConfirmOutcome::Accept))
-            }
             "d" | "decline" => return Some(confirm(request_id, ModelConfirmOutcome::Decline)),
             "q" | "quit" | "" => {
                 surface.line(LineKind::Notice, LEFT_OPEN);
@@ -352,11 +322,24 @@ pub fn render_status(
             "install:   nothing selected, so nothing is installed.",
         ),
     }
-    if let Some(request_id) = &status.pending_request_id {
+    if let Some(proposal) = &status.pending_proposal {
+        // Name it. `teton model status` is a report, not a prompt, so it does not
+        // ask — but a user told "something is awaiting an answer" without being
+        // told *what* has learned nothing they can act on.
+        let what = match &proposal.proposed {
+            Some(proposed) => format!(
+                "{} ({} download, needs {} RAM)",
+                proposed.entry.name,
+                firstrun::format_bytes(proposed.entry.size_bytes),
+                firstrun::format_bytes(proposed.entry.ram_floor_bytes),
+            ),
+            None => "no fitting catalog entry — you would pick one yourself".to_owned(),
+        };
         surface.line(
             LineKind::Notice,
             &format!(
-                "a model proposal ({request_id}) is awaiting an answer — run `teton` to answer it."
+                "proposal {} is awaiting an answer: {what} — run `teton` to answer it.",
+                proposal.request_id
             ),
         );
     }
@@ -742,39 +725,77 @@ mod tests {
     // late attach: the proposal event was broadcast before this client existed
     // -----------------------------------------------------------------------
 
-    /// Answer an outstanding proposal discovered through `model/status`.
+    /// Answer an outstanding proposal retrieved through `model/status`.
+    ///
+    /// The payload is the *same* `ModelSelectionProposed` the live event carries,
+    /// because that is now what `model/status.pending_proposal` returns.
     fn answer_outstanding(
         answers: &[&str],
         auto_accept: bool,
     ) -> (Option<ModelConfirmParams>, RecordingSurface) {
         let mut surface = RecordingSurface::new();
         let mut prompter = ScriptedPrompter::new(answers);
-        let reply = resolve_outstanding(
-            &RequestId::from("req-late-1"),
-            &list_result(),
-            auto_accept,
-            &mut surface,
-            &mut prompter,
-        );
+        let mut proposal = proposal();
+        proposal.request_id = RequestId::from("req-late-1");
+        let reply = resolve_outstanding(&proposal, auto_accept, &mut surface, &mut prompter);
         (reply, surface)
     }
 
+    /// The defect this replaced: a late-attaching client could not name the
+    /// daemon's pick, so it printed "the daemon's own pick for the mid band" and
+    /// asked the user to accept a model they had never been shown. BR-2 says a
+    /// bare name is not enough — a *missing* name is certainly not.
     #[test]
-    fn a_late_attaching_client_can_accept_the_outstanding_proposal() {
-        let (reply, surface) = answer_outstanding(&["a"], false);
+    fn a_late_attaching_client_renders_the_proposed_model_by_name_with_size_and_ram_floor() {
+        let (reply, surface) = answer_outstanding(&[""], false);
         let reply = reply.expect("an accept is sent");
         assert_eq!(reply.outcome, ModelConfirmOutcome::Accept);
         assert_eq!(reply.request_id, RequestId::from("req-late-1"));
-        // It still renders the hardware reasoning (BR-2) from `model/list`.
-        assert!(surface.any_line_contains(LineKind::Info, "16.0 GB RAM"));
-        assert!(surface.any_line_contains(LineKind::Info, "band:     mid"));
-        assert!(surface.any_line_contains(LineKind::Prompt, "before this client attached"));
+
+        let text = surface.lines_of(LineKind::Info).join("\n");
+        // The pick, BY NAME, with its download size and its RAM floor.
+        assert!(
+            text.contains("proposed: qwen2.5-coder-7b"),
+            "the proposed entry must be named: {text}"
+        );
+        assert!(text.contains("4.4 GB download"), "download size: {text}");
+        assert!(text.contains("needs 8.0 GB RAM"), "RAM floor: {text}");
+        // And nothing may describe the pick by its band any more.
+        assert!(
+            !text.contains("the daemon's own pick"),
+            "the band-only stand-in must be gone: {text}"
+        );
+        // The hardware reasoning and the alternatives are there too (BR-2/BR-3).
+        assert!(text.contains("16.0 GB RAM"), "{text}");
+        assert!(text.contains("band:     mid"), "{text}");
+        assert!(text.contains("1. qwen2.5-coder-3b"), "{text}");
+        assert!(surface.any_line_contains(LineKind::Notice, "before this client attached"));
+    }
+
+    /// The two delivery paths render identically, because they are one path.
+    #[test]
+    fn the_late_attach_rendering_matches_the_live_event_rendering() {
+        let mut proposal = proposal();
+        proposal.request_id = RequestId::from("req-late-1");
+
+        let mut live = RecordingSurface::new();
+        resolve_proposal(&proposal, true, &mut live, &mut ScriptedPrompter::new(&[]));
+
+        let mut late = RecordingSurface::new();
+        resolve_outstanding(&proposal, true, &mut late, &mut ScriptedPrompter::new(&[]));
+
+        assert_eq!(
+            live.lines_of(LineKind::Info),
+            late.lines_of(LineKind::Info),
+            "a client that attached late must see exactly what a live one sees"
+        );
     }
 
     #[test]
     fn a_late_attaching_client_honours_the_same_double_confirmation() {
-        // Entry 3 of the catalog is above this machine's RAM.
-        let (reply, surface) = answer_outstanding(&["3", "y"], false);
+        // Alternative 2 is above this machine's RAM. Answering "n" to the
+        // proposal's own question opens the override menu (it is not a decline).
+        let (reply, surface) = answer_outstanding(&["n", "2", "y"], false);
         assert!(surface.any_line_contains(LineKind::Notice, "warning: qwen3-coder-30b"));
         assert_eq!(
             reply.unwrap().outcome,
@@ -784,16 +805,16 @@ mod tests {
             }
         );
 
-        let (refused, _) = answer_outstanding(&["3", "n"], false);
+        let (refused, _) = answer_outstanding(&["n", "2", "n"], false);
         assert!(refused.is_none(), "refusing the warning sends nothing");
     }
 
     #[test]
     fn a_late_attaching_client_can_decline_or_leave_it_open() {
-        let (declined, _) = answer_outstanding(&["d"], false);
+        let (declined, _) = answer_outstanding(&["n", "d"], false);
         assert_eq!(declined.unwrap().outcome, ModelConfirmOutcome::Decline);
 
-        let (left_open, surface) = answer_outstanding(&["q"], false);
+        let (left_open, surface) = answer_outstanding(&["n", "q"], false);
         assert!(left_open.is_none());
         assert!(surface.any_line_contains(LineKind::Notice, "left the proposal open"));
     }
@@ -870,7 +891,7 @@ mod tests {
                 model_name: "qwen2.5-coder-7b".to_owned(),
                 status: InstallStatus::Verified,
             }),
-            pending_request_id: None,
+            pending_proposal: None,
         };
         let path = weights_path(Path::new("/state/teton"), "qwen2.5-coder-7b");
         let mut surface = RecordingSurface::new();
@@ -885,16 +906,22 @@ mod tests {
     }
 
     #[test]
-    fn render_status_surfaces_an_outstanding_proposal() {
+    fn render_status_names_the_outstanding_proposal_rather_than_just_flagging_one() {
+        let mut proposal = proposal();
+        proposal.request_id = RequestId::from("req-open-1");
         let status = ModelStatusResult {
             selection: None,
             install: None,
-            pending_request_id: Some(RequestId::from("req-open-1")),
+            pending_proposal: Some(proposal),
         };
         let mut surface = RecordingSurface::new();
         render_status(&status, None, &mut surface);
         assert!(surface.any_line_contains(LineKind::Info, "nothing is installed"));
-        assert!(surface.any_line_contains(LineKind::Notice, "req-open-1"));
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("req-open-1"), "{notice}");
+        assert!(notice.contains("qwen2.5-coder-7b"), "{notice}");
+        assert!(notice.contains("4.4 GB download"), "{notice}");
+        assert!(notice.contains("needs 8.0 GB RAM"), "{notice}");
     }
 
     #[test]

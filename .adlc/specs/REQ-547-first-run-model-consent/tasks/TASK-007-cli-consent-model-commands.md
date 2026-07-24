@@ -54,6 +54,11 @@ protocol event (BR-11).
 - `model/list` cannot name the daemon's proposed entry, so the late-attach path
   offers "[a]ccept as offered" rather than guessing a name it would then
   mis-render — the same double-confirm gates its numbered choices.
+  **Superseded by TASK-009**: `model/status` now carries the whole proposal
+  (`pending_proposal`), so the late-attach path renders the named pick through
+  the same `resolve_proposal` the live event uses, and the band-only
+  "accept as offered" wording is gone. The two bullets above describe what
+  TASK-007 shipped; read them as history, not as current behaviour.
 - Backing out of the BR-3 warning **sends nothing at all** and does not re-open
   the menu; EOF and `q` likewise leave the proposal open (BR-1 remote-only)
   rather than being read as a decline, which BR-4 would persist.
