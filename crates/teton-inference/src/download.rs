@@ -210,7 +210,7 @@ impl<'a> Downloader<'a> {
             }
 
             let before = written;
-            let mut file = OpenOptions::new().create(true).append(true).open(dest)?;
+            let mut file = open_partial(dest)?;
 
             let result = self.fetcher.fetch(&model.url, written, &mut |chunk| {
                 file.write_all(chunk)?;
@@ -262,6 +262,26 @@ impl<'a> Downloader<'a> {
         }
         Ok(())
     }
+}
+
+/// Open the partial-download file for append, refusing to follow a symlink.
+///
+/// The `.part` path is predictable, so a hostile symlink planted there would
+/// otherwise turn a resumed download into a write to an arbitrary file. On Unix
+/// the open carries `O_NOFOLLOW`, which fails (`ELOOP`) rather than following a
+/// symlink at the final path component; a real regular `.part` opens and resumes
+/// as before. This is defence in depth behind the daemon-owned `0700` weights
+/// directory (REQ-547 M-11), which already denies another user the ability to
+/// plant the symlink in the first place.
+fn open_partial(dest: &Path) -> Result<std::fs::File, DownloadError> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    Ok(opts.open(dest)?)
 }
 
 /// Current length of `path`, or `0` if it does not exist yet.
@@ -408,6 +428,30 @@ mod tests {
             other => panic!("expected a Download event last, got {other:?}"),
         }
         std::fs::remove_file(&dest).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_a_symlinked_partial() {
+        // M-11: a symlink planted at the predictable `.part` path must not
+        // redirect the write. `O_NOFOLLOW` makes the open fail rather than follow
+        // it, and the target file is left untouched.
+        let data: Vec<u8> = (0u8..251).cycle().take(4096).collect();
+        let model = model_for(&data);
+        let dest = temp_path("symlink-part");
+        let target = temp_path("symlink-target");
+        std::fs::write(&target, b"do-not-clobber").unwrap();
+        let _ = std::fs::remove_file(&dest);
+        std::os::unix::fs::symlink(&target, &dest).expect("plant a symlink at the .part path");
+
+        let fetcher = WholeFetcher { data };
+        let result = Downloader::new(&fetcher).fetch(&model, &dest, &mut |_| {});
+        assert!(result.is_err(), "a symlinked .part must be refused");
+        // The symlink's target is untouched — the write never followed the link.
+        assert_eq!(std::fs::read(&target).unwrap(), b"do-not-clobber");
+
+        std::fs::remove_file(&dest).ok();
+        std::fs::remove_file(&target).ok();
     }
 
     #[test]

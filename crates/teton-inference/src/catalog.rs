@@ -40,6 +40,12 @@ use crate::probe::HardwareProfile;
 /// the specific hazard rather than the generic "not 40 hex characters".
 const MOVING_REFS: &[&str] = &["main", "master", "head", "latest", "dev", "develop"];
 
+/// The one host a catalog URL may name (ADR-004). A mirror is applied later via
+/// `[local_model] base_url` (BR-16), never by writing a different host into the
+/// catalog — so this invariant holds for an *external* catalog (`TETON_CATALOG`)
+/// exactly as it does for the bundled one.
+const CATALOG_HOST: &str = "huggingface.co";
+
 /// A catalog entry that violates an invariant the downloader depends on.
 ///
 /// Every variant carries the offending entry's `name` and a remedy, because the
@@ -121,6 +127,35 @@ pub enum CatalogError {
         /// The duplicated catalog name.
         name: String,
     },
+    /// The `name` contains characters that could escape the weights directory
+    /// when interpolated into `<weights_dir>/<name>.gguf`.
+    #[error(
+        "catalog entry `{name}` has a name that is not a plain catalog id: a name may contain \
+         only ASCII letters, digits, `.`, `-` and `_` — never `/`, `\\`, `..`, or any other path \
+         separator — because it is interpolated into the on-disk weights filename \
+         (`<weights_dir>/<name>.gguf`). A name like `../../etc/foo` would escape the weights \
+         directory. Rename the entry to a plain id such as `qwen2.5-coder-3b`."
+    )]
+    MalformedName {
+        /// The offending name, as written in the catalog.
+        name: String,
+    },
+    /// The URL does not name the one host a catalog URL may (ADR-004).
+    #[error(
+        "catalog entry `{name}` is hosted at `{host}`, not on `huggingface.co` over HTTPS \
+         (ADR-004). The catalog's canonical URL must be \
+         `https://huggingface.co/<owner>/<repo>/resolve/<40-hex-commit-sha>/<file>.gguf`; a \
+         corporate mirror is configured with `[local_model] base_url` (BR-16), never by writing a \
+         different host into the catalog. URL: `{url}`."
+    )]
+    UntrustedHost {
+        /// The offending entry's catalog name.
+        name: String,
+        /// The host parsed from the URL (empty when the URL has none).
+        host: String,
+        /// The URL as written in the catalog.
+        url: String,
+    },
 }
 
 /// The `<repo>`, `<revision>` and `<file>` of a HuggingFace `resolve` URL.
@@ -163,6 +198,44 @@ fn url_path(url: &str) -> Option<&str> {
     let authority = &url[url.find("://")? + 3..];
     let slash = authority.find('/')?;
     Some(&authority[slash..])
+}
+
+/// The host of an absolute URL — `https://huggingface.co/a/b` → `huggingface.co`
+/// — with any `userinfo@` and `:port` stripped. `None` if `url` has no `://` or
+/// an empty authority.
+///
+/// Used both to enforce the catalog-host invariant in [`ModelEntry::validate`]
+/// and to surface non-sensitive provenance at consent (the publisher's host),
+/// without ever putting a full URL on the wire (BR-11).
+#[must_use]
+pub fn url_host(url: &str) -> Option<&str> {
+    let after_scheme = &url[url.find("://")? + 3..];
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|a| !a.is_empty())?;
+    // Strip any `user:pass@` userinfo, then any `:port`.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split(':').next().unwrap_or(host);
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether `name` is shaped like a catalog id.
+///
+/// The same rule teton-core applies to a config pin (`is_model_name_shaped`):
+/// non-empty ASCII alphanumerics plus `.`, `-`, `_`. Enforced here so a `name`
+/// that would escape the weights directory when interpolated into
+/// `<weights_dir>/<name>.gguf` — `../../evil`, an absolute path, a backslash — is
+/// rejected before it can be used to build a path. A `..` component is refused
+/// explicitly even though `.` is an allowed character, since a bare `..` is the
+/// one dotted form that names a parent directory.
+fn is_catalog_name_shaped(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 /// Is `value` exactly `len` lowercase hex characters?
@@ -285,10 +358,30 @@ impl ModelEntry {
     /// Returns the first violated invariant as a [`CatalogError`] whose message
     /// names the entry and the remedy.
     pub fn validate(&self) -> Result<(), CatalogError> {
+        // The name becomes a filename (`<weights_dir>/<name>.gguf`), so a name
+        // with a path separator is a directory-traversal primitive. Checked
+        // first, before the name is trusted anywhere else.
+        if !is_catalog_name_shaped(&self.name) {
+            return Err(CatalogError::MalformedName {
+                name: self.name.clone(),
+            });
+        }
+
         let source = self.source().ok_or_else(|| CatalogError::UnpinnableUrl {
             name: self.name.clone(),
             url: self.url.clone(),
         })?;
+
+        // ADR-004: the catalog's canonical URL is an HTTPS `huggingface.co`
+        // resolve URL. Enforced in `validate` — not only in the tests against
+        // the bundled catalog — so an external catalog inherits it too.
+        if !self.url.starts_with("https://") || url_host(&self.url) != Some(CATALOG_HOST) {
+            return Err(CatalogError::UntrustedHost {
+                name: self.name.clone(),
+                host: url_host(&self.url).unwrap_or_default().to_owned(),
+                url: self.url.clone(),
+            });
+        }
 
         for revision in [self.revision.as_str(), source.revision] {
             if MOVING_REFS.contains(&revision.to_ascii_lowercase().as_str())
@@ -672,6 +765,65 @@ mod tests {
             matches!(err, CatalogError::DuplicateName { ref name } if name == "test-model"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_names_that_could_escape_the_weights_dir() {
+        // `name` is interpolated into `<weights_dir>/<name>.gguf`; a name with a
+        // path separator would escape it. Every one of these must be refused.
+        for bad in [
+            "../../etc/passwd",
+            "..",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "with space",
+            "",
+        ] {
+            let mut model = entry();
+            model.name = bad.to_owned();
+            let err = model.validate().expect_err(bad);
+            assert!(
+                matches!(err, CatalogError::MalformedName { .. }),
+                "{bad:?} produced {err:?}"
+            );
+            assert!(err.to_string().contains("path separator"), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_non_huggingface_host() {
+        // ADR-004 lives in `validate` now, so an external catalog inherits it.
+        // A resolve URL on the wrong host, and an http (non-TLS) URL, are both
+        // refused — the mirror is `[local_model] base_url`, not the catalog host.
+        for bad in [
+            format!("https://models.evil.example/Acme/Acme-GGUF/resolve/{REV}/acme-q4_k_m.gguf"),
+            format!("http://huggingface.co/Acme/Acme-GGUF/resolve/{REV}/acme-q4_k_m.gguf"),
+            format!("https://huggingface.co.evil.example/Acme/Acme-GGUF/resolve/{REV}/a.gguf"),
+        ] {
+            let mut model = entry();
+            model.url = bad.clone();
+            let err = model.validate().expect_err(&bad);
+            assert!(
+                matches!(err, CatalogError::UntrustedHost { .. }),
+                "{bad} produced {err:?}"
+            );
+            assert!(err.to_string().contains("huggingface.co"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn url_host_parses_the_authority_only() {
+        assert_eq!(
+            url_host("https://huggingface.co/a/b"),
+            Some("huggingface.co")
+        );
+        assert_eq!(
+            url_host("http://mirror.corp.internal:8080/hf/x"),
+            Some("mirror.corp.internal")
+        );
+        assert_eq!(url_host("not a url"), None);
+        assert_eq!(url_host("https://"), None);
     }
 
     // ---- BR-16: base-URL override ------------------------------------------

@@ -704,6 +704,11 @@ mod tests {
             band: TierBand::Mid,
             size_bytes: 4_700_000_000,
             ram_floor_bytes: 12_884_901_888,
+            provenance: crate::events::CatalogProvenance {
+                repo: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF".to_owned(),
+                host: "huggingface.co".to_owned(),
+                revision: "13fb94b".to_owned(),
+            },
         }
     }
 
@@ -720,7 +725,13 @@ mod tests {
                 band: TierBand::Small,
                 size_bytes: 2_104_932_800,
                 ram_floor_bytes: 8_589_934_592,
+                provenance: crate::events::CatalogProvenance {
+                    repo: "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF".to_owned(),
+                    host: "huggingface.co".to_owned(),
+                    revision: "f74adce".to_owned(),
+                },
             }],
+            fetch_notice: None,
         }
     }
 
@@ -840,6 +851,11 @@ mod tests {
                         band: TierBand::Large,
                         size_bytes: 18_000_000_000,
                         ram_floor_bytes: 51_539_607_552,
+                        provenance: crate::events::CatalogProvenance {
+                            repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF".to_owned(),
+                            host: "huggingface.co".to_owned(),
+                            revision: "b17cb02".to_owned(),
+                        },
                     },
                     fits_ram: false,
                     fits_disk: true,

@@ -442,8 +442,8 @@ pub fn weights_path(base_dir: &Path, model_name: &str) -> PathBuf {
 #[cfg(test)]
 pub(crate) mod testing {
     use teton_protocol::events::{
-        CatalogEntryView, ChosenBand, GpuClass, ModelSelectionProposed, ProbeReportView,
-        ProposedModel, TierBand,
+        CatalogEntryView, CatalogProvenance, ChosenBand, GpuClass, ModelSelectionProposed,
+        ProbeReportView, ProposedModel, TierBand,
     };
     use teton_protocol::methods::{ModelListEntry, ModelListResult};
 
@@ -452,7 +452,8 @@ pub(crate) mod testing {
     /// Free disk on the scripted machine.
     pub const FREE_DISK: u64 = 120 * 1024 * 1024 * 1024;
 
-    /// One catalog entry.
+    /// One catalog entry, with a synthesized huggingface.co provenance so the
+    /// rendered proposal has a source to show (H-2).
     pub fn entry(
         name: &str,
         band: TierBand,
@@ -464,6 +465,11 @@ pub(crate) mod testing {
             band,
             size_bytes,
             ram_floor_bytes,
+            provenance: CatalogProvenance {
+                repo: format!("Qwen/{name}-GGUF"),
+                host: "huggingface.co".to_owned(),
+                revision: "f74adce".to_owned(),
+            },
         }
     }
 
@@ -514,6 +520,7 @@ pub(crate) mod testing {
                 required_disk_bytes: 5_200_000_000,
             }),
             alternatives: vec![small_entry(), oversized_entry()],
+            fetch_notice: None,
         }
     }
 

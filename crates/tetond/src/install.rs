@@ -39,6 +39,19 @@
 //! falls back to re-digesting rather than guessing. The expensive answer is
 //! reached only on suspicion, and never skipped in favour of a hopeful one.
 //!
+//! ## The receipt is a cache, not an attestation (M-10)
+//!
+//! The receipt is keyed on `(sha256, size, mtime)`, and mtime is **forgeable** —
+//! `utimensat(2)` sets it to anything. So the receipt is a pay-once *cache* that
+//! saves re-hashing a multi-GB file on every attach; it is **not** a tamper-proof
+//! attestation, and nothing security-relevant may trust it alone. The one
+//! security-relevant decision — un-gating the local tier at daemon start — does
+//! not: [`WeightsInstall::deep_status`] re-digests the bytes, and
+//! `model_consent::ModelConsentGate::resolve` reads *that* before opening the
+//! tier. The cheap [`status`](WeightsInstall::status) still serves the
+//! non-security-critical attach/status path, so the pay-once optimisation stands
+//! for everything except the moment where forgery would actually matter.
+//!
 //! ## Why the precise failure cause comes from the fetcher
 //!
 //! [`teton_inference::download::DownloadError`] is deliberately coarse: it has
@@ -146,6 +159,30 @@ pub struct FixedFreeSpace(pub Option<u64>);
 impl FreeSpace for FixedFreeSpace {
     fn available_bytes(&self, _path: &Path) -> Option<u64> {
         self.0
+    }
+}
+
+/// A free-space measurement capped at a ceiling — it can only ever report *less*
+/// than the real volume, never more (REQ-547 M-8).
+///
+/// The `TETON_DISK_FREE_BYTES` test seam feeds the ceiling. Taking the minimum of
+/// the real measurement and the ceiling is what makes the seam unable to *disable*
+/// the BR-7 preflight: a seam that could raise the reported free space would be a
+/// way to make a full disk look empty, so it is constrained to only tighten the
+/// check. When the real volume is unmeasurable, there is no measurement to lower,
+/// so the seam reports nothing (`None` = "unknown", never a fabricated ceiling).
+pub struct CapFreeSpace {
+    /// The real measurement being capped.
+    pub inner: Arc<dyn FreeSpace>,
+    /// The most free space this may report.
+    pub ceiling: u64,
+}
+
+impl FreeSpace for CapFreeSpace {
+    fn available_bytes(&self, path: &Path) -> Option<u64> {
+        self.inner
+            .available_bytes(path)
+            .map(|real| real.min(self.ceiling))
     }
 }
 
@@ -497,9 +534,12 @@ impl WeightsInstall {
 
 impl WeightsInstaller for WeightsInstall {
     fn install(&self, entry: &ModelEntry) -> Result<(), InstallError> {
-        std::fs::create_dir_all(&self.weights_dir).map_err(|err| InstallError::Io {
-            detail: err.kind().to_string(),
-        })?;
+        // M-11/M-12: create the weights dir owner-only (0700) and refuse a base
+        // this daemon does not exclusively own, so a shared temp-dir base cannot
+        // become a cross-user create/append primitive on the predictable `.part`
+        // path, and the verify→rename window is bounded by an owned directory no
+        // other user can write into.
+        prepare_weights_dir(&self.weights_dir)?;
 
         let partial = self.partial_path(entry);
 
@@ -574,6 +614,18 @@ impl WeightsInstaller for WeightsInstall {
             &self.installed_path(entry),
             &self.partial_path(entry),
             &self.receipt_path(entry),
+            entry,
+        )
+    }
+
+    fn deep_status(&self, entry: &ModelEntry) -> InstallStatus {
+        // M-10: the tier-un-gating path calls this, so it reads the bytes rather
+        // than trusting the mtime-keyed receipt. Same computation as the inherent
+        // [`WeightsInstall::deep_status`], reached through the trait object the
+        // gate holds.
+        deep_status_at(
+            &self.installed_path(entry),
+            &self.partial_path(entry),
             entry,
         )
     }
@@ -762,6 +814,54 @@ fn modified_ns(meta: &std::fs::Metadata) -> Option<u64> {
 /// Current length of `path`, or `0` when it does not exist.
 fn current_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+/// Create the weights directory owner-only (`0700`) and refuse one this daemon
+/// does not exclusively own (M-11/M-12).
+///
+/// Mirrors [`crate::auth::secure_socket_dir`]: every missing component is created
+/// `0700` from the start (never umask-dependent), and a pre-existing directory is
+/// tightened. It then refuses unless the directory is owned by this effective uid
+/// and is owner-only — the temp-dir fallback base is the cross-user hazard, where
+/// a world-writable base would let another user pre-seed the directory or plant a
+/// symlink at the predictable `.part` path. A `0700` directory the daemon owns
+/// also bounds the verify→rename window (M-12): no other user can traverse in.
+#[cfg(unix)]
+fn prepare_weights_dir(dir: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    if !dir.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|err| InstallError::Io {
+                detail: err.kind().to_string(),
+            })?;
+    }
+    // Force exactly 0700 regardless of umask or a pre-existing looser mode. A
+    // directory owned by another user cannot be tightened; that is caught by the
+    // ownership check below, not here.
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+
+    let meta = std::fs::metadata(dir).map_err(|err| InstallError::Io {
+        detail: err.kind().to_string(),
+    })?;
+    // SAFETY: `geteuid` is always successful and touches no memory.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid || meta.mode() & 0o077 != 0 {
+        return Err(InstallError::UntrustedWeightsDir);
+    }
+    Ok(())
+}
+
+/// Non-Unix fallback: create the directory. The ownership/mode guarantees above
+/// are POSIX concepts; the atomic-install and digest checks still hold.
+#[cfg(not(unix))]
+fn prepare_weights_dir(dir: &Path) -> Result<(), InstallError> {
+    std::fs::create_dir_all(dir).map_err(|err| InstallError::Io {
+        detail: err.kind().to_string(),
+    })
 }
 
 /// Map the library's coarse [`DownloadError`] onto the user-facing
@@ -1326,6 +1426,58 @@ mod tests {
             "{ticks:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M-8: the disk seam can only tighten the check -------------------
+
+    #[test]
+    fn cap_free_space_only_ever_lowers_the_measurement() {
+        // The real measurement wins when it is already below the ceiling; the
+        // ceiling wins only by being *smaller*. A seam that could report *more*
+        // free space than reality would be a way to disable BR-7.
+        let low = CapFreeSpace {
+            inner: Arc::new(FixedFreeSpace(Some(1_000))),
+            ceiling: 5_000,
+        };
+        assert_eq!(low.available_bytes(Path::new("/")), Some(1_000));
+
+        let capped = CapFreeSpace {
+            inner: Arc::new(FixedFreeSpace(Some(9_000))),
+            ceiling: 4_096,
+        };
+        assert_eq!(capped.available_bytes(Path::new("/")), Some(4_096));
+
+        // An unmeasurable volume stays unknown — the seam has nothing to lower,
+        // and must not fabricate a ceiling that could look like more free space.
+        let unknown = CapFreeSpace {
+            inner: Arc::new(FixedFreeSpace(None)),
+            ceiling: 4_096,
+        };
+        assert_eq!(unknown.available_bytes(Path::new("/")), None);
+    }
+
+    // --- M-11: the weights directory is owner-only and daemon-owned -------
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_weights_dir_creates_owner_only_and_tightens_a_loose_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A fresh directory is created 0700.
+        let base = temp_dir("weights-mode");
+        let fresh = base.join("models");
+        prepare_weights_dir(&fresh).expect("create owner-only");
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a fresh weights dir must be owner-only");
+
+        // A pre-existing group/world-accessible directory (that we own) is
+        // tightened rather than trusted as-is.
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_weights_dir(&fresh).expect("tighten a loose dir we own");
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a loose weights dir must be tightened");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // --- fetcher doubles -------------------------------------------------

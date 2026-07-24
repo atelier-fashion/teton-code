@@ -18,8 +18,8 @@
 //! daemon and no model.
 
 use teton_protocol::events::{
-    CatalogEntryView, ChosenBand, GpuClass, ModelLifecycleStage, ModelSelectionDecided,
-    ModelSelectionProposed, ProbeReportView, SelectionSource, TierBand,
+    CatalogEntryView, ChosenBand, FetchNotice, GpuClass, ModelLifecycleStage,
+    ModelSelectionDecided, ModelSelectionProposed, ProbeReportView, SelectionSource, TierBand,
 };
 
 use crate::prompt::Prompter;
@@ -144,6 +144,10 @@ pub fn render_proposal(proposal: &ModelSelectionProposed, surface: &mut dyn Surf
                     format_bytes(proposed.required_disk_bytes),
                 ),
             );
+            surface.line(
+                LineKind::Info,
+                &format!("  source:   {}", provenance_line(entry)),
+            );
         }
         None => surface.line(
             LineKind::Info,
@@ -156,10 +160,57 @@ pub fn render_proposal(proposal: &ModelSelectionProposed, surface: &mut dyn Surf
         proposal.probe.total_ram_bytes,
         surface,
     );
+    render_fetch_notice(proposal.fetch_notice.as_ref(), surface);
     surface.line(
         LineKind::Notice,
         "nothing is downloaded until you answer (BR-1).",
     );
+}
+
+/// The provenance of a catalog entry as one line: who published it, from what
+/// host, at which commit (H-2). Legibility *is* consent — a user approving a
+/// multi-gigabyte transfer is entitled to see where the bytes come from, not just
+/// the model's name.
+#[must_use]
+pub fn provenance_line(entry: &CatalogEntryView) -> String {
+    let p = &entry.provenance;
+    format!("{} on {} @ {}", p.repo, p.host, p.revision)
+}
+
+/// Surface a redirected fetch before the user answers (H-2).
+///
+/// When a `[local_model] base_url` mirror or a non-bundled catalog is in force,
+/// the bytes do not come from the provenance host each entry shows — and a
+/// redirect the user cannot see is exactly where consent means least. So it is
+/// stated plainly, as a warning, not buried.
+pub fn render_fetch_notice(notice: Option<&FetchNotice>, surface: &mut dyn Surface) {
+    let Some(notice) = notice else {
+        return;
+    };
+    match &notice.mirror_host {
+        Some(host) => surface.line(
+            LineKind::Notice,
+            &format!(
+                "WARNING: downloading from a configured mirror ({host}), not huggingface.co — \
+                 the pinned artifact and its checksum are unchanged, but the bytes come from \
+                 this host."
+            ),
+        ),
+        // A `base_url` was set but named no parseable host: the fetch is still
+        // redirected, so say so rather than stay silent.
+        None if !notice.override_catalog => surface.line(
+            LineKind::Notice,
+            "WARNING: the model fetch is redirected to a configured mirror, not huggingface.co.",
+        ),
+        None => {}
+    }
+    if notice.override_catalog {
+        surface.line(
+            LineKind::Notice,
+            "WARNING: these entries come from an override catalog (TETON_CATALOG), not the \
+             catalog this build shipped with.",
+        );
+    }
 }
 
 /// Render the probe's reasoning: the hardware it measured, the band it chose,
@@ -433,6 +484,61 @@ mod tests {
         );
         // And the BR-1 promise itself.
         assert!(surface.any_line_contains(LineKind::Notice, "nothing is downloaded"));
+    }
+
+    /// H-2: the proposal must show *where the bytes come from* — publisher/repo,
+    /// host, and the short revision — not only the model name.
+    #[test]
+    fn render_proposal_shows_the_source_provenance() {
+        let mut surface = RecordingSurface::new();
+        render_proposal(&proposal(), &mut surface);
+        let text = surface.lines_of(LineKind::Info).join("\n");
+        assert!(text.contains("source:"), "no source line: {text}");
+        // The proposed 7B entry's synthesized provenance.
+        assert!(
+            text.contains("Qwen/qwen2.5-coder-7b-GGUF"),
+            "publisher/repo missing: {text}"
+        );
+        assert!(text.contains("huggingface.co"), "host missing: {text}");
+        assert!(text.contains("f74adce"), "revision missing: {text}");
+        // Legibility, not a URL: no scheme rides the rendered proposal.
+        assert!(!text.contains("://"), "a URL was rendered: {text}");
+    }
+
+    #[test]
+    fn a_mirror_notice_warns_that_the_fetch_is_redirected() {
+        // H-2: a redirected fetch the user cannot otherwise see must be surfaced.
+        let mut proposal = proposal();
+        proposal.fetch_notice = Some(FetchNotice {
+            mirror_host: Some("hf-mirror.corp.internal".to_owned()),
+            override_catalog: false,
+        });
+        let mut surface = RecordingSurface::new();
+        render_proposal(&proposal, &mut surface);
+        assert!(surface.any_line_contains(LineKind::Notice, "configured mirror"));
+        assert!(surface.any_line_contains(LineKind::Notice, "hf-mirror.corp.internal"));
+        assert!(surface.any_line_contains(LineKind::Notice, "not huggingface.co"));
+    }
+
+    #[test]
+    fn an_override_catalog_notice_says_it_is_not_the_shipped_catalog() {
+        let mut proposal = proposal();
+        proposal.fetch_notice = Some(FetchNotice {
+            mirror_host: None,
+            override_catalog: true,
+        });
+        let mut surface = RecordingSurface::new();
+        render_proposal(&proposal, &mut surface);
+        assert!(surface.any_line_contains(LineKind::Notice, "override catalog"));
+        assert!(surface.any_line_contains(LineKind::Notice, "TETON_CATALOG"));
+    }
+
+    #[test]
+    fn no_fetch_notice_renders_no_redirect_warning() {
+        let mut surface = RecordingSurface::new();
+        render_proposal(&proposal(), &mut surface);
+        assert!(!surface.any_line_contains(LineKind::Notice, "mirror"));
+        assert!(!surface.any_line_contains(LineKind::Notice, "override catalog"));
     }
 
     #[test]

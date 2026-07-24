@@ -39,11 +39,14 @@ Usage
         the artifact itself still happens at download time against this
         `sha256` (BR-6) — the two checks answer different questions.
 
-    python3 tools/refresh-catalog.py --update
-        Re-resolve each repository's `main` to its current commit SHA, re-derive
-        every digest at that revision, and rewrite the TOML. Use this to adopt a
-        newer upstream quantization. Review the diff — a changed `sha256` means
-        the artifact changed.
+    python3 tools/refresh-catalog.py --update <name>
+        Re-resolve exactly the named entry's repository `main` to its current
+        commit SHA, re-derive its digest at that revision, and rewrite the TOML;
+        every *other* entry stays at its committed pin. Per-entry on purpose
+        (M-13): adopting a publisher's new commit — above all the third-party
+        quantizer entry, whose bytes a new commit could change wholesale — must be
+        a deliberate act, not a side effect of refreshing the Qwen entries. Review
+        the diff — a changed `sha256` means the artifact changed.
 
     python3 tools/refresh-catalog.py --print
         Write the regenerated catalog to stdout instead of the file.
@@ -94,14 +97,50 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+
+
+def _validated_api_base(endpoint: str) -> str:
+    """The `/api/models` base for `endpoint`, refusing a non-web scheme (M-9).
+
+    `urlopen` will happily open `file://…`, which would let a hostile `HF_ENDPOINT`
+    turn the generator into a local-file reader. So the scheme is constrained to
+    `https`, with `http` allowed *only* on a loopback host — the hermetic tests
+    point the tool at a `127.0.0.1` mock, and nothing else has a reason to speak
+    plaintext to a metadata API.
+    """
+    endpoint = endpoint.rstrip("/")
+    parsed = urllib.parse.urlparse(endpoint)
+    host = parsed.hostname or ""
+    loopback = host in ("localhost", "127.0.0.1", "::1")
+    if parsed.scheme == "https" or (parsed.scheme == "http" and loopback):
+        return f"{endpoint}/api/models"
+    raise SystemExit(
+        f"refusing HF_ENDPOINT {endpoint!r}: the metadata API must be https "
+        f"(http is allowed only on a loopback host, for the hermetic tests). "
+        f"A non-web scheme like file:// is never accepted."
+    )
+
 
 # The metadata API is redirectable (HF_ENDPOINT, mirroring the daemon's
 # `[local_model] base_url`, BR-16); the *resolve* host is not. What the catalog
 # records is the canonical download URL, so deriving it from a mirror would make
 # `--check` rewrite the very field it is meant to verify.
-HF_API = f"{os.environ.get('HF_ENDPOINT', 'https://huggingface.co').rstrip('/')}/api/models"
+HF_API = _validated_api_base(os.environ.get("HF_ENDPOINT", "https://huggingface.co"))
 HF_RESOLVE = "https://huggingface.co"
+
+# LFS oid == the artifact's SHA-256. Validated before it can enter the rendered
+# TOML, so a hostile or MITM'd API response cannot inject catalog syntax through
+# it (M-9).
+SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+# The developer-authored fields interpolated into a URL or a filename. Restricted
+# to a safe charset so an ill-advised edit to `PICKS` cannot smuggle TOML syntax,
+# a path separator, or URL structure into the generated catalog (M-9).
+SAFE_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+SAFE_FILE_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+SAFE_REPO_RE = re.compile(r"\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CATALOG_PATH = os.path.join(
@@ -354,7 +393,18 @@ def lfs_metadata(repo: str, revision: str, path: str):
                 f"guess. (An upstream repo that stopped using LFS for this "
                 f"file needs a new pin, not a hand-typed digest.)"
             )
-        return lfs["oid"], int(lfs["size"])
+        oid = lfs["oid"]
+        # M-9: the oid is interpolated verbatim into `sha256 = "…"` in the TOML.
+        # A hostile or MITM'd response could otherwise inject a quote + newline +
+        # arbitrary `[[models]]` entry here. It *is* a SHA-256, so it must look
+        # like exactly one — 64 lowercase hex — or it does not enter the catalog.
+        if not isinstance(oid, str) or not SHA256_RE.match(oid):
+            raise Mismatch(
+                f"{repo}@{revision}:{path} reported an LFS oid {oid!r} that is not "
+                f"a SHA-256 (64 lowercase hex). Refusing to write it into the "
+                f"catalog — the response may be corrupt or tampered with."
+            )
+        return oid, int(lfs["size"])
     raise Mismatch(
         f"{repo}@{revision} has no file {path!r}. The file was renamed or "
         f"removed upstream at the pinned revision. Pick a file that actually "
@@ -429,27 +479,55 @@ def committed_entries(text: str) -> dict:
     return entries
 
 
-def derive_rows(update: bool, existing: str) -> list:
+def validate_pick(pick: dict) -> None:
+    """Refuse a `PICKS` entry whose author-supplied fields are not safely shaped.
+
+    `name`, `file`, and `repo` are interpolated into a filename or a URL and then
+    into the TOML. They are developer-authored, not API-derived, but validating
+    them keeps an ill-advised edit — a path separator, a stray quote, URL
+    structure — from ever reaching the rendered catalog (M-9).
+    """
+    if not SAFE_NAME_RE.match(pick["name"]):
+        raise Mismatch(
+            f"catalog pick name {pick['name']!r} is not a plain id "
+            f"(letters, digits, `.`, `-`, `_`)."
+        )
+    if not SAFE_FILE_RE.match(pick["file"]):
+        raise Mismatch(
+            f"catalog pick file {pick['file']!r} for {pick['name']!r} is not a "
+            f"plain filename (letters, digits, `.`, `-`, `_`)."
+        )
+    if not SAFE_REPO_RE.match(pick["repo"]):
+        raise Mismatch(
+            f"catalog pick repo {pick['repo']!r} for {pick['name']!r} is not an "
+            f"`owner/name` slug."
+        )
+
+
+def derive_rows(update_target, existing: str) -> list:
     """Derive every catalog row from the API, at `main` or at the pins.
 
+    `update_target` is `None` (verify/print at the committed pins), or a single
+    entry name whose repo is re-resolved to its current `main` (M-13). Every
+    *other* entry stays at its committed pin, so re-adopting a publisher's new
+    commit — an especially deliberate act for the third-party quantizer entry — is
+    per-entry, never a side effect of refreshing the others.
+
     In pinned mode each revision is asserted immutable *before* it is used in a
-    URL, so a moving ref is rejected locally rather than silently re-derived
-    into a catalog that would drift the next time upstream moves.
+    URL, so a moving ref is rejected locally rather than silently re-derived into
+    a catalog that would drift the next time upstream moves.
     """
-    pins = (
-        {}
-        if update
-        else {name: e.get("revision") for name, e in committed_entries(existing).items()}
-    )
+    pins = {name: e.get("revision") for name, e in committed_entries(existing).items()}
     rows = []
     for pick in PICKS:
-        if update:
+        validate_pick(pick)
+        if pick["name"] == update_target:
             revision = resolve_main(pick["repo"])
         else:
             if pick["name"] not in pins:
                 raise Mismatch(
                     f"{CATALOG_PATH} pins no revision for {pick['name']!r}; "
-                    f"run --update to author it."
+                    f"run --update {pick['name']} to author it."
                 )
             revision = assert_pinned(pick["name"], pins[pick["name"]])
         assert_public_and_ungated(pick["repo"])
@@ -469,9 +547,9 @@ def derive_rows(update: bool, existing: str) -> list:
     return rows
 
 
-def derive(update: bool, existing: str) -> str:
-    """Derive the catalog, either at upstream's current main or at the pins."""
-    return render(derive_rows(update=update, existing=existing))
+def derive(update_target, existing: str) -> str:
+    """Derive the catalog, re-resolving `update_target` (if any) at its main."""
+    return render(derive_rows(update_target=update_target, existing=existing))
 
 
 def field_mismatches(existing: str, rows: list) -> list:
@@ -512,7 +590,7 @@ def field_mismatches(existing: str, rows: list) -> list:
 
 def check(existing: str) -> int:
     """Run the integrity gate. Returns an exit code; never raises `Mismatch`."""
-    rows = derive_rows(update=False, existing=existing)
+    rows = derive_rows(update_target=None, existing=existing)
     problems = field_mismatches(existing, rows)
     generated = render(rows)
 
@@ -575,8 +653,13 @@ def main() -> int:
     )
     mode.add_argument(
         "--update",
-        action="store_true",
-        help="re-resolve each repo's main and rewrite the catalog",
+        metavar="NAME",
+        help=(
+            "re-resolve entry NAME's repo to its current main and rewrite the "
+            "catalog. Per-entry on purpose (M-13): adopting a publisher's new "
+            "commit — especially the third-party quantizer — must be deliberate, "
+            "not a side effect of refreshing the others"
+        ),
     )
     mode.add_argument(
         "--print", dest="to_stdout", action="store_true", help="write to stdout"
@@ -598,11 +681,20 @@ def main() -> int:
     except FileNotFoundError:
         existing = ""
 
+    # M-13: `--update NAME` re-resolves exactly one entry. Reject a name that is
+    # not a known pick before any network call, so a typo cannot quietly no-op.
+    if args.update is not None and args.update not in {pick["name"] for pick in PICKS}:
+        known = ", ".join(pick["name"] for pick in PICKS)
+        sys.stderr.write(
+            f"error: --update {args.update!r} names no catalog entry. Known entries: {known}.\n"
+        )
+        return EXIT_MISMATCH
+
     try:
         if args.check:
             return check(existing)
 
-        generated = derive(update=args.update, existing=existing)
+        generated = derive(update_target=args.update, existing=existing)
     except Unverified as err:
         # The one outcome that says nothing about the catalog. It gets its own
         # exit code and its own vocabulary so no reader — human or CI — can

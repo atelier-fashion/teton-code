@@ -117,6 +117,9 @@ impl TestDaemon {
                 (500u64 * 1024 * 1024 * 1024).to_string(),
             )
             .env("TETON_PROBE_GPU", "apple-silicon")
+            // DECISION 3: the retry-delay seam is honoured only in a debug build
+            // with this master switch set.
+            .env("TETON_TEST_SEAMS", "1")
             .env("TETON_DOWNLOAD_RETRY_BASE_MS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

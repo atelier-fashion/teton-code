@@ -1197,23 +1197,31 @@ async fn the_proposal_payload_carries_no_path_url_digest_or_credential() {
         let proposal = next_proposal(&mut sub).await;
         let json = serde_json::to_string(&proposal).unwrap();
 
+        // BR-11: no scheme+URL, no full revision, no digest, no filename, no
+        // filesystem path. The provenance triple (H-2) legitimately carries a
+        // `repo` slug with a `/`, so the blanket "no slash" check is replaced by
+        // the specific path/URL markers a real leak would contain.
         for forbidden in [
-            "http",
-            REVISION,
-            SMALL_SHA,
-            ".gguf",
-            h.dir.to_str().unwrap(),
-            "/",
+            "://",                   // no scheme: no full URL on the wire
+            REVISION,                // the full 40-hex pin stays daemon-side
+            SMALL_SHA,               // no digest
+            ".gguf",                 // no filename
+            h.dir.to_str().unwrap(), // no daemon state path
+            "resolve/",              // no HF resolve URL path
+            "/Users/",               // no absolute home path
         ] {
             assert!(
                 !json.contains(forbidden),
                 "BR-11: the proposal leaked {forbidden:?}: {json}"
             );
         }
-        // What it *does* carry: the hardware reasoning the user needs (BR-2).
+        // What it *does* carry: the hardware reasoning (BR-2) and each entry's
+        // non-sensitive provenance (H-2) — the short revision, never the full one.
         assert!(json.contains("total_ram_bytes"));
         assert!(json.contains("required_disk_bytes"));
         assert!(json.contains("reason"));
+        assert!(json.contains("provenance"), "no provenance (H-2): {json}");
+        assert!(json.contains(&REVISION[..7]), "no short revision: {json}");
 
         h.pending
             .resolve(&proposal.request_id, ModelConfirmOutcome::Decline);

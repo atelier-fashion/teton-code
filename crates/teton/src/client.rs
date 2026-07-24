@@ -581,6 +581,11 @@ mod tests {
                         "band": "small",
                         "size_bytes": 2_147_483_648u64,
                         "ram_floor_bytes": 5_368_709_120u64,
+                        "provenance": {
+                            "repo": "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF",
+                            "host": "huggingface.co",
+                            "revision": "f74adce",
+                        },
                     },
                     "required_disk_bytes": 3_221_225_472u64,
                 },

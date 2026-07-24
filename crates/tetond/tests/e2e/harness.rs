@@ -460,6 +460,11 @@ impl Daemon {
         cmd.env("XDG_RUNTIME_DIR", &workspace.runtime_dir)
             .env("TETON_CONFIG", &workspace.config_path)
             .env("TETON_REPO_ROOT", &workspace.repo)
+            // DECISION 3: the acceptance suite drives the daemon through gated
+            // test seams (TETON_CATALOG, TETON_DISK_FREE_BYTES,
+            // TETON_DOWNLOAD_RETRY_BASE_MS), which a debug build honours only with
+            // this master switch set.
+            .env("TETON_TEST_SEAMS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));

@@ -494,12 +494,35 @@ pub struct ProbeReportView {
     pub reason: String,
 }
 
+/// Where a catalog entry's bytes come from, shown at consent (H-2).
+///
+/// A projection of the pinned artifact's *origin* — publisher/repo, host, and the
+/// short commit revision — so the user can see *from whom* and *from where* they
+/// are about to download, not merely a model name. These are public provenance
+/// facts (a repository id, a hostname, an abbreviated commit), never a credential,
+/// a full URL, a local path, or file content, so BR-11 holds: it is exactly the
+/// non-sensitive triple a person needs in order to trust the source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogProvenance {
+    /// The publisher/repository, e.g. `Qwen/Qwen2.5-Coder-3B-Instruct-GGUF`.
+    pub repo: String,
+    /// The host serving the pinned artifact, e.g. `huggingface.co`. This is the
+    /// *catalog's* host; a `[local_model] base_url` mirror or an override catalog
+    /// redirects the actual fetch, surfaced separately by
+    /// [`ModelSelectionProposed::fetch_notice`].
+    pub host: String,
+    /// The short (7-hex) commit the URL pins, e.g. `f74adce`. Abbreviated for
+    /// display; the full 40-hex pin stays daemon-side (BR-11).
+    pub revision: String,
+}
+
 /// A catalog entry as offered to the user.
 ///
-/// A deliberate projection of the catalog row: `url` and `sha256` are daemon-side
-/// download mechanics the user is not choosing between, and no install path ever
-/// appears (BR-11). What is left is what a person needs in order to choose — the
-/// name, the band it serves, what it costs in disk, and what it needs in RAM.
+/// A deliberate projection of the catalog row: the full `url` and the `sha256`
+/// are daemon-side download mechanics the user is not choosing between, and no
+/// install path ever appears (BR-11). What is left is what a person needs in
+/// order to choose — the name, the band it serves, what it costs in disk, what it
+/// needs in RAM, and its non-sensitive [`provenance`](Self::provenance).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEntryView {
     /// Catalog id, e.g. `qwen2.5-coder-3b`.
@@ -512,6 +535,10 @@ pub struct CatalogEntryView {
     /// exceeds [`ProbeReportView::total_ram_bytes`] is permitted but needs a
     /// second, explicit confirmation (BR-3).
     pub ram_floor_bytes: u64,
+    /// Where the bytes come from (H-2): publisher/repo, host, short revision.
+    /// Present on every entry so the consent screen can always show the source,
+    /// not only the name.
+    pub provenance: CatalogProvenance,
 }
 
 /// The entry the daemon proposes, plus what installing it will take.
@@ -525,6 +552,30 @@ pub struct ProposedModel {
     /// Free disk the install needs: the download size plus the working margin
     /// the preflight check applies before fetching a byte (BR-7).
     pub required_disk_bytes: u64,
+}
+
+/// A notice that the fetch is redirected away from the provenance host each entry
+/// shows (H-2).
+///
+/// Set when a `[local_model] base_url` mirror or a non-bundled catalog
+/// (`TETON_CATALOG`) is in force. A redirected fetch the user cannot see from the
+/// entry's [`CatalogProvenance`] alone is exactly where consent means least, so
+/// when this is present the client MUST surface it before the user answers.
+/// `None` means the bytes come from the host on each entry's provenance.
+///
+/// Carries a bare host, never a full base URL — no scheme, path, or userinfo — so
+/// BR-11 holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchNotice {
+    /// The mirror host serving the pinned artifact instead of the provenance
+    /// host, e.g. `hf-mirror.corp.internal`. `None` when no mirror is configured
+    /// (an override catalog is the reason for the notice).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mirror_host: Option<String>,
+    /// True when a non-bundled catalog (`TETON_CATALOG`) replaced the shipped
+    /// one, so the entries do not come from the catalog this build was released
+    /// with.
+    pub override_catalog: bool,
 }
 
 /// The daemon proposes a local model and waits (spec: `model_selection_proposed`).
@@ -548,6 +599,11 @@ pub struct ModelSelectionProposed {
     /// proposed entry; may include entries above this machine's RAM floor, which
     /// the client must flag rather than hide.
     pub alternatives: Vec<CatalogEntryView>,
+    /// Present when the fetch is redirected away from the entries' provenance
+    /// host — a configured mirror or an override catalog (H-2). The client MUST
+    /// surface it; a silent redirect is where consent means least.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fetch_notice: Option<FetchNotice>,
 }
 
 /// Where a model-selection decision came from (spec entity `ModelSelection.source`).
@@ -706,6 +762,11 @@ mod tests {
                     band: TierBand::Mid,
                     size_bytes: 4_700_000_000,
                     ram_floor_bytes: 12_884_901_888,
+                    provenance: CatalogProvenance {
+                        repo: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF".to_owned(),
+                        host: "huggingface.co".to_owned(),
+                        revision: "13fb94b".to_owned(),
+                    },
                 },
                 required_disk_bytes: 5_700_000_000,
             }),
@@ -714,7 +775,13 @@ mod tests {
                 band: TierBand::Small,
                 size_bytes: 2_000_000_000,
                 ram_floor_bytes: 5_368_709_120,
+                provenance: CatalogProvenance {
+                    repo: "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF".to_owned(),
+                    host: "huggingface.co".to_owned(),
+                    revision: "f74adce".to_owned(),
+                },
             }],
+            fetch_notice: None,
         }
     }
 
@@ -991,7 +1058,13 @@ mod tests {
                 band: TierBand::Small,
                 size_bytes: 1_100_000_000,
                 ram_floor_bytes: 3_221_225_472,
+                provenance: CatalogProvenance {
+                    repo: "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF".to_owned(),
+                    host: "huggingface.co".to_owned(),
+                    revision: "f86cb2c".to_owned(),
+                },
             }],
+            fetch_notice: None,
         };
         round_trip(&below_floor);
 
@@ -1095,6 +1168,50 @@ mod tests {
     }
 
     #[test]
+    fn a_proposal_carries_the_provenance_triple_without_a_full_url() {
+        // H-2: the user must see *from whom* and *from where* the bytes come.
+        // Publisher/repo, host, and the short revision are non-sensitive (BR-11):
+        // none is a credential, a full URL, a path, or file content.
+        let json = serde_json::to_string(&sample_proposal()).unwrap();
+        assert!(json.contains("provenance"), "no provenance: {json}");
+        assert!(
+            json.contains("Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"),
+            "{json}"
+        );
+        assert!(json.contains("huggingface.co"), "no host: {json}");
+        assert!(json.contains("13fb94b"), "no short revision: {json}");
+        // The host is a bare hostname, not a scheme+URL.
+        assert!(!json.contains("://"), "a full URL rode the wire: {json}");
+    }
+
+    #[test]
+    fn a_mirror_fetch_notice_round_trips_and_carries_only_a_bare_host() {
+        // A redirected fetch must be legible (H-2) but still leak nothing (BR-11):
+        // a bare mirror host, never the base URL's scheme, path, or userinfo.
+        let mut proposal = sample_proposal();
+        proposal.fetch_notice = Some(FetchNotice {
+            mirror_host: Some("hf-mirror.corp.internal".to_owned()),
+            override_catalog: false,
+        });
+        round_trip(&proposal);
+        let json = serde_json::to_string(&proposal).unwrap();
+        assert!(json.contains("hf-mirror.corp.internal"), "{json}");
+        for forbidden in ["url", "sha256", "http", "/Users/", "auth", "://"] {
+            assert!(
+                !json.contains(forbidden),
+                "mirror notice leaked `{forbidden}`: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_fetch_notice_does_not_ride_the_wire() {
+        // The common case (bundled catalog, no mirror) must not add a null field.
+        let json = serde_json::to_string(&sample_proposal()).unwrap();
+        assert!(!json.contains("fetch_notice"), "{json}");
+    }
+
+    #[test]
     fn permission_request_round_trips() {
         round_trip(&PermissionRequest {
             request_id: RequestId::from("r1"),
@@ -1195,6 +1312,11 @@ mod tests {
                     "band": "mid",
                     "size_bytes": 4700000000,
                     "ram_floor_bytes": 12884901888,
+                    "provenance": {
+                        "repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                        "host": "huggingface.co",
+                        "revision": "13fb94b"
+                    },
                     "future_entry_field": "quant"
                 },
                 "required_disk_bytes": 5700000000

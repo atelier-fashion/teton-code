@@ -31,26 +31,39 @@
 //! - `TETON_PROBE_RAM_BYTES` / `TETON_PROBE_DISK_BYTES` / `TETON_PROBE_GPU` /
 //!   `TETON_PROBE_FORCE_SLOW_BENCH` — hardware-probe overrides (REQ-544 BR-9 /
 //!   AC-8).
+//!
+//! ### Gated test seams (DECISION 3)
+//!
+//! The next three are **test seams, not operator features**. Each is honoured
+//! only when [`test_seams_enabled`] is true — a *debug build* with the master
+//! switch `TETON_TEST_SEAMS=1` set. A release build refuses them regardless of
+//! the environment, so a shipped daemon cannot have its catalog swapped, its disk
+//! check disabled, or its retry ladder shortened by an environment variable. They
+//! exist so the acceptance suite (`tests/e2e`) can stand the daemon up against
+//! mocks; nothing in production sets the master switch.
+//!
 //! - `TETON_CATALOG` — a model-catalog TOML replacing [`Catalog::bundled`]. The
-//!   REQ-547 acceptance suite needs a catalog whose artifact is small enough to
-//!   actually download in CI *and* whose `sha256`/`size_bytes` are the genuine
-//!   digest and length of the bytes a mock host serves — otherwise the verify
-//!   path (BR-6/AC-7) could only ever be asserted, never exercised. An
-//!   unreadable, unparseable or invalid file falls back to the bundled catalog
-//!   with a warning rather than refusing to start.
-//! - `TETON_DISK_FREE_BYTES` — the free space the *installer's* preflight sees
-//!   (BR-7 / AC-6). Distinct from `TETON_PROBE_DISK_BYTES`, which is the figure
-//!   the probe *reports* to the user; the preflight measures the volume it is
-//!   about to write to, and a test for "refuses on a full disk" cannot wait for
-//!   a genuinely full volume.
+//!   acceptance suite needs a catalog whose artifact is small enough to actually
+//!   download in CI *and* whose `sha256`/`size_bytes` are the genuine digest and
+//!   length of the bytes a mock host serves — otherwise the verify path
+//!   (BR-6/AC-7) could only ever be asserted, never exercised. An unreadable,
+//!   unparseable or invalid file falls back to the bundled catalog with a
+//!   warning; a valid override prints a prominent warning and drives the
+//!   proposal's `fetch_notice` (H-2), so the consent screen says the entries are
+//!   not the shipped catalog.
+//! - `TETON_DISK_FREE_BYTES` — a *ceiling* on the free space the installer's
+//!   preflight sees (BR-7 / AC-6). It may only ever **lower** the real
+//!   measurement, never raise it (M-8): a seam that could raise it would be a way
+//!   to make a full disk look empty and so disable the check. Distinct from
+//!   `TETON_PROBE_DISK_BYTES`, the figure the probe *reports* to the user.
 //! - `TETON_DOWNLOAD_RETRY_BASE_MS` — base delay of the download retry ladder
 //!   (BR-16). Only the delays shrink: the number of attempts, the doubling and
 //!   the jitter are the production ones, so a test exercises the real ladder
 //!   without spending its seconds.
 //!
-//! None of these are required in production (a real build resolves hardware and
-//! weights itself); they exist so the whole daemon can be exercised end to end
-//! against mocks.
+//! The `TETON_PROBE_*` and `TETON_LOCAL_SCRIPT` seams above are not required in
+//! production either (a real build resolves hardware and weights itself); they
+//! exist so the whole daemon can be exercised end to end against mocks.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -98,7 +111,7 @@ use crate::harness::{
     build_system_prompt, ContextManager, LocalEngineSource, PendingPermissions, PermissionConfig,
     PermissionGate, SessionEvents, ToolContext, ToolRegistry,
 };
-use crate::install::{FetchCause, FixedFreeSpace, LifecycleProgress, WeightsInstall};
+use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
 use crate::mcp::{McpRegistry, McpServerConfig};
 use crate::model_consent::{
@@ -485,7 +498,7 @@ impl DaemonRuntime {
 
         // --- local tier: hardware probe (REQ-544 BR-9 / AC-8) + scripted engine ---
         let profile = probe_profile();
-        let catalog = load_catalog();
+        let (catalog, catalog_overridden) = load_catalog();
         // The effective pin is `[local_model] pinned` (REQ-544's top-level key is
         // hard-deprecated and rejected by validation — Decision 2). Resolving it
         // once here means the probe, the consent gate, and `model/list` cannot
@@ -516,7 +529,10 @@ impl DaemonRuntime {
             // that can load the weights — the same signal `startup_lifecycle`
             // uses — so a completed install on a no-engine build says `disabled`,
             // not `ready`.
-            .with_local_engine(engine.is_some()),
+            .with_local_engine(engine.is_some())
+            // H-2: a non-bundled catalog is a redirected source; the proposal's
+            // `fetch_notice` tells the user so before they answer.
+            .with_catalog_override(catalog_overridden),
         );
         // The gate governs weights the daemon would have to **download**. A
         // `TETON_LOCAL_SCRIPT` engine is canned replies from a file: nothing is
@@ -1296,9 +1312,17 @@ fn build_installer(
                 .with_cause(cause)
                 .with_progress(Arc::new(LifecycleProgress::new(Arc::clone(events))));
             // AC-6's claim is about behaviour on a full volume, which no CI
-            // machine will provide on demand.
-            if let Some(free_bytes) = env_u64("TETON_DISK_FREE_BYTES") {
-                install = install.with_free_space(Arc::new(FixedFreeSpace(Some(free_bytes))));
+            // machine will provide on demand. DECISION 3 + M-8: a test seam,
+            // honoured only in a debug build with the master switch, and it may
+            // only ever *lower* the measured free space — a seam that could raise
+            // it would be a way to disable BR-7, so `CapFreeSpace` takes the
+            // minimum of the real measurement and the ceiling.
+            if let Some(ceiling) = env_u64("TETON_DISK_FREE_BYTES").filter(|_| test_seams_enabled())
+            {
+                install = install.with_free_space(Arc::new(CapFreeSpace {
+                    inner: Arc::new(HostFreeSpace),
+                    ceiling,
+                }));
             }
             Arc::new(install)
         }
@@ -1314,7 +1338,9 @@ fn build_installer(
 /// takes, not what it does.
 fn download_retry_policy() -> RetryPolicy {
     let default = RetryPolicy::default();
-    match env_u64("TETON_DOWNLOAD_RETRY_BASE_MS") {
+    // DECISION 3: a test seam, honoured only in a debug build with the master
+    // switch — never in a shipped daemon.
+    match env_u64("TETON_DOWNLOAD_RETRY_BASE_MS").filter(|_| test_seams_enabled()) {
         Some(base_ms) => RetryPolicy {
             base_delay: Duration::from_millis(base_ms),
             max_delay: Duration::from_millis(base_ms.saturating_mul(8)),
@@ -1324,29 +1350,61 @@ fn download_retry_policy() -> RetryPolicy {
     }
 }
 
-/// The model catalog this daemon proposes from: `TETON_CATALOG` when it names a
-/// usable catalog, else the bundled one.
+/// Whether the test seams (`TETON_CATALOG`, `TETON_DISK_FREE_BYTES`,
+/// `TETON_DOWNLOAD_RETRY_BASE_MS`) may be honoured (DECISION 3).
 ///
-/// An override that does not parse or does not validate falls back with a warning
-/// rather than aborting startup. A mistyped path must not brick a daemon, and the
-/// bundled catalog is always a correct answer — whereas a *silently* substituted
-/// one would not be, which is why the fallback is announced.
-fn load_catalog() -> Catalog {
+/// A **debug build with `TETON_TEST_SEAMS=1`** and nothing else. A release build
+/// refuses regardless of the switch — the seams are how the acceptance suite
+/// stands the daemon up against mocks, never an operator feature, so a shipped
+/// binary must not honour them even if the environment sets them.
+fn test_seams_enabled() -> bool {
+    cfg!(debug_assertions) && matches!(std::env::var("TETON_TEST_SEAMS").as_deref(), Ok("1"))
+}
+
+/// The model catalog this daemon proposes from, and whether it is a non-bundled
+/// override.
+///
+/// `TETON_CATALOG` is a **test seam** (DECISION 3): it is honoured only when
+/// [`test_seams_enabled`] is true. In a release build, or without the master
+/// switch, it is ignored and its use is logged — a shipped daemon always proposes
+/// from the catalog it was released with, never one an environment variable
+/// swapped in. When an override IS honoured, a prominent warning is printed and
+/// the returned flag drives the proposal's `fetch_notice`, so the consent screen
+/// says the entries are not the shipped catalog.
+///
+/// An override that does not parse or does not validate falls back to the bundled
+/// catalog with a warning rather than aborting startup: a mistyped path must not
+/// brick a daemon, and a *silently* substituted catalog would not be a correct
+/// answer, which is why the fallback is announced.
+fn load_catalog() -> (Catalog, bool) {
     let Some(path) = std::env::var_os("TETON_CATALOG") else {
-        return Catalog::bundled();
+        return (Catalog::bundled(), false);
     };
+    if !test_seams_enabled() {
+        eprintln!(
+            "tetond: ignoring TETON_CATALOG — it is a test seam honoured only in a debug build \
+             with TETON_TEST_SEAMS=1, not an operator feature. Using the bundled catalog."
+        );
+        return (Catalog::bundled(), false);
+    }
     let parsed = std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| Catalog::from_toml(&text).ok())
         .filter(|catalog| catalog.validate().is_ok());
     match parsed {
-        Some(catalog) => catalog,
+        Some(catalog) => {
+            eprintln!(
+                "tetond: WARNING — proposing from an override model catalog (TETON_CATALOG). \
+                 This is a test seam, not the shipped catalog; the consent prompt will say so."
+            );
+            (catalog, true)
+        }
         None => {
             eprintln!(
                 "tetond: TETON_CATALOG did not name a readable, valid catalog; \
                  using the bundled catalog"
             );
-            Catalog::bundled()
+            (Catalog::bundled(), false)
         }
     }
 }

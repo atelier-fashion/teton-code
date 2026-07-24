@@ -1454,6 +1454,7 @@ dependencies = [
 name = "teton-inference"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "llama-cpp-2",
  "serde",
  "thiserror",

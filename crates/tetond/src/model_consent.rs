@@ -49,13 +49,14 @@ use tokio::sync::oneshot;
 use teton_core::config::LocalModelConfig;
 use teton_core::entities::{ModelSelection, SelectionSource};
 
-use teton_inference::catalog::{Catalog, ModelEntry, TierBand};
+use teton_inference::catalog::{url_host, Catalog, ModelEntry, TierBand};
 use teton_inference::probe::{band_for_ram, decide, GpuClass, HardwareProfile, TierDecision, GIB};
 
 use teton_protocol::events::{
-    CatalogEntryView, ChosenBand, Event, GpuClass as WireGpuClass, ModelLifecycle,
-    ModelLifecycleStage, ModelSelectionDecided, ModelSelectionProposed, ProbeReportView,
-    ProposedModel, SelectionSource as WireSelectionSource, TierBand as WireTierBand,
+    CatalogEntryView, CatalogProvenance, ChosenBand, Event, FetchNotice, GpuClass as WireGpuClass,
+    ModelLifecycle, ModelLifecycleStage, ModelSelectionDecided, ModelSelectionProposed,
+    ProbeReportView, ProposedModel, SelectionSource as WireSelectionSource,
+    TierBand as WireTierBand,
 };
 use teton_protocol::methods::{
     InstallStateView, InstallStatus, ModelConfirmOutcome, ModelListEntry, ModelSelectionView,
@@ -271,6 +272,18 @@ pub enum InstallError {
         /// The failure kind. Never a path.
         detail: String,
     },
+    /// The weights directory is not exclusively owned by this daemon (M-11/M-12).
+    ///
+    /// The temp-dir fallback base is the hazard: a world-writable base lets another
+    /// user pre-create the directory, or plant a symlink at the predictable `.part`
+    /// path, before the daemon writes. Refusing is the safe answer — a shared base
+    /// is not a place to land weights the engine will later load.
+    #[error(
+        "refusing to install model weights: the daemon's weights directory is not \
+         exclusively owned by this user, so another user could tamper with the \
+         download. Check the permissions on the daemon state directory."
+    )]
+    UntrustedWeightsDir,
     /// This daemon has no download client, so no install can be attempted.
     #[error("this daemon has no model-download client; no weights were installed")]
     Unavailable,
@@ -294,8 +307,21 @@ pub trait WeightsInstaller: Send + Sync {
     /// Returns an [`InstallError`] classifying the failure.
     fn install(&self, entry: &ModelEntry) -> Result<(), InstallError>;
 
-    /// The on-disk state of `entry`'s weights.
+    /// The on-disk state of `entry`'s weights — the cheap, receipt-backed read
+    /// the daemon performs on every attach (Group B: paid for once).
     fn status(&self, entry: &ModelEntry) -> InstallStatus;
+
+    /// The on-disk state of `entry`'s weights read from the *bytes themselves*,
+    /// never from the receipt (M-10).
+    ///
+    /// The receipt is a pay-once cache keyed on size+mtime; mtime is forgeable,
+    /// so it is a cache, not an attestation. This is the read the tier-un-gating
+    /// path uses — the security-relevant moment — so the tier cannot open on a
+    /// forged receipt. The default delegates to [`status`](Self::status), which is
+    /// correct for installers that keep no cache (they read the bytes regardless).
+    fn deep_status(&self, entry: &ModelEntry) -> InstallStatus {
+        self.status(entry)
+    }
 }
 
 /// An installer for a daemon with no download client.
@@ -357,8 +383,12 @@ fn wire_source(source: SelectionSource) -> WireSelectionSource {
 
 /// The client-facing projection of a catalog entry.
 ///
-/// Drops `url`, `revision`, and `sha256`: download mechanics the user is not
-/// choosing between, and the shape BR-11 keeps off the wire.
+/// Drops the full `url` and the `sha256` — download mechanics the user is not
+/// choosing between, and the shape BR-11 keeps off the wire — but keeps the
+/// entry's *provenance* (H-2): the publisher/repo, the host, and the short
+/// revision, so the consent screen shows where the bytes come from, not only the
+/// model's name. These are public facts, never a credential, a full URL, or a
+/// path.
 #[must_use]
 pub fn entry_view(entry: &ModelEntry) -> CatalogEntryView {
     CatalogEntryView {
@@ -366,7 +396,31 @@ pub fn entry_view(entry: &ModelEntry) -> CatalogEntryView {
         band: wire_band(entry.band),
         size_bytes: entry.size_bytes,
         ram_floor_bytes: entry.ram_floor_bytes,
+        provenance: provenance_view(entry),
     }
+}
+
+/// The non-sensitive provenance triple for `entry` (H-2).
+///
+/// `repo` and `revision` come from the pinned `resolve` URL; `host` is the URL's
+/// authority. The revision is abbreviated to 7 hex for display — the full 40-hex
+/// pin stays daemon-side. A catalog that reaches this point has passed
+/// [`ModelEntry::validate`], so the URL parses and the host is `huggingface.co`;
+/// the fallbacks exist only so a projection can never panic on a malformed entry.
+#[must_use]
+fn provenance_view(entry: &ModelEntry) -> CatalogProvenance {
+    let source = entry.source();
+    CatalogProvenance {
+        repo: source.map(|s| s.repo.to_owned()).unwrap_or_default(),
+        host: url_host(&entry.url).unwrap_or_default().to_owned(),
+        revision: short_revision(&entry.revision),
+    }
+}
+
+/// The first 7 hex of a commit revision, for display (e.g. `f74adce`).
+#[must_use]
+fn short_revision(revision: &str) -> String {
+    revision.get(..7).unwrap_or(revision).to_owned()
 }
 
 /// The client-facing projection of a persisted decision.
@@ -440,12 +494,20 @@ pub fn probe_view(profile: &HardwareProfile, decision: &TierDecision) -> ProbeRe
 /// `alternatives` is every *other* catalog entry in catalog order, including ones
 /// above this machine's RAM floor — BR-3 says the user may pick them, so hiding
 /// them would be the wrong kind of protection; the client flags them instead.
+///
+/// `base_url` and `catalog_overridden` produce the [`FetchNotice`] (H-2): when a
+/// `[local_model] base_url` mirror or a non-bundled catalog is in force, the fetch
+/// is redirected away from the provenance host each entry shows, and the user must
+/// be told before answering — a redirect they cannot see is where consent means
+/// least.
 #[must_use]
 pub fn build_proposal(
     request_id: RequestId,
     profile: &HardwareProfile,
     catalog: &Catalog,
     decision: &TierDecision,
+    base_url: Option<&str>,
+    catalog_overridden: bool,
 ) -> ModelSelectionProposed {
     let proposed_name = decision.model().map(str::to_owned);
     let proposed = proposed_name
@@ -468,6 +530,29 @@ pub fn build_proposal(
         probe: probe_view(profile, decision),
         proposed,
         alternatives,
+        fetch_notice: fetch_notice(base_url, catalog_overridden),
+    }
+}
+
+/// The [`FetchNotice`] for a proposal, or `None` when nothing redirects the fetch.
+///
+/// A mirror contributes only its bare host — never the base URL's scheme, path,
+/// or userinfo — so the notice is legible (H-2) without leaking a URL (BR-11). A
+/// `base_url` with no parseable host still raises the notice with `mirror_host:
+/// None`, because the fetch is redirected either way and silence would be the
+/// wrong answer.
+#[must_use]
+fn fetch_notice(base_url: Option<&str>, catalog_overridden: bool) -> Option<FetchNotice> {
+    let mirror = base_url
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(|b| url_host(b).map(str::to_owned));
+    match (mirror, catalog_overridden) {
+        (None, false) => None,
+        (mirror, override_catalog) => Some(FetchNotice {
+            mirror_host: mirror.flatten(),
+            override_catalog,
+        }),
     }
 }
 
@@ -669,6 +754,10 @@ pub struct ModelConsentGate {
     /// Defaults to `false` — the honest default for the production build, which
     /// ships no GGUF loader.
     local_engine_present: bool,
+    /// Whether the catalog is a non-bundled override (`TETON_CATALOG`, H-2).
+    /// Feeds the proposal's [`FetchNotice`] so the consent screen says the
+    /// entries are not from the shipped catalog. Defaults to `false`.
+    catalog_overridden: bool,
     /// Model names whose install is in flight (M-2). Claimed under the lock
     /// before an install begins and released when it ends, so two installs of
     /// the same entry can never both open the shared `.part` — the second finds
@@ -700,8 +789,21 @@ impl ModelConsentGate {
             installer,
             counter: AtomicU64::new(0),
             local_engine_present: false,
+            catalog_overridden: false,
             installing: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Declare that the catalog is a non-bundled override (`TETON_CATALOG`, H-2).
+    ///
+    /// Threaded into the proposal's [`FetchNotice`] so the consent screen states
+    /// the entries are not the shipped catalog — a redirected source the user
+    /// cannot otherwise see. Left `false` (the constructor default), the bundled
+    /// catalog is assumed.
+    #[must_use]
+    pub fn with_catalog_override(mut self, overridden: bool) -> Self {
+        self.catalog_overridden = overridden;
+        self
     }
 
     /// Declare whether this build has a local inference engine that can load
@@ -818,7 +920,15 @@ impl ModelConsentGate {
                 .as_deref()
                 .and_then(|name| self.catalog.get(name))
             {
-                if self.installer.status(entry) == InstallStatus::Verified {
+                // M-10: un-gating the tier is the security-relevant moment, so it
+                // is decided by re-digesting the bytes (`deep_status`), not by
+                // trusting the install receipt — which is a pay-once *cache* keyed
+                // on size+mtime, and mtime is forgeable. `resolve` runs once at
+                // startup, so this pays the hash at most once per boot; the cheap
+                // receipt-backed `status` still serves the non-security-critical
+                // attach/status path (Group B). The tier must not open on a
+                // forgeable receipt alone.
+                if self.installer.deep_status(entry) == InstallStatus::Verified {
                     return ConsentOutcome::Ready { selection };
                 }
             }
@@ -870,7 +980,14 @@ impl ModelConsentGate {
             "model-{}",
             self.counter.fetch_add(1, Ordering::SeqCst)
         ));
-        let proposal = build_proposal(request_id.clone(), &self.profile, &self.catalog, &decision);
+        let proposal = build_proposal(
+            request_id.clone(),
+            &self.profile,
+            &self.catalog,
+            &decision,
+            self.config.base_url.as_deref(),
+            self.catalog_overridden,
+        );
         let proposed_name = proposal
             .proposed
             .as_ref()
@@ -1343,7 +1460,7 @@ mod tests {
         let profile = small_machine();
         let catalog = test_catalog();
         let decision = decide(&profile, &catalog, None);
-        build_proposal(request_id, &profile, &catalog, &decision)
+        build_proposal(request_id, &profile, &catalog, &decision, None, false)
     }
 
     pub(super) fn small_machine() -> HardwareProfile {
