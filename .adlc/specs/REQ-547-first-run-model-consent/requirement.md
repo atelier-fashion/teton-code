@@ -370,9 +370,18 @@ sessions; the first three are chipped as background tasks:
   `HarnessConfig::context_budget_bytes`, `SUMMARIZER_INPUT_MAX_BYTES`); the
   summarizer's engine-failure fallback is mechanical truncation, reported on
   `SummarizeOutcome` and logged by the turn loop, never silent raw folding.
-- **Cross-process AC-2 e2e** — the socket-level suite cannot exercise
+- **Cross-process AC-2 e2e** — ~~the socket-level suite cannot exercise
   install → load → benchmark → ready → local session without a
-  `TETON_TEST_SEAMS`-gated fake loader.
+  `TETON_TEST_SEAMS`-gated fake loader.~~ **Resolved 2026-07-24 (PR #6,
+  `923cd8c`)**: the gated `TETON_FAKE_ENGINE_LOADER` seam stages a
+  `MockEngine` through the production `StagedEngines` → `EngineSlot::install`
+  path (fakes only the GGUF parse + measurement); `consent_matrix`'s
+  engine-leg tests assert the chain over the real socket — benchmark stage
+  with the loader's own figures, `ready` strictly after it, the tier flip
+  observed via a fresh client's state-derived replay, a turn served by the
+  committed engine, and the BR-10 restart leg without a re-prompt. Also
+  closed the adversary's slot-fact gap: both loaders now share the one
+  staged→serving transition (LESSON-450, LESSON-451).
 - **AC-13 Linux leg** — unrun; the recorded sign-off is macOS-only
   (LESSON-433). The macOS block is countersigned by Brett (2026-07-24).
 - **Startup re-benchmark policy** — every boot re-measures (~44 s tier-open

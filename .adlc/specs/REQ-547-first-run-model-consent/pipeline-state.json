@@ -75,6 +75,11 @@
       "phase": 8,
       "name": "Post-close: local inference moved to the blocking pool (deferred item) merged via PR #4",
       "completedAt": "2026-07-24T20:35:06Z"
+    },
+    {
+      "phase": 8,
+      "name": "Post-close: cross-process AC-2 e2e (deferred item) merged via PR #6 \u2014 TETON_FAKE_ENGINE_LOADER seam",
+      "completedAt": "2026-07-24T22:33:49Z"
     }
   ],
   "integrationBranch": "main",
