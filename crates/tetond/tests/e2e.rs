@@ -8,13 +8,18 @@
 //! CI with no model weights and no live API keys.
 //!
 //! - [`harness`] — spawn/drive support, the mock provider (egress-capture) HTTP
-//!   server, and the suite-wide BR-1 capture assertion.
-//! - [`ac_matrix`] — one test per acceptance criterion.
+//!   server, the mock HuggingFace host, and the suite-wide BR-1 capture assertion.
+//! - [`ac_matrix`] — one test per REQ-544 acceptance criterion.
+//! - [`consent_matrix`] — one test per REQ-547 acceptance criterion (the
+//!   first-run model-consent gate), against a mock model host and a fixture
+//!   catalog whose digests are genuinely computed from the bytes served.
 
 // The suite lives under `tests/e2e/`; `#[path]` keeps that layout while this
 // top-level file remains the integration-test binary Cargo compiles.
 #[path = "e2e/ac_matrix.rs"]
 mod ac_matrix;
+#[path = "e2e/consent_matrix.rs"]
+mod consent_matrix;
 #[path = "e2e/harness.rs"]
 mod harness;
 #[path = "e2e/privacy_fixes.rs"]

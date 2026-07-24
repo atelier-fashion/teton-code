@@ -30,6 +30,22 @@
 //! - `TETON_REPO_ROOT` — the repo the tools are jailed to.
 //! - `TETON_PROBE_RAM_BYTES` / `TETON_PROBE_DISK_BYTES` / `TETON_PROBE_GPU` /
 //!   `TETON_PROBE_FORCE_SLOW_BENCH` — hardware-probe overrides (BR-9 / AC-8).
+//! - `TETON_CATALOG` — a model-catalog TOML replacing [`Catalog::bundled`]. The
+//!   REQ-547 acceptance suite needs a catalog whose artifact is small enough to
+//!   actually download in CI *and* whose `sha256`/`size_bytes` are the genuine
+//!   digest and length of the bytes a mock host serves — otherwise the verify
+//!   path (BR-6/AC-7) could only ever be asserted, never exercised. An
+//!   unreadable, unparseable or invalid file falls back to the bundled catalog
+//!   with a warning rather than refusing to start.
+//! - `TETON_DISK_FREE_BYTES` — the free space the *installer's* preflight sees
+//!   (BR-7 / AC-6). Distinct from `TETON_PROBE_DISK_BYTES`, which is the figure
+//!   the probe *reports* to the user; the preflight measures the volume it is
+//!   about to write to, and a test for "refuses on a full disk" cannot wait for
+//!   a genuinely full volume.
+//! - `TETON_DOWNLOAD_RETRY_BASE_MS` — base delay of the download retry ladder
+//!   (BR-16). Only the delays shrink: the number of attempts, the doubling and
+//!   the jitter are the production ones, so a test exercises the real ladder
+//!   without spending its seconds.
 //!
 //! None of these are required in production (a real build resolves hardware and
 //! weights itself); they exist so the whole daemon can be exercised end to end
@@ -72,7 +88,7 @@ use teton_providers::{
 
 use crate::broadcast::EventBus;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
-use crate::download::HttpRangeFetcher;
+use crate::download::{HttpRangeFetcher, RetryPolicy};
 use crate::egress::{inspect, origin_of, Egress, HttpTransport};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
@@ -81,7 +97,7 @@ use crate::harness::{
     build_system_prompt, ContextManager, LocalEngineSource, PendingPermissions, PermissionConfig,
     PermissionGate, SessionEvents, ToolContext, ToolRegistry,
 };
-use crate::install::{FetchCause, LifecycleProgress, WeightsInstall};
+use crate::install::{FetchCause, FixedFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
 use crate::mcp::{McpRegistry, McpServerConfig};
 use crate::model_consent::{
@@ -457,7 +473,7 @@ impl DaemonRuntime {
 
         // --- local tier: hardware probe (BR-9 / AC-8) + scripted engine ---
         let profile = probe_profile();
-        let catalog = Catalog::bundled();
+        let catalog = load_catalog();
         // `[local_model] pinned` supersedes the legacy top-level key; resolving it
         // once here means the probe, the consent gate, and `model/list` cannot
         // disagree about which pin is in force.
@@ -1168,17 +1184,66 @@ fn build_installer(
     base_url: Option<String>,
     events: &Arc<EventBus>,
 ) -> Arc<dyn WeightsInstaller> {
-    match HttpRangeFetcher::new() {
+    match HttpRangeFetcher::with_policy(download_retry_policy()) {
         Ok(fetcher) => {
             let fetcher = Arc::new(fetcher);
             let cause: Arc<dyn FetchCause> = fetcher.clone();
-            Arc::new(
-                WeightsInstall::new(fetcher, base_dir.join(WEIGHTS_DIR), base_url)
-                    .with_cause(cause)
-                    .with_progress(Arc::new(LifecycleProgress::new(Arc::clone(events)))),
-            )
+            let mut install = WeightsInstall::new(fetcher, base_dir.join(WEIGHTS_DIR), base_url)
+                .with_cause(cause)
+                .with_progress(Arc::new(LifecycleProgress::new(Arc::clone(events))));
+            // AC-6's claim is about behaviour on a full volume, which no CI
+            // machine will provide on demand.
+            if let Some(free_bytes) = env_u64("TETON_DISK_FREE_BYTES") {
+                install = install.with_free_space(Arc::new(FixedFreeSpace(Some(free_bytes))));
+            }
+            Arc::new(install)
         }
         Err(_) => Arc::new(NoInstaller),
+    }
+}
+
+/// The download retry ladder, with only its *delays* overridable (BR-16).
+///
+/// The attempt count, the doubling and the jitter stay production values: a test
+/// that shortened the ladder itself would be exercising a different policy than
+/// the one that ships. Shortening the base delay changes how long the same ladder
+/// takes, not what it does.
+fn download_retry_policy() -> RetryPolicy {
+    let default = RetryPolicy::default();
+    match env_u64("TETON_DOWNLOAD_RETRY_BASE_MS") {
+        Some(base_ms) => RetryPolicy {
+            base_delay: Duration::from_millis(base_ms),
+            max_delay: Duration::from_millis(base_ms.saturating_mul(8)),
+            ..default
+        },
+        None => default,
+    }
+}
+
+/// The model catalog this daemon proposes from: `TETON_CATALOG` when it names a
+/// usable catalog, else the bundled one.
+///
+/// An override that does not parse or does not validate falls back with a warning
+/// rather than aborting startup. A mistyped path must not brick a daemon, and the
+/// bundled catalog is always a correct answer — whereas a *silently* substituted
+/// one would not be, which is why the fallback is announced.
+fn load_catalog() -> Catalog {
+    let Some(path) = std::env::var_os("TETON_CATALOG") else {
+        return Catalog::bundled();
+    };
+    let parsed = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| Catalog::from_toml(&text).ok())
+        .filter(|catalog| catalog.validate().is_ok());
+    match parsed {
+        Some(catalog) => catalog,
+        None => {
+            eprintln!(
+                "tetond: TETON_CATALOG did not name a readable, valid catalog; \
+                 using the bundled catalog"
+            );
+            Catalog::bundled()
+        }
     }
 }
 

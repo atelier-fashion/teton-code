@@ -1,10 +1,10 @@
 ---
 id: TASK-008
 title: "Acceptance suite AC-1..AC-12 + manual-gate runbook"
-status: draft
+status: complete
 parent: REQ-547
 created: 2026-07-21
-updated: 2026-07-21
+updated: 2026-07-23
 dependencies: [TASK-005, TASK-006, TASK-007]
 ---
 
@@ -23,11 +23,11 @@ written runbook for AC-13 (the one claim CI cannot make).
 
 ## Acceptance Criteria
 
-- [ ] Each of AC-1..AC-10 and AC-12 has a distinct test that fails when its feature is broken; mutation spot-check **AC-1 and AC-7** specifically (break, observe red, revert — report it)
-- [ ] The suite runs in CI with no real model weights and no network to huggingface.co (mock server only) — TASK-006's integrity check is the only network-touching job
-- [ ] AC-13 is **not** auto-checked anywhere; the runbook exists and the spec's AC-13 stays unchecked until a human signs off
-- [ ] Full workspace green: `cargo test --workspace`, `clippy -D warnings`, `fmt --check`
-- [ ] Suite completes in under ~2 minutes
+- [x] Each of AC-1..AC-10 and AC-12 has a distinct test that fails when its feature is broken; mutation spot-check **AC-1 and AC-7** specifically (break, observe red, revert — report it)
+- [x] The suite runs in CI with no real model weights and no network to huggingface.co (mock server only) — TASK-006's integrity check is the only network-touching job
+- [x] AC-13 is **not** auto-checked anywhere; the runbook exists and the spec's AC-13 stays unchecked until a human signs off
+- [x] Full workspace green: `cargo test --workspace`, `clippy -D warnings`, `fmt --check`
+- [x] Suite completes in under ~2 minutes
 
 ## Technical Notes
 

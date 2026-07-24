@@ -389,6 +389,26 @@ impl Workspace {
     pub fn read_repo_file(&self, rel: &str) -> String {
         std::fs::read_to_string(self.repo.join(rel)).unwrap()
     }
+
+    /// Write a model-catalog TOML and return its path (`TETON_CATALOG`).
+    pub fn write_catalog(&self, toml: &str) -> PathBuf {
+        let path = self.root.join("catalog.toml");
+        std::fs::write(&path, toml).unwrap();
+        path
+    }
+
+    /// The daemon's state directory: where the decision record and the weights
+    /// live, and the reason a restarted daemon remembers anything (D-4).
+    pub fn state_dir(&self) -> PathBuf {
+        self.runtime_dir.join("teton")
+    }
+
+    /// Where installed weights land. Local display only — this path never
+    /// crosses the protocol boundary (BR-11), which is why a test that wants it
+    /// derives it the same way the CLI does.
+    pub fn weights_dir(&self) -> PathBuf {
+        self.state_dir().join("models")
+    }
 }
 
 impl Drop for Workspace {
@@ -721,6 +741,103 @@ impl Client {
         let resp = self.call("cost/query", json!({}));
         resp["result"]["report"].clone()
     }
+
+    // -- REQ-547 consent helpers --
+
+    /// Pump events until one named `name` arrives (or `window` elapses),
+    /// returning the first such event — including one already observed.
+    pub fn wait_for_event(&mut self, name: &str, window: Duration) -> Option<Value> {
+        if let Some(seen) = self.events_named(name).first() {
+            return Some((*seen).clone());
+        }
+        let deadline = Instant::now() + window;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                return None;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(Incoming::Event(ev)) => {
+                    let matched = ev.get("event").and_then(Value::as_str) == Some(name);
+                    self.on_event(ev);
+                    if matched {
+                        return self.events_named(name).last().map(|e| (*e).clone());
+                    }
+                }
+                Ok(Incoming::Response(_)) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Await the first-run proposal *as an event*
+    /// (`model_selection_proposed`).
+    ///
+    /// Note the daemon publishes its proposal before `server::serve` begins
+    /// accepting connections, so in the current wiring no client can be
+    /// subscribed in time to receive it — see the ignored
+    /// `ac1_proposal_event_reaches_an_attached_client`. Every other consent test
+    /// therefore finds the open proposal the way a real client does, through
+    /// [`Self::await_pending_proposal`].
+    pub fn await_proposal(&mut self, window: Duration) -> Value {
+        self.wait_for_event("model_selection_proposed", window)
+            .expect("the daemon should have proposed a model")
+    }
+
+    /// Poll `model/status` until a proposal is outstanding, returning the
+    /// `request_id` it must be answered with.
+    ///
+    /// This is the path every shipped client takes (`teton`'s
+    /// `answer_outstanding_model_proposal`).
+    pub fn await_pending_proposal(&mut self, window: Duration) -> String {
+        let deadline = Instant::now() + window;
+        loop {
+            let status = self.model_status();
+            if let Some(id) = status["pending_request_id"].as_str() {
+                return id.to_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no model proposal became outstanding within {window:?}; last status: {status}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Answer an outstanding proposal (`model/confirm`).
+    pub fn confirm_model(&mut self, request_id: &str, outcome: Value) -> Value {
+        self.call(
+            "model/confirm",
+            json!({ "request_id": request_id, "outcome": outcome }),
+        )
+    }
+
+    /// The catalog, each entry's fit, and the current selection (`model/list`).
+    pub fn model_list(&mut self) -> Value {
+        self.call("model/list", json!({}))["result"].clone()
+    }
+
+    /// The decision, install state, and any open proposal (`model/status`).
+    pub fn model_status(&mut self) -> Value {
+        self.call("model/status", json!({}))["result"].clone()
+    }
+
+    /// Poll `model/status` until the selected weights report `status`, or give up.
+    pub fn wait_for_install_status(&mut self, status: &str, window: Duration) -> Value {
+        let deadline = Instant::now() + window;
+        loop {
+            let reported = self.model_status();
+            if reported["install"]["status"].as_str() == Some(status) {
+                return reported;
+            }
+            if Instant::now() >= deadline {
+                return reported;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -822,4 +939,480 @@ fn now_nanos() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos()
+}
+
+// ---------------------------------------------------------------------------
+// Mock HuggingFace host (REQ-547 TASK-008)
+// ---------------------------------------------------------------------------
+//
+// The consent matrix needs a model host it can make behave: serve an artifact,
+// hand off to a CDN with a `302`, rate-limit, or hand back bytes that are the
+// right length and the wrong content. Mocking that surface — rather than
+// fetching from huggingface.co — is what keeps the suite hermetic and fast; the
+// *real* HF contract is TASK-006's job, and it is the only network-touching one.
+//
+// The artifact is small and its `sha256` is genuinely computed from the bytes
+// served, so the verify path (BR-6) is exercised rather than asserted: point the
+// host at different bytes and the digest check fails for the real reason.
+
+/// What the mock host does with a `…/resolve/…` request.
+#[derive(Clone)]
+pub enum HfArtifact {
+    /// Serve the requested file's real bytes from [`MockHfConfig::files`],
+    /// honouring a `Range` request.
+    Files,
+    /// Serve the requested file's *length* in bytes that are not its bytes: the
+    /// right size, the wrong content, so nothing but the digest can catch it
+    /// (AC-7).
+    CorruptFiles,
+    /// Answer `302` with `Location: <base><path>` — the HF → CDN handoff a
+    /// credential-free, redirect-following client must complete (BR-14).
+    RedirectTo(String),
+    /// Answer every fetch with this status, optionally with a `Retry-After`.
+    /// A `Retry-After: 0` walks the whole real ladder without spending its
+    /// seconds (AC-12).
+    Status {
+        /// The HTTP status to answer with.
+        code: u16,
+        /// `Retry-After` header value in seconds, when one should be sent.
+        retry_after_secs: Option<u64>,
+    },
+}
+
+/// One file in a mock `GET /api/models/<repo>/tree/<revision>` response.
+#[derive(Clone)]
+pub struct HfTreeFile {
+    /// Path within the repository.
+    pub path: String,
+    /// The LFS object id — which *is* the artifact's SHA-256 (architecture D-1).
+    pub oid: String,
+    /// The LFS object size in bytes.
+    pub size: u64,
+}
+
+/// How a [`MockHf`] should behave.
+pub struct MockHfConfig {
+    /// The `resolve` behaviour.
+    pub artifact: HfArtifact,
+    /// Artifact bytes, keyed by the file's last path segment.
+    pub files: std::collections::BTreeMap<String, Vec<u8>>,
+    /// Tree listings, keyed `"<repo>@<revision>"`.
+    pub tree: std::collections::BTreeMap<String, Vec<HfTreeFile>>,
+    /// Resolve requests answered with [`Self::fail_status`] before the artifact
+    /// is served — the transient-then-recovers path.
+    pub fail_first: usize,
+    /// Status for those first `fail_first` requests.
+    pub fail_status: u16,
+    /// `Retry-After` sent alongside them.
+    pub fail_retry_after_secs: Option<u64>,
+}
+
+impl Default for MockHfConfig {
+    fn default() -> Self {
+        Self {
+            artifact: HfArtifact::Files,
+            files: std::collections::BTreeMap::new(),
+            tree: std::collections::BTreeMap::new(),
+            fail_first: 0,
+            fail_status: 429,
+            fail_retry_after_secs: Some(0),
+        }
+    }
+}
+
+struct HfState {
+    config: MockHfConfig,
+    failures_left: AtomicUsize,
+    requests: Mutex<Vec<String>>,
+}
+
+/// A localhost stand-in for HuggingFace: the LFS metadata API and the artifact
+/// `resolve` endpoint, with every request path recorded.
+pub struct MockHf {
+    port: u16,
+    state: Arc<HfState>,
+    running: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MockHf {
+    /// Start a host behaving as `config` describes.
+    pub fn start(config: MockHfConfig) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock hf");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let state = Arc::new(HfState {
+            failures_left: AtomicUsize::new(config.fail_first),
+            config,
+            requests: Mutex::new(Vec::new()),
+        });
+        let running = Arc::new(AtomicBool::new(true));
+
+        let handle = {
+            let state = Arc::clone(&state);
+            let running = Arc::clone(&running);
+            thread::spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve_hf(stream, &state),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+
+        Self {
+            port,
+            state,
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    /// A host serving every fixture model's real bytes.
+    pub fn serving(models: &[TestModel]) -> Self {
+        Self::start(MockHfConfig {
+            files: file_map(models),
+            ..MockHfConfig::default()
+        })
+    }
+
+    /// A host serving every fixture model at the right length and the wrong
+    /// content (AC-7).
+    pub fn corrupting(models: &[TestModel]) -> Self {
+        Self::start(MockHfConfig {
+            artifact: HfArtifact::CorruptFiles,
+            files: file_map(models),
+            ..MockHfConfig::default()
+        })
+    }
+
+    /// The base URL to configure as `[local_model] base_url` (BR-16).
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Every request path this host received, in order.
+    pub fn requests(&self) -> Vec<String> {
+        self.state.requests.lock().unwrap().clone()
+    }
+
+    /// How many *artifact* requests this host received.
+    ///
+    /// The number AC-1 is about: metadata reads are not model data, so counting
+    /// every request would make the assertion mean something weaker than it says.
+    pub fn artifact_request_count(&self) -> usize {
+        self.requests()
+            .iter()
+            .filter(|path| path.contains("/resolve/"))
+            .count()
+    }
+}
+
+impl Drop for MockHf {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Serve one mock-HF request.
+fn serve_hf(mut stream: TcpStream, state: &Arc<HfState>) {
+    let Some((path, range_from)) = read_hf_request(&mut stream) else {
+        return;
+    };
+    state.requests.lock().unwrap().push(path.clone());
+
+    if let Some(rest) = path.strip_prefix("/api/models/") {
+        serve_hf_api(&mut stream, state, rest);
+        return;
+    }
+
+    // Scripted transient failures come first: they are about the *transport*,
+    // so they must precede whatever the artifact behaviour is.
+    if state.failures_left.load(Ordering::SeqCst) > 0 {
+        state.failures_left.fetch_sub(1, Ordering::SeqCst);
+        write_hf_status(
+            &mut stream,
+            state.config.fail_status,
+            state.config.fail_retry_after_secs,
+        );
+        return;
+    }
+
+    let file = path.rsplit('/').next().unwrap_or_default().to_owned();
+    match &state.config.artifact {
+        HfArtifact::Files => match state.config.files.get(&file) {
+            Some(bytes) => write_hf_body(&mut stream, bytes, range_from),
+            None => write_hf_status(&mut stream, 404, None),
+        },
+        HfArtifact::CorruptFiles => match state.config.files.get(&file) {
+            // Right length, wrong bytes: only the SHA-256 can tell.
+            Some(bytes) => {
+                let corrupt: Vec<u8> = bytes.iter().map(|b| b ^ 0xa5).collect();
+                write_hf_body(&mut stream, &corrupt, range_from);
+            }
+            None => write_hf_status(&mut stream, 404, None),
+        },
+        HfArtifact::RedirectTo(base) => {
+            let location = format!("{}{}", base.trim_end_matches('/'), path);
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+        }
+        HfArtifact::Status {
+            code,
+            retry_after_secs,
+        } => write_hf_status(&mut stream, *code, *retry_after_secs),
+    }
+}
+
+/// Answer the two metadata endpoints `tools/refresh-catalog.py` reads: the repo
+/// info (public/ungated flags) and the LFS tree at a revision (architecture D-1).
+fn serve_hf_api(stream: &mut TcpStream, state: &Arc<HfState>, rest: &str) {
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let body = match rest.split_once("/tree/") {
+        Some((repo, revision)) => {
+            let key = format!("{repo}@{revision}");
+            match state.config.tree.get(&key) {
+                Some(files) => {
+                    let entries: Vec<Value> = files
+                        .iter()
+                        .map(|f| {
+                            json!({
+                                "type": "file",
+                                "path": f.path,
+                                "size": f.size,
+                                "lfs": { "oid": f.oid, "size": f.size, "pointerSize": 134 },
+                            })
+                        })
+                        .collect();
+                    Value::Array(entries)
+                }
+                None => {
+                    write_hf_status(stream, 404, None);
+                    return;
+                }
+            }
+        }
+        // Repo info. Public and ungated: the mock stands in for a repo the
+        // catalog is *allowed* to name, so the gate's other refusals stay
+        // exercised by their own cases rather than by this one failing early.
+        None => json!({
+            "id": rest,
+            "sha": "0".repeat(40),
+            "gated": false,
+            "private": false,
+            "disabled": false,
+        }),
+    };
+    let text = body.to_string();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        text.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(text.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Write a bare status response, with an optional `Retry-After`.
+fn write_hf_status(stream: &mut TcpStream, code: u16, retry_after_secs: Option<u64>) {
+    let reason = match code {
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let mut head = format!("HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n");
+    if let Some(secs) = retry_after_secs {
+        head.push_str(&format!("Retry-After: {secs}\r\n"));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Write `bytes`, honouring a `Range: bytes=<from>-` with a `206`.
+fn write_hf_body(stream: &mut TcpStream, bytes: &[u8], range_from: Option<u64>) {
+    let total = bytes.len() as u64;
+    let head = match range_from {
+        Some(from) if from < total => {
+            let slice_len = total - from;
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\n\
+                 Content-Length: {slice_len}\r\nConnection: close\r\n\r\n",
+                from,
+                total - 1,
+                total
+            )
+        }
+        _ => format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"),
+    };
+    let from = range_from.filter(|from| *from < total).unwrap_or(0) as usize;
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(&bytes[from..]);
+    let _ = stream.flush();
+}
+
+/// Read a request line + headers, returning the path and any `Range` start.
+fn read_hf_request(stream: &mut TcpStream) -> Option<(String, Option<u64>)> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).ok()? == 0 {
+        return None;
+    }
+    let path = request_line.split_whitespace().nth(1)?.to_owned();
+    let mut range_from = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            break;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("range:") {
+            range_from = rest
+                .trim()
+                .strip_prefix("bytes=")
+                .and_then(|spec| spec.split('-').next())
+                .and_then(|start| start.trim().parse::<u64>().ok());
+        }
+    }
+    Some((path, range_from))
+}
+
+// ---------------------------------------------------------------------------
+// The fixture catalog (REQ-547 TASK-008)
+// ---------------------------------------------------------------------------
+
+/// A fixture catalog entry: a real (tiny) artifact with its real digest.
+pub struct TestModel {
+    /// Catalog name.
+    pub name: &'static str,
+    /// HuggingFace-shaped repository.
+    pub repo: &'static str,
+    /// File within the repository.
+    pub file: &'static str,
+    /// The pinned 40-hex revision (BR-15).
+    pub revision: &'static str,
+    /// The band this entry serves.
+    pub band: &'static str,
+    /// Its RAM floor.
+    pub ram_floor_bytes: u64,
+    /// The bytes a mock host serves for it.
+    pub payload: Vec<u8>,
+}
+
+impl TestModel {
+    /// The canonical (pre-override) download URL.
+    pub fn url(&self) -> String {
+        format!(
+            "https://huggingface.co/{}/resolve/{}/{}",
+            self.repo, self.revision, self.file
+        )
+    }
+
+    /// The genuine SHA-256 of [`Self::payload`] — computed, never pinned, so the
+    /// fixture cannot drift away from the bytes it describes.
+    pub fn sha256(&self) -> String {
+        teton_inference::hash::sha256_hex(&self.payload)
+    }
+}
+
+/// Index every fixture model's payload by its file name, the way a host serves it.
+pub fn file_map(models: &[TestModel]) -> std::collections::BTreeMap<String, Vec<u8>> {
+    models
+        .iter()
+        .map(|m| (m.file.to_owned(), m.payload.clone()))
+        .collect()
+}
+
+/// Deterministic pseudo-random bytes: a stand-in artifact small enough to move
+/// in a test and incompressible enough to be a real digest input.
+pub fn fixture_payload(len: usize, seed: u8) -> Vec<u8> {
+    let mut state = u32::from(seed).wrapping_add(0x9e37_79b9);
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xff) as u8
+        })
+        .collect()
+}
+
+/// The fixture catalog: one entry per band, mirroring the shipped catalog's
+/// shape (pinned revisions, real digests) at a size CI can actually fetch.
+///
+/// A 16 GiB machine lands in the `small` band, so `tiny-small` is what the probe
+/// proposes, `tiny-mid` is a legal override, and `tiny-large` is the
+/// above-RAM-floor pick BR-3's second confirmation exists for.
+pub fn fixture_models() -> Vec<TestModel> {
+    vec![
+        TestModel {
+            name: "tiny-small",
+            repo: "teton-fixtures/tiny-gguf",
+            file: "tiny-small-q4_k_m.gguf",
+            revision: "1111111111111111111111111111111111111111",
+            band: "small",
+            ram_floor_bytes: 3 * (1024 * 1024 * 1024),
+            payload: fixture_payload(64 * 1024, 1),
+        },
+        TestModel {
+            name: "tiny-mid",
+            repo: "teton-fixtures/tiny-gguf",
+            file: "tiny-mid-q4_k_m.gguf",
+            revision: "2222222222222222222222222222222222222222",
+            band: "mid",
+            ram_floor_bytes: 9 * (1024 * 1024 * 1024),
+            payload: fixture_payload(96 * 1024, 2),
+        },
+        TestModel {
+            name: "tiny-large",
+            repo: "teton-fixtures/tiny-gguf",
+            file: "tiny-large-q4_k_m.gguf",
+            revision: "3333333333333333333333333333333333333333",
+            band: "large",
+            ram_floor_bytes: 21 * (1024 * 1024 * 1024),
+            payload: fixture_payload(128 * 1024, 3),
+        },
+    ]
+}
+
+/// Render `models` as a catalog TOML the daemon accepts via `TETON_CATALOG`.
+pub fn fixture_catalog_toml(models: &[TestModel]) -> String {
+    let mut out = String::from("# fixture catalog (REQ-547 TASK-008)\nversion = 1\n");
+    for model in models {
+        out.push_str(&format!(
+            "\n[[models]]\nname = \"{}\"\nurl = \"{}\"\nrevision = \"{}\"\n\
+             sha256 = \"{}\"\nsize_bytes = {}\nram_floor_bytes = {}\nband = \"{}\"\n",
+            model.name,
+            model.url(),
+            model.revision,
+            model.sha256(),
+            model.payload.len(),
+            model.ram_floor_bytes,
+            model.band,
+        ));
+    }
+    out
+}
+
+/// The `[local_model]` config block redirecting fetches at `base_url` (BR-16).
+pub fn local_model_block(base_url: &str, auto_accept: bool) -> String {
+    format!("[local_model]\nauto_accept = {auto_accept}\nbase_url = \"{base_url}\"\n\n")
 }

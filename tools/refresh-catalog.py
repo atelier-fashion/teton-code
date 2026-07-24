@@ -48,6 +48,23 @@ Usage
     python3 tools/refresh-catalog.py --print
         Write the regenerated catalog to stdout instead of the file.
 
+    --catalog PATH
+        Read (and, for --update, write) that file instead of the committed
+        catalog. Exists so the gate itself is testable: REQ-547 TASK-008 points
+        it at a fixture pinning a moving ref and asserts the MISMATCH is raised
+        with an actionable message (AC-12). A gate nobody has ever seen fail is
+        not a gate.
+
+Environment
+-----------
+    HF_ENDPOINT
+        Base URL of the *metadata API*, default `https://huggingface.co`. The
+        emitted download URLs stay canonical regardless: a check run against a
+        mirror must still verify the catalog that ships, not rewrite it to point
+        at the mirror. Set by the acceptance suite to a local mock so the gate's
+        own behaviour — pass on agreement, MISMATCH on drift — is exercised
+        hermetically, with the real network run remaining the CI job's job.
+
 Exit codes
 ----------
 A network failure and a digest mismatch are *categorically different events*
@@ -79,7 +96,11 @@ import time
 import urllib.error
 import urllib.request
 
-HF_API = "https://huggingface.co/api/models"
+# The metadata API is redirectable (HF_ENDPOINT, mirroring the daemon's
+# `[local_model] base_url`, BR-16); the *resolve* host is not. What the catalog
+# records is the canonical download URL, so deriving it from a mirror would make
+# `--check` rewrite the very field it is meant to verify.
+HF_API = f"{os.environ.get('HF_ENDPOINT', 'https://huggingface.co').rstrip('/')}/api/models"
 HF_RESOLVE = "https://huggingface.co"
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -560,7 +581,16 @@ def main() -> int:
     mode.add_argument(
         "--print", dest="to_stdout", action="store_true", help="write to stdout"
     )
+    parser.add_argument(
+        "--catalog",
+        metavar="PATH",
+        help="catalog file to read/write instead of the committed one",
+    )
     args = parser.parse_args()
+
+    if args.catalog:
+        global CATALOG_PATH  # noqa: PLW0603 — the path is the tool's one global input
+        CATALOG_PATH = os.path.abspath(args.catalog)
 
     try:
         with open(CATALOG_PATH, encoding="utf-8") as handle:

@@ -168,37 +168,53 @@ daemon contains no production wiring for `Downloader` at all._
       with its download size and RAM floor, and the selectable alternatives — and
       **zero bytes of model data are fetched** until the user answers. Verified by
       asserting no download request is issued before the decision.
+      _Unchecked after TASK-008. The named verification passes end to end
+      (`consent_matrix::ac1_…`), as do the probe reasoning and every selectable
+      entry with its size and RAM floor. What does **not** hold is "the proposed
+      model": `model_selection_proposed` is published before the daemon accepts
+      connections, so no client ever receives it and the CLI can name only the
+      band, not the pick. Ignored test
+      `consent_matrix::ac1_proposal_event_reaches_an_attached_client` un-ignores
+      the day that is fixed._
 - [ ] AC-2: Accepting the proposal downloads, verifies the SHA-256, installs
       atomically, benchmarks, and reaches a working local session, with progress
       rendered from `model_lifecycle` events.
-- [ ] AC-3: Overriding to a different catalog entry downloads that entry instead
+      _Unchecked after TASK-008. Download, SHA-256 verification, atomic install
+      and `model_lifecycle` progress are verified end to end
+      (`consent_matrix::ac2_…`). Two clauses are **not** met: the consent flow
+      runs no post-install benchmark (the `benchmark` event is REQ-544's
+      synthetic startup sequence), and nothing in `tetond` ever builds a
+      `LlamaEngine` from the installed weights — `tetond` has no `llama` feature
+      — so no local session can be served from them. See
+      `docs/manual-verification.md` "Known gaps"._
+- [x] AC-3: Overriding to a different catalog entry downloads that entry instead
       of the proposed one; choosing an entry above the machine's RAM floor emits
       an explicit warning and is only applied after a second confirmation.
-- [ ] AC-4: Declining runs the session remote-only, persists the decision, and a
+- [x] AC-4: Declining runs the session remote-only, persists the decision, and a
       subsequent daemon start does not re-prompt.
-- [ ] AC-5: With auto-accept (CLI flag or config key) a first run completes with
+- [x] AC-5: With auto-accept (CLI flag or config key) a first run completes with
       no prompt and no user input — the unattended/CI path.
-- [ ] AC-6: With insufficient free disk, the run refuses before any bytes are
+- [x] AC-6: With insufficient free disk, the run refuses before any bytes are
       fetched, naming required vs available space.
-- [ ] AC-7: A corrupted/mismatched download is discarded, never installed, and
+- [x] AC-7: A corrupted/mismatched download is discarded, never installed, and
       surfaces a clear error; the engine never loads a partial file (assert
       `InstallState` never reports `verified` for a truncated artifact).
-- [ ] AC-8: An automated catalog-integrity check verifies every entry's URL
+- [x] AC-8: An automated catalog-integrity check verifies every entry's URL
       resolves and its advertised `size_bytes` matches the real artifact; a
       full-digest verification mode exists and is runnable on demand (see OQ-3
       for whether it gates CI or only releases).
-- [ ] AC-9: `teton model list` shows the catalog, each entry's fit for this
+- [x] AC-9: `teton model list` shows the catalog, each entry's fit for this
       machine, and the current selection; `teton model set <name>` changes it
       post-first-run (subject to BR-3's warning) and `teton model status` reports
       install state.
-- [ ] AC-10: Accepting the proposal with no network produces a clear network
+- [x] AC-10: Accepting the proposal with no network produces a clear network
       error, leaves no partial install, and does not record a "declined"
       decision — a later run with connectivity re-prompts and succeeds (BR-12).
-- [ ] AC-11: The download client is credential-free and follows redirects (a
+- [x] AC-11: The download client is credential-free and follows redirects (a
       HuggingFace `resolve` → CDN 302 completes), while the provider/MCP egress
       client still refuses redirects — asserted by a test covering both halves,
       so relaxing one never silently relaxes the other (BR-14).
-- [ ] AC-12: A catalog entry whose URL pins a moving ref (e.g. `/resolve/main/`)
+- [x] AC-12: A catalog entry whose URL pins a moving ref (e.g. `/resolve/main/`)
       fails the catalog-integrity check with an actionable message (BR-15); a
       configured base-URL override redirects fetches to the mirror (BR-16); an
       HTTP 429 is retried with backoff and reported as rate-limiting, not as a
@@ -208,6 +224,9 @@ daemon contains no production wiring for `Downloader` at all._
       (manual/`--features live` verification — this is the claim CI's mocks
       cannot make, and it must be signed off by a human rather than silently
       checked). (informed by LESSON-433)
+      _Runbook: `docs/manual-verification.md`. **This box stays empty until a
+      human fills in a sign-off block there.** No test, script, or agent may tick
+      it — that is the entire point of a manual gate._
 
 ## External Dependencies
 
