@@ -502,9 +502,10 @@ impl Daemon {
             .env("TETON_REPO_ROOT", &workspace.repo)
             // DECISION 3: the acceptance suite drives the daemon through gated
             // test seams (TETON_CATALOG, TETON_DISK_FREE_BYTES,
-            // TETON_DOWNLOAD_RETRY_BASE_MS, and the TETON_PROBE_* simulated
-            // machine), which a debug build honours only with this master switch
-            // set. A release build refuses them outright.
+            // TETON_DOWNLOAD_RETRY_BASE_MS, the TETON_PROBE_* simulated
+            // machine, and the TETON_FAKE_ENGINE_LOADER stand-in loader), which
+            // a debug build honours only with this master switch set. A release
+            // build refuses them outright.
             .env("TETON_TEST_SEAMS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

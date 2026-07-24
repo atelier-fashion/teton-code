@@ -70,15 +70,20 @@
 //!   hardware" the consent screen shows would be the environment's fiction rather
 //!   than the machine. `TETON_PROBE_FORCE_SLOW_BENCH` likewise publishes
 //!   `benchmark` and `stepped_down` stages for measurements that never happened.
+//! - `TETON_FAKE_ENGINE_LOADER` — a stand-in weights loader that stages a
+//!   [`MockEngine`] and commits it through the daemon's real staging →
+//!   serving-slot path instead of parsing a GGUF, reporting a fixed,
+//!   recognizably fake benchmark. It exists so the acceptance suite can drive
+//!   the full accept → install → load → `benchmark` → `ready` → local-turn
+//!   chain over the socket in a build without the `llama` feature. Gated
+//!   because it fabricates the one fact `ready` exists to prove — that an
+//!   engine actually loaded the installed weights and met the BR-8 duty.
 //!
 //! `TETON_LOCAL_SCRIPT` stays ungated: it supplies an engine rather than
 //! *describing* the machine, changes no safety decision, and is how the offline
 //! session path is exercised at all.
 
-use std::collections::{BTreeMap, HashSet};
-// The loader's staging map exists only when a loader can (the `llama` feature).
-#[cfg(feature = "llama")]
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -92,6 +97,7 @@ use teton_core::entities::{
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
 
+use teton_inference::benchmark::{BenchmarkResult, DutySpec};
 use teton_inference::catalog::Catalog;
 use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GIB};
 use teton_inference::{Completion, Engine, EngineError, GenParams, MockEngine};
@@ -560,7 +566,11 @@ impl DaemonRuntime {
         // slot and the probe's GPU class; handed to the consent gate, which calls
         // it only after digest verification. A scripted tier gets none — its
         // engine is already live and the consent flow does not apply to it (E-5).
-        let engine_loader = build_engine_loader(&engine, &profile, base_dir, scripted_engine);
+        // The gated `TETON_FAKE_ENGINE_LOADER` seam takes precedence when
+        // honoured, so the acceptance suite drives the same gate → stage →
+        // commit → slot path without a GGUF parser in the build.
+        let engine_loader = fake_engine_loader(&engine, scripted_engine)
+            .or_else(|| build_engine_loader(&engine, &profile, base_dir, scripted_engine));
         let weights_loader_present = engine_loader.is_some();
 
         // --- first-run consent (REQ-547) ---
@@ -1510,7 +1520,8 @@ fn seam_policy(debug_build: bool, switch: Option<&str>) -> SeamPolicy {
 }
 
 /// Whether the test seams (`TETON_CATALOG`, `TETON_DISK_FREE_BYTES`,
-/// `TETON_DOWNLOAD_RETRY_BASE_MS`, `TETON_PROBE_*`) may be honoured (DECISION 3).
+/// `TETON_DOWNLOAD_RETRY_BASE_MS`, `TETON_PROBE_*`, `TETON_FAKE_ENGINE_LOADER`)
+/// may be honoured (DECISION 3).
 ///
 /// A **debug build with `TETON_TEST_SEAMS=1`** and nothing else. A release build
 /// refuses regardless of the switch — the seams are how the acceptance suite
@@ -1530,9 +1541,9 @@ fn test_seams_enabled() -> bool {
         SeamPolicy::Refuse => panic!(
             "tetond: TETON_TEST_SEAMS=1 is set, but this is a release build, which cannot \
              honour the test seams (TETON_CATALOG, TETON_DISK_FREE_BYTES, \
-             TETON_DOWNLOAD_RETRY_BASE_MS, TETON_PROBE_*). Refusing to start rather than run \
-             as a production daemon while the environment believes it is under test control. \
-             Unset TETON_TEST_SEAMS, or use a debug build."
+             TETON_DOWNLOAD_RETRY_BASE_MS, TETON_PROBE_*, TETON_FAKE_ENGINE_LOADER). Refusing \
+             to start rather than run as a production daemon while the environment believes \
+             it is under test control. Unset TETON_TEST_SEAMS, or use a debug build."
         ),
     }
 }
@@ -1994,6 +2005,63 @@ impl EngineSlot {
     }
 }
 
+/// The staging bay every [`crate::model_consent::LocalEngineLoader`] in this
+/// module shares: loaded-and-measured engines keyed by model, in front of the
+/// daemon's one serving slot.
+///
+/// Staging is per-model so concurrent flows for different models can never
+/// clobber each other's staged engines, and [`Self::commit`] is the ONLY path
+/// from "staged" to "serving" — it goes through [`EngineSlot::install`] on the
+/// runtime's real slot. Shared between the real [`LlamaEngineLoader`] and the
+/// seam's [`FakeEngineLoader`] so `ready`'s tier-opening fact
+/// ([`EngineSlot::present`]) is established by the same code in production and
+/// in the acceptance suite — a seam with its own private commit path would
+/// leave the production one exercised only in a dogfood run.
+struct StagedEngines {
+    slot: Arc<EngineSlot>,
+    /// Loaded-and-measured engines awaiting the gate's commit/abandon verdict.
+    staged: Mutex<HashMap<String, Arc<Mutex<dyn Engine>>>>,
+}
+
+impl StagedEngines {
+    /// An empty staging bay in front of `slot`.
+    fn new(slot: Arc<EngineSlot>) -> Self {
+        Self {
+            slot,
+            staged: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Hold `engine` as `model_name`'s staged engine — measured, not serving.
+    fn stage(&self, model_name: &str, engine: Arc<Mutex<dyn Engine>>) {
+        self.staged
+            .lock()
+            .expect("staged map poisoned")
+            .insert(model_name.to_owned(), engine);
+    }
+
+    /// Make `model_name`'s staged engine live in the serving slot. A no-op when
+    /// nothing is staged under that name.
+    fn commit(&self, model_name: &str) {
+        let staged = self
+            .staged
+            .lock()
+            .expect("staged map poisoned")
+            .remove(model_name);
+        if let Some(engine) = staged {
+            self.slot.install(model_name.to_owned(), engine);
+        }
+    }
+
+    /// Discard `model_name`'s staged engine, if any — never anything live.
+    fn abandon(&self, model_name: &str) {
+        self.staged
+            .lock()
+            .expect("staged map poisoned")
+            .remove(model_name);
+    }
+}
+
 /// The replay-time explanation for verified weights whose load has not finished:
 /// the startup flow (deep verify → load → benchmark) is still in flight. Names
 /// the model but no path (BR-11).
@@ -2063,10 +2131,9 @@ fn build_engine_loader(
         return None;
     }
     Some(Arc::new(LlamaEngineLoader {
-        slot: Arc::clone(slot),
+        staged: StagedEngines::new(Arc::clone(slot)),
         base_dir: base_dir.to_owned(),
         gpu: profile.gpu,
-        staged: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -2079,6 +2146,90 @@ fn build_engine_loader(
     _scripted_engine: bool,
 ) -> Option<Arc<dyn crate::model_consent::LocalEngineLoader>> {
     None
+}
+
+/// The measurement [`FakeEngineLoader`] reports, fixed so the acceptance suite
+/// can assert the published `benchmark` stage carries **this loader's** figures
+/// — not a real measurement, not a default — while sitting safely inside the
+/// BR-8 duty so the flow reaches `ready`.
+const FAKE_LOADER_FIRST_TOKEN_MS: u32 = 42;
+/// See [`FAKE_LOADER_FIRST_TOKEN_MS`].
+const FAKE_LOADER_TOKENS_PER_SEC: f32 = 512.5;
+
+/// The `TETON_FAKE_ENGINE_LOADER` seam's loader: a [`MockEngine`] behind the
+/// same [`StagedEngines`] stage → re-check → commit path as the real loader,
+/// against the runtime's real serving slot.
+///
+/// What it fakes is deliberately minimal — the GGUF parse and the measurement.
+/// Everything downstream is the production machinery: the gate's supersede
+/// re-check, the staged-not-live discipline, [`EngineSlot::install`], and
+/// `ready` opening the tier on the slot's own fact. That is the point of the
+/// seam: the cross-process suite can otherwise never watch an accepted install
+/// proceed past `verified`, because the default build carries no loader and a
+/// scripted engine skips the consent flow entirely.
+struct FakeEngineLoader {
+    staged: StagedEngines,
+}
+
+impl crate::model_consent::LocalEngineLoader for FakeEngineLoader {
+    fn load(&self, model_name: &str) -> Result<crate::model_consent::EngineLoadReport, String> {
+        let benchmark = BenchmarkResult {
+            first_token_ms: FAKE_LOADER_FIRST_TOKEN_MS,
+            tokens_per_sec: FAKE_LOADER_TOKENS_PER_SEC,
+        };
+        // The judgement is the real duty applied to the fake figures, so the
+        // gate downstream sees the same shape a real loader hands it.
+        let duty = DutySpec::default().evaluate(&benchmark);
+        if duty.is_pass() {
+            self.staged.stage(
+                model_name,
+                Arc::new(Mutex::new(MockEngine::new(model_name))) as Arc<Mutex<dyn Engine>>,
+            );
+        }
+        Ok(crate::model_consent::EngineLoadReport { benchmark, duty })
+    }
+
+    fn commit(&self, model_name: &str) {
+        self.staged.commit(model_name);
+    }
+
+    fn abandon(&self, model_name: &str) {
+        self.staged.abandon(model_name);
+    }
+}
+
+/// Build the `TETON_FAKE_ENGINE_LOADER` stand-in loader when the seam is set
+/// and honoured, or `None` to fall through to the loader the build carries.
+///
+/// A **gated test seam** (DECISION 3), honoured only under
+/// [`test_seams_enabled`]: a fabricated "engine loaded and passed its
+/// benchmark" is exactly the class of fiction the master switch exists to
+/// fence off, so a release build refuses the master switch outright and a
+/// build without the switch declines this request loudly rather than
+/// silently. A scripted tier gets no loader here for the same reason it gets
+/// no real one: its engine is already live and the consent flow — the only
+/// caller of a loader — does not apply to it (E-5).
+fn fake_engine_loader(
+    slot: &Arc<EngineSlot>,
+    scripted_engine: bool,
+) -> Option<Arc<dyn crate::model_consent::LocalEngineLoader>> {
+    if !env_flag("TETON_FAKE_ENGINE_LOADER") {
+        return None;
+    }
+    if !test_seams_enabled() {
+        eprintln!(
+            "tetond: ignoring TETON_FAKE_ENGINE_LOADER — it is a test seam honoured only in a \
+             debug build with TETON_TEST_SEAMS=1, not an operator feature. The daemon keeps \
+             whatever weights loader this build actually carries."
+        );
+        return None;
+    }
+    if scripted_engine {
+        return None;
+    }
+    Some(Arc::new(FakeEngineLoader {
+        staged: StagedEngines::new(Arc::clone(slot)),
+    }))
 }
 
 /// Generation context window for the local tier's engine, in **BPE tokens**.
@@ -2114,11 +2265,9 @@ const LOCAL_ENGINE_N_CTX: u32 = 16_384;
 /// committed flow ever touches the serving slot.
 #[cfg(feature = "llama")]
 struct LlamaEngineLoader {
-    slot: Arc<EngineSlot>,
+    staged: StagedEngines,
     base_dir: PathBuf,
     gpu: GpuClass,
-    /// Loaded-and-measured engines awaiting the gate's commit/abandon verdict.
-    staged: Mutex<HashMap<String, Arc<Mutex<dyn Engine>>>>,
 }
 
 /// Strip any rendering of `path` out of a third-party error message (BR-11).
@@ -2164,8 +2313,8 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
         // one is dropped here (unmapping the weights); the failure memo is
         // recorded by `apply_consent_outcome` from the outcome this becomes.
         if duty.is_pass() {
-            self.staged.lock().expect("staged map poisoned").insert(
-                model_name.to_owned(),
+            self.staged.stage(
+                model_name,
                 Arc::new(Mutex::new(engine)) as Arc<Mutex<dyn Engine>>,
             );
         }
@@ -2173,21 +2322,11 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
     }
 
     fn commit(&self, model_name: &str) {
-        let staged = self
-            .staged
-            .lock()
-            .expect("staged map poisoned")
-            .remove(model_name);
-        if let Some(engine) = staged {
-            self.slot.install(model_name.to_owned(), engine);
-        }
+        self.staged.commit(model_name);
     }
 
     fn abandon(&self, model_name: &str) {
-        self.staged
-            .lock()
-            .expect("staged map poisoned")
-            .remove(model_name);
+        self.staged.abandon(model_name);
     }
 }
 
@@ -2832,6 +2971,85 @@ mod tests {
             "an empty slot must not be reported capable, whatever the outcome claims"
         );
         assert!(!runtime.local_tier_available());
+    }
+
+    /// The seam loader (`TETON_FAKE_ENGINE_LOADER`) must observe the same
+    /// staged-not-live discipline as the real one: `load` stages and the slot
+    /// stays empty — a superseded flow still has nothing live to undo — and
+    /// only `commit` makes the engine the slot's fact, through the shared
+    /// [`StagedEngines`] path.
+    #[test]
+    fn the_fake_loader_stages_on_load_and_only_commit_fills_the_serving_slot() {
+        use crate::model_consent::LocalEngineLoader;
+        let slot = EngineSlot::empty();
+        let loader = FakeEngineLoader {
+            staged: StagedEngines::new(Arc::clone(&slot)),
+        };
+
+        let report = loader.load("tiny-small").expect("the fake load succeeds");
+        assert_eq!(report.benchmark.first_token_ms, FAKE_LOADER_FIRST_TOKEN_MS);
+        assert_eq!(report.benchmark.tokens_per_sec, FAKE_LOADER_TOKENS_PER_SEC);
+        assert!(
+            report.duty.is_pass(),
+            "the fake figures must pass the real BR-8 duty, or the seam could \
+             never drive the flow to `ready`"
+        );
+        assert!(
+            !slot.present(),
+            "`load` only stages; the serving slot must stay empty until commit"
+        );
+
+        loader.commit("tiny-small");
+        assert_eq!(
+            slot.model().as_deref(),
+            Some("tiny-small"),
+            "commit must land the staged engine in the real slot, under its tag"
+        );
+    }
+
+    /// An abandoned staged engine (a superseded flow) never reaches the slot,
+    /// and a commit after the abandon finds nothing to make live.
+    #[test]
+    fn an_abandoned_fake_load_never_reaches_the_serving_slot() {
+        use crate::model_consent::LocalEngineLoader;
+        let slot = EngineSlot::empty();
+        let loader = FakeEngineLoader {
+            staged: StagedEngines::new(Arc::clone(&slot)),
+        };
+
+        loader.load("tiny-small").expect("the fake load succeeds");
+        loader.abandon("tiny-small");
+        loader.commit("tiny-small");
+        assert!(
+            !slot.present(),
+            "an abandoned engine must be gone; the late commit must be a no-op"
+        );
+    }
+
+    /// The complement of
+    /// [`a_ready_outcome_with_an_empty_slot_does_not_open_the_tier`]: when the
+    /// loader's commit HAS filled the runtime's slot — through the same
+    /// [`StagedEngines`] path the daemon assembles — the `Ready` outcome opens
+    /// the tier on that fact.
+    #[test]
+    fn a_ready_outcome_opens_the_tier_after_the_loader_committed_into_the_slot() {
+        use crate::model_consent::LocalEngineLoader;
+        use teton_core::entities::{ModelSelection, SelectionSource};
+        let runtime = DaemonRuntime::minimal();
+        let loader = FakeEngineLoader {
+            staged: StagedEngines::new(Arc::clone(&runtime.engine)),
+        };
+
+        loader.load("m").expect("the fake load succeeds");
+        loader.commit("m");
+        runtime.apply_consent_outcome(&ConsentOutcome::Ready {
+            selection: ModelSelection::accepted("m", SelectionSource::Probe, 1),
+        });
+        assert!(
+            runtime.local_tier_available(),
+            "a committed engine plus a Ready outcome must open the tier"
+        );
+        assert_eq!(runtime.engine.model().as_deref(), Some("m"));
     }
 
     /// E-5: a scripted tier's engine owes nothing to the weights-install flow,
