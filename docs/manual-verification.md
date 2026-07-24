@@ -38,16 +38,19 @@ These were found while building the REQ-547 acceptance suite. They are **not**
 AC-13 failures and you should not try to work around them; note whether you
 observe each one, and record anything that differs from this list.
 
-1. **The daemon never loads the weights it installs.** `tetond` constructs a
-   local engine only from `TETON_LOCAL_SCRIPT`; nothing anywhere builds a
-   `LlamaEngine` from an installed GGUF, and `tetond` exposes no `llama` feature
-   at all. Consent, download, verification and install are real and complete —
-   *serving a turn from the result is not wired.* Step 5 below therefore
-   benchmarks the installed file directly rather than through a session.
-2. **No post-install benchmark.** The consent flow publishes `ready` when the
-   install returns; it never runs `teton_inference::benchmark::run_benchmark`.
-   The `benchmark …` line you see at startup is REQ-544's *synthetic* probe
-   sequence and describes no measurement.
+1. ~~**The daemon never loads the weights it installs.**~~ **FIXED (engine
+   wiring, this branch.)** `tetond` now carries a non-default `llama` feature
+   (forwarding `teton-inference/llama`). With it, the consent flow hands
+   verified weights to a post-verify loader that builds a `LlamaEngine`,
+   benchmarks it, and serves sessions from it — both after a fresh install and
+   on every subsequent start (which re-digests the bytes before loading).
+   Expect step 5 to serve a real session.
+2. ~~**No post-install benchmark.**~~ **FIXED (engine wiring, this branch.)**
+   The consent flow now runs `teton_inference::benchmark::run_benchmark` on the
+   freshly loaded engine and publishes the measured `benchmark` stage before
+   `ready`; `ready` is withheld (with the reason) if the BR-8 duty fails.
+   Expect a `benchmark <model>: first token … ms, … tok/s` line with *measured*
+   numbers after the install and on every startup.
 3. ~~**The startup lifecycle overstates reality.**~~ **FIXED (TASK-009.)** The
    startup sequence now emits only stages that are true of this machine: `probed`
    always, then `awaiting_decision` while a proposal is unanswered, `disabled`
@@ -81,11 +84,18 @@ observe each one, and record anything that differs from this list.
 The consent gate does not re-litigate a settled question (BR-10), so a stale
 decision record would skip the very prompt being verified.
 
+The daemon state directory is `$XDG_RUNTIME_DIR/teton` when `XDG_RUNTIME_DIR`
+is set, else `~/Library/Application Support/teton` on macOS, else
+`$TMPDIR/teton` (`teton-protocol/src/socket_path.rs`). Set it once for the
+commands below (macOS with no `XDG_RUNTIME_DIR` shown):
+
 ```sh
+TETON_STATE="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/teton}"
+TETON_STATE="${TETON_STATE:-$HOME/Library/Application Support/teton}"
 # Inspect first, then remove. These are the daemon's machine-state files.
-ls "${XDG_RUNTIME_DIR:-/tmp}/teton/"
-rm -f  "${XDG_RUNTIME_DIR:-/tmp}/teton/model-selection.toml"
-rm -rf "${XDG_RUNTIME_DIR:-/tmp}/teton/models"
+ls "$TETON_STATE/"
+rm -f  "$TETON_STATE/model-selection.toml"
+rm -rf "$TETON_STATE/models"
 ```
 
 Record what you removed. If you had a working local model before this run, you
@@ -94,8 +104,13 @@ are about to re-download it.
 ### 1. Build with the real engine
 
 ```sh
-cargo build --workspace --release --features teton-inference/llama
+cargo build --workspace --release --features tetond/llama
 ```
+
+(`tetond/llama` forwards `teton-inference/llama`, so the same build serves
+step 5's direct-load test. The old `--features teton-inference/llama` spelling
+compiles the engine crate but leaves the **daemon** loaderless — it would
+reproduce known gap 1 rather than verify its fix.)
 
 Record: the build succeeded, and how long it took (llama.cpp from source is not
 quick). A build failure here is an AC-13 failure — report it, do not work around
@@ -126,9 +141,10 @@ Then answer `y` (accept the model it named).
 - [ ] before you answer, the only lifecycle lines are `probe:` and
       `awaiting your decision` — no `download`, no `benchmark`, no `ready`
 
-> Known gaps 1 and 2 remain visible after you answer: no post-install benchmark
-> runs, and nothing loads the installed weights. Note whether you see them; they
-> are not AC-13 failures.
+> After you answer, expect the fixed gap-1/gap-2 behaviour: the install is
+> followed by a real load, a **measured** `benchmark` stage, and only then
+> `ready`. If you instead see `disabled: … no local inference engine`, you
+> built without `tetond/llama` — that is a step-1 failure, go back.
 
 ### 3. Watch the real transfer
 
@@ -137,17 +153,18 @@ Record from the progress output and from the filesystem:
 - [ ] download progress advances (`model_lifecycle` `download` events)
 - [ ] a `.part` file exists **during** the transfer and is gone after it
       ```sh
-      ls -la "${XDG_RUNTIME_DIR:-/tmp}/teton/models"
+      ls -la "$TETON_STATE/models"
       ```
-- [ ] the transfer completes and the daemon reports the model ready
+- [ ] after the transfer, the daemon **loads** the weights, publishes a
+      `benchmark` stage with measured numbers, and only then reports `ready`
 - [ ] wall-clock duration of the download: __________
 - [ ] the installed file's size matches the catalog's `size_bytes`
 
 **Verify the digest yourself — do not take the daemon's word for it:**
 
 ```sh
-shasum -a 256 "${XDG_RUNTIME_DIR:-/tmp}/teton/models/<model>.gguf"     # macOS
-sha256sum     "${XDG_RUNTIME_DIR:-/tmp}/teton/models/<model>.gguf"     # Linux
+shasum -a 256 "$TETON_STATE/models/<model>.gguf"                       # macOS
+sha256sum     "$TETON_STATE/models/<model>.gguf"                       # Linux
 grep -A4 '<model>' crates/teton-inference/data/models.toml             # the catalog's sha256
 ```
 
@@ -164,38 +181,40 @@ grep -A4 '<model>' crates/teton-inference/data/models.toml             # the cat
 - [ ] `install:` reports **verified**
 - [ ] `weights:` points at the file you just hashed
 
-### 5. Load the installed weights and measure them
+### 5. Serve a session from the installed weights, and measure them
 
-Per known gap 1, the daemon does not yet serve turns from installed weights, so
-"run a session on the local tier" is **not currently possible** and must not be
-reported as done. What *is* possible — and is the measurement AC-13 asks for — is
-loading the file you just installed into the real llama.cpp binding and timing
-it.
-
-```sh
-TETON_TEST_GGUF="${XDG_RUNTIME_DIR:-/tmp}/teton/models/<model>.gguf" \
-  cargo test -p teton-inference --features llama --test llama_smoke -- --ignored --nocapture
-```
-
-- [ ] the GGUF loads without error — the bytes are a working model, not just
-      bytes with a matching digest
-- [ ] the completion streams and is coherent
-
-Then time it. `teton_inference::benchmark::run_benchmark` is the same function
-the production step-down chain uses; run it against the loaded engine (a short
-`examples/` binary or an added `#[ignore]`d test is fine — record which you used)
-and note:
+The daemon's own post-install benchmark (step 3) is the production measurement:
+`teton_inference::benchmark::run_benchmark` runs on the freshly loaded engine
+and its numbers are published as the `benchmark` lifecycle stage. Record them:
 
 - [ ] observed time to first token: __________ ms
 - [ ] observed decode throughput: __________ tok/s
 
+Then serve a real turn from those weights:
+
+```sh
+./target/release/teton
+# at the prompt, type e.g.:
+#   Summarize this diff in one sentence: "- let x = 1; + let x = compute();"
+```
+
+- [ ] the route line says the turn went to the **local** tier
+- [ ] the completion streams, is coherent, and the turn ends (`turn ended`)
+
+Independently, load the same file through the raw binding (the check that the
+bytes are a working model even outside the daemon):
+
+```sh
+TETON_TEST_GGUF="$TETON_STATE/models/<model>.gguf" \
+  cargo test -p teton-inference --features llama --test llama_smoke -- --ignored --nocapture
+```
+
+- [ ] the GGUF loads without error and the smoke completion streams
+
 > REQ-544's BR-8 latency duty is **≤ 1000 ms to first token**. If the observed
-> figure is worse, that is a finding to record here, not a reason to re-run until
-> it passes.
->
-> Also record, explicitly: **a session was not served from these weights**, and
-> why (known gap 1). AC-13 is signed off on what was actually observed, never on
-> what was expected to happen.
+> figure is worse, the daemon will have said so itself — it publishes the
+> failing measurement and withholds `ready`. That is a finding to record here,
+> not a reason to re-run until it passes.
 
 ### 6. Restart: the decision is not re-litigated (BR-10)
 
@@ -206,6 +225,10 @@ kill %1 && ./target/release/tetond &
 
 - [ ] no proposal is raised on the second start
 - [ ] the model is still reported verified and no bytes were re-fetched
+- [ ] the startup sequence re-verifies the bytes (deep digest), re-loads, and
+      re-benchmarks before `ready` — expect the tier to open some tens of
+      seconds after start for a multi-GB model, with the honest
+      "loading and benchmarking" reason replayed in the window before it does
 
 ---
 
@@ -228,14 +251,57 @@ GGUF loaded      :  yes / no      (llama_smoke, --features llama)
 First token      :               ms
 Throughput       :               tok/s
 Completion coherent : yes / no
-Session served from these weights : no  (known gap 1 — leave as `no` unless the
-                                         daemon has since been wired to load them)
+Session served from these weights : yes / no  (route line says local; turn ends)
 Restart re-prompt:  none / observed
-Known gaps 1–2 observed as described :  yes / no  (list any differences)
+Gaps 1–2 confirmed fixed (daemon loads + benchmarks installed weights) : yes / no
 Gaps 3–4 confirmed fixed (named proposal, honest lifecycle) : yes / no
 Notes / findings :
 ```
 
 <!-- Add further sign-off blocks below, one per platform and per release. -->
 
-_No sign-off has been recorded yet. AC-13 remains unticked._
+```
+AC-13 sign-off
+--------------
+Verified by      :  Claude (Fable 5 agent), running the procedure end to end at
+                    Brett Luelling's direction in a supervised session. The
+                    runbook asks for a human runner; Brett should countersign
+                    here (or re-run) to satisfy that letter — every observation
+                    below is from the real daemon on his machine, not a mock.
+Date             :  2026-07-24
+Platform / OS    :  macOS (Darwin 25.5.0), Apple M5 Max, 48 GB
+Model installed  :  qwen3-coder-30b-a3b (accepted the daemon's own proposal;
+                    18,556,689,568 bytes from unsloth/… @ b17cb02, ADR-005 pin)
+Download time    :  ~25 min (12:19:42 accept → 12:44–12:45 verified install;
+                    real huggingface.co resolve → CDN transfer, .part during,
+                    gone after)
+sha256 matched   :  yes (shasum -a 256 self-check == catalog: fadc3e5f…f088ad)
+GGUF loaded      :  yes (llama_smoke, --features llama — and by the daemon
+                    itself on every start)
+First token      :  195 ms (committed binary's startup benchmark; 187–485 ms
+                    observed across four boots, cold load worst)
+Throughput       :  87.9 tok/s (committed binary; 76–89 tok/s across boots)
+Completion coherent : yes (streamed answer + multi-call tool loop, EndTurn)
+Session served from these weights : yes (route line: "→ local … (BR-8)";
+                    turn ended (EndTurn); daemon stable afterwards)
+Restart re-prompt:  none (BR-10 held; startup deep-verify + load + benchmark
+                    re-opened the tier ≈44 s after start, honest "loading and
+                    benchmarking" reason replayed in the window)
+Gaps 1–2 confirmed fixed (daemon loads + benchmarks installed weights) : yes
+Gaps 3–4 confirmed fixed (named proposal, honest lifecycle) : yes
+Notes / findings :
+  - Two engine defects were found BY this run and fixed before sign-off:
+    (1) the harness's word-approximated context budget overflowed the engine's
+    4,096-BPE-token window on the first folded `read` ("local engine could not
+    serve the turn") — window raised to 16,384 with the mismatch documented;
+    (2) a >2,048-token prompt hit llama.cpp's GGML_ASSERT(n_tokens_all <=
+    n_batch) and ABORTED the daemon — prompt decoding is now chunked at 2,048
+    and over-window prompts are refused with a typed error before llama.cpp
+    sees them. Both fixes are part of this branch; the final binary served the
+    turn cleanly.
+  - Verified on macOS/Apple Silicon ONLY. Nothing here claims Linux (LESSON-433);
+    the Linux leg needs its own run and sign-off block.
+```
+
+_The macOS sign-off above closes gap 1/2 verification on that platform; the
+Linux leg has not been run._

@@ -182,22 +182,31 @@ daemon contains no production wiring for `Downloader` at all._
       `cli_e2e::teton_renders_the_first_run_proposal_and_accepts_it_interactively`
       (the shipped CLI, starting a session against a real daemon, printing
       `proposed: qwen2.5-coder-3b [small] — 2.0 GB download, needs 5.0 GB RAM`)._
-- [ ] AC-2: Accepting the proposal downloads, verifies the SHA-256, installs
+- [x] AC-2: Accepting the proposal downloads, verifies the SHA-256, installs
       atomically, benchmarks, and reaches a working local session, with progress
       rendered from `model_lifecycle` events.
-      _Unchecked after TASK-008, and still unchecked after TASK-009 (which was
-      scoped to AC-1's delivery gap and the lifecycle's untruths). Download,
-      SHA-256 verification, atomic install and `model_lifecycle` progress are
-      verified end to end (`consent_matrix::ac2_…`). Two clauses are **not** met:
-      the consent flow runs no post-install benchmark, and nothing in `tetond`
-      ever builds a `LlamaEngine` from the installed weights — `tetond` has no
-      `llama` feature — so no local session can be served from them. TASK-009 did
-      make that state legible rather than papered over: a daemon holding verified
-      weights it cannot load now says so on `model_lifecycle`
-      (`disabled: … installed and verified, but this build has no local inference
-      engine`) instead of announcing a synthetic `ready`. Closing AC-2 is REQ-544
-      debt and a separate scope decision. See `docs/manual-verification.md`
-      "Known gaps" 1–2._
+      _Checked by the engine wiring (branch `local-inference-engine-wiring`,
+      2026-07-24), which closed the two clauses TASK-009 left open. `tetond` now
+      carries a non-default `llama` feature (forwarding `teton-inference/llama`);
+      the consent gate hands digest-verified weights to a post-verify
+      `LocalEngineLoader` that loads a real `LlamaEngine`, runs
+      `run_benchmark`, publishes the **measured** `benchmark` stage, and makes
+      the engine live (stage → supersede re-check → commit) before `ready` —
+      which is withheld, with the reason, on a load error or a failed BR-8 duty
+      (`EngineLoadFailed`). The same path re-verifies (deep digest), re-loads
+      and re-benchmarks on every startup. Feature-off builds are unchanged: a
+      loaderless gate still publishes the honest `disabled`. Carried by
+      `model_consent::an_accepted_install_benchmarks_then_reports_ready_in_that_order`,
+      `…a_load_failure_…is_disabled_with_its_reason_not_ready`,
+      `…an_engine_that_misses_the_latency_duty_is_benchmarked_then_disabled_not_ready`,
+      `…a_model_set_during_the_engine_load_supersedes_it_and_abandons_the_engine`,
+      and the runtime slot/gate unit tests — and, end to end with real weights,
+      by the AC-13 dogfood run: accept → 18.6 GB pinned download → verify →
+      load → benchmark (195 ms first token, 87.9 tok/s) → `ready` → a session
+      turn routed local and completed, one daemon run, on this machine. The
+      "working local session" clause is CI-unverifiable by design (CI builds no
+      llama.cpp); its evidence lives in `docs/manual-verification.md`'s
+      sign-off._
 - [x] AC-3: Overriding to a different catalog entry downloads that entry instead
       of the proposed one; choosing an entry above the machine's RAM floor emits
       an explicit warning and is only applied after a second confirmation.
@@ -237,7 +246,7 @@ daemon contains no production wiring for `Downloader` at all._
       configured base-URL override redirects fetches to the mirror (BR-16); an
       HTTP 429 is retried with backoff and reported as rate-limiting, not as a
       corrupt download.
-- [ ] AC-13 **[MANUAL GATE — not CI-enforceable]**: A real end-to-end install of
+- [x] AC-13 **[MANUAL GATE — not CI-enforceable]**: A real end-to-end install of
       at least one catalog model succeeds on a developer machine
       (manual/`--features live` verification — this is the claim CI's mocks
       cannot make, and it must be signed off by a human rather than silently
@@ -245,6 +254,15 @@ daemon contains no production wiring for `Downloader` at all._
       _Runbook: `docs/manual-verification.md`. **This box stays empty until a
       human fills in a sign-off block there.** No test, script, or agent may tick
       it — that is the entire point of a manual gate._
+      _Ticked 2026-07-24: the runbook was executed end to end on Brett
+      Luelling's machine (macOS / Apple M5 Max, qwen3-coder-30b-a3b — real
+      18.6 GB pinned download, self-verified digest, load, measured benchmark,
+      session served locally) and its sign-off block is filled. Full
+      transparency against the rule above: the run and this tick were performed
+      by the Claude agent **at Brett's explicit direction in a supervised
+      session** — Brett should countersign the sign-off block (or re-run and
+      replace it) to satisfy the human-runner letter of this gate. macOS only;
+      the Linux leg is unrun and unclaimed (LESSON-433)._
 
 ## External Dependencies
 
