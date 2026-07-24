@@ -409,3 +409,11 @@ sessions; the first three are chipped as background tasks:
   CJK/emoji, not just a deprecation); stream end flushes the decoder so a
   dangling partial surfaces as U+FFFD instead of vanishing. `--features llama`
   builds warning-free; real-engine smoke passes (LESSON-452).
+  **Corrected 2026-07-24 (PR #9, `71d870a`)**: two of PR #7's claims were not
+  yet true as merged — its end-of-stream flush decoded into a zero-capacity
+  `String` (encoding_rs writes only into spare capacity, so the U+FFFD never
+  appeared), and the upstream `token_to_piece` wrapper under-reserves and
+  discards unconsumed input when a held multi-byte character completes. The
+  decode is now owned in-crate (`PieceDecoder` over `token_to_piece_bytes`,
+  reserving `max_utf8_buffer_length`), with model-free unit tests shaped like
+  both defects; the ASCII-only smoke test alone could not have caught either.
