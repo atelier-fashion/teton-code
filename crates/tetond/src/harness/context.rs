@@ -27,7 +27,7 @@
 //! egress to guard.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use teton_inference::{Engine, GenParams};
 
@@ -563,13 +563,18 @@ pub struct SummarizeOutcome {
 /// a small model. Summarization is a *local* duty (BR-8 latency, not
 /// intelligence): the engine passed here is the local tier. The text sent to the
 /// engine is bounded by [`SUMMARIZER_INPUT_MAX_BYTES`] so the summarizer prompt
-/// itself always fits the engine window. On an engine error the result is
-/// truncated **mechanically** to the same threshold — never folded raw, which
-/// would silently no-op the duty — and the error is reported on the outcome for
-/// the caller to surface.
+/// itself always fits the engine window. On any failure — an engine error, or a
+/// blocking task that panicked — the result is truncated **mechanically** to the
+/// same threshold — never folded raw, which would silently no-op the duty — and
+/// the error is reported on the outcome for the caller to surface.
+///
+/// The completion itself runs on the blocking pool (E-3): with a real llama.cpp
+/// engine a summary takes seconds, and this is called from the async turn loop,
+/// where running it inline would park the tokio worker and stall every other
+/// session's RPCs.
 #[must_use]
-pub fn summarize_if_large(
-    engine: &Mutex<dyn Engine>,
+pub async fn summarize_if_large(
+    engine: &Arc<Mutex<dyn Engine>>,
     tool: &str,
     text: &str,
     threshold_tokens: usize,
@@ -586,10 +591,23 @@ pub fn summarize_if_large(
         "Summarize the following `{tool}` tool output in a few lines, preserving \
          file paths, symbol names, and any errors. Output only the summary.\n\n{bounded}"
     );
-    let params = GenParams::default();
-    let guard = engine.lock().expect("engine mutex poisoned");
-    match guard.complete(&prompt, &params, &mut |_| {}) {
-        Ok(completion) => SummarizeOutcome {
+    let engine = Arc::clone(engine);
+    let result = tokio::task::spawn_blocking(move || {
+        let params = GenParams::default();
+        let guard = engine.lock().expect("engine mutex poisoned");
+        guard.complete(&prompt, &params, &mut |_| {})
+    })
+    .await;
+    let mechanical = |error: String| SummarizeOutcome {
+        text: format!(
+            "[oversized {tool} output truncated mechanically — the local \
+             summarizer was unavailable]\n{}",
+            truncate_middle(text, threshold_bytes)
+        ),
+        engine_error: Some(error),
+    };
+    match result {
+        Ok(Ok(completion)) => SummarizeOutcome {
             text: format!(
                 "[summarized {tool} output — {} tokens elided]\n{}",
                 approx_tokens(text),
@@ -597,14 +615,8 @@ pub fn summarize_if_large(
             ),
             engine_error: None,
         },
-        Err(err) => SummarizeOutcome {
-            text: format!(
-                "[oversized {tool} output truncated mechanically — the local \
-                 summarizer was unavailable]\n{}",
-                truncate_middle(text, threshold_bytes)
-            ),
-            engine_error: Some(err.to_string()),
-        },
+        Ok(Err(err)) => mechanical(err.to_string()),
+        Err(_) => mechanical("the local summarization task did not complete".to_owned()),
     }
 }
 
@@ -757,33 +769,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn small_tool_results_are_not_summarized() {
-        let engine = Mutex::new(MockEngine::new("mock"));
-        let out = summarize_if_large(&engine, "read", "short output", 100);
+    #[tokio::test]
+    async fn small_tool_results_are_not_summarized() {
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::new("mock")));
+        let out = summarize_if_large(&engine, "read", "short output", 100).await;
         assert_eq!(out.text, "short output");
         assert_eq!(out.engine_error, None);
     }
 
-    #[test]
-    fn large_tool_results_are_summarized_by_the_local_engine() {
-        let engine = Mutex::new(MockEngine::with_response("mock-3b", "CONDENSED"));
+    #[tokio::test]
+    async fn large_tool_results_are_summarized_by_the_local_engine() {
+        let engine: Arc<Mutex<dyn Engine>> =
+            Arc::new(Mutex::new(MockEngine::with_response("mock-3b", "CONDENSED")));
         let big = "word ".repeat(500);
-        let out = summarize_if_large(&engine, "grep", &big, 50);
+        let out = summarize_if_large(&engine, "grep", &big, 50).await;
         assert!(out.text.contains("summarized grep output"));
         assert!(out.text.contains("CONDENSED"));
         assert_eq!(out.engine_error, None);
     }
 
-    #[test]
-    fn whitespace_poor_but_byte_huge_results_trigger_summarization() {
+    #[tokio::test]
+    async fn whitespace_poor_but_byte_huge_results_trigger_summarization() {
         // The dogfooded failure mode: a minified single-line file is a handful of
         // whitespace "words" but enormous in bytes/BPE. The byte-denominated
         // trigger must summarize it even though the token trigger waves it through.
-        let engine = Mutex::new(MockEngine::with_response("mock-3b", "CONDENSED"));
+        let engine: Arc<Mutex<dyn Engine>> =
+            Arc::new(Mutex::new(MockEngine::with_response("mock-3b", "CONDENSED")));
         let minified = "x".repeat(100_000); // 1 whitespace token, 100 KB
         assert!(approx_tokens(&minified) <= 100);
-        let out = summarize_if_large(&engine, "read", &minified, 100);
+        let out = summarize_if_large(&engine, "read", &minified, 100).await;
         assert!(out.text.contains("summarized read output"));
         assert!(out.text.contains("CONDENSED"));
     }
@@ -812,16 +826,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn summarizer_input_is_bounded_in_engine_window_bytes() {
+    #[tokio::test]
+    async fn summarizer_input_is_bounded_in_engine_window_bytes() {
         // The summarizer prompt must fit the engine window regardless of how big
         // the tool result is — pre-fix, the ENTIRE result rode the prompt.
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let engine = Mutex::new(PromptLenEngine {
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(PromptLenEngine {
             seen: std::sync::Arc::clone(&seen),
-        });
+        }));
         let huge = "word ".repeat(200_000); // 1 MB
-        let out = summarize_if_large(&engine, "shell", &huge, 100);
+        let out = summarize_if_large(&engine, "shell", &huge, 100).await;
         assert!(out.text.contains("SUMMARY"));
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
@@ -833,15 +847,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn engine_failure_falls_back_to_bounded_mechanical_truncation() {
+    #[tokio::test]
+    async fn engine_failure_falls_back_to_bounded_mechanical_truncation() {
         // Pre-fix: Err(_) => text.to_owned() folded the raw oversized result and
         // told nobody. Now the fallback is mechanically truncated to the same
         // threshold, and the error is reported for the caller to surface.
-        let engine = Mutex::new(MockEngine::unavailable("mock", "unloaded under pressure"));
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::unavailable(
+            "mock",
+            "unloaded under pressure",
+        )));
         let big = "word ".repeat(50_000); // 250 KB
         let threshold_tokens = 100;
-        let out = summarize_if_large(&engine, "read", &big, threshold_tokens);
+        let out = summarize_if_large(&engine, "read", &big, threshold_tokens).await;
         assert!(out.text.contains("truncated mechanically"));
         assert!(
             out.text.len() <= threshold_tokens * APPROX_BYTES_PER_TOKEN + 256,

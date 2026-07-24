@@ -13,7 +13,9 @@
 //! - [`LocalEngineSource`] — the offline AC-1 path, unchanged in spirit: lock the
 //!   local engine, complete, parse the reply into a tool call or an end-of-turn.
 //!   It takes no transport, so egress remains impossible on this path *by
-//!   construction*.
+//!   construction*. The completion itself runs on the blocking pool (E-3): a
+//!   real llama.cpp turn takes seconds, and running it inline would park a
+//!   tokio worker per session and stall every client's RPCs.
 //! - [`RemoteProviderSource`] — drives a [`Provider`] through the single egress
 //!   choke point ([`Egress`]). The provider only ever holds the provenance-scoped
 //!   `&dyn Transport` egress hands it, so the same remote turn is subject to the
@@ -24,13 +26,13 @@
 //! [`TurnDecision`] (call a tool, end the turn, or a malformed call folded back).
 //! The loop switches on that and never sees a provider-specific shape.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
-use teton_inference::Engine;
+use teton_inference::{Engine, EngineError};
 use teton_protocol::{Phase, ProviderId, SessionId};
 use teton_providers::{
     Message, Provider, Role, TokenUsage, ToolSpec, Transport, TurnEvent, TurnRequest,
@@ -110,22 +112,25 @@ pub trait CompletionSource: Send {
     ) -> Result<SourceTurn, HarnessError>;
 }
 
-/// The local-tier source: drives the [`Engine`] behind a shared `Mutex` and parses
-/// its text reply. Transport-free — egress is impossible on this path.
-pub struct LocalEngineSource<'a> {
-    engine: &'a Mutex<dyn Engine>,
+/// The local-tier source: drives the [`Engine`] behind a shared `Arc<Mutex<_>>`
+/// and parses its text reply. Transport-free — egress is impossible on this path.
+///
+/// The source holds an *owned* handle (not a borrow) because the completion runs
+/// inside [`tokio::task::spawn_blocking`], whose closure must be `'static`.
+pub struct LocalEngineSource {
+    engine: Arc<Mutex<dyn Engine>>,
 }
 
-impl<'a> LocalEngineSource<'a> {
+impl LocalEngineSource {
     /// A source over the shared local `engine`.
     #[must_use]
-    pub fn new(engine: &'a Mutex<dyn Engine>) -> Self {
+    pub fn new(engine: Arc<Mutex<dyn Engine>>) -> Self {
         Self { engine }
     }
 }
 
 #[async_trait]
-impl CompletionSource for LocalEngineSource<'_> {
+impl CompletionSource for LocalEngineSource {
     async fn produce_turn(
         &mut self,
         prompt: &PreparedPrompt,
@@ -135,15 +140,36 @@ impl CompletionSource for LocalEngineSource<'_> {
         exposed: &[&str],
         on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
     ) -> Result<SourceTurn, HarnessError> {
-        // The local text engine consumes the flat single-string rendering; its
-        // output is atomic, so the turn is emitted as one chunk (unchanged from
-        // the local-first loop).
-        let completion = {
-            let guard = self.engine.lock().expect("engine mutex poisoned");
-            guard.complete(&prompt.flat, &config.gen_params, &mut |_| {})?
-        };
+        // The local text engine consumes the flat single-string rendering.
+        //
+        // Real inference rides the blocking pool (E-3): a llama.cpp completion
+        // holds a core for seconds, so run inline it would park this tokio
+        // worker — one slow local turn per worker and the whole daemon stops
+        // answering RPCs. The engine handle is moved into `spawn_blocking`, and
+        // its token stream is bridged back over a channel so the caller's
+        // `on_token` sink still observes tokens (and first-token latency) live.
+        let engine = Arc::clone(&self.engine);
+        let flat = prompt.flat.clone();
+        let params = config.gen_params;
+        let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let task = tokio::task::spawn_blocking(move || {
+            let guard = engine.lock().expect("engine mutex poisoned");
+            guard.complete(&flat, &params, &mut |token| {
+                // A closed receiver means the caller went away; keep completing
+                // (spawn_blocking is not cancellable) and drop the token.
+                let _ = token_tx.send(token.to_owned());
+            })
+        });
+        while let Some(token) = token_rx.recv().await {
+            on_token(&token);
+        }
+        // The sender is dropped when the closure returns, ending the loop above,
+        // so this join is immediate. A panicked/aborted task is a backend
+        // failure, not a daemon crash.
+        let completion = task.await.map_err(|_| {
+            EngineError::Backend("the local inference task did not complete".to_owned())
+        })??;
         let text = completion.text;
-        on_token(&text);
         let decision = match parse_turn(&text, exposed) {
             ParsedTurn::ToolCall { name, arguments } => TurnDecision::ToolCall { name, arguments },
             ParsedTurn::EndTurn(final_text) => TurnDecision::EndTurn { final_text },
@@ -537,11 +563,11 @@ mod tests {
 
     #[tokio::test]
     async fn local_source_parses_a_tool_call_and_streams_the_text() {
-        let engine = Mutex::new(MockEngine::with_response(
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::with_response(
             "mock",
             r#"{"tool":"read","arguments":{"path":"a.rs"}}"#,
-        ));
-        let mut source = LocalEngineSource::new(&engine);
+        )));
+        let mut source = LocalEngineSource::new(engine);
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let mut streamed = String::new();
@@ -566,11 +592,11 @@ mod tests {
 
     #[tokio::test]
     async fn local_source_reports_plain_text_as_end_of_turn() {
-        let engine = Mutex::new(MockEngine::with_response(
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::with_response(
             "mock",
             "All done, nothing more to do.",
-        ));
-        let mut source = LocalEngineSource::new(&engine);
+        )));
+        let mut source = LocalEngineSource::new(engine);
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let prompt = flat_prompt("prompt");

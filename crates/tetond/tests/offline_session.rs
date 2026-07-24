@@ -119,8 +119,8 @@ async fn offline_read_edit_verify_completes_with_zero_egress() {
     ];
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let engine: Mutex<ScriptedEngine> =
-        Mutex::new(ScriptedEngine::new(&script, Arc::clone(&calls)));
+    let engine: Arc<Mutex<dyn Engine>> =
+        Arc::new(Mutex::new(ScriptedEngine::new(&script, Arc::clone(&calls))));
 
     let config = HarnessConfig::default(); // weak-model shape: verification required
     let tools = ToolRegistry::with_builtins();
@@ -221,8 +221,8 @@ async fn a_failing_verify_after_an_edit_does_not_satisfy_the_gate() {
     ];
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let engine: Mutex<ScriptedEngine> =
-        Mutex::new(ScriptedEngine::new(&script, Arc::clone(&calls)));
+    let engine: Arc<Mutex<dyn Engine>> =
+        Arc::new(Mutex::new(ScriptedEngine::new(&script, Arc::clone(&calls))));
 
     let config = HarnessConfig::default(); // weak-model shape: verification required
     let tools = ToolRegistry::with_builtins();
@@ -276,10 +276,10 @@ async fn malformed_tool_calls_do_not_cause_an_unbounded_loop() {
     // must fold the error back and remain bounded by max_turns, never spinning.
     let bad = r#"{"tool": "nonexistent_tool", "arguments": {}}"#;
     let calls = Arc::new(AtomicUsize::new(0));
-    let engine: Mutex<ScriptedEngine> = Mutex::new(ScriptedEngine::new(
+    let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(ScriptedEngine::new(
         &[bad, bad, bad, bad],
         Arc::clone(&calls),
-    ));
+    )));
 
     let config = HarnessConfig {
         max_turns: 4,

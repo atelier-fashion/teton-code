@@ -1276,7 +1276,7 @@ impl DaemonRuntime {
                     "no local tier configured",
                 )));
             };
-            let mut source = LocalEngineSource::new(&**engine);
+            let mut source = LocalEngineSource::new(Arc::clone(engine));
             return run_session_turn_with_source(
                 &mut source,
                 tools,
@@ -1286,7 +1286,7 @@ impl DaemonRuntime {
                 ctx,
                 &route.harness,
                 &mut hook,
-                Some(&**engine),
+                Some(Arc::clone(engine)),
             )
             .await;
         }
@@ -1323,7 +1323,7 @@ impl DaemonRuntime {
             source = source.with_phase(ph);
         }
 
-        let summarizer = local_engine.as_deref();
+        let summarizer = local_engine;
         run_session_turn_with_source(
             &mut source,
             tools,
