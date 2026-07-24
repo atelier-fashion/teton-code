@@ -779,8 +779,10 @@ mod tests {
 
     #[tokio::test]
     async fn large_tool_results_are_summarized_by_the_local_engine() {
-        let engine: Arc<Mutex<dyn Engine>> =
-            Arc::new(Mutex::new(MockEngine::with_response("mock-3b", "CONDENSED")));
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::with_response(
+            "mock-3b",
+            "CONDENSED",
+        )));
         let big = "word ".repeat(500);
         let out = summarize_if_large(&engine, "grep", &big, 50).await;
         assert!(out.text.contains("summarized grep output"));
@@ -793,8 +795,10 @@ mod tests {
         // The dogfooded failure mode: a minified single-line file is a handful of
         // whitespace "words" but enormous in bytes/BPE. The byte-denominated
         // trigger must summarize it even though the token trigger waves it through.
-        let engine: Arc<Mutex<dyn Engine>> =
-            Arc::new(Mutex::new(MockEngine::with_response("mock-3b", "CONDENSED")));
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::with_response(
+            "mock-3b",
+            "CONDENSED",
+        )));
         let minified = "x".repeat(100_000); // 1 whitespace token, 100 KB
         assert!(approx_tokens(&minified) <= 100);
         let out = summarize_if_large(&engine, "read", &minified, 100).await;
