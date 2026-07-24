@@ -126,6 +126,103 @@ pub struct PrivacyBoundary {
     pub mode: BoundaryMode,
 }
 
+/// Where a [`ModelSelection`] came from (System Model: `ModelSelection.source`).
+///
+/// Variant names and the `snake_case` rule mirror
+/// [`teton_protocol::events::SelectionSource`] exactly, the same
+/// no-drift-across-the-wire-boundary technique [`ProviderKind`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionSource {
+    /// The hardware probe's proposal, accepted as offered.
+    Probe,
+    /// The user chose a different catalog entry, or declined the local tier
+    /// (REQ-547 BR-3/BR-4).
+    UserOverride,
+    /// A `[local_model] pinned` config key named the model the proposal offered.
+    ///
+    /// The pin overrides the probe's pick (REQ-544 BR-9) but does **not** decide
+    /// on the user's behalf: post-C-1 (REQ-547 review) a pin proposes and the user
+    /// still answers, so an accepted pin is recorded as [`Self::Probe`]. Retained
+    /// for wire/state compatibility; the daemon no longer records a selection with
+    /// this source.
+    ConfigPin,
+    /// The explicit opt-in auto-accept path took the decision unattended
+    /// (REQ-547 BR-5) — the CI/unattended route.
+    AutoAccept,
+}
+
+/// The recorded answer to a model proposal (System Model: `ModelSelection`).
+///
+/// This is **machine state, not project config** (REQ-547 D-4): "which model
+/// this machine installed" is not a property of a repository, so the daemon
+/// persists this record beside the weights while the user's TOML holds only the
+/// *inputs* ([`crate::config::LocalModelConfig`]). Persisting it is what makes
+/// BR-10's "a recorded decision is not re-litigated" a state read rather than a
+/// re-prompt.
+///
+/// It deliberately carries **no install path**. BR-11 keeps absolute filesystem
+/// paths out of every protocol payload, and this record is projected straight
+/// onto the wire as `model_selection_decided`, so the path is not merely omitted
+/// from the projection — there is no field to omit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelection {
+    /// The chosen catalog model name; `None` exactly when the local tier was
+    /// declined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// How the decision was reached.
+    pub source: SelectionSource,
+    /// True when the user declined the local tier (BR-4): run remote-only and do
+    /// not re-prompt on later starts.
+    pub declined_local: bool,
+    /// When the decision was recorded, as Unix epoch milliseconds. An integer
+    /// rather than a formatted stamp, matching the cost ledger's
+    /// `recorded_at_ms` — and keeping this crate free of a date-time dependency.
+    pub decided_at_ms: u64,
+}
+
+impl ModelSelection {
+    /// Records a decision to install `model_name`.
+    #[must_use]
+    pub fn accepted(
+        model_name: impl Into<String>,
+        source: SelectionSource,
+        decided_at_ms: u64,
+    ) -> Self {
+        Self {
+            model_name: Some(model_name.into()),
+            source,
+            declined_local: false,
+            decided_at_ms,
+        }
+    }
+
+    /// Records a decision to decline the local tier (BR-4).
+    ///
+    /// The source is always [`SelectionSource::UserOverride`]: only a user may
+    /// answer a proposal (spec Permissions table), and neither a config pin nor
+    /// the auto-accept path can produce a decline.
+    #[must_use]
+    pub fn declined(decided_at_ms: u64) -> Self {
+        Self {
+            model_name: None,
+            source: SelectionSource::UserOverride,
+            declined_local: true,
+            decided_at_ms,
+        }
+    }
+
+    /// Whether this decision names a model the daemon should install and load.
+    ///
+    /// False for a decline, so callers ask this rather than testing
+    /// `model_name.is_some()` and missing the declined case.
+    #[must_use]
+    pub fn installs_local_model(&self) -> bool {
+        !self.declined_local && self.model_name.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +254,73 @@ mod tests {
         assert!(s.contains("openai-compatible"), "got: {s}");
         let back: Wrap = toml::from_str(&s).unwrap();
         assert_eq!(back.kind, ProviderKind::OpenaiCompatible);
+    }
+
+    #[test]
+    fn model_selection_records_an_acceptance() {
+        let sel = ModelSelection::accepted("qwen2.5-coder-7b", SelectionSource::Probe, 1_700_000);
+        assert_eq!(sel.model_name.as_deref(), Some("qwen2.5-coder-7b"));
+        assert!(!sel.declined_local);
+        assert!(sel.installs_local_model());
+        assert_eq!(sel.decided_at_ms, 1_700_000);
+    }
+
+    #[test]
+    fn model_selection_records_a_decline_with_no_model() {
+        // BR-4: declining is persisted, runs remote-only, and never names a
+        // model to install.
+        let sel = ModelSelection::declined(1_700_001);
+        assert_eq!(sel.model_name, None);
+        assert!(sel.declined_local);
+        assert!(!sel.installs_local_model());
+        assert_eq!(sel.source, SelectionSource::UserOverride);
+    }
+
+    #[test]
+    fn model_selection_round_trips_and_omits_an_absent_model_name() {
+        for sel in [
+            ModelSelection::accepted("qwen2.5-coder-3b", SelectionSource::ConfigPin, 1),
+            ModelSelection::accepted("qwen2.5-coder-7b", SelectionSource::AutoAccept, 2),
+            ModelSelection::accepted("qwen2.5-coder-3b", SelectionSource::UserOverride, 3),
+            ModelSelection::declined(4),
+        ] {
+            let text = toml::to_string(&sel).unwrap();
+            let back: ModelSelection = toml::from_str(&text).unwrap();
+            assert_eq!(back, sel, "round-trip mismatch; serialized as:\n{text}");
+        }
+        assert!(!toml::to_string(&ModelSelection::declined(4))
+            .unwrap()
+            .contains("model_name"));
+    }
+
+    #[test]
+    fn model_selection_carries_no_install_path() {
+        // BR-11: this record is projected straight onto the wire, so an install
+        // path must not exist as a field in the first place.
+        let text =
+            toml::to_string(&ModelSelection::accepted("m", SelectionSource::Probe, 1)).unwrap();
+        for forbidden in ["path", "url", "/Users/", "/home/"] {
+            assert!(!text.contains(forbidden), "leaked `{forbidden}`: {text}");
+        }
+    }
+
+    #[test]
+    fn selection_source_uses_the_spec_wire_names() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            source: SelectionSource,
+        }
+        for (source, expected) in [
+            (SelectionSource::Probe, "probe"),
+            (SelectionSource::UserOverride, "user_override"),
+            (SelectionSource::ConfigPin, "config_pin"),
+            (SelectionSource::AutoAccept, "auto_accept"),
+        ] {
+            let text = toml::to_string(&Wrap { source }).unwrap();
+            assert!(text.contains(expected), "got: {text}");
+            let back: Wrap = toml::from_str(&text).unwrap();
+            assert_eq!(back.source, source);
+        }
     }
 
     #[test]

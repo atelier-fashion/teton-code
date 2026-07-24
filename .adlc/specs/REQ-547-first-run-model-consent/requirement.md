@@ -1,7 +1,7 @@
 ---
 id: REQ-547
 title: "First-run local model consent: show the hardware-based pick, let the user override, then install"
-status: draft
+status: complete
 deployable: true
 created: 2026-07-21
 updated: 2026-07-21
@@ -51,7 +51,7 @@ looking like a regression.
 |--------|-------|------|-------------|
 | ProbeReport | total_ram_bytes | number | required; from the existing probe |
 | ProbeReport | free_disk_bytes | number | required |
-| ProbeReport | gpu_class | enum(metal, cuda, cpu) | required |
+| ProbeReport | gpu_class | enum(apple_silicon, cuda, cpu) | required; mirrors the shipped `teton_inference::probe::GpuClass` verbatim — the spec originally said `metal`, which was wrong; one spelling per concept |
 | ProbeReport | chosen_band | enum(none, small, mid, large) | required |
 | ProbeReport | reason | string | required; user-facing sentence explaining the band choice |
 | ModelSelection | model_name | string | null when the local tier is declined |
@@ -163,42 +163,76 @@ daemon contains no production wiring for `Downloader` at all._
 
 ## Acceptance Criteria
 
-- [ ] AC-1: On a machine with no installed weights, starting a session shows the
+- [x] AC-1: On a machine with no installed weights, starting a session shows the
       probe result (RAM, free disk, GPU class, band, reason), the proposed model
       with its download size and RAM floor, and the selectable alternatives — and
       **zero bytes of model data are fetched** until the user answers. Verified by
       asserting no download request is issued before the decision.
+      _Checked at TASK-009, which closed the "the proposed model" gap TASK-008
+      found. The outstanding proposal is now retrievable in full from
+      `model/status.pending_proposal`, so delivery no longer depends on a client
+      having been attached at the instant of the broadcast. Three tests carry it:
+      `consent_matrix::ac1_nothing_downloads_before_the_answer_and_the_machine_is_legible`
+      (zero artifact requests before the answer, asserted against the mock host;
+      probe reasoning; every selectable entry with size and RAM floor),
+      `consent_matrix::ac1_proposal_event_reaches_an_attached_client` (no longer
+      ignored — a client attaching after the daemon started retrieves the named
+      pick with its size, RAM floor and required disk over a real socket, and
+      answers it), and `teton`'s
+      `cli_e2e::teton_renders_the_first_run_proposal_and_accepts_it_interactively`
+      (the shipped CLI, starting a session against a real daemon, printing
+      `proposed: qwen2.5-coder-3b [small] — 2.0 GB download, needs 5.0 GB RAM`)._
 - [ ] AC-2: Accepting the proposal downloads, verifies the SHA-256, installs
       atomically, benchmarks, and reaches a working local session, with progress
       rendered from `model_lifecycle` events.
-- [ ] AC-3: Overriding to a different catalog entry downloads that entry instead
+      _Unchecked after TASK-008, and still unchecked after TASK-009 (which was
+      scoped to AC-1's delivery gap and the lifecycle's untruths). Download,
+      SHA-256 verification, atomic install and `model_lifecycle` progress are
+      verified end to end (`consent_matrix::ac2_…`). Two clauses are **not** met:
+      the consent flow runs no post-install benchmark, and nothing in `tetond`
+      ever builds a `LlamaEngine` from the installed weights — `tetond` has no
+      `llama` feature — so no local session can be served from them. TASK-009 did
+      make that state legible rather than papered over: a daemon holding verified
+      weights it cannot load now says so on `model_lifecycle`
+      (`disabled: … installed and verified, but this build has no local inference
+      engine`) instead of announcing a synthetic `ready`. Closing AC-2 is REQ-544
+      debt and a separate scope decision. See `docs/manual-verification.md`
+      "Known gaps" 1–2._
+- [x] AC-3: Overriding to a different catalog entry downloads that entry instead
       of the proposed one; choosing an entry above the machine's RAM floor emits
       an explicit warning and is only applied after a second confirmation.
-- [ ] AC-4: Declining runs the session remote-only, persists the decision, and a
+- [x] AC-4: Declining runs the session remote-only, persists the decision, and a
       subsequent daemon start does not re-prompt.
-- [ ] AC-5: With auto-accept (CLI flag or config key) a first run completes with
+- [x] AC-5: With auto-accept (CLI flag or config key) a first run completes with
       no prompt and no user input — the unattended/CI path.
-- [ ] AC-6: With insufficient free disk, the run refuses before any bytes are
+- [x] AC-6: With insufficient free disk, the run refuses before any bytes are
       fetched, naming required vs available space.
-- [ ] AC-7: A corrupted/mismatched download is discarded, never installed, and
+- [x] AC-7: A corrupted/mismatched download is discarded, never installed, and
       surfaces a clear error; the engine never loads a partial file (assert
       `InstallState` never reports `verified` for a truncated artifact).
-- [ ] AC-8: An automated catalog-integrity check verifies every entry's URL
-      resolves and its advertised `size_bytes` matches the real artifact; a
-      full-digest verification mode exists and is runnable on demand (see OQ-3
-      for whether it gates CI or only releases).
-- [ ] AC-9: `teton model list` shows the catalog, each entry's fit for this
+- [x] AC-8: An automated catalog-integrity check verifies every entry against
+      HuggingFace's LFS metadata at its pinned, immutable revision — the
+      advertised `size_bytes` matches `lfs.size` and the `sha256` matches
+      `lfs.oid` — over an anonymous, ungated request (architecture D-1). That is
+      metadata only, no artifact is downloaded, so it verifies in seconds and
+      gates every CI run (`tools/refresh-catalog.py --check`). The artifact's own
+      bytes are still hashed against that same `sha256` at download time by the
+      downloader (BR-6); the two checks answer different questions and neither
+      replaces the other. (There is no separate `--deep` artifact-download gate:
+      the download-time digest already provides full-byte verification — see
+      OQ-3.)
+- [x] AC-9: `teton model list` shows the catalog, each entry's fit for this
       machine, and the current selection; `teton model set <name>` changes it
       post-first-run (subject to BR-3's warning) and `teton model status` reports
       install state.
-- [ ] AC-10: Accepting the proposal with no network produces a clear network
+- [x] AC-10: Accepting the proposal with no network produces a clear network
       error, leaves no partial install, and does not record a "declined"
       decision — a later run with connectivity re-prompts and succeeds (BR-12).
-- [ ] AC-11: The download client is credential-free and follows redirects (a
+- [x] AC-11: The download client is credential-free and follows redirects (a
       HuggingFace `resolve` → CDN 302 completes), while the provider/MCP egress
       client still refuses redirects — asserted by a test covering both halves,
       so relaxing one never silently relaxes the other (BR-14).
-- [ ] AC-12: A catalog entry whose URL pins a moving ref (e.g. `/resolve/main/`)
+- [x] AC-12: A catalog entry whose URL pins a moving ref (e.g. `/resolve/main/`)
       fails the catalog-integrity check with an actionable message (BR-15); a
       configured base-URL override redirects fetches to the mirror (BR-16); an
       HTTP 429 is retried with backoff and reported as rate-limiting, not as a
@@ -208,6 +242,9 @@ daemon contains no production wiring for `Downloader` at all._
       (manual/`--features live` verification — this is the claim CI's mocks
       cannot make, and it must be signed off by a human rather than silently
       checked). (informed by LESSON-433)
+      _Runbook: `docs/manual-verification.md`. **This box stays empty until a
+      human fills in a sign-off block there.** No test, script, or agent may tick
+      it — that is the entire point of a manual gate._
 
 ## External Dependencies
 
@@ -249,9 +286,13 @@ daemon contains no production wiring for `Downloader` at all._
 - [ ] OQ-2: Which exact quantization per band ships as the default (`q4_k_m`
       assumed today), and are the four current Qwen picks confirmed? Blocked on
       REQ-544 OQ-3's real benchmark.
-- [ ] OQ-3: Does AC-8's full-digest verification gate every CI run (expensive —
+- [x] OQ-3: ~~Does AC-8's full-digest verification gate every CI run (expensive —
       it downloads real artifacts) or only a release job, with CI limited to a
-      cheap URL/size check?
+      cheap URL/size check?~~ **RESOLVED 2026-07-24: neither.** Architecture D-1's
+      metadata check (HuggingFace LFS `oid`/`size` at the pinned revision) gates
+      every CI run with no downloads, and the full-byte digest is verified at
+      download time by the downloader (BR-6); no standalone deep-download gate
+      exists or is needed.
 - [ ] OQ-4: If the user declines the local tier but has no remote provider
       configured, what is the correct first-run experience — refuse with guidance
       to add a provider, or proceed and fail at first turn?

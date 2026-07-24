@@ -154,3 +154,47 @@ through the privacy boundary choke point (BR-1) — content under a `local-only`
 boundary never reaches a remote MCP server. Tool-result content entering
 context is data, not instructions (prompt-injection posture to be detailed in
 the harness child REQ).
+
+### ADR-005: The large-band catalog entry trusts a third-party quantizer (2026-07-24)
+
+**Decision**: the `large` band ships `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`
+— a **third-party** quantization, not a first-party Qwen release — pinned to a
+specific commit SHA with its LFS `lfs.oid` recorded as the catalog `sha256`. The
+other three catalog entries are Qwen's own GGUF repos.
+
+**Why a third party at all**: Qwen publishes no GGUF for Qwen3-Coder-30B-A3B —
+`huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF` does not exist. unsloth
+is the most-used third-party quantizer for this model and ships the Q4_K_M as a
+single file (the downloader fetches one URL). The alternatives were to drop the
+`large` band entirely (leaving 32 GB+ machines with only the 7B `mid` tier) or
+to quantize and self-host it (ops burden ADR-004 explicitly avoids pre-alpha).
+Shipping the entry with an honest, bounded trust statement is the chosen middle.
+
+**What the commit-SHA + digest pin does and does NOT cover**:
+- **Covers — post-pin substitution.** Once pinned, the bytes cannot change under
+  us: the URL names an immutable commit, the recorded `sha256` is that revision's
+  `lfs.oid`, and BR-6 verifies the download against it. unsloth cannot swap the
+  artifact for a fixed revision, and `refresh-catalog.py --check` fails loudly if
+  the artifact at the pinned revision ever changes upstream.
+- **Does NOT cover — fidelity at pin time.** The pin says nothing about whether
+  the quantization was done *correctly or benignly* when it was produced. We are
+  trusting unsloth's competence and good faith for the bytes as they stood at the
+  pinned commit; the digest only makes that trust *stable*, not *unnecessary*.
+- **Does NOT cover — the GGUF parser attack surface.** A GGUF is parsed by
+  llama.cpp, whose loader has had memory-safety bugs (malformed tensor
+  metadata/dimensions). A pinned digest guarantees we load the *same* bytes every
+  time; it does not guarantee those bytes are safe to parse. This is a general
+  property of loading any GGUF, sharpened for a third-party artifact whose
+  producer we do not control. The daemon holds no additional sandbox around the
+  loader today; that is a known, accepted residual risk for this entry.
+
+**Re-adoption is deliberate, not incidental**: `refresh-catalog.py --update`
+requires an explicit entry name (`--update <name>`). Re-resolving the unsloth
+repo's `main` to a **new** commit — re-granting trust to bytes we have not seen —
+is therefore a conscious, per-entry act, never a side effect of refreshing the
+Qwen entries. The generated `models.toml` carries a `NOT an official Qwen repo`
+comment on the entry so the trust boundary is visible at the point of use.
+
+**Consequences**: revisit if Qwen (or another first party) publishes an official
+GGUF for this model — prefer it. Any future move to sandbox the GGUF loader would
+retire the parser-surface residual risk recorded here.

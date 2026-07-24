@@ -19,11 +19,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use teton_protocol::events::{DaemonClientAttach, Event, ModelLifecycle, PhaseTransition};
+use teton_protocol::events::{DaemonClientAttach, Event, PhaseTransition};
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
 use teton_protocol::methods::{
     ConfigGetParams, ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams,
+    ModelConfirmParams, ModelListParams, ModelSetParams, ModelStatusParams,
     PermissionRespondParams, PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod,
     SessionAttachParams, SessionAttachResult, SessionCreateParams, SessionCreateResult,
     SessionListParams, SessionListResult,
@@ -359,15 +360,21 @@ fn do_handshake(
     };
     let _ = out_tx.try_send(ok_string(id, &result));
 
-    // Replay the local-model lifecycle (BR-9 / AC-8) to the just-subscribed
-    // client so it can observe probe → benchmark → ready (or disabled /
-    // stepped-down). Published after the subscribe above, so this client receives
-    // it; a machine with no local tier has an empty sequence and emits nothing.
+    // Replay the local-model lifecycle (REQ-544 BR-9 / AC-8) to the just-subscribed
+    // client, so it learns the state of the local tier on this machine: probed,
+    // then awaiting a decision / disabled / ready. Published after the subscribe
+    // above, so this client receives it; a machine with no local tier has an
+    // empty sequence and emits nothing.
+    //
+    // Because it is replayed on *every* attach, every stage in it must be true of
+    // the machine right now — see `runtime::startup_lifecycle`. A replayed
+    // `download` or `ready` that described nothing would be repeated to every
+    // client that ever connects, which is how a decorative sequence becomes a
+    // daemon-wide lie.
     for lifecycle in daemon.runtime.lifecycle_events() {
-        daemon.events.publish(
-            None,
-            Event::ModelLifecycle(ModelLifecycle::clone(lifecycle)),
-        );
+        daemon
+            .events
+            .publish(None, Event::ModelLifecycle(lifecycle));
     }
 
     Some(subscription)
@@ -386,6 +393,10 @@ fn dispatch(daemon: &Daemon, id: Id, method: &str, params: Value) -> Option<Stri
         }
         SessionAttachParams::METHOD => Some(handle_session_attach(daemon, id, params)),
         PermissionRespondParams::METHOD => Some(handle_permission_respond(daemon, id, params)),
+        ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, id, params)),
+        ModelListParams::METHOD => Some(ok_string(id, &daemon.runtime.model_list())),
+        ModelSetParams::METHOD => Some(handle_model_set(daemon, id, params)),
+        ModelStatusParams::METHOD => Some(ok_string(id, &daemon.runtime.model_status())),
         ConfigGetParams::METHOD => Some(handle_config_get(daemon, id)),
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, id)),
@@ -410,6 +421,73 @@ fn handle_permission_respond(daemon: &Daemon, id: Id, params: Value) -> String {
         .pending()
         .resolve(&params.request_id, params.outcome);
     ok_string(id, &PermissionRespondResult {})
+}
+
+/// Deliver a client's `model/confirm` to the waiting consent flow (REQ-547 BR-1).
+///
+/// The counterpart to [`handle_permission_respond`], and deliberately the same
+/// shape: the daemon broadcast a proposal carrying a `request_id`, and the
+/// deciding client answers by that id while this reader loop stays free to keep
+/// reading. That is what makes the round-trip deadlock-free — the consent flow
+/// awaits on its own task, never on this one.
+///
+/// Unlike a permission answer, a model choice can be *wrong* in a way the client
+/// can fix (an unknown catalog name, an above-RAM-floor pick with no second
+/// confirmation, BR-3). Those come back as `INVALID_PARAMS` with the proposal
+/// still open, rather than silently consuming the user's one chance to answer.
+fn handle_model_confirm(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: ModelConfirmParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        // A closed enum by design (TASK-001): an `outcome` this build does not
+        // understand is an error, never a silent fallback to "accept".
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    match daemon.runtime.confirm_model(params) {
+        Ok(result) => ok_string(id, &result),
+        Err(err) => error_from(id, err),
+    }
+}
+
+/// Change the selected model after first run (`model/set`, AC-9).
+///
+/// Records and announces the decision synchronously so the client gets an
+/// immediate answer, then installs the newly chosen weights on its own task —
+/// a multi-gigabyte download must not hold the reader loop.
+fn handle_model_set(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: ModelSetParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    match daemon
+        .runtime
+        .set_model(&params.name, params.confirmed_above_ram_floor)
+    {
+        Ok(result) => {
+            // The selection is already recorded by `set_model` above; the install
+            // runs as a spawned task, gated by two guards:
+            //
+            // * `try_current().is_ok()` — `tokio::spawn` panics with no runtime.
+            //   Production dispatch always runs inside the daemon's runtime, so
+            //   this is only ever false in the synchronous dispatch unit tests
+            //   that call `handle_model_set` directly with no runtime; the guard
+            //   exists solely so those tests do not panic. Because the selection
+            //   is already persisted, skipping the spawn loses nothing a test
+            //   relies on.
+            // * M-2 in-flight guard — only spawn when an install for this entry is
+            //   not already running, so repeated `model/set` calls cannot pile up
+            //   unbounded install tasks.
+            if tokio::runtime::Handle::try_current().is_ok()
+                && !daemon.runtime.consent().install_in_flight(&params.name)
+            {
+                let runtime = Arc::clone(&daemon.runtime);
+                tokio::spawn(async move {
+                    runtime.install_selected_model().await;
+                });
+            }
+            ok_string(id, &result)
+        }
+        Err(err) => error_from(id, err),
+    }
 }
 
 /// Serve the current configuration snapshot (`config/get`).

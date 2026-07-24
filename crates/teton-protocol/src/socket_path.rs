@@ -14,16 +14,24 @@
 
 use std::path::PathBuf;
 
-/// The concrete socket and lock paths the daemon binds and every client dials.
+/// The concrete socket, lock, and log paths the daemon uses and every client
+/// dials or reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPaths {
     /// Path the daemon binds its `UnixListener` to.
     pub socket: PathBuf,
     /// Path of the advisory single-instance lock file.
     pub lock: PathBuf,
+    /// Where an autostarted daemon's stderr is captured (H-1 / E-4).
+    ///
+    /// A daemon the CLI spawned has no terminal, so a startup diagnostic written
+    /// to stderr — a refused config, a failed bind — would go to `/dev/null` and
+    /// the user would see only "could not reach the daemon". Capturing it to a
+    /// file beside the socket is what lets `teton` quote the actual cause back.
+    pub log: PathBuf,
 }
 
-/// Resolves the socket and lock paths from the current environment.
+/// Resolves the socket, lock, and log paths from the current environment.
 #[must_use]
 pub fn daemon_paths() -> DaemonPaths {
     let base = resolve_base_dir(
@@ -33,6 +41,7 @@ pub fn daemon_paths() -> DaemonPaths {
     DaemonPaths {
         socket: base.join("tetond.sock"),
         lock: base.join("tetond.lock"),
+        log: base.join("tetond.log"),
     }
 }
 
@@ -79,7 +88,11 @@ mod tests {
     fn daemon_paths_share_a_base_and_name_socket_and_lock() {
         let paths = daemon_paths();
         assert_eq!(paths.socket.parent(), paths.lock.parent());
+        // The startup log lives beside them, so a CLI that knows where to dial
+        // also knows where the daemon's own diagnostics landed (H-1 / E-4).
+        assert_eq!(paths.socket.parent(), paths.log.parent());
         assert_eq!(paths.socket.file_name().unwrap(), "tetond.sock");
         assert_eq!(paths.lock.file_name().unwrap(), "tetond.lock");
+        assert_eq!(paths.log.file_name().unwrap(), "tetond.log");
     }
 }

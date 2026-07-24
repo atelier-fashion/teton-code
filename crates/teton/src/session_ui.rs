@@ -19,12 +19,12 @@
 use std::collections::{HashMap, HashSet};
 
 use teton_protocol::events::{
-    DaemonClientAttach, Event, EventEnvelope, FailureClass, ModelLifecycle, PermissionOption,
-    PermissionOptionKind, PermissionRequest, PhaseTransition, PrivacyAction, PrivacyBlock,
-    ProviderDegraded, RouteDecided, SessionUpdatePayload, ToolCallStatus,
+    DaemonClientAttach, Event, EventEnvelope, FailureClass, ModelLifecycle, ModelSelectionProposed,
+    PermissionOption, PermissionOptionKind, PermissionRequest, PhaseTransition, PrivacyAction,
+    PrivacyBlock, ProviderDegraded, RouteDecided, SessionUpdatePayload, ToolCallStatus,
 };
 use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
-use teton_protocol::Phase;
+use teton_protocol::{Phase, RequestId};
 
 use crate::cost_ui::CostMeter;
 use crate::firstrun;
@@ -71,6 +71,8 @@ pub struct SessionState {
     pub grants: SessionGrants,
     /// Cost accumulated from `cost_recorded` events.
     pub cost: CostMeter,
+    /// Model proposals this client has already taken up (REQ-547).
+    model_seen: HashSet<RequestId>,
 }
 
 impl SessionState {
@@ -78,6 +80,18 @@ impl SessionState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Claim a model proposal, returning `true` the first time only.
+    ///
+    /// A client can meet the same proposal twice — once as a broadcast event and
+    /// once through `model/status`'s `pending_proposal` on the late-attach path
+    /// (the daemon does not replay the event, so the client must ask). Both must
+    /// not prompt, so the id is claimed once and the second sighting is dropped.
+    /// Both carry the same `request_id`, which is what makes the two sightings
+    /// recognisable as one.
+    pub fn claim_model_proposal(&mut self, request_id: &RequestId) -> bool {
+        self.model_seen.insert(request_id.clone())
     }
 }
 
@@ -89,6 +103,10 @@ pub enum EventOutcome {
     /// A permission decision is required. The caller resolves it with
     /// [`resolve_permission`] and sends the result.
     Permission(Box<PermissionRequest>),
+    /// A local-model proposal needs an answer (REQ-547 BR-1). The caller renders
+    /// and resolves it with [`crate::model_ui::resolve_proposal`] and sends the
+    /// resulting `model/confirm` — or sends nothing, leaving the proposal open.
+    ModelProposal(Box<ModelSelectionProposed>),
 }
 
 /// Render one event, updating `state`, and report whether follow-up is needed.
@@ -131,6 +149,18 @@ pub fn render_event(
             EventOutcome::Rendered
         }
         Event::PermissionRequest(pr) => EventOutcome::Permission(Box::new(pr.clone())),
+        // REQ-547: the consent round-trip. The proposal is *not* rendered here —
+        // it is handed back so the caller can decide whether this client owns the
+        // prompt, and the client that owns it renders and answers in one step
+        // (like a permission request). The decision, by contrast, is pure
+        // information: every attached client shows it.
+        Event::ModelSelectionProposed(proposed) => {
+            EventOutcome::ModelProposal(Box::new(proposed.clone()))
+        }
+        Event::ModelSelectionDecided(decided) => {
+            surface.line(LineKind::Notice, &firstrun::format_decided(decided));
+            EventOutcome::Rendered
+        }
     }
 }
 
@@ -416,7 +446,8 @@ mod tests {
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
     use teton_protocol::events::{
-        CostRecord, CostRecorded, PlanEntry, PlanEntryStatus, SessionUpdate,
+        CostRecord, CostRecorded, ModelSelectionDecided, PlanEntry, PlanEntryStatus,
+        SelectionSource, SessionUpdate,
     };
     use teton_protocol::{ProviderId, RequestId, SessionId};
 
@@ -597,6 +628,59 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn a_model_proposal_is_handed_back_rather_than_rendered_here() {
+        // The owning client renders and answers in one step (it must not be
+        // painted twice, once by the pump and once by the prompt).
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let outcome = render_event(
+            &envelope(Event::ModelSelectionProposed(
+                crate::model_ui::testing::proposal(),
+            )),
+            &mut surface,
+            &mut state,
+        );
+        match outcome {
+            EventOutcome::ModelProposal(proposal) => {
+                assert_eq!(proposal.request_id, RequestId::from("req-model-1"));
+            }
+            other => panic!("expected a model proposal, got {other:?}"),
+        }
+        assert!(surface.calls.is_empty(), "the pump renders nothing itself");
+    }
+
+    #[test]
+    fn a_model_decision_renders_as_a_notice_for_every_attached_client() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let outcome = render_event(
+            &envelope(Event::ModelSelectionDecided(ModelSelectionDecided {
+                request_id: Some(RequestId::from("req-model-1")),
+                model_name: Some("qwen2.5-coder-7b".to_owned()),
+                declined_local: false,
+                source: SelectionSource::UserOverride,
+            })),
+            &mut surface,
+            &mut state,
+        );
+        assert!(matches!(outcome, EventOutcome::Rendered));
+        assert!(surface.any_line_contains(LineKind::Notice, "qwen2.5-coder-7b"));
+        assert!(surface.any_line_contains(LineKind::Notice, "user override"));
+    }
+
+    #[test]
+    fn a_proposal_is_claimed_once_so_the_late_attach_path_cannot_double_prompt() {
+        let mut state = SessionState::new();
+        let id = RequestId::from("req-model-1");
+        assert!(state.claim_model_proposal(&id), "first sighting wins");
+        assert!(
+            !state.claim_model_proposal(&id),
+            "the same proposal seen again (event, then model/status) is dropped"
+        );
+        assert!(state.claim_model_proposal(&RequestId::from("req-model-2")));
     }
 
     #[test]

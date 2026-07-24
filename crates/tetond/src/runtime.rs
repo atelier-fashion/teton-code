@@ -28,21 +28,61 @@
 //!   servers (used by the acceptance harness for isolation). Precedence:
 //!   `TETON_MCP_CONFIG` (when set) > `TETON_CONFIG`'s `[[mcp_server]]` table.
 //! - `TETON_REPO_ROOT` — the repo the tools are jailed to.
-//! - `TETON_PROBE_RAM_BYTES` / `TETON_PROBE_DISK_BYTES` / `TETON_PROBE_GPU` /
-//!   `TETON_PROBE_FORCE_SLOW_BENCH` — hardware-probe overrides (BR-9 / AC-8).
 //!
-//! None of these are required in production (a real build resolves hardware and
-//! weights itself); they exist so the whole daemon can be exercised end to end
-//! against mocks.
+//! ### Gated test seams (DECISION 3)
+//!
+//! The rest are **test seams, not operator features**. Each is honoured only when
+//! [`test_seams_enabled`] is true — a *debug build* with the master switch
+//! `TETON_TEST_SEAMS=1` set. A release build refuses them regardless of the
+//! environment (and refuses *loudly*, rather than pretending it never saw the
+//! request), so a shipped daemon cannot have its catalog swapped, its disk check
+//! disabled, its retry ladder shortened, or its hardware fabricated by an
+//! environment variable. They exist so the acceptance suite (`tests/e2e`) can
+//! stand the daemon up against mocks; nothing in production sets the master
+//! switch.
+//!
+//! - `TETON_CATALOG` — a model-catalog TOML replacing [`Catalog::bundled`]. The
+//!   acceptance suite needs a catalog whose artifact is small enough to actually
+//!   download in CI *and* whose `sha256`/`size_bytes` are the genuine digest and
+//!   length of the bytes a mock host serves — otherwise the verify path
+//!   (BR-6/AC-7) could only ever be asserted, never exercised. An unreadable,
+//!   unparseable or invalid file falls back to the bundled catalog with a
+//!   warning; a valid override prints a prominent warning and drives the
+//!   proposal's `fetch_notice` (H-2), so the consent screen says the entries are
+//!   not the shipped catalog.
+//! - `TETON_DISK_FREE_BYTES` — a *ceiling* on the free space the installer's
+//!   preflight sees (BR-7 / AC-6). It may only ever **lower** the real
+//!   measurement, never raise it (M-8): a seam that could raise it would be a way
+//!   to make a full disk look empty and so disable the check. Distinct from
+//!   `TETON_PROBE_DISK_BYTES`, the figure the probe *reports* to the user.
+//! - `TETON_DOWNLOAD_RETRY_BASE_MS` — base delay of the download retry ladder
+//!   (BR-16). Only the delays shrink: the number of attempts, the doubling and
+//!   the jitter are the production ones, so a test exercises the real ladder
+//!   without spending its seconds.
+//! - `TETON_PROBE_RAM_BYTES` / `TETON_PROBE_DISK_BYTES` / `TETON_PROBE_GPU` /
+//!   `TETON_PROBE_FORCE_SLOW_BENCH` — a simulated machine (REQ-544 BR-9 / AC-8),
+//!   so the decision table can be driven from a test instead of from whatever
+//!   hardware CI happens to provide. Gated for the same reason as the rest and
+//!   then some (E-6): `ram_bytes` feeds
+//!   [`validate_choice`](crate::model_consent::validate_choice), so a large
+//!   enough `TETON_PROBE_RAM_BYTES` would make every catalog entry look like it
+//!   fits and suppress BR-3's above-the-floor confirmation — while the "detected
+//!   hardware" the consent screen shows would be the environment's fiction rather
+//!   than the machine. `TETON_PROBE_FORCE_SLOW_BENCH` likewise publishes
+//!   `benchmark` and `stepped_down` stages for measurements that never happened.
+//!
+//! `TETON_LOCAL_SCRIPT` stays ungated: it supplies an engine rather than
+//! *describing* the machine, changes no safety decision, and is how the offline
+//! session path is exercised at all.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use teton_core::boundary::BoundaryMatcher;
-use teton_core::config::Config;
+use teton_core::config::{Config, LocalModelConfig};
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind, RoutingPolicy,
 };
@@ -57,7 +97,8 @@ use teton_protocol::events::{ModelLifecycle, ModelLifecycleStage, PrivacyAction}
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     ConfigSnapshot, ConfigUpdate, CostGroupView, CostQueryResult, CostReportView,
-    PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, RoutingRule,
+    ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult, ModelSetResult,
+    ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, RoutingRule,
 };
 use teton_protocol::{
     Phase as ProtoPhase, PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId,
@@ -71,6 +112,7 @@ use teton_providers::{
 
 use crate::broadcast::EventBus;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
+use crate::download::{HttpRangeFetcher, RetryPolicy};
 use crate::egress::{inspect, origin_of, Egress, HttpTransport};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
@@ -79,9 +121,15 @@ use crate::harness::{
     build_system_prompt, ContextManager, LocalEngineSource, PendingPermissions, PermissionConfig,
     PermissionGate, SessionEvents, ToolContext, ToolRegistry,
 };
+use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
 use crate::mcp::{McpRegistry, McpServerConfig};
+use crate::model_consent::{
+    list_entries, no_local_engine_reason, probe_view, selection_view, ConsentOutcome,
+    ModelConsentGate, NoInstaller, PendingModelDecisions, WeightsInstaller,
+};
 use crate::router::Router;
+use crate::selection_store::SelectionStore;
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
 const SCRIPT_SEPARATOR: &str = "---";
@@ -329,6 +377,32 @@ pub struct DaemonRuntime {
     engine: Option<Arc<Mutex<dyn Engine>>>,
     /// Whether the local tier can meet its BR-8 latency duty right now.
     local_available: bool,
+    /// The REQ-547 first-run consent gate: the probe, the catalog, the recorded
+    /// decision, the pending-answer registry, and the installer.
+    consent: Arc<ModelConsentGate>,
+    /// Whether the local tier is **withheld pending a consent decision** (D-3).
+    ///
+    /// Separate from `local_available`, which answers "can the tier meet its
+    /// latency duty"; this answers "has the user agreed to install it at all".
+    /// Held as an atomic because the decision arrives asynchronously, long after
+    /// the runtime was assembled, and every client task shares one runtime.
+    ///
+    /// The gate withholds the **tier**, never the session: while it is set,
+    /// sessions still run — they route remote-only (BR-1).
+    local_gated: AtomicBool,
+    /// Whether this daemon's local engine was supplied out of band by
+    /// `TETON_LOCAL_SCRIPT` — canned replies from a file, downloading nothing.
+    ///
+    /// The one sanctioned reason to skip the consent flow, and it is named
+    /// rather than inferred (E-5). It used to be spelled `engine.is_none()`,
+    /// which happened to be equivalent only because the scripted engine is the
+    /// *only* engine this build can construct: the day a real GGUF loader lands
+    /// (the tracked REQ-544 debt), that spelling would have disabled the consent
+    /// gate and its deep verification on exactly the machines where downloading
+    /// weights finally means something. Consent gates *fetching weights*; this
+    /// flag says "there are no weights to fetch", which is a different claim
+    /// from "there is no engine".
+    scripted_engine: bool,
     /// The append-only cost ledger (BR-2). Recorded at the egress choke point.
     ledger: CostLedger,
     /// Daemon-wide registry of in-flight permission prompts (the
@@ -338,9 +412,17 @@ pub struct DaemonRuntime {
     permission_config: PermissionConfig,
     /// Registered MCP servers (ADR-003), or `None` when none are configured.
     mcp_servers: Vec<McpServerConfig>,
-    /// The startup model-lifecycle event sequence (BR-9 / AC-8), replayed to each
-    /// newly attached client so it can observe probe → benchmark → ready.
-    lifecycle: Vec<ModelLifecycle>,
+    /// The startup hardware probe's *facts*, or `None` for a runtime with no
+    /// local tier at all (the minimal/consent-only runtimes).
+    ///
+    /// Deliberately the facts and not a rendered event list: the sequence is
+    /// replayed to every client that attaches, at whatever time it attaches, so
+    /// it is derived fresh from the probe **and the current consent state**
+    /// ([`Self::lifecycle_events`]). A stored list would go stale the moment the
+    /// user answered — a client attaching after an install would be told the
+    /// daemon was still awaiting a decision, which is the same class of untruth
+    /// the synthetic `download`/`ready` sequence was.
+    probe: Option<ProbeResult>,
     /// Monotonic turn-id source.
     turn_counter: AtomicU64,
     /// Per-session privacy taint: sessions pinned to the local tier because their
@@ -371,17 +453,36 @@ impl DaemonRuntime {
         let ledger =
             CostLedger::open_in_memory(PriceTable::bundled(), Arc::new(crate::cost::NoopCostSink))
                 .expect("in-memory ledger");
+        // A minimal runtime has no local tier at all, so its consent gate records
+        // in memory, installs nothing, and probes a machine below the floor —
+        // there is nothing for a decision to be about.
+        let consent = Arc::new(ModelConsentGate::new(
+            HardwareProfile {
+                ram_bytes: 0,
+                free_disk_bytes: 0,
+                gpu: GpuClass::Cpu,
+            },
+            Catalog::bundled(),
+            LocalModelConfig::default(),
+            Arc::new(EventBus::new()),
+            Arc::new(PendingModelDecisions::new()),
+            Arc::new(SelectionStore::in_memory()),
+            Arc::new(NoInstaller),
+        ));
         Self {
             config: Mutex::new(Config::default()),
             config_path: None,
             repo_root: std::env::temp_dir(),
             engine: None,
             local_available: false,
+            consent,
+            local_gated: AtomicBool::new(false),
+            scripted_engine: false,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
             permission_config: PermissionConfig::coding_defaults(),
             mcp_servers: Vec::new(),
-            lifecycle: Vec::new(),
+            probe: None,
             turn_counter: AtomicU64::new(0),
             session_taint: SessionTaint::new(),
             provider_health: Mutex::new(BTreeMap::new()),
@@ -402,7 +503,10 @@ impl DaemonRuntime {
         let config_path = std::env::var_os("TETON_CONFIG")
             .map(PathBuf::from)
             .or_else(|| Some(base_dir.join("config.toml")));
-        let config = load_config(config_path.as_deref());
+        // H-1: a present-but-invalid config refuses to start rather than failing
+        // open to an empty default that would drop every declared privacy
+        // boundary. A genuinely absent file still defaults.
+        let config = load_config(config_path.as_deref())?;
 
         // --- repo root (the tool jail) ---
         let repo_root = std::env::var_os("TETON_REPO_ROOT")
@@ -416,11 +520,53 @@ impl DaemonRuntime {
             CostLedger::open(base_dir.join("cost.db"), PriceTable::bundled(), cost_sink)
                 .or_else(|_| CostLedger::open_in_memory(PriceTable::bundled(), events.clone()))?;
 
-        // --- local tier: hardware probe (BR-9 / AC-8) + scripted engine ---
-        let pinned = config.pinned_local_model.clone();
-        let probe = probe_local_tier(pinned.as_deref());
-        let engine: Option<Arc<Mutex<dyn Engine>>> = build_local_engine(&probe);
+        // --- local tier: hardware probe (REQ-544 BR-9 / AC-8) + scripted engine ---
+        let profile = probe_profile();
+        let (catalog, catalog_overridden) = load_catalog();
+        // The effective pin is `[local_model] pinned` (REQ-544's top-level key is
+        // hard-deprecated and rejected by validation — Decision 2). Resolving it
+        // once here means the probe, the consent gate, and `model/list` cannot
+        // disagree about which pin is in force.
+        let pinned = config.effective_pinned_local_model().map(str::to_owned);
+        let probe = probe_local_tier(&profile, &catalog, pinned.as_deref());
+        let local = build_local_engine(&probe);
+        // E-5: the *kind* of engine, recorded explicitly. Only a scripted engine
+        // exempts this daemon from the consent flow, and only because it fetches
+        // nothing — not because an engine happens to exist.
+        let scripted_engine = local.as_ref().is_some_and(|local| local.scripted);
+        let engine: Option<Arc<Mutex<dyn Engine>>> = local.map(|local| local.engine);
         let local_available = engine.is_some() && !probe.disabled;
+
+        // --- first-run consent (REQ-547) ---
+        //
+        // Assembled but NOT run here: `from_env` must return promptly so the
+        // daemon can serve sessions while a proposal is outstanding (D-3). The
+        // flow is driven by `run_model_consent`, which `main` spawns.
+        let mut local_model = config.local_model.clone();
+        local_model.pinned = pinned;
+        let consent = Arc::new(
+            ModelConsentGate::new(
+                profile,
+                catalog,
+                local_model,
+                Arc::clone(events),
+                Arc::new(PendingModelDecisions::new()),
+                Arc::new(SelectionStore::open(base_dir)),
+                build_installer(base_dir, config.local_model.base_url.clone(), events),
+            )
+            // M-1: gate the gate's `ready` publish on the presence of an engine
+            // that can load the weights — the same signal `startup_lifecycle`
+            // uses — so a completed install on a no-engine build says `disabled`,
+            // not `ready`.
+            .with_local_engine(engine.is_some())
+            // H-2: a non-bundled catalog is a redirected source; the proposal's
+            // `fetch_notice` tells the user so before they answer.
+            .with_catalog_override(catalog_overridden),
+        );
+        let local_gated = AtomicBool::new(local_tier_gated(
+            scripted_engine,
+            consent.consent_required(),
+        ));
 
         // --- MCP servers (ADR-003 / AC-9): the main TOML config is the source of
         // truth; TETON_MCP_CONFIG is a test-only override (see `load_mcp_servers`).
@@ -432,16 +578,41 @@ impl DaemonRuntime {
             repo_root,
             engine,
             local_available,
+            consent,
+            local_gated,
+            scripted_engine,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
             permission_config: PermissionConfig::coding_defaults(),
             mcp_servers,
-            lifecycle: probe.lifecycle,
+            probe: Some(probe),
             turn_counter: AtomicU64::new(0),
             session_taint: SessionTaint::new(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         })
+    }
+
+    /// A runtime wired for the local-tier consent flow and nothing else.
+    ///
+    /// The `model/*` handlers read only the consent gate, so this is what the
+    /// consent tests stand a [`crate::server::Daemon`] up on — a full
+    /// [`Self::from_env`] would drag in the environment, the real state
+    /// directory, and the bundled catalog's real digests.
+    ///
+    /// The tier is marked *capable* (`local_available`) so that the consent gate
+    /// is the only thing that can withhold it: a test asserting "undecided ⇒
+    /// remote-only" must be observing the gate, not a machine that had no local
+    /// tier to begin with.
+    #[must_use]
+    pub fn with_consent(consent: Arc<ModelConsentGate>) -> Self {
+        let gated = local_tier_gated(false, consent.consent_required());
+        Self {
+            local_available: true,
+            local_gated: AtomicBool::new(gated),
+            consent,
+            ..Self::minimal()
+        }
     }
 
     /// The daemon-wide pending-permission registry (the `permission/respond` seam).
@@ -450,10 +621,226 @@ impl DaemonRuntime {
         &self.pending
     }
 
-    /// The startup model-lifecycle events (BR-9), replayed to attaching clients.
+    /// The first-run consent gate for the local tier (REQ-547).
     #[must_use]
-    pub fn lifecycle_events(&self) -> &[ModelLifecycle] {
-        &self.lifecycle
+    pub fn consent(&self) -> &Arc<ModelConsentGate> {
+        &self.consent
+    }
+
+    /// Whether the local tier may serve a turn right now.
+    ///
+    /// Two independent conditions: the tier must be *capable* (`local_available`,
+    /// BR-8's latency duty) and it must be *consented to* (REQ-547 BR-1). A
+    /// machine awaiting an answer routes remote-only rather than blocking — the
+    /// gate withholds the tier, never the session (D-3).
+    #[must_use]
+    pub fn local_tier_available(&self) -> bool {
+        self.local_available && !self.local_gated.load(Ordering::SeqCst)
+    }
+
+    /// Whether the first-run consent flow applies to this daemon at all.
+    ///
+    /// It does not when the local tier's engine was supplied out of band — a
+    /// `TETON_LOCAL_SCRIPT` stand-in replays canned replies from a file and
+    /// downloads nothing, so proposing a download would prompt the user for
+    /// something that is never going to happen. Consent gates *fetching weights*;
+    /// where there are no weights to fetch there is nothing to consent to.
+    ///
+    /// Keyed on that specific exemption (E-5), never on "this build has no
+    /// engine": a daemon that CAN load a GGUF is exactly the daemon that must
+    /// ask before downloading one.
+    #[must_use]
+    pub fn first_run_consent_applies(&self) -> bool {
+        !self.scripted_engine
+    }
+
+    /// Drive the first-run consent flow to a decision (REQ-547 BR-1).
+    ///
+    /// Awaits a client's `model/confirm` when a proposal is needed, so callers
+    /// must run it off the path that serves requests — `main` spawns it. On a
+    /// decided-and-installed outcome the local tier is un-gated for every
+    /// subsequent turn.
+    pub async fn run_model_consent(self: &Arc<Self>) -> ConsentOutcome {
+        let outcome = self.consent.resolve().await;
+        self.apply_consent_outcome(&outcome);
+        outcome
+    }
+
+    /// Install the weights for the decision already recorded (`model/set`).
+    pub async fn install_selected_model(self: &Arc<Self>) -> ConsentOutcome {
+        let outcome = self.consent.install_recorded().await;
+        self.apply_consent_outcome(&outcome);
+        outcome
+    }
+
+    /// Open or close the tier gate according to a consent outcome.
+    ///
+    /// Only a `Ready` outcome opens it. A refusal, a failed install, and an
+    /// unanswered proposal all leave the tier withheld and the session
+    /// remote-only, which is the BR-1 default rather than a special case.
+    ///
+    /// A `Superseded` outcome (M-4) and an `AlreadyInstalling` outcome (M-2) are
+    /// the two cases that must NOT touch the gate: in both, another task is the
+    /// authority on the tier — the `model/set` that superseded the first-run
+    /// proposal, or the in-flight install this attempt deferred to — so this
+    /// abandoned flow leaves the gate exactly as it found it rather than racing
+    /// the authoritative decision (an `AlreadyInstalling` no-op that re-gated the
+    /// tier would fight the running install that is about to un-gate it).
+    fn apply_consent_outcome(&self, outcome: &ConsentOutcome) {
+        if matches!(
+            outcome,
+            ConsentOutcome::Superseded | ConsentOutcome::AlreadyInstalling { .. }
+        ) {
+            return;
+        }
+        self.local_gated
+            .store(!outcome.local_tier_ready(), Ordering::SeqCst);
+    }
+
+    /// The catalog with each entry's fit for this machine (`model/list`, AC-9).
+    #[must_use]
+    pub fn model_list(&self) -> ModelListResult {
+        let consent = &self.consent;
+        let decision = consent.probe_decision();
+        ModelListResult {
+            probe: probe_view(consent.profile(), &decision),
+            models: list_entries(consent.profile(), consent.catalog()),
+            selection: consent.current_selection().as_ref().map(selection_view),
+        }
+    }
+
+    /// The recorded decision, the weights' install state, and any outstanding
+    /// proposal (`model/status`, AC-9).
+    ///
+    /// `pending_proposal` carries the proposal **in full** — the same payload the
+    /// `model_selection_proposed` event carries. That is what lets a client which
+    /// attached *after* the broadcast render the pick by name, with its download
+    /// size and RAM floor (BR-2), and answer it — rather than waiting forever for
+    /// an event it already missed, or answering a prompt it could only describe
+    /// as "the daemon's own pick".
+    #[must_use]
+    pub fn model_status(&self) -> ModelStatusResult {
+        ModelStatusResult {
+            selection: self
+                .consent
+                .current_selection()
+                .as_ref()
+                .map(selection_view),
+            install: self.consent.current_install(),
+            pending_proposal: self.consent.pending().outstanding(),
+        }
+    }
+
+    /// Change the selected model after first run (`model/set`, AC-9 / BR-3).
+    ///
+    /// # Errors
+    /// Returns a [`RpcError`] (`INVALID_PARAMS`) naming an unknown catalog entry,
+    /// or an above-RAM-floor pick that has not been confirmed a second time.
+    pub fn set_model(
+        &self,
+        name: &str,
+        confirmed_above_ram_floor: bool,
+    ) -> Result<ModelSetResult, RpcError> {
+        let selection = self
+            .consent
+            .set_model(name, confirmed_above_ram_floor)
+            .map_err(|refusal| RpcError::new(error_code::INVALID_PARAMS, refusal.to_string()))?;
+        Ok(ModelSetResult {
+            selection: selection_view(&selection),
+        })
+    }
+
+    /// Deliver a client's answer to an outstanding proposal (`model/confirm`).
+    ///
+    /// A `choose` is validated **before** the waiter is resolved, so a bad answer
+    /// comes back as an RPC error the client can correct while the proposal stays
+    /// open — a mistyped model name must not cost the user their prompt (BR-3).
+    ///
+    /// # Errors
+    /// Returns a [`RpcError`] (`INVALID_PARAMS`) for a refused choice.
+    pub fn confirm_model(
+        &self,
+        params: ModelConfirmParams,
+    ) -> Result<ModelConfirmResult, RpcError> {
+        match &params.outcome {
+            ModelConfirmOutcome::Choose {
+                name,
+                confirmed_above_ram_floor,
+            } => {
+                crate::model_consent::validate_choice(
+                    self.consent.catalog(),
+                    self.consent.profile(),
+                    name,
+                    *confirmed_above_ram_floor,
+                )
+                .map_err(|refusal| {
+                    RpcError::new(error_code::INVALID_PARAMS, refusal.to_string())
+                })?;
+            }
+            // Pre-validate an `accept` the same way a `choose` is pre-validated,
+            // and against the same two rules.
+            //
+            // If the outstanding proposal offered no model (this machine has no
+            // fitting catalog entry), there is nothing to accept. And if it
+            // proposed an entry above this machine's RAM floor — which a
+            // `[local_model] pinned` key can do, since a pin overrides the probe
+            // unconditionally and since C-1 reaches the user as the proposal
+            // itself — then BR-3's second confirmation is owed before a
+            // multi-gigabyte fetch begins, and an `accept` does not carry one
+            // (E-1).
+            //
+            // Both are rejected as INVALID_PARAMS with the proposal LEFT OPEN,
+            // rather than letting the accept resolve the waiter and fail inside
+            // the flow: that would permanently consume the user's one chance to
+            // answer and leave the tier dead for the daemon's lifetime. Left
+            // open, the client re-sends the same entry as
+            // `choose { confirmed_above_ram_floor: true }`.
+            ModelConfirmOutcome::Accept => {
+                if let Some(open) = self.consent.pending().outstanding() {
+                    let Some(proposed) = open.proposed.as_ref() else {
+                        return Err(RpcError::new(
+                            error_code::INVALID_PARAMS,
+                            crate::model_consent::ChoiceRefusal::NothingToAccept.to_string(),
+                        ));
+                    };
+                    crate::model_consent::validate_choice(
+                        self.consent.catalog(),
+                        self.consent.profile(),
+                        &proposed.entry.name,
+                        false,
+                    )
+                    .map_err(|refusal| {
+                        RpcError::new(error_code::INVALID_PARAMS, refusal.to_string())
+                    })?;
+                }
+            }
+            ModelConfirmOutcome::Decline => {}
+        }
+        // Idempotent, like `permission/respond`: a late or duplicate answer for a
+        // proposal that already resolved simply finds no waiter. E-8: say which
+        // it was, so a client whose prompt was cancelled by a `model/set` is not
+        // told its answer landed.
+        let delivered = self
+            .consent
+            .pending()
+            .resolve(&params.request_id, params.outcome);
+        Ok(ModelConfirmResult { delivered })
+    }
+
+    /// The startup model-lifecycle events (REQ-544 BR-9), replayed to attaching
+    /// clients.
+    ///
+    /// Derived per call, from the probe *and* the consent state as it stands
+    /// right now — see [`startup_lifecycle`]. A client attaching before the user
+    /// answers is told the daemon is awaiting a decision; one attaching after an
+    /// install is told what is actually on disk. Both are true when they are
+    /// said, which a snapshot taken at startup could not be.
+    #[must_use]
+    pub fn lifecycle_events(&self) -> Vec<ModelLifecycle> {
+        match &self.probe {
+            Some(probe) => startup_lifecycle(probe, self.engine.is_some(), &self.consent),
+            None => Vec::new(),
+        }
     }
 
     /// A snapshot of the current configuration for `config/get`.
@@ -550,7 +937,10 @@ impl DaemonRuntime {
             .collect();
         let router = build_router(
             &config,
-            self.local_available,
+            // REQ-547 BR-1/D-3: a tier awaiting a consent decision is withheld
+            // here, so this turn routes remote-only instead of blocking on the
+            // answer.
+            self.local_tier_available(),
             self.ledger.prices(),
             &health_snapshot,
         );
@@ -878,14 +1268,46 @@ impl DaemonRuntime {
 // Construction helpers
 // ---------------------------------------------------------------------------
 
-/// Load the config from `path`, falling back to defaults on any read/parse error.
-fn load_config(path: Option<&Path>) -> Config {
+/// Load the config from `path`.
+///
+/// A *genuinely absent* config file defaults — a fresh install has none, and
+/// defaulting there is correct. But a config that **exists** and fails to parse
+/// or validate must NOT be silently replaced by [`Config::default`] (H-1): the
+/// default carries `boundaries: vec![]`, so failing open would drop every
+/// declared privacy boundary, provider, routing rule and MCP server on the floor
+/// and bring the daemon up with a security posture the user never chose — a typo
+/// in one field silently disabling every `local-only` boundary. A present-but-
+/// invalid config is refused instead, with a diagnostic naming the failure, so
+/// the operator fixes it rather than unknowingly running wide open.
+///
+/// # Errors
+/// Returns an error when a config file is present but cannot be read, parsed, or
+/// validated. The message names the validation failure but no filesystem path
+/// (BR-11).
+fn load_config(path: Option<&Path>) -> anyhow::Result<Config> {
     let Some(path) = path else {
-        return Config::default();
+        return Ok(Config::default());
     };
     match std::fs::read_to_string(path) {
-        Ok(text) => Config::load(&text).unwrap_or_default(),
-        Err(_) => Config::default(),
+        // Present and readable: it MUST parse and validate. Refusing here is the
+        // whole point — a fail-open default would drop the user's boundaries.
+        Ok(text) => Config::load(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "the daemon configuration is present but invalid, so it was NOT loaded. \
+                 Refusing to start rather than fall back to an empty config that would \
+                 silently drop your privacy boundaries, providers, routing, and MCP servers. \
+                 Fix the config and restart. Cause: {e}"
+            )
+        }),
+        // Genuinely absent (a fresh install): defaulting is correct.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        // Present but unreadable (permissions, I/O): surface it rather than
+        // defaulting — the operator has a config they meant to apply.
+        Err(err) => Err(anyhow::anyhow!(
+            "the daemon configuration file exists but could not be read ({}); \
+             refusing to start rather than silently ignore it.",
+            err.kind()
+        )),
     }
 }
 
@@ -907,146 +1329,443 @@ fn load_mcp_servers(config: &Config) -> Vec<McpServerConfig> {
     config.mcp_server.clone()
 }
 
-/// The result of the startup hardware probe (BR-9 / AC-8).
-struct ProbeResult {
-    /// The selected local model id, or `None` when disabled.
-    model: Option<String>,
-    /// Whether the local tier is disabled (below floor / resource-starved).
-    disabled: bool,
-    /// The lifecycle event sequence to replay to attaching clients.
-    lifecycle: Vec<ModelLifecycle>,
+/// The `model_id` a lifecycle event carries when the machine has no model to
+/// name — a below-the-floor probe, or a catalog with nothing that fits.
+const LOCAL_TIER_ID: &str = "local";
+
+/// The installer the consent gate hands a decided model to.
+///
+/// The download client is credential-free and redirect-following (D-2, TASK-002).
+/// If it cannot be built at all, the daemon still runs — it just cannot install
+/// weights, and says so rather than reporting them as merely absent.
+///
+/// Three wires matter here and each is load-bearing:
+/// - `base_url` is the `[local_model] base_url` override reaching the *fetch*
+///   (BR-16). The catalog's `download_url` implements the rewrite, but a
+///   configured mirror that never reaches the installer redirects nothing.
+/// - the fetcher is handed over twice — once as the transport, once as the
+///   [`FetchCause`] the pipeline reads the precise failure back from, so a 429
+///   is reported as rate-limiting rather than as a generic transport failure
+///   (AC-12).
+/// - `events` makes install progress observable as `model_lifecycle` (AC-2).
+fn build_installer(
+    base_dir: &Path,
+    base_url: Option<String>,
+    events: &Arc<EventBus>,
+) -> Arc<dyn WeightsInstaller> {
+    match HttpRangeFetcher::with_policy(download_retry_policy()) {
+        Ok(fetcher) => {
+            let fetcher = Arc::new(fetcher);
+            let cause: Arc<dyn FetchCause> = fetcher.clone();
+            let mut install = WeightsInstall::new(
+                fetcher,
+                base_dir.join(teton_protocol::weights::WEIGHTS_DIR),
+                base_url,
+            )
+            .with_cause(cause)
+            .with_progress(Arc::new(LifecycleProgress::new(Arc::clone(events))));
+            // AC-6's claim is about behaviour on a full volume, which no CI
+            // machine will provide on demand. DECISION 3 + M-8: a test seam,
+            // honoured only in a debug build with the master switch, and it may
+            // only ever *lower* the measured free space — a seam that could raise
+            // it would be a way to disable BR-7, so `CapFreeSpace` takes the
+            // minimum of the real measurement and the ceiling.
+            if let Some(ceiling) = env_u64("TETON_DISK_FREE_BYTES").filter(|_| test_seams_enabled())
+            {
+                install = install.with_free_space(Arc::new(CapFreeSpace {
+                    inner: Arc::new(HostFreeSpace),
+                    ceiling,
+                }));
+            }
+            Arc::new(install)
+        }
+        Err(_) => Arc::new(NoInstaller),
+    }
 }
 
-/// Run the first-run hardware probe against real or env-overridden hardware and
-/// synthesize the model-lifecycle event sequence (probe → download → benchmark →
-/// ready / stepped-down / disabled).
-fn probe_local_tier(pinned: Option<&str>) -> ProbeResult {
-    let profile = probe_profile();
-    let catalog = Catalog::bundled();
-    let decision = decide(&profile, &catalog, pinned);
+/// The download retry ladder, with only its *delays* overridable (BR-16).
+///
+/// The attempt count, the doubling and the jitter stay production values: a test
+/// that shortened the ladder itself would be exercising a different policy than
+/// the one that ships. Shortening the base delay changes how long the same ladder
+/// takes, not what it does.
+fn download_retry_policy() -> RetryPolicy {
+    let default = RetryPolicy::default();
+    // DECISION 3: a test seam, honoured only in a debug build with the master
+    // switch — never in a shipped daemon.
+    match env_u64("TETON_DOWNLOAD_RETRY_BASE_MS").filter(|_| test_seams_enabled()) {
+        Some(base_ms) => RetryPolicy {
+            base_delay: Duration::from_millis(base_ms),
+            max_delay: Duration::from_millis(base_ms.saturating_mul(8)),
+            ..default
+        },
+        None => default,
+    }
+}
 
+/// What the seam master switch means for this build (DECISION 3 / E-6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeamPolicy {
+    /// A debug build with the switch on: the seams are honoured.
+    Honour,
+    /// Nobody asked for them.
+    Ignore,
+    /// The switch was set in a build that cannot honour it. **Refuse loudly.**
+    /// Ignoring it silently is the dangerous answer: whoever set it believes the
+    /// daemon is under test control — mocked catalog, simulated hardware, capped
+    /// free space — and would read the resulting run as a test result while the
+    /// daemon quietly used the real catalog, the real machine, and the real
+    /// network. A refusal is a fixable mistake; a silent one is a wrong answer.
+    Refuse,
+}
+
+/// The policy for a build kind and the raw `TETON_TEST_SEAMS` value.
+///
+/// Pure so the release-build refusal is testable from a debug-build test — the
+/// branch that matters is the one this binary cannot otherwise reach.
+fn seam_policy(debug_build: bool, switch: Option<&str>) -> SeamPolicy {
+    match (debug_build, switch) {
+        (true, Some("1")) => SeamPolicy::Honour,
+        // Only the value a debug build would have honoured is a refusal; an
+        // explicit `TETON_TEST_SEAMS=0` is someone turning them off, which a
+        // release build is entitled to simply agree with.
+        (false, Some("1")) => SeamPolicy::Refuse,
+        _ => SeamPolicy::Ignore,
+    }
+}
+
+/// Whether the test seams (`TETON_CATALOG`, `TETON_DISK_FREE_BYTES`,
+/// `TETON_DOWNLOAD_RETRY_BASE_MS`, `TETON_PROBE_*`) may be honoured (DECISION 3).
+///
+/// A **debug build with `TETON_TEST_SEAMS=1`** and nothing else. A release build
+/// refuses regardless of the switch — the seams are how the acceptance suite
+/// stands the daemon up against mocks, never an operator feature, so a shipped
+/// binary must not honour them even if the environment sets them — and it refuses
+/// *loudly* (E-6) rather than pretending it never saw the request.
+///
+/// # Panics
+/// Panics when `TETON_TEST_SEAMS=1` is set in a release build.
+fn test_seams_enabled() -> bool {
+    match seam_policy(
+        cfg!(debug_assertions),
+        std::env::var("TETON_TEST_SEAMS").ok().as_deref(),
+    ) {
+        SeamPolicy::Honour => true,
+        SeamPolicy::Ignore => false,
+        SeamPolicy::Refuse => panic!(
+            "tetond: TETON_TEST_SEAMS=1 is set, but this is a release build, which cannot \
+             honour the test seams (TETON_CATALOG, TETON_DISK_FREE_BYTES, \
+             TETON_DOWNLOAD_RETRY_BASE_MS, TETON_PROBE_*). Refusing to start rather than run \
+             as a production daemon while the environment believes it is under test control. \
+             Unset TETON_TEST_SEAMS, or use a debug build."
+        ),
+    }
+}
+
+/// The model catalog this daemon proposes from, and whether it is a non-bundled
+/// override.
+///
+/// `TETON_CATALOG` is a **test seam** (DECISION 3): it is honoured only when
+/// [`test_seams_enabled`] is true. In a release build, or without the master
+/// switch, it is ignored and its use is logged — a shipped daemon always proposes
+/// from the catalog it was released with, never one an environment variable
+/// swapped in. When an override IS honoured, a prominent warning is printed and
+/// the returned flag drives the proposal's `fetch_notice`, so the consent screen
+/// says the entries are not the shipped catalog.
+///
+/// An override that does not parse or does not validate falls back to the bundled
+/// catalog with a warning rather than aborting startup: a mistyped path must not
+/// brick a daemon, and a *silently* substituted catalog would not be a correct
+/// answer, which is why the fallback is announced.
+fn load_catalog() -> (Catalog, bool) {
+    let Some(path) = std::env::var_os("TETON_CATALOG") else {
+        return (Catalog::bundled(), false);
+    };
+    if !test_seams_enabled() {
+        eprintln!(
+            "tetond: ignoring TETON_CATALOG — it is a test seam honoured only in a debug build \
+             with TETON_TEST_SEAMS=1, not an operator feature. Using the bundled catalog."
+        );
+        return (Catalog::bundled(), false);
+    }
+    let parsed = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| Catalog::from_toml(&text).ok())
+        .filter(|catalog| catalog.validate().is_ok());
+    match parsed {
+        Some(catalog) => {
+            eprintln!(
+                "tetond: WARNING — proposing from an override model catalog (TETON_CATALOG). \
+                 This is a test seam, not the shipped catalog; the consent prompt will say so."
+            );
+            (catalog, true)
+        }
+        None => {
+            eprintln!(
+                "tetond: TETON_CATALOG did not name a readable, valid catalog; \
+                 using the bundled catalog"
+            );
+            (Catalog::bundled(), false)
+        }
+    }
+}
+
+/// The result of the startup hardware probe (REQ-544 BR-9 / AC-8).
+///
+/// Facts only. What the *client* is told about them is
+/// [`startup_lifecycle`]'s job, because the honest answer depends on state this
+/// function cannot see — whether a decision has been made, whether weights are
+/// on disk, and whether anything in this build can load them.
+struct ProbeResult {
+    /// The local model id in force after any step-down, or `None` when disabled.
+    model: Option<String>,
+    /// The model the probe itself picked, before a simulated step-down moved off
+    /// it. What the `probed` stage names, because that is what was probed.
+    probed_model: Option<String>,
+    /// Whether the local tier is disabled (below floor / resource-starved).
+    disabled: bool,
+    /// Why the local tier is disabled, when it is — the probe's own sentence.
+    disabled_reason: Option<String>,
+    /// Detected system RAM, as quoted in the `probed` stage.
+    ram_bytes: u64,
+    /// Whether the machine cleared the local-tier RAM floor.
+    above_floor: bool,
+    /// The `TETON_PROBE_FORCE_SLOW_BENCH` simulation, when it was asked for.
+    forced_bench: Option<ForcedBench>,
+}
+
+/// A benchmark ladder the operator explicitly asked to have *simulated*
+/// (`TETON_PROBE_FORCE_SLOW_BENCH`), so REQ-544's auto-step-down duty is
+/// exercisable end to end without a real model.
+///
+/// It is the one place a `benchmark` stage is published without a measurement,
+/// and it exists only when that env flag is set: a daemon nobody asked to
+/// simulate anything never emits one.
+struct ForcedBench {
+    /// The model whose simulated benchmark missed the latency duty.
+    from_model: String,
+    /// The smaller model it stepped down to, or `None` when nothing smaller
+    /// clears the duty and the tier is disabled instead.
+    to_model: Option<String>,
+}
+
+/// Run the first-run hardware probe against `profile`.
+///
+/// The profile and catalog are passed in rather than resolved here so the probe
+/// and the REQ-547 consent gate describe the *same* machine and the *same*
+/// catalog — re-detecting would let the two disagree.
+fn probe_local_tier(
+    profile: &HardwareProfile,
+    catalog: &Catalog,
+    pinned: Option<&str>,
+) -> ProbeResult {
+    let decision = decide(profile, catalog, pinned);
     let above_floor = profile.ram_bytes >= 8 * GIB;
-    let mut lifecycle = Vec::new();
 
     match decision {
-        TierDecision::Disabled { reason } => {
-            let model_id = "local".to_owned();
-            lifecycle.push(ModelLifecycle {
-                model_id: model_id.clone(),
-                stage: ModelLifecycleStage::Probed {
-                    ram_bytes: profile.ram_bytes,
-                    above_floor,
-                },
-            });
-            lifecycle.push(ModelLifecycle {
-                model_id,
-                stage: ModelLifecycleStage::Disabled { reason },
-            });
-            ProbeResult {
-                model: None,
-                disabled: true,
-                lifecycle,
-            }
-        }
+        TierDecision::Disabled { reason } => ProbeResult {
+            model: None,
+            probed_model: None,
+            disabled: true,
+            disabled_reason: Some(reason),
+            ram_bytes: profile.ram_bytes,
+            above_floor,
+            forced_bench: None,
+        },
         TierDecision::Selected { model, .. } => {
-            lifecycle.push(ModelLifecycle {
-                model_id: model.clone(),
-                stage: ModelLifecycleStage::Probed {
+            // A forced-slow micro-benchmark trips the BR-8 latency duty and
+            // auto-steps-down to the next smaller catalog model (AC-8). It
+            // publishes `benchmark` and `stepped_down` stages for measurements
+            // that never happened, so it is a test seam like the rest (E-6) and
+            // is honoured only under the master switch: a shipped daemon must not
+            // be able to be told to narrate work it did not do.
+            if env_flag("TETON_PROBE_FORCE_SLOW_BENCH") && test_seams_enabled() {
+                let to_model = step_down_target(catalog, &model);
+                return ProbeResult {
+                    model: to_model.clone(),
+                    probed_model: Some(model.clone()),
+                    disabled: to_model.is_none(),
+                    disabled_reason: to_model.is_none().then(|| {
+                        "no smaller model clears the latency duty; remote-only".to_owned()
+                    }),
                     ram_bytes: profile.ram_bytes,
                     above_floor,
-                },
-            });
-            lifecycle.push(ModelLifecycle {
-                model_id: model.clone(),
-                stage: ModelLifecycleStage::Download {
-                    downloaded_bytes: 0,
-                    total_bytes: None,
-                },
-            });
-
-            // A forced-slow micro-benchmark trips the BR-8 latency duty and
-            // auto-steps-down to the next smaller catalog model (AC-8).
-            let force_slow = env_flag("TETON_PROBE_FORCE_SLOW_BENCH");
-            if force_slow {
-                let first_token_ms = 2_500;
-                lifecycle.push(ModelLifecycle {
-                    model_id: model.clone(),
-                    stage: ModelLifecycleStage::Benchmark {
-                        first_token_ms,
-                        tokens_per_sec: 2.0,
-                    },
-                });
-                let smaller = step_down_target(&catalog, &model);
-                match smaller {
-                    Some(to_model) => {
-                        lifecycle.push(ModelLifecycle {
-                            model_id: model.clone(),
-                            stage: ModelLifecycleStage::SteppedDown {
-                                from_model: model.clone(),
-                                to_model: to_model.clone(),
-                                reason: "benchmark exceeded the 1s first-token latency duty"
-                                    .to_owned(),
-                            },
-                        });
-                        lifecycle.push(ModelLifecycle {
-                            model_id: to_model.clone(),
-                            stage: ModelLifecycleStage::Benchmark {
-                                first_token_ms: 600,
-                                tokens_per_sec: 30.0,
-                            },
-                        });
-                        lifecycle.push(ModelLifecycle {
-                            model_id: to_model.clone(),
-                            stage: ModelLifecycleStage::Ready,
-                        });
-                        return ProbeResult {
-                            model: Some(to_model),
-                            disabled: false,
-                            lifecycle,
-                        };
-                    }
-                    None => {
-                        lifecycle.push(ModelLifecycle {
-                            model_id: model.clone(),
-                            stage: ModelLifecycleStage::Disabled {
-                                reason: "no smaller model clears the latency duty; remote-only"
-                                    .to_owned(),
-                            },
-                        });
-                        return ProbeResult {
-                            model: None,
-                            disabled: true,
-                            lifecycle,
-                        };
-                    }
-                }
+                    forced_bench: Some(ForcedBench {
+                        from_model: model,
+                        to_model,
+                    }),
+                };
             }
 
-            lifecycle.push(ModelLifecycle {
-                model_id: model.clone(),
-                stage: ModelLifecycleStage::Benchmark {
-                    first_token_ms: 350,
-                    tokens_per_sec: 40.0,
-                },
-            });
-            lifecycle.push(ModelLifecycle {
-                model_id: model.clone(),
-                stage: ModelLifecycleStage::Ready,
-            });
             ProbeResult {
-                model: Some(model),
+                model: Some(model.clone()),
+                probed_model: Some(model),
                 disabled: false,
-                lifecycle,
+                disabled_reason: None,
+                ram_bytes: profile.ram_bytes,
+                above_floor,
+                forced_bench: None,
             }
         }
     }
 }
 
+/// The startup `model_lifecycle` sequence replayed to every attaching client.
+///
+/// **Every stage here is a claim about something that actually happened.** The
+/// sequence this replaced announced `download …`, `benchmark …` and `local model
+/// … ready` on every attach — before the user had answered the proposal, and on
+/// a machine with no weights at all. In a daemon whose thesis is legibility that
+/// is worse than saying nothing: a client cannot distinguish a real readiness
+/// from a decorative one, so the honest states have to be nameable.
+///
+/// What this daemon can truthfully say at startup:
+///
+/// | State | Stage |
+/// |---|---|
+/// | the probe ran | `probed` (always) |
+/// | below the floor / no fitting entry | `disabled`, with the probe's reason |
+/// | a proposal is open, or weights are missing | `awaiting_decision` |
+/// | the tier was declined (BR-4) | `disabled`, saying so |
+/// | weights installed, nothing in this build can load them | `disabled`, saying so |
+/// | an engine is loaded and serving | `ready` |
+///
+/// Nothing here claims a download: the only `download` stages that reach a
+/// client come from [`crate::install::LifecycleProgress`], which publishes bytes
+/// as they actually move.
+fn startup_lifecycle(
+    probe: &ProbeResult,
+    engine_present: bool,
+    consent: &ModelConsentGate,
+) -> Vec<ModelLifecycle> {
+    let model_id = probe
+        .model
+        .clone()
+        .unwrap_or_else(|| LOCAL_TIER_ID.to_owned());
+    let mut lifecycle = vec![ModelLifecycle {
+        // The model the *probe* chose, which a simulated step-down may since have
+        // moved off.
+        model_id: probe
+            .probed_model
+            .clone()
+            .unwrap_or_else(|| LOCAL_TIER_ID.to_owned()),
+        stage: ModelLifecycleStage::Probed {
+            ram_bytes: probe.ram_bytes,
+            above_floor: probe.above_floor,
+        },
+    }];
+
+    // The explicitly-requested simulation, and only when requested.
+    if let Some(bench) = &probe.forced_bench {
+        lifecycle.push(ModelLifecycle {
+            model_id: bench.from_model.clone(),
+            stage: ModelLifecycleStage::Benchmark {
+                first_token_ms: 2_500,
+                tokens_per_sec: 2.0,
+            },
+        });
+        if let Some(to_model) = &bench.to_model {
+            lifecycle.push(ModelLifecycle {
+                model_id: bench.from_model.clone(),
+                stage: ModelLifecycleStage::SteppedDown {
+                    from_model: bench.from_model.clone(),
+                    to_model: to_model.clone(),
+                    reason: "benchmark exceeded the 1s first-token latency duty".to_owned(),
+                },
+            });
+            lifecycle.push(ModelLifecycle {
+                model_id: to_model.clone(),
+                stage: ModelLifecycleStage::Benchmark {
+                    first_token_ms: 600,
+                    tokens_per_sec: 30.0,
+                },
+            });
+        }
+    }
+
+    if probe.disabled {
+        lifecycle.push(ModelLifecycle {
+            model_id,
+            stage: ModelLifecycleStage::Disabled {
+                reason: probe
+                    .disabled_reason
+                    .clone()
+                    .unwrap_or_else(|| "the local tier is unavailable on this machine".to_owned()),
+            },
+        });
+        return lifecycle;
+    }
+
+    // An engine is loaded and answering: `ready` is a fact, not a hope. Today
+    // that means a `TETON_LOCAL_SCRIPT` engine — which downloads nothing, which
+    // is exactly why it is not gated on a consent decision.
+    if engine_present {
+        lifecycle.push(ModelLifecycle {
+            model_id,
+            stage: ModelLifecycleStage::Ready,
+        });
+        return lifecycle;
+    }
+
+    let declined = consent
+        .current_selection()
+        .is_some_and(|selection| selection.declined_local);
+    let stage = if declined {
+        // BR-4: a settled, deliberate absence. Not a failure and not a prompt.
+        ModelLifecycleStage::Disabled {
+            reason: "the local tier was declined; sessions run remote-only. \
+                     `teton model set <name>` changes that."
+                .to_owned(),
+        }
+    } else if consent.consent_required() {
+        // BR-1: proposed and unanswered, or answered but the weights are gone.
+        // Nothing has been fetched, measured, or loaded, and the sequence says so.
+        ModelLifecycleStage::AwaitingDecision {
+            reason: "proposed for this machine — nothing is downloaded, benchmarked, or loaded \
+                     until you answer; sessions run remote-only until then."
+                .to_owned(),
+        }
+    } else {
+        // Decided, downloaded, verified — and unloadable, because nothing in this
+        // build constructs a local engine from installed weights (REQ-544 debt,
+        // tracked as AC-2). Saying `ready` here would be the exact untruth this
+        // function exists to stop. The reason is shared with the consent gate's
+        // install-time event (M-1) so the two can never drift apart.
+        ModelLifecycleStage::Disabled {
+            reason: no_local_engine_reason(&model_id),
+        }
+    };
+    lifecycle.push(ModelLifecycle { model_id, stage });
+    lifecycle
+}
+
 /// The hardware profile to probe: env overrides when present, else detected.
+///
+/// DECISION 3 / E-6: the overrides are test seams like every other, honoured only
+/// under [`test_seams_enabled`]. They were the three ungated ones, and they were
+/// the worst three to leave open: `ram_bytes` feeds [`validate_choice`], so a
+/// `TETON_PROBE_RAM_BYTES` large enough would make every catalog entry look like
+/// it fits and suppress BR-3's above-the-floor confirmation outright — while the
+/// "hardware" figures the consent screen shows the user came from the environment
+/// rather than the machine. A shipped daemon describes the machine it is on.
+///
+/// [`validate_choice`]: crate::model_consent::validate_choice
 fn probe_profile() -> HardwareProfile {
-    let ram = env_u64("TETON_PROBE_RAM_BYTES");
-    let disk = env_u64("TETON_PROBE_DISK_BYTES");
-    let gpu = std::env::var("TETON_PROBE_GPU").ok();
+    let seams = test_seams_enabled();
+    let ram = env_u64("TETON_PROBE_RAM_BYTES").filter(|_| seams);
+    let disk = env_u64("TETON_PROBE_DISK_BYTES").filter(|_| seams);
+    let gpu = std::env::var("TETON_PROBE_GPU").ok().filter(|_| seams);
+    if !seams
+        && (std::env::var_os("TETON_PROBE_RAM_BYTES").is_some()
+            || std::env::var_os("TETON_PROBE_DISK_BYTES").is_some()
+            || std::env::var_os("TETON_PROBE_GPU").is_some())
+    {
+        eprintln!(
+            "tetond: ignoring TETON_PROBE_RAM_BYTES/_DISK_BYTES/_GPU — they are test seams \
+             honoured only in a debug build with TETON_TEST_SEAMS=1, not operator overrides. \
+             Probing the real machine."
+        );
+    }
     if ram.is_some() || disk.is_some() || gpu.is_some() {
         return HardwareProfile {
             ram_bytes: ram.unwrap_or(16 * GIB),
@@ -1076,9 +1795,43 @@ fn step_down_target(catalog: &Catalog, current: &str) -> Option<String> {
         .map(|e| e.name.clone())
 }
 
+/// Whether the local tier starts out **withheld** pending a decision (BR-1 / E-5).
+///
+/// Two inputs, one rule: the tier is withheld while a consent decision is
+/// outstanding, and the *only* exemption is a scripted engine — canned replies
+/// from a file, which download nothing, so there is nothing to consent to.
+///
+/// Named and separated because the expression used to be
+/// `engine.is_none() && consent.consent_required()`, which is the same thing only
+/// while the scripted engine is the *sole* engine this build can construct. A
+/// real weights-loading engine is not an exemption; it is precisely the case the
+/// gate exists for, and the old spelling would have opened the tier for it
+/// unconditionally — while `first_run_consent_applies()`, keyed the same way,
+/// stopped the consent flow (and its deep verification) from ever running.
+fn local_tier_gated(scripted_engine: bool, consent_required: bool) -> bool {
+    consent_required && !scripted_engine
+}
+
+/// A constructed local engine, and what kind of engine it is (E-5).
+///
+/// The kind travels with the engine because the consent flow's one exemption is
+/// about the *kind* — a scripted engine downloads nothing — and inferring it from
+/// "an engine exists" silently becomes wrong the day a real GGUF loader lands.
+struct LocalEngine {
+    /// The engine the router will call.
+    engine: Arc<Mutex<dyn Engine>>,
+    /// Whether it replays canned replies from `TETON_LOCAL_SCRIPT` rather than
+    /// loading weights the daemon would have had to download.
+    scripted: bool,
+}
+
 /// Build the local engine when a scripted engine is configured and the probe did
 /// not disable the tier.
-fn build_local_engine(probe: &ProbeResult) -> Option<Arc<Mutex<dyn Engine>>> {
+///
+/// A real weights-loading engine would be constructed here too, and would carry
+/// `scripted: false` — which is what would (correctly) keep the consent flow and
+/// its deep verification switched on for it.
+fn build_local_engine(probe: &ProbeResult) -> Option<LocalEngine> {
     if probe.disabled {
         return None;
     }
@@ -1088,7 +1841,10 @@ fn build_local_engine(probe: &ProbeResult) -> Option<Arc<Mutex<dyn Engine>>> {
         .clone()
         .unwrap_or_else(|| "scripted-local".to_owned());
     let engine = ScriptedFileEngine::from_file(model_id, Path::new(&script)).ok()?;
-    Some(Arc::new(Mutex::new(engine)) as Arc<Mutex<dyn Engine>>)
+    Some(LocalEngine {
+        engine: Arc::new(Mutex::new(engine)) as Arc<Mutex<dyn Engine>>,
+        scripted: true,
+    })
 }
 
 /// The Anthropic Messages API version header value the credential layer injects
@@ -1471,6 +2227,94 @@ fn env_flag(key: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A throwaway directory under the system temp dir, unique per test.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "teton-loadcfg-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_absent_config_file_defaults() {
+        // A fresh install has no config; defaulting there is correct.
+        let dir = scratch_dir("absent");
+        let missing = dir.join("config.toml");
+        assert_eq!(
+            load_config(Some(&missing)).expect("an absent file defaults"),
+            Config::default()
+        );
+        // No path at all also defaults.
+        assert_eq!(
+            load_config(None).expect("no path defaults"),
+            Config::default()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_present_but_invalid_config_refuses_rather_than_dropping_boundaries() {
+        // H-1: a config that EXISTS but fails validation must NOT be silently
+        // replaced by `Config::default()` (which has `boundaries: vec![]`). Here a
+        // one-character mistake — a `base_url` with no scheme — sits beside a
+        // declared `local-only` privacy boundary. Failing open would drop that
+        // boundary on the floor with nothing logged; instead the load refuses.
+        let dir = scratch_dir("invalid");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[local_model]\nbase_url = \"hf-mirror.corp.internal\"\n\n\
+             [[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n",
+        )
+        .unwrap();
+
+        let err = load_config(Some(&path))
+            .expect_err("a present-but-invalid config must refuse, not fail open");
+        let message = err.to_string();
+        // The refusal explains itself and names the offending field's rule, so an
+        // operator can fix it rather than unknowingly running with no boundaries.
+        assert!(
+            message.contains("invalid") && message.contains("boundaries"),
+            "diagnostic should explain the fail-open it prevented: {message}"
+        );
+
+        // The proof it did not fail open: the very same file, with only the
+        // base_url corrected, loads AND still carries the privacy boundary. So the
+        // refusal above was the invalidity, never a dropped boundary.
+        std::fs::write(
+            &path,
+            "[local_model]\nbase_url = \"https://hf-mirror.corp.internal\"\n\n\
+             [[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n",
+        )
+        .unwrap();
+        let loaded = load_config(Some(&path)).expect("the corrected config loads");
+        assert_eq!(
+            loaded.boundaries.len(),
+            1,
+            "a valid config keeps its declared privacy boundaries"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_with_the_deprecated_legacy_pin_refuses_to_start() {
+        // Decision 2 + H-1 together: the legacy `pinned_local_model` key now fails
+        // validation, and `load_config` surfaces that as a refusal rather than
+        // defaulting past it.
+        let dir = scratch_dir("legacy-pin");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "pinned_local_model = \"qwen2.5-coder-3b\"\n").unwrap();
+        let err = load_config(Some(&path)).expect_err("a deprecated legacy pin must refuse");
+        assert!(err.to_string().contains("invalid"), "diagnostic: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn scripted_engine_replays_blocks_then_ends() {
         let script = "first reply\n---\nsecond reply\n---\nthird";
@@ -1601,6 +2445,45 @@ mod tests {
             config.providers[0].endpoint.as_deref(),
             Some("https://b.example/v1/chat/completions")
         );
+    }
+
+    /// E-5: the consent gate must not switch itself off the moment a real engine
+    /// appears — which is exactly when downloading weights starts to mean
+    /// something.
+    #[test]
+    fn only_a_scripted_engine_exempts_the_local_tier_from_the_consent_gate() {
+        // The ordinary first run on a production build: withheld until answered.
+        assert!(local_tier_gated(false, true));
+        // Decided and installed: open.
+        assert!(!local_tier_gated(false, false));
+        // A `TETON_LOCAL_SCRIPT` engine fetches nothing, so it is never gated.
+        assert!(!local_tier_gated(true, true));
+        assert!(!local_tier_gated(true, false));
+        // And the regression this pins: a build that HAS a weights-loading engine
+        // (`scripted_engine == false`) and an outstanding decision is withheld.
+        // The old `engine.is_none() && …` spelling made that case un-gated.
+        assert!(
+            local_tier_gated(false, true),
+            "a real engine must not un-gate the tier before the user has decided"
+        );
+    }
+
+    /// DECISION 3 / E-6: the master switch is a debug-build affordance, and a
+    /// release build asked to honour it must **refuse**, not quietly ignore it.
+    #[test]
+    fn the_seam_master_switch_is_debug_only_and_refuses_loudly_in_a_release_build() {
+        assert_eq!(seam_policy(true, Some("1")), SeamPolicy::Honour);
+        assert_eq!(seam_policy(true, None), SeamPolicy::Ignore);
+        assert_eq!(seam_policy(true, Some("0")), SeamPolicy::Ignore);
+        assert_eq!(seam_policy(true, Some("yes")), SeamPolicy::Ignore);
+        // The branch a debug-build test cannot otherwise reach: whoever set this
+        // believes the daemon is running against mocks, simulated hardware and a
+        // capped volume. Ignoring them silently means they read a production run
+        // as a test result.
+        assert_eq!(seam_policy(false, Some("1")), SeamPolicy::Refuse);
+        // Turning the seams off explicitly is not a mistake to refuse over.
+        assert_eq!(seam_policy(false, Some("0")), SeamPolicy::Ignore);
+        assert_eq!(seam_policy(false, None), SeamPolicy::Ignore);
     }
 
     #[test]
@@ -1826,6 +2709,7 @@ mod tests {
     fn two_provider_spec_config() -> Config {
         Config {
             pinned_local_model: None,
+            local_model: teton_core::LocalModelConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),

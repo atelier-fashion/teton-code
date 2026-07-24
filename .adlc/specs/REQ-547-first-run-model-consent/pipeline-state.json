@@ -1,0 +1,87 @@
+{
+  "req": "REQ-547",
+  "branch": "feat/REQ-547-first-run-model-consent",
+  "startedAt": "2026-07-23T23:23:20Z",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Step 0 worktree+preflight",
+      "completedAt": "2026-07-23T23:27:15Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-07-23T23:27:15Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-07-23T23:27:15Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Arch & Tasks",
+      "completedAt": "2026-07-23T23:27:15Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-07-24T01:55:02Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (review + 5 fix groups + re-verify)",
+      "completedAt": "2026-07-24T17:17:55Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-07-24T17:18:36Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-547",
+      "branch": "feat/REQ-547-first-run-model-consent",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/2",
+      "prNumber": 2,
+      "prCreatedAt": "2026-07-24T17:18:36Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-001",
+      "TASK-002",
+      "TASK-003",
+      "TASK-004",
+      "TASK-006",
+      "TASK-005",
+      "TASK-007",
+      "TASK-008",
+      "TASK-009"
+    ],
+    "failedTasks": []
+  }
+}

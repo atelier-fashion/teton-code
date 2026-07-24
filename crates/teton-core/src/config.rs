@@ -19,16 +19,74 @@ use crate::phase::Phase;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// User-authored inputs for the local model tier (the `[local_model]` table).
+///
+/// Only *inputs* live here. Which model this machine actually installed is
+/// machine state, not project config, and is persisted by the daemon as a
+/// [`crate::entities::ModelSelection`] instead (REQ-547 D-4) — a repository
+/// checkout should not carry another machine's install decision.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LocalModelConfig {
+    /// A pinned catalog model name. When set it overrides the hardware probe's
+    /// pick (REQ-544 BR-9), so the pinned model is the one the daemon *proposes*
+    /// on first run.
+    ///
+    /// It does **not** bypass consent (REQ-547 BR-1): the user still answers the
+    /// proposal before a single byte is downloaded. A pin changes *which* model is
+    /// proposed, never *whether* a decision is required — so an operator who pins
+    /// a large model does not get an unprompted multi-gigabyte fetch on first
+    /// start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<String>,
+    /// Accept the proposed model without prompting — the unattended/CI path
+    /// (REQ-547 BR-5).
+    ///
+    /// **Defaults to `false`**, and that default is the requirement, not an
+    /// implementation detail: REQ-547 narrows REQ-544's "zero-config auto-proceed"
+    /// to "one confirmation, then zero-config", so the silent download is opt-in
+    /// rather than the default. Serialized unconditionally (no
+    /// `skip_serializing_if`) so a written-out config states the posture rather
+    /// than leaving the reader to infer it.
+    #[serde(default)]
+    pub auto_accept: bool,
+    /// Override the catalog's download base URL — the `HF_ENDPOINT`-style key
+    /// (REQ-547 BR-16) for users behind a firewall or a corporate mirror. Must be
+    /// an absolute `http`/`https` URL with a host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+impl LocalModelConfig {
+    /// Whether every field still holds its default, used to keep the
+    /// `[local_model]` table out of a config that never set one.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Top-level configuration document.
 ///
 /// Field order matters for TOML serialization: the scalar `pinned_local_model`
-/// is declared before the array-of-table fields so the emitted TOML is valid.
+/// and the `[local_model]` table are declared before the array-of-table fields so
+/// the emitted TOML is valid.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// User-pinned local model id; when set it overrides the hardware probe
-    /// (BR-9).
+    /// **Deprecated (REQ-547):** REQ-544's top-level spelling of the local-model
+    /// pin.
+    ///
+    /// It is no longer honoured — [`Config::validate`] now *rejects* a config that
+    /// sets it (see [`ConfigError::DeprecatedLegacyPin`]) and points the user at
+    /// `[local_model] pinned` instead. It is never promoted into the effective
+    /// pin: silently honouring it post-REQ-547 would mean downloading a model the
+    /// probe never proposed. The field is retained only so its presence can be
+    /// *detected* and reported, not so it can take effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_local_model: Option<String>,
+    /// Local-model tier inputs (`[local_model]`): the pin, the auto-accept
+    /// opt-in, and the catalog base-URL override.
+    #[serde(default, skip_serializing_if = "LocalModelConfig::is_unset")]
+    pub local_model: LocalModelConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -121,6 +179,48 @@ pub enum ConfigError {
     /// An `http` MCP server declares no `endpoint` to reach (AC-9).
     #[error("mcp server '{0}' uses the http transport and must set a non-empty `endpoint`")]
     McpMissingEndpoint(String),
+
+    /// `[local_model] pinned` is not shaped like a catalog model name. Caught at
+    /// load time rather than at first-run selection, where the failure would
+    /// surface as a confusing "no such model" long after the typo (REQ-547).
+    #[error(
+        "[local_model] pinned = \"{name}\" is not a valid catalog model name. A model name is a \
+         catalog id such as \"qwen2.5-coder-3b\" — letters, digits, '.', '-' and '_' only, and \
+         never a path or URL. Run `teton model list` to see the names this build ships."
+    )]
+    InvalidPinnedModel {
+        /// The offending value (user-authored, never a credential).
+        name: String,
+    },
+
+    /// The hard-deprecated top-level `pinned_local_model` key is set (REQ-547
+    /// Decision 2). The pin moved into the `[local_model]` table; the old key is
+    /// no longer honoured — a config that still sets it is rejected with a
+    /// migration instruction rather than silently promoted (which, post-REQ-547,
+    /// would mean an unprompted download the probe never proposed). Same posture
+    /// as [`ConfigError::FreeformRoutingPolicy`]: reject the inert key loudly
+    /// instead of ignoring it.
+    #[error(
+        "the top-level `pinned_local_model` key is no longer supported (it was REQ-544's \
+         spelling). Move it into the local-model table: replace `pinned_local_model = \"{name}\"` \
+         with a `[local_model]` section containing `pinned = \"{name}\"`."
+    )]
+    DeprecatedLegacyPin {
+        /// The value found under the deprecated key (user-authored, never a
+        /// credential).
+        name: String,
+    },
+
+    /// `[local_model] base_url` is not a usable catalog base URL (BR-16).
+    #[error(
+        "[local_model] base_url = \"{base_url}\" is not a usable catalog base URL. It must be an \
+         absolute http/https URL including a host, e.g. \"https://hf-mirror.example.com\" — the \
+         HF_ENDPOINT-style override that points model downloads at a mirror (BR-16)."
+    )]
+    InvalidLocalModelBaseUrl {
+        /// The offending value (user-authored, never a credential).
+        base_url: String,
+    },
 }
 
 impl Config {
@@ -159,6 +259,8 @@ impl Config {
     /// # Errors
     /// Returns the first [`ConfigError`] found.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_local_model()?;
+
         let mut ids: HashSet<&str> = HashSet::with_capacity(self.providers.len());
         for p in &self.providers {
             if !ids.insert(p.id.as_str()) {
@@ -228,6 +330,93 @@ impl Config {
 
         Ok(())
     }
+
+    /// Validates the `[local_model]` inputs (REQ-547).
+    ///
+    /// The pin's *shape* is what a config-time check can honestly assert: this
+    /// crate holds no catalog (that is `teton-inference`), so it rejects values
+    /// that could never name a catalog entry — a path, a URL, a blank string —
+    /// and leaves "is there such a model?" to the daemon, which has the catalog
+    /// and can list the alternatives.
+    fn validate_local_model(&self) -> Result<(), ConfigError> {
+        // Decision 2 (REQ-547 review): the legacy top-level `pinned_local_model`
+        // is hard-deprecated. Reject it before anything else touches a pin, so no
+        // path can promote an unvalidated legacy value (M-7). An operator who
+        // pinned under the old spelling is told to migrate rather than having the
+        // key silently ignored — or, worse, silently honoured as a download the
+        // probe would never have proposed.
+        if let Some(legacy) = &self.pinned_local_model {
+            return Err(ConfigError::DeprecatedLegacyPin {
+                name: legacy.clone(),
+            });
+        }
+
+        // Shape-check the effective pin (now only `[local_model] pinned`).
+        if let Some(pinned) = &self.local_model.pinned {
+            if !is_model_name_shaped(pinned) {
+                return Err(ConfigError::InvalidPinnedModel {
+                    name: pinned.clone(),
+                });
+            }
+        }
+
+        if let Some(base_url) = &self.local_model.base_url {
+            if !is_absolute_http_url(base_url) {
+                return Err(ConfigError::InvalidLocalModelBaseUrl {
+                    base_url: base_url.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The model the user pinned, from the `[local_model] pinned` key.
+    ///
+    /// REQ-544's top-level `pinned_local_model` is hard-deprecated — a config that
+    /// sets it fails validation (see [`ConfigError::DeprecatedLegacyPin`]), so it
+    /// is *never* promoted into the effective pin. This is now simply the current
+    /// key, kept as a named accessor because the daemon resolves the effective pin
+    /// in one place and hands it to the probe, the consent gate, and `model/list`
+    /// so they cannot disagree about which pin is in force.
+    #[must_use]
+    pub fn effective_pinned_local_model(&self) -> Option<&str> {
+        self.local_model.pinned.as_deref()
+    }
+}
+
+/// Whether `value` could name a catalog entry.
+///
+/// Catalog ids look like `qwen2.5-coder-3b`: ASCII alphanumerics plus `.`, `-`
+/// and `_`. Rejecting everything else catches the mistakes that actually happen
+/// — a filesystem path, a URL, a quoted display name, an empty string — at load
+/// time instead of at first-run selection.
+fn is_model_name_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Whether `value` is an absolute `http`/`https` URL with a non-empty host.
+///
+/// Deliberately hand-rolled rather than pulling in a URL parser: this crate is
+/// the pure-logic core and the check it needs is narrow — a scheme, a host, and
+/// no embedded whitespace. Full URL semantics are the download client's problem
+/// (`tetond`), which parses it for real before fetching anything.
+fn is_absolute_http_url(value: &str) -> bool {
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !host.is_empty() && !host.starts_with(':')
 }
 
 /// Error from [`Config::load`] — either the TOML failed to parse or the parsed
@@ -278,7 +467,12 @@ mod tests {
 
     fn sample_config() -> Config {
         Config {
-            pinned_local_model: Some("qwen2.5-coder-3b".to_owned()),
+            pinned_local_model: None,
+            local_model: LocalModelConfig {
+                pinned: Some("qwen2.5-coder-3b".to_owned()),
+                auto_accept: false,
+                base_url: Some("https://hf-mirror.example.com".to_owned()),
+            },
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),
@@ -627,10 +821,238 @@ auth_ref = "sk-ant-api03-not-a-keychain-ref-000000"
         }
     }
 
+    // -----------------------------------------------------------------------
+    // [local_model] (REQ-547)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auto_accept_defaults_to_false() {
+        // BR-5 is opt-in: REQ-547 narrows REQ-544's silent auto-proceed to "one
+        // confirmation, then zero-config", so a config that says nothing must
+        // mean "prompt me" — never "download 18 GB without asking".
+        assert!(!LocalModelConfig::default().auto_accept);
+        assert!(!Config::default().local_model.auto_accept);
+
+        // Including when the table exists but omits the key.
+        let cfg = Config::load("[local_model]\npinned = \"qwen2.5-coder-3b\"\n").expect("loads");
+        assert!(!cfg.local_model.auto_accept);
+
+        // And when the whole document is empty.
+        assert!(!Config::load("").expect("loads").local_model.auto_accept);
+    }
+
+    #[test]
+    fn local_model_section_round_trips_through_toml() {
+        let cfg = Config {
+            local_model: LocalModelConfig {
+                pinned: Some("qwen2.5-coder-7b".to_owned()),
+                auto_accept: true,
+                base_url: Some("https://hf-mirror.example.com/".to_owned()),
+            },
+            ..Config::default()
+        };
+        let toml_text = cfg.to_toml().expect("serialize");
+        let back = Config::from_toml(&toml_text).expect("deserialize");
+        assert_eq!(cfg, back, "round-trip mismatch; toml was:\n{toml_text}");
+        assert!(toml_text.contains("[local_model]"), "toml: {toml_text}");
+    }
+
+    #[test]
+    fn an_unset_local_model_table_is_not_written_out() {
+        // A config that never mentioned the local model should not grow an empty
+        // `[local_model]` table the first time it is rewritten.
+        let toml_text = Config::default().to_toml().expect("serialize");
+        assert!(!toml_text.contains("local_model"), "toml: {toml_text}");
+    }
+
+    #[test]
+    fn load_reads_a_local_model_section() {
+        let toml_text = r#"
+[local_model]
+pinned = "qwen2.5-coder-7b"
+auto_accept = true
+base_url = "https://hf-mirror.example.com"
+"#;
+        let cfg = Config::load(toml_text).expect("should load and validate");
+        assert_eq!(cfg.local_model.pinned.as_deref(), Some("qwen2.5-coder-7b"));
+        assert!(cfg.local_model.auto_accept);
+        assert_eq!(
+            cfg.local_model.base_url.as_deref(),
+            Some("https://hf-mirror.example.com")
+        );
+    }
+
+    #[test]
+    fn a_pinned_model_that_is_not_a_catalog_name_is_rejected() {
+        for bad in [
+            "",                              // blank
+            "/Users/me/models/qwen.gguf",    // a path, not a name
+            "https://example.com/qwen.gguf", // a URL, not a name
+            "qwen 2.5 coder",                // spaces
+            "qwen2.5-coder-3b\n",            // trailing newline
+            "../../etc/passwd",              // traversal-shaped
+            "qwen:latest",                   // tag syntax from another tool
+        ] {
+            let mut cfg = sample_config();
+            cfg.local_model.pinned = Some(bad.to_owned());
+            let err = cfg.validate().unwrap_err();
+            assert_eq!(
+                err,
+                ConfigError::InvalidPinnedModel {
+                    name: bad.to_owned()
+                },
+                "value: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_invalid_pin_message_is_actionable() {
+        let mut cfg = sample_config();
+        cfg.local_model.pinned = Some("/Users/me/models/qwen.gguf".to_owned());
+        let msg = cfg.validate().unwrap_err().to_string();
+        assert!(msg.contains("[local_model] pinned"), "message: {msg}");
+        assert!(
+            msg.contains("teton model list"),
+            "message should say how to find a valid name: {msg}"
+        );
+        assert!(
+            msg.contains("qwen2.5-coder-3b"),
+            "message should show the expected shape: {msg}"
+        );
+    }
+
+    #[test]
+    fn valid_catalog_names_are_accepted() {
+        for good in [
+            "qwen2.5-coder-3b",
+            "qwen2.5-coder-30b-a3b",
+            "Llama_3.1-8B",
+            "m",
+        ] {
+            let mut cfg = sample_config();
+            cfg.local_model.pinned = Some(good.to_owned());
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("`{good}` should be accepted, got {e}"));
+        }
+    }
+
+    #[test]
+    fn the_legacy_top_level_pin_key_is_hard_deprecated() {
+        // Decision 2 (REQ-547 review): a config that still sets REQ-544's top-level
+        // `pinned_local_model` must FAIL validation with a migration instruction,
+        // rather than being silently promoted into the effective pin — which, post
+        // REQ-547, would mean an unprompted download the probe never proposed.
+        let mut cfg = Config {
+            pinned_local_model: Some("qwen2.5-coder-7b".to_owned()),
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::DeprecatedLegacyPin {
+                name: "qwen2.5-coder-7b".to_owned(),
+            }
+        );
+        // The message names the migration: the old key, the new table, and the new
+        // key spelled out with the same value.
+        let msg = err.to_string();
+        assert!(msg.contains("pinned_local_model"), "message: {msg}");
+        assert!(
+            msg.contains("[local_model]"),
+            "message must name the new home: {msg}"
+        );
+        assert!(
+            msg.contains("pinned = \"qwen2.5-coder-7b\""),
+            "message must show the migrated key: {msg}"
+        );
+
+        // It is rejected even when it agrees with the new key — the old spelling is
+        // gone, not merely superseded by a disagreeing one.
+        cfg.local_model.pinned = Some("qwen2.5-coder-7b".to_owned());
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::DeprecatedLegacyPin { .. }
+        ));
+
+        // The new key alone validates cleanly.
+        cfg.pinned_local_model = None;
+        cfg.validate()
+            .expect("the [local_model] pinned key alone is valid");
+    }
+
+    #[test]
+    fn the_effective_pin_reads_only_the_current_key() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.effective_pinned_local_model(), None);
+
+        // The deprecated legacy key is never promoted into the effective pin
+        // (validation rejects it outright; the accessor does not resurrect it).
+        cfg.pinned_local_model = Some("legacy-model".to_owned());
+        assert_eq!(cfg.effective_pinned_local_model(), None);
+
+        cfg.local_model.pinned = Some("current-model".to_owned());
+        assert_eq!(cfg.effective_pinned_local_model(), Some("current-model"));
+    }
+
+    #[test]
+    fn a_malformed_base_url_is_rejected() {
+        for bad in [
+            "hf-mirror.example.com",      // no scheme
+            "ftp://mirror.example.com",   // wrong scheme
+            "https://",                   // no host
+            "https:///models",            // empty host
+            "https://:8080/models",       // port with no host
+            "file:///Users/me/models",    // not http(s)
+            "https://mirror example.com", // embedded space
+            "",                           // blank
+        ] {
+            let mut cfg = sample_config();
+            cfg.local_model.base_url = Some(bad.to_owned());
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::InvalidLocalModelBaseUrl {
+                    base_url: bad.to_owned()
+                },
+                "value: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_malformed_base_url_message_is_actionable() {
+        let mut cfg = sample_config();
+        cfg.local_model.base_url = Some("hf-mirror.example.com".to_owned());
+        let msg = cfg.validate().unwrap_err().to_string();
+        assert!(msg.contains("[local_model] base_url"), "message: {msg}");
+        assert!(msg.contains("BR-16"), "message should cite BR-16: {msg}");
+        assert!(
+            msg.contains("https://"),
+            "message should show the expected form: {msg}"
+        );
+    }
+
+    #[test]
+    fn usable_base_urls_are_accepted() {
+        for good in [
+            "https://huggingface.co",
+            "https://hf-mirror.example.com/",
+            "http://localhost:8080",
+            "https://mirror.corp.example.com/models/gguf",
+            "https://10.0.0.5:8443",
+        ] {
+            let mut cfg = sample_config();
+            cfg.local_model.base_url = Some(good.to_owned());
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("`{good}` should be accepted, got {e}"));
+        }
+    }
+
     #[test]
     fn load_accepts_a_keychain_ref_config() {
         let toml_text = r#"
-pinned_local_model = "qwen2.5-coder-3b"
+[local_model]
+pinned = "qwen2.5-coder-3b"
 
 [[providers]]
 id = "anthropic-prod"
@@ -647,7 +1069,7 @@ path_glob = "secrets/**"
 mode = "local-only"
 "#;
         let cfg = Config::load(toml_text).expect("should load and validate");
-        assert_eq!(cfg.pinned_local_model.as_deref(), Some("qwen2.5-coder-3b"));
+        assert_eq!(cfg.local_model.pinned.as_deref(), Some("qwen2.5-coder-3b"));
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.routing[0].phase, Phase::Architect);
     }

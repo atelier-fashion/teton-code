@@ -1,5 +1,10 @@
 # Teton Code local-model catalog.
 #
+# GENERATED FILE — do not hand-edit. Regenerate with:
+#
+#     python3 tools/refresh-catalog.py --update   # adopt upstream's current main
+#     python3 tools/refresh-catalog.py --check    # prove this file is derived
+#
 # Versioned *data*, not code: the daemon can replace this file with a newer
 # catalog (bumping `version`) without a teton-inference release. Each entry maps
 # a model name to its GGUF download URL, expected SHA-256, download size, and the
@@ -9,42 +14,66 @@
 #   mid   -> 7B       (16-32 GiB machines)
 #   large -> 30B-A3B  (32 GiB+ machines, optional)
 #
-# NOTE: the `sha256` and `url` values below are PLACEHOLDERS pending the
-# dogfooding benchmark that fixes the exact model picks (REQ-544 OQ-3). Replace
-# them with the real digests before wiring first-run downloads to these URLs.
-# The download checksum path is exercised by tests against synthetic byte streams
-# with real, computed digests, so these placeholders do not affect verification.
+# `sha256` and `size_bytes` are not hand-typed. They are HuggingFace's `lfs.oid`
+# (which *is* the artifact's SHA-256) and `lfs.size`, read from
+# `GET /api/models/<repo>/tree/<revision>` — no multi-GB download is needed to
+# author or to re-verify them (REQ-547 architecture D-1).
+#
+# Every `url` pins an immutable 40-hex commit SHA, mirrored in `revision`, never
+# a moving ref like `main` (BR-15): a moving ref would silently invalidate the
+# recorded `sha256` and turn the download integrity check into spurious
+# corruption failures. `Catalog::validate` rejects any entry that drifts from
+# this rule.
+#
+# Model picks remain provisional pending REQ-544 OQ-3's dogfooding benchmark.
 
 version = 1
 
+# Qwen's own GGUF release (official, public, ungated).
 [[models]]
 name = "qwen2.5-coder-1.5b"
-url = "https://models.tetoncode.ai/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000001"
-size_bytes = 1_100_000_000
+url = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/f86cb2c1fa58255f8052cc32aeede1b7482d4361/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+revision = "f86cb2c1fa58255f8052cc32aeede1b7482d4361"
+sha256 = "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"
+size_bytes = 1_117_320_768
 ram_floor_bytes = 3_221_225_472
 band = "small"
 
+# Qwen's own GGUF release (official, public, ungated). NOTE: the 3B weights
+# carry the Qwen Research licence, unlike the Apache-2.0 1.5B/7B — revisit
+# before shipping this entry as a default.
 [[models]]
 name = "qwen2.5-coder-3b"
-url = "https://models.tetoncode.ai/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
-size_bytes = 2_000_000_000
+url = "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/f74adce6aa16316c625447af059dbebe4983757c/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+revision = "f74adce6aa16316c625447af059dbebe4983757c"
+sha256 = "724fb256bec1ff062b2f65e4569e871ad2e95ab2a3989723d1769c54294730b7"
+size_bytes = 2_104_932_800
 ram_floor_bytes = 5_368_709_120
 band = "small"
 
+# Qwen's own GGUF release (official, public, ungated). The repo also ships a
+# two-part split of this quant; the single-file artifact is pinned because the
+# downloader fetches one URL.
 [[models]]
 name = "qwen2.5-coder-7b"
-url = "https://models.tetoncode.ai/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000003"
-size_bytes = 4_700_000_000
+url = "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/13fb94bfda8c8cf22497dc57b78f391a9acb426a/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+revision = "13fb94bfda8c8cf22497dc57b78f391a9acb426a"
+sha256 = "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
+size_bytes = 4_683_073_536
 ram_floor_bytes = 9_663_676_416
 band = "mid"
 
+# NOT an official Qwen repo: Qwen publishes no GGUF for
+# Qwen3-Coder-30B-A3B-Instruct
+# (huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF does not exist).
+# unsloth is the most-used third-party quantizer for this model and its Q4_K_M
+# is a single file. The pinned revision is what makes trusting a third-party
+# quantizer tractable: the bytes cannot change under us.
 [[models]]
 name = "qwen3-coder-30b-a3b"
-url = "https://models.tetoncode.ai/qwen3-coder-30b-a3b-instruct-q4_k_m.gguf"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000004"
-size_bytes = 18_000_000_000
+url = "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/b17cb02dd882d5b6ab62fc777ad2995f19668350/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+revision = "b17cb02dd882d5b6ab62fc777ad2995f19668350"
+sha256 = "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad"
+size_bytes = 18_556_689_568
 ram_floor_bytes = 21_474_836_480
 band = "large"
