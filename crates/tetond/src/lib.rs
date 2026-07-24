@@ -18,6 +18,9 @@
 //! - [`download`] — the model-download HTTP client (REQ-547 D-2): the *second*
 //!   trust context — credential-free and redirect-following, deliberately
 //!   separate from [`egress`]'s credentialed, redirect-refusing client.
+//! - [`install`] — the weights install pipeline (REQ-547 BR-7/BR-9): disk
+//!   preflight before a byte is fetched, download to a temporary path, verify,
+//!   then an atomic rename into place.
 //! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
 //! - [`router`] — phase-policy routing (BR-5), BR-6 degradation, remote wiring
 //!   through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
@@ -47,6 +50,7 @@ pub mod download;
 pub mod egress;
 pub mod harness;
 pub mod heuristics;
+pub mod install;
 pub mod keychain;
 pub mod mcp;
 pub mod model_consent;

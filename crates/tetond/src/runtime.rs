@@ -81,11 +81,12 @@ use crate::harness::{
     build_system_prompt, ContextManager, LocalEngineSource, PendingPermissions, PermissionConfig,
     PermissionGate, SessionEvents, ToolContext, ToolRegistry,
 };
+use crate::install::{FetchCause, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
 use crate::mcp::{McpRegistry, McpServerConfig};
 use crate::model_consent::{
-    list_entries, probe_view, selection_view, ConsentOutcome, FetcherInstaller, ModelConsentGate,
-    NoInstaller, PendingModelDecisions, WeightsInstaller,
+    list_entries, probe_view, selection_view, ConsentOutcome, ModelConsentGate, NoInstaller,
+    PendingModelDecisions, WeightsInstaller,
 };
 use crate::router::Router;
 use crate::selection_store::SelectionStore;
@@ -479,7 +480,7 @@ impl DaemonRuntime {
             Arc::clone(events),
             Arc::new(PendingModelDecisions::new()),
             Arc::new(SelectionStore::open(base_dir)),
-            build_installer(base_dir, config.local_model.base_url.clone()),
+            build_installer(base_dir, config.local_model.base_url.clone(), events),
         ));
         // The gate governs weights the daemon would have to **download**. A
         // `TETON_LOCAL_SCRIPT` engine is canned replies from a file: nothing is
@@ -1152,13 +1153,31 @@ const WEIGHTS_DIR: &str = "models";
 /// The download client is credential-free and redirect-following (D-2, TASK-002).
 /// If it cannot be built at all, the daemon still runs — it just cannot install
 /// weights, and says so rather than reporting them as merely absent.
-fn build_installer(base_dir: &Path, base_url: Option<String>) -> Arc<dyn WeightsInstaller> {
+///
+/// Three wires matter here and each is load-bearing:
+/// - `base_url` is the `[local_model] base_url` override reaching the *fetch*
+///   (BR-16). The catalog's `download_url` implements the rewrite, but a
+///   configured mirror that never reaches the installer redirects nothing.
+/// - the fetcher is handed over twice — once as the transport, once as the
+///   [`FetchCause`] the pipeline reads the precise failure back from, so a 429
+///   is reported as rate-limiting rather than as a generic transport failure
+///   (AC-12).
+/// - `events` makes install progress observable as `model_lifecycle` (AC-2).
+fn build_installer(
+    base_dir: &Path,
+    base_url: Option<String>,
+    events: &Arc<EventBus>,
+) -> Arc<dyn WeightsInstaller> {
     match HttpRangeFetcher::new() {
-        Ok(fetcher) => Arc::new(FetcherInstaller::new(
-            Arc::new(fetcher),
-            base_dir.join(WEIGHTS_DIR),
-            base_url,
-        )),
+        Ok(fetcher) => {
+            let fetcher = Arc::new(fetcher);
+            let cause: Arc<dyn FetchCause> = fetcher.clone();
+            Arc::new(
+                WeightsInstall::new(fetcher, base_dir.join(WEIGHTS_DIR), base_url)
+                    .with_cause(cause)
+                    .with_progress(Arc::new(LifecycleProgress::new(Arc::clone(events)))),
+            )
+        }
         Err(_) => Arc::new(NoInstaller),
     }
 }

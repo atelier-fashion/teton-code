@@ -27,8 +27,9 @@
 //! flow that can touch the network — and calls it in exactly one place,
 //! [`ModelConsentGate::commit`], which is reachable only from a decided outcome.
 //! That is what makes AC-1 testable rather than assertable: a recording
-//! [`RangeFetcher`] double placed behind the *production* installer must show
-//! zero calls until an answer arrives.
+//! [`teton_inference::download::RangeFetcher`] double placed behind the
+//! *production* installer ([`crate::install::WeightsInstall`]) must show zero
+//! calls until an answer arrives.
 //!
 //! ## Failure is not a decline
 //!
@@ -39,7 +40,6 @@
 //! connectivity re-prompts and succeeds". One mechanism covers both a failed
 //! install and a crash mid-download.
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -49,7 +49,6 @@ use teton_core::config::LocalModelConfig;
 use teton_core::entities::{ModelSelection, SelectionSource};
 
 use teton_inference::catalog::{Catalog, ModelEntry, TierBand};
-use teton_inference::download::{DownloadError, Downloader, RangeFetcher};
 use teton_inference::probe::{band_for_ram, decide, GpuClass, HardwareProfile, TierDecision, GIB};
 
 use teton_protocol::events::{
@@ -182,12 +181,40 @@ pub enum InstallError {
         /// The classified transport cause, from the download client.
         detail: String,
     },
+    /// The model host is rate-limiting downloads (BR-16 / AC-12).
+    ///
+    /// Deliberately **not** a [`InstallError::Network`]: "wait and retry" and
+    /// "your connection is broken" are different instructions, and AC-12
+    /// requires a 429 never read as a corrupt download either.
+    #[error(
+        "the model host is rate-limiting downloads: {detail}. \
+         Nothing was installed; try again shortly."
+    )]
+    RateLimited {
+        /// The classified transport cause, from the download client.
+        detail: String,
+    },
     /// The artifact failed its SHA-256 check and was discarded (BR-6/BR-9).
     #[error(
         "the downloaded model weights failed their integrity check and were discarded. \
          Nothing was installed; run the download again."
     )]
     Corrupt,
+    /// The volume has less free space than the artifact plus its working margin
+    /// (BR-7 / AC-6). Raised by the preflight, **before** any bytes are fetched.
+    #[error(
+        "not enough free disk space for the model weights: {} needed, {} available. \
+         Free up space and start the daemon again.",
+        gib(*required_bytes),
+        gib(*available_bytes)
+    )]
+    InsufficientDisk {
+        /// Free space the install needs: the artifact's size plus
+        /// [`DISK_WORKING_MARGIN_BYTES`], less anything already downloaded.
+        required_bytes: u64,
+        /// Free space the volume actually reported.
+        available_bytes: u64,
+    },
     /// A local filesystem failure while writing or installing the weights.
     #[error("could not write the model weights to the daemon state directory: {detail}")]
     Io {
@@ -202,9 +229,10 @@ pub enum InstallError {
 /// Downloads, verifies, and installs a catalog entry's weights.
 ///
 /// The seam between the consent gate (which decides *whether* to fetch) and the
-/// install pipeline (which decides *how*). TASK-005 supersedes
-/// [`FetcherInstaller`] with the full preflight + atomic pipeline; the gate is
-/// written against this trait so that swap changes nothing here.
+/// install pipeline (which decides *how*). The production implementation is
+/// [`crate::install::WeightsInstall`]; the gate knows only this trait, which is
+/// what let TASK-005 replace the whole pipeline underneath it without touching a
+/// line of the decision flow.
 pub trait WeightsInstaller: Send + Sync {
     /// Fetch, verify, and install `entry`'s weights.
     ///
@@ -236,127 +264,6 @@ impl WeightsInstaller for NoInstaller {
 
     fn status(&self, _entry: &ModelEntry) -> InstallStatus {
         InstallStatus::Absent
-    }
-}
-
-/// The production installer: the resumable/verifying [`Downloader`] over the
-/// daemon's credential-free download client, landing in the daemon state
-/// directory.
-///
-/// Deliberately thin. It exists so the consent gate has a real, network-touching
-/// implementation to be tested *against* (AC-1's zero-call assertion is only
-/// meaningful if the double stands in for something real). The disk preflight,
-/// the progress events, and the richer `InstallState` reporting are TASK-005's.
-pub struct FetcherInstaller {
-    fetcher: Arc<dyn RangeFetcher + Send + Sync>,
-    weights_dir: PathBuf,
-    base_url: Option<String>,
-}
-
-impl FetcherInstaller {
-    /// An installer that fetches through `fetcher` into `weights_dir`, applying
-    /// the configured catalog base-URL override (BR-16) to every entry.
-    #[must_use]
-    pub fn new(
-        fetcher: Arc<dyn RangeFetcher + Send + Sync>,
-        weights_dir: PathBuf,
-        base_url: Option<String>,
-    ) -> Self {
-        Self {
-            fetcher,
-            weights_dir,
-            base_url,
-        }
-    }
-
-    /// The installed weights path for `entry`. Local display only — this never
-    /// crosses the protocol boundary (BR-11).
-    #[must_use]
-    pub fn installed_path(&self, entry: &ModelEntry) -> PathBuf {
-        self.weights_dir.join(format!("{}.gguf", entry.name))
-    }
-
-    /// The in-progress download path for `entry` (resumable, never loadable).
-    fn partial_path(&self, entry: &ModelEntry) -> PathBuf {
-        self.weights_dir.join(format!("{}.gguf.part", entry.name))
-    }
-}
-
-impl WeightsInstaller for FetcherInstaller {
-    fn install(&self, entry: &ModelEntry) -> Result<(), InstallError> {
-        std::fs::create_dir_all(&self.weights_dir).map_err(|err| InstallError::Io {
-            detail: err.kind().to_string(),
-        })?;
-
-        // BR-16: fetch the mirrored URL when a base override is configured. The
-        // repo/revision/file path — and therefore the pinned digest's meaning —
-        // is preserved by `download_url`.
-        let mut target = entry.clone();
-        target.url = entry.download_url(self.base_url.as_deref());
-
-        let partial = self.partial_path(entry);
-        let result = Downloader::new(&*self.fetcher).fetch(&target, &partial, &mut |_event| {});
-
-        match result {
-            Ok(()) => {
-                // BR-9: the file only reaches its final name after the library
-                // verified its SHA-256, and the rename is atomic within the dir.
-                std::fs::rename(&partial, self.installed_path(entry)).map_err(|err| {
-                    InstallError::Io {
-                        detail: err.kind().to_string(),
-                    }
-                })
-            }
-            Err(err) => Err(classify_download_error(&err)),
-        }
-    }
-
-    fn status(&self, entry: &ModelEntry) -> InstallStatus {
-        install_status_at(
-            &self.installed_path(entry),
-            &self.partial_path(entry),
-            entry,
-        )
-    }
-}
-
-/// The install state implied by what is on disk.
-///
-/// The size check is a cheap sentinel, not a re-verification: the byte-level
-/// SHA-256 is checked at download time (BR-6) before the file is ever given its
-/// final name, so a wrong-sized file at the final path means something outside
-/// the daemon truncated or replaced it — `corrupt`, never `verified`.
-fn install_status_at(installed: &Path, partial: &Path, entry: &ModelEntry) -> InstallStatus {
-    match std::fs::metadata(installed) {
-        Ok(meta) if meta.len() == entry.size_bytes => InstallStatus::Verified,
-        Ok(_) => InstallStatus::Corrupt,
-        Err(_) if partial.exists() => InstallStatus::Partial,
-        Err(_) => InstallStatus::Absent,
-    }
-}
-
-/// Map the library's coarse [`DownloadError`] onto the user-facing classification.
-///
-/// `Checksum` is the one failure that means "the bytes were wrong" (BR-6); every
-/// transport-shaped failure is a network problem the user can retry. The library
-/// funnels the precise HTTP cause through `Transport`/`Io` message text, which
-/// the download client (TASK-002) keeps content-free by construction.
-fn classify_download_error(error: &DownloadError) -> InstallError {
-    match error {
-        DownloadError::Checksum { .. } => InstallError::Corrupt,
-        DownloadError::Transport(detail) => InstallError::Network {
-            detail: detail.clone(),
-        },
-        DownloadError::Stalled { .. } => InstallError::Network {
-            detail: "the transfer stopped making progress".to_owned(),
-        },
-        DownloadError::Oversized { .. } => InstallError::Corrupt,
-        // The fetcher reports a permanent HTTP failure as `Io` carrying its own
-        // classified message (TASK-002 D-2); a genuine filesystem failure lands
-        // here too. Both are reported with the same content-free text.
-        DownloadError::Io(err) => InstallError::Network {
-            detail: err.to_string(),
-        },
     }
 }
 
@@ -1099,49 +1006,16 @@ mod tests {
     }
 
     #[test]
-    fn install_status_never_reports_verified_for_a_truncated_file() {
-        let dir = std::env::temp_dir().join(format!("teton-status-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let entry = test_entry("m", 8, 8 * GIB, TierBand::Small);
-        let installed = dir.join("m.gguf");
-        let partial = dir.join("m.gguf.part");
-
-        assert_eq!(
-            install_status_at(&installed, &partial, &entry),
-            InstallStatus::Absent
-        );
-        std::fs::write(&partial, b"abc").unwrap();
-        assert_eq!(
-            install_status_at(&installed, &partial, &entry),
-            InstallStatus::Partial
-        );
-        std::fs::write(&installed, b"abc").unwrap();
-        assert_eq!(
-            install_status_at(&installed, &partial, &entry),
-            InstallStatus::Corrupt
-        );
-        std::fs::write(&installed, b"abcdefgh").unwrap();
-        assert_eq!(
-            install_status_at(&installed, &partial, &entry),
-            InstallStatus::Verified
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_checksum_failure_is_corrupt_and_a_transport_failure_is_network() {
-        assert_eq!(
-            classify_download_error(&DownloadError::Checksum {
-                expected: "a".to_owned(),
-                actual: "b".to_owned(),
-                attempts: 3,
-            }),
-            InstallError::Corrupt
-        );
-        assert!(matches!(
-            classify_download_error(&DownloadError::Transport("offline".to_owned())),
-            InstallError::Network { .. }
-        ));
+    fn an_insufficient_disk_refusal_names_both_figures() {
+        // AC-6's "naming required vs available" is a property of the message,
+        // so it is asserted on the message rather than on the variant.
+        let rendered = InstallError::InsufficientDisk {
+            required_bytes: 9 * GIB,
+            available_bytes: 2 * GIB,
+        }
+        .to_string();
+        assert!(rendered.contains("9.0 GiB"), "message: {rendered}");
+        assert!(rendered.contains("2.0 GiB"), "message: {rendered}");
     }
 
     // --- shared fixtures -------------------------------------------------

@@ -242,9 +242,11 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// Compute the lowercase-hex SHA-256 digest of `data`.
 ///
-/// Only the streaming file path ([`sha256_file`]) is used in non-test builds;
-/// this one-shot helper backs the unit tests and the download tests' fixtures.
-#[cfg(test)]
+/// Production code hashes files, not buffers, so [`sha256_file`] is what the
+/// download and install paths call. This one-shot helper exists for fixtures —
+/// including the daemon's install-pipeline suite, which builds a catalog entry
+/// whose `sha256` must be the *real* digest of the artifact its double serves,
+/// so that every verification in those tests runs the genuine check.
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();

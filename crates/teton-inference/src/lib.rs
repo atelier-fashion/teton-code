@@ -36,11 +36,15 @@ pub mod benchmark;
 pub mod catalog;
 pub mod download;
 pub mod engine;
+/// SHA-256 over files and byte slices — the integrity primitive behind BR-6.
+///
+/// Public because the daemon's install pipeline re-verifies an already-installed
+/// artifact (REQ-547 BR-9's `InstallState`), and a second SHA-256 implementation
+/// in the workspace would be a second thing to keep correct.
+pub mod hash;
 pub mod lifecycle;
 pub mod pressure;
 pub mod probe;
-
-mod hash;
 
 pub use benchmark::{
     benchmark_with_step_down, default_prompts, run_benchmark, BenchmarkResult, BenchmarkSelection,

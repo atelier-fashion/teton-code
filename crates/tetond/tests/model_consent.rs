@@ -48,8 +48,9 @@ use teton_protocol::RequestId;
 use teton_providers::CapabilityProfile;
 
 use tetond::broadcast::{EventBus, Subscription};
+use tetond::install::{FixedFreeSpace, FreeSpace, WeightsInstall};
 use tetond::model_consent::{
-    ConsentOutcome, FetcherInstaller, InstallError, ModelConsentGate, PendingModelDecisions,
+    ConsentOutcome, InstallError, ModelConsentGate, PendingModelDecisions,
 };
 use tetond::router::Router;
 use tetond::runtime::DaemonRuntime;
@@ -234,11 +235,18 @@ impl Harness {
         let store = Arc::new(SelectionStore::open(&dir));
         let fetcher = Arc::new(fetcher);
         let weights_dir = dir.join("models");
-        let installer = Arc::new(FetcherInstaller::new(
-            Arc::clone(&fetcher) as Arc<dyn RangeFetcher + Send + Sync>,
-            weights_dir.clone(),
-            None,
-        ));
+        // A fixed free-space answer rather than the host's: these tests are about
+        // the *decision*, and a preflight that consulted the real volume would
+        // make them fail on a full disk for reasons unrelated to consent. The
+        // preflight's own behaviour is asserted in `install_pipeline.rs`.
+        let installer = Arc::new(
+            WeightsInstall::new(
+                Arc::clone(&fetcher) as Arc<dyn RangeFetcher + Send + Sync>,
+                weights_dir.clone(),
+                None,
+            )
+            .with_free_space(Arc::new(FixedFreeSpace(Some(u64::MAX))) as Arc<dyn FreeSpace>),
+        );
         let gate = Arc::new(ModelConsentGate::new(
             profile,
             test_catalog(),
