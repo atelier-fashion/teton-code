@@ -156,6 +156,77 @@ fn wait_for_lifecycle(
         .is_some()
 }
 
+/// Wait for a stage of the **replayed** startup sequence — the matching event
+/// that arrives *after* this connection's `probed` — rather than for any event
+/// that merely matches. Returns whether it arrived within `window`.
+///
+/// [`wait_for_lifecycle`] is the right wait for a client that drove the install
+/// itself. It is the wrong one for a client that attaches to a daemon which has
+/// *already* installed, because two different events carry the same terminal
+/// text: the live one `report_install_success` publishes to the whole bus when
+/// an install completes on a build with no engine, and the replayed one the
+/// server derives per attach. `model/status` reports `verified` from the bytes
+/// on disk, which is true a moment *before* that live publish, so a client that
+/// attaches in the gap can receive the live copy ahead of its own replay.
+/// Matching it returns with a single `disabled` observed and nothing else, and
+/// every assertion made from the observed stream afterwards is then reading a
+/// sequence that has not arrived yet — including the negative ones, which would
+/// pass vacuously. Anchoring on `probed`, the stage every replay opens with,
+/// makes the wait mean "the replay reached this client", which is what those
+/// assertions require.
+fn wait_for_replayed_lifecycle(
+    client: &mut Client,
+    stage: &str,
+    reason_contains: Option<&str>,
+    window: Duration,
+) -> bool {
+    let mut replay_started = false;
+    client
+        .wait_for_event_where(
+            "model_lifecycle",
+            |e| {
+                let seen = e["stage"]["stage"].as_str();
+                if seen == Some("probed") {
+                    replay_started = true;
+                    return false;
+                }
+                replay_started
+                    && seen == Some(stage)
+                    && reason_contains.is_none_or(|needle| {
+                        e["stage"]["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains(needle))
+                    })
+            },
+            window,
+        )
+        .is_some()
+}
+
+/// Poll `model/status` until the selected weights report `verified`, and fail
+/// with a message that says *which* thing went wrong.
+///
+/// [`Client::wait_for_install_status`] returns the last status it polled whether
+/// it matched or the window ran out, so asserting on the returned value alone
+/// reports a timeout as though the daemon had claimed some other status — the
+/// one failure mode a flaky test most needs told apart from a real one.
+fn assert_install_verified(client: &mut Client, window: Duration) {
+    let started = Instant::now();
+    let status = client.wait_for_install_status("verified", window);
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status["install"]["status"].as_str(),
+        Some("verified"),
+        "the state under test is 'weights installed', and the install did not get \
+         there: {} after {elapsed:?}; last status {status}",
+        if elapsed >= window {
+            format!("the {window:?} wait TIMED OUT")
+        } else {
+            "the daemon reported a different status".to_owned()
+        }
+    );
+}
+
 /// A TCP port with nothing listening on it: bound to learn a free number, then
 /// released. The honest stand-in for "the model host cannot be reached" (AC-10)
 /// — a refused connection, not a slow one.
@@ -1392,26 +1463,29 @@ fn the_startup_lifecycle_claims_only_what_actually_happened() {
     let mut client = daemon.connect();
     let id = client.await_pending_proposal(PROPOSAL_WINDOW);
     client.confirm_model(&id, json!({ "outcome": "accept" }));
-    let installed = client.wait_for_install_status("verified", INSTALL_WINDOW);
-    assert_eq!(
-        installed["install"]["status"].as_str(),
-        Some("verified"),
-        "the state under test is 'weights installed'; got {installed}"
-    );
+    assert_install_verified(&mut client, INSTALL_WINDOW);
 
     // A second client on the *same* daemon: the replayed sequence is derived when
     // it is replayed, so it describes the machine as it is now. A snapshot taken
     // at startup would still be telling this client to answer a prompt that was
     // answered minutes ago — stale in exactly the way the synthetic sequence was.
+    //
+    // Waited for as a *replayed* stage (see [`wait_for_replayed_lifecycle`]): the
+    // install that just finished published a live `disabled` with the same
+    // terminal text to the whole bus, and this client can be attached in time to
+    // receive that copy before its own replay — which is exactly the race that
+    // made this assertion block flake.
     let mut late = daemon.connect();
     assert!(
-        wait_for_lifecycle(
+        wait_for_replayed_lifecycle(
             &mut late,
             "disabled",
             Some("installed and verified"),
             INSTALL_WINDOW
         ),
-        "the replayed lifecycle must reach this late client through its terminal stage"
+        "the replayed lifecycle must reach this late client through its terminal \
+         stage; saw {:?}",
+        lifecycle_stages(&late)
     );
     let stages = lifecycle_stages(&late);
     assert!(

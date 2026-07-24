@@ -289,11 +289,22 @@ impl Connection {
             // Not inside an event dispatch here, so the answer is sent as a real
             // call: a refusal (an unknown name, or a missing second confirmation)
             // leaves the proposal open and deserves to be shown, not swallowed.
-            if let Err(err) = self.call(reply, ctx)? {
-                ctx.surface.line(
+            match self.call(reply, ctx)? {
+                Err(err) => ctx.surface.line(
                     LineKind::Error,
                     &format!("the daemon refused the model choice: {}", err.message),
-                );
+                ),
+                // E-8: the daemon accepted the call but found no proposal waiting
+                // on that id — it was already answered, or a `teton model set`
+                // superseded and cancelled it. Reporting that as success would
+                // tell the user their answer decided something when a different
+                // decision is on record.
+                Ok(result) if !result.delivered => ctx.surface.line(
+                    LineKind::Notice,
+                    "that proposal was no longer open, so this answer decided nothing — \
+                     the decision on record was made elsewhere (`teton model status` shows it).",
+                ),
+                Ok(_) => {}
             }
         }
         Ok(())
@@ -418,7 +429,7 @@ pub fn ensure_connected(
     }
 
     surface.line(LineKind::Info, "no daemon reachable — starting tetond…");
-    spawn_daemon()?;
+    spawn_daemon(&paths.log)?;
 
     for _ in 0..POLL_ATTEMPTS {
         thread::sleep(POLL_INTERVAL);
@@ -428,20 +439,101 @@ pub fn ensure_connected(
             return Ok(conn);
         }
     }
-    bail!("could not reach the daemon after autostart; try running `tetond` manually")
+    // H-1 (E-4): the daemon we just spawned had no terminal, so whatever it said
+    // on the way down went to its log and nowhere else. The commonest cause by
+    // far is a config it refused to load — and that refusal is worthless if the
+    // user only ever sees "could not reach the daemon". Quote it.
+    match tail_daemon_log(&paths.log) {
+        Some(tail) => bail!(
+            "could not reach the daemon after autostart. The daemon reported:\n{tail}\n\
+             (full log: {})",
+            paths.log.display()
+        ),
+        None => bail!(
+            "could not reach the daemon after autostart, and it left no diagnostic at {}; \
+             try running `tetond` manually to see why.",
+            paths.log.display()
+        ),
+    }
+}
+
+/// How many bytes of the daemon log to quote back on an autostart failure.
+const LOG_TAIL_BYTES: u64 = 4096;
+
+/// The last few lines of the daemon's captured stderr, when it wrote any.
+///
+/// Bounded: a log that has been appended to across many runs must not be pasted
+/// into a terminal in full, and the cause of *this* failure is at the end.
+fn tail_daemon_log(log: &Path) -> Option<String> {
+    let text = read_tail(log, LOG_TAIL_BYTES)?;
+    let tail = text
+        .lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!tail.trim().is_empty()).then_some(tail)
+}
+
+/// Read at most the last `limit` bytes of `path` as lossy UTF-8.
+fn read_tail(path: &Path, limit: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > limit {
+        file.seek(SeekFrom::Start(len - limit)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Spawn a detached `tetond` process. It takes the single-instance lock itself,
 /// so a redundant spawn is harmless (the extra process exits cleanly).
-fn spawn_daemon() -> anyhow::Result<()> {
+///
+/// Its stderr goes to `log` rather than `/dev/null` (E-4). A daemon started this
+/// way has no terminal, so discarding stderr discarded every reason it could give
+/// for failing to come up — including the config refusal H-1 added, which every
+/// existing user carrying REQ-544's hard-deprecated `pinned_local_model` key hits
+/// on their first start. Appending (not truncating) keeps the previous run's
+/// explanation if this one dies before writing its own.
+fn spawn_daemon(log: &Path) -> anyhow::Result<()> {
     let binary = daemon_binary_path();
     Command::new(&binary)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(daemon_log_sink(log))
         .spawn()
         .map_err(|e| anyhow!("failed to start daemon `{}`: {e}", binary.display()))?;
     Ok(())
+}
+
+/// Size past which the daemon log is restarted rather than appended to.
+///
+/// Appending keeps the previous run's explanation when this one dies before
+/// writing its own; a cap keeps that from becoming an unbounded file in the
+/// user's state directory. Only the tail is ever read, so nothing of value is
+/// lost by starting over.
+const LOG_MAX_BYTES: u64 = 256 * 1024;
+
+/// The stderr sink for a spawned daemon: the log file, or `/dev/null` if it
+/// cannot be opened (a daemon that cannot log is still a daemon worth starting).
+fn daemon_log_sink(log: &Path) -> Stdio {
+    if let Some(parent) = log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let oversized = std::fs::metadata(log).is_ok_and(|meta| meta.len() > LOG_MAX_BYTES);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(!oversized)
+        .write(oversized)
+        .truncate(oversized)
+        .open(log)
+        .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
 /// Locate the `tetond` binary: next to this executable if present, else on PATH.
@@ -561,6 +653,28 @@ mod tests {
         );
     }
 
+    /// The stub daemon's deadlock backstop: how long it will block on any single
+    /// socket operation before giving up (E-10).
+    ///
+    /// Both sides of this test block: the client waits for a response only the
+    /// stub can send, and the stub waits for a line only the client can send. Any
+    /// bug that breaks that lock-step wedges both threads — and because the
+    /// client's reader thread holds a dup of the socket, dropping the connection
+    /// does not give the stub an EOF either. Untimed, `join()` would then hang
+    /// until CI killed the whole job, hiding a real failure behind a job timeout.
+    /// Long enough that a loaded runner never trips it; short enough to be a test
+    /// failure rather than an outage.
+    const STUB_IO_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// How long the stub waits for *more* traffic after the client has answered.
+    ///
+    /// The exchange is over at that point, so the backstop above would otherwise
+    /// be paid in full on every green run. The window still has to be wide enough
+    /// to catch the failure this test is about: a client that prompts twice sends
+    /// its second `model/confirm` microseconds after the first, so a duplicate
+    /// cannot slip out after the stub stops listening.
+    const STUB_IDLE_GRACE: Duration = Duration::from_millis(500);
+
     /// A stub daemon that hands the *same* proposal to a client twice — once as
     /// the broadcast event, once on the `model/status` it answers next — and
     /// records every request the client sent back.
@@ -572,6 +686,12 @@ mod tests {
         let listener = UnixListener::bind(&socket).expect("bind the stub daemon socket");
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("a client connects");
+            stream
+                .set_read_timeout(Some(STUB_IO_TIMEOUT))
+                .expect("the stub socket accepts a read timeout");
+            stream
+                .set_write_timeout(Some(STUB_IO_TIMEOUT))
+                .expect("the stub socket accepts a write timeout");
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut writer = BufWriter::new(stream);
             let proposal = serde_json::json!({
@@ -638,6 +758,15 @@ mod tests {
                     writeln!(writer, "{response}").unwrap();
                 }
                 writer.flush().unwrap();
+                if method == methods::ModelConfirmParams::METHOD {
+                    // The client has answered, so the conversation is over and
+                    // the long backstop has nothing left to protect. Drop to the
+                    // grace window: a duplicate answer would already be on its
+                    // way, and a green run should not pay 20 seconds to prove one
+                    // never came. (A socket option applies to the socket, so this
+                    // reaches the reader's dup of it too.)
+                    let _ = writer.get_ref().set_read_timeout(Some(STUB_IDLE_GRACE));
+                }
             }
             seen
         })

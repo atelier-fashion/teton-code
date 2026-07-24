@@ -127,11 +127,18 @@ pub fn render_proposal(proposal: &ModelSelectionProposed, surface: &mut dyn Surf
             surface.line(
                 LineKind::Info,
                 &format!(
-                    "  proposed: {} [{}] — {} download, needs {} RAM, {} free disk to install",
+                    "  proposed: {} [{}] — {} download, needs {} RAM{}, {} free disk to install",
                     entry.name,
                     tier_label(entry.band),
                     format_bytes(entry.size_bytes),
                     format_bytes(entry.ram_floor_bytes),
+                    // E-1: the alternatives carry this flag and the *proposed*
+                    // entry did not — yet the proposed entry is the one a single
+                    // Enter installs. A `[local_model] pinned` key overrides the
+                    // probe unconditionally, so the proposal can name an entry
+                    // this machine cannot hold; the line that says so must be the
+                    // line the user is answering.
+                    above_ram_flag(entry, proposal.probe.total_ram_bytes),
                     format_bytes(proposed.required_disk_bytes),
                 ),
             );
@@ -255,24 +262,42 @@ pub fn render_alternatives(
     }
 }
 
-/// One catalog entry as a single line, annotated with its fit for this machine.
+/// The above-the-floor annotation for `entry` on this machine, or `""`.
+///
+/// One function so the proposed entry and every alternative are flagged by the
+/// same rule — the proposed line used to omit it, which is the one line a single
+/// keystroke acts on (E-1).
+#[must_use]
+fn above_ram_flag(entry: &CatalogEntryView, total_ram_bytes: u64) -> &'static str {
+    if entry.ram_floor_bytes > total_ram_bytes {
+        " — ABOVE this machine's RAM"
+    } else {
+        ""
+    }
+}
+
+/// One catalog entry as a single line, annotated with its fit for this machine
+/// and with **who published it**.
 ///
 /// An entry above the machine's RAM is shown rather than hidden (BR-3: the user's
 /// machine is the user's call) but is labelled so the extra confirmation it needs
 /// is never a surprise.
+///
+/// The publisher is here for the same reason it is on the proposed line (H-2 /
+/// E-7): this is the text the override menu is built from, so choosing entry `2`
+/// approves a multi-gigabyte transfer from whoever quantized it. Naming the
+/// source only for the daemon's own pick left the *deliberate* choice — the one
+/// the user typed a number for — as the blind one.
 #[must_use]
 pub fn entry_summary(entry: &CatalogEntryView, total_ram_bytes: u64) -> String {
-    let fit = if entry.ram_floor_bytes > total_ram_bytes {
-        " — ABOVE this machine's RAM"
-    } else {
-        ""
-    };
     format!(
-        "{} [{}] — {} download, needs {} RAM{fit}",
+        "{} [{}] — {} download, needs {} RAM{} — from {}",
         entry.name,
         tier_label(entry.band),
         format_bytes(entry.size_bytes),
         format_bytes(entry.ram_floor_bytes),
+        above_ram_flag(entry, total_ram_bytes),
+        provenance_line(entry),
     )
 }
 
@@ -571,6 +596,72 @@ mod tests {
         let ram = 16 * 1024 * 1024 * 1024;
         assert!(!entry_summary(&fits, ram).contains("ABOVE"));
         assert!(entry_summary(&over, ram).contains("ABOVE this machine's RAM"));
+    }
+
+    /// H-2 / E-7: the override menu is built from these lines, so choosing an
+    /// alternative approves a multi-gigabyte transfer from whoever published it.
+    /// Naming the source only on the proposed line left the *deliberate* choice
+    /// as the blind one.
+    #[test]
+    fn every_alternative_names_its_publisher_not_only_the_proposed_entry() {
+        let mut surface = RecordingSurface::new();
+        render_proposal(&proposal(), &mut surface);
+        let text = surface.lines_of(LineKind::Info).join("\n");
+
+        // The over-sized 30B alternative — the one an override menu makes it
+        // easiest to pick by accident — names its repo on its own line.
+        let line = text
+            .lines()
+            .find(|line| line.contains("qwen3-coder-30b"))
+            .unwrap_or_else(|| panic!("the over-sized alternative is not rendered: {text}"));
+        assert!(
+            line.contains("Qwen/qwen3-coder-30b-GGUF"),
+            "the alternative does not say who published it: {line}"
+        );
+        assert!(
+            line.contains("huggingface.co"),
+            "the alternative does not say what host it comes from: {line}"
+        );
+        // Still legibility, not a URL (BR-11).
+        assert!(!text.contains("://"), "a URL was rendered: {text}");
+    }
+
+    /// E-1: the proposed line is the one a single Enter installs, so it carries
+    /// the same above-the-floor flag its alternatives do.
+    ///
+    /// A `[local_model] pinned` key overrides the probe unconditionally, so the
+    /// proposal can name an entry this machine cannot hold — and the annotation
+    /// used to appear on every line *except* that one.
+    #[test]
+    fn a_proposed_entry_above_this_machines_ram_is_flagged_on_its_own_line() {
+        let mut pinned = proposal();
+        // The pinned-oversized case: the 30B entry, proposed.
+        pinned.proposed = Some(teton_protocol::events::ProposedModel {
+            entry: crate::model_ui::testing::oversized_entry(),
+            required_disk_bytes: 19_000_000_000,
+        });
+        let mut surface = RecordingSurface::new();
+        render_proposal(&pinned, &mut surface);
+        let text = surface.lines_of(LineKind::Info).join("\n");
+        let line = text
+            .lines()
+            .find(|line| line.contains("proposed:"))
+            .unwrap_or_else(|| panic!("no proposed line: {text}"));
+        assert!(
+            line.contains("ABOVE this machine's RAM"),
+            "the proposed entry needs more RAM than this machine has and the line \
+             the user answers must say so: {line}"
+        );
+
+        // And the ordinary case is not decorated with a warning it has not earned.
+        let mut surface = RecordingSurface::new();
+        render_proposal(&proposal(), &mut surface);
+        let text = surface.lines_of(LineKind::Info).join("\n");
+        let line = text
+            .lines()
+            .find(|line| line.contains("proposed:"))
+            .expect("no proposed line");
+        assert!(!line.contains("ABOVE"), "{line}");
     }
 
     #[test]

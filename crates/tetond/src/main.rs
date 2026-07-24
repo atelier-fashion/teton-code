@@ -65,13 +65,22 @@ fn main() -> anyhow::Result<ExitCode> {
         .unwrap_or_else(std::env::temp_dir);
 
     runtime.block_on(async move {
-        let listener = server::bind_listener(&paths.socket)?;
-        eprintln!("tetond listening on {}", paths.socket.display());
         // Assemble the runtime (local tier, providers, cost ledger, MCP) from
         // config and the environment, sharing the event bus so cost and privacy
         // events reach attached clients.
+        //
+        // H-1 (E-4): this happens **before** the socket is bound, and the order
+        // is load-bearing. `from_env` refuses to start on a present-but-invalid
+        // config rather than falling open to an empty one — but bound first, a
+        // client's `connect` succeeded into the listen backlog and then died at
+        // the handshake with a bare EOF, so the diagnostic the refusal exists to
+        // deliver never reached anyone. With no socket, the CLI's autostart poll
+        // fails cleanly and reports the daemon's own stderr instead.
         let events = Arc::new(EventBus::new());
         let daemon_runtime = Arc::new(DaemonRuntime::from_env(&base_dir, &events)?);
+
+        let listener = server::bind_listener(&paths.socket)?;
+        eprintln!("tetond listening on {}", paths.socket.display());
 
         // REQ-547 BR-1/D-3: drive the first-run consent flow on its own task. It
         // may await a client's `model/confirm` indefinitely, and while it does

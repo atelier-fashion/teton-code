@@ -448,3 +448,77 @@ fn teton_model_list_renders_the_catalog_and_each_entry_fit() {
         "declining the warning must leave the selection alone; output:\n{after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// H-1 / E-4 — a refused config reaches the person who has to fix it
+// ---------------------------------------------------------------------------
+
+/// A daemon that refuses its config must say so *to the user*, through the CLI
+/// that started it.
+///
+/// H-1 made a present-but-invalid config a refusal instead of a silent fall-open
+/// to `Config::default()` — but the refusal was invisible from where it mattered.
+/// Two things hid it, and both are fixed here: the daemon bound its socket
+/// *before* loading the config, so the CLI's `connect` succeeded into the listen
+/// backlog and then died at the handshake with a bare EOF; and the CLI spawned
+/// the daemon with `stderr` on `/dev/null`, so the diagnostic went nowhere. That
+/// combination is what every existing REQ-544 user with a top-level
+/// `pinned_local_model` key would have hit on their first start after this REQ
+/// hard-deprecated it: a daemon that will not start and a CLI that cannot say
+/// why.
+///
+/// This test uses that exact key, and never spawns `tetond` itself — the CLI's
+/// own autostart path is the thing under test.
+#[test]
+fn a_refused_config_is_reported_by_the_cli_that_autostarted_the_daemon() {
+    let tetond = tetond_bin();
+    if !tetond.exists() {
+        let _ = std::io::stderr()
+            .write_all(b"skipping CLI e2e: tetond binary not built (run under --workspace)\n");
+        return;
+    }
+
+    let root = PathBuf::from("/tmp").join(format!("tcbad{:x}", std::process::id()));
+    let runtime_dir = root.join("x");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let config_path = root.join("config.toml");
+    // REQ-544's key, hard-deprecated by DECISION 2. Under REQ-544 it meant
+    // "override the probe's pick"; it is now a validation error pointing at the
+    // replacement.
+    std::fs::write(&config_path, "pinned_local_model = \"qwen2.5-coder-3b\"\n").unwrap();
+
+    // `cost` (unlike `doctor`, which only *reports* whether a daemon is up) goes
+    // through `ensure_connected`, which is the autostart path under test.
+    let output = Command::new(teton_bin())
+        .arg("cost")
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("TETON_CONFIG", &config_path)
+        .env("TETON_REPO_ROOT", &root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run teton cost");
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        combined.contains("could not reach the daemon"),
+        "the CLI must report the autostart failure; output:\n{combined}"
+    );
+    assert!(
+        combined.contains("The daemon reported:"),
+        "the CLI must quote the daemon's own diagnostic rather than guessing; \
+         output:\n{combined}"
+    );
+    assert!(
+        combined.contains("configuration is present but invalid"),
+        "the quoted diagnostic must be the config refusal itself; output:\n{combined}"
+    );
+    assert!(
+        combined.contains("pinned_local_model"),
+        "and it must name the key the user has to change; output:\n{combined}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

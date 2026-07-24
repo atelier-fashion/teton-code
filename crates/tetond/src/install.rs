@@ -456,6 +456,15 @@ impl WeightsInstall {
         ) {
             return InstallError::Corrupt;
         }
+        // M-11: `open_partial` opens the `.part` with `O_NOFOLLOW`, so an `ELOOP`
+        // means the predictable partial path *was a symlink* — the cross-user
+        // create/append primitive that flag exists to refuse. Like the digest
+        // check above it is decided before the transport is consulted, because it
+        // is a statement about the filesystem: reporting it as a network failure
+        // would send the user to check their connection over a planted symlink.
+        if is_symlink_refusal(error) {
+            return InstallError::UntrustedWeightsDir;
+        }
         match self.cause.as_ref().and_then(|cause| cause.last_cause()) {
             // HTTP 416 (Range Not Satisfiable) on a resume means the offset our
             // `.part` reached is past the resource's actual end: the catalog size
@@ -544,9 +553,21 @@ impl WeightsInstaller for WeightsInstall {
 
         let partial = self.partial_path(entry);
 
-        // Already installed and still attested: nothing to fetch, and no reason
-        // to hold the install to a disk requirement it has already met.
-        if self.status(entry) == InstallStatus::Verified {
+        // Already installed and still *provably* the catalog's bytes: nothing to
+        // fetch, and no reason to hold the install to a disk requirement it has
+        // already met.
+        //
+        // M-10 (E-2): this reads the bytes (`deep_status`), never the receipt.
+        // The receipt is keyed on (digest, size, mtime) and mtime is settable —
+        // `utimensat(2)` needs nothing but write access to the file — so a forged
+        // receipt beside a same-sized impostor makes `status()` answer `verified`
+        // for bytes that are not the catalog's. Trusting it here would turn the
+        // install into a no-op that then publishes a completed install and
+        // un-gates the tier over attacker-chosen weights. This is a once-per-
+        // decision path that already runs on the blocking pool, so re-digesting
+        // costs a hash the daemon was about to spend downloading anyway; the
+        // cheap receipt-backed `status()` still serves the per-attach reads.
+        if self.deep_status(entry) == InstallStatus::Verified {
             // A `.part` left over from an interrupted attempt that a *later* run
             // completed some other way is now dead weight beside verified
             // weights — nothing will ever resume it. Reclaim the space.
@@ -786,8 +807,14 @@ fn cached_verdict(
 }
 
 /// Write the receipt for a just-checked `installed` file, recording `verdict`.
+///
 /// Best-effort: a receipt that cannot be written costs a re-digest on the next
-/// read, never correctness.
+/// read, never correctness. Written to a temporary file and `rename`d into place
+/// — the same tmp+rename [`crate::selection_store`] uses — so a crash or a full
+/// volume mid-write leaves either the old receipt or none, never a half-written
+/// one. The truncated form would parse-fail and be discarded anyway, so this buys
+/// tidiness rather than safety; it costs two lines, and "the file at this path is
+/// always a whole record" is a cheaper invariant to hold than to reason about.
 fn write_receipt(receipt: &Path, installed: &Path, entry: &ModelEntry, verdict: ReceiptVerdict) {
     let Ok(meta) = std::fs::metadata(installed) else {
         return;
@@ -798,8 +825,33 @@ fn write_receipt(receipt: &Path, installed: &Path, entry: &ModelEntry, verdict: 
         modified_ns: modified_ns(&meta),
         verdict,
     };
-    if let Ok(text) = serde_json::to_string(&record) {
-        let _ = std::fs::write(receipt, text);
+    let Ok(text) = serde_json::to_string(&record) else {
+        return;
+    };
+    let temp = receipt.with_extension("tmp");
+    if std::fs::write(&temp, text).is_ok() && std::fs::rename(&temp, receipt).is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+}
+
+/// Whether `error` is the `O_NOFOLLOW` refusal to open a symlinked `.part`.
+///
+/// `ELOOP` is what the kernel returns when `O_NOFOLLOW` meets a symlink at the
+/// final path component — here, the predictable partial path (M-11). On the rare
+/// platform that reports `EMLINK` for the same condition, that reads the same
+/// way.
+fn is_symlink_refusal(error: &DownloadError) -> bool {
+    let DownloadError::Io(err) = error else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
     }
 }
 
@@ -1331,6 +1383,145 @@ mod tests {
 
         install.install(&model).expect("already installed");
         assert_eq!(install.status(&model), InstallStatus::Verified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The forgery M-10 describes, built exactly as an attacker would: an
+    /// impostor file of the right *size*, and a receipt beside it whose every
+    /// field is public or settable — the catalog's published digest, the file's
+    /// real length, and its real mtime (which `utimensat(2)` can set to anything,
+    /// but does not even need to here). This is why the receipt is a cache and
+    /// not an attestation.
+    fn forge_receipt(install: &WeightsInstall, model: &ModelEntry, impostor: &[u8]) -> PathBuf {
+        let installed = install.installed_path(model);
+        std::fs::write(&installed, impostor).unwrap();
+        write_receipt(
+            &install.receipt_path(model),
+            &installed,
+            model,
+            ReceiptVerdict::Verified,
+        );
+        installed
+    }
+
+    /// M-10 (E-2): a forged **positive** receipt fools the cheap read — and must
+    /// not fool anything that matters.
+    ///
+    /// `install()` used to short-circuit on `status()`, so this forgery turned the
+    /// install into a no-op that then reported success: the gate published a
+    /// completed install and un-gated the local tier over bytes the daemon had
+    /// never verified. The install now decides from the bytes.
+    #[test]
+    fn a_forged_receipt_is_believed_by_status_refuted_by_deep_status_and_ignored_by_install() {
+        let dir = temp_dir("forged-receipt");
+        let model = entry();
+        // Right size, wrong bytes — a wrong length would be caught by the cheap
+        // size check alone and would prove nothing about the receipt.
+        let impostor = b"WEIGHTS".to_vec();
+        assert_eq!(impostor.len(), BODY.len());
+        assert_ne!(impostor.as_slice(), BODY);
+
+        let install = WeightsInstall::new(Arc::new(WholeFetcher(BODY.to_vec())), dir.clone(), None)
+            .with_free_space(Arc::new(FixedFreeSpace(Some(u64::MAX))));
+        let installed = forge_receipt(&install, &model, &impostor);
+
+        assert_eq!(
+            install.status(&model),
+            InstallStatus::Verified,
+            "the receipt-backed read believes the forgery — that is the blind spot, \
+             and the reason nothing security-relevant may depend on it"
+        );
+        assert_eq!(
+            install.deep_status(&model),
+            InstallStatus::Corrupt,
+            "the bytes themselves refute it"
+        );
+
+        install
+            .install(&model)
+            .expect("the install runs rather than short-circuiting on the forged receipt");
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            BODY,
+            "the impostor bytes must have been replaced by the catalog's"
+        );
+        assert_eq!(install.deep_status(&model), InstallStatus::Verified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same forgery, on a host that cannot supply the real artifact: the
+    /// install must **refuse**, not inherit the receipt's claim. A returned `Ok`
+    /// here is what would un-gate the tier over attacker-chosen weights.
+    #[test]
+    fn a_forged_receipt_cannot_make_an_unverifiable_install_report_success() {
+        let dir = temp_dir("forged-receipt-fail");
+        let model = entry();
+        let impostor = b"WEIGHTS".to_vec();
+
+        let recorder = Arc::new(Recorder::default());
+        // The host serves the impostor too, so nothing anywhere can satisfy the
+        // pinned digest.
+        let install =
+            WeightsInstall::new(Arc::new(WholeFetcher(impostor.clone())), dir.clone(), None)
+                .with_free_space(Arc::new(FixedFreeSpace(Some(u64::MAX))))
+                .with_progress(Arc::clone(&recorder) as Arc<dyn InstallProgress>);
+        forge_receipt(&install, &model, &impostor);
+
+        assert_eq!(
+            install
+                .install(&model)
+                .expect_err("the install must refuse"),
+            InstallError::Corrupt
+        );
+        let steps = recorder.0.lock().unwrap().clone();
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, InstallStep::Installed { .. })),
+            "a refused install must not announce an installed model; got {steps:?}"
+        );
+        assert_eq!(
+            install.deep_status(&model),
+            InstallStatus::Corrupt,
+            "and the bytes on disk are still not the catalog's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M-11: a symlink planted at the predictable `.part` path is refused —
+    /// and refused *as what it is*.
+    ///
+    /// `O_NOFOLLOW` already stopped the write; the classification is the fix
+    /// here. Reported as a `Network` failure it read as "your connection is
+    /// broken", which sends the user to restart their router while an attacker's
+    /// symlink sits in their state directory. It is also the difference between a
+    /// message that says "retry" and one that says "check the permissions on the
+    /// daemon state directory".
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_partial_path_is_refused_as_untrusted_not_as_a_network_failure() {
+        let dir = temp_dir("symlink-part");
+        let model = entry();
+        let install = WeightsInstall::new(Arc::new(WholeFetcher(BODY.to_vec())), dir.clone(), None)
+            .with_free_space(Arc::new(FixedFreeSpace(Some(u64::MAX))));
+
+        let partial = install.partial_path(&model);
+        std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        // What a co-resident user plants on a world-writable base: the `.part`
+        // path, pointing somewhere they want the daemon's bytes to land.
+        let victim = dir.join("victim");
+        std::os::unix::fs::symlink(&victim, &partial).unwrap();
+
+        assert_eq!(
+            install
+                .install(&model)
+                .expect_err("a symlinked .part must be refused"),
+            InstallError::UntrustedWeightsDir
+        );
+        assert!(
+            !victim.exists(),
+            "not one byte may be written through the planted symlink"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

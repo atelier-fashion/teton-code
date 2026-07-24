@@ -168,8 +168,13 @@ impl PendingModelDecisions {
     /// decision is now on record", rather than letting a later `Accept` overwrite
     /// the user's `model/set` choice. A stale `model/confirm` that arrives after
     /// the cancel finds no waiter and is a harmless no-op, exactly like a duplicate
-    /// answer. Returns the cancelled proposal (at most one is ever outstanding) for
-    /// the caller to inspect or log.
+    /// answer.
+    ///
+    /// Returns the cancelled proposal (at most one is ever outstanding), and the
+    /// caller is expected to *use* it: [`ModelConsentGate::set_model`] announces
+    /// its own decision under the cancelled `request_id`, so a client parked on
+    /// that prompt is told what became of it instead of rendering a question whose
+    /// waiter no longer exists (E-8).
     pub fn cancel(&self) -> Option<ModelSelectionProposed> {
         let mut waiters = self
             .waiters
@@ -928,8 +933,32 @@ impl ModelConsentGate {
                 // receipt-backed `status` still serves the non-security-critical
                 // attach/status path (Group B). The tier must not open on a
                 // forgeable receipt alone.
-                if self.installer.deep_status(entry) == InstallStatus::Verified {
-                    return ConsentOutcome::Ready { selection };
+                //
+                // M-3 (E-3): that digest reads multiple gigabytes *synchronously*,
+                // and `resolve` is an `async fn` on a tokio worker — so it runs on
+                // the blocking pool, exactly like the install itself. Doing it
+                // inline would park a runtime thread for the whole hash on every
+                // start, which is the defect `status`'s receipt cache exists to
+                // avoid on the attach path.
+                let installer = Arc::clone(&self.installer);
+                let target = entry.clone();
+                let verified = matches!(
+                    tokio::task::spawn_blocking(move || installer.deep_status(&target)).await,
+                    Ok(InstallStatus::Verified)
+                );
+                if verified {
+                    // M-1 (E-5): verified weights are not a running tier. Whether
+                    // the tier may serve depends on something the bytes cannot
+                    // supply — an engine to load them — so this reports exactly
+                    // what `report_install_success` reports for the same state,
+                    // rather than a `Ready` the daemon could not honour.
+                    return if self.local_engine_present {
+                        ConsentOutcome::Ready { selection }
+                    } else {
+                        ConsentOutcome::InstalledNoEngine {
+                            model_name: entry.name.clone(),
+                        }
+                    };
                 }
             }
             // Missing, corrupt, or no-longer-catalogued weights: BR-10's one
@@ -1037,16 +1066,38 @@ impl ModelConsentGate {
                 ConsentOutcome::Declined
             }
             ModelConfirmOutcome::Accept => {
-                let Some(entry) = proposed_name
-                    .as_deref()
-                    .and_then(|name| self.catalog.get(name))
-                else {
+                let Some(name) = proposed_name.as_deref() else {
                     return ConsentOutcome::Refused {
                         refusal: ChoiceRefusal::NothingToAccept,
                     };
                 };
-                self.commit(entry, SelectionSource::Probe, Some(request_id))
-                    .await
+                // BR-3 (E-1): an `accept` is the cheapest answer in the system —
+                // one keystroke, and the client's question defaults to yes. It
+                // must therefore be held to the SAME floor check as a `choose`,
+                // because the proposal can name an entry above this machine's
+                // RAM: `probe::decide` honours a `[local_model] pinned` key
+                // unconditionally (REQ-544 BR-9), and since C-1 that pin reaches
+                // the user as the *proposed* model rather than a silent commit.
+                // Without this, a pin naming the 30B entry on a 16 GiB machine
+                // turned one Enter into an 18 GB fetch and BR-3's second
+                // confirmation was never asked for. `accept` carries no second
+                // confirmation by construction, so it is validated with
+                // `confirmed_above_ram_floor: false`; the client re-sends the
+                // same entry as a `choose` once the user has confirmed twice.
+                match validate_choice(&self.catalog, &self.profile, name, false) {
+                    Ok(entry) => {
+                        // The pin is what chose this model, so the record says so
+                        // rather than crediting the probe it overrode.
+                        let source = match &decision {
+                            TierDecision::Selected { pinned: true, .. } => {
+                                SelectionSource::ConfigPin
+                            }
+                            _ => SelectionSource::Probe,
+                        };
+                        self.commit(entry, source, Some(request_id)).await
+                    }
+                    Err(refusal) => ConsentOutcome::Refused { refusal },
+                }
             }
             ModelConfirmOutcome::Choose {
                 name,
@@ -1095,7 +1146,7 @@ impl ModelConsentGate {
         // outstanding first-run proposal. Cancel it *before* recording, so a
         // late `Accept` for the old proposal finds no waiter and cannot overwrite
         // this choice with a different model.
-        self.pending.cancel();
+        let cancelled = self.pending.cancel();
         let selection =
             ModelSelection::accepted(entry.name.clone(), SelectionSource::UserOverride, now_ms());
         // M-6: a decision the daemon could not persist must not vanish silently —
@@ -1104,7 +1155,14 @@ impl ModelConsentGate {
         if let Err(err) = self.store.record(&selection) {
             report_persist_failure("model/set selection", &err);
         }
-        self.announce(&selection, None);
+        // E-8: when this superseded an open proposal, the decided event carries
+        // that proposal's `request_id`. A client parked on it is otherwise never
+        // told what became of its prompt — it would keep rendering a question
+        // whose waiter no longer exists, and a `model/confirm` answering it would
+        // be silently dropped. Naming the cancelled id is what lets the client
+        // correlate "the thing I asked" with "the decision that was actually
+        // made".
+        self.announce(&selection, cancelled.map(|open| open.request_id));
         Ok(selection)
     }
 
@@ -1161,9 +1219,8 @@ impl ModelConsentGate {
         // M-2: claim this entry before touching its `.part`. If another install
         // of the same entry already holds the claim, this one does nothing — two
         // installs appending to one shared partial file would interleave bytes
-        // and fail the digest. The claim is released when `_guard` drops, so a
-        // panic in the blocking task cannot strand it.
-        let Some(_guard) = self.claim_install(&entry.name) else {
+        // and fail the digest.
+        let Some(guard) = self.claim_install(&entry.name) else {
             return ConsentOutcome::AlreadyInstalling {
                 model_name: entry.name.clone(),
             };
@@ -1171,7 +1228,19 @@ impl ModelConsentGate {
 
         let installer = Arc::clone(&self.installer);
         let target = entry.clone();
-        let result = tokio::task::spawn_blocking(move || installer.install(&target)).await;
+        // E-9: the guard is moved INTO the blocking closure, so the claim's
+        // lifetime tracks the *work* rather than this future. `spawn_blocking`
+        // work is not cancellable: if this future were dropped — the task
+        // aborted, the daemon shutting down — a guard held out here would drop
+        // immediately and release the claim while the installer thread was still
+        // appending to the shared `.part`, which is precisely the interleaving
+        // M-2 exists to prevent. Held inside, it is released when the installer
+        // returns or unwinds, so a panic still cannot strand the claim.
+        let result = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            installer.install(&target)
+        })
+        .await;
 
         match result {
             Ok(Ok(())) => self.report_install_success(entry, selection),
@@ -1217,11 +1286,27 @@ impl ModelConsentGate {
     /// "the exact untruth this function exists to stop", so the daemon publishes
     /// `disabled` with the no-engine reason instead — matching what a later attach
     /// would independently report.
+    ///
+    /// It also re-reads the store: a `model/set` is allowed at any moment, so the
+    /// decision can have moved *while this install ran*. Un-gating the tier for
+    /// weights that are no longer the recorded selection would open it for a model
+    /// the daemon is not going to load, and publish a terminal stage for a
+    /// decision nobody holds. That is the same "another task is the authority
+    /// here" shape as [`ConsentOutcome::Superseded`], so it is reported the same
+    /// way — leaving the gate to the `model/set` install that now owns it.
     fn report_install_success(
         &self,
         entry: &ModelEntry,
         selection: ModelSelection,
     ) -> ConsentOutcome {
+        let still_selected = self
+            .store
+            .current()
+            .and_then(|current| current.model_name)
+            .is_some_and(|name| name == entry.name);
+        if !still_selected {
+            return ConsentOutcome::Superseded;
+        }
         if self.local_engine_present {
             self.events.publish(
                 None,
@@ -1288,6 +1373,11 @@ impl ModelConsentGate {
 /// A guard rather than an explicit remove at each `run_install` return so that a
 /// panic in the blocking install task — or any early return — cannot leave the
 /// entry marked in-flight forever, which would wedge every future install of it.
+///
+/// It is deliberately owned by the **blocking closure**, not by the `run_install`
+/// future (E-9). The claim protects a file the installer thread is writing, and
+/// that thread cannot be cancelled — so the claim has to outlive a cancelled
+/// future, which it can only do from inside the work it is guarding.
 struct InFlightGuard {
     installing: Arc<Mutex<HashSet<String>>>,
     name: String,

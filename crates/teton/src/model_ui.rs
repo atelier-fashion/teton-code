@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
-use teton_protocol::events::{CatalogEntryView, ModelSelectionProposed};
+use teton_protocol::events::{CatalogEntryView, ModelSelectionProposed, ProposedModel};
 use teton_protocol::methods::{
     InstallStatus, ModelConfirmOutcome, ModelConfirmParams, ModelListEntry, ModelListResult,
     ModelSelectionView, ModelStatusResult,
@@ -59,7 +59,12 @@ pub fn resolve_proposal(
     let request_id = &proposal.request_id;
 
     if auto_accept {
-        return auto_accepted(request_id, proposal.proposed.is_some(), surface);
+        return auto_accepted(
+            request_id,
+            proposal.proposed.as_ref(),
+            proposal.probe.total_ram_bytes,
+            surface,
+        );
     }
 
     // The proposal's own question first — REQ-544's `confirm_model`, finally
@@ -71,7 +76,22 @@ pub fn resolve_proposal(
             Some(proposed.entry.size_bytes),
             prompter,
         ) {
-            return Some(confirm(request_id, ModelConfirmOutcome::Accept));
+            match accept_outcome(
+                &proposed.entry,
+                proposal.probe.total_ram_bytes,
+                surface,
+                prompter,
+            ) {
+                Some(outcome) => return Some(confirm(request_id, outcome)),
+                // The proposed entry needs more RAM than this machine has and the
+                // user backed out of that warning. Falling through to the menu is
+                // the same thing a "no" to the question above does — it offers
+                // the smaller entries — and it is emphatically not a decline.
+                None => surface.line(
+                    LineKind::Notice,
+                    &format!("not installing {}; nothing was sent.", proposed.entry.name),
+                ),
+            }
         }
     }
 
@@ -115,24 +135,76 @@ pub fn resolve_outstanding(
 /// (sessions run remote-only, BR-1) rather than being answered with a `decline`
 /// the user never asked for — a decline is persisted and suppresses re-prompting
 /// (BR-4), which is far too big a consequence to infer from a `--yes`.
+///
+/// An above-the-RAM-floor pick is left open for the opposite reason: BR-3 wants a
+/// *second* confirmation for it, and `--yes` is one flag, not two answers (E-1).
+/// `--yes` means "do not ask me about the ordinary case"; it cannot stand in for
+/// the deliberation the oversized case exists to force.
 fn auto_accepted(
     request_id: &RequestId,
-    has_proposal: bool,
+    proposed: Option<&ProposedModel>,
+    total_ram_bytes: u64,
     surface: &mut dyn Surface,
 ) -> Option<ModelConfirmParams> {
-    if has_proposal {
+    let Some(proposed) = proposed else {
         surface.line(
             LineKind::Notice,
-            "auto-accept: installing the proposed model without prompting (BR-5).",
+            "auto-accept: no catalog entry fits this machine, so there is nothing to accept — \
+             the proposal stays open and sessions run remote-only.",
         );
-        return Some(confirm(request_id, ModelConfirmOutcome::Accept));
+        return None;
+    };
+    if proposed.entry.ram_floor_bytes > total_ram_bytes {
+        surface.line(
+            LineKind::Notice,
+            &format!(
+                "auto-accept declined to answer: the proposed model {} needs {} RAM and this \
+                 machine has {}. An over-sized install needs a second, explicit confirmation \
+                 (BR-3), which `--yes` is not — the proposal stays open. Answer it \
+                 interactively, or choose it deliberately with `teton model set {}`.",
+                proposed.entry.name,
+                firstrun::format_bytes(proposed.entry.ram_floor_bytes),
+                firstrun::format_bytes(total_ram_bytes),
+                proposed.entry.name,
+            ),
+        );
+        return None;
     }
     surface.line(
         LineKind::Notice,
-        "auto-accept: no catalog entry fits this machine, so there is nothing to accept — the \
-         proposal stays open and sessions run remote-only.",
+        "auto-accept: installing the proposed model without prompting (BR-5).",
     );
-    None
+    Some(confirm(request_id, ModelConfirmOutcome::Accept))
+}
+
+/// Turn a "yes, install the proposed model" into the outcome to send, gating an
+/// above-the-floor proposal on BR-3's second confirmation (E-1).
+///
+/// The confirmed answer is a `choose`, not an `accept`: `accept` carries no
+/// `confirmed_above_ram_floor` flag by construction, so it is the one answer the
+/// daemon cannot honour for an over-sized entry. Naming the same entry through
+/// `choose` is how the confirmation reaches the wire — and the daemon leaves the
+/// proposal open on the refused `accept` precisely so this re-send works.
+fn accept_outcome(
+    entry: &CatalogEntryView,
+    total_ram_bytes: u64,
+    surface: &mut dyn Surface,
+    prompter: &mut dyn Prompter,
+) -> Option<ModelConfirmOutcome> {
+    if entry.ram_floor_bytes <= total_ram_bytes {
+        return Some(ModelConfirmOutcome::Accept);
+    }
+    confirm_above_ram_floor(
+        &entry.name,
+        entry.ram_floor_bytes,
+        total_ram_bytes,
+        surface,
+        prompter,
+    )
+    .then(|| ModelConfirmOutcome::Choose {
+        name: entry.name.clone(),
+        confirmed_above_ram_floor: true,
+    })
 }
 
 /// The override menu: pick an entry, decline the local tier, or leave it open.
@@ -623,6 +695,104 @@ mod tests {
             }
         );
         assert_eq!(prompter.asked, 3, "proposal, menu, second confirmation");
+    }
+
+    /// A proposal whose *proposed* entry is over-sized — the pinned-oversized
+    /// case a `[local_model] pinned` key produces.
+    fn oversized_proposal() -> ModelSelectionProposed {
+        let mut proposal = proposal();
+        proposal.proposed = Some(ProposedModel {
+            entry: super::testing::oversized_entry(),
+            required_disk_bytes: 19_000_000_000,
+        });
+        proposal
+    }
+
+    fn answer_oversized(
+        answers: &[&str],
+        auto_accept: bool,
+    ) -> (
+        Option<ModelConfirmParams>,
+        RecordingSurface,
+        ScriptedPrompter,
+    ) {
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(answers);
+        let reply = resolve_proposal(
+            &oversized_proposal(),
+            auto_accept,
+            &mut surface,
+            &mut prompter,
+        );
+        (reply, surface, prompter)
+    }
+
+    /// E-1: saying yes to an over-sized *proposal* still costs a second answer.
+    ///
+    /// `confirm_model`'s question defaults to yes on an empty line, so without
+    /// this a pinned entry the machine cannot hold was one Enter away from an
+    /// 18 GB fetch. The confirmed answer rides as a `choose`, because `accept`
+    /// has nowhere to carry the confirmation — and the daemon refuses an `accept`
+    /// here for exactly that reason.
+    #[test]
+    fn accepting_an_over_sized_proposal_needs_the_second_confirmation_and_sends_choose() {
+        let (reply, surface, prompter) = answer_oversized(&["", "y"], false);
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "warning: qwen3-coder-30b needs 32.0 GiB"),
+            "an over-sized proposal must warn before it installs: {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+        assert_eq!(
+            reply.expect("the confirmed answer is sent").outcome,
+            ModelConfirmOutcome::Choose {
+                name: "qwen3-coder-30b".to_owned(),
+                confirmed_above_ram_floor: true,
+            }
+        );
+        assert_eq!(prompter.asked, 2, "the proposal, then the confirmation");
+    }
+
+    /// Backing out of that warning is not a decline and not an install: it opens
+    /// the menu, exactly as a "no" to the proposal's own question does.
+    #[test]
+    fn refusing_the_warning_on_an_over_sized_proposal_falls_through_to_the_menu() {
+        // yes to the proposal, no to the warning, then alternative 1 (which fits).
+        let (reply, surface, prompter) = answer_oversized(&["y", "n", "1"], false);
+        assert!(surface.any_line_contains(LineKind::Notice, "not installing qwen3-coder-30b"));
+        assert_eq!(
+            reply.expect("the fitting alternative is sent").outcome,
+            ModelConfirmOutcome::Choose {
+                name: "qwen2.5-coder-3b".to_owned(),
+                confirmed_above_ram_floor: false,
+            }
+        );
+        assert_eq!(prompter.asked, 3, "proposal, warning, menu");
+    }
+
+    /// BR-5 vs BR-3: `--yes` is one flag, not two answers. It answers the
+    /// ordinary case and declines to answer the one that exists to be deliberate.
+    #[test]
+    fn auto_accept_leaves_an_over_sized_proposal_open_rather_than_confirming_it() {
+        let (reply, surface, prompter) = answer_oversized(&[], true);
+        assert!(
+            reply.is_none(),
+            "`--yes` must not supply BR-3's second confirmation"
+        );
+        assert_eq!(prompter.asked, 0, "auto-accept never reads user input");
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "second, explicit confirmation"),
+            "the user must be told why nothing was answered: {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+        // And the fitting case still auto-accepts, so this did not just disable
+        // `--yes`.
+        let (reply, _, _) = answer(&[], true);
+        assert_eq!(
+            reply
+                .expect("a fitting proposal is still auto-accepted")
+                .outcome,
+            ModelConfirmOutcome::Accept
+        );
     }
 
     #[test]

@@ -61,7 +61,13 @@ impl SingleInstance {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    /// How long the test lets a *transient* holder of the lock's open file
+    /// description get out of the way. See [`acquire_within`].
+    const RELEASE_WINDOW: Duration = Duration::from_secs(2);
 
     fn temp_lock() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -72,6 +78,40 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// Acquire, retrying until `window` elapses, and report the attempts spent.
+    ///
+    /// `flock(2)` binds the lock to the **open file description**, not to the
+    /// process, and releases it only once *every* descriptor referring to that
+    /// description is closed. Every `std::process::Command` this test binary
+    /// spawns — the shell tool's `sh -c`, the MCP client's subprocess tests —
+    /// duplicates the whole descriptor table into the child at fork, so a fork
+    /// that lands between this test's `acquire` and its `drop` leaves the child
+    /// holding a copy of the lock's description. `O_CLOEXEC` closes it at the
+    /// child's `exec`, but not before: for the few milliseconds of that
+    /// fork→exec window the lock stays held by a process that has no idea it
+    /// owns it, and the acquire that should have succeeded sees `EWOULDBLOCK`.
+    /// That window is why this test is green alone and flaky in a parallel run
+    /// of the whole binary — the fork has to land inside it.
+    ///
+    /// Retrying is the honest fix rather than a mask: the borrowed descriptor is
+    /// *transient*, so what the test loses to it is time, not the property under
+    /// test. A lock that is genuinely never released still fails, one attempt
+    /// per 25ms until the window is out.
+    fn acquire_within(path: &std::path::Path, window: Duration) -> (Option<SingleInstance>, u32) {
+        let deadline = Instant::now() + window;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match SingleInstance::acquire(path).expect("acquiring the lock must not error") {
+                Some(instance) => return (Some(instance), attempts),
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                None => return (None, attempts),
+            }
+        }
     }
 
     #[test]
@@ -89,10 +129,14 @@ mod tests {
 
         drop(first);
 
-        let third = SingleInstance::acquire(&path).unwrap();
+        // Retried, not asserted on the first try: another test in this binary can
+        // have forked a child that transiently holds an inherited copy of the
+        // lock's open file description — see [`acquire_within`].
+        let (third, attempts) = acquire_within(&path, RELEASE_WINDOW);
         assert!(
             third.is_some(),
-            "acquire should succeed after the lock frees"
+            "acquire should succeed after the lock frees (gave up after {attempts} \
+             attempts over {RELEASE_WINDOW:?})"
         );
 
         drop(third);

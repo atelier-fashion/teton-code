@@ -738,6 +738,13 @@ async fn a_config_pin_proposes_the_pinned_entry_and_downloads_nothing_until_answ
         matches!(outcome, ConsentOutcome::Ready { .. }),
         "{outcome:?}"
     );
+    // And the record credits the pin, not the probe it overrode: `model/list`
+    // and `teton model status` say "config pin", which is the true answer to
+    // "why is this the model?".
+    assert_eq!(
+        h.store.current().expect("a decision was recorded").source,
+        SelectionSource::ConfigPin
+    );
     assert!(h.installed("alt-fit").exists());
     assert!(!h.installed("small-fit").exists());
     assert!(
@@ -746,6 +753,225 @@ async fn a_config_pin_proposes_the_pinned_entry_and_downloads_nothing_until_answ
         h.fetcher.calls()
     );
     h.cleanup();
+}
+
+#[tokio::test]
+async fn a_pin_above_the_ram_floor_cannot_be_installed_by_a_bare_accept() {
+    // E-1: the hole the C-1 fix opened. `probe::decide` honours a
+    // `[local_model] pinned` key UNCONDITIONALLY — no `fits()`, no RAM-floor test
+    // (REQ-544 BR-9) — so once the pin reaches the user as the *proposal* rather
+    // than a silent commit, `proposal.proposed` can name an entry above this
+    // machine's RAM for the first time. `accept` is the one answer that carries
+    // no `confirmed_above_ram_floor`, and the client's question for it defaults
+    // to yes: without this check, a pin naming an entry this machine cannot hold
+    // turned a single Enter into a multi-gigabyte fetch with BR-3's second
+    // confirmation never asked for.
+    let h = Harness::new(
+        "pin-oversized",
+        RecordingFetcher::serving(),
+        LocalModelConfig {
+            pinned: Some("oversized".to_owned()),
+            ..LocalModelConfig::default()
+        },
+    );
+    let runtime = Arc::new(DaemonRuntime::with_consent(Arc::clone(&h.gate)));
+    let mut sub = h.subscribe();
+
+    let resolve = h.gate.resolve();
+    let answer = async {
+        let proposal = next_proposal(&mut sub).await;
+        let proposed = proposal
+            .proposed
+            .as_ref()
+            .expect("the pin is proposed even though it does not fit");
+        assert_eq!(proposed.entry.name, "oversized");
+        assert!(
+            proposed.entry.ram_floor_bytes > proposal.probe.total_ram_bytes,
+            "the state under test is a proposal above this machine's RAM floor"
+        );
+
+        // The bare `accept` is refused at the RPC boundary, and refused in a way
+        // the client can act on: it names both figures and leaves the proposal
+        // OPEN, so the user's one chance to answer is not consumed by it.
+        let err = runtime
+            .confirm_model(ModelConfirmParams {
+                request_id: proposal.request_id.clone(),
+                outcome: ModelConfirmOutcome::Accept,
+            })
+            .expect_err("accepting an above-RAM-floor proposal must be refused");
+        assert!(
+            err.message.contains("64.0 GiB") && err.message.contains("16.0 GiB"),
+            "the refusal must name what it needs and what the machine has: {}",
+            err.message
+        );
+        assert_eq!(
+            h.pending.pending_count(),
+            1,
+            "the proposal must stay open so the user can confirm properly"
+        );
+        assert_eq!(
+            h.fetcher.call_count(),
+            0,
+            "not one byte may move for a refused accept: {:?}",
+            h.fetcher.calls()
+        );
+        assert!(!h.installed("oversized").exists());
+
+        // BR-3's actual path: the same entry, chosen deliberately, with the
+        // second confirmation on the wire. It is the user's machine and the
+        // user's call — it just cannot happen by accident.
+        runtime
+            .confirm_model(ModelConfirmParams {
+                request_id: proposal.request_id.clone(),
+                outcome: ModelConfirmOutcome::Choose {
+                    name: "oversized".to_owned(),
+                    confirmed_above_ram_floor: true,
+                },
+            })
+            .expect("a twice-confirmed choice is honoured");
+    };
+    let (outcome, ()) = tokio::join!(resolve, answer);
+
+    assert!(
+        matches!(outcome, ConsentOutcome::Ready { .. }),
+        "the confirmed choice should install: {outcome:?}"
+    );
+    assert!(h.installed("oversized").exists());
+    h.cleanup();
+}
+
+#[tokio::test]
+async fn the_gate_itself_refuses_an_above_ram_floor_accept_that_reaches_it() {
+    // Defence in depth for E-1: `confirm_model` pre-validates, but the gate must
+    // not depend on its caller having done so. An `accept` delivered straight to
+    // the waiter — a client speaking the protocol directly, a future in-process
+    // caller — is validated by the same rule, and nothing is fetched or recorded.
+    let h = Harness::new(
+        "pin-oversized-gate",
+        RecordingFetcher::serving(),
+        LocalModelConfig {
+            pinned: Some("oversized".to_owned()),
+            ..LocalModelConfig::default()
+        },
+    );
+    let mut sub = h.subscribe();
+
+    let resolve = h.gate.resolve();
+    let answer = async {
+        let proposal = next_proposal(&mut sub).await;
+        assert!(h
+            .pending
+            .resolve(&proposal.request_id, ModelConfirmOutcome::Accept));
+    };
+    let (outcome, ()) = tokio::join!(resolve, answer);
+
+    match outcome {
+        ConsentOutcome::Refused {
+            refusal: tetond::model_consent::ChoiceRefusal::AboveRamFloor { name, .. },
+        } => assert_eq!(name, "oversized"),
+        other => panic!("expected an above-RAM-floor refusal, got {other:?}"),
+    }
+    assert_eq!(
+        h.fetcher.call_count(),
+        0,
+        "a refused accept fetches nothing: {:?}",
+        h.fetcher.calls()
+    );
+    assert!(
+        h.store.current().is_none(),
+        "a refusal records no decision at all"
+    );
+    assert!(!h.installed("oversized").exists());
+    h.cleanup();
+}
+
+/// An installer that parks inside `install()` until it is released, so a test can
+/// observe the in-flight claim while the *blocking* work is still running.
+struct BlockingInstaller {
+    started: std::sync::mpsc::Sender<()>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl tetond::model_consent::WeightsInstaller for BlockingInstaller {
+    fn install(&self, _entry: &ModelEntry) -> Result<(), InstallError> {
+        let _ = self.started.send(());
+        let receiver = self
+            .release
+            .lock()
+            .unwrap()
+            .take()
+            .expect("installed once per test");
+        let _ = receiver.recv();
+        Ok(())
+    }
+
+    fn status(&self, _entry: &ModelEntry) -> InstallStatus {
+        InstallStatus::Absent
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aborting_an_install_future_does_not_release_the_claim_the_blocking_work_still_holds() {
+    // E-9: the M-2 claim is what stops two installs of one entry from appending
+    // to the same `.part`. It used to live in the `run_install` *future* — but
+    // the install itself runs on the blocking pool, and blocking work is not
+    // cancellable. Dropping the future (task aborted, daemon shutting down) would
+    // therefore release the claim while the installer thread was still writing,
+    // re-opening exactly the interleaving M-2 closed. The guard now lives inside
+    // the blocking closure, so its lifetime tracks the work.
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let dir = temp_dir("e9-cancel");
+    let store = Arc::new(SelectionStore::open(&dir));
+    store
+        .record(&ModelSelection::accepted(
+            "small-fit",
+            SelectionSource::UserOverride,
+            0,
+        ))
+        .expect("record the decision to install");
+    let gate = Arc::new(ModelConsentGate::new(
+        machine(),
+        test_catalog(),
+        LocalModelConfig::default(),
+        Arc::new(EventBus::new()),
+        Arc::new(PendingModelDecisions::new()),
+        store,
+        Arc::new(BlockingInstaller {
+            started: started_tx,
+            release: Mutex::new(Some(release_rx)),
+        }),
+    ));
+
+    let task = {
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move { gate.install_recorded().await })
+    };
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the blocking install starts");
+    assert!(gate.install_in_flight("small-fit"));
+
+    // The future is gone. The installer thread is not.
+    task.abort();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        gate.install_in_flight("small-fit"),
+        "the claim must outlive the cancelled future: the blocking installer is \
+         still writing, and a second install must still be refused"
+    );
+
+    // Released: the work ends, and the claim ends with it.
+    release_tx.send(()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while gate.install_in_flight("small-fit") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the claim must be released once the install finishes"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,6 +1627,39 @@ async fn a_model_set_during_an_outstanding_proposal_supersedes_it_and_a_late_acc
             !h.pending
                 .resolve(&proposal.request_id, ModelConfirmOutcome::Accept),
             "a late Accept for the superseded proposal must find no waiter"
+        );
+
+        // E-8: the decision that superseded it NAMES the cancelled proposal. A
+        // client parked on that request_id would otherwise keep rendering a
+        // question whose waiter no longer exists, with nothing on the event
+        // stream connecting the two.
+        let decided = drain(&mut sub)
+            .await
+            .into_iter()
+            .find_map(|event| match event {
+                Event::ModelSelectionDecided(decided) => Some(decided),
+                _ => None,
+            })
+            .expect("the set announces its decision");
+        assert_eq!(
+            decided.request_id.as_ref(),
+            Some(&proposal.request_id),
+            "the decided event must name the proposal it superseded"
+        );
+        assert_eq!(decided.model_name.as_deref(), Some("alt-fit"));
+
+        // And answering the dead proposal is reported as what it is: an answer
+        // that decided nothing. Telling the user it landed would be a lie about
+        // which decision is on record.
+        let result = runtime
+            .confirm_model(ModelConfirmParams {
+                request_id: proposal.request_id.clone(),
+                outcome: ModelConfirmOutcome::Accept,
+            })
+            .expect("a late answer is idempotent, not an error");
+        assert!(
+            !result.delivered,
+            "an answer with no waiter must not be reported as delivered"
         );
     };
     let (outcome, ()) = tokio::join!(drive, interject);

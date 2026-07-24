@@ -267,12 +267,38 @@ pub enum ModelConfirmOutcome {
 
 /// Result of [`ModelConfirmParams`].
 ///
-/// Deliberately empty, like [`PermissionRespondResult`]: the authoritative
+/// Carries no *decision*, like [`PermissionRespondResult`]: the authoritative
 /// outcome reaches *every* attached client as a `model_selection_decided` event,
 /// so echoing it here would duplicate the record in two places that could
-/// disagree.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelConfirmResult {}
+/// disagree. It carries one fact the event cannot: whether **this** answer is
+/// what decided anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConfirmResult {
+    /// Whether this answer reached a proposal that was still awaiting one.
+    ///
+    /// `false` means no waiter held this `request_id`: the proposal had already
+    /// been answered, or an explicit `model/set` superseded and cancelled it. A
+    /// client that reported success regardless would tell a user their answer
+    /// landed when a different decision is on record — so the daemon says which
+    /// it was and the client can point at the `model_selection_decided` event
+    /// that names the cancelled `request_id`.
+    ///
+    /// Defaults to `true` when absent, so a payload from a daemon that predates
+    /// this field reads as the success it used to mean unconditionally.
+    #[serde(default = "delivered_by_default")]
+    pub delivered: bool,
+}
+
+/// A `model/confirm` result with no `delivered` field means "delivered".
+fn delivered_by_default() -> bool {
+    true
+}
+
+impl Default for ModelConfirmResult {
+    fn default() -> Self {
+        Self { delivered: true }
+    }
+}
 
 impl RpcMethod for ModelConfirmParams {
     const METHOD: &'static str = "model/confirm";

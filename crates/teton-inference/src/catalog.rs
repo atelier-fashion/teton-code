@@ -156,6 +156,21 @@ pub enum CatalogError {
         /// The URL as written in the catalog.
         url: String,
     },
+    /// The URL's authority carries `userinfo` (`user:pass@host`).
+    ///
+    /// The message deliberately quotes **no** part of the URL: the offending
+    /// component is a credential, and a validation error is a thing that gets
+    /// logged and pasted into issues.
+    #[error(
+        "catalog entry `{name}` has a URL whose authority carries userinfo (`user@host`). \
+         A catalog artifact is a public, credential-free download (BR-11): embedded \
+         credentials would be sent to the host on every fetch and would ride in any \
+         diagnostic that quoted the URL. Remove the userinfo from the entry's URL."
+    )]
+    CredentialInUrl {
+        /// The offending entry's catalog name.
+        name: String,
+    },
 }
 
 /// The `<repo>`, `<revision>` and `<file>` of a HuggingFace `resolve` URL.
@@ -200,6 +215,21 @@ fn url_path(url: &str) -> Option<&str> {
     Some(&authority[slash..])
 }
 
+/// The authority of an absolute URL, **userinfo and port included** —
+/// `https://u:p@h:8443/a` → `u:p@h:8443`. `None` if `url` has no `://` or an
+/// empty authority.
+///
+/// Separate from [`url_host`] precisely because `url_host` throws the userinfo
+/// away: a check that wants to know whether a credential is present has to look
+/// at the authority before it is cleaned up.
+fn url_authority(url: &str) -> Option<&str> {
+    let after_scheme = &url[url.find("://")? + 3..];
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())
+}
+
 /// The host of an absolute URL — `https://huggingface.co/a/b` → `huggingface.co`
 /// — with any `userinfo@` and `:port` stripped. `None` if `url` has no `://` or
 /// an empty authority.
@@ -209,11 +239,7 @@ fn url_path(url: &str) -> Option<&str> {
 /// without ever putting a full URL on the wire (BR-11).
 #[must_use]
 pub fn url_host(url: &str) -> Option<&str> {
-    let after_scheme = &url[url.find("://")? + 3..];
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|a| !a.is_empty())?;
+    let authority = url_authority(url)?;
     // Strip any `user:pass@` userinfo, then any `:port`.
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let host = host.split(':').next().unwrap_or(host);
@@ -371,6 +397,17 @@ impl ModelEntry {
             name: self.name.clone(),
             url: self.url.clone(),
         })?;
+
+        // A credential in the authority is refused before the host is compared,
+        // because `url_host` *strips* userinfo to find the host — so
+        // `https://evil@huggingface.co/…` passes the host check while sending a
+        // credential on every fetch. Refusing here is what makes "the catalog is
+        // a list of public artifacts" true rather than merely intended.
+        if url_authority(&self.url).is_some_and(|authority| authority.contains('@')) {
+            return Err(CatalogError::CredentialInUrl {
+                name: self.name.clone(),
+            });
+        }
 
         // ADR-004: the catalog's canonical URL is an HTTPS `huggingface.co`
         // resolve URL. Enforced in `validate` — not only in the tests against
@@ -809,6 +846,29 @@ mod tests {
                 "{bad} produced {err:?}"
             );
             assert!(err.to_string().contains("huggingface.co"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_url_that_carries_a_credential_in_its_authority() {
+        // `url_host` strips userinfo to find the host, so the host check alone
+        // waves this through: the entry looks like huggingface.co and every fetch
+        // sends `evil:secret` to it. A catalog artifact is a public download.
+        for bad in [
+            format!("https://evil:secret@huggingface.co/A/B-GGUF/resolve/{REV}/a.gguf"),
+            format!("https://evil@huggingface.co/A/B-GGUF/resolve/{REV}/a.gguf"),
+        ] {
+            let mut model = entry();
+            model.url = bad.clone();
+            let err = model.validate().expect_err(&bad);
+            assert!(
+                matches!(err, CatalogError::CredentialInUrl { .. }),
+                "{bad} produced {err:?}"
+            );
+            // The message must not echo the credential it just refused.
+            let rendered = err.to_string();
+            assert!(!rendered.contains("secret"), "{rendered}");
+            assert!(!rendered.contains("evil"), "{rendered}");
         }
     }
 
