@@ -10,6 +10,15 @@
 //!    build log) is condensed by the *local* engine before it enters context, via
 //!    [`summarize_if_large`], so a single grep can't evict the whole conversation.
 //!
+//! Both duties are enforced in **two currencies**: whitespace-approximated
+//! tokens ([`approx_tokens`]) and UTF-8 bytes. The token heuristic undercounts
+//! pathological content — a minified single-line file is a handful of "words"
+//! but tens of thousands of real BPE tokens — so every budget here carries a
+//! byte-denominated twin sized to the local engine's window (bytes are a
+//! conservative proxy for BPE tokens: code averages ≳2 bytes per BPE token).
+//! This is what keeps one dense block from pushing an assembled prompt past the
+//! engine window and killing the turn.
+//!
 //! Every context block carries a [`Provenance`] tag. That tag is the seam
 //! TASK-007's egress choke point plugs into: a [`ProvenanceHook`] is invoked for
 //! each block as the prompt is assembled, so egress can identify
@@ -198,25 +207,38 @@ impl ProvenanceHook for RecordingProvenanceHook {
     }
 }
 
-/// Manages the assembled context for one session under a token budget.
+/// Manages the assembled context for one session under a token budget and a
+/// byte budget (the engine-window currency — see the module docs).
 #[derive(Debug, Clone)]
 pub struct ContextManager {
     system: String,
     blocks: Vec<ContextBlock>,
     budget_tokens: usize,
+    budget_bytes: usize,
     truncated: bool,
 }
 
 impl ContextManager {
-    /// A manager with the given system prompt and token budget.
+    /// A manager with the given system prompt and token budget. The byte budget
+    /// defaults to `budget_tokens` × [`APPROX_BYTES_PER_TOKEN`] — the same
+    /// relationship `HarnessConfig::default` encodes; override it with
+    /// [`ContextManager::with_budget_bytes`] to match a specific engine window.
     #[must_use]
     pub fn new(system: impl Into<String>, budget_tokens: usize) -> Self {
         Self {
             system: system.into(),
             blocks: Vec::new(),
             budget_tokens,
+            budget_bytes: budget_tokens.saturating_mul(APPROX_BYTES_PER_TOKEN),
             truncated: false,
         }
+    }
+
+    /// Set the byte budget for the assembled context (engine-window currency).
+    #[must_use]
+    pub fn with_budget_bytes(mut self, budget_bytes: usize) -> Self {
+        self.budget_bytes = budget_bytes;
+        self
     }
 
     /// Append a user turn.
@@ -288,12 +310,40 @@ impl ContextManager {
         n
     }
 
-    /// Drop the oldest blocks until the estimate fits the budget. The system
-    /// prompt and the single most recent block are always preserved.
+    /// Estimated total bytes (system + all blocks) — the engine-window currency
+    /// that catches what the whitespace heuristic undercounts.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        self.system.len() + self.blocks.iter().map(|b| b.text.len()).sum::<usize>()
+    }
+
+    /// Drop the oldest blocks until the estimate fits **both** budgets (tokens
+    /// and bytes). The system prompt and the single most recent block are always
+    /// preserved — but if that last block alone still busts the byte budget (a
+    /// pathological fold, a giant paste), its text is clamped in place with an
+    /// elision marker. The assembled prompt is therefore bounded in bytes no
+    /// matter what any single block carries: the turn degrades instead of
+    /// handing the engine an over-window prompt it can only refuse.
     pub fn truncate_to_budget(&mut self) {
-        while self.estimated_tokens() > self.budget_tokens && self.blocks.len() > 1 {
+        while (self.estimated_tokens() > self.budget_tokens
+            || self.estimated_bytes() > self.budget_bytes)
+            && self.blocks.len() > 1
+        {
             self.blocks.remove(0);
             self.truncated = true;
+        }
+        if self.estimated_bytes() > self.budget_bytes {
+            // Floor keeps a degenerate configuration (system prompt near or over
+            // the whole byte budget) from clamping the block to nothing.
+            let room = self
+                .budget_bytes
+                .saturating_sub(self.system.len())
+                .max(1_024);
+            if let Some(last) = self.blocks.last_mut() {
+                if last.text.len() > room {
+                    last.text = truncate_middle(&last.text, room);
+                }
+            }
         }
     }
 
@@ -426,36 +476,135 @@ pub fn approx_tokens(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+/// Bytes-per-whitespace-token bridge between the two budget currencies.
+///
+/// A whitespace "token" of source code averages ~7–8 bytes (word plus
+/// separator), so a token budget of N is consistent with a byte budget of
+/// N × 8. At the local engine's window this is also the safe direction: 8 bytes
+/// per whitespace word ≈ 2 bytes per real BPE token for code, comfortably above
+/// the ~2-bytes-per-token floor valid UTF-8 tokenizes at in practice.
+pub const APPROX_BYTES_PER_TOKEN: usize = 8;
+
+/// Byte ceiling on the tool-result text handed to the summarizer engine.
+///
+/// The summarizer's own prompt must fit the engine window too — sending an
+/// unbounded result to the engine that exists to shrink it just moves the
+/// over-window failure one call earlier (the pre-fix behavior). 16 KiB is at
+/// most ~8k BPE tokens of pathological input, about half the 16,384-token
+/// window (`LOCAL_ENGINE_N_CTX`), leaving ample room for the instruction and
+/// generation.
+pub const SUMMARIZER_INPUT_MAX_BYTES: usize = 16_384;
+
+/// Truncate `text` to at most `max_bytes`, keeping the head and tail with an
+/// elision marker between them (errors cluster at the end of build logs, paths
+/// and signatures at the top of files). Splits on `char` boundaries; returns
+/// the text unchanged when it already fits.
+#[must_use]
+pub fn truncate_middle(text: &str, max_bytes: usize) -> String {
+    const MARKER: &str =
+        "\n[... middle elided: content truncated to fit the local context window ...]\n";
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let keep = max_bytes.saturating_sub(MARKER.len());
+    if keep < 64 {
+        // Degenerate cap: no room for a useful head/tail split.
+        return text[..floor_char_boundary(text, max_bytes)].to_owned();
+    }
+    let head_len = keep * 2 / 3;
+    let head_end = floor_char_boundary(text, head_len);
+    let tail_start = ceil_char_boundary(text, text.len() - (keep - head_len));
+    format!("{}{MARKER}{}", &text[..head_end], &text[tail_start..])
+}
+
+/// Largest index ≤ `i` that is a `char` boundary of `s`.
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest index ≥ `i` that is a `char` boundary of `s`.
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// What [`summarize_if_large`] did with a tool result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarizeOutcome {
+    /// The text to fold into context: the engine's summary, a mechanical
+    /// truncation (engine failure), or the original (under threshold).
+    pub text: String,
+    /// The engine error hit while summarizing, when the summary fell back to
+    /// mechanical truncation. The caller MUST surface this (log or event) — the
+    /// summarization duty guards the context window, so its failure is never
+    /// allowed to be silent.
+    pub engine_error: Option<String>,
+}
+
 /// Summarize a tool result with the local engine when it is larger than
-/// `threshold_tokens`; otherwise return it unchanged.
+/// `threshold_tokens` (whitespace tokens) **or** its byte-denominated twin
+/// (`threshold_tokens` × [`APPROX_BYTES_PER_TOKEN`]); otherwise return it
+/// unchanged. The byte trigger is what catches whitespace-poor content — a
+/// minified single-line file is a handful of "words" but tens of thousands of
+/// BPE tokens, exactly the input the whitespace heuristic waves through.
 ///
 /// This keeps a large file read or a noisy log from evicting the conversation on
 /// a small model. Summarization is a *local* duty (BR-8 latency, not
-/// intelligence): the engine passed here is the local tier. On any engine error
-/// the original text is returned (summarization is best-effort, never fatal).
+/// intelligence): the engine passed here is the local tier. The text sent to the
+/// engine is bounded by [`SUMMARIZER_INPUT_MAX_BYTES`] so the summarizer prompt
+/// itself always fits the engine window. On an engine error the result is
+/// truncated **mechanically** to the same threshold — never folded raw, which
+/// would silently no-op the duty — and the error is reported on the outcome for
+/// the caller to surface.
 #[must_use]
 pub fn summarize_if_large(
     engine: &Mutex<dyn Engine>,
     tool: &str,
     text: &str,
     threshold_tokens: usize,
-) -> String {
-    if approx_tokens(text) <= threshold_tokens {
-        return text.to_owned();
+) -> SummarizeOutcome {
+    let threshold_bytes = threshold_tokens.saturating_mul(APPROX_BYTES_PER_TOKEN);
+    if approx_tokens(text) <= threshold_tokens && text.len() <= threshold_bytes {
+        return SummarizeOutcome {
+            text: text.to_owned(),
+            engine_error: None,
+        };
     }
+    let bounded = truncate_middle(text, SUMMARIZER_INPUT_MAX_BYTES);
     let prompt = format!(
         "Summarize the following `{tool}` tool output in a few lines, preserving \
-         file paths, symbol names, and any errors. Output only the summary.\n\n{text}"
+         file paths, symbol names, and any errors. Output only the summary.\n\n{bounded}"
     );
     let params = GenParams::default();
     let guard = engine.lock().expect("engine mutex poisoned");
     match guard.complete(&prompt, &params, &mut |_| {}) {
-        Ok(completion) => format!(
-            "[summarized {tool} output — {} tokens elided]\n{}",
-            approx_tokens(text),
-            completion.text
-        ),
-        Err(_) => text.to_owned(),
+        Ok(completion) => SummarizeOutcome {
+            text: format!(
+                "[summarized {tool} output — {} tokens elided]\n{}",
+                approx_tokens(text),
+                completion.text
+            ),
+            engine_error: None,
+        },
+        Err(err) => SummarizeOutcome {
+            text: format!(
+                "[oversized {tool} output truncated mechanically — the local \
+                 summarizer was unavailable]\n{}",
+                truncate_middle(text, threshold_bytes)
+            ),
+            engine_error: Some(err.to_string()),
+        },
     }
 }
 
@@ -612,7 +761,8 @@ mod tests {
     fn small_tool_results_are_not_summarized() {
         let engine = Mutex::new(MockEngine::new("mock"));
         let out = summarize_if_large(&engine, "read", "short output", 100);
-        assert_eq!(out, "short output");
+        assert_eq!(out.text, "short output");
+        assert_eq!(out.engine_error, None);
     }
 
     #[test]
@@ -620,7 +770,136 @@ mod tests {
         let engine = Mutex::new(MockEngine::with_response("mock-3b", "CONDENSED"));
         let big = "word ".repeat(500);
         let out = summarize_if_large(&engine, "grep", &big, 50);
-        assert!(out.contains("summarized grep output"));
-        assert!(out.contains("CONDENSED"));
+        assert!(out.text.contains("summarized grep output"));
+        assert!(out.text.contains("CONDENSED"));
+        assert_eq!(out.engine_error, None);
+    }
+
+    #[test]
+    fn whitespace_poor_but_byte_huge_results_trigger_summarization() {
+        // The dogfooded failure mode: a minified single-line file is a handful of
+        // whitespace "words" but enormous in bytes/BPE. The byte-denominated
+        // trigger must summarize it even though the token trigger waves it through.
+        let engine = Mutex::new(MockEngine::with_response("mock-3b", "CONDENSED"));
+        let minified = "x".repeat(100_000); // 1 whitespace token, 100 KB
+        assert!(approx_tokens(&minified) <= 100);
+        let out = summarize_if_large(&engine, "read", &minified, 100);
+        assert!(out.text.contains("summarized read output"));
+        assert!(out.text.contains("CONDENSED"));
+    }
+
+    /// An engine that records the byte length of every prompt it is handed.
+    struct PromptLenEngine {
+        seen: std::sync::Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Engine for PromptLenEngine {
+        fn model_id(&self) -> &str {
+            "prompt-len"
+        }
+        fn complete(
+            &self,
+            prompt: &str,
+            _params: &GenParams,
+            _on_token: &mut dyn FnMut(&str),
+        ) -> Result<teton_inference::Completion, teton_inference::EngineError> {
+            self.seen.lock().expect("seen poisoned").push(prompt.len());
+            Ok(teton_inference::Completion {
+                text: "SUMMARY".to_owned(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+    }
+
+    #[test]
+    fn summarizer_input_is_bounded_in_engine_window_bytes() {
+        // The summarizer prompt must fit the engine window regardless of how big
+        // the tool result is — pre-fix, the ENTIRE result rode the prompt.
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let engine = Mutex::new(PromptLenEngine {
+            seen: std::sync::Arc::clone(&seen),
+        });
+        let huge = "word ".repeat(200_000); // 1 MB
+        let out = summarize_if_large(&engine, "shell", &huge, 100);
+        assert!(out.text.contains("SUMMARY"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        // Bounded input plus the fixed instruction preamble; generous slack.
+        assert!(
+            seen[0] <= SUMMARIZER_INPUT_MAX_BYTES + 512,
+            "summarizer prompt was {} bytes — unbounded input reached the engine",
+            seen[0]
+        );
+    }
+
+    #[test]
+    fn engine_failure_falls_back_to_bounded_mechanical_truncation() {
+        // Pre-fix: Err(_) => text.to_owned() folded the raw oversized result and
+        // told nobody. Now the fallback is mechanically truncated to the same
+        // threshold, and the error is reported for the caller to surface.
+        let engine = Mutex::new(MockEngine::unavailable("mock", "unloaded under pressure"));
+        let big = "word ".repeat(50_000); // 250 KB
+        let threshold_tokens = 100;
+        let out = summarize_if_large(&engine, "read", &big, threshold_tokens);
+        assert!(out.text.contains("truncated mechanically"));
+        assert!(
+            out.text.len() <= threshold_tokens * APPROX_BYTES_PER_TOKEN + 256,
+            "fallback fold was {} bytes — the raw result leaked through",
+            out.text.len()
+        );
+        let err = out.engine_error.expect("engine failure must be reported");
+        assert!(err.contains("unloaded under pressure"));
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail_within_the_cap() {
+        let text = format!("{}{}{}", "HEAD ".repeat(100), "x".repeat(10_000), " TAIL");
+        let out = truncate_middle(&text, 1_000);
+        assert!(out.len() <= 1_000);
+        assert!(out.starts_with("HEAD "));
+        assert!(out.ends_with(" TAIL"));
+        assert!(out.contains("middle elided"));
+        // Under the cap: untouched.
+        assert_eq!(truncate_middle("small", 1_000), "small");
+    }
+
+    #[test]
+    fn truncate_middle_respects_char_boundaries() {
+        // Multi-byte chars at the cut points must not panic or split.
+        let text = "é".repeat(2_000); // 4,000 bytes of 2-byte chars
+        let out = truncate_middle(&text, 500);
+        assert!(out.len() <= 500);
+        assert!(out.contains("middle elided"));
+    }
+
+    #[test]
+    fn truncation_evicts_on_bytes_even_when_tokens_fit() {
+        // Two dense single-word blocks: 2 tokens (far under the token budget) but
+        // way over the byte budget — the byte currency must drive eviction.
+        let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(5_000);
+        ctx.push_user("a".repeat(4_000));
+        ctx.push_user("b".repeat(4_000));
+        assert!(ctx.estimated_tokens() < 10_000);
+        ctx.truncate_to_budget();
+        assert!(ctx.was_truncated());
+        assert_eq!(ctx.blocks().len(), 1);
+        assert!(ctx.estimated_bytes() <= 5_000);
+    }
+
+    #[test]
+    fn a_single_oversized_block_is_clamped_in_place() {
+        // Eviction preserves the most recent block, so a lone pathological block
+        // must be clamped rather than handed to the engine over-window.
+        let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(5_000);
+        ctx.push_user("z".repeat(50_000));
+        ctx.truncate_to_budget();
+        assert_eq!(ctx.blocks().len(), 1);
+        assert!(
+            ctx.estimated_bytes() <= 5_000,
+            "assembled context is {} bytes — the clamp did not bound it",
+            ctx.estimated_bytes()
+        );
+        assert!(ctx.blocks()[0].text.contains("middle elided"));
     }
 }

@@ -1065,7 +1065,8 @@ impl DaemonRuntime {
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
         let system = build_system_prompt(&tools, &route.harness);
-        let mut ctx = ContextManager::new(system, route.harness.context_budget_tokens);
+        let mut ctx = ContextManager::new(system, route.harness.context_budget_tokens)
+            .with_budget_bytes(route.harness.context_budget_bytes);
         ctx.push_user(prompt);
 
         let mut attempts = 0u32;
@@ -2090,9 +2091,15 @@ fn build_engine_loader(
 /// budget's number therefore overflows on exactly the inputs the tier exists
 /// for — a folded `read` of a real file killed the first dogfooded turn with
 /// "local engine could not serve the turn" — so the window is the budget's
-/// worst-case BPE expansion (~4×) plus generation headroom. Pathological
-/// content (minified single-line files) can still exceed it; the engine then
-/// returns a typed backend error rather than serving a truncated fiction.
+/// worst-case BPE expansion (~4×) plus generation headroom.
+///
+/// The harness now also bounds its side in this window's currency: the
+/// assembled context and the summarizer's input are capped in **bytes**
+/// (`HarnessConfig::context_budget_bytes`, sized to this window), so
+/// pathological content (a minified single-line file) is clamped or
+/// mechanically truncated instead of reaching the engine over-window. The
+/// engine's typed backend error remains as the backstop, never the expected
+/// path.
 #[cfg(feature = "llama")]
 const LOCAL_ENGINE_N_CTX: u32 = 16_384;
 
