@@ -231,5 +231,11 @@ context budgets and the engine window must be kept currency-compatible
 budget (`HarnessConfig::context_budget_bytes`, `SUMMARIZER_INPUT_MAX_BYTES`),
 with the summarizer's engine-failure fallback degrading to bounded mechanical
 truncation, reported and logged, never a silent raw fold (LESSON-447);
+the loader's "real inference rides the blocking pool" rule (E-3) binds the
+serving path too — since PR #4, `LocalEngineSource::produce_turn` and
+`summarize_if_large` run `Engine::complete` inside `spawn_blocking` on an owned
+`Arc<Mutex<dyn Engine>>` (tokens bridged back over a channel), so a seconds-long
+local completion can never park a tokio worker and stall unrelated RPCs
+(LESSON-448, pinned by `tests/nonblocking_inference.rs`);
 default/CI builds compile none of this and keep the loaderless
 honest-`disabled` behavior.

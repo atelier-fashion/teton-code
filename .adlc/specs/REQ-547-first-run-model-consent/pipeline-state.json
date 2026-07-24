@@ -70,6 +70,11 @@
       "phase": 8,
       "name": "Post-close: harness byte-bounding (deferred token-currency item) merged via PR #5",
       "completedAt": "2026-07-24T20:27:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Post-close: local inference moved to the blocking pool (deferred item) merged via PR #4",
+      "completedAt": "2026-07-24T20:35:06Z"
     }
   ],
   "integrationBranch": "main",

@@ -342,9 +342,16 @@ daemon contains no production wiring for `Downloader` at all._
 The AC-2/AC-13 engine wiring (PR #3) deliberately left these for their own
 sessions; the first three are chipped as background tasks:
 
-- **Local inference off tokio workers** — `LocalEngineSource::produce_turn` and
-  `summarize_if_large` call the engine synchronously inside async tasks; with a
-  real `LlamaEngine` a few concurrent local turns can stall the whole daemon.
+- **Local inference off tokio workers** — ~~`LocalEngineSource::produce_turn`
+  and `summarize_if_large` call the engine synchronously inside async tasks;
+  with a real `LlamaEngine` a few concurrent local turns can stall the whole
+  daemon.~~ **Resolved 2026-07-24 (PR #4, `1ab8816`)**: both now run
+  `Engine::complete` on the blocking pool (`spawn_blocking`) with the engine
+  held as an owned `Arc<Mutex<dyn Engine>>`; the local turn's token stream is
+  bridged back over a channel so tokens stream live. Pinned by
+  `tests/nonblocking_inference.rs`: a gated engine on a single-worker runtime
+  proves an unrelated task completes while inference is mid-flight (mutation-
+  verified — the tests fail against the old inline code).
 - **Token-currency mismatch** — ~~harness context budgets are whitespace-approx
   tokens, the engine window is BPE (~2.5–4× denser for code); the summarizer's
   input is unbounded and its engine-failure fallback is silent. The 16,384
