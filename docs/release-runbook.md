@@ -151,9 +151,10 @@ and "it could not run" can never be confused (LESSON-442, ADR-548-4):
 
 ## 5. Verify after the release
 
-Everything below is checkable from a laptop. `verify-install` already proved the
-macOS arm64 path inside CI; these are the checks that CI structurally cannot
-make about itself.
+Everything below is checkable from a laptop. CI already proved the macOS arm64
+path — `bump-formula` ran the install, `brew test` and the services handshake
+before it pushed the tap, and `verify-install` then installed from the live tap
+— so these are the checks that CI structurally cannot make about itself.
 
 ```sh
 TAG=vX.Y.Z
