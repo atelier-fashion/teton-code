@@ -40,8 +40,8 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-548",
       "branch": "feat/REQ-548-homebrew-install-and-landing-page",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/10",
+      "prNumber": 10,
       "merged": false
     }
   },
