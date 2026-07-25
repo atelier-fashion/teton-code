@@ -1,0 +1,56 @@
+{
+  "req": "REQ-548",
+  "branch": "feat/REQ-548-homebrew-install-and-landing-page",
+  "startedAt": "2026-07-25T00:05:00Z",
+  "completed": false,
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve repos + worktree + preflight + draft-PR deferred (no commits \u2014 LESSON-004)",
+      "completedAt": "2026-07-25T00:06:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Spec validated (run immediately pre-pipeline at user request) and marked approved",
+      "completedAt": "2026-07-25T00:07:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architecture + 6 tasks (TASK-015..020); single repo, all tasks repo:teton-code; footprint publish skipped (draft PR deferred)",
+      "completedAt": "2026-07-25T00:20:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Architecture + tasks validated; AC-5/AC-6 coverage gap fixed in TASK-016 (verify-install job)",
+      "completedAt": "2026-07-25T00:25:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-548",
+      "branch": "feat/REQ-548-homebrew-install-and-landing-page",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}

@@ -1,10 +1,10 @@
 ---
 id: REQ-548
 title: "One-command Homebrew install and the tetoncode.ai landing page"
-status: draft
+status: approved
 deployable: true
 created: 2026-07-24
-updated: 2026-07-24
+updated: 2026-07-25
 component: "distribution/release"
 domain: "distribution"
 stack: ["rust", "github-actions", "homebrew", "ci", "static-site"]
