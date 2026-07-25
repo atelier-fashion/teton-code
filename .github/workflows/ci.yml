@@ -189,10 +189,28 @@ jobs:
       # transient error is not a gate (LESSON-447).
       - name: Install actionlint (pinned, checksum-verified)
         run: |
-          set -euo pipefail
+          set -uo pipefail
           tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -fsSL --retry 3 --retry-connrefused -O \
-            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+
+          # `--retry-all-errors` matters as much as the count: the observed
+          # failure here was `curl: (35) Recv failure: Connection reset by peer`
+          # — a mid-transfer reset, which plain `--retry` does NOT retry
+          # (it covers transient HTTP codes and, with --retry-connrefused,
+          # refused connections). Without it a single reset reads exactly like
+          # a broken script.
+          fetch_status=0
+          curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --retry-all-errors -O \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}" \
+            || fetch_status=$?
+          if [ "$fetch_status" -ne 0 ]; then
+            # LESSON-442: a transport failure is NOT a lint failure. This job
+            # gates the release tooling; announcing "could not fetch the linter"
+            # as though the tooling were broken sends the next person to debug
+            # the wrong thing. 75 = could not run, nothing was learned.
+            echo "::error title=Release tooling UNCHECKED (transport)::curl exited $fetch_status fetching actionlint ${ACTIONLINT_VERSION} after 5 attempts, so the workflows and release scripts were never linted. This says nothing about them — re-run the job."
+            exit 75
+          fi
+          set -e
           echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
           tar -xzf "$tarball" actionlint
           sudo install -m 0755 actionlint /usr/local/bin/actionlint
