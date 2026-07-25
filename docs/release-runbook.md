@@ -127,8 +127,8 @@ that users' `brew install` may already have resolved.
 | `preflight` | ubuntu | Compares the tag against `[workspace.package] version` (BR-3) and decides `publish` | `64` the versions disagree; any other non-zero, the check could not run — either way nothing is built |
 | `build` (×3) | macos-15 ×2, ubuntu | Builds with `--features tetond/llama`, packages a flat tarball, then smokes the **unpacked tarball**: both binaries report the version, the release build refuses `TETON_TEST_SEAMS=1` (BR-9), `teton doctor` handshakes a live `tetond` | `65` an assertion failed; `75` the smoke could not run. `fail-fast: false` — you learn about all three targets, not the first |
 | `release` | ubuntu | Recomputes `checksums.txt` from the uploaded artifacts (BR-5), renders notes, `gh release create --verify-tag` | fewer than 3 tarballs (`75`); a dry run stops here and prints what it would have published |
-| `bump-formula` | macos-15 | Re-downloads the published assets and re-checks them against the published `checksums.txt`; renders `Formula/teton.rb`; asserts Homebrew resolves it at the tag; `brew style` + `brew audit`; fetches all three URLs; commits and pushes the tap | any of the above. Nothing here is `continue-on-error` — BR-4 |
-| `verify-install` | macos-15 | `brew install atelier-fashion/tap/teton` as a user, `brew test`, `brew services start` → `doctor` → `restart` → `stop` (AC-5/AC-6) | any step. Covers **macOS arm64 only** — a green run here is not evidence about Intel or Linux (LESSON-433) |
+| `bump-formula` | macos-15 | Re-downloads the published assets and re-checks them against the published `checksums.txt`; renders `Formula/teton.rb`; asserts Homebrew resolves it at the tag; `brew style` + `brew audit`; fetches all three URLs; then — **before the push** — installs the rendered formula, runs `brew test` (AC-5) and `brew services start` → `doctor` → `restart` → `stop` (AC-6); only then commits and pushes the tap | any of the above. Nothing here is `continue-on-error` — BR-4. The install/service gates run pre-push deliberately: a broken `service` block fails with the tap still pointing at the previous good release, and its messages say so ("The tap was NOT updated") |
+| `verify-install` | macos-15 | Post-push **reachability** evidence only: `brew install atelier-fashion/tap/teton` on a runner that has never seen the tap, `brew test`, version check — proving the one-command auto-tap path works against the *live* tap (BR-1). The functional service gates already ran in `bump-formula` | any step. Covers **macOS arm64 only** — a green run here is not evidence about Intel or Linux (LESSON-433) |
 
 After `bump-formula` is green, the run **dispatches**
 [`deploy-site.yml`](../.github/workflows/deploy-site.yml) to republish
@@ -245,7 +245,8 @@ install and record the result in that release's sign-off.
 3. **`verify-install` is the first time anything installs from the live tap.**
    It runs `brew install atelier-fashion/tap/teton` as its very first step,
    before it teaches Homebrew anything about the tap — that ordering *is* the
-   BR-1 evidence.
+   BR-1 evidence. (`bump-formula` also installs, but from its own local clone,
+   which cannot exercise the auto-tap fetch — that is exactly why both exist.)
 4. **The site will not deploy** (OQ-5). Expected; see §5. The dispatch still
    happens — you will see a `Deploy site` run appear and go red at its last
    step. That is the design, not a symptom of the release.
@@ -405,8 +406,10 @@ Check the token's `contents: write` on `homebrew-tap`, then re-run the job.
 Highest-urgency failure in this list: it is the one that is wrong on users'
 machines rather than in a log.
 
-**`brew services start FAILED` / daemon never answered (`verify-install`,
+**`brew services start FAILED` / daemon never answered (`bump-formula`,
 `65`)** — the formula's `service` block or the daemon's startup is broken on a
-clean machine. The release is already published at this point; the fix is a new
-patch release, and the failure log's `brew services list` + daemon logs are the
+clean machine. The release is published at this point but **the tap was not
+updated**, so no user can install the broken formula: `brew install` still
+serves the previous release. Fix forward with a patch release; the failure
+log's `brew services list` + daemon logs are the
 starting point.

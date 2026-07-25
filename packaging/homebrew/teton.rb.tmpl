@@ -80,7 +80,8 @@ class Teton < Formula
     # sandbox with no daemon, and `teton doctor` exits 0 whether or not one is
     # reachable — a doctor assertion here would pass against nothing. The live
     # start → doctor → stop handshake is exercised by the release workflow's
-    # `verify-install` job, where there is a real launchd service to talk to.
+    # `bump-formula` job (before it pushes the tap), where there is a real
+    # launchd service to talk to.
     assert_match version.to_s, shell_output("#{bin}/teton --version")
     assert_match version.to_s, shell_output("#{bin}/tetond --version")
   end
