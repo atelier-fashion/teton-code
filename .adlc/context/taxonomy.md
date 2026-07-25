@@ -25,6 +25,7 @@ Values for this project:
 - `cli`
 - `extension/vscode`
 - `agent/engine` (charter-level, whole-engine work)
+- `distribution/release` (release pipeline, packaging, install channels)
 
 ## domain (broad area)
 
@@ -41,6 +42,7 @@ Values for this project:
 - `cost`
 - `harness` (tool-use loop, permissions, verification)
 - `clients`
+- `distribution` (packaging, install channels, web presence)
 
 ## stack (tech layers)
 
@@ -59,6 +61,10 @@ Values for this project:
 - `json-rpc` (or the protocol chosen in ADR-002)
 - `keychain`
 - `gguf`
+- `github-actions`
+- `homebrew`
+- `ci`
+- `static-site`
 
 ## concerns (cross-cutting dimensions)
 
