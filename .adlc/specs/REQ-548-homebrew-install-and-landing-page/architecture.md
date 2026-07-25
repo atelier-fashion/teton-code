@@ -25,13 +25,21 @@ version before any build starts.
  └──────┬─────────────────────────────────────────┘
         ▼
  ┌─────────────┐    ┌──────────────┐    ┌───────────────────┐
- │ GitHub      │───►│ bump-formula │    │ deploy-site       │
- │ Release     │    │ render tmpl, │    │ (on release       │
- │ + checksums │    │ push to tap  │    │  published;       │
- └─────────────┘    └──────────────┘    │  loud no-op until │
+ │ GitHub      │───►│ bump-formula │───►│ deploy-site       │
+ │ Release     │    │ render tmpl, │    │ (DISPATCHED by    │
+ │ + checksums │    │ push to tap  │    │  release.yml once │
+ └─────────────┘    └──────────────┘    │  the tap bump is  │
+                                        │  green — never    │
+                                        │  before it, never │
+                                        │  beside it;       │
+                                        │  fails loud until │
                                         │  GCP secrets set) │
                                         └───────────────────┘
 ```
+
+The `bump-formula ──► deploy-site` arrow is an explicit `workflow_dispatch`,
+not an event subscription, and its direction is an invariant — see ADR-548-3
+and ADR-548-3a.
 
 The smoke gate per target (BR-7/BR-9), derived from integration probing:
 
@@ -62,6 +70,15 @@ The smoke gate per target (BR-7/BR-9), derived from integration probing:
   `CARGO_TERM_COLOR`, per-ref concurrency, and the `tools/refresh-catalog.py`
   exit-code taxonomy (0 / distinct-failure / 75-unverified) with `::error` /
   `::warning` annotations (LESSON-442).
+- **And to extend.** Verify found this REQ shipping a release pipeline with no
+  standing CI at all: every workflow and every script under `tools/release/`
+  was first exercised by cutting a tag, which is after they can still be wrong.
+  `ci.yml`'s `tooling` job closes that on every PR — `actionlint`
+  (shellcheck-backed) over `.github/workflows/*.yml`, `shellcheck` over
+  `tools/release/*.sh` + `site/render.sh`, and `tools/release/selftest.sh`,
+  which drives the release scripts through their success *and* failure paths
+  with no network and no cargo. `tools/release/selftest.sh` is a contract path:
+  the CI job, the runbook, and the release pipeline all name it.
 
 ## ADRs
 
@@ -93,22 +110,74 @@ it under Rosetta 2 on the same runner, and record that leg as
 the binary loads and runs its CPU paths; it is not native-hardware evidence,
 and per LESSON-433 the claim is recorded at exactly its strength (spec BR-7).
 
-### ADR-548-3: The site deploy is release-triggered, version-injected, and loudly degraded until GCP secrets exist
+### ADR-548-3: The site deploy is dispatched by the release run, version-injected, and loudly degraded until GCP secrets exist
 
 **Decision**: `site/` holds a dependency-free static page; a small render step
 injects the current version + install command from the release tag at deploy
-time (BR-8 — no hand-edited version strings). `deploy-site.yml` runs on
-release-published and `workflow_dispatch`, targeting the Atelier GCP infra
-(user-confirmed hosting). Until the GCP secrets (project id, workload identity
-/ SA) are configured — OQ-5 — the deploy job **fails its final step with a
-::warning-annotated, named reason** ("site deploy skipped: GCP secrets not
-configured") rather than silently succeeding while deploying nothing
-(LESSON-447: a degraded path must be visible and preserve the invariant —
-here, "green deploy job ⇒ site actually deployed").
+time (BR-8 — no hand-edited version strings). `deploy-site.yml` targets the
+Atelier GCP infra (user-confirmed hosting). Until the GCP secrets (project id,
+workload identity / SA) are configured — OQ-5 — the deploy job **fails its
+final step with a ::warning-annotated, named reason** ("site deploy blocked:
+required GCP configuration is not set in this repository") rather than silently
+succeeding while deploying nothing (LESSON-447: a degraded path must be visible
+and preserve the invariant — here, "green deploy job ⇒ site actually
+deployed").
+
+**How it is triggered — corrected during verify.** The original decision said
+"runs on release-published and `workflow_dispatch`". As implemented, that
+subscription can *never* fire: `release.yml` creates the release with
+`gh release create` under the default `GITHUB_TOKEN`, and GitHub deliberately
+does not raise workflow-triggering events for actions taken by that token. The
+site deploy would have sat silent after every release — the exact
+green-while-nothing-happened failure the rest of this ADR is built to refuse,
+reintroduced by the trigger itself.
+
+Implemented instead: **`release.yml` dispatches `deploy-site.yml` explicitly,
+after `bump-formula` succeeds.** The dispatched run resolves its version from
+the repository's latest published release, so the page can still only ever
+advertise a version that exists (BR-8) and the dispatcher needs no input.
+`deploy-site.yml` keeps the `release: published` trigger as a fallback for a
+release cut by a human or a PAT — those *do* raise the event — but nothing in
+the pipeline depends on it.
+
+**The guard is receipt-based, not status-based.** Each deploy step writes a
+receipt file as its *last* action, and the final `Deploy result` step passes
+only on a non-empty receipt. Every other outcome — no GCP configuration, an
+unrecognised surface, a deploy that died halfway — exits `78` (`EX_CONFIG`)
+with the reason named. A receipt cannot be written by a step that did not
+complete, which is what makes "this job is green" mean "tetoncode.ai was
+republished" rather than "no step reported an error". The guard also
+distinguishes *"the configuration step never ran"* (an earlier step failed —
+defer to it) from *"it ran and found nothing"*, so an upstream render or
+version failure is never reported as a missing-secret problem.
 
 **Rationale**: decouples the shippable, reviewable site + automation from the
 one input only the user can provide (which GCP surface/project the Atelier
 site uses). First real deploy is a human-confirmed step per the infra rule.
+
+### ADR-548-3a (addendum): the site deploy must never race or precede the tap bump
+
+**Decision**: the site deploy is ordered strictly *after* `bump-formula`
+succeeds, and is dispatched by it rather than running concurrently with it.
+
+**Rationale**: the landing page's whole job is to display a version and the
+`brew install` command that fetches it. Those two claims are only
+simultaneously true once the tap points at the new release. A site deploy that
+raced the bump — or that fired off the release event in parallel with it, which
+is what a plain `release: published` subscription would have done had it worked
+— publishes a page advertising vX.Y.Z next to an install command that hands the
+visitor vX.Y.Z-1. That is worse than a stale page, because it is confidently
+wrong at the moment of peak attention, and no one operating either workflow
+would see it: both jobs are green.
+
+**Consequences for anyone editing either workflow.** `deploy-site.yml` must not
+regain a trigger that fires on release publication from the pipeline's own
+releases, and `release.yml` must not move its dispatch above or alongside
+`bump-formula`. If `bump-formula` fails, the site deploy must not run at all:
+the previous page, advertising the previous version, is *correct* for a tap that
+still points at the previous version. `deploy-site.yml`'s
+`concurrency: deploy-site` group with `cancel-in-progress: false` backstops the
+ordering if two runs are ever in flight — they queue, they do not interleave.
 
 ### ADR-548-4: Version preflight uses a distinct exit code
 

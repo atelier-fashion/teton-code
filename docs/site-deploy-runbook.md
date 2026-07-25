@@ -4,10 +4,34 @@ How `https://tetoncode.ai` gets published, and what has to exist in this
 repository before it can be.
 
 The publisher is [`.github/workflows/deploy-site.yml`](../.github/workflows/deploy-site.yml).
-It runs on `release: published` and on `workflow_dispatch`, renders
-`site/index.html` with the release's version and the install command
-(`site/render.sh`, REQ-548 BR-8), and pushes the result to the Atelier Google
+It renders `site/index.html` with the release's version and the install command
+(`site/render.sh`, REQ-548 BR-8) and pushes the result to the Atelier Google
 Cloud infrastructure.
+
+**How it gets triggered.** A release run does not *notify* this workflow — it
+**dispatches** it. [`release.yml`](../.github/workflows/release.yml) calls
+`deploy-site.yml` itself, once `bump-formula` has pushed the tap successfully.
+There is no `release: published` subscription doing the work, because there
+could not be: `release.yml` creates the release with the default `GITHUB_TOKEN`,
+and GitHub does not raise workflow-triggering events for anything that token
+does. A workflow subscribed to `release: published` would never have run after a
+single release, and would have looked fine the whole time.
+
+Three consequences worth holding on to:
+
+- The site deploy is **strictly after** the tap bump, never beside it
+  (ADR-548-3a). The page advertises a version *and* the `brew install` that
+  fetches it; both are only true once the tap points at the new release.
+- If `bump-formula` fails, the site is **not** deployed. That is correct, not a
+  gap: the page still on tetoncode.ai matches the version the tap still serves.
+- The dispatched run takes the `workflow_dispatch` path below, so it reads its
+  version from `repos/{repo}/releases/latest` rather than from an event payload.
+
+`deploy-site.yml` does still carry a `release: published` trigger, but only as a
+fallback for a release cut **by a human through the UI or by a PAT** — those do
+raise the event. Nothing in the release pipeline depends on it. And you can
+always run the workflow by hand (Actions → Deploy site → Run workflow) for a
+site copy fix or an infrastructure change.
 
 **Right now it cannot finish.** The GCP coordinates are REQ-548's Open Question
 5 and nobody has answered it, so the workflow's last step fails with:
@@ -85,6 +109,17 @@ Notes on the two that surprise people:
   rest of this design refuses. The workflow emits a `::warning` on every run
   where the variable is unset, so the gap stays visible instead of silent. Set
   it if a CDN exists.
+
+  **The invalidation is scoped to the objects this deploy writes** — `/` plus
+  every file the renderer produced under `site/dist` (today, just
+  `/index.html`), enumerated at deploy time and issued one `--path` at a time.
+  It is deliberately **not** `--path '/*'`. This URL map may be the one fronting
+  the whole Atelier site; a landing-page release has no business evicting every
+  other property's cache behind it, and the cost of a full flush is paid by
+  services that had nothing to do with the release. If you point
+  `GCP_CDN_URL_MAP` at a shared load balancer, that is fine and expected — the
+  scoping is what makes it fine. If the page ever gains assets, they are picked
+  up automatically; nobody has to remember to widen a path list.
 
 Setting them (`gh` CLI, from a checkout of this repository):
 
@@ -280,16 +315,28 @@ Set `vars.GCP_RUN_SERVICE` and `vars.GCP_RUN_REGION`.
 
 | Step | Behaviour |
 |------|-----------|
-| Resolve the release version | `release` event → the event's tag. `workflow_dispatch` → `repos/{repo}/releases/latest`. Exits `65` (release event with no tag), `69` (dispatched with no published release yet), `75` (the lookup failed — not the same as "no release"). |
+| Resolve the release version | `workflow_dispatch` (including the dispatch from `release.yml`) → `repos/{repo}/releases/latest`. `release` event, i.e. the human/PAT fallback → the event's tag. Exits `65` (release event with no tag), `69` (dispatched with no published release yet), `75` (the lookup failed — not the same as "no release"). |
 | Render the landing page | `site/render.sh <tag> "brew install atelier-fashion/tap/teton"`. Exits `64` if a version is malformed or a template placeholder survives; the partial output is deleted, so a page reading `{{VERSION}}` can never reach a deploy step. |
-| Upload the rendered site | Always. Artifact `site-dist` is the page that would have gone out — this is how the site is reviewed before any of the above exists. |
+| Upload the rendered site | Always. Artifact `site-dist` is the page that would have gone out — this is how the site is reviewed before any of the above exists. **Ordered before the auth step on purpose**: `google-github-actions/auth` writes a `gha-creds-*.json` credential into the workspace, and this step runs while that file does not yet exist. Do not move it down. |
 | Resolve the GCP deploy configuration | Reads the table in section 2 and records what is missing. Never fails on its own; it only reports. |
-| Authenticate / Set up gcloud / Deploy | Run only when the configuration is complete. The deploy step writes a **receipt** as its final action. |
+| Authenticate / Set up gcloud / Deploy | Run only when the configuration is complete. The deploy step writes a **receipt** as its final action. On `gcs`, that includes the scoped CDN invalidation (section 2). |
 | **Deploy result** | The guard. Exits `0` only on a receipt from a deploy step that ran to completion; otherwise `78` (`EX_CONFIG`) with the reason and this file's path. |
 
 `workflow_dispatch` picks up the *latest published* release, which excludes
 drafts and pre-releases. Dispatching after cutting a pre-release republishes the
 last stable version, not the pre-release — by design.
+
+**The guard names the right cause.** Because `Deploy result` runs on every
+non-cancelled outcome, it can be reached on a run where the configuration step
+never executed — a version resolution that exited `69`/`75`, or a render that
+exited `64`, stops the job before it. On those runs every `steps.config.*`
+output is empty, and a guard reading only those outputs would announce
+*"required GCP configuration is not set … (no deploy surface was resolved)"* for
+a run that never looked at the configuration at all. It does not: it checks
+whether the configuration step ran before it interprets that step's silence, and
+says **"an earlier step in this job failed before the deploy configuration was
+ever read"** instead. If you see that message, the fix is the red step above it —
+this run tells you nothing about your secrets either way.
 
 ---
 
@@ -308,7 +355,7 @@ yet.
 4. Dispatch again, **watching the run**. Read the `gcloud` output. Confirm the
    `Deploy result` step prints a `Site deployed` notice naming what went where.
 5. Run the AC-7 checklist in section 7.
-6. Only then let a release-triggered run happen unattended.
+6. Only then let a release run dispatch this workflow unattended.
 
 If step 4 fails partway, the site is unchanged or partially updated — check
 section 8 before re-running.
@@ -363,6 +410,18 @@ checks above prove bytes and TLS, not that the page reads correctly.
 until section 2 is done. The message lists the exact names that are unset. This
 is the workflow working, not failing.
 
+**`site deploy blocked: an earlier step in this job failed before the deploy
+configuration was ever read`** — do **not** start checking secrets. Something
+above the guard went red: the version resolution (`65`/`69`/`75`) or the render
+(`64`). Scroll up, fix that, re-run. This run learned nothing about your GCP
+configuration, and the guard says so rather than blaming the settings it never
+looked at.
+
+**`site deploy blocked: the deploy-configuration step itself did not succeed`**
+— the `Resolve the GCP deploy configuration` step failed while running, which is
+different from it reporting things missing. Read that step's log; the settings
+may well be fine.
+
 **`vars.GCP_DEPLOY_SURFACE is 'cloudrun', which is neither cloud-run nor gcs`**
 — the value is normalised (lowercased, whitespace stripped) but not guessed at.
 Set it to exactly `cloud-run` or `gcs`.
@@ -383,8 +442,18 @@ and re-run; `index.html` is uploaded with `max-age=300`, so an unset CDN
 invalidation self-corrects within minutes on the bucket's own caching but not
 necessarily at the edge.
 
+If the variable *is* set and the edge is still stale, check which paths the run
+invalidated — the receipt names the count, and the step logs one
+`invalidate-cdn-cache --path …` line per path. The invalidation covers `/` and
+each file under `site/dist` (section 2); a URL serving the page from some other
+path (a `/teton/` prefix on a shared load balancer, say) is not covered, and
+that is a URL-map routing question rather than a workflow bug.
+
 **No published release yet (exit `69`)** — the landing page displays a release
 version, so there must be a release. Cut one with the release workflow first.
+This is also what a dispatch from `release.yml` would hit if it somehow ran
+before the release existed; it cannot, because the dispatch happens after
+`bump-formula`, which runs after the `release` job publishes.
 
 **Nothing is being cleaned up** — the deploy is an rsync **without** delete, on
 purpose: `vars.GCP_SITE_BUCKET` may be a prefix in a bucket shared with the rest

@@ -8,16 +8,17 @@
 # Node
 node_modules/
 
-# Build output: Node bundles, and tools/release/package.sh's local staging dir
-# (the release tarballs land in <repo>/dist when you run it by hand)
+# Build output. A bare `dist/` matches every directory of that name at any
+# depth, so this one rule covers both:
+#   * tools/release/package.sh's local staging dir (release tarballs land in
+#     <repo>/dist when you run it by hand), and
+#   * site/dist/ — the landing-page render output. site/index.html is the
+#     committed source of truth; site/dist/ is stamped from release metadata at
+#     deploy time (REQ-548 BR-8) and is never committed.
 dist/
 
 # Rust
 target/
-
-# Landing-page render output — site/index.html is the committed source of truth,
-# site/dist/ is stamped from release metadata at deploy time (REQ-548 BR-8)
-site/dist/
 
 # Go
 bin/
@@ -33,6 +34,14 @@ models/
 # Secrets — keys live in the OS keychain, never in the repo
 .env
 .env.*
+
+# google-github-actions/auth writes the credential it mints into the workspace
+# as gha-creds-<random>.json. Required by that action's own documentation, and
+# it is the second line of defence behind deploy-site.yml's step ordering: the
+# rendered-site artifact is uploaded before the auth step runs, so the file does
+# not exist yet when anything is packaged. Never commit one, never `git add -f`
+# one, and never widen an upload-artifact `path:` to the workspace root.
+gha-creds-*.json
 
 # ADLC worktrees (used by /proceed for parallel session isolation)
 .worktrees/

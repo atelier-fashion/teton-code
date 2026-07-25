@@ -17,8 +17,8 @@ to go stale:
 - [`docs/homebrew-tap-setup.md`](homebrew-tap-setup.md) — the
   `atelier-fashion/homebrew-tap` repository and the `HOMEBREW_TAP_TOKEN` secret.
 - [`docs/site-deploy-runbook.md`](site-deploy-runbook.md) — `tetoncode.ai`,
-  which deploys on `release: published` and is blocked until REQ-548's OQ-5 is
-  answered.
+  which this workflow **dispatches** after the tap bump succeeds, and which is
+  blocked until REQ-548's OQ-5 is answered.
 
 **The invariant this whole pipeline defends:** a green release run means the tap
 points at the release, the release's artifacts hash to the checksums published
@@ -63,9 +63,11 @@ it: there is no published release to install from.
 What a dry run proves, precisely:
 
 - The `x86_64-apple-darwin` cross leg compiles and its binaries execute
-  (under Rosetta 2 on the arm64 runner, ADR-548-2). **Until a dry run goes
-  green, that leg is designed but unproven** — it is the one most likely to
-  fail first, and finding out from a tag means retagging.
+  (under Rosetta 2 on the arm64 runner, which that leg installs for itself with
+  `softwareupdate --install-rosetta` rather than assuming the image has it —
+  ADR-548-2). **Until a dry run goes green, that leg is designed but unproven**
+  — it is the one most likely to fail first, and finding out from a tag means
+  retagging.
 - The rendered formula passes the audit gate that would otherwise fail *after*
   a release is already published.
 
@@ -128,6 +130,12 @@ that users' `brew install` may already have resolved.
 | `bump-formula` | macos-15 | Re-downloads the published assets and re-checks them against the published `checksums.txt`; renders `Formula/teton.rb`; asserts Homebrew resolves it at the tag; `brew style` + `brew audit`; fetches all three URLs; commits and pushes the tap | any of the above. Nothing here is `continue-on-error` — BR-4 |
 | `verify-install` | macos-15 | `brew install atelier-fashion/tap/teton` as a user, `brew test`, `brew services start` → `doctor` → `restart` → `stop` (AC-5/AC-6) | any step. Covers **macOS arm64 only** — a green run here is not evidence about Intel or Linux (LESSON-433) |
 
+After `bump-formula` is green, the run **dispatches**
+[`deploy-site.yml`](../.github/workflows/deploy-site.yml) to republish
+`tetoncode.ai` at the new version. That is a separate workflow run with its own
+entry in the Actions list, not a job in this table — see §5 for why it is a
+dispatch and why it comes after the bump rather than beside it.
+
 Exit codes across `tools/release/` are a taxonomy, not a boolean, so "it failed"
 and "it could not run" can never be confused (LESSON-442, ADR-548-4):
 
@@ -182,11 +190,24 @@ refuses for an untrusted tap; `brew trust atelier-fashion/tap` once if it does.
 The fully-qualified install above never needs it — see
 [homebrew-tap-setup.md §4](homebrew-tap-setup.md).
 
-Finally, the site: a published release triggers
-[`deploy-site.yml`](../.github/workflows/deploy-site.yml). Until OQ-5 is
-answered it renders the page, uploads it as the `site-dist` artifact, and then
-fails its `Deploy result` step on purpose. That red job does **not** mean the
-release is bad — see [site-deploy-runbook.md](site-deploy-runbook.md).
+Finally, the site. Once `bump-formula` has pushed the tap, this workflow
+**dispatches** [`deploy-site.yml`](../.github/workflows/deploy-site.yml) — an
+explicit `workflow_dispatch`, not a `release: published` subscription. It has to
+be: `gh release create` runs under the default `GITHUB_TOKEN`, and GitHub does
+not raise workflow-triggering events for that token's actions, so a subscribed
+workflow would sit silent after every release while looking perfectly healthy.
+
+The ordering is deliberate and is an invariant (ADR-548-3a): the page advertises
+a version *and* the `brew install` that fetches it, and both are only true once
+the tap points at the new release. A site deploy that ran beside the bump would
+publish a page naming vX.Y.Z next to an install command still handing out
+vX.Y.Z-1. So if `bump-formula` fails, the site is not deployed — correctly: the
+page already up matches the version the tap still serves.
+
+Until OQ-5 is answered that dispatched run renders the page, uploads it as the
+`site-dist` artifact, and then fails its `Deploy result` step on purpose. That
+red job does **not** mean the release is bad — see
+[site-deploy-runbook.md](site-deploy-runbook.md).
 
 ---
 
@@ -225,10 +246,22 @@ install and record the result in that release's sign-off.
    It runs `brew install atelier-fashion/tap/teton` as its very first step,
    before it teaches Homebrew anything about the tap — that ordering *is* the
    BR-1 evidence.
-4. **The site will not deploy** (OQ-5). Expected; see §5.
+4. **The site will not deploy** (OQ-5). Expected; see §5. The dispatch still
+   happens — you will see a `Deploy site` run appear and go red at its last
+   step. That is the design, not a symptom of the release.
 5. **AC-4 is staged**, not met (§6).
 6. **AC-1/AC-2 human sign-off** (§8) — CI covers macOS arm64. The other two
    platforms are unrun until a human runs them, and are recorded as unrun.
+7. **The release tooling is already under standing CI.** `ci.yml`'s `tooling`
+   job runs on every pull request: `actionlint` (shellcheck-backed) over the
+   workflows, `shellcheck` over `tools/release/*.sh` and `site/render.sh`, and
+   `tools/release/selftest.sh`, which exercises each release script's success
+   **and** failure paths with no network and no cargo. So a syntax error or a
+   broken exit code in this pipeline is caught on the PR that introduces it,
+   not by a tag. What that job cannot cover is everything that needs real
+   published bytes — the tarball URLs, the tap push, `brew install` — which is
+   exactly what the dry run in §2 and this section exist for. Green `tooling`
+   is not a substitute for item 1.
 
 ---
 
@@ -325,10 +358,20 @@ that platform's tarball. The bytes are bad; the log names which assertion. Do
 not retry hoping for green. `fail-fast: false` means the other two legs still
 report, so read all three before diagnosing.
 
-**`Rosetta 2 unavailable` (`75`)** — the arm64 macOS runner cannot execute
-x86_64 binaries, so the Intel artifact could not be exercised. Failing beats
-shipping an unsmoked binary; if GitHub's image changed, ADR-548-2's whole
-approach needs revisiting.
+**`Rosetta 2 unavailable` (`75`)** — the arm64 macOS runner could not execute
+the x86_64 binaries, so the Intel artifact was not exercised. Failing beats
+shipping an unsmoked binary.
+
+Note what this does **not** mean any more. The x86_64 leg now runs
+`softwareupdate --install-rosetta --agree-to-license` before its smoke, so an
+image that merely ships without Rosetta preinstalled is handled, not fatal — the
+workflow installs it. Reaching this failure therefore means the *install* did
+not take: GitHub's image refused it, the runner lost network mid-install, or
+Apple stopped offering Rosetta for that macOS version. The first two are
+re-runnable infrastructure faults. Only the third puts ADR-548-2's whole
+cross-compile-and-Rosetta-smoke approach in question, and it would be visible in
+the `softwareupdate` output rather than inferred from this exit code. Read that
+step's log before concluding anything about the ADR.
 
 **`Missing release artifacts` (`75`)** — fewer than three tarballs reached the
 `release` job. A release that silently omits a platform is worse than no
