@@ -65,13 +65,22 @@ fi
 # re-evaluates whether we are inside that table, so a `version` under
 # `[package]`, `[workspace.dependencies]`, or any other table can never be
 # picked up by accident.
+#
+# Both patterns match on the whole line rather than on awk's default
+# whitespace-split fields, because TOML does not require the whitespace those
+# fields assume. `version="0.1.0"` is one field, not three, and a `$1 ==
+# "version"` test missed it; `[workspace.package] # comment` is legal TOML that
+# an anchored `]$` header test refused to enter. Both forms exited 75 —
+# "the check could not run" — against a manifest that was perfectly well-formed
+# and did declare a version. A release gate that a legal reformat can silence
+# is not a gate.
 manifest_version="$(
     awk '
         /^[[:space:]]*\[/ {
-            in_block = ($0 ~ /^[[:space:]]*\[workspace\.package\][[:space:]]*$/)
+            in_block = ($0 ~ /^[[:space:]]*\[workspace\.package\][[:space:]]*(#.*)?$/)
             next
         }
-        in_block && $1 == "version" {
+        in_block && $0 ~ /^[[:space:]]*version[[:space:]]*=/ {
             value = $0
             sub(/^[^=]*=[[:space:]]*/, "", value)
             sub(/[[:space:]]*#.*$/, "", value)

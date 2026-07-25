@@ -1,12 +1,16 @@
 <!DOCTYPE html>
 <!--
-  tetoncode.ai landing page — template.
+  tetoncode.ai landing page.
 
-  This file is NOT the deployed artifact. `site/render.sh <version>` stamps the
-  VERSION and INSTALL_COMMAND placeholders from release metadata and writes
-  site/dist/index.html (REQ-548 BR-8: the page derives from the release source
-  of truth, never hand-edited version strings). The placeholder tokens are
-  spelled without their braces here so this comment survives the render.
+  Source of truth: site/index.html. Deployed artifact: site/dist/index.html,
+  written by `site/render.sh <version>`, which stamps the VERSION and
+  INSTALL_COMMAND placeholders from release metadata (REQ-548 BR-8: the page
+  derives from the release source of truth, never hand-edited version strings).
+
+  Edit the source; never the rendered copy, which the next deploy overwrites.
+  This comment ships to production inside the rendered page, so it is worded to
+  stay true there — the placeholder tokens are spelled without their braces so
+  it survives the render unchanged.
 
   Constraints this file must keep:
     - fully self-contained: no external scripts, fonts, stylesheets, analytics
@@ -372,8 +376,10 @@ teton</code></pre>
       <h3>The model arrives on first run, with your consent</h3>
       <p>The install is small because it ships no weights. The first time you
         run <code>teton</code>, it proposes a local model matched to your
-        hardware and names the download size and the RAM it needs
-        <em>before</em> fetching anything. Nothing downloads until you say
+        hardware and names that model's exact download size and RAM floor
+        <em>before</em> fetching anything — today's catalog spans roughly 1&nbsp;GB
+        for the smallest model to about 18&nbsp;GB for the largest, and which one
+        you are offered depends on your machine. Nothing downloads until you say
         yes.</p>
     </section>
 

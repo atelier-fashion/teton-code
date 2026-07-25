@@ -28,16 +28,31 @@
 #
 # Exit codes:
 #   0   the tarball was built and its sha256 recorded.
-#   64  EX_USAGE — wrong invocation.
+#   64  EX_USAGE — wrong invocation, or an argument that is not what it claims
+#       to be: `version` is pasted into a filesystem path and `target` is handed
+#       to `cargo build --target`, so neither is free text.
 #   70  EX_SOFTWARE — the build reported success but an expected binary is not
 #       where it should be. That is an internal inconsistency, not a compile
 #       error, and it is worth its own code so it cannot be read as one.
+#   75  EX_TEMPFAIL — the tarball was built but could not be hashed, because the
+#       machine has no sha256 tool at all. Distinct from 70 for the same reason
+#       the rest of tools/release/ separates them (LESSON-442): "could not run"
+#       is not "ran and found a problem".
 #   *   whatever `cargo build` exited with, propagated unchanged.
 
 set -euo pipefail
 
 EXIT_USAGE=64
 EXIT_INTERNAL=70
+EXIT_UNCHECKED=75
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+
+# `source=` lets `shellcheck -x` follow this; `disable=SC1091` keeps a bare
+# `shellcheck <file>` — which cannot follow it — from failing on the info.
+# shellcheck source=tools/release/lib.sh disable=SC1091
+. "$script_dir/lib.sh"
 
 if [ "$#" -lt 2 ]; then
     echo "usage: package.sh <target> <version> [outdir]" >&2
@@ -47,25 +62,31 @@ fi
 target="$1"
 version="${2#v}"
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd -- "$script_dir/../.." && pwd)"
+# Both arguments are validated before anything is built, because both leave this
+# script: `version` becomes part of a path this script creates and writes, and
+# `target` is passed to `cargo build --target`. This was the only script in
+# tools/release/ that took its inputs on trust.
+if ! is_release_version "$version"; then
+    echo "package: <version> must be a release version X.Y.Z (a leading 'v' is fine); got '$2'." >&2
+    exit "$EXIT_USAGE"
+fi
+
+# An allowlist, not a pattern: these are exactly the three targets the release
+# builds (ADR-548-2), and a typo'd fourth should stop here rather than after a
+# long cargo failure — or, worse, produce a tarball named for a platform the
+# formula will never point at.
+case "$target" in
+    aarch64-apple-darwin | x86_64-apple-darwin | x86_64-unknown-linux-gnu) ;;
+    *)
+        echo "package: <target> must be one of aarch64-apple-darwin, x86_64-apple-darwin," >&2
+        echo "         x86_64-unknown-linux-gnu; got '$target'." >&2
+        exit "$EXIT_USAGE"
+        ;;
+esac
 
 outdir="${3:-$repo_root/dist}"
 mkdir -p "$outdir"
 outdir="$(cd -- "$outdir" && pwd)"
-
-# Hash with whatever the platform ships: macOS has `shasum`, Linux has
-# `sha256sum`, and openssl is the last resort. The output format is normalised
-# to `<sha256>  <name>`, which both `shasum -a 256 -c` and `sha256sum -c` read.
-sha256_of() {
-    if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | awk '{ print $1 }'
-    elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{ print $1 }'
-    else
-        openssl dgst -sha256 "$1" | awk '{ print $NF }'
-    fi
-}
 
 echo "package: building $target (release, --features tetond/llama)"
 cargo build --release --workspace --target "$target" --features tetond/llama
@@ -102,7 +123,14 @@ COPYFILE_DISABLE=1 tar -czf "$tarball" -C "$stage" teton tetond LICENSE README.m
 # by hand. It is NOT what ends up in the release: `checksums.txt` is recomputed
 # in the release job from the files actually uploaded (BR-5), so a hash can
 # never describe bytes other than the ones being published.
-sha="$(sha256_of "$tarball")"
+#
+# The sidecar's format is `<sha256>  <name>`, which both `shasum -a 256 -c` and
+# `sha256sum -c` read.
+if ! sha="$(sha256_of "$tarball")"; then
+    echo "package: no sha256 tool (shasum, sha256sum, openssl) on PATH." >&2
+    echo "         $(basename "$tarball") was built but has no recorded hash." >&2
+    exit "$EXIT_UNCHECKED"
+fi
 printf '%s  %s\n' "$sha" "$(basename "$tarball")" >"$tarball.sha256"
 
 echo "package: built $(basename "$tarball")"

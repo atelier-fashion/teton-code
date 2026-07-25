@@ -47,6 +47,11 @@ EXIT_UNCHECKED=75
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 
+# `source=` lets `shellcheck -x` follow this; `disable=SC1091` keeps a bare
+# `shellcheck <file>` — which cannot follow it — from failing on the info.
+# shellcheck source=tools/release/lib.sh disable=SC1091
+. "$script_dir/lib.sh"
+
 template="$repo_root/packaging/homebrew/teton.rb.tmpl"
 base_url="https://github.com/atelier-fashion/teton-code/releases/download"
 version=""
@@ -136,8 +141,14 @@ done
 # Pinning its shape keeps both honest, and rejects the empty string that a
 # `--version ""` or an unset workflow output would otherwise render as
 # `version ""` — a formula that parses, installs nothing, and reads as fine.
-if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
-    echo "render-formula: --version must be X.Y.Z (optionally with a -pre/+build suffix); got '$version'." >&2
+#
+# `is_release_version` (lib.sh) refuses `-rc.1` and `+build` suffixes too, which
+# this check used to accept. It should not have: the release workflow's tag
+# preflight rejects them, so every suffixed version this rendered was a formula
+# pointing at release URLs that could not exist.
+if ! is_release_version "$version"; then
+    echo "render-formula: --version must be a release version X.Y.Z — no -pre or +build" >&2
+    echo "                suffix, because no such release is ever published; got '$version'." >&2
     exit "$EXIT_USAGE"
 fi
 
@@ -145,21 +156,6 @@ if [ ! -f "$template" ]; then
     echo "render-formula: template not found: $template — nothing was rendered." >&2
     exit "$EXIT_UNCHECKED"
 fi
-
-# Hash with whatever the platform ships — macOS has `shasum`, Linux has
-# `sha256sum` — the same fallback chain package.sh uses to record the per-leg
-# sidecar hashes.
-sha256_of() {
-    if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | awk '{ print $1 }'
-    elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{ print $1 }'
-    elif command -v openssl >/dev/null 2>&1; then
-        openssl dgst -sha256 "$1" | awk '{ print $NF }'
-    else
-        return 1
-    fi
-}
 
 tarball_name() {
     printf 'teton-v%s-%s.tar.gz' "$version" "$1"

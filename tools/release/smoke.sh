@@ -48,11 +48,33 @@ EXIT_USAGE=64
 EXIT_FAILED=65
 EXIT_UNCHECKED=75
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# `source=` lets `shellcheck -x` follow this; `disable=SC1091` keeps a bare
+# `shellcheck <file>` — which cannot follow it — from failing on the info.
+# shellcheck source=tools/release/lib.sh disable=SC1091
+. "$script_dir/lib.sh"
+
 # How long the seam refusal gets to happen, and how long the daemon gets to come
 # up. The refusal is a panic during startup, so it is immediate; the daemon runs
 # a hardware probe first, so it gets longer.
-SEAM_DEADLINE_SECS=20
-HANDSHAKE_DEADLINE_SECS=45
+#
+# Both are overridable so selftest.sh can exercise the two timeout paths — a
+# daemon that does not refuse the seams, and one that never handshakes — without
+# spending a minute per case. The override direction is safe by construction:
+# shortening a deadline can only make an assertion give up sooner, i.e. FAIL
+# earlier. There is no value of either that turns a failing artifact into a
+# passing one, which is why this knob is allowed to exist on a release gate at
+# all. Leave them unset in CI and the defaults apply.
+SEAM_DEADLINE_SECS="${TETON_SMOKE_SEAM_DEADLINE_SECS:-20}"
+HANDSHAKE_DEADLINE_SECS="${TETON_SMOKE_HANDSHAKE_DEADLINE_SECS:-45}"
+
+for deadline in "$SEAM_DEADLINE_SECS" "$HANDSHAKE_DEADLINE_SECS"; do
+    if ! printf '%s' "$deadline" | grep -Eq '^[1-9][0-9]*$'; then
+        echo "smoke: deadline overrides must be a positive whole number of seconds; got '$deadline'." >&2
+        exit "$EXIT_USAGE"
+    fi
+done
 
 if [ "$#" -lt 2 ]; then
     echo "usage: smoke.sh <tarball> <version>" >&2
@@ -61,6 +83,19 @@ fi
 
 tarball="$1"
 version="${2#v}"
+
+# Every assertion below is `grep -qF -- "$version"`, and `grep -qF -- ""` matches
+# any input at all — so an empty version made all four assertions pass against
+# any pair of binaries, including binaries reporting a completely different
+# version. That is worse than no gate: it is a gate that reports PASS. The
+# version must therefore be a release version before it is allowed to be a
+# needle.
+if ! is_release_version "$version"; then
+    echo "smoke: <version> must be a release version X.Y.Z (a leading 'v' is fine); got '${2}'." >&2
+    echo "       An empty or malformed version would be greped for literally, and an empty" >&2
+    echo "       needle matches everything — every assertion would pass without checking." >&2
+    exit "$EXIT_USAGE"
+fi
 
 if [ ! -f "$tarball" ]; then
     echo "smoke: tarball not found: $tarball — nothing was exercised." >&2
@@ -144,10 +179,20 @@ seam_pid=$!
 # A watchdog, because the failure mode being guarded against is a daemon that
 # does NOT refuse: that daemon runs in the foreground forever, and without this
 # the smoke would hang instead of reporting the failure it just found.
+#
+# Its output is redirected to /dev/null, and that redirect is load-bearing. The
+# `kill` below signals this subshell, not the `sleep` it is blocked on: with job
+# control off, a background job shares the script's process group, so the signal
+# reaches the subshell alone and the `sleep` is orphaned and runs out its full
+# deadline. An orphan is harmless — except that it inherited the caller's stdout,
+# and a pipe stays open while any writer holds it. Undetached, this made a smoke
+# whose four assertions all finished instantly take SEAM_DEADLINE_SECS to be
+# observed as finished, once per build leg, by anything reading its output —
+# every CI step, every `$(...)`.
 (
     sleep "$SEAM_DEADLINE_SECS"
     kill -9 "$seam_pid" 2>/dev/null || true
-) &
+) >/dev/null 2>&1 &
 seam_watchdog=$!
 
 seam_status=0
