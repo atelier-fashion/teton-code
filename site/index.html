@@ -291,6 +291,10 @@
       <p class="step-label">Then start the daemon and open the CLI:</p>
       <pre><code>brew services start teton
 teton</code></pre>
+      <p class="meta">If Homebrew answers that the tap is not trusted, run
+        <code>brew trust atelier-fashion/tap</code> once — the install command
+        above is self-authorizing because it names the tap in full, and the
+        short name <code>teton</code> is not.</p>
       <p class="meta">Latest release v{{VERSION}}. Two binaries —
         <code>teton</code> (CLI) and <code>tetond</code> (daemon). No Rust
         toolchain, no cmake, no build step.</p>

@@ -6,6 +6,57 @@ frontier-model money only where frontier-model intelligence matters.**
 > ⛰️ Named in the Tetons, where the idea was born. A mountain range is a range —
 > of peaks, of sizes, of routes. So is your model lineup.
 
+## Install
+
+```sh
+brew install atelier-fashion/tap/teton
+brew services start teton
+teton
+```
+
+That is the whole install: two binaries — `teton` (CLI) and `tetond` (the
+daemon `brew services` runs under launchd) — with no Rust toolchain, no cmake,
+and no feature flags to get right.
+
+If `brew services start teton` refuses with a tap-trust error, run
+`brew trust atelier-fashion/tap` once — Homebrew 6 treats the fully-qualified
+name in the install command as self-authorizing, but not the short name.
+
+**The model arrives on first run, with your consent.** The install ships no
+weights. The first `teton` run proposes a local model matched to your hardware
+and names the download size and the RAM it needs *before* fetching anything;
+nothing is downloaded until you accept. `teton model list` shows the catalog and
+each entry's fit for your machine.
+
+Afterwards, `teton doctor` diagnoses the daemon, its socket, the model state and
+your providers; the daemon's own logs live under
+`$(brew --prefix)/var/log/teton/`.
+
+### Upgrading
+
+```sh
+brew upgrade teton
+brew services restart teton
+```
+
+The restart is the load-bearing half. An upgrade replaces the binaries on disk;
+the `tetond` already running is still the old one until something restarts it,
+and `teton doctor` names the running daemon's version so you can tell which one
+answered.
+
+### What runs where
+
+| Platform | Release target | Local inference |
+|---|---|---|
+| macOS, Apple Silicon | `aarch64-apple-darwin` | Metal GPU acceleration |
+| macOS, Intel | `x86_64-apple-darwin` | CPU only |
+| Linux x86_64 (glibc) | `x86_64-unknown-linux-gnu` | CPU only |
+| Windows | — | Not supported |
+
+Remote models run the same everywhere; only the local base-camp model depends on
+your hardware. On Linux, Homebrew installs the binaries, but `brew services` is
+not a v1 claim — run `tetond` yourself, or write your own systemd user unit.
+
 ## What it is
 
 Teton Code is a Claude Code–style agentic coding harness with two
@@ -24,7 +75,7 @@ differentiators:
 Two promises, both made visible:
 
 - **Cost control** — a live cost meter with per-phase attribution and measured
-  savings vs. an all-frontier baseline.
+  savings vs. an all-frontier baseline (`teton cost`).
 - **Privacy boundaries** — mark paths as *local-only* and their content never
   leaves your machine. Enforced at the daemon's single egress point, verified by
   egress-capture tests, not vibes.
@@ -38,13 +89,43 @@ daemon. Clients are thin:
 1. **CLI (`teton`)** — first surface, MVP target.
 2. **VS Code extension** — second surface, same daemon protocol.
 
+Architecture decisions are recorded in
+[.adlc/context/architecture.md](.adlc/context/architecture.md); the product
+charter (business rules, acceptance criteria, open questions) is
+[REQ-544](.adlc/specs/REQ-544-teton-code-charter/requirement.md).
+
+## For contributors
+
+Homebrew is how you *use* Teton Code. Building from source is how you work on
+it — and it needs the toolchain the formula exists to spare everyone else.
+
+Prerequisites: a Rust toolchain (the channel is pinned in
+`rust-toolchain.toml`) and **cmake** — the `tetond/llama` feature compiles
+llama.cpp from source.
+
+```sh
+cargo build --workspace --release --features tetond/llama
+```
+
+The feature flag is not decoration. Without `tetond/llama` the daemon builds
+and runs, offers you a model, downloads it — and then cannot load it. Release
+tarballs are always built with it (`tools/release/package.sh`), so an installed
+daemon can serve the model the CLI offered.
+
+Maintainers cutting a release: [docs/release-runbook.md](docs/release-runbook.md).
+
 ## Status
 
-🚧 **Pre-alpha — product spec stage.** See
-[the product charter](.adlc/specs/REQ-544-teton-code-charter/requirement.md)
-for the full requirement spec (business rules, acceptance criteria, open
-questions). The daemon and CLI will be Rust; architecture decisions are
-recorded in [.adlc/context/architecture.md](.adlc/context/architecture.md).
+Early, and real. The daemon and CLI are implemented in Rust: first-run model
+consent, local inference through llama.cpp, provider registration, routing
+policy, privacy boundaries, and the cost meter all run on your machine today.
+The first-run flow has been human-verified end to end on Apple Silicon and only
+there — see [docs/manual-verification.md](docs/manual-verification.md), which
+records the unrun platforms as unrun rather than assuming them.
+
+Homebrew distribution is published by the release workflow on every `vX.Y.Z`
+tag. If `brew install` cannot find the formula, no release has been cut yet and
+the source build above is the way in.
 
 ## License
 

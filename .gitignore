@@ -7,6 +7,9 @@
 
 # Node
 node_modules/
+
+# Build output: Node bundles, and tools/release/package.sh's local staging dir
+# (the release tarballs land in <repo>/dist when you run it by hand)
 dist/
 
 # Rust
