@@ -26,8 +26,13 @@ ride this repo's PR review.
 Nothing else is required. The bump job creates `Formula/teton.rb` on its first
 successful run.
 
-Creating it is TASK-017's job — this section is the specification that task
-implements, not a second copy of the work.
+**Executed 2026-07-25 (TASK-017)**: the repo exists —
+<https://github.com/atelier-fashion/homebrew-tap> — public, `main`, README +
+MIT LICENSE only, deliberately no `Formula/teton.rb` yet. `brew tap
+atelier-fashion/tap` verified against the empty tap (exit 0) and untapped
+again. Still pending from this document: the token (section 2) — the bump job
+fails loudly until `HOMEBREW_TAP_TOKEN` is set, which is the correct
+pre-first-release state.
 
 ## 2. The token
 
