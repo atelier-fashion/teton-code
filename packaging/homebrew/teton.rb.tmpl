@@ -1,0 +1,87 @@
+# teton {{VERSION}} — GENERATED FILE, DO NOT EDIT IN THE TAP.
+#
+# Rendered from `packaging/homebrew/teton.rb.tmpl` in atelier-fashion/teton-code
+# by `tools/release/render-formula.sh`, and pushed to
+# atelier-fashion/homebrew-tap by that repo's release workflow (ADR-548-1).
+# The tap is a publish target, never a source: any hand edit here is silently
+# overwritten by the next release. Change the template instead, where the edit
+# rides the repo's PR review.
+#
+# The three `sha256` values below were computed in the release run from the
+# bytes GitHub actually serves at the URLs beside them (BR-5) — never typed,
+# never carried over from a local build.
+#
+# There is deliberately no `version` stanza: Homebrew scans the version out of
+# the release URL, and `brew audit` rejects a declaration that agrees with the
+# scan as redundant — so the audit gate and an explicit version cannot both
+# exist. The version is therefore pinned the same way the sha256s are, by the
+# rendered URLs, and the release workflow asserts that the version Homebrew
+# resolves equals the tag before it pushes (BR-3) rather than trusting the
+# scanner's heuristic.
+class Teton < Formula
+  desc "Local-first AI coding agent — the teton CLI and its tetond daemon"
+  homepage "https://tetoncode.ai"
+  license "MIT"
+
+  # Prebuilt per-target tarballs, not a source build: reimposing the Rust +
+  # cmake toolchain on every install is the burden this formula exists to
+  # remove (REQ-548). Each tarball is flat — `teton`, `tetond`, `LICENSE`,
+  # `README.md` at its root — and was built with `--features tetond/llama`, so
+  # an installed daemon can always load the model the CLI offers to fetch
+  # (BR-2).
+  on_macos do
+    on_arm do
+      url "{{URL_ARM64_DARWIN}}"
+      sha256 "{{SHA_ARM64_DARWIN}}"
+    end
+
+    on_intel do
+      url "{{URL_X64_DARWIN}}"
+      sha256 "{{SHA_X64_DARWIN}}"
+    end
+  end
+
+  # x86_64 only, deliberately: there is no arm64 Linux build, and stubbing a
+  # target we do not produce would make `brew install` fail with a 404 instead
+  # of Homebrew's honest "does not provide a package for this platform"
+  # (BR-10 — do not claim what the shipped binaries cannot do).
+  on_linux do
+    on_intel do
+      url "{{URL_X64_LINUX}}"
+      sha256 "{{SHA_X64_LINUX}}"
+    end
+  end
+
+  def install
+    # BR-1: both binaries, one command. `teton` without `tetond` is a CLI with
+    # nothing to talk to.
+    bin.install "teton", "tetond"
+
+    # Created here rather than left to launchd: the service below redirects
+    # stdout/stderr into this directory, and launchd does not create a missing
+    # parent — it fails the spawn, which surfaces as a service that flaps
+    # instead of a message about a missing directory (BR-6).
+    (var/"log/teton").mkpath
+  end
+
+  service do
+    # `tetond` runs in the foreground and resolves its own socket, lock and
+    # state under `~/Library/Application Support/teton`, so launchd needs to
+    # pass it nothing. A second instance exits 0 with "already running", which
+    # is exactly what keep_alive wants from a restart that raced a live daemon.
+    run [opt_bin/"tetond"]
+    keep_alive true
+    log_path var/"log/teton/tetond.log"
+    error_log_path var/"log/teton/tetond.err.log"
+  end
+
+  test do
+    # AC-5. `--version` is the whole assertion on purpose: `brew test` runs in a
+    # sandbox with no daemon, and `teton doctor` exits 0 whether or not one is
+    # reachable — a doctor assertion here would pass against nothing. The live
+    # start → doctor → stop handshake is exercised by the release workflow's
+    # `verify-install` job, where there is a real launchd service to talk to.
+    assert_match version.to_s, shell_output("#{bin}/teton --version")
+    assert_match version.to_s, shell_output("#{bin}/tetond --version")
+  end
+end
