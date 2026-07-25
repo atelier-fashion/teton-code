@@ -197,7 +197,7 @@ jobs:
       # on, so pinning them defends against a strictly smaller threat than the
       # upgrade friction costs.
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Each target compiles its own llama.cpp; sharing one cache key across
           # them would thrash it every run.
@@ -346,7 +346,7 @@ jobs:
           count="$(grep -c . "$work/tarballs.txt" || true)"
           if [ "${count:-0}" -ne 3 ]; then
             echo "::error title=Missing release artifacts::Expected 3 tarballs (one per target) but found ${count:-0}. A release that silently omits a platform is worse than no release — stopping before publish."
-            exit 75
+            exit 65
           fi
 
           # Guarded, not left to `-e`: hashing failing outright is a different
@@ -366,14 +366,14 @@ jobs:
           hashed="$(grep -c . checksums.txt || true)"
           if [ "${hashed:-0}" -ne "$count" ]; then
             echo "::error title=checksums.txt is incomplete (BR-5)::$count tarballs are about to be published but checksums.txt carries ${hashed:-0} lines. Nothing was published."
-            exit 75
+            exit 65
           fi
 
           awk '{ name = $2; sub(/^\*/, "", name); print name }' checksums.txt \
             | sort >"$work/hashed.txt"
           if ! diff -u "$work/tarballs.txt" "$work/hashed.txt"; then
             echo "::error title=checksums.txt does not describe these artifacts (BR-5)::The filenames in checksums.txt are not the set of tarballs about to be uploaded — in the diff above, '-' lines are present but unhashed and '+' lines are hashed but absent. Nothing was published."
-            exit 75
+            exit 65
           fi
 
           echo "checksums.txt:"
