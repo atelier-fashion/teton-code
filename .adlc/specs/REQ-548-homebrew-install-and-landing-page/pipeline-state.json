@@ -3,7 +3,7 @@
   "branch": "feat/REQ-548-homebrew-install-and-landing-page",
   "startedAt": "2026-07-25T00:05:00Z",
   "completed": false,
-  "currentPhase": 7,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,8 @@
     3,
     4,
     5,
-    6
+    6,
+    7
   ],
   "phaseHistory": [
     {
@@ -48,6 +49,11 @@
       "phase": 6,
       "name": "PR #10 body set (footprint preserved) and flipped to ready",
       "completedAt": "2026-07-25T04:45:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "CI green on all 6 checks incl. the new release-tooling gate; one transient curl reset fixed at root (retry-all-errors + 75 taxonomy)",
+      "completedAt": "2026-07-25T05:10:00Z"
     }
   ],
   "integrationBranch": "main",
