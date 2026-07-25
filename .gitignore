@@ -12,6 +12,10 @@ dist/
 # Rust
 target/
 
+# Landing-page render output — site/index.html is the committed source of truth,
+# site/dist/ is stamped from release metadata at deploy time (REQ-548 BR-8)
+site/dist/
+
 # Go
 bin/
 

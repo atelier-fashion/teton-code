@@ -1,7 +1,7 @@
 ---
 id: TASK-018
 title: "The tetoncode.ai landing page: static, dependency-free, version-injected"
-status: draft
+status: complete
 parent: REQ-548
 created: 2026-07-25
 updated: 2026-07-25
