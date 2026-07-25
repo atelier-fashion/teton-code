@@ -1,0 +1,324 @@
+name: Release
+
+# Pushing `vX.Y.Z` is the whole trigger: the tag is the single source of truth
+# for every version-shaped string downstream (BR-3), and the first thing this
+# workflow does is prove the tag and the workspace manifest agree.
+#
+# `workflow_dispatch` exists so the pipeline itself is testable without burning
+# a tag. With `dry_run` left at its default the run does everything — gate,
+# build all three targets, smoke each artifact, assemble `checksums.txt`, render
+# the release notes — and stops one step short of publishing.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the gate, builds, smokes and checksums, but publish nothing."
+        type: boolean
+        default: true
+
+# Unlike ci.yml, an in-flight run is NOT cancelled by a newer one. A release is
+# half-published for a few seconds in the middle of `gh release create`;
+# cancelling there leaves a release with some of its assets, which is worse than
+# waiting.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege by default. Only the `release` job widens this, and only to
+# what publishing needs.
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: version gate (BR-3 / ADR-548-4)
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.gate.outputs.tag }}
+      version: ${{ steps.gate.outputs.version }}
+      publish: ${{ steps.gate.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Nothing is built until the tag and `[workspace.package] version` agree.
+      # The exit code is a taxonomy, not a boolean, so "the versions disagree"
+      # can never be confused with "the check could not run" (LESSON-442):
+      #
+      #   0   MATCH       proceed.
+      #   64  MISMATCH    red, ::error::. A real BR-3 violation — the tag names
+      #                   a version the workspace does not declare. Retag, or
+      #                   bump the manifest. Nothing was built.
+      #   *   UNCHECKED   red, ::error::. The gate could not run at all (missing
+      #                   manifest, unparseable version). This is NOT evidence
+      #                   that the versions agree, so the release stops here
+      #                   rather than shipping on an unverified version.
+      - name: Tag vs workspace version
+        id: gate
+        env:
+          # A `workflow_dispatch` boolean arrives as the string "true"/"false";
+          # on a tag push the whole `inputs` context is absent and this is "".
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            # Dispatched from a branch: there is no tag, so the version comes
+            # from the manifest and the comparison below is the manifest against
+            # itself — it cannot fail, and it is not pretending to be the gate.
+            # The gate is the tag push. This path exists so the rest of the
+            # pipeline (build, smoke, checksums) is exercisable on demand.
+            manifest_version="$(bash tools/release/verify-version.sh --print-version)" || {
+              echo "::error title=Version gate UNCHECKED::The workspace version could not be read from Cargo.toml, so this run has no version to build. See the log."
+              exit 75
+            }
+            tag="v$manifest_version"
+            echo "::notice title=No tag to gate::This run was dispatched from '$GITHUB_REF_NAME', which is not a tag, so the version was taken from Cargo.toml ($tag) and the version gate compares it against itself. The real BR-3 gate runs on the tag push."
+          fi
+
+          # The runner's default shell is `bash -e`, so the check is bracketed
+          # by `set +e`/`set -e` — otherwise a failing gate would abort the step
+          # before its annotation could name which failure it was.
+          set +e
+          bash tools/release/verify-version.sh "$tag"
+          status=$?
+          set -e
+
+          case "$status" in
+            0)
+              echo "::notice title=Version gate MATCH::Tag $tag matches the workspace version. Building all three targets."
+              ;;
+            64)
+              echo "::error title=Version MISMATCH (BR-3)::Tag $tag and the root Cargo.toml [workspace.package] version name different versions — see the log for both. Nothing was built. Bump the workspace version or retag."
+              exit "$status"
+              ;;
+            *)
+              echo "::error title=Version gate UNCHECKED::verify-version.sh could not perform the check (exit $status). Nothing was learned about the tag, so the release is stopped rather than built on an unverified version."
+              exit "$status"
+              ;;
+          esac
+
+          # Publish only from a real tag ref, and only when a dry run was not
+          # requested. A branch dispatch never publishes: `gh release create`
+          # would mint a tag as a side effect, which is exactly the
+          # "a release appeared from nowhere" outcome the tag gate exists to
+          # prevent.
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${DRY_RUN:-}" != "true" ]; then
+            publish=true
+          else
+            publish=false
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
+
+  build:
+    name: build · smoke (${{ matrix.target }})
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One target failing should not hide the state of the other two — a
+      # release needs to know everything that is broken, not the first thing.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+            rosetta: false
+          # GitHub retired Intel macOS runners, so this leg is cross-compiled on
+          # the arm64 runner and smoke-tested under Rosetta 2 (ADR-548-2). That
+          # proves the binary loads and runs; it is not native-hardware
+          # evidence, and the release notes say so at exactly that strength.
+          - target: x86_64-apple-darwin
+            os: macos-15
+            rosetta: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            rosetta: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        # rustup reads rust-toolchain.toml and installs the pinned channel.
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Each target compiles its own llama.cpp; sharing one cache key across
+          # them would thrash it every run.
+          key: release-${{ matrix.target }}
+
+      # llama.cpp is built by its own cmake, which does not read Rust's
+      # `--target`. Without this it would happily produce arm64 objects for an
+      # x86_64 Rust build and fail at link — in this job, which is the loud
+      # place for it to fail, but with a message that reads like a linker bug
+      # rather than a configuration one.
+      - name: Point llama.cpp's cmake at the cross target
+        if: matrix.rosetta
+        run: echo "CMAKE_OSX_ARCHITECTURES=x86_64" >>"$GITHUB_ENV"
+
+      # Checked before the build so a runner without Rosetta costs a minute
+      # rather than a full llama.cpp compile, and so the failure names its own
+      # cause instead of surfacing as an exec-format error inside the smoke.
+      - name: Verify Rosetta 2 is available (x86_64 smoke host)
+        if: matrix.rosetta
+        run: |
+          if arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            echo "::notice title=Rosetta 2 available::The x86_64 artifact will be smoke-tested under Rosetta 2 on this arm64 runner (ADR-548-2)."
+          else
+            echo "::error title=Rosetta 2 unavailable::This runner cannot execute x86_64 binaries, so the x86_64-apple-darwin artifact could NOT be exercised. Failing rather than shipping an unsmoked binary for a platform we cannot test here."
+            exit 75
+          fi
+
+      - name: Build and package
+        run: |
+          bash tools/release/package.sh \
+            "${{ matrix.target }}" \
+            "${{ needs.preflight.outputs.version }}" \
+            dist
+
+      # The gate that decides whether these bytes ship (BR-7/BR-9): version
+      # strings, the release build's refusal of TETON_TEST_SEAMS, and a live
+      # daemon handshake — all against the unpacked tarball, not the build tree.
+      #
+      #   0   PASS
+      #   65  FAILED     red, ::error::. The artifact is bad. Do not release.
+      #   *   UNCHECKED  red, ::error::. The smoke could not run, so nothing is
+      #                  known about the artifact — which is not a pass.
+      - name: Smoke the tarball (BR-7/BR-9)
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          tarball="dist/teton-v$VERSION-$TARGET.tar.gz"
+
+          set +e
+          bash tools/release/smoke.sh "$tarball" "$VERSION"
+          status=$?
+          set -e
+
+          case "$status" in
+            0)
+              echo "::notice title=Smoke PASSED ($TARGET)::Both binaries report $VERSION, the release build refused TETON_TEST_SEAMS=1, and teton doctor handshook a live tetond."
+              ;;
+            65)
+              echo "::error title=Smoke FAILED ($TARGET)::A shipped-artifact assertion failed for $tarball — see the log for which one. These bytes must not be released."
+              ;;
+            *)
+              echo "::error title=Smoke UNCHECKED ($TARGET)::The smoke harness could not run against $tarball (exit $status), so nothing was learned about the artifact. Failing rather than publishing an unexercised binary."
+              ;;
+          esac
+          exit "$status"
+
+      - name: Upload target artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: teton-${{ matrix.target }}
+          # The sidecar `.sha256` is deliberately left behind: the release's
+          # checksums are recomputed from the uploaded files (BR-5).
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: checksums · GitHub Release
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      # Scoped to this job, not the workflow: it is the only one that writes.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download every target's tarball
+        uses: actions/download-artifact@v4
+        with:
+          path: staging
+          pattern: teton-*
+          merge-multiple: true
+
+      # BR-5: the published checksums are computed HERE, from the files that are
+      # about to be uploaded — never carried forward from the build legs. A hash
+      # that travelled separately from its bytes is a hash that can describe
+      # different bytes.
+      - name: Compute checksums.txt from the uploaded artifacts (BR-5)
+        working-directory: staging
+        run: |
+          set -uo pipefail
+          ls -l
+
+          count=$(find . -maxdepth 1 -name "*.tar.gz" | wc -l | tr -d ' ')
+          if [ "$count" -ne 3 ]; then
+            echo "::error title=Missing release artifacts::Expected 3 tarballs (one per target) but found $count. A release that silently omits a platform is worse than no release — stopping before publish."
+            exit 75
+          fi
+
+          sha256sum ./*.tar.gz | sed 's|\./||' >checksums.txt
+          echo "checksums.txt:"
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          PUBLISH: ${{ needs.preflight.outputs.publish }}
+        run: |
+          set -euo pipefail
+
+          notes="$(mktemp)"
+
+          # The backticks below are markdown — code fences and inline code in
+          # the release body — so the format strings are single-quoted on
+          # purpose and every value is passed as a printf argument.
+          # shellcheck disable=SC2016
+          {
+            printf '## teton %s\n\n' "$VERSION"
+            printf '```sh\nbrew install atelier-fashion/tap/teton\n```\n\n'
+            printf '### Platforms\n\n'
+            printf -- '- `aarch64-apple-darwin` — built and smoke-tested natively on macOS arm64.\n'
+            printf -- '- `x86_64-apple-darwin` — **Rosetta-verified**: cross-compiled on an arm64 runner and smoke-tested under Rosetta 2 (GitHub no longer offers Intel macOS runners). That proves the binary loads and runs its CPU paths; it is not evidence from native Intel hardware.\n'
+            printf -- '- `x86_64-unknown-linux-gnu` — built and smoke-tested natively on Linux.\n\n'
+            printf 'Every artifact passed the release smoke gate: `teton` and `tetond` both report %s, the release build refuses `TETON_TEST_SEAMS=1` rather than honouring the test seams, and `teton doctor` completed a live handshake against a freshly started daemon.\n\n' "$VERSION"
+            printf '### Checksums (sha256)\n\n```\n'
+            cat staging/checksums.txt
+            printf '```\n'
+          } >"$notes"
+
+          # The dry-run branch is a step that RUNS and says what it did, not a
+          # skipped job: "publish was skipped, here is the reason and here is
+          # exactly what would have gone out" is checkable; a grey box is not.
+          if [ "$PUBLISH" != "true" ]; then
+            echo "::notice title=Release publish SKIPPED::This run built, smoked and checksummed every target but published nothing (dry run, or dispatched from a branch rather than a tag). Everything below is what a real run would have released."
+            echo "--- assets that would be uploaded ---"
+            ls -1 staging/
+            echo "--- release notes ---"
+            cat "$notes"
+            exit 0
+          fi
+
+          # --verify-tag: refuse to invent a tag. If the tag is not already on
+          # the remote, something is wrong upstream of here and the fix is not
+          # for this step to create one.
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "teton $VERSION" \
+            --notes-file "$notes" \
+            staging/*.tar.gz \
+            staging/checksums.txt
+
+          echo "::notice title=Release published::$TAG is live with 3 tarballs and checksums.txt."

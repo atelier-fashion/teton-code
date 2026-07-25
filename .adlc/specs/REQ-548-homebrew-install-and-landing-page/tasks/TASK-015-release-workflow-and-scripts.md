@@ -1,7 +1,7 @@
 ---
 id: TASK-015
 title: "Tag-triggered release workflow: version gate, 3-target llama builds, smoke, GitHub Release"
-status: draft
+status: complete
 parent: REQ-548
 created: 2026-07-25
 updated: 2026-07-25
@@ -29,12 +29,12 @@ without burning a tag.
 
 ## Acceptance Criteria
 
-- [ ] `bash tools/release/verify-version.sh v0.1.0` exits 0 against the current tree; `v9.9.9` exits 64 with a message naming both versions
-- [ ] Workflow YAML parses (`python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/release.yml'))"`) and `shellcheck`/`bash -n` pass on all three scripts (shellcheck if installed, `bash -n` minimum)
-- [ ] The build matrix covers exactly `aarch64-apple-darwin` (macos-15), `x86_64-apple-darwin` (cross-compiled on macos-15, smoke under Rosetta 2 — ADR-548-2), `x86_64-unknown-linux-gnu` (ubuntu-24.04); every leg passes `--features tetond/llama`
-- [ ] `smoke.sh` runs green locally against a `--features tetond/llama` release build of the current tree (arm64 leg), including the seam-refusal and doctor-text assertions
-- [ ] The `release` job uploads all tarballs plus a single `checksums.txt` whose entries are computed in-workflow from the uploaded files (BR-5) and marks x86_64-darwin as Rosetta-verified in the release notes body
-- [ ] `workflow_dispatch` with `dry_run=true` runs preflight+build+smoke and skips the Release publish
+- [x] `bash tools/release/verify-version.sh v0.1.0` exits 0 against the current tree; `v9.9.9` exits 64 with a message naming both versions
+- [x] Workflow YAML parses (`python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/release.yml'))"`) and `shellcheck`/`bash -n` pass on all three scripts (shellcheck if installed, `bash -n` minimum)
+- [x] The build matrix covers exactly `aarch64-apple-darwin` (macos-15), `x86_64-apple-darwin` (cross-compiled on macos-15, smoke under Rosetta 2 — ADR-548-2), `x86_64-unknown-linux-gnu` (ubuntu-24.04); every leg passes `--features tetond/llama`
+- [x] `smoke.sh` runs green locally against a `--features tetond/llama` release build of the current tree (arm64 leg), including the seam-refusal and doctor-text assertions
+- [x] The `release` job uploads all tarballs plus a single `checksums.txt` whose entries are computed in-workflow from the uploaded files (BR-5) and marks x86_64-darwin as Rosetta-verified in the release notes body
+- [x] `workflow_dispatch` with `dry_run=true` runs preflight+build+smoke and skips the Release publish
 
 ## Technical Notes
 
