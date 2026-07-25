@@ -168,6 +168,8 @@ done
 seam_runtime="$work/seam"
 mkdir -p "$seam_runtime"
 seam_out="$work/seam.out"
+# Marker file: written by the watchdog iff it had to kill the daemon.
+seam_killed="$work/seam.killed"
 
 TETON_TEST_SEAMS=1 \
     XDG_RUNTIME_DIR="$seam_runtime" \
@@ -191,6 +193,11 @@ seam_pid=$!
 # every CI step, every `$(...)`.
 (
     sleep "$SEAM_DEADLINE_SECS"
+    # Leave a marker BEFORE killing: the kill is what makes $seam_status
+    # non-zero, so without this a daemon that printed the refusal and then kept
+    # running with the seams honoured — a BR-9 violation, the exact thing this
+    # assertion exists to catch — would be scored as a refusal.
+    : >"$seam_killed"
     kill -9 "$seam_pid" 2>/dev/null || true
 ) >/dev/null 2>&1 &
 seam_watchdog=$!
@@ -200,7 +207,10 @@ wait "$seam_pid" || seam_status=$?
 kill "$seam_watchdog" 2>/dev/null || true
 wait "$seam_watchdog" 2>/dev/null || true
 
-if [ "$seam_status" -ne 0 ] && grep -qF "TETON_TEST_SEAMS=1 is set" "$seam_out"; then
+if [ -e "$seam_killed" ]; then
+    fail "TETON_TEST_SEAMS=1 tetond was still running after ${SEAM_DEADLINE_SECS}s and had to be killed — it did not refuse, whatever it printed. Output:"
+    sed 's/^/  | /' "$seam_out" >&2 || true
+elif [ "$seam_status" -ne 0 ] && grep -qF "TETON_TEST_SEAMS=1 is set" "$seam_out"; then
     pass "TETON_TEST_SEAMS=1 tetond refused to start (exit $seam_status) with the release-build refusal"
 else
     fail "TETON_TEST_SEAMS=1 tetond did not refuse as a release build should (exit $seam_status). Output:"

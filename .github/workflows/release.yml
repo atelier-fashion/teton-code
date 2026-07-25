@@ -228,7 +228,7 @@ jobs:
       - name: Install Rosetta 2 (x86_64 smoke host)
         if: matrix.rosetta
         run: |
-          if softwareupdate --install-rosetta --agree-to-license; then
+          if sudo softwareupdate --install-rosetta --agree-to-license; then
             echo "::notice title=Rosetta 2 install requested::softwareupdate reported success. It is a no-op when Rosetta is already present."
           else
             echo "::warning title=Rosetta 2 install did not report success::'softwareupdate --install-rosetta --agree-to-license' exited non-zero. That is not by itself evidence that Rosetta is unavailable — the probe in the next step is the assertion."
@@ -652,6 +652,16 @@ jobs:
           # of the ascending sort; if that is the version we are about to push,
           # the push is a downgrade.
           oldest="$(printf '%s\n%s\n' "$VERSION" "$current" | sort -V | head -1 || true)"
+          # Fail CLOSED. An empty capture means the comparison did not happen
+          # (no `sort -V` on this image, sort errored) — and an empty string is
+          # never equal to $VERSION, so without this the guard would wave the
+          # push through while printing "Tap moves forward: -> ". The one half
+          # of the downgrade protection that could be disabled with nothing
+          # going red.
+          if [ -z "$oldest" ]; then
+            echo "::error title=Version comparison UNCHECKED (BR-4)::Could not compare $VERSION against the tap's current $current — 'sort -V' produced nothing, so whether this push is a downgrade is unknown. Nothing was pushed."
+            exit 75
+          fi
           if [ "$oldest" = "$VERSION" ]; then
             echo "::error title=Refusing to downgrade the tap (BR-4)::The tap already points at teton $current and this run would replace it with the OLDER $VERSION. Nothing was pushed. This is what two releases racing looks like from the losing side: the later push wins regardless of which version is newer, and every 'brew upgrade' after it hands users a downgrade. If the newer tag's tap job is the one that failed, re-run that job."
             exit 65
@@ -1160,10 +1170,16 @@ jobs:
           set -uo pipefail
 
           dispatch_status=0
-          gh workflow run deploy-site.yml --ref "$TAG" || dispatch_status=$?
+          # -f tag: the dispatched run must render THE version whose tap bump
+          # this run just proved. --ref alone selects which workflow FILE to
+          # run, not which version it renders; without the input deploy-site
+          # falls back to `releases/latest`, which under two racing releases is
+          # a different version than the tap now carries — the page would
+          # advertise X beside a `brew install` that hands visitors Y.
+          gh workflow run deploy-site.yml --ref "$TAG" -f tag="$TAG" || dispatch_status=$?
 
           if [ "$dispatch_status" -ne 0 ]; then
-            echo "::error title=Site deploy was NOT requested (BR-8)::'gh workflow run deploy-site.yml --ref $TAG' exited $dispatch_status, so tetoncode.ai was never asked to republish and still advertises the previous version. The release and the tap are correct; only the site is stale. Re-run this job, or dispatch Deploy site manually against $TAG."
+            echo "::error title=Site deploy was NOT requested (BR-8)::'gh workflow run deploy-site.yml --ref $TAG' exited $dispatch_status, so tetoncode.ai was never asked to republish and still advertises the previous version. The release and the tap are correct; only the site is stale. Re-run this job, or dispatch Deploy site manually with tag=$TAG."
             exit 65
           fi
 

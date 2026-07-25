@@ -40,6 +40,15 @@
 #     it from a checkout that need not contain tools/), so it carries its own
 #     copy behind a comment pointing here.
 is_release_version() {
+    # The `case` runs FIRST because the grep below is line-anchored, not
+    # string-anchored: `grep -Eq '^...$'` happily matches a multi-line string
+    # whose first line looks like a version, while release.yml's bash `[[ =~ ]]`
+    # would reject it. Without this guard the file that calls itself the
+    # authority would be the most permissive of the three. (site/render.sh
+    # carries the same pair for the same reason.)
+    case "${1-}" in
+        *[!0-9.]* | '') return 1 ;;
+    esac
     printf '%s' "${1-}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
 }
 
@@ -51,13 +60,32 @@ is_release_version() {
 # knows which of its own exit codes "this could not be computed" deserves; this
 # function does not.
 sha256_of() {
+    local digest=""
     if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | awk '{ print $1 }'
+        digest="$(shasum -a 256 "$1" | awk '{ print $1 }')"
     elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{ print $1 }'
+        digest="$(sha256sum "$1" | awk '{ print $1 }')"
     elif command -v openssl >/dev/null 2>&1; then
-        openssl dgst -sha256 "$1" | awk '{ print $NF }'
+        # `$NF`, not `$2`: openssl's prefix has already changed once
+        # (`SHA256(f)=` -> `SHA2-256(f)=`), and the digest is the last field
+        # under both.
+        digest="$(openssl dgst -sha256 "$1" | awk '{ print $NF }')"
     else
         return 1
     fi
+
+    # A tool that EXISTS but fails leaves awk with empty input, and the
+    # pipeline's status is awk's — zero. Without this the function returns
+    # success with an empty digest, and an empty string is what would then be
+    # written into checksums.txt or spliced into the formula's `sha256`. Only a
+    # well-formed digest counts as having hashed anything.
+    case "$digest" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+            if [ "${#digest}" -eq 64 ]; then
+                printf '%s\n' "$digest"
+                return 0
+            fi
+            ;;
+    esac
+    return 1
 }

@@ -9,9 +9,11 @@ name: Deploy site
 #
 #   workflow_dispatch    the normal path, and the one a release actually takes.
 #                        release.yml dispatches this workflow itself, once
-#                        `bump-formula` has succeeded. The version comes from
-#                        the repository's latest published release, so a run can
-#                        never quietly publish a page advertising a version
+#                        `bump-formula` has succeeded, passing the tag it just
+#                        proved as the `tag` input. A hand-run may omit it and
+#                        take the latest published release instead. Either way
+#                        the tag must resolve to a real published release, so a
+#                        run can never publish a page advertising a version
 #                        nobody cut.
 #
 #                        It is an explicit dispatch rather than a `release:
@@ -46,6 +48,14 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Published release tag to render (e.g. v0.1.0). release.yml passes the
+          tag whose tap bump it just proved, so the page and the `brew install`
+          it shows agree. Leave empty on a hand-run to take the latest release.
+        required: false
+        type: string
 
 # Unlike ci.yml, an in-flight run is NOT cancelled by a newer one: a half-synced
 # bucket or a half-rolled Cloud Run revision is worse than a queued run.
@@ -78,10 +88,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Nothing in this job pushes; don't leave the token in .git/config
+          # across the gcloud auth and buildpack steps below.
+          persist-credentials: false
 
-      # The version is release metadata, never workflow input: whichever trigger
-      # fired, the page can only ever claim a version that exists as a published
-      # release (BR-8). Exit codes are a taxonomy, not a boolean, so "there is no
+      # The version is always a REAL published release (BR-8) — a dispatch may
+      # name which one, but never invent it: the `tag` input is verified with
+      # `gh release view` before it is used, so an unpublished or mistyped tag
+      # is 69, never silently swapped for `latest`. Exit codes are a taxonomy, not a boolean, so "there is no
       # release yet" can never be confused with "GitHub did not answer"
       # (LESSON-442, ADR-548-4):
       #
@@ -99,6 +114,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -110,6 +126,17 @@ jobs:
               exit 65
             fi
             echo "::notice title=Version from release event::Publishing tetoncode.ai at $tag."
+          elif [ -n "${INPUT_TAG:-}" ]; then
+            # Dispatched with an explicit tag — the release-driven path. Verify
+            # it is a published release rather than trusting the caller: this is
+            # what keeps the page's version and the tap's version the same fact
+            # under two racing releases (ADR-548-3a).
+            tag="$INPUT_TAG"
+            if ! gh release view "$tag" --repo "$REPO" --json tagName >/dev/null 2>&1; then
+              echo "::error title=Dispatched tag is not a published release::'$tag' was passed as the tag input but is not a published release of $REPO, so there is nothing to advertise. Nothing was rendered."
+              exit 69
+            fi
+            echo "::notice title=Version from dispatch input::Publishing tetoncode.ai at $tag."
           else
             # `releases/latest` is the REST endpoint that already excludes drafts
             # and pre-releases, so a dispatched re-publish tracks the same thing

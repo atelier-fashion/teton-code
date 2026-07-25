@@ -165,6 +165,19 @@ refute() {
     return 0
 }
 
+# skip <label> — records a case that could NOT be exercised on this machine.
+#
+# Counted separately from a pass: "this machine has no third hashing tool" is
+# not evidence that the third branch works. Never fails the suite — a developer
+# laptop missing a tool must not turn CI's signal red — but it prints, so a
+# silently-shrinking suite is visible rather than inferred.
+skipped=0
+skip() {
+    skipped=$((skipped + 1))
+    printf '  SKIP  %s\n' "$1"
+    return 0
+}
+
 # --- syntax ----------------------------------------------------------------
 
 group "syntax (bash -n)"
@@ -458,7 +471,14 @@ expect_output "  ... and says which assertion failed" "--version does not report
 
 expect_exit 65 "a tetond that HONOURS TETON_TEST_SEAMS=1 -> 65 FAILED (BR-9)" \
     bash "$SMOKE" "$tb_seams_honoured" 1.2.3
-expect_output "  ... and says the daemon did not refuse" "did not refuse as a release build should"
+# The seams-honoured stub PRINTS the refusal line and then keeps running, so
+# the diagnosis has to name what actually happened — "still running … had to be
+# killed" — not the generic did-not-refuse text, which a daemon that exited on
+# its own would also earn. Asserting the killed wording is what pins the gate
+# hole shut: before smoke.sh recorded the watchdog's kill, the kill itself
+# supplied the non-zero exit and this stub scored as a PASS.
+expect_output "  ... and says the daemon was killed, not that it refused" "was still running after"
+expect_output "  ... and does not credit it with refusing" "it did not refuse, whatever it printed"
 
 expect_exit 65 "a daemon that never handshakes -> 65 FAILED" \
     bash "$SMOKE" "$tb_no_handshake" 1.2.3
@@ -518,9 +538,59 @@ refute "is_release_version rejects +build metadata" is_release_version 1.2.3+bui
 refute "is_release_version rejects a leading v" is_release_version v1.2.3
 
 printf 'teton\n' >"$work/hashme"
-# Independently known: sha256("teton\n").
+# The literal digest of "teton\n", not a second call to the same tool the
+# function's first branch uses: comparing sha256_of against `shasum` compares
+# the function to its own body on any machine that has shasum, which is every
+# runner we use — an assertion that cannot fail is not an assertion.
+TETON_SHA256='f8d217bfc368404968c10875256c45590bd3fba03f13bd7dac156a548b4857d8'
 assert "sha256_of prints the file's sha256" \
-    [ "$(sha256_of "$work/hashme")" = "$(shasum -a 256 "$work/hashme" | awk '{print $1}')" ]
+    [ "$(sha256_of "$work/hashme")" = "$TETON_SHA256" ]
+
+# Each branch of the fallback chain, forced by hiding the tool ahead of it on
+# PATH. Untested fallbacks are where format drift hides: openssl already
+# changed its prefix once (`SHA256(f)=` -> `SHA2-256(f)=`), which the
+# `awk '{print $NF}'` parse survives only by taking the LAST field.
+# Exercise each fallback branch precisely: build a directory containing ONLY
+# the tools that branch is allowed to see, and set PATH to exactly it.
+#
+# Not by planting a stub that exits non-zero — `command -v` finds a failing stub
+# and takes that branch, so a stub tests only the first branch's error handling
+# (which is how the empty-digest return-0 bug below was found). And not by
+# pruning directories either: shasum and openssl both live in /usr/bin, so
+# dropping one drops the other.
+only_path="$work/only"
+mkdir -p "$only_path"
+# awk is needed by every branch; link it in unconditionally.
+ln -sf "$(command -v awk)" "$only_path/awk" 2>/dev/null || true
+
+for branch in sha256sum openssl; do
+    tool_path="$(command -v "$branch" 2>/dev/null || true)"
+    if [ -z "$tool_path" ]; then
+        skip "sha256_of's $branch branch ($branch is not on this machine)"
+        continue
+    fi
+    rm -f "$only_path/shasum" "$only_path/sha256sum" "$only_path/openssl"
+    ln -sf "$tool_path" "$only_path/$branch"
+    # PATH is narrowed INSIDE the child: `PATH=... bash -c` cannot find bash
+    # itself to run (the same footgun the no-tool case below documents).
+    # shellcheck disable=SC2016  # deliberate: argv, not interpolation
+    if bash -c 'PATH="$1"; . "$2"; sha256_of "$3"' _ "$only_path" "$LIB" "$work/hashme" >"$work/fb.out" 2>/dev/null; then
+        assert "sha256_of's $branch branch produces the right digest" \
+            [ "$(cat "$work/fb.out")" = "$TETON_SHA256" ]
+    else
+        report_fail "sha256_of's $branch branch produced nothing" "$(cat "$work/fb.out" 2>/dev/null)"
+    fi
+done
+
+# The bug the pruning above uncovered: a hasher that EXISTS but fails must not
+# yield exit 0 and an empty digest.
+broken="$work/broken-hasher"
+mkdir -p "$broken"
+printf '#!/bin/sh\nexit 127\n' >"$broken/shasum"
+chmod +x "$broken/shasum"
+# shellcheck disable=SC2016  # deliberate: argv, not interpolation
+expect_exit 1 "sha256_of fails when the hasher it picked is broken (no empty digest)" \
+    bash -c 'PATH="$1:$PATH"; . "$2"; sha256_of "$3"' _ "$broken" "$LIB" "$work/hashme"
 # The reason lib.sh exists. package.sh's old copy ran `openssl` unconditionally
 # here, so a machine with none of the three tools aborted the build with 127
 # under `set -e`. `expect_exit 1`, not `refute`, precisely because 127 is also a
@@ -528,13 +598,20 @@ assert "sha256_of prints the file's sha256" \
 #
 # PATH is emptied INSIDE the child rather than via `env PATH=... bash`, which
 # cannot find bash to run and fails before testing anything.
+# shellcheck disable=SC2016  # deliberate: the body takes $1/$2 as argv, not interpolation
 expect_exit 1 "sha256_of returns 1, not 127, when no sha256 tool exists" \
-    bash -c "PATH=/nonexistent; . '$LIB'; sha256_of '$work/hashme'"
+    bash -c 'PATH=/nonexistent; . "$1"; sha256_of "$2"' _ "$LIB" "$work/hashme"
 
 # --- summary ---------------------------------------------------------------
 
 total=$((passed + failed))
-printf '\n%s\n' "selftest: $passed/$total passed, $failed failed."
+summary="selftest: $passed/$total passed, $failed failed"
+# Skips are reported, never folded into the pass count: a case that could not
+# run on this machine is not evidence that the thing it covers works.
+if [ "$skipped" -ne 0 ]; then
+    summary="$summary, $skipped skipped (not exercised on this machine)"
+fi
+printf '\n%s\n' "$summary."
 
 if [ "$failed" -ne 0 ]; then
     exit "$EXIT_FAILED"
