@@ -1,0 +1,87 @@
+{
+  "req": "REQ-548",
+  "branch": "feat/REQ-548-homebrew-install-and-landing-page",
+  "startedAt": "2026-07-25T00:05:00Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve repos + worktree + preflight + draft-PR deferred (no commits \u2014 LESSON-004)",
+      "completedAt": "2026-07-25T00:06:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Spec validated (run immediately pre-pipeline at user request) and marked approved",
+      "completedAt": "2026-07-25T00:07:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architecture + 6 tasks (TASK-015..020); single repo, all tasks repo:teton-code; footprint publish skipped (draft PR deferred)",
+      "completedAt": "2026-07-25T00:20:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Architecture + tasks validated; AC-5/AC-6 coverage gap fixed in TASK-016 (verify-install job)",
+      "completedAt": "2026-07-25T00:25:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "All 6 tasks implemented (tiers: 015+018, 016+019, 017+020); tap repo live; no failed tasks",
+      "completedAt": "2026-07-25T01:30:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify: 6 agents -> 4 Critical + ~10 Major consolidated; 3-group fix pass; re-verify (correctness+security) found 3 more Majors + the sha256_of empty-digest bug; all closed. selftest 98/98, actionlint+shellcheck clean",
+      "completedAt": "2026-07-25T04:30:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "PR #10 body set (footprint preserved) and flipped to ready",
+      "completedAt": "2026-07-25T04:45:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "CI green on all 6 checks incl. the new release-tooling gate; one transient curl reset fixed at root (retry-all-errors + 75 taxonomy)",
+      "completedAt": "2026-07-25T05:10:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-548",
+      "branch": "feat/REQ-548-homebrew-install-and-landing-page",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/10",
+      "prNumber": 10,
+      "merged": false
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-018",
+      "TASK-015",
+      "TASK-019",
+      "TASK-016",
+      "TASK-017",
+      "TASK-020"
+    ],
+    "failedTasks": []
+  }
+}

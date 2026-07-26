@@ -11,6 +11,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Declared here rather than inherited from the repo-wide default: the default is
+# a mutable org/repo setting, and this workflow executes repo-authored shell
+# (tools/release/selftest.sh) on every PR. Jobs widen locally if they ever need to.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -33,7 +39,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -105,7 +111,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # The end-to-end acceptance suite (TASK-014) spawns the real `tetond`
       # binary and drives every AC against mock transports/engines — no model
@@ -127,7 +133,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
@@ -154,3 +160,136 @@ jobs:
             exit 0
           fi
           cargo audit --no-fetch --db "$HOME/.cargo/advisory-db"
+
+  tooling:
+    name: release tooling (actionlint · shellcheck · selftest)
+    runs-on: ubuntu-latest
+    # No cargo, no network beyond the pinned actionlint download, no secrets —
+    # the whole job is well under a minute, so the release pipeline gets the
+    # same every-PR gate the daemon has had since REQ-547. Before this job the
+    # release and site workflows and every script under tools/release/ were
+    # only ever exercised by cutting a tag, i.e. after they could still be
+    # wrong (REQ-548 verify: "no standing CI checks for any of the new
+    # tooling").
+    env:
+      # Pinned, and checksum-verified against the pin: a new upstream release
+      # must not red an unrelated PR, and a pinned URL without a digest is not
+      # actually a pin. Bump both lines together — the digest comes from
+      # actionlint's own `actionlint_<version>_checksums.txt` release asset.
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # A download failure fails the job rather than warning past it. Unlike the
+      # advisory database above — where an outage teaches nothing about our
+      # dependencies but the tree is still auditable later — an absent linter
+      # means this gate did not run at all, and a gate that waives itself on a
+      # transient error is not a gate (LESSON-447).
+      - name: Install actionlint (pinned, checksum-verified)
+        run: |
+          set -uo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+
+          # `--retry-all-errors` matters as much as the count: the observed
+          # failure here was `curl: (35) Recv failure: Connection reset by peer`
+          # — a mid-transfer reset, which plain `--retry` does NOT retry
+          # (it covers transient HTTP codes and, with --retry-connrefused,
+          # refused connections). Without it a single reset reads exactly like
+          # a broken script.
+          fetch_status=0
+          curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --retry-all-errors -O \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}" \
+            || fetch_status=$?
+          if [ "$fetch_status" -ne 0 ]; then
+            # LESSON-442: a transport failure is NOT a lint failure. This job
+            # gates the release tooling; announcing "could not fetch the linter"
+            # as though the tooling were broken sends the next person to debug
+            # the wrong thing. 75 = could not run, nothing was learned.
+            echo "::error title=Release tooling UNCHECKED (transport)::curl exited $fetch_status fetching actionlint ${ACTIONLINT_VERSION} after 5 attempts, so the workflows and release scripts were never linted. This says nothing about them — re-run the job."
+            exit 75
+          fi
+          set -e
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          rm -f actionlint "$tarball"
+          actionlint --version
+
+      # actionlint shells out to shellcheck for every `run:` block, and if
+      # shellcheck is absent it checks none of them and still exits 0. That is
+      # exactly the silent-degradation shape this repo refuses, so shellcheck's
+      # presence is asserted here rather than assumed from the runner image, and
+      # its version is printed so a runner-image bump that introduces a new
+      # check is diagnosable from the log.
+      - name: Lint the workflows (actionlint, shellcheck-backed)
+        run: |
+          set -euo pipefail
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "::error title=shellcheck missing::shellcheck is not on this runner, so actionlint would have skipped every 'run:' block while still exiting 0. The lint gate did NOT run. Install shellcheck in this job before trusting it."
+            exit 75
+          fi
+          shellcheck --version
+          actionlint -color -shellcheck shellcheck .github/workflows/*.yml
+
+      # The release and site pipelines are mostly shell, and it is shell that
+      # runs against a published release with no undo. `failglob` makes a
+      # vanished directory a named error instead of shellcheck being handed a
+      # literal '*' pattern.
+      - name: Lint the release + site shell scripts (shellcheck)
+        run: |
+          set -euo pipefail
+          shopt -s failglob
+          shellcheck tools/release/*.sh site/render.sh
+
+      # The self-test is the release tooling's own test suite (network-free,
+      # cargo-free): it drives every script under tools/release/ through its
+      # positive AND negative paths, including smoke.sh, so the exit-code
+      # taxonomy the workflows branch on is verified rather than assumed.
+      #
+      # This path is a contract. `release.yml`, `deploy-site.yml` and
+      # docs/release-runbook.md all treat "the selftest is green" as the
+      # standing evidence for the release scripts; do not rename it and do not
+      # inline its logic here.
+      #
+      # Same taxonomy as the catalog job above — "it failed" and "it could not
+      # run" must never be confused (LESSON-442, ADR-548-4). Any non-zero code
+      # fails the job; the codes only change what the log says happened.
+      #
+      #   0   passed.
+      #   64  red, ::error::. The harness was invoked wrongly.
+      #   65  red, ::error::. A script under test behaved wrongly. A real bug.
+      #   75  red, ::warning::. The harness could not run. Nothing was learned,
+      #                         which is not a pass.
+      - name: Release tooling self-test (tools/release/selftest.sh)
+        run: |
+          set -euo pipefail
+
+          # Asserted, never skipped. If the harness is deleted the gate must go
+          # red and say so — a check that quietly disappears along with its
+          # script is worse than no check, because the badge keeps claiming it.
+          if [ ! -f tools/release/selftest.sh ]; then
+            echo "::error title=Release tooling self-test MISSING::tools/release/selftest.sh does not exist, so nothing under tools/release/ was exercised this run. This job asserts the harness rather than skipping past it."
+            exit 75
+          fi
+
+          set +e
+          bash tools/release/selftest.sh
+          status=$?
+          set -e
+          case "$status" in
+            0)
+              echo "::notice title=Release tooling self-test::PASSED — every script under tools/release/ behaved as specified on both its success and its failure paths."
+              ;;
+            64)
+              echo "::error title=Release tooling self-test MISINVOKED::tools/release/selftest.sh rejected its own invocation (64). The harness did not test anything; fix the call in this job."
+              ;;
+            75)
+              echo "::warning title=Release tooling self-test UNVERIFIED::tools/release/selftest.sh could not run (75), so the release scripts were NOT exercised this run. This is NOT a passing result — it is the absence of one."
+              ;;
+            *)
+              echo "::error title=Release tooling self-test FAILED::A script under tools/release/ behaved wrongly (exit $status). This is a real defect in the release pipeline — see the log for the failing case. Do not cut a tag until it is green."
+              ;;
+          esac
+          exit "$status"

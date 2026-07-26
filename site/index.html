@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<!--
+  tetoncode.ai landing page.
+
+  Source of truth: site/index.html. Deployed artifact: site/dist/index.html,
+  written by `site/render.sh <version>`, which stamps the VERSION and
+  INSTALL_COMMAND placeholders from release metadata (REQ-548 BR-8: the page
+  derives from the release source of truth, never hand-edited version strings).
+
+  Edit the source; never the rendered copy, which the next deploy overwrites.
+  This comment ships to production inside the rendered page, so it is worded to
+  stay true there — the placeholder tokens are spelled without their braces so
+  it survives the render unchanged.
+
+  Constraints this file must keep:
+    - fully self-contained: no external scripts, fonts, stylesheets, analytics
+    - no JavaScript required (there is none)
+    - legible with CSS disabled: semantic headings, real <pre>/<table>
+    - claims limited to what the shipped binaries do (BR-10)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Teton Code — an AI coding agent that routes across a range of models</title>
+<meta name="description" content="Teton Code routes each phase of coding work to the model tier you choose, with a live cost meter and local-only paths enforced at the daemon's single egress point. Install with Homebrew on macOS and Linux.">
+<style>
+  :root {
+    --bg:      #fbfaf8;
+    --surface: #f2f0eb;
+    --text:    #1b1a18;
+    --muted:   #5b5852;
+    --border:  #e3dfd7;
+    --accent:  #0e6b5e;
+    --accent-hover: #0a534a;
+    --rule:    #ded9d0;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:      #101211;
+      --surface: #191c1b;
+      --text:    #e8e6e1;
+      --muted:   #a09c94;
+      --border:  #2b2f2e;
+      --accent:  #63d3bd;
+      --accent-hover: #8ee5d2;
+      --rule:    #232726;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    padding: 0 1.5rem 4rem;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 44rem;
+    margin: 0 auto;
+  }
+
+  a {
+    color: var(--accent);
+    text-underline-offset: 0.15em;
+    text-decoration-thickness: 1px;
+  }
+  a:hover { color: var(--accent-hover); }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  /* --- header ------------------------------------------------------- */
+
+  header {
+    padding: 4.5rem 0 0;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 2.75rem;
+    line-height: 1.1;
+    letter-spacing: -0.025em;
+    font-weight: 640;
+  }
+
+  .tagline {
+    margin: 1rem 0 0;
+    font-size: 1.2rem;
+    line-height: 1.5;
+    color: var(--muted);
+    max-width: 34rem;
+  }
+
+  .ridge {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-width: 100%;
+    margin: 2.25rem 0 0;
+    color: var(--accent);
+  }
+
+  /* --- sections ----------------------------------------------------- */
+
+  section {
+    padding-top: 2.75rem;
+  }
+
+  h2 {
+    margin: 0 0 0.75rem;
+    font-size: 0.8rem;
+    font-weight: 660;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  h3 {
+    margin: 1.75rem 0 0.35rem;
+    font-size: 1.08rem;
+    font-weight: 640;
+    letter-spacing: -0.01em;
+  }
+
+  p { margin: 0 0 1rem; }
+  p:last-child { margin-bottom: 0; }
+
+  .lede { font-size: 1.05rem; }
+
+  /* --- code --------------------------------------------------------- */
+
+  pre {
+    margin: 0 0 1rem;
+    padding: 0.95rem 1.1rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+  }
+
+  pre.install {
+    border-left: 3px solid var(--accent);
+  }
+
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+                 "Liberation Mono", monospace;
+    font-size: 0.94rem;
+  }
+
+  pre code {
+    font-size: 1rem;
+    line-height: 1.6;
+    white-space: pre;
+  }
+
+  p code, td code, li code {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.06em 0.34em;
+    font-size: 0.88em;
+  }
+
+  .step-label {
+    margin: 0 0 0.4rem;
+    font-size: 0.92rem;
+    color: var(--muted);
+  }
+
+  .meta {
+    font-size: 0.92rem;
+    color: var(--muted);
+  }
+
+  /* --- table -------------------------------------------------------- */
+
+  .table-scroll { overflow-x: auto; }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0 0 1rem;
+    font-size: 0.95rem;
+  }
+
+  caption {
+    text-align: left;
+    color: var(--muted);
+    font-size: 0.92rem;
+    padding-bottom: 0.5rem;
+  }
+
+  th, td {
+    text-align: left;
+    padding: 0.55rem 0.9rem 0.55rem 0;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+
+  thead th {
+    font-weight: 620;
+    color: var(--muted);
+    font-size: 0.8rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  /* Row headers name a platform — body text, not a column label. */
+  tbody th {
+    font-weight: 600;
+    padding-right: 1.5rem;
+  }
+
+  tbody tr:last-child th,
+  tbody tr:last-child td { border-bottom: none; }
+
+  /* --- footer ------------------------------------------------------- */
+
+  footer {
+    margin-top: 3.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--rule);
+    font-size: 0.92rem;
+    color: var(--muted);
+  }
+
+  footer ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.25rem;
+  }
+
+  @media (max-width: 30rem) {
+    body { font-size: 16px; }
+    header { padding-top: 3rem; }
+    h1 { font-size: 2.15rem; }
+    .tagline { font-size: 1.08rem; }
+
+    /* Fit the install command on a phone screen without wrapping it: a soft
+       wrap lands mid-token ("atelier-" / "fashion/tap/teton") and reads like
+       the tap name contains a break. Tighter type and padding keep it on one
+       line at common widths; anything narrower still scrolls the <pre>, which
+       never misrepresents the command. */
+    body { padding-left: 1.15rem; padding-right: 1.15rem; }
+    pre { padding: 0.85rem 0.8rem; }
+    pre code { font-size: 0.78rem; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Teton Code</h1>
+    <p class="tagline">An AI coding agent that routes work across a range of
+      models — so you spend frontier-model money only where frontier-model
+      intelligence matters.</p>
+    <svg class="ridge" width="800" height="76" viewBox="0 0 800 76"
+         preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg"
+         aria-hidden="true" focusable="false">
+      <path d="M0 76 L96 40 L150 54 L246 14 L318 46 L392 26 L470 58 L548 30 L628 50 L700 34 L800 76 Z"
+            fill="currentColor" fill-opacity="0.10"
+            stroke="currentColor" stroke-opacity="0.55" stroke-width="1.5"
+            stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
+    </svg>
+  </header>
+
+  <main>
+
+    <section aria-labelledby="install-h">
+      <h2 id="install-h">Install</h2>
+      <pre class="install"><code>{{INSTALL_COMMAND}}</code></pre>
+      <p class="step-label">Then start the daemon and open the CLI:</p>
+      <pre><code>brew services start teton
+teton</code></pre>
+      <p class="meta">If Homebrew answers that the tap is not trusted, run
+        <code>brew trust atelier-fashion/tap</code> once — the install command
+        above is self-authorizing because it names the tap in full, and the
+        short name <code>teton</code> is not.</p>
+      <p class="meta">Latest release v{{VERSION}}. Two binaries —
+        <code>teton</code> (CLI) and <code>tetond</code> (daemon). No Rust
+        toolchain, no cmake, no build step.</p>
+    </section>
+
+    <section aria-labelledby="promises-h">
+      <h2 id="promises-h">Two promises, both made visible</h2>
+
+      <h3>Cost control</h3>
+      <p>Each phase of work goes to the tier you choose: architecture to a
+        frontier model, implementation to a cheap one executing from
+        well-specified task artifacts, mechanical I/O to the local daemon. A
+        live cost meter shows per-phase attribution and measured savings
+        against an all-frontier baseline — so the routing pays for itself in
+        numbers you can read, not in claims.</p>
+
+      <h3>Privacy boundaries</h3>
+      <p>Mark paths as <em>local-only</em> and their content never leaves your
+        machine. The rule is enforced at the daemon's single egress point —
+        one place where anything can go out — and verified by egress-capture
+        tests, not vibes.</p>
+    </section>
+
+    <section aria-labelledby="how-h">
+      <h2 id="how-h">Base camp and summits</h2>
+
+      <h3>Base camp: a slim local model, always with you</h3>
+      <p>Teton Code probes your machine, benchmarks the best-fitting local
+        model, and runs it as a persistent daemon. It carries the always-on
+        cheap tier: routing, summarization, commit messages, secret redaction,
+        and offline fallback.</p>
+
+      <h3>Summits: bring your own models</h3>
+      <p>Register Anthropic or any OpenAI-compatible endpoint — DeepSeek, Kimi,
+        Ollama, vLLM — with your own keys. A mountain range is a range: of
+        peaks, of sizes, of routes. So is your model lineup.</p>
+    </section>
+
+    <section aria-labelledby="platforms-h">
+      <h2 id="platforms-h">What runs where</h2>
+      <div class="table-scroll">
+        <table>
+          <caption>Local inference support, per platform.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Platform</th>
+              <th scope="col">Local inference</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">macOS, Apple Silicon (arm64)</th>
+              <td>Metal GPU acceleration</td>
+            </tr>
+            <tr>
+              <th scope="row">macOS, Intel (x86_64)</th>
+              <td>CPU only</td>
+            </tr>
+            <tr>
+              <th scope="row">Linux x86_64 (glibc)</th>
+              <td>CPU only</td>
+            </tr>
+            <tr>
+              <th scope="row">Windows</th>
+              <td>Not supported</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Remote models run the same everywhere; only the local base-camp model
+        depends on your hardware. On Linux, <code>brew services</code> is not a
+        v1 claim — run <code>tetond</code> yourself, or write a systemd user
+        unit.</p>
+
+      <h3>The model arrives on first run, with your consent</h3>
+      <p>The install is small because it ships no weights. The first time you
+        run <code>teton</code>, it proposes a local model matched to your
+        hardware and names that model's exact download size and RAM floor
+        <em>before</em> fetching anything — today's catalog spans roughly 1&nbsp;GB
+        for the smallest model to about 18&nbsp;GB for the largest, and which one
+        you are offered depends on your machine. Nothing downloads until you say
+        yes.</p>
+    </section>
+
+  </main>
+
+  <footer>
+    <ul>
+      <li>v{{VERSION}}</li>
+      <li><a href="https://github.com/atelier-fashion/teton-code">Source on GitHub</a></li>
+      <li>MIT licensed</li>
+    </ul>
+  </footer>
+
+</div>
+</body>
+</html>

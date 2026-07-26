@@ -1,0 +1,1190 @@
+name: Release
+
+# Pushing `vX.Y.Z` is the whole trigger: the tag is the single source of truth
+# for every version-shaped string downstream (BR-3), and the first thing this
+# workflow does is prove the tag and the workspace manifest agree.
+#
+# `workflow_dispatch` exists so the pipeline itself is testable without burning
+# a tag. With `dry_run` left at its default the run does everything — gate,
+# build all three targets, smoke each artifact, assemble `checksums.txt`, render
+# the release notes — and stops one step short of publishing.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the gate, builds, smokes and checksums, but publish nothing."
+        type: boolean
+        default: true
+
+# Unlike ci.yml, an in-flight run is NOT cancelled by a newer one. A release is
+# half-published for a few seconds in the middle of `gh release create`;
+# cancelling there leaves a release with some of its assets, which is worse than
+# waiting.
+#
+# This group is keyed on the ref, which is right for building and publishing —
+# two tags are two independent releases and neither should wait on the other —
+# and wrong for the tap, which is one file every run overwrites. The tap-writing
+# job therefore carries its own repo-wide group (`tap-bump`) AND refuses a
+# version that would move the tap backwards; ordering there is a correctness
+# property, not a performance one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege by default. Two jobs widen this, each only to what it needs:
+# `release` writes the GitHub Release, `dispatch-site-deploy` starts one
+# workflow.
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: version gate (BR-3 / ADR-548-4)
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.gate.outputs.tag }}
+      version: ${{ steps.gate.outputs.version }}
+      publish: ${{ steps.gate.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Nothing is built until the tag is a version shape this pipeline supports
+      # and the tag and `[workspace.package] version` agree. The exit code is a
+      # taxonomy, not a boolean, so "the versions disagree" can never be
+      # confused with "the check could not run" (LESSON-442):
+      #
+      #   0   MATCH       proceed.
+      #   64  REFUSED     red, ::error::. The gate RAN and rejected the tag —
+      #                   either it is not a plain `vX.Y.Z`, or it names a
+      #                   version the workspace does not declare. Retag, or bump
+      #                   the manifest. Nothing was built.
+      #   *   UNCHECKED   red, ::error::. The gate could not run at all (missing
+      #                   manifest, unparseable version). This is NOT evidence
+      #                   that the versions agree, so the release stops here
+      #                   rather than shipping on an unverified version.
+      - name: Tag vs workspace version
+        id: gate
+        env:
+          # A `workflow_dispatch` boolean arrives as the string "true"/"false";
+          # on a tag push the whole `inputs` context is absent and this is "".
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            # Dispatched from a branch: there is no tag, so the version comes
+            # from the manifest and the comparison below is the manifest against
+            # itself — it cannot fail, and it is not pretending to be the gate.
+            # The gate is the tag push. This path exists so the rest of the
+            # pipeline (build, smoke, checksums) is exercisable on demand.
+            manifest_version="$(bash tools/release/verify-version.sh --print-version)" || {
+              echo "::error title=Version gate UNCHECKED::The workspace version could not be read from Cargo.toml, so this run has no version to build. See the log."
+              exit 75
+            }
+            tag="v$manifest_version"
+            echo "::notice title=No tag to gate::This run was dispatched from '$GITHUB_REF_NAME', which is not a tag, so the version was taken from Cargo.toml ($tag) and the version gate compares it against itself. The real BR-3 gate runs on the tag push."
+          fi
+
+          # BR-3 names exactly one version shape, `vX.Y.Z`, and everything
+          # downstream assumes it: the tarball filenames, the version Homebrew
+          # scans back out of the formula's URLs, `brew audit`, the site's
+          # install line. `v0.1.0-rc.1` and `v0.1.0+build.5` both match this
+          # workflow's `v*.*.*` trigger and neither survives those assumptions —
+          # a prerelease would be published as an ordinary release and pushed to
+          # the tap as the version every `brew install` hands out, and build
+          # metadata breaks every filename reconstructed from the version. So
+          # both are refused HERE, before anything is built.
+          #
+          # The trigger glob is deliberately not narrowed to exclude them
+          # (`tags: ["v*.*.*", "!v*-*", "!v*+*"]` would work): a refused tag has
+          # to be a red run with a reason on it. A tag push that silently does
+          # nothing is indistinguishable from a broken workflow.
+          version="${tag#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Unsupported version shape (BR-3)::Tag '$tag' resolves to version '$version', which is not a plain X.Y.Z. Prerelease ('-rc.1') and build-metadata ('+build.5') versions are NOT supported by this pipeline: they would be published as an ordinary release and pushed to the tap as the version every user installs. Nothing was built. Retag as vX.Y.Z."
+            exit 64
+          fi
+
+          # The runner's default shell is `bash -e`, so the check is bracketed
+          # by `set +e`/`set -e` — otherwise a failing gate would abort the step
+          # before its annotation could name which failure it was.
+          set +e
+          bash tools/release/verify-version.sh "$tag"
+          status=$?
+          set -e
+
+          case "$status" in
+            0)
+              echo "::notice title=Version gate MATCH::Tag $tag matches the workspace version. Building all three targets."
+              ;;
+            64)
+              echo "::error title=Version MISMATCH (BR-3)::Tag $tag and the root Cargo.toml [workspace.package] version name different versions — see the log for both. Nothing was built. Bump the workspace version or retag."
+              exit "$status"
+              ;;
+            *)
+              echo "::error title=Version gate UNCHECKED::verify-version.sh could not perform the check (exit $status). Nothing was learned about the tag, so the release is stopped rather than built on an unverified version."
+              exit "$status"
+              ;;
+          esac
+
+          # Publish only from a real tag ref, and only when a dry run was not
+          # requested. A branch dispatch never publishes: `gh release create`
+          # would mint a tag as a side effect, which is exactly the
+          # "a release appeared from nowhere" outcome the tag gate exists to
+          # prevent.
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${DRY_RUN:-}" != "true" ]; then
+            publish=true
+          else
+            publish=false
+          fi
+
+          # `version` was validated against the strict shape above, so nothing
+          # downstream — including the run bodies that interpolate it — can be
+          # handed anything but digits and dots.
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
+
+  build:
+    name: build · smoke (${{ matrix.target }})
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One target failing should not hide the state of the other two — a
+      # release needs to know everything that is broken, not the first thing.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+            rosetta: false
+          # GitHub retired Intel macOS runners, so this leg is cross-compiled on
+          # the arm64 runner and smoke-tested under Rosetta 2 (ADR-548-2). That
+          # proves the binary loads and runs; it is not native-hardware
+          # evidence, and the release notes say so at exactly that strength.
+          - target: x86_64-apple-darwin
+            os: macos-15
+            rosetta: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            rosetta: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        # rustup reads rust-toolchain.toml and installs the pinned channel.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$TARGET"
+
+      # Third-party actions are pinned to a full commit SHA. A tag is a mutable
+      # pointer someone else controls, and this job produces the bytes users
+      # install — `@v2` moving under us is a supply-chain change nobody in this
+      # repository would see in a diff. First-party `actions/*` stay on their
+      # major tag, matching ci.yml: GitHub owns the runner those actions execute
+      # on, so pinning them defends against a strictly smaller threat than the
+      # upgrade friction costs.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Each target compiles its own llama.cpp; sharing one cache key across
+          # them would thrash it every run.
+          key: release-${{ matrix.target }}
+          # A release binary must not be assembled out of cache entries some
+          # other run wrote. `save-if: false` stops this job writing any, and
+          # rust-cache's restore key carries the `release-<target>` prefix
+          # above, which nothing else in this repository writes — so the restore
+          # misses and a tag build compiles cold. That is the intent, not a side
+          # effect: the cost is build minutes on a tag push, which is the
+          # cheapest place in this pipeline to spend them.
+          save-if: false
+
+      # llama.cpp is built by its own cmake, which does not read Rust's
+      # `--target`. Without this it would happily produce arm64 objects for an
+      # x86_64 Rust build and fail at link — in this job, which is the loud
+      # place for it to fail, but with a message that reads like a linker bug
+      # rather than a configuration one.
+      - name: Point llama.cpp's cmake at the cross target
+        if: matrix.rosetta
+        run: echo "CMAKE_OSX_ARCHITECTURES=x86_64" >>"$GITHUB_ENV"
+
+      # Rosetta 2 is NOT preinstalled on GitHub's arm64 macOS runner images, so
+      # the probe below on its own failed the x86_64 leg of every tag, forever.
+      # The install is idempotent and takes seconds. This step deliberately
+      # asserts nothing: if it cannot install Rosetta, the probe that follows is
+      # still what decides, and it says so out loud.
+      - name: Install Rosetta 2 (x86_64 smoke host)
+        if: matrix.rosetta
+        run: |
+          if sudo softwareupdate --install-rosetta --agree-to-license; then
+            echo "::notice title=Rosetta 2 install requested::softwareupdate reported success. It is a no-op when Rosetta is already present."
+          else
+            echo "::warning title=Rosetta 2 install did not report success::'softwareupdate --install-rosetta --agree-to-license' exited non-zero. That is not by itself evidence that Rosetta is unavailable — the probe in the next step is the assertion."
+          fi
+
+      # Checked before the build so a runner without Rosetta costs a minute
+      # rather than a full llama.cpp compile, and so the failure names its own
+      # cause instead of surfacing as an exec-format error inside the smoke.
+      - name: Verify Rosetta 2 is available (x86_64 smoke host)
+        if: matrix.rosetta
+        run: |
+          if arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            echo "::notice title=Rosetta 2 available::The x86_64 artifact will be smoke-tested under Rosetta 2 on this arm64 runner (ADR-548-2)."
+          else
+            echo "::error title=Rosetta 2 unavailable::This runner cannot execute x86_64 binaries even after the install step above, so the x86_64-apple-darwin artifact could NOT be exercised. Failing rather than shipping an unsmoked binary for a platform we cannot test here."
+            exit 75
+          fi
+
+      # Values reach the shell through `env:`, never by being pasted into the
+      # script body: a `${{ }}` interpolation is a textual splice into the
+      # program, and `$VERSION` is derived from a git ref. The smoke step below
+      # has always done it this way; this one now matches it.
+      - name: Build and package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          bash tools/release/package.sh "$TARGET" "$VERSION" dist
+
+      # The gate that decides whether these bytes ship (BR-7/BR-9): version
+      # strings, the release build's refusal of TETON_TEST_SEAMS, and a live
+      # daemon handshake — all against the unpacked tarball, not the build tree.
+      #
+      #   0   PASS
+      #   65  FAILED     red, ::error::. The artifact is bad. Do not release.
+      #   *   UNCHECKED  red, ::error::. The smoke could not run, so nothing is
+      #                  known about the artifact — which is not a pass.
+      - name: Smoke the tarball (BR-7/BR-9)
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          tarball="dist/teton-v$VERSION-$TARGET.tar.gz"
+
+          set +e
+          bash tools/release/smoke.sh "$tarball" "$VERSION"
+          status=$?
+          set -e
+
+          case "$status" in
+            0)
+              echo "::notice title=Smoke PASSED ($TARGET)::Both binaries report $VERSION, the release build refused TETON_TEST_SEAMS=1, and teton doctor handshook a live tetond."
+              ;;
+            65)
+              echo "::error title=Smoke FAILED ($TARGET)::A shipped-artifact assertion failed for $tarball — see the log for which one. These bytes must not be released."
+              ;;
+            *)
+              echo "::error title=Smoke UNCHECKED ($TARGET)::The smoke harness could not run against $tarball (exit $status), so nothing was learned about the artifact. Failing rather than publishing an unexercised binary."
+              ;;
+          esac
+          exit "$status"
+
+      - name: Upload target artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: teton-${{ matrix.target }}
+          # The sidecar `.sha256` is deliberately left behind: the release's
+          # checksums are recomputed from the uploaded files (BR-5).
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: checksums · GitHub Release
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      # Scoped to this job, not the workflow: it is the only one that writes.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # This job's token can write to the repository. `persist-credentials`
+          # would leave it in .git/config for every later step to read; `gh`
+          # takes it from the environment instead, and nothing here pushes.
+          # The remote itself stays, so `gh` still resolves the repository.
+          persist-credentials: false
+
+      - name: Download every target's tarball
+        uses: actions/download-artifact@v4
+        with:
+          path: staging
+          pattern: teton-*
+          merge-multiple: true
+
+      # BR-5: the published checksums are computed HERE, from the files that are
+      # about to be uploaded — never carried forward from the build legs. A hash
+      # that travelled separately from its bytes is a hash that can describe
+      # different bytes.
+      - name: Compute checksums.txt from the uploaded artifacts (BR-5)
+        working-directory: staging
+        run: |
+          # `set -e` matters more here than anywhere else in the workflow.
+          # Without it this step hashed whatever it could, ended on a `cat`, and
+          # exited 0 — so a partially-written checksums.txt was published as if
+          # it were complete, and the gate could not fail.
+          set -euo pipefail
+          ls -l
+
+          work="${RUNNER_TEMP:-/tmp}"
+
+          find . -maxdepth 1 -type f -name '*.tar.gz' -exec basename {} ';' \
+            | sort >"$work/tarballs.txt"
+          count="$(grep -c . "$work/tarballs.txt" || true)"
+          if [ "${count:-0}" -ne 3 ]; then
+            echo "::error title=Missing release artifacts::Expected 3 tarballs (one per target) but found ${count:-0}. A release that silently omits a platform is worse than no release — stopping before publish."
+            exit 65
+          fi
+
+          # Guarded, not left to `-e`: hashing failing outright is a different
+          # thing from hashing the wrong set, and a step that dies on a bare 1
+          # here would say neither.
+          if ! sha256sum ./*.tar.gz | sed 's|\./||' >checksums.txt; then
+            echo "::error title=Hashing the release artifacts FAILED (BR-5)::sha256sum could not hash the staged tarballs, so no checksums.txt was produced and nothing is known about these bytes. Nothing was published."
+            exit 75
+          fi
+
+          # Two assertions, because neither covers the other: the line count
+          # catches a truncated file, the set comparison catches a file with the
+          # right number of lines naming the wrong things. A checksums.txt that
+          # covers only some of the assets is worse than none at all — a user
+          # who verifies what it lists would believe they had verified the
+          # release.
+          hashed="$(grep -c . checksums.txt || true)"
+          if [ "${hashed:-0}" -ne "$count" ]; then
+            echo "::error title=checksums.txt is incomplete (BR-5)::$count tarballs are about to be published but checksums.txt carries ${hashed:-0} lines. Nothing was published."
+            exit 65
+          fi
+
+          awk '{ name = $2; sub(/^\*/, "", name); print name }' checksums.txt \
+            | sort >"$work/hashed.txt"
+          if ! diff -u "$work/tarballs.txt" "$work/hashed.txt"; then
+            echo "::error title=checksums.txt does not describe these artifacts (BR-5)::The filenames in checksums.txt are not the set of tarballs about to be uploaded — in the diff above, '-' lines are present but unhashed and '+' lines are hashed but absent. Nothing was published."
+            exit 65
+          fi
+
+          echo "checksums.txt:"
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          PUBLISH: ${{ needs.preflight.outputs.publish }}
+        run: |
+          set -euo pipefail
+
+          notes="$(mktemp)"
+
+          # The backticks below are markdown — code fences and inline code in
+          # the release body — so the format strings are single-quoted on
+          # purpose and every value is passed as a printf argument.
+          # shellcheck disable=SC2016
+          {
+            printf '## teton %s\n\n' "$VERSION"
+            printf '```sh\nbrew install atelier-fashion/tap/teton\n```\n\n'
+            printf '### Platforms\n\n'
+            printf -- '- `aarch64-apple-darwin` — built and smoke-tested natively on macOS arm64.\n'
+            printf -- '- `x86_64-apple-darwin` — **Rosetta-verified**: cross-compiled on an arm64 runner and smoke-tested under Rosetta 2 (GitHub no longer offers Intel macOS runners). That proves the binary loads and runs its CPU paths; it is not evidence from native Intel hardware.\n'
+            printf -- '- `x86_64-unknown-linux-gnu` — built and smoke-tested natively on Linux.\n\n'
+            printf 'Every artifact passed the release smoke gate: `teton` and `tetond` both report %s, the release build refuses `TETON_TEST_SEAMS=1` rather than honouring the test seams, and `teton doctor` completed a live handshake against a freshly started daemon.\n\n' "$VERSION"
+            printf '### Checksums (sha256)\n\n```\n'
+            cat staging/checksums.txt
+            printf '```\n'
+          } >"$notes"
+
+          # The dry-run branch is a step that RUNS and says what it did, not a
+          # skipped job: "publish was skipped, here is the reason and here is
+          # exactly what would have gone out" is checkable; a grey box is not.
+          if [ "$PUBLISH" != "true" ]; then
+            echo "::notice title=Release publish SKIPPED::This run built, smoked and checksummed every target but published nothing (dry run, or dispatched from a branch rather than a tag). Everything below is what a real run would have released."
+            echo "--- assets that would be uploaded ---"
+            ls -1 staging/
+            echo "--- release notes ---"
+            cat "$notes"
+            exit 0
+          fi
+
+          # --verify-tag: refuse to invent a tag. If the tag is not already on
+          # the remote, something is wrong upstream of here and the fix is not
+          # for this step to create one.
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "teton $VERSION" \
+            --notes-file "$notes" \
+            staging/*.tar.gz \
+            staging/checksums.txt
+
+          echo "::notice title=Release published::$TAG is live with 3 tarballs and checksums.txt."
+
+  # BR-4: the release is not finished when the Release page appears — it is
+  # finished when the tap points at it, and points at something that installs
+  # and runs. Nothing in this job carries `continue-on-error`, so a render,
+  # audit, install or push failure paints the whole run red. A green release
+  # beside a stale formula is the one outcome BR-4 exists to make impossible,
+  # and a yellow warning nobody reads is how that outcome happens (LESSON-447).
+  bump-formula:
+    name: render · audit · install · push tap formula (BR-4)
+    needs: [preflight, release]
+    # macOS, not ubuntu, for one reason: `brew style` and `brew audit` ARE the
+    # gate here. Running them where Homebrew is a preinstalled afterthought
+    # invites the version of this job where the runner image quietly stops
+    # shipping brew, the commands are not found, and a gate that never ran
+    # looks exactly like a gate that passed (LESSON-443).
+    runs-on: macos-15
+    # The tap is one file in one repository, so writing it is a repo-wide
+    # critical section — NOT a per-ref one like the workflow-level group above.
+    # Without this, `v0.1.9` and `v0.2.0` pushed minutes apart run as two
+    # independent workflows, both reach this job, and whichever finishes last
+    # owns the formula regardless of which version is newer. Both runs go green
+    # while every `brew upgrade` afterwards hands users whichever one lost the
+    # race. Serialising is half the fix; the monotonic check below is the other
+    # half, because a queue orders the writes without ordering the versions.
+    #
+    # `cancel-in-progress: false` for the same reason the workflow-level group
+    # sets it: a tap push interrupted midway is worse than a queued one. Note
+    # that GitHub keeps only ONE pending job per group, so a third concurrent
+    # release cancels the second's tap job rather than queueing it — a cancelled
+    # job is red, not green, so BR-4 still holds: no run claims to have bumped a
+    # tap it did not bump.
+    concurrency:
+      group: tap-bump
+      cancel-in-progress: false
+    env:
+      # `brew install` below runs against the tap clone this job made and has
+      # NOT pushed yet. Homebrew's auto-update would `git fetch`/reset that
+      # clone and could silently restore the previous formula underneath us —
+      # installing the old version while this job believed it was testing the
+      # new one. The version assertions after the install would catch it; not
+      # letting it happen is better than catching it.
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # This job holds the tap's write credential. Leaving the repository's
+          # own token in .git/config for the whole job — through a `brew
+          # install`, a formula's test block and a launchd service — hands it to
+          # every one of them for no benefit: `gh` reads the environment, and
+          # the tap is a separate clone.
+          persist-credentials: false
+
+      # A publish run hashes the bytes GitHub actually serves for the release
+      # that was just published — byte-for-byte what `brew install` will fetch
+      # from the URLs this formula is about to carry. Then it re-checks them
+      # against the `checksums.txt` the release job computed and published: two
+      # independent derivations of the same hashes, from two different fetches
+      # of the same assets (BR-5). If they ever disagree, the artifacts changed
+      # between publish and now, and no formula should be written.
+      - name: Download the published release assets (publish runs)
+        if: needs.preflight.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          gh release download "$TAG" \
+            --dir artifacts \
+            --pattern '*.tar.gz' \
+            --pattern 'checksums.txt'
+
+          cd artifacts
+          ls -l
+
+          work="${RUNNER_TEMP:-/tmp}"
+
+          # `shasum -c` only checks the files checksums.txt names, so a
+          # truncated or edited checksums.txt passes it while describing one
+          # asset out of three. What it covers is therefore asserted before it
+          # is trusted — the same assertion the release job makes when it writes
+          # the file, made again here against what GitHub actually serves.
+          find . -maxdepth 1 -type f -name '*.tar.gz' -exec basename {} ';' \
+            | sort >"$work/downloaded.txt"
+          awk '{ name = $2; sub(/^\*/, "", name); print name }' checksums.txt \
+            | sort >"$work/claimed.txt"
+
+          downloaded="$(grep -c . "$work/downloaded.txt" || true)"
+          if [ "${downloaded:-0}" -ne 3 ]; then
+            echo "::error title=Release is missing assets (BR-5)::Release $TAG serves ${downloaded:-0} tarballs, expected 3 (one per target). The formula was NOT rendered."
+            exit 65
+          fi
+
+          if ! diff -u "$work/downloaded.txt" "$work/claimed.txt"; then
+            echo "::error title=Published checksums do not cover the published assets (BR-5)::checksums.txt on release $TAG does not name exactly the tarballs the release serves (diff above). 'shasum -c' would have passed while verifying only what it was told about. The formula was NOT rendered."
+            exit 65
+          fi
+
+          set +e
+          shasum -a 256 -c checksums.txt
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=Published assets do not match published checksums (BR-5)::The tarballs downloaded from release $TAG hash differently than the checksums.txt published beside them. The formula was NOT rendered — a sha256 that disagrees with itself must never reach a user's brew install."
+            exit 65
+          fi
+
+      # A dry run has no release to download from, so it hashes this run's build
+      # artifacts: the same bytes a publish run would have uploaded. It renders
+      # and audits a real formula from real hashes — it just does not claim to
+      # have verified anything about bytes GitHub is serving, because nothing
+      # was served.
+      - name: Download this run's build artifacts (dry runs)
+        if: needs.preflight.outputs.publish != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: teton-*
+          merge-multiple: true
+
+      # One tap directory serves both modes: a publish run clones the real tap
+      # into it and pushes from it, a dry run gets a scratch tap at the same
+      # path. Homebrew resolves `atelier-fashion/tap/teton` from that location
+      # either way, so the render and the audits below are literally the same
+      # commands against the same formula reference in both modes. There is no
+      # publish-only path for the gate to be missing from.
+      - name: Prepare the tap working copy
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          PUBLISH: ${{ needs.preflight.outputs.publish }}
+        run: |
+          set -euo pipefail
+
+          tap_dir="$(brew --repository)/Library/Taps/atelier-fashion/homebrew-tap"
+          echo "TAP_DIR=$tap_dir" >>"$GITHUB_ENV"
+          rm -rf "$tap_dir"
+          mkdir -p "$(dirname "$tap_dir")"
+
+          if [ "$PUBLISH" != "true" ]; then
+            # A real repository with a commit and a remote, not a bare
+            # directory. Homebrew asks git about a tap — its remote, its HEAD —
+            # and a dry run that hands brew a different shape than a publish run
+            # does is a dry run that can pass while the real thing fails.
+            git init -q -b main "$tap_dir"
+            mkdir -p "$tap_dir/Formula"
+            git -C "$tap_dir" remote add origin https://github.com/atelier-fashion/homebrew-tap.git
+            git -C "$tap_dir" \
+              -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -q --allow-empty -m "scratch tap (dry run)"
+            echo "::notice title=Tap clone SKIPPED (dry run)::Rendering into a scratch tap at $tap_dir. Nothing will be cloned, committed or pushed, and no tap token is read."
+            exit 0
+          fi
+
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::error title=HOMEBREW_TAP_TOKEN is not set (BR-4)::The release is published but the formula cannot be pushed, so the tap still points at the previous version. Add the secret (see docs/homebrew-tap-setup.md) and re-run this job."
+            exit 75
+          fi
+
+          # Cloned over plain HTTPS — the tap is public and reading it needs no
+          # credential — and the clone is left with NO credential attached. The
+          # token goes into .git/config for the length of the push and is
+          # scrubbed immediately after (see the push step). A write-capable
+          # token sitting in a config file for the rest of a job that runs `brew
+          # install`, a formula's test block and a launchd service is a token
+          # all three of those can read.
+          #
+          # Not shallow: the tap's history is the bump audit trail, and pushing
+          # from a truncated one is a fight with the server nobody needs.
+          git clone https://github.com/atelier-fashion/homebrew-tap.git "$tap_dir"
+          mkdir -p "$tap_dir/Formula"
+
+      # Serialising the tap writes (the `tap-bump` group above) orders them; it
+      # does not order the VERSIONS. Two tags racing still means the loser can
+      # land last and overwrite a newer formula with an older one, both runs
+      # green, every `brew upgrade` after it a downgrade. So the tap is only
+      # ever allowed to move forward, and a refusal is a named error rather than
+      # a quiet skip — "nothing happened" and "nothing needed to happen" must
+      # not look the same.
+      #
+      # The tap's current version is read out of the download URLs in the
+      # formula it already carries, because that is where the version lives: the
+      # formula deliberately has no `version` stanza (see the BR-3 step below).
+      # This runs before the render, which overwrites that file.
+      - name: Refuse a bump that would move the tap backwards (BR-4)
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -uo pipefail
+
+          formula="$TAP_DIR/Formula/teton.rb"
+          if [ ! -f "$formula" ]; then
+            echo "::notice title=No formula in the tap yet::$formula does not exist, so there is no previous version this bump could move backwards from."
+            exit 0
+          fi
+
+          # `-e` is on (the runner's default shell is `bash -e`) and a failing
+          # command substitution takes the whole step with it, so every capture
+          # here lands in a variable via `|| true` and is then checked. Letting
+          # the shell die on a bare 1 would make the named errors below
+          # unreachable — a taxonomy nothing can ever print (LESSON-442).
+          current="$(grep -oE 'teton-v[0-9]+\.[0-9]+\.[0-9]+-' "$formula" | head -1 || true)"
+          current="${current#teton-v}"
+          current="${current%-}"
+
+          if [ -z "$current" ]; then
+            echo "::error title=Tap version UNREADABLE (BR-4)::A formula exists at $formula but no 'teton-vX.Y.Z-' download URL could be read out of it, so this run cannot tell whether pushing $VERSION would move the tap backwards. Nothing was learned, so nothing is pushed."
+            exit 75
+          fi
+
+          if [ "$current" = "$VERSION" ]; then
+            echo "::notice title=Tap already at this version::The tap carries $current, which is this release. Re-running a release over its own bump is a no-op, not a downgrade."
+            exit 0
+          fi
+
+          # `sort -V` is version-aware on both runner images (BSD sort on
+          # macos-15, GNU coreutils on ubuntu) — 0.9.0 sorts below 0.10.0, which
+          # a lexical compare gets backwards. The oldest of the two is the head
+          # of the ascending sort; if that is the version we are about to push,
+          # the push is a downgrade.
+          oldest="$(printf '%s\n%s\n' "$VERSION" "$current" | sort -V | head -1 || true)"
+          # Fail CLOSED. An empty capture means the comparison did not happen
+          # (no `sort -V` on this image, sort errored) — and an empty string is
+          # never equal to $VERSION, so without this the guard would wave the
+          # push through while printing "Tap moves forward: -> ". The one half
+          # of the downgrade protection that could be disabled with nothing
+          # going red.
+          if [ -z "$oldest" ]; then
+            echo "::error title=Version comparison UNCHECKED (BR-4)::Could not compare $VERSION against the tap's current $current — 'sort -V' produced nothing, so whether this push is a downgrade is unknown. Nothing was pushed."
+            exit 75
+          fi
+          if [ "$oldest" = "$VERSION" ]; then
+            echo "::error title=Refusing to downgrade the tap (BR-4)::The tap already points at teton $current and this run would replace it with the OLDER $VERSION. Nothing was pushed. This is what two releases racing looks like from the losing side: the later push wins regardless of which version is newer, and every 'brew upgrade' after it hands users a downgrade. If the newer tag's tap job is the one that failed, re-run that job."
+            exit 65
+          fi
+
+          echo "::notice title=Tap moves forward::$current -> $VERSION."
+
+      # Exit codes, per tools/release/render-formula.sh:
+      #
+      #   0   RENDERED
+      #   64  red, ::error::. The inputs are wrong, or the template grew a
+      #       placeholder the renderer cannot fill. Either way the formula would
+      #       have carried a literal `{{...}}` or an empty string.
+      #   *   red, ::error::. The render could not be attempted at all.
+      - name: Render Formula/teton.rb from the template
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set +e
+          bash tools/release/render-formula.sh \
+            --version "$VERSION" \
+            --artifacts artifacts \
+            --output "$TAP_DIR/Formula/teton.rb"
+          status=$?
+          set -e
+
+          case "$status" in
+            0)
+              echo "::notice title=Formula rendered::teton $VERSION, with all three sha256s computed here from the artifacts themselves (BR-5)."
+              ;;
+            64)
+              echo "::error title=Formula render REFUSED::render-formula.sh rejected its inputs or found an unfilled placeholder — see the log for which. Nothing was written to the tap."
+              ;;
+            *)
+              echo "::error title=Formula render UNCHECKED::render-formula.sh could not run (exit $status), so no formula exists to audit or push. Failing rather than leaving the tap on the previous version with a green release beside it (BR-4)."
+              ;;
+          esac
+          exit "$status"
+
+      # BR-3's third place. The formula carries no `version` stanza on purpose
+      # — `brew audit` rejects one that agrees with the version it scans out of
+      # the release URL — so the formula's version is Homebrew's own reading of
+      # a URL this workflow rendered. That is a heuristic, and a heuristic that
+      # is load-bearing gets checked: if some future Homebrew reads
+      # `teton-v1.2.3-x86_64-apple-darwin.tar.gz` as anything but `1.2.3`, the
+      # release stops here rather than publishing a tap entry whose version
+      # disagrees with the tag.
+      - name: Homebrew resolves the formula at the tag version (BR-3)
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -uo pipefail
+
+          work="${RUNNER_TEMP:-/tmp}"
+
+          # `brew info | jq` in one pipeline, under `-e -o pipefail`, cannot
+          # report its own failure: brew exiting non-zero kills the step with a
+          # bare 1 before any annotation runs, and "brew could not answer" then
+          # looks nothing like the version mismatch this step exists to name.
+          # So brew's status is captured and branched on separately, and jq
+          # reads a file rather than a pipe.
+          set +e
+          brew info --json=v2 --formula atelier-fashion/tap/teton \
+            >"$work/brew-info.json" 2>"$work/brew-info.err"
+          brew_status=$?
+          set -e
+
+          if [ "$brew_status" -ne 0 ]; then
+            cat "$work/brew-info.err" || true
+            echo "::error title=Formula version UNCHECKED (BR-3)::'brew info --json=v2' exited $brew_status against the rendered formula, so Homebrew's reading of its version was never obtained. That is not evidence the version is right. The tap was NOT updated."
+            exit 75
+          fi
+
+          resolved="$(jq -r '.formulae[0].versions.stable' <"$work/brew-info.json" || true)"
+          if [ -z "$resolved" ] || [ "$resolved" = "null" ]; then
+            echo "::error title=Formula version UNCHECKED (BR-3)::'brew info --json=v2' succeeded but carried no .formulae[0].versions.stable, so nothing was learned about the formula's version. The tap was NOT updated."
+            exit 75
+          fi
+
+          if [ "$resolved" != "$VERSION" ]; then
+            echo "::error title=Formula version does not equal the tag (BR-3)::Homebrew reads this formula as version '$resolved', but the release is '$VERSION'. The tap was NOT updated. Homebrew's URL version scan changed shape — the template needs an explicit version stanza again, and brew audit's redundancy check needs an exception."
+            exit 65
+          fi
+
+          echo "::notice title=Formula version MATCH (BR-3)::Homebrew resolves atelier-fashion/tap/teton as $resolved, which is the tag."
+
+      # Both run before either can fail the step: a formula can be wrong in
+      # rubocop's eyes and in the auditor's for unrelated reasons, and learning
+      # only the first of two problems costs a whole release cycle. Same reason
+      # the build matrix sets `fail-fast: false`.
+      #
+      # Neither command needs `brew trust`, and that is not luck: Homebrew 6
+      # treats a fully-qualified formula named on the command line as
+      # self-authorizing, which is exactly how a user's
+      # `brew install atelier-fashion/tap/teton` also clears the gate (BR-1).
+      - name: brew style · brew audit the rendered formula
+        run: |
+          set +e
+          brew style --formula atelier-fashion/tap/teton
+          style=$?
+          brew audit --formula atelier-fashion/tap/teton
+          audit=$?
+          set -e
+
+          if [ "$style" -ne 0 ] || [ "$audit" -ne 0 ]; then
+            echo "::error title=Rendered formula failed brew style/audit::brew style exited $style, brew audit exited $audit — see the log for the offences. The tap was NOT updated. Fix packaging/homebrew/teton.rb.tmpl; the tap copy is generated and editing it there would be undone by the next release."
+            exit 65
+          fi
+
+          echo "::notice title=Formula passes brew style + brew audit::Rendered from the template and checked before anything was pushed."
+
+      # The install below is on macOS arm64 and only proves the arm64 URL. The
+      # other two are read straight back out of the rendered formula — not
+      # reconstructed here, because a second place that knows the URL shape is a
+      # second place to get it wrong — and fetched. A formula whose Linux URL
+      # 404s is a release that looks green everywhere except on the machines it
+      # broke (LESSON-433).
+      - name: Every URL in the formula resolves (publish runs)
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          set -uo pipefail
+
+          # `|| true` into a variable, then branch on emptiness: `-e` is on, and
+          # `urls="$(grep ...)"` with no match exits the step at grep's bare 1,
+          # before the "does not carry three URLs" error can print. The error
+          # existed and was unreachable.
+          urls="$(grep -oE 'https://[^"]+\.tar\.gz' "$TAP_DIR/Formula/teton.rb" || true)"
+          count="$(printf '%s\n' "$urls" | grep -c . || true)"
+          if [ "${count:-0}" -ne 3 ]; then
+            echo "::error title=Formula does not carry three download URLs::Found ${count:-0} tarball URLs in the rendered formula, expected one per target. The tap was NOT updated."
+            exit 65
+          fi
+
+          # Read line by line. `for url in $urls` split on every space and tab
+          # as well, so a URL that ever contained one would have been fetched as
+          # two half-URLs, and both halves would have 404'd into a confusing
+          # failure rather than an honest one.
+          unreachable=0
+          while IFS= read -r url; do
+            [ -n "$url" ] || continue
+            if curl -fsSIL --retry 3 --retry-delay 2 -o /dev/null "$url"; then
+              echo "reachable: $url"
+            else
+              echo "::error title=Formula URL is not fetchable::$url returned no successful response. brew install would fail on whichever platform that URL serves. The tap was NOT updated."
+              unreachable=$((unreachable + 1))
+            fi
+          done <<<"$urls"
+
+          [ "$unreachable" -eq 0 ] || exit 65
+
+      # ---------------------------------------------------------------------
+      # AC-5 and AC-6's mechanical evidence, gathered from a machine that
+      # installs the formula and runs the binaries — and gathered BEFORE the
+      # push, which is the whole point of it living here.
+      #
+      # It used to be a separate job that ran after the tap was pushed. A broken
+      # `service do` block was therefore discovered at a moment when the release
+      # AND the tap already pointed at it: exactly the state BR-4 exists to
+      # prevent, reached by the job meant to prove it had not been. Nothing had
+      # to move for this to run earlier — the release assets are live (the
+      # release job published them) and the rendered formula is already in this
+      # runner's tap clone.
+      #
+      # What these steps do NOT prove, and the `verify-install` job below does:
+      # that `brew install atelier-fashion/tap/teton` works on a machine that
+      # has never seen this tap. Homebrew resolves the name out of the clone
+      # this job made, so the auto-tap fetch is not exercised here and BR-1's
+      # one-command claim is not what these steps are evidence for.
+      # ---------------------------------------------------------------------
+      - name: brew install the formula about to be pushed (publish runs)
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          brew install --formula atelier-fashion/tap/teton
+          echo "::notice title=Installed from the local tap clone::The formula this run rendered installs, and its arm64 tarball matched the sha256 the formula carries."
+
+      # Everything after this point names the formula the short way — the way
+      # AC-6 and the README spell it — which Homebrew 6 will not accept for an
+      # untrusted tap. Trusting it here is a CI convenience that makes those
+      # commands deterministic; it is NOT part of the install path proved above
+      # or in verify-install.
+      - name: Trust the tap for the short-name commands below (publish runs)
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          if brew trust --help >/dev/null 2>&1; then
+            brew trust atelier-fashion/tap
+            echo "::notice title=Tap trusted for short-name commands::This Homebrew has a 'brew trust' subcommand and it accepted the tap; the steps below use 'teton' rather than the fully-qualified name."
+          else
+            echo "::notice title=No 'brew trust' subcommand on this runner::'brew trust --help' did not succeed, so there is no trust subcommand to call here. Whether the short-name commands below require one was NOT established by this step — if they do, they will fail loudly at that point rather than being skipped."
+          fi
+
+      # AC-5: the formula's own test block, run by brew, against the installed
+      # keg — both binaries must report the formula's version.
+      - name: brew test teton (AC-5)
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          brew test teton
+          echo "::notice title=brew test PASSED (AC-5)::The formula's test block ran against the installed binaries."
+
+      - name: The installed teton reports the tag (BR-3)
+        if: needs.preflight.outputs.publish == 'true'
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -uo pipefail
+
+          # Captured with `|| true` and checked, not spliced straight into an
+          # assignment: `-e` is on, so a `teton` that exits non-zero — the most
+          # interesting failure this step could see — would have killed the step
+          # before the MISMATCH annotation below could name it.
+          installed="$(teton --version 2>&1 || true)"
+          if [ -z "$installed" ]; then
+            echo "::error title=Installed version UNCHECKED (BR-3)::'teton --version' produced no output on the installed keg, so nothing was learned about which version brew installed. The tap was NOT updated."
+            exit 75
+          fi
+
+          case "$installed" in
+            *"$VERSION"*)
+              echo "::notice title=Installed version MATCH (BR-3)::teton --version reports '$installed' for tag v$VERSION."
+              ;;
+            *)
+              echo "::error title=Installed version MISMATCH (BR-3)::brew installed the formula for $VERSION but 'teton --version' says '$installed'. The tag, the workspace version and the thing users get do not agree. The tap was NOT updated."
+              exit 65
+              ;;
+          esac
+
+      # AC-6 and BR-6, end to end: launchd runs the daemon, the CLI handshakes
+      # it without anyone invoking tetond by hand, restart survives, stop
+      # actually stops, and the logs are where brew says logs are.
+      #
+      # Every assertion is on doctor's TEXT, never its exit code. `teton doctor`
+      # exits 0 whether or not it reaches a daemon — it is a diagnostic, not a
+      # probe — so an exit-code assertion would pass against a service that
+      # never started, which is precisely what this step exists to catch. Same
+      # stance, same reason, as tools/release/smoke.sh.
+      - name: services start · doctor · restart · stop (AC-6 / BR-6)
+        if: needs.preflight.outputs.publish == 'true'
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -uo pipefail
+
+          DEADLINE_SECS=60
+
+          doctor_says_running() {
+            teton doctor </dev/null 2>&1 | grep -F "daemon: running" || true
+          }
+
+          # Polls doctor rather than the socket file: bind() creates that file
+          # before listen() accepts anything, so an existence check has a window
+          # in which it is true and a connect still fails.
+          wait_for_daemon() {
+            local deadline line
+            deadline=$(($(date +%s) + DEADLINE_SECS))
+            while :; do
+              line="$(doctor_says_running)"
+              if [ -n "$line" ]; then
+                printf '%s\n' "$line"
+                return 0
+              fi
+              [ "$(date +%s)" -lt "$deadline" ] || return 1
+              sleep 1
+            done
+          }
+
+          wait_for_no_daemon() {
+            local deadline
+            deadline=$(($(date +%s) + DEADLINE_SECS))
+            while :; do
+              [ -n "$(doctor_says_running)" ] || return 0
+              [ "$(date +%s)" -lt "$deadline" ] || return 1
+              sleep 1
+            done
+          }
+
+          report_and_fail() {
+            echo "::error title=$1"
+            echo "--- teton doctor ---"
+            teton doctor </dev/null 2>&1 || true
+            echo "--- brew services list ---"
+            brew services list || true
+            echo "--- daemon logs ---"
+            tail -n 50 "$(brew --prefix)/var/log/teton/"*.log 2>/dev/null || echo "(no logs)"
+            exit 65
+          }
+
+          brew services start teton \
+            || report_and_fail "brew services start FAILED (AC-6)::launchd would not take the service defined by the formula, so the daemon never started. The tap was NOT updated."
+
+          line="$(wait_for_daemon)" \
+            || report_and_fail "Daemon never answered after start (AC-6)::brew services start exited 0 but teton doctor never reported a running daemon within ${DEADLINE_SECS}s — without anyone invoking tetond by hand, which is the whole claim. The tap was NOT updated."
+
+          case "$line" in
+            *"$VERSION"*)
+              echo "::notice title=Daemon handshake OK (AC-6)::$line"
+              ;;
+            *)
+              report_and_fail "Daemon is running the wrong version (AC-6 / BR-3)::doctor reported '$line', which does not name $VERSION. The tap was NOT updated."
+              ;;
+          esac
+
+          # BR-6: "where are the logs" must have a brew answer. launchd creates
+          # both redirect targets when it spawns the service, so if the daemon
+          # is up and these are not here, the formula's log paths are wrong.
+          log_dir="$(brew --prefix)/var/log/teton"
+          if [ -f "$log_dir/tetond.log" ] && [ -f "$log_dir/tetond.err.log" ]; then
+            echo "::notice title=Daemon logs are under brew var (BR-6)::$log_dir"
+            ls -l "$log_dir"
+          else
+            report_and_fail "Daemon logs are not where the formula says (BR-6)::Expected tetond.log and tetond.err.log under $log_dir. The tap was NOT updated."
+          fi
+
+          brew services restart teton \
+            || report_and_fail "brew services restart FAILED (AC-6)::the service would not come back. The tap was NOT updated."
+          wait_for_daemon >/dev/null \
+            || report_and_fail "Daemon never answered after restart (AC-6)::restart exited 0 but no daemon responded within ${DEADLINE_SECS}s. The tap was NOT updated."
+          echo "::notice title=Restart OK (AC-6)::The daemon came back after brew services restart."
+
+          brew services stop teton \
+            || report_and_fail "brew services stop FAILED (AC-6)::brew could not stop the service. The tap was NOT updated."
+
+          # An exit-0 `stop` that leaves the daemon serving would satisfy a
+          # naive check and violate the rule, so stop is asserted the same way
+          # start is: by asking the daemon.
+          wait_for_no_daemon \
+            || report_and_fail "Daemon still answering after stop (AC-6)::brew services stop exited 0 but teton doctor still reports a running daemon after ${DEADLINE_SECS}s. The tap was NOT updated."
+
+          echo "::notice title=Stop OK (AC-6)::The daemon stopped answering after brew services stop."
+          brew services list
+
+      - name: Commit and push the bump (publish runs)
+        if: needs.preflight.outputs.publish == 'true'
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # A token the server rejects otherwise turns into an interactive
+          # credential prompt on a runner with no terminal, which is a job that
+          # hangs until it is cancelled rather than a job that fails.
+          GIT_TERMINAL_PROMPT: 0
+        run: |
+          set -uo pipefail
+
+          clean_url="https://github.com/atelier-fashion/homebrew-tap.git"
+
+          # The credential is attached to the push remote for the length of the
+          # push and no longer. The trap makes the scrub unconditional: a push
+          # that dies partway must not leave a write-capable token in a file
+          # that outlives this step.
+          scrub_push_url() {
+            git -C "$TAP_DIR" remote set-url --push origin "$clean_url" >/dev/null 2>&1 || true
+          }
+          trap scrub_push_url EXIT
+
+          git -C "$TAP_DIR" add Formula/teton.rb
+
+          # Re-running a release over an already-correct tap is a no-op, not a
+          # failure: the invariant BR-4 protects is "the tap points at this
+          # release", and it already does.
+          if git -C "$TAP_DIR" diff --cached --quiet; then
+            echo "::notice title=Formula already current::The tap's Formula/teton.rb already matches what this run rendered for $VERSION. Nothing to commit."
+            exit 0
+          fi
+
+          git -C "$TAP_DIR" \
+            -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "teton $VERSION"
+
+          git -C "$TAP_DIR" remote set-url --push origin \
+            "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/atelier-fashion/homebrew-tap.git"
+
+          # No --force, ever. The tap's history is the bump audit trail, and a
+          # force-push is how a wrong formula stops being reconstructable.
+          push_status=0
+          git -C "$TAP_DIR" push || push_status=$?
+
+          scrub_push_url
+
+          # Asserted, not assumed: the credential is gone from the only file it
+          # was ever written to. This is checked before the push result is
+          # reported, so a failed push cannot skip past it.
+          if grep -Fq 'x-access-token' "$TAP_DIR/.git/config"; then
+            echo "::error title=Tap token still present in .git/config::The push URL was not scrubbed, so a write-capable credential is readable for the remainder of this job. Failing the release rather than continuing with it in place."
+            exit 65
+          fi
+
+          if [ "$push_status" -ne 0 ]; then
+            echo "::error title=Tap push FAILED (BR-4)::Release $VERSION is published but the tap still points at the previous version, so brew installs the old release. Check that HOMEBREW_TAP_TOKEN still has contents:write on atelier-fashion/homebrew-tap (docs/homebrew-tap-setup.md), then re-run this job."
+            exit 65
+          fi
+
+          echo "::notice title=Tap formula bumped::atelier-fashion/homebrew-tap now points at teton $VERSION."
+
+      - name: What a publish run would have done (dry runs)
+        if: needs.preflight.outputs.publish != 'true'
+        run: |
+          echo "::notice title=Tap push SKIPPED::This run rendered the formula below from its own build artifacts and it passed brew style, brew audit and the BR-3 version check — but nothing was cloned, committed or pushed, and the install/services steps are skipped because there is no published release to install from."
+          cat "$TAP_DIR/Formula/teton.rb"
+
+  # BR-1, stated the way a user states it: one command, no tap step, no `brew
+  # trust`, no toolchain — on a machine that has never seen this tap. That is
+  # the one assertion which cannot move earlier: it requires the formula to be
+  # PUSHED, because the thing being proved is that Homebrew can find and fetch
+  # it. (Homebrew 6 requires third-party taps to be trusted but treats a
+  # fully-qualified name on the command line as self-authorizing, which is why
+  # this is still one command.)
+  #
+  # Everything functional about the formula — its version, its test block, its
+  # launchd service, its logs — was already proved before the push, in
+  # bump-formula. This job is deliberately narrow: it is evidence about the
+  # published tap's reachability, not a second functional gate.
+  #
+  # It covers macOS arm64 only, because that is the runner GitHub offers. The
+  # x86_64 legs stay covered at the strength the release notes claim for them
+  # (Rosetta smoke in `build`, URL reachability in `bump-formula`) and no
+  # further — a green run here is not evidence about Intel or Linux (LESSON-433).
+  verify-install:
+    name: brew install from the published tap (BR-1 / AC-5)
+    needs: [preflight, bump-formula]
+    # Nothing was published, so there is nothing to install. bump-formula's dry
+    # -run step says so out loud, so this grey box has its reason printed
+    # beside it rather than merely being absent.
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: macos-15
+    steps:
+      - name: brew install atelier-fashion/tap/teton (BR-1)
+        run: |
+          set -euo pipefail
+          brew install atelier-fashion/tap/teton
+          echo "::notice title=Installed from the live tap::One command on a runner that had never seen this tap — no trust step, no Rust toolchain, no cmake."
+
+      # Named the long way on purpose: this job proves the untrusted-tap path,
+      # so it must not trust the tap first. bump-formula covers the short-name
+      # commands.
+      - name: brew test the published formula (AC-5)
+        run: |
+          set -euo pipefail
+          brew test atelier-fashion/tap/teton
+          echo "::notice title=brew test PASSED (AC-5)::The pushed formula's test block ran against binaries installed from the published tap."
+
+      - name: The installed teton reports the tag (BR-3)
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -uo pipefail
+
+          installed="$(teton --version 2>&1 || true)"
+          if [ -z "$installed" ]; then
+            echo "::error title=Installed version UNCHECKED (BR-3)::'teton --version' produced no output after installing from the published tap, so nothing was learned about what users now get."
+            exit 75
+          fi
+
+          case "$installed" in
+            *"$VERSION"*)
+              echo "::notice title=Installed version MATCH (BR-3)::teton --version reports '$installed' for tag v$VERSION, installed from the published tap."
+              ;;
+            *)
+              echo "::error title=Installed version MISMATCH (BR-3)::The published tap installs something that reports '$installed', not $VERSION."
+              exit 65
+              ;;
+          esac
+
+  # BR-8: tetoncode.ai must advertise this release, and it will not do so on its
+  # own.
+  #
+  # deploy-site.yml triggers on `release: published`, and that event never
+  # arrives: GitHub does not raise workflow-triggering events for actions taken
+  # with the repository's GITHUB_TOKEN, and `gh release create` above is one of
+  # them. The site workflow is therefore not "wired up and occasionally flaky" —
+  # it can never fire from a release this pipeline publishes. The event trigger
+  # stays in deploy-site.yml for releases cut by a human or a PAT; this job is
+  # the path that actually runs for a tag push.
+  #
+  # `workflow_dispatch` is the documented exception to that rule — along with
+  # `repository_dispatch` it is the one event GITHUB_TOKEN may raise — which is
+  # why this dispatches rather than, say, re-creating the release.
+  #
+  # DO NOT "simplify" this away by relying on the release event. It looks
+  # redundant with deploy-site.yml's own trigger and it is not.
+  #
+  # Placed last on purpose: the site may only advertise a version that is
+  # published, whose tap actually carries it, and which installs from that tap.
+  # A page announcing a version whose tap bump failed sends every reader to a
+  # `brew install` that hands them the previous release.
+  dispatch-site-deploy:
+    name: publish tetoncode.ai (BR-8)
+    needs: [preflight, release, bump-formula, verify-install]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # `gh workflow run` is an Actions API write. Scoped to this job; no other
+      # job in this workflow may start a workflow.
+      actions: write
+    steps:
+      - name: Dispatch deploy-site.yml at the release tag
+        env:
+          # No checkout in this job, so `gh` has no git remote to infer the
+          # repository from; GH_REPO tells it directly.
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -uo pipefail
+
+          dispatch_status=0
+          # -f tag: the dispatched run must render THE version whose tap bump
+          # this run just proved. --ref alone selects which workflow FILE to
+          # run, not which version it renders; without the input deploy-site
+          # falls back to `releases/latest`, which under two racing releases is
+          # a different version than the tap now carries — the page would
+          # advertise X beside a `brew install` that hands visitors Y.
+          gh workflow run deploy-site.yml --ref "$TAG" -f tag="$TAG" || dispatch_status=$?
+
+          if [ "$dispatch_status" -ne 0 ]; then
+            echo "::error title=Site deploy was NOT requested (BR-8)::'gh workflow run deploy-site.yml --ref $TAG' exited $dispatch_status, so tetoncode.ai was never asked to republish and still advertises the previous version. The release and the tap are correct; only the site is stale. Re-run this job, or dispatch Deploy site manually with tag=$TAG."
+            exit 65
+          fi
+
+          # Stated at exactly the strength it holds: this job proves the deploy
+          # was REQUESTED and accepted. Whether tetoncode.ai actually
+          # republished is that run's own red-or-green, not this one's — a green
+          # box here is not evidence the site is live (LESSON-443).
+          echo "::notice title=Site deploy requested (BR-8)::Deploy site was dispatched against $TAG. Its own run reports whether tetoncode.ai republished: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/deploy-site.yml"

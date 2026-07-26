@@ -1,10 +1,10 @@
 ---
 id: REQ-548
 title: "One-command Homebrew install and the tetoncode.ai landing page"
-status: draft
+status: complete
 deployable: true
 created: 2026-07-24
-updated: 2026-07-24
+updated: 2026-07-25
 component: "distribution/release"
 domain: "distribution"
 stack: ["rust", "github-actions", "homebrew", "ci", "static-site"]
@@ -227,6 +227,29 @@ Rust+cmake burden this REQ exists to remove.
       landing page follows the same pattern; needed at architecture time,
       along with CI deploy credentials (service account or workload
       identity).
+
+## Deferred (verify pass, 2026-07-25)
+
+Two security findings from the Phase-5 audit were deliberately NOT implemented
+in this REQ, because both require repo-admin action in the GitHub UI that the
+pipeline cannot perform or verify. Neither blocks the one-command install; both
+harden the supply chain around it and should be done before the project has
+real users.
+
+- **Build provenance / artifact signing.** `checksums.txt` is published beside
+  the assets it describes, over the same channel, mutable by the same
+  principals — a direct-download user verifies only that the release page
+  agrees with itself. (Homebrew users are covered: the tap's pinned `sha256`
+  lives in a different repo behind a different token.) Fix is
+  `actions/attest-build-provenance` in the release job plus
+  `gh attestation verify` in the runbook, needing `id-token: write` +
+  `attestations: write`.
+- **Environment-gated secrets.** `HOMEBREW_TAP_TOKEN` and the `GCP_*` secrets
+  are repository secrets, readable by any workflow on any ref. The tap token is
+  the highest-value credential in the design — it rewrites the formula every
+  `brew install` executes. Fix is GitHub Environments (`tap-publish`,
+  `site-deploy`) with deployment branch/tag rules limited to `v*.*.*` and
+  `main`, plus `assertion.ref` in the WIF attribute condition.
 
 ## Out of Scope
 

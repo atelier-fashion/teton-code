@@ -1,0 +1,529 @@
+name: Deploy site
+
+# tetoncode.ai is published from `site/`. Its displayed version and install
+# command are stamped in at deploy time from the release that triggered the run
+# (BR-8) — never hand-edited into the HTML, where they would drift from what
+# `brew install` actually gives you.
+#
+# Two ways in:
+#
+#   workflow_dispatch    the normal path, and the one a release actually takes.
+#                        release.yml dispatches this workflow itself, once
+#                        `bump-formula` has succeeded, passing the tag it just
+#                        proved as the `tag` input. A hand-run may omit it and
+#                        take the latest published release instead. Either way
+#                        the tag must resolve to a real published release, so a
+#                        run can never publish a page advertising a version
+#                        nobody cut.
+#
+#                        It is an explicit dispatch rather than a `release:
+#                        published` subscription because release.yml creates the
+#                        release with the default GITHUB_TOKEN, and GitHub does
+#                        not emit workflow-triggering events for actions taken
+#                        by that token. Subscribing alone, this workflow would
+#                        have sat silent after every single release — green,
+#                        untriggered, and indistinguishable from working.
+#
+#                        Also how a human re-publishes on demand (site copy fix,
+#                        infra change).
+#
+#   release: published   fallback only. Fires for a release created by a human
+#                        through the UI or by a PAT-authenticated client — never
+#                        for one release.yml cut. Kept because such a release
+#                        should still update the page; not relied on, because
+#                        the release pipeline's releases never raise it. The
+#                        event's tag IS the version on this path.
+#
+# The `deploy-site` concurrency group below is what makes carrying both triggers
+# safe: if a human-cut release ever raises the event AND something dispatches,
+# the second run queues behind the first rather than racing it into the bucket.
+#
+# Until the Atelier GCP coordinates exist as repository secrets/variables
+# (OQ-5), this workflow still renders the page and uploads it as an artifact —
+# and then FAILS its last step with a named reason. It does not skip, and it
+# does not pass. A green run of this job means exactly one thing: tetoncode.ai
+# was actually republished (ADR-548-3, LESSON-447 — a degraded path must stay
+# visible and must preserve the invariant it stands in for).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Published release tag to render (e.g. v0.1.0). release.yml passes the
+          tag whose tap bump it just proved, so the page and the `brew install`
+          it shows agree. Leave empty on a hand-run to take the latest release.
+        required: false
+        type: string
+
+# Unlike ci.yml, an in-flight run is NOT cancelled by a newer one: a half-synced
+# bucket or a half-rolled Cloud Run revision is worse than a queued run.
+concurrency:
+  group: deploy-site
+  cancel-in-progress: false
+
+# Least privilege by default; the deploy job widens it only to what workload
+# identity federation needs.
+permissions:
+  contents: read
+
+env:
+  # The tap coordinates from ADR-548-1, passed explicitly to site/render.sh.
+  # render.sh carries the same string as a convenience default for local
+  # renders, but relying on that default would leave the published install
+  # command defined in two places that can drift apart silently. This workflow
+  # is the thing that publishes, so this workflow states it.
+  INSTALL_COMMAND: brew install atelier-fashion/tap/teton
+
+jobs:
+  deploy:
+    name: render · deploy (tetoncode.ai)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Workload identity federation mints a short-lived GCP credential from
+      # this run's OIDC identity. Nothing else in the job needs the token.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Nothing in this job pushes; don't leave the token in .git/config
+          # across the gcloud auth and buildpack steps below.
+          persist-credentials: false
+
+      # The version is always a REAL published release (BR-8) — a dispatch may
+      # name which one, but never invent it: the `tag` input is verified with
+      # `gh release view` before it is used, so an unpublished or mistyped tag
+      # is 69, never silently swapped for `latest`. Exit codes are a taxonomy, not a boolean, so "there is no
+      # release yet" can never be confused with "GitHub did not answer"
+      # (LESSON-442, ADR-548-4):
+      #
+      #   0   resolved.
+      #   65  red, ::error::. A release event arrived with no tag_name. Malformed
+      #       event; nothing to publish.
+      #   69  red, ::error::. Dispatched, but this repository has no published
+      #       release yet. Cut one first — there is no version to advertise.
+      #   75  red, ::error::. The release lookup itself failed. Nothing was
+      #       learned about the latest release, which is NOT the same as there
+      #       being none, so the run stops rather than guessing.
+      - name: Resolve the release version (BR-8)
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "release" ]; then
+            tag="$RELEASE_TAG"
+            if [ -z "$tag" ]; then
+              echo "::error title=Release tag missing::The release event carried no tag_name, so there is no version to publish. Nothing was rendered."
+              exit 65
+            fi
+            echo "::notice title=Version from release event::Publishing tetoncode.ai at $tag."
+          elif [ -n "${INPUT_TAG:-}" ]; then
+            # Dispatched with an explicit tag — the release-driven path. Verify
+            # it is a published release rather than trusting the caller: this is
+            # what keeps the page's version and the tap's version the same fact
+            # under two racing releases (ADR-548-3a).
+            tag="$INPUT_TAG"
+            if ! gh release view "$tag" --repo "$REPO" --json tagName >/dev/null 2>&1; then
+              echo "::error title=Dispatched tag is not a published release::'$tag' was passed as the tag input but is not a published release of $REPO, so there is nothing to advertise. Nothing was rendered."
+              exit 69
+            fi
+            echo "::notice title=Version from dispatch input::Publishing tetoncode.ai at $tag."
+          else
+            # `releases/latest` is the REST endpoint that already excludes drafts
+            # and pre-releases, so a dispatched re-publish tracks the same thing
+            # a visitor would call "the current release". Its 404 means "this
+            # repository has published nothing", which is a different failure
+            # from a transport or auth problem — hence the stderr check below,
+            # with anything unrecognised falling through to UNCHECKED rather
+            # than being optimistically reported as "no release".
+            err="$(mktemp)"
+            set +e
+            tag="$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>"$err")"
+            status=$?
+            set -e
+
+            if [ "$status" -ne 0 ] || [ -z "$tag" ] || [ "$tag" = "null" ]; then
+              cat "$err" >&2
+              if grep -q 'HTTP 404' "$err"; then
+                echo "::error title=No published release::This repository has no published release, so there is no version for the landing page to display. Cut a release first (push a vX.Y.Z tag), then re-run this workflow. Nothing was rendered and nothing was deployed."
+                exit 69
+              fi
+              echo "::error title=Release lookup UNCHECKED::The latest release could not be read (gh exit $status). That is not evidence that no release exists, so this run stops rather than publishing a page with a guessed version."
+              exit 75
+            fi
+            echo "::notice title=Version from latest release::This dispatched run publishes tetoncode.ai at $tag, the repository's latest published release."
+          fi
+
+          echo "tag=$tag" >>"${GITHUB_OUTPUT:-/dev/null}"
+
+      # One renderer, one substitution implementation: site/render.sh (TASK-018).
+      # It refuses on an unfilled placeholder and deletes its own partial output,
+      # so a page reading "{{VERSION}}" cannot reach the deploy steps below.
+      #
+      #   0   rendered.
+      #   64  red, ::error::. render.sh refused — bad version, bad install
+      #       command, or a template placeholder it does not know how to fill.
+      #   *   red, ::error::. The renderer could not run at all.
+      - name: Render the landing page (site/render.sh, BR-8)
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          set +e
+          bash site/render.sh "$TAG" "$INSTALL_COMMAND"
+          status=$?
+          set -e
+
+          case "$status" in
+            0)
+              echo "::notice title=Landing page rendered::site/dist/index.html carries $TAG and the install command '$INSTALL_COMMAND', with no placeholder left behind."
+              ;;
+            64)
+              echo "::error title=Render REFUSED::site/render.sh refused to render $TAG — see the log for which input or placeholder it rejected. Nothing was deployed."
+              ;;
+            *)
+              echo "::error title=Render UNCHECKED::site/render.sh could not run (exit $status), so no page exists to publish. Nothing was deployed."
+              ;;
+          esac
+          exit "$status"
+
+      # Uploaded unconditionally, including on runs that go on to fail the guard
+      # below: "here is exactly the page that would have gone out" is reviewable
+      # evidence, and it is how the site is checked before the GCP coordinates
+      # exist. Same posture as release.yml's dry-run branch.
+      #
+      # ORDERING INVARIANT — THIS STEP MUST STAY ABOVE THE AUTH STEP.
+      # google-github-actions/auth writes its credential to a `gha-creds-*.json`
+      # file inside the workspace (that is why .gitignore carries that pattern).
+      # `path: site/dist` does not glob it today, but this step runs before the
+      # credential file exists at all, and that ordering is what makes the
+      # guarantee structural instead of a property of one `path:` expression.
+      # Moving this below the auth step — or widening `path:` to the workspace —
+      # would publish a long-lived service-account key as a downloadable
+      # artifact on a public repository.
+      - name: Upload the rendered site
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-dist
+          path: site/dist
+          if-no-files-found: error
+          retention-days: 14
+
+      # Reads the repository's GCP configuration and reports what is missing.
+      # This step deliberately does NOT fail: the render above is still worth
+      # publishing as an artifact, and collapsing "not configured" into an early
+      # abort would hide which names are absent. The failure is the guard at the
+      # end of the job, which is the only step allowed to decide the job's
+      # colour.
+      #
+      # Secrets cannot be read from a step-level `if:` (the `secrets` context is
+      # not available there), so presence is resolved here, in bash, and the
+      # deploy steps branch on these outputs instead.
+      - name: Resolve the GCP deploy configuration
+        id: config
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          GCP_DEPLOY_SURFACE: ${{ vars.GCP_DEPLOY_SURFACE }}
+          GCP_RUN_SERVICE: ${{ vars.GCP_RUN_SERVICE }}
+          GCP_RUN_REGION: ${{ vars.GCP_RUN_REGION }}
+          GCP_SITE_BUCKET: ${{ vars.GCP_SITE_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          missing=''
+          note() { missing="${missing:+$missing; }$1"; }
+
+          # Workload identity federation is the preferred shape (no long-lived
+          # key in GitHub); a service-account key is accepted as the documented
+          # fallback and says so in the log every time it is used.
+          auth_mode=none
+          if [ -n "${GCP_WIF_PROVIDER:-}" ] && [ -n "${GCP_SERVICE_ACCOUNT:-}" ]; then
+            auth_mode=wif
+          elif [ -n "${GCP_CREDENTIALS_JSON:-}" ]; then
+            auth_mode=key
+          else
+            note 'secrets.GCP_WIF_PROVIDER + secrets.GCP_SERVICE_ACCOUNT (or, not recommended, secrets.GCP_CREDENTIALS_JSON)'
+          fi
+
+          [ -n "${GCP_PROJECT:-}" ] || note 'secrets.GCP_PROJECT'
+
+          # Normalised before matching so a stray capital or trailing space in a
+          # repository variable produces a named failure rather than two silently
+          # skipped deploy steps.
+          surface="$(printf '%s' "${GCP_DEPLOY_SURFACE:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          case "$surface" in
+            cloud-run)
+              [ -n "${GCP_RUN_SERVICE:-}" ] || note 'vars.GCP_RUN_SERVICE'
+              [ -n "${GCP_RUN_REGION:-}" ] || note 'vars.GCP_RUN_REGION'
+              ;;
+            gcs)
+              [ -n "${GCP_SITE_BUCKET:-}" ] || note 'vars.GCP_SITE_BUCKET'
+              ;;
+            '')
+              note 'vars.GCP_DEPLOY_SURFACE (set it to cloud-run or gcs)'
+              ;;
+            *)
+              note "vars.GCP_DEPLOY_SURFACE is '$surface', which is neither cloud-run nor gcs"
+              surface=''
+              ;;
+          esac
+
+          if [ -n "$missing" ]; then
+            ready=false
+            echo "::notice title=GCP deploy configuration incomplete::Not set: $missing. The page will still be rendered and uploaded as an artifact, and this job will fail its last step — see docs/site-deploy-runbook.md."
+          else
+            ready=true
+            echo "::notice title=GCP deploy configuration resolved::Surface '$surface', authenticating by $auth_mode."
+          fi
+
+          {
+            echo "ready=$ready"
+            echo "surface=$surface"
+            echo "auth_mode=$auth_mode"
+            echo "missing=$missing"
+          } >>"${GITHUB_OUTPUT:-/dev/null}"
+
+      # Preferred: a short-lived credential minted from this run's OIDC identity.
+      # No long-lived key exists to leak, and the provider's attribute condition
+      # scopes it to this repository (runbook: "Authentication").
+      - name: Authenticate to Google Cloud (workload identity federation)
+        if: steps.config.outputs.ready == 'true' && steps.config.outputs.auth_mode == 'wif'
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          project_id: ${{ secrets.GCP_PROJECT }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      # Documented fallback for orgs that cannot stand up WIF. It works, and it
+      # announces its own cost on every run so it does not become the permanent
+      # arrangement by inattention.
+      - name: Authenticate to Google Cloud (service-account key — not recommended)
+        if: steps.config.outputs.ready == 'true' && steps.config.outputs.auth_mode == 'key'
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          project_id: ${{ secrets.GCP_PROJECT }}
+          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+
+      - name: Warn that a long-lived service-account key was used
+        if: steps.config.outputs.ready == 'true' && steps.config.outputs.auth_mode == 'key'
+        run: |
+          set -euo pipefail
+          echo "::warning title=Long-lived service-account key in use::This deploy authenticated with secrets.GCP_CREDENTIALS_JSON, a key that does not expire and that anyone with repository admin can read out of a workflow they add. Migrate to workload identity federation — docs/site-deploy-runbook.md, 'Authentication'."
+
+      - name: Set up gcloud
+        if: steps.config.outputs.ready == 'true'
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      # Surface A of two (ADR-548-3): the site is a Cloud Run service. Selected
+      # by vars.GCP_DEPLOY_SURFACE=cloud-run.
+      #
+      # `--source` builds with Google Cloud buildpacks. If the Atelier site
+      # produces its container from a Dockerfile instead, the OQ-5 intake in the
+      # runbook says so and this step's source directory changes with it — that
+      # is a decision the runbook forces before the first deploy, not a surprise
+      # discovered here.
+      - name: Deploy to Cloud Run
+        if: steps.config.outputs.ready == 'true' && steps.config.outputs.surface == 'cloud-run'
+        env:
+          RECEIPT: ${{ runner.temp }}/site-deploy-receipt
+          PROJECT: ${{ secrets.GCP_PROJECT }}
+          SERVICE: ${{ vars.GCP_RUN_SERVICE }}
+          REGION: ${{ vars.GCP_RUN_REGION }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gcloud run deploy "$SERVICE" \
+            --project "$PROJECT" \
+            --region "$REGION" \
+            --source site/dist \
+            --allow-unauthenticated \
+            --quiet
+
+          url="$(gcloud run services describe "$SERVICE" \
+            --project "$PROJECT" \
+            --region "$REGION" \
+            --format 'value(status.url)')"
+
+          # The receipt is written last, and only here: the guard at the end of
+          # this job treats its absence as "nothing was published". Writing it
+          # before the deploy, or writing it from a step that only half-ran,
+          # would turn the guard back into the green-while-nothing-happened
+          # box it exists to prevent.
+          printf 'Cloud Run service %s (%s) now serves teton %s at %s\n' \
+            "$SERVICE" "$REGION" "$TAG" "$url" >"$RECEIPT"
+
+      # Surface B of two (ADR-548-3): the site is static objects behind the
+      # existing external load balancer. Selected by vars.GCP_DEPLOY_SURFACE=gcs.
+      #
+      # rsync, never a delete-the-rest sync: the destination may be a prefix in a
+      # bucket the Atelier site shares, and no landing-page deploy should be able
+      # to remove objects it did not put there.
+      - name: Deploy to Cloud Storage
+        if: steps.config.outputs.ready == 'true' && steps.config.outputs.surface == 'gcs'
+        env:
+          RECEIPT: ${{ runner.temp }}/site-deploy-receipt
+          PROJECT: ${{ secrets.GCP_PROJECT }}
+          BUCKET: ${{ vars.GCP_SITE_BUCKET }}
+          URL_MAP: ${{ vars.GCP_CDN_URL_MAP }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gcloud storage rsync site/dist "gs://$BUCKET" \
+            --project "$PROJECT" \
+            --recursive
+
+          # A landing page whose whole job is to display the current version must
+          # not be cached for a day. Five minutes with revalidation keeps the
+          # page cheap while bounding how long AC-7 can be false after a release.
+          gcloud storage objects update "gs://$BUCKET/index.html" \
+            --project "$PROJECT" \
+            --cache-control 'public, max-age=300, must-revalidate'
+
+          if [ -n "${URL_MAP:-}" ]; then
+            # Scoped to the objects this deploy actually wrote, never '/*'. The
+            # URL map may front the entire Atelier site (site-deploy-runbook
+            # section 2 says as much), and '/*' would evict every property
+            # behind it — a landing-page release must not cold-start somebody
+            # else's cache, and the blast radius of a cache flush is not the
+            # landing page's to spend.
+            #
+            # `invalidate-cdn-cache` takes one --path per invocation, so the
+            # paths are enumerated from what the renderer produced (today: just
+            # index.html) and issued one at a time. Enumerating rather than
+            # hardcoding means an asset added to site/dist is invalidated
+            # without anyone remembering to edit this step. '/' is invalidated
+            # explicitly because that is the URL the index object is served at.
+            #
+            # Synchronous on purpose: a CDN still serving the previous version
+            # is AC-7 failing at the URL, so the run should not report success
+            # until the edge has been told. This can take a few minutes.
+            paths_file="$(mktemp)"
+            {
+              printf '/\n'
+              # `find .` prints './index.html'; stripping the leading '.' — not
+              # substituting it — is what yields '/index.html' rather than
+              # '//index.html', which Cloud CDN would not match.
+              (cd site/dist && find . -type f | sed 's|^\.||' | sort)
+            } >"$paths_file"
+
+            invalidated=0
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              gcloud compute url-maps invalidate-cdn-cache "$URL_MAP" \
+                --project "$PROJECT" \
+                --path "$path"
+              invalidated=$((invalidated + 1))
+            done <"$paths_file"
+            rm -f "$paths_file"
+
+            cdn_note=" and $invalidated path(s) were invalidated in the Cloud CDN cache behind $URL_MAP"
+          else
+            cdn_note=""
+            echo "::warning title=No CDN invalidation requested::vars.GCP_CDN_URL_MAP is not set, so no Cloud CDN invalidation ran. If a CDN fronts this bucket, tetoncode.ai can keep serving the previous version until its TTL expires — which is AC-7 being false at the URL while this job is green. See docs/site-deploy-runbook.md."
+          fi
+
+          printf 'gs://%s was synced with teton %s%s\n' "$BUCKET" "$TAG" "$cdn_note" >"$RECEIPT"
+
+      # THE GUARD (ADR-548-3, LESSON-447). The last word on this job's colour.
+      #
+      # It passes only on a receipt written by a deploy step that ran to
+      # completion. Every other outcome — no GCP configuration in the repository,
+      # an unrecognised surface, a deploy step that died halfway — fails, loudly,
+      # with the reason and the runbook in the message. Never `continue-on-error`,
+      # never a skip that reads as green: "this job is green" has to mean
+      # "tetoncode.ai was republished", or it means nothing at all.
+      #
+      #   0   published; the receipt says what was published where.
+      #   78  red, ::warning:: + ::error-level message on stderr. EX_CONFIG —
+      #       nothing was published. The site still serves whatever it served
+      #       before this run.
+      #
+      # Runs on every non-cancelled outcome so a failure upstream still gets the
+      # "nothing was published" statement in the log rather than a bare red step.
+      #
+      # Because it runs on upstream failures too, it must not read the config
+      # step's EMPTY outputs as an answer. When an earlier step fails — version
+      # resolution (65/69/75) or the render (64) — the config step never runs,
+      # `steps.config.outputs.*` are all empty, and a guard that only looked at
+      # those outputs would announce "required GCP configuration is not set …
+      # (no deploy surface was resolved)" for a run whose GCP configuration was
+      # never consulted at all. That message names the wrong cause and sends the
+      # operator to the wrong runbook section — so `steps.config.outcome` (empty
+      # when the step never ran) is the discriminator, and the guard defers to
+      # the real failure instead of guessing.
+      - name: Deploy result (fails until the site is actually published)
+        if: ${{ !cancelled() }}
+        env:
+          RECEIPT: ${{ runner.temp }}/site-deploy-receipt
+          CONFIG_OUTCOME: ${{ steps.config.outcome }}
+          MISSING_CONFIG: ${{ steps.config.outputs.missing }}
+          SURFACE: ${{ steps.config.outputs.surface }}
+        run: |
+          set -uo pipefail
+
+          runbook='docs/site-deploy-runbook.md'
+          receipt="${RECEIPT:-}"
+
+          if [ -n "$receipt" ] && [ -s "$receipt" ]; then
+            echo "::notice title=Site deployed::$(cat "$receipt")"
+            exit 0
+          fi
+
+          config_outcome="${CONFIG_OUTCOME:-}"
+          missing="${MISSING_CONFIG:-}"
+          surface="${SURFACE:-}"
+
+          case "$config_outcome" in
+            '')
+              # Never ran. Say so, and point at the failure rather than at the
+              # secrets — this run learned nothing about them either way.
+              reason='an earlier step in this job failed before the deploy configuration was ever read'
+              guidance="fix the failed step above — this run says nothing about whether the GCP_* secrets and variables are set."
+              ;;
+            success)
+              if [ -n "$missing" ]; then
+                reason="required GCP configuration is not set in this repository (not set: ${missing})"
+                guidance="configure the GCP_* secrets and variables listed in ${runbook}, then re-run this workflow."
+              elif [ -z "$surface" ]; then
+                # Unreachable by construction: the config step records a missing
+                # name for every path that leaves the surface empty. Kept, and
+                # labelled, so an unreachable state never reports as a config
+                # problem the operator cannot find.
+                reason='the deploy configuration reported nothing missing yet resolved no surface, which the configuration step should make impossible'
+                guidance="this is a bug in the 'Resolve the GCP deploy configuration' step, not a missing setting — read that step's log."
+              else
+                reason="the '${surface}' deploy step left no receipt, so nothing is known to have been published"
+                guidance="read the failed deploy step's gcloud output; ${runbook} section 8 covers the partial-deploy case."
+              fi
+              ;;
+            *)
+              reason="the deploy-configuration step itself did not succeed (outcome: ${config_outcome}), so this repository's GCP settings were never fully resolved"
+              guidance="read that step's log — this is not evidence that the settings are missing."
+              ;;
+          esac
+
+          echo "::warning title=Site deploy blocked::site deploy blocked: ${reason}. ${guidance}"
+          {
+            printf 'site deploy blocked: %s\n' "$reason"
+            printf 'nothing was published — tetoncode.ai still serves whatever it served before this run.\n'
+            printf 'this step fails on purpose: a green deploy job has to mean the site was actually deployed.\n'
+            printf 'the rendered page is attached to this run as the "site-dist" artifact.\n'
+            printf 'fix: %s\n' "$guidance"
+            printf 'runbook: %s\n' "$runbook"
+          } >&2
+          exit 78
