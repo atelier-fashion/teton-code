@@ -248,3 +248,29 @@ local completion can never park a tokio worker and stall unrelated RPCs
 (LESSON-448, pinned by `tests/nonblocking_inference.rs`);
 default/CI builds compile none of this and keep the loaderless
 honest-`disabled` behavior.
+
+### ADR-006: Distribution is a Homebrew tap of prebuilt binaries, formula templated in-repo (2026-07-26)
+
+**Decision**: users install with one command —
+`brew install atelier-fashion/tap/teton` — from `atelier-fashion/homebrew-tap`,
+which serves prebuilt per-platform tarballs from GitHub Releases. The formula's
+source of truth is `packaging/homebrew/teton.rb.tmpl` in THIS repo; the release
+workflow renders it with the tag and the artifacts' real sha256s and pushes it.
+The tap is a publish target, never hand-edited. `brew services` runs `tetond`
+under launchd.
+
+**Rationale**: a source-build formula would reimpose the Rust + cmake burden the
+one-command install exists to remove; homebrew-core needs notability the project
+does not yet have. Keeping the template here puts formula changes through this
+repo's PR review. The install stays small because REQ-547's consent flow fetches
+weights on first run rather than bundling them.
+
+**Consequences**: releases are tag-driven and gated — tag/`Cargo.toml` version
+agreement, a per-target smoke that asserts the DECISION 3 seam refusal on the
+shipped binary, install + `brew services` verification before the tap is
+pushed, and a tap-wide concurrency group so two releases cannot race the
+formula backwards. The x86_64-darwin leg is cross-compiled and Rosetta-smoked
+(GitHub retired Intel macOS runners), recorded at that strength rather than as
+native verification. Two hardening items are deliberately deferred and recorded
+in REQ-548: build-provenance attestation, and environment-gated secrets for the
+tap token and the GCP credentials.

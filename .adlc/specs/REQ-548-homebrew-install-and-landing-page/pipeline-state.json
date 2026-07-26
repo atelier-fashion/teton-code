@@ -2,7 +2,7 @@
   "req": "REQ-548",
   "branch": "feat/REQ-548-homebrew-install-and-landing-page",
   "startedAt": "2026-07-25T00:05:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,11 @@
       "phase": 7,
       "name": "CI green on all 6 checks incl. the new release-tooling gate; one transient curl reset fixed at root (retry-all-errors + 75 taxonomy)",
       "completedAt": "2026-07-25T05:10:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "PR #10 squash-merged to main; worktree torn down",
+      "completedAt": "2026-07-26T12:53:09Z"
     }
   ],
   "integrationBranch": "main",
@@ -66,7 +72,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/10",
       "prNumber": 10,
-      "merged": false
+      "merged": true
     }
   },
   "mergeOrder": [
