@@ -22,7 +22,8 @@ teton-code/
 ## Naming
 
 - Rust: standard rustfmt + clippy defaults; crates prefixed `teton-`.
-- Binaries: `tetond` (daemon), `teton` (CLI).
+- Binaries: `teton-code` (daemon — renamed from `tetond` in REQ-549/ADR-007;
+  the crate is still `tetond`), `teton` (CLI).
 - Branches: `feat/REQ-xxx-slug`, `fix/BUG-xxx-slug` (ADLC convention).
 
 ## Testing
