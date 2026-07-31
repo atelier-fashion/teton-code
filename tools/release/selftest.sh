@@ -31,7 +31,7 @@
 #                   go red, so this group builds deliberately bad artifacts and
 #                   requires exactly that.
 #
-# The smoke stand-ins are shell scripts named `teton` and `tetond`, tarred the
+# The smoke stand-ins are shell scripts named `teton` and `teton-code`, tarred the
 # way package.sh tars the real ones. They are not the product and prove nothing
 # about it — they are the KNOWN-BAD and KNOWN-GOOD inputs that let this suite
 # ask smoke.sh a question it can get wrong.
@@ -394,7 +394,7 @@ case "\${1:-}" in
     --version) echo "teton $reported"; exit 0 ;;
     doctor)
         if [ -f "\${XDG_RUNTIME_DIR:-/nonexistent}/teton/handshake" ]; then
-            echo "daemon: running — tetond $reported (protocol 1)"
+            echo "daemon: running — teton-code $reported (protocol 1)"
         else
             echo "daemon: not running (no socket)"
         fi
@@ -406,12 +406,12 @@ EOF
 
     # \`exec sleep\` rather than a wait loop: smoke.sh kills the pid it started,
     # and exec makes that pid the thing that needs killing.
-    cat >"$dir/tetond" <<EOF
+    cat >"$dir/teton-code" <<EOF
 #!/usr/bin/env bash
-# selftest stand-in for the released tetond daemon. Not the product.
-case "\${1:-}" in --version) echo "tetond $reported"; exit 0 ;; esac
+# selftest stand-in for the released teton-code daemon. Not the product.
+case "\${1:-}" in --version) echo "teton-code $reported"; exit 0 ;; esac
 if [ "\${TETON_TEST_SEAMS:-}" = "1" ] && [ "$refuses" = "yes" ]; then
-    echo "tetond: TETON_TEST_SEAMS=1 is set, but this is a release build, which cannot honour them." >&2
+    echo "teton-code: TETON_TEST_SEAMS=1 is set, but this is a release build, which cannot honour them." >&2
     exit 70
 fi
 if [ "$handshakes" = "yes" ]; then
@@ -421,7 +421,7 @@ fi
 exec sleep 600
 EOF
 
-    chmod +x "$dir/teton" "$dir/tetond"
+    chmod +x "$dir/teton" "$dir/teton-code"
     printf 'stand-in licence\n' >"$dir/LICENSE"
     printf 'stand-in readme\n' >"$dir/README.md"
 }
@@ -430,7 +430,7 @@ EOF
 make_tarball() {
     local name="$1" dir="$work/standin-$1"
     make_standins "$dir" "$2" "$3" "$4"
-    tar -czf "$work/teton-v1.2.3-$name.tar.gz" -C "$dir" teton tetond LICENSE README.md
+    tar -czf "$work/teton-v1.2.3-$name.tar.gz" -C "$dir" teton teton-code LICENSE README.md
     printf '%s\n' "$work/teton-v1.2.3-$name.tar.gz"
 }
 
@@ -441,7 +441,7 @@ tb_no_handshake="$(make_tarball no-handshake 1.2.3 yes no)"
 
 # A tarball that is missing a binary entirely — the UNCHECKED path.
 make_standins "$work/standin-truncated" 1.2.3 yes yes
-rm -f "$work/standin-truncated/tetond"
+rm -f "$work/standin-truncated/teton-code"
 tar -czf "$work/teton-v1.2.3-truncated.tar.gz" -C "$work/standin-truncated" teton LICENSE README.md
 
 # Deliberately generous for the good pair: the timing assertion below needs a
@@ -469,7 +469,7 @@ expect_exit 65 "binaries reporting the WRONG version -> 65 FAILED" \
     bash "$SMOKE" "$tb_wrong_version" 1.2.3
 expect_output "  ... and says which assertion failed" "--version does not report 1.2.3"
 
-expect_exit 65 "a tetond that HONOURS TETON_TEST_SEAMS=1 -> 65 FAILED (BR-9)" \
+expect_exit 65 "a teton-code that HONOURS TETON_TEST_SEAMS=1 -> 65 FAILED (BR-9)" \
     bash "$SMOKE" "$tb_seams_honoured" 1.2.3
 # The seams-honoured stub PRINTS the refusal line and then keeps running, so
 # the diagnosis has to name what actually happened — "still running … had to be
@@ -498,7 +498,7 @@ expect_exit 64 "a prerelease version -> 64" bash "$SMOKE" "$tb_good" 1.2.3-rc.1
 expect_exit 64 "a malformed version -> 64" bash "$SMOKE" "$tb_good" "latest"
 expect_exit 64 "too few arguments -> 64" bash "$SMOKE" "$tb_good"
 expect_exit 75 "tarball not found -> 75 UNCHECKED" bash "$SMOKE" "$work/absent.tar.gz" 1.2.3
-expect_exit 75 "a tarball missing tetond -> 75 UNCHECKED" \
+expect_exit 75 "a tarball missing teton-code -> 75 UNCHECKED" \
     bash "$SMOKE" "$work/teton-v1.2.3-truncated.tar.gz" 1.2.3
 
 expect_exit 64 "a nonsense deadline override -> 64" \

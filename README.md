@@ -14,7 +14,7 @@ brew services start teton
 teton
 ```
 
-That is the whole install: two binaries — `teton` (CLI) and `tetond` (the
+That is the whole install: two binaries — `teton` (CLI) and `teton-code` (the
 daemon `brew services` runs under launchd) — with no Rust toolchain, no cmake,
 and no feature flags to get right.
 
@@ -40,7 +40,7 @@ brew services restart teton
 ```
 
 The restart is the load-bearing half. An upgrade replaces the binaries on disk;
-the `tetond` already running is still the old one until something restarts it,
+the `teton-code` already running is still the old one until something restarts it,
 and `teton doctor` names the running daemon's version so you can tell which one
 answered.
 
@@ -55,7 +55,7 @@ answered.
 
 Remote models run the same everywhere; only the local base-camp model depends on
 your hardware. On Linux, Homebrew installs the binaries, but `brew services` is
-not a v1 claim — run `tetond` yourself, or write your own systemd user unit.
+not a v1 claim — run `teton-code` yourself, or write your own systemd user unit.
 
 ## What it is
 

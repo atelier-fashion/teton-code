@@ -482,7 +482,7 @@ impl DaemonOptions {
     }
 }
 
-/// A spawned `tetond` process, killed on drop.
+/// A spawned `teton-code` daemon process, killed on drop.
 pub struct Daemon {
     child: Child,
     socket: PathBuf,
@@ -496,7 +496,7 @@ impl Daemon {
         let log_path = workspace.root.join("tetond.log");
         let log = std::fs::File::create(&log_path).unwrap();
 
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tetond"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_teton-code"));
         cmd.env("XDG_RUNTIME_DIR", &workspace.runtime_dir)
             .env("TETON_CONFIG", &workspace.config_path)
             .env("TETON_REPO_ROOT", &workspace.repo)
@@ -520,7 +520,7 @@ impl Daemon {
             cmd.env(k, v);
         }
 
-        let child = cmd.spawn().expect("spawn tetond");
+        let child = cmd.spawn().expect("spawn teton-code");
         let mut daemon = Self {
             child,
             socket,

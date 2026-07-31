@@ -23,6 +23,7 @@ use teton_protocol::methods::{
 };
 use teton_protocol::{Phase, PrivacyMode, ProviderId, ProviderKind, SessionMode};
 
+mod banner;
 mod client;
 mod cost_ui;
 mod firstrun;
@@ -34,7 +35,7 @@ mod session_ui;
 
 use client::{Connection, UiContext};
 use keychain::Keychain;
-use prompt::{Prompter, StdinPrompter};
+use prompt::{FramedStdinPrompter, Prompter, StdinPrompter};
 use render::{stdout_surface, LineKind, Surface};
 use session_ui::SessionState;
 use teton_protocol::socket_path::{self, DaemonPaths};
@@ -282,6 +283,20 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
+
+    // The banner is for humans at a terminal. Piped stdout (the e2e suites,
+    // shell composition) sees the same byte stream it always did.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let color = interactive && banner::color_enabled();
+    if interactive {
+        banner::print(
+            &mut surface,
+            env!("CARGO_PKG_VERSION"),
+            banner::cwd_display().as_deref(),
+            color,
+        );
+    }
+
     let mut conn = client::ensure_connected(paths, &mut surface)?;
 
     {
@@ -320,8 +335,24 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool) -> anyhow::Result<()> {
             LineKind::Info,
             &format!("session {session_id} ready (freeform). Type a prompt; Ctrl-D to end."),
         );
+        if interactive {
+            // A blank line so the entry area sits clear of the status text.
+            ctx.surface.line(LineKind::Info, "");
+        }
 
-        while let Some(input) = ctx.prompter.ask("› ") {
+        // The entry area gets its own framed prompter; permission and model
+        // questions keep the plain one in `ctx` — they are dialogue, not entry.
+        let entry_prompt = if interactive {
+            if color {
+                " \x1b[36m›\x1b[0m "
+            } else {
+                " › "
+            }
+        } else {
+            "› "
+        };
+        let mut entry = FramedStdinPrompter::new(interactive, color);
+        while let Some(input) = entry.ask(entry_prompt) {
             let text = input.trim();
             if text.is_empty() {
                 continue;
@@ -613,7 +644,7 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
         },
         Err(_) => surface.line(
             LineKind::Notice,
-            "daemon: not running (run `teton` to autostart it, or start `tetond`).",
+            "daemon: not running (run `teton` to autostart it, or start `teton-code`).",
         ),
     }
 

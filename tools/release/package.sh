@@ -96,7 +96,7 @@ bin_dir="${CARGO_TARGET_DIR:-$repo_root/target}/$target/release"
 stage="$(mktemp -d "${TMPDIR:-/tmp}/teton-package.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT
 
-for bin in teton tetond; do
+for bin in teton teton-code; do
     if [ ! -x "$bin_dir/$bin" ]; then
         echo "package: cargo reported success but $bin_dir/$bin is missing or not executable." >&2
         exit "$EXIT_INTERNAL"
@@ -114,10 +114,10 @@ tarball="$outdir/teton-v$version-$target.tar.gz"
 
 # Members are listed explicitly rather than archiving `.`: it fixes the entry
 # order and keeps the `./` prefix (and any stray dotfile) out of the archive, so
-# the tarball is flat — `teton`, `tetond`, `LICENSE`, `README.md` at the root.
+# the tarball is flat — `teton`, `teton-code`, `LICENSE`, `README.md` at the root.
 # COPYFILE_DISABLE stops macOS's bsdtar from smuggling `._*` AppleDouble xattr
 # members in beside them; it is meaningless, and harmless, on Linux.
-COPYFILE_DISABLE=1 tar -czf "$tarball" -C "$stage" teton tetond LICENSE README.md
+COPYFILE_DISABLE=1 tar -czf "$tarball" -C "$stage" teton teton-code LICENSE README.md
 
 # A per-leg sidecar, for this job's log and for anyone re-checking one artifact
 # by hand. It is NOT what ends up in the release: `checksums.txt` is recomputed
