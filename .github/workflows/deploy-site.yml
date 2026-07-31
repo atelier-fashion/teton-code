@@ -80,6 +80,9 @@ jobs:
   deploy:
     name: render · deploy (tetoncode.ai)
     runs-on: ubuntu-24.04
+    # REQ-550 BR-4: WIF token exchange + GCP config resolve only under the
+    # site-deploy environment (rules: tags v*.*.* + main)
+    environment: site-deploy
     permissions:
       contents: read
       # Workload identity federation mints a short-lived GCP credential from

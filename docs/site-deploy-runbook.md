@@ -460,3 +460,89 @@ purpose: `vars.GCP_SITE_BUCKET` may be a prefix in a bucket shared with the rest
 of the Atelier site, and no landing-page deploy should be able to remove objects
 it did not create. Remove stale objects by hand if the page's asset set ever
 shrinks.
+
+---
+
+## 9. Which refs may deploy (REQ-550 BR-4)
+
+Two gates, on two sides of the token exchange. Both are needed, and only one of
+them lives in this repository.
+
+### The GitHub side — done
+
+The `deploy` job declares `environment: site-deploy`. GitHub will not hand that
+job an OIDC token, or resolve any secret or variable scoped to the environment,
+unless the run's ref satisfies the environment's deployment rules:
+
+| Rule | Value |
+|------|-------|
+| Protected tags | `v*.*.*` |
+| Deployment branch | `main` |
+
+The environment and those rules were created on **2026-07-31**. Nothing in this
+repository creates them — the workflow only *declares* the name, and a run on a
+ref the rules reject fails to start the job rather than deploying from it.
+
+Both real entry points already satisfy the rules, which is why this is a gate
+and not a change in behaviour:
+
+- A release-driven run. `release.yml`'s `dispatch-site-deploy` job runs
+  `gh workflow run deploy-site.yml --ref "$TAG"`, so the run's ref is
+  `refs/tags/vX.Y.Z` — matched by the tag rule.
+- A hand-run from Actions → Deploy site → Run workflow, which defaults to
+  `main` — matched by the branch rule.
+
+A run dispatched from a topic branch is the case this closes. It used to be able
+to mint a GCP credential and publish to tetoncode.ai; now it cannot reach the
+auth step at all.
+
+### The GCP side — REQUIRED-HUMAN
+
+The environment rules stop GitHub from *issuing* the token. They do not stop
+Google from *accepting* one. The workload identity pool provider decides that,
+and its attribute condition today (section 3) constrains only the repository:
+
+```
+assertion.repository == 'atelier-fashion/teton-code'
+```
+
+Any ref of this repository — any branch, any fork-free push that can start a
+workflow — still satisfies it. Closing that means adding `assertion.ref` to the
+condition, and it is a `gcloud`/console action against the Atelier GCP org that
+no workflow in this repository can perform.
+
+- [ ] **Restrict the WIF provider to release refs.** Copy-paste template —
+      substitute `PROJECT_ID`, and the pool/provider names if section 3's
+      defaults (`github`/`github`) were not used:
+
+```sh
+PROJECT_ID=…            # secrets.GCP_PROJECT
+POOL=github             # --workload-identity-pool from section 3
+PROVIDER=github         # the provider created by `providers create-oidc`
+
+gcloud iam workload-identity-pools providers update-oidc "$PROVIDER" \
+  --project="$PROJECT_ID" --location=global \
+  --workload-identity-pool="$POOL" \
+  --attribute-condition="assertion.repository == 'atelier-fashion/teton-code' && (assertion.ref == 'refs/heads/main' || assertion.ref.startsWith('refs/tags/v'))"
+```
+
+`--attribute-condition` **replaces** the whole condition rather than appending
+to it, so the repository clause is restated above on purpose. Dropping it while
+adding the ref clause would let every repository on GitHub mint tokens from
+`main` — a strictly worse position than before the change.
+
+Verify the condition that is actually live, not the one you meant to set:
+
+```sh
+gcloud iam workload-identity-pools providers describe "$PROVIDER" \
+  --project="$PROJECT_ID" --location=global \
+  --workload-identity-pool="$POOL" \
+  --format='value(attributeCondition)'
+```
+
+Then dispatch Deploy site once at a release tag and confirm it still reaches the
+`Deploy result` step green. If the auth step fails after this change, the
+condition is wrong — read it back with the command above before touching
+anything in this repository. A rejected token fails at
+`google-github-actions/auth`, which is identity, not the missing-role
+authorization failure described in section 8.
