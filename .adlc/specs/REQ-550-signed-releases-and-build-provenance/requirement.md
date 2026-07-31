@@ -1,7 +1,7 @@
 ---
 id: REQ-550
 title: "Stable code-signing identity and build provenance for released binaries"
-status: draft
+status: approved
 deployable: true
 created: 2026-07-31
 updated: 2026-07-31
