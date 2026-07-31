@@ -1,7 +1,7 @@
 ---
 id: TASK-021
 title: "Signature and attestation gate scripts with seam-testable exit taxonomy"
-status: draft
+status: complete
 parent: REQ-550
 created: 2026-07-31
 updated: 2026-07-31

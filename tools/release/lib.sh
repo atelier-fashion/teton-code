@@ -89,3 +89,38 @@ sha256_of() {
     esac
     return 1
 }
+
+# Print the external tool a gate script should run — the override if one is set,
+# otherwise the default name, resolved on PATH:
+#
+#     codesign="$(tool_or_unchecked "${TETON_CODESIGN:-}" codesign)" || exit "$EXIT_UNCHECKED"
+#
+# Returns 1 when neither resolves to something runnable, for the same reason
+# `sha256_of` returns rather than aborting: the CALLER owns its exit taxonomy.
+# Both gates spell that outcome 75 UNCHECKED today, but a helper that exited on
+# their behalf would be a second place where the taxonomy lives — and the one
+# thing that must never happen is a gate exiting with a code it did not choose
+# (LESSON-442). It also never falls through to running the default name and
+# hoping: a command that is not there fails with 127, which is neither a
+# rejection nor a verdict.
+#
+# The override argument is how selftest.sh drives the gates on the Linux
+# `tooling` job, where `codesign` does not exist and `gh` has no token
+# (ADR-550-4). It can only change WHICH tool is asked — the caller still
+# classifies whatever answer comes back — so no value of `TETON_CODESIGN` or
+# `TETON_GH` can turn a rejection into a pass.
+tool_or_unchecked() {
+    local tool="${1:-}"
+    if [ -z "$tool" ]; then
+        tool="${2:-}"
+    fi
+    if [ -z "$tool" ]; then
+        return 1
+    fi
+
+    # `command -v`, not `[ -x ]`: the default is a bare name to be found on
+    # PATH, while an override is usually a path to a stand-in. This resolves
+    # both shapes, and rejects a path that exists but cannot be executed. `--`
+    # keeps a tool name that begins with `-` from being read as an option.
+    command -v -- "$tool" 2>/dev/null || return 1
+}
