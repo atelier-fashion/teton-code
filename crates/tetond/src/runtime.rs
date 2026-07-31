@@ -674,6 +674,87 @@ impl DaemonRuntime {
     /// Two independent conditions: the tier must be *capable* (`local_available`,
     /// BR-8's latency duty) and it must be *consented to* (REQ-547 BR-1). A
     /// machine awaiting an answer routes remote-only rather than blocking — the
+    /// Why no tier could serve a turn, said so the user can act on it
+    /// (BUG-146).
+    ///
+    /// Reached only from the [`HarnessError::NoTierAvailable`] arm — the route
+    /// named a provider this daemon does not have and the local slot was empty.
+    /// "Nothing could serve it" is one condition with five very different
+    /// causes, and the daemon can tell them apart: it published exactly this
+    /// classification on the lifecycle stream at startup. The precedence below
+    /// is [`startup_lifecycle`]'s, deliberately — a turn failure and the
+    /// lifecycle replay describing the same machine at the same moment must
+    /// not tell the user two different stories.
+    ///
+    /// Every branch names the model but never a path (BR-11): the two reason
+    /// builders it borrows, [`loading_local_engine_reason`] and
+    /// [`no_local_engine_reason`], are the same ones the lifecycle stream
+    /// already publishes.
+    fn unserved_turn_reason(&self, config: &Config) -> String {
+        let has_remote = config.providers.iter().any(|p| p.kind.is_remote());
+        // The one clause that is the same in every branch: with a remote
+        // provider registered, the turn would have had somewhere to go.
+        let add_provider = if has_remote {
+            // A remote provider IS configured, so the route resolving to a
+            // missing one is a routing/config mismatch rather than an empty
+            // machine — say that instead of telling them to add what they have.
+            " A remote provider is configured but this turn did not route to it; \
+             check `teton policy show` and the provider id in `teton provider list`."
+        } else {
+            " No remote provider is configured either — `teton provider add` \
+             registers one to serve turns while the local tier is unavailable."
+        };
+
+        // A machine below the hardware floor has no local tier to wait for.
+        if let Some(probe) = &self.probe {
+            if probe.disabled {
+                let reason = probe
+                    .disabled_reason
+                    .clone()
+                    .unwrap_or_else(|| "the local tier is unavailable on this machine".to_owned());
+                return format!("{reason}{add_provider}");
+            }
+        }
+
+        let selection = self.consent.current_selection();
+        let model_id = selection
+            .as_ref()
+            .and_then(|s| s.model_name.clone())
+            .or_else(|| self.probe.as_ref().and_then(|p| p.model.clone()))
+            .unwrap_or_else(|| "the local model".to_owned());
+
+        // BR-4: a settled, deliberate absence — not something to wait for.
+        if selection.as_ref().is_some_and(|s| s.declined_local) {
+            return format!(
+                "the local tier was declined, so it will not serve turns; \
+                 `teton model set <name>` changes that.{add_provider}"
+            );
+        }
+
+        // BR-1: proposed and unanswered. The session runs, the tier does not.
+        if self.consent.consent_required() {
+            return format!(
+                "{model_id} is proposed for this machine but has not been \
+                 answered yet, so the local tier is withheld — answer the \
+                 prompt (or `teton model list`) to open it.{add_provider}"
+            );
+        }
+
+        // Decided and installed. Either the load is in flight — the window this
+        // bug was reported from — or it already failed and left its reason.
+        if self.weights_loader_present {
+            return match self.engine.load_failure() {
+                Some(reason) => format!("{reason}{add_provider}"),
+                None => format!(
+                    "{}  Retry in a moment.{add_provider}",
+                    loading_local_engine_reason(&model_id)
+                ),
+            };
+        }
+
+        format!("{}{add_provider}", no_local_engine_reason(&model_id))
+    }
+
     /// gate withholds the tier, never the session (D-3).
     #[must_use]
     pub fn local_tier_available(&self) -> bool {
@@ -1200,10 +1281,23 @@ impl DaemonRuntime {
                         "remote turn failed after exhausting fallbacks",
                     ));
                 }
-                Err(HarnessError::Engine(_)) => {
+                // BUG-146: name what actually failed. The reason is the
+                // engine's own sentence, which on this path is always a static
+                // literal or an already-scrubbed backend message — never a
+                // path or prompt text (BR-11).
+                Err(HarnessError::Engine(e)) => {
                     return Err(RpcError::new(
                         error_code::INTERNAL_ERROR,
-                        "local engine could not serve the turn",
+                        format!("the local engine could not serve the turn: {e}"),
+                    ));
+                }
+                // BUG-146: nothing could serve the turn. The daemon knows
+                // exactly why — it published the same fact on the lifecycle
+                // stream moments earlier — so it says so, with the action.
+                Err(HarnessError::NoTierAvailable) => {
+                    return Err(RpcError::new(
+                        error_code::UNKNOWN_PROVIDER,
+                        self.unserved_turn_reason(&config),
                     ));
                 }
                 // REQ-544 M-3: a credential that will not resolve is a config
@@ -1282,9 +1376,10 @@ impl DaemonRuntime {
 
         if is_local {
             let Some(engine) = local_engine.as_ref() else {
-                return Err(HarnessError::Engine(EngineError::unavailable(
-                    "no local tier configured",
-                )));
+                // The route named a Local-kind provider but the slot is empty —
+                // the tier is loading, failed, or was never opened. Not an
+                // engine failure (BUG-146); the caller classifies from state.
+                return Err(HarnessError::NoTierAvailable);
             };
             let mut source = LocalEngineSource::new(Arc::clone(engine));
             return run_session_turn_with_source(
@@ -1302,9 +1397,11 @@ impl DaemonRuntime {
         }
 
         // Remote: build the adapter + egress choke point, then drive it.
-        let provider_cfg = provider_cfg.ok_or_else(|| {
-            HarnessError::Engine(EngineError::unavailable("no provider for this turn"))
-        })?;
+        // The route named a provider this daemon does not have. On a fresh
+        // install that is the literal "local" fallback `build_router` invents
+        // when no providers are registered — so this is "nothing is configured
+        // and the tier is not live", never an engine fault (BUG-146).
+        let provider_cfg = provider_cfg.ok_or(HarnessError::NoTierAvailable)?;
         let model = route
             .model
             .clone()
@@ -2241,8 +2338,9 @@ fn fake_engine_loader(
 /// at roughly 2.5–4 BPE tokens per whitespace word. A window equal to the
 /// budget's number therefore overflows on exactly the inputs the tier exists
 /// for — a folded `read` of a real file killed the first dogfooded turn with
-/// "local engine could not serve the turn" — so the window is the budget's
-/// worst-case BPE expansion (~4×) plus generation headroom.
+/// an opaque "local engine could not serve the turn" (that failure now carries
+/// the engine's own over-window sentence, BUG-146) — so the window is the
+/// budget's worst-case BPE expansion (~4×) plus generation headroom.
 ///
 /// The harness now also bounds its side in this window's currency: the
 /// assembled context and the summarizer's input are capped in **bytes**
@@ -2949,6 +3047,165 @@ mod tests {
             local_tier_gated(false, true),
             "a real engine must not un-gate the tier before the user has decided"
         );
+    }
+
+    /// BUG-146: "nothing could serve this turn" has five very different
+    /// causes, and the message must name the one that actually applies —
+    /// the reported bug was a loading tier being blamed as a broken engine.
+    ///
+    /// Each case asserts the distinguishing phrase AND refutes the phrase of
+    /// the state it is most easily confused with, so collapsing two branches
+    /// back into one sentence fails here rather than in a user's terminal.
+    #[test]
+    fn unserved_turn_reason_names_the_state_that_actually_applies() {
+        use crate::model_consent::WeightsInstaller;
+        use teton_core::entities::{ModelSelection, SelectionSource};
+        use teton_inference::catalog::ModelEntry;
+        use teton_protocol::methods::InstallStatus;
+
+        /// An installer that reports the weights already verified on disk —
+        /// the state a machine is in once the download has completed, which is
+        /// what makes `consent_required()` false and lets the classifier reach
+        /// its load-state branches at all.
+        struct VerifiedInstaller;
+        impl WeightsInstaller for VerifiedInstaller {
+            fn install(
+                &self,
+                _entry: &ModelEntry,
+            ) -> Result<(), crate::model_consent::InstallError> {
+                Ok(())
+            }
+            fn status(&self, _entry: &ModelEntry) -> InstallStatus {
+                InstallStatus::Verified
+            }
+        }
+
+        // A machine that has DECIDED: a selection is recorded for a real
+        // catalog entry and its bytes are verified. `DaemonRuntime::minimal`
+        // alone is an *undecided* machine, whose honest answer is "answer the
+        // proposal" — a different branch, asserted separately below.
+        let decided_runtime = |model: &str| {
+            let catalog = Catalog::bundled();
+            let store = Arc::new(SelectionStore::in_memory());
+            store
+                .record(&ModelSelection::accepted(model, SelectionSource::Probe, 1))
+                .expect("in-memory record");
+            let gate = ModelConsentGate::new(
+                HardwareProfile {
+                    ram_bytes: 48 * GIB,
+                    free_disk_bytes: 500 * GIB,
+                    gpu: GpuClass::AppleSilicon,
+                },
+                catalog,
+                LocalModelConfig::default(),
+                Arc::new(EventBus::new()),
+                Arc::new(PendingModelDecisions::new()),
+                store,
+                Arc::new(VerifiedInstaller),
+            );
+            DaemonRuntime {
+                consent: Arc::new(gate),
+                ..DaemonRuntime::minimal()
+            }
+        };
+
+        let empty_config = Config::default();
+        // A real bundled-catalog entry: `consent_required()` re-checks the
+        // recorded name against the catalog, so a made-up id would land in the
+        // re-propose branch instead.
+        let model = Catalog::bundled()
+            .models
+            .first()
+            .expect("the bundled catalog is non-empty")
+            .name
+            .clone();
+
+        // 1. The reported bug: decided, installed, loader present, load in
+        //    flight. Must say "loading" and must NOT blame the engine.
+        let mut loading = decided_runtime(&model);
+        loading.weights_loader_present = true;
+        loading.probe = Some(ProbeResult {
+            model: Some(model.clone()),
+            probed_model: Some(model.clone()),
+            disabled: false,
+            disabled_reason: None,
+            ram_bytes: 48 * GIB,
+            above_floor: true,
+            forced_bench: None,
+        });
+        let msg = loading.unserved_turn_reason(&empty_config);
+        assert!(
+            msg.contains("loading and benchmarking"),
+            "a loading tier must say so; got: {msg}"
+        );
+        assert!(
+            msg.contains("Retry in a moment"),
+            "a loading tier is the one state where waiting is the action; got: {msg}"
+        );
+        assert!(
+            !msg.contains("could not be loaded") && !msg.contains("no local inference engine"),
+            "a tier that is still loading must not be reported as failed or absent; got: {msg}"
+        );
+
+        // 2. Same machine, but the load already failed: its recorded reason
+        //    wins over the loading sentence.
+        loading
+            .engine
+            .record_load_failure(format!("{model}'s weights could not be loaded"));
+        let failed = loading.unserved_turn_reason(&empty_config);
+        assert!(
+            failed.contains("could not be loaded"),
+            "a failed load must surface its own reason; got: {failed}"
+        );
+        assert!(
+            !failed.contains("Retry in a moment"),
+            "a terminal load failure must not tell the user to wait; got: {failed}"
+        );
+
+        // 3. Below the hardware floor: nothing to wait for at all.
+        let mut below = DaemonRuntime::minimal();
+        below.probe = Some(ProbeResult {
+            model: None,
+            probed_model: None,
+            disabled: true,
+            disabled_reason: Some("4.0 GiB RAM is below the local-tier floor".to_owned()),
+            ram_bytes: 4 * GIB,
+            above_floor: false,
+            forced_bench: None,
+        });
+        let msg = below.unserved_turn_reason(&empty_config);
+        assert!(
+            msg.contains("below the local-tier floor"),
+            "the probe's own sentence must survive; got: {msg}"
+        );
+        assert!(
+            !msg.contains("loading"),
+            "a disabled tier is never 'loading'; got: {msg}"
+        );
+
+        // 4. Every branch tells a provider-less machine how to get unstuck.
+        for msg in [
+            loading.unserved_turn_reason(&empty_config),
+            below.unserved_turn_reason(&empty_config),
+        ] {
+            assert!(
+                msg.contains("teton provider add"),
+                "with no remote provider, the message must name the way out; got: {msg}"
+            );
+        }
+
+        // 5. BR-11: no branch may leak a filesystem path.
+        let selection = ModelSelection::accepted("m", SelectionSource::Probe, 1);
+        assert!(!selection.model_name.unwrap_or_default().contains('/'));
+        for msg in [
+            loading.unserved_turn_reason(&empty_config),
+            below.unserved_turn_reason(&empty_config),
+        ] {
+            assert!(
+                !msg.contains('/') || msg.contains("teton provider add"),
+                "no path may ride the turn's failure message; got: {msg}"
+            );
+        }
     }
 
     /// A `Ready` outcome opens the tier on the slot's *fact*, not the loader's

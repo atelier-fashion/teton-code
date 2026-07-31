@@ -79,6 +79,20 @@ pub enum HarnessError {
     /// rather than retrying the same broken credential.
     #[error("credential resolution failed: {0}")]
     Credential(String),
+    /// **No tier could serve the turn at all** — the route named a provider this
+    /// daemon does not have, and the local tier was not live to fall back to.
+    ///
+    /// Deliberately NOT [`Engine`](Self::Engine) (BUG-146). This is a
+    /// configuration-and-timing condition — no remote provider is registered,
+    /// and/or the local tier has not opened yet — and classifying it as an
+    /// engine failure is what made the daemon report "local engine could not
+    /// serve the turn" for a local engine that was loading correctly and about
+    /// to become available. The variant carries no message: the *actionable*
+    /// reason depends on daemon state the turn loop cannot see (is the tier
+    /// loading, declined, failed, or awaiting consent?), so the caller
+    /// classifies it from that state rather than the loop guessing here.
+    #[error("no tier could serve this turn")]
+    NoTierAvailable,
 }
 
 impl HarnessError {

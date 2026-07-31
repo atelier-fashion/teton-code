@@ -681,6 +681,25 @@ fn ac2_with_a_loader_accept_benchmarks_reaches_ready_and_serves_a_local_turn() {
         "before consent the local tier must be withheld, so this remote-less \
          daemon must refuse the turn: {starved}"
     );
+    // BUG-146: refusing is not enough — the refusal has to say WHICH of the
+    // several "no tier" states this machine is in, or the user cannot act on
+    // it. Here the tier is withheld awaiting a decision; the message must
+    // name that and must NOT blame the local engine, which has done nothing
+    // wrong (the shipped v0.1.0 said "local engine could not serve the turn"
+    // for exactly this state).
+    let starved_msg = starved["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        starved_msg.contains("has not been answered yet"),
+        "the refusal must name the outstanding decision as the cause; got: {starved_msg}"
+    );
+    assert!(
+        starved_msg.contains("teton provider add"),
+        "a provider-less machine must be told how to serve turns meanwhile; got: {starved_msg}"
+    );
+    assert!(
+        !starved_msg.contains("local engine could not serve"),
+        "a withheld tier must not be reported as a broken engine; got: {starved_msg}"
+    );
 
     let id = client.await_pending_proposal(PROPOSAL_WINDOW);
     client.confirm_model(&id, json!({ "outcome": "accept" }));
