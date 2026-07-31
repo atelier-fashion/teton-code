@@ -1539,7 +1539,7 @@ fn test_seams_enabled() -> bool {
         SeamPolicy::Honour => true,
         SeamPolicy::Ignore => false,
         SeamPolicy::Refuse => panic!(
-            "tetond: TETON_TEST_SEAMS=1 is set, but this is a release build, which cannot \
+            "teton-code: TETON_TEST_SEAMS=1 is set, but this is a release build, which cannot \
              honour the test seams (TETON_CATALOG, TETON_DISK_FREE_BYTES, \
              TETON_DOWNLOAD_RETRY_BASE_MS, TETON_PROBE_*, TETON_FAKE_ENGINE_LOADER). Refusing \
              to start rather than run as a production daemon while the environment believes \

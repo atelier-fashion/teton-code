@@ -1,7 +1,7 @@
 //! End-to-end smoke tests that spawn the **real** `teton` CLI binary
-//! (`CARGO_BIN_EXE_teton`) against a live `tetond`.
+//! (`CARGO_BIN_EXE_teton`) against a live `teton-code`.
 //!
-//! This is the client-surface layer the daemon-side acceptance matrix (`tetond`'s
+//! This is the client-surface layer the daemon-side acceptance matrix (the `daemon` crate's
 //! `tests/e2e`) never exercised: it drove the daemon over the socket directly and
 //! never ran the actual `teton` binary, so a regression in the CLI's own wiring —
 //! for instance the CLI failing to call the daemon's authoritative `cost/query`
@@ -24,13 +24,13 @@ fn teton_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_teton"))
 }
 
-/// Path to the sibling `tetond` daemon binary (built alongside `teton` into the
+/// Path to the sibling `teton-code` daemon binary (built alongside `teton` into the
 /// same target directory under `--workspace`).
-fn tetond_bin() -> PathBuf {
+fn daemon_bin() -> PathBuf {
     teton_bin()
         .parent()
         .expect("teton binary has a parent dir")
-        .join("tetond")
+        .join("teton-code")
 }
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ fn teton_version_flag_prints_the_version() {
 // `teton doctor` / `teton cost` against a live daemon
 // ---------------------------------------------------------------------------
 
-/// A short-lived `tetond`, spawned into an isolated `XDG_RUNTIME_DIR`, killed on
+/// A short-lived `daemon`, spawned into an isolated `XDG_RUNTIME_DIR`, killed on
 /// drop. The short `/tmp` base keeps the Unix socket path under `SUN_LEN`.
 struct TestDaemon {
     child: Child,
@@ -70,7 +70,7 @@ struct TestDaemon {
 }
 
 impl TestDaemon {
-    fn spawn(tetond: &Path) -> Self {
+    fn spawn(daemon: &Path) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let root =
@@ -86,7 +86,7 @@ impl TestDaemon {
         // reach huggingface.co, and an accepted proposal fails its *download*
         // fast while still recording the decision — which is the half of the
         // consent round-trip these CLI tests are about. Whether the bytes then
-        // arrive is `tetond`'s `consent_matrix`, against a mock host.
+        // arrive is `daemon`'s `consent_matrix`, against a mock host.
         let config_path = root.join("config.toml");
         std::fs::write(
             &config_path,
@@ -100,7 +100,7 @@ impl TestDaemon {
         .unwrap();
 
         let log = std::fs::File::create(root.join("tetond.log")).unwrap();
-        let mut command = Command::new(tetond);
+        let mut command = Command::new(daemon);
         command
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("TETON_CONFIG", &config_path)
@@ -124,7 +124,7 @@ impl TestDaemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
-        let child = command.spawn().expect("spawn tetond");
+        let child = command.spawn().expect("spawn teton-code");
 
         let socket = runtime_dir.join("teton").join("tetond.sock");
         let daemon = Self {
@@ -147,7 +147,7 @@ impl TestDaemon {
         }
         let log = std::fs::read_to_string(self.root.join("tetond.log")).unwrap_or_default();
         panic!(
-            "tetond socket never appeared at {}. log:\n{log}",
+            "daemon socket never appeared at {}. log:\n{log}",
             self.socket.display()
         );
     }
@@ -206,16 +206,16 @@ impl Drop for TestDaemon {
 
 #[test]
 fn teton_doctor_and_cost_report_against_a_live_daemon() {
-    let tetond = tetond_bin();
-    if !tetond.exists() {
+    let daemon = daemon_bin();
+    if !daemon.exists() {
         // `cargo test -p teton` alone does not build the sibling daemon; the
         // workspace test run does. Skip cleanly rather than fail in that case.
         let _ = std::io::stderr()
-            .write_all(b"skipping CLI e2e: tetond binary not built (run under --workspace)\n");
+            .write_all(b"skipping CLI e2e: teton-code binary not built (run under --workspace)\n");
         return;
     }
 
-    let daemon = TestDaemon::spawn(&tetond);
+    let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
     // `teton doctor`: reaches the running daemon and reports it plus the
@@ -255,7 +255,7 @@ fn teton_doctor_and_cost_report_against_a_live_daemon() {
 // (REQ-547 AC-1 / AC-3 / AC-5)
 // ---------------------------------------------------------------------------
 //
-// `tetond`'s `consent_matrix` drives the daemon over the socket directly. What
+// `daemon`'s `consent_matrix` drives the daemon over the socket directly. What
 // it cannot show is that the *shipped CLI* renders the machine's reasoning,
 // reads a human's answer from a terminal, and puts a well-formed `model/confirm`
 // on the wire. That is this file's job, and TASK-007 deferred it here on purpose.
@@ -265,22 +265,22 @@ fn teton_doctor_and_cost_report_against_a_live_daemon() {
 
 /// Skip cleanly when the sibling daemon has not been built (a bare
 /// `cargo test -p teton` does not build it; the workspace run does).
-fn tetond_or_skip() -> Option<PathBuf> {
-    let tetond = tetond_bin();
-    if tetond.exists() {
-        return Some(tetond);
+fn daemon_or_skip() -> Option<PathBuf> {
+    let daemon = daemon_bin();
+    if daemon.exists() {
+        return Some(daemon);
     }
     let _ = std::io::stderr()
-        .write_all(b"skipping CLI consent e2e: tetond binary not built (run under --workspace)\n");
+        .write_all(b"skipping CLI consent e2e: teton-code binary not built (run under --workspace)\n");
     None
 }
 
 #[test]
 fn teton_renders_the_first_run_proposal_and_accepts_it_interactively() {
-    let Some(tetond) = tetond_or_skip() else {
+    let Some(daemon) = daemon_or_skip() else {
         return;
     };
-    let daemon = TestDaemon::spawn(&tetond);
+    let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
     // `y` accepts the model the CLI just named; the closed stdin that follows
@@ -372,10 +372,10 @@ fn teton_renders_the_first_run_proposal_and_accepts_it_interactively() {
 
 #[test]
 fn teton_yes_answers_the_first_run_proposal_with_no_input() {
-    let Some(tetond) = tetond_or_skip() else {
+    let Some(daemon) = daemon_or_skip() else {
         return;
     };
-    let daemon = TestDaemon::spawn(&tetond);
+    let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
     // AC-5: no input at all — stdin is empty and closed immediately.
@@ -398,10 +398,10 @@ fn teton_yes_answers_the_first_run_proposal_with_no_input() {
 
 #[test]
 fn teton_model_list_renders_the_catalog_and_each_entry_fit() {
-    let Some(tetond) = tetond_or_skip() else {
+    let Some(daemon) = daemon_or_skip() else {
         return;
     };
-    let daemon = TestDaemon::spawn(&tetond);
+    let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
     // AC-9, cross-process: the catalog, the machine, and each entry's verdict.
@@ -467,14 +467,14 @@ fn teton_model_list_renders_the_catalog_and_each_entry_fit() {
 /// hard-deprecated it: a daemon that will not start and a CLI that cannot say
 /// why.
 ///
-/// This test uses that exact key, and never spawns `tetond` itself — the CLI's
+/// This test uses that exact key, and never spawns `daemon` itself — the CLI's
 /// own autostart path is the thing under test.
 #[test]
 fn a_refused_config_is_reported_by_the_cli_that_autostarted_the_daemon() {
-    let tetond = tetond_bin();
-    if !tetond.exists() {
+    let daemon = daemon_bin();
+    if !daemon.exists() {
         let _ = std::io::stderr()
-            .write_all(b"skipping CLI e2e: tetond binary not built (run under --workspace)\n");
+            .write_all(b"skipping CLI e2e: teton-code binary not built (run under --workspace)\n");
         return;
     }
 

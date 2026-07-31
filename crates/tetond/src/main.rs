@@ -1,4 +1,4 @@
-//! tetond — the Teton Code daemon binary.
+//! `teton-code` — the Teton Code daemon binary (crate `tetond`).
 //!
 //! Startup wiring only: resolve the socket/lock paths, take the single-instance
 //! lock, bind the socket, and run the JSON-RPC server (see the `tetond` library
@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<ExitCode> {
     let version = env!("CARGO_PKG_VERSION");
 
     if wants_version() {
-        println!("tetond {version}");
+        println!("teton-code {version}");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<ExitCode> {
         Some(instance) => instance,
         None => {
             eprintln!(
-                "tetond: already running (lock held at {})",
+                "teton-code: already running (lock held at {})",
                 paths.lock.display()
             );
             return Ok(ExitCode::SUCCESS);
@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<ExitCode> {
     // Reference every library crate so the dependency edges stay real (the
     // daemon must fail to compile if a layer is missing).
     eprintln!(
-        "tetond {version} — core {}, protocol {}, providers {}, inference {}",
+        "teton-code {version} — core {}, protocol {}, providers {}, inference {}",
         teton_core::version(),
         teton_protocol::version(),
         teton_providers::version(),

@@ -160,7 +160,7 @@ mod tests {
         round_trip(&params(1, 1));
         round_trip(&HandshakeResult {
             protocol_version: ProtocolVersion(1),
-            daemon_name: "tetond".to_owned(),
+            daemon_name: "teton-code".to_owned(),
             daemon_version: "0.1.0".to_owned(),
             capabilities: vec!["structured_mode".to_owned(), "local_tier".to_owned()],
         });

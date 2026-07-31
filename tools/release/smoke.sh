@@ -12,12 +12,12 @@
 # tree, not `cargo run` — because the thing being released is the tarball:
 #
 #   1. `teton --version` reports the released version.
-#   2. `tetond --version` reports the released version.
-#   3. `TETON_TEST_SEAMS=1 ./tetond` REFUSES to start (BR-9): non-zero exit AND
+#   2. `teton-code --version` reports the released version.
+#   3. `TETON_TEST_SEAMS=1 ./teton-code` REFUSES to start (BR-9): non-zero exit AND
 #      the refusal text. A release build must never honour the acceptance
 #      suite's injection seams, and it must say so rather than starting
 #      silently.
-#   4. A backgrounded `tetond` and a real `teton doctor` complete a handshake:
+#   4. A backgrounded `teton-code` and a real `teton doctor` complete a handshake:
 #      doctor's OUTPUT names the running daemon and its version.
 #
 # Two shapes of assertion deserve their reasons recorded, because both are easy
@@ -25,7 +25,7 @@
 #
 #   * The version checks grep for the bare version string. The two binaries
 #     print different shapes — clap's `teton X.Y.Z` versus the daemon's
-#     hand-rolled `tetond X.Y.Z` — and pinning either exact line here would make
+#     hand-rolled `teton-code X.Y.Z` — and pinning either exact line here would make
 #     this gate a test of the formatting rather than of the version.
 #   * The handshake asserts on doctor's TEXT, never its exit code. `teton
 #     doctor` deliberately exits 0 when the daemon is unreachable — it is a
@@ -136,7 +136,7 @@ if ! tar -xzf "$tarball" -C "$extract"; then
     exit "$EXIT_UNCHECKED"
 fi
 
-for bin in teton tetond; do
+for bin in teton teton-code; do
     if [ ! -x "$extract/$bin" ]; then
         echo "smoke: $bin is missing from the tarball (or is not executable) — nothing was exercised." >&2
         exit "$EXIT_UNCHECKED"
@@ -146,11 +146,11 @@ done
 # Architecture evidence in the log. On the cross-compiled leg this is the line
 # that shows an x86_64 binary really did run on the arm64 runner (ADR-548-2).
 if command -v file >/dev/null 2>&1; then
-    echo "smoke: $(file -b "$extract/tetond")"
+    echo "smoke: $(file -b "$extract/teton-code")"
 fi
 
 # --- 1 + 2: both binaries report the released version ----------------------
-for bin in teton tetond; do
+for bin in teton teton-code; do
     out="$("$extract/$bin" --version 2>&1 || true)"
     if printf '%s' "$out" | grep -qF -- "$version"; then
         pass "$bin --version reports $version ($out)"
@@ -175,7 +175,7 @@ TETON_TEST_SEAMS=1 \
     XDG_RUNTIME_DIR="$seam_runtime" \
     HOME="$work" \
     TETON_REPO_ROOT="$work" \
-    "$extract/tetond" >"$seam_out" 2>&1 &
+    "$extract/teton-code" >"$seam_out" 2>&1 &
 seam_pid=$!
 
 # A watchdog, because the failure mode being guarded against is a daemon that
@@ -208,24 +208,24 @@ kill "$seam_watchdog" 2>/dev/null || true
 wait "$seam_watchdog" 2>/dev/null || true
 
 if [ -e "$seam_killed" ]; then
-    fail "TETON_TEST_SEAMS=1 tetond was still running after ${SEAM_DEADLINE_SECS}s and had to be killed — it did not refuse, whatever it printed. Output:"
+    fail "TETON_TEST_SEAMS=1 teton-code was still running after ${SEAM_DEADLINE_SECS}s and had to be killed — it did not refuse, whatever it printed. Output:"
     sed 's/^/  | /' "$seam_out" >&2 || true
 elif [ "$seam_status" -ne 0 ] && grep -qF "TETON_TEST_SEAMS=1 is set" "$seam_out"; then
-    pass "TETON_TEST_SEAMS=1 tetond refused to start (exit $seam_status) with the release-build refusal"
+    pass "TETON_TEST_SEAMS=1 teton-code refused to start (exit $seam_status) with the release-build refusal"
 else
-    fail "TETON_TEST_SEAMS=1 tetond did not refuse as a release build should (exit $seam_status). Output:"
+    fail "TETON_TEST_SEAMS=1 teton-code did not refuse as a release build should (exit $seam_status). Output:"
     sed 's/^/       | /' "$seam_out" >&2 || true
 fi
 
 # --- 4: a real handshake, asserted on doctor's text ------------------------
 run_dir="$work/run"
 mkdir -p "$run_dir"
-daemon_log="$work/tetond.log"
+daemon_log="$work/teton-code.log"
 
 XDG_RUNTIME_DIR="$run_dir" \
     HOME="$work" \
     TETON_REPO_ROOT="$work" \
-    "$extract/tetond" >"$daemon_log" 2>&1 &
+    "$extract/teton-code" >"$daemon_log" 2>&1 &
 daemon_pid=$!
 
 # Poll `doctor` itself rather than waiting for the socket file to appear: bind()
@@ -249,7 +249,7 @@ done
 
 daemon_line="$(grep -F "daemon: running" "$doctor_out" || true)"
 if [ -n "$daemon_line" ] && printf '%s' "$daemon_line" | grep -qF -- "$version"; then
-    pass "teton doctor handshook a live tetond — $daemon_line"
+    pass "teton doctor handshook a live teton-code — $daemon_line"
 else
     fail "teton doctor did not report a running daemon at version $version. doctor said:"
     sed 's/^/       | /' "$doctor_out" >&2 || true

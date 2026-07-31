@@ -413,7 +413,7 @@ fn classify(raw: &str) -> Option<Incoming> {
     }
 }
 
-/// Connect to the daemon, autostarting `tetond` if the socket is absent.
+/// Connect to the daemon, autostarting `teton-code` if the socket is absent.
 ///
 /// # Errors
 ///
@@ -428,7 +428,7 @@ pub fn ensure_connected(
         return Ok(conn);
     }
 
-    surface.line(LineKind::Info, "no daemon reachable — starting tetond…");
+    surface.line(LineKind::Info, "no daemon reachable — starting teton-code…");
     spawn_daemon(&paths.log)?;
 
     for _ in 0..POLL_ATTEMPTS {
@@ -451,7 +451,7 @@ pub fn ensure_connected(
         ),
         None => bail!(
             "could not reach the daemon after autostart, and it left no diagnostic at {}; \
-             try running `tetond` manually to see why.",
+             try running `teton-code` manually to see why.",
             paths.log.display()
         ),
     }
@@ -492,7 +492,7 @@ fn read_tail(path: &Path, limit: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Spawn a detached `tetond` process. It takes the single-instance lock itself,
+/// Spawn a detached `teton-code` daemon process. It takes the single-instance lock itself,
 /// so a redundant spawn is harmless (the extra process exits cleanly).
 ///
 /// Its stderr goes to `log` rather than `/dev/null` (E-4). A daemon started this
@@ -536,7 +536,7 @@ fn daemon_log_sink(log: &Path) -> Stdio {
         .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
-/// Locate the `tetond` binary: next to this executable if present, else on PATH.
+/// Locate the `teton-code` daemon binary: next to this executable if present, else on PATH.
 fn daemon_binary_path() -> PathBuf {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -544,15 +544,15 @@ fn daemon_binary_path() -> PathBuf {
     resolve_daemon_binary(exe_dir.as_deref())
 }
 
-/// Pure resolver: prefer `tetond` beside `exe_dir`, else the bare name for PATH.
+/// Pure resolver: prefer `teton-code` beside `exe_dir`, else the bare name for PATH.
 fn resolve_daemon_binary(exe_dir: Option<&Path>) -> PathBuf {
     if let Some(dir) = exe_dir {
-        let candidate = dir.join("tetond");
+        let candidate = dir.join("teton-code");
         if candidate.exists() {
             return candidate;
         }
     }
-    PathBuf::from("tetond")
+    PathBuf::from("teton-code")
 }
 
 #[cfg(test)]
@@ -836,14 +836,14 @@ mod tests {
     #[test]
     fn resolve_daemon_binary_prefers_a_sibling_then_falls_back_to_path() {
         // Empty/absent dir → bare name for PATH lookup.
-        assert_eq!(resolve_daemon_binary(None), PathBuf::from("tetond"));
+        assert_eq!(resolve_daemon_binary(None), PathBuf::from("teton-code"));
 
         let dir = std::env::temp_dir().join(format!("teton-cli-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(resolve_daemon_binary(Some(&dir)), PathBuf::from("tetond"));
+        assert_eq!(resolve_daemon_binary(Some(&dir)), PathBuf::from("teton-code"));
 
-        // A sibling `tetond` file is preferred.
-        let sibling = dir.join("tetond");
+        // A sibling `teton-code` file is preferred.
+        let sibling = dir.join("teton-code");
         std::fs::write(&sibling, b"#!/bin/sh\n").unwrap();
         assert_eq!(resolve_daemon_binary(Some(&dir)), sibling);
 

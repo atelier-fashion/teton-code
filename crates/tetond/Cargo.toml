@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# The crate keeps its internal name (`tetond::` imports, `--features
+# tetond/llama`), but the shipped executable is `teton-code`: macOS permission
+# dialogs (Keychain, network) attribute requests to the executable's filename,
+# and "tetond" read as a typo rather than as the product name.
+[[bin]]
+name = "teton-code"
+path = "src/main.rs"
+
 # The daemon is where all differentiating logic lives, so it depends on every
 # library crate. Binaries may depend on libs; libs never depend on binaries.
 # The `live` feature un-ignores the e2e suite's real-model / real-provider smoke

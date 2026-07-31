@@ -354,7 +354,7 @@ fn do_handshake(
 
     let result = HandshakeResult {
         protocol_version: version,
-        daemon_name: "tetond".to_owned(),
+        daemon_name: "teton-code".to_owned(),
         daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
         capabilities: Vec::new(),
     };
