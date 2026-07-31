@@ -26,14 +26,21 @@
 # targeting; a mismatch fails at link time, in this job, which is the loud place
 # for it to fail.
 #
+# Signing is REQUESTED by the environment, never inferred from it (ADR-550-1).
+# With `TETON_SIGN_IDENTITY` set, both staged binaries are codesigned and
+# verified before the tarball is written, and any failure ends the leg; without
+# it they stay as the linker left them and the script says so. A dev build is
+# not a release, and a release that could not sign is not a release either.
+#
 # Exit codes:
 #   0   the tarball was built and its sha256 recorded.
 #   64  EX_USAGE — wrong invocation, or an argument that is not what it claims
 #       to be: `version` is pasted into a filesystem path and `target` is handed
 #       to `cargo build --target`, so neither is free text.
 #   70  EX_SOFTWARE — the build reported success but an expected binary is not
-#       where it should be. That is an internal inconsistency, not a compile
-#       error, and it is worth its own code so it cannot be read as one.
+#       where it should be, or signing was asked for and could not be carried
+#       out. Both are internal inconsistencies rather than compile errors, and
+#       they are worth their own code so neither can be read as one.
 #   75  EX_TEMPFAIL — the tarball was built but could not be hashed, because the
 #       machine has no sha256 tool at all. Distinct from 70 for the same reason
 #       the rest of tools/release/ separates them (LESSON-442): "could not run"
@@ -84,6 +91,33 @@ case "$target" in
         ;;
 esac
 
+# Whether this build CAN sign is settled before it is built, for the reason the
+# target allowlist is: a signing-requested build on a machine without codesign
+# is going to die either way, and dying after a from-source llama.cpp compile
+# only makes the same answer slower and dearer to arrive at. The tool resolved
+# here is the one the staging step below uses.
+#
+# The predicate is the REQUEST, never the availability of a certificate. The
+# release workflow sets TETON_SIGN_IDENTITY unconditionally on both macOS legs
+# (ADR-550-1), so a leg that cannot sign has to die rather than quietly write a
+# tarball that looks like every other one (BR-2). A guard that switches itself
+# off when its tool is missing is not a guard (LESSON-443) — which is why an
+# absent codesign is 70 here and not the 75 the verify gates spell it: those
+# gates report on bytes somebody else made, while this script is the one making
+# them, and "could not check" and "did not do it" are different failures.
+#
+# `TETON_CODESIGN` is the same seam verify-signature.sh carries, for the same
+# reason: it changes WHICH tool is asked, never how the answer is scored.
+codesign_tool=""
+if [ -n "${TETON_SIGN_IDENTITY:-}" ]; then
+    if ! codesign_tool="$(tool_or_unchecked "${TETON_CODESIGN:-}" codesign)"; then
+        echo "package: signing was requested (TETON_SIGN_IDENTITY is set) but '${TETON_CODESIGN:-codesign}'" >&2
+        echo "         is not on this machine. Refusing to build a tarball that would be unsigned" >&2
+        echo "         and indistinguishable from a signed one." >&2
+        exit "$EXIT_INTERNAL"
+    fi
+fi
+
 outdir="${3:-$repo_root/dist}"
 mkdir -p "$outdir"
 outdir="$(cd -- "$outdir" && pwd)"
@@ -103,6 +137,48 @@ for bin in teton teton-code; do
     fi
     cp "$bin_dir/$bin" "$stage/$bin"
 done
+
+# The signing phase (ADR-550-1), on the STAGED copies rather than the originals
+# under target/: the tarball below is assembled from this directory, so signing
+# here is what makes the shipped bytes the verified bytes. Signing the build
+# output instead would leave a gap between what was checked and what was tarred.
+#
+# Keyed on the identity again, not on `$codesign_tool` being non-empty. The two
+# are equivalent by construction — the check above exits when they are not — but
+# "sign if a tool happens to be around" is the self-disabling shape (LESSON-443)
+# and should not be what this reads like to whoever edits it next.
+if [ -n "${TETON_SIGN_IDENTITY:-}" ]; then
+    for bin in teton teton-code; do
+        # `--options runtime` (the hardened runtime) is what notarization will
+        # require of these binaries (spec OQ-3) and costs nothing before then.
+        # `--force` is there because Apple's linker already ad-hoc signs arm64
+        # Mach-Os at link time and codesign refuses to replace an existing
+        # signature without it; it decides only WHICH signature survives, never
+        # whether one is checked — the --verify below, and verify-signature.sh
+        # in the smoke, still have to accept whatever it produced.
+        if ! "$codesign_tool" --force --sign "$TETON_SIGN_IDENTITY" \
+            --timestamp --options runtime "$stage/$bin"; then
+            echo "package: codesign could not sign $bin with the requested identity." >&2
+            echo "         No tarball is written: a signing-requested build never ships unsigned." >&2
+            exit "$EXIT_INTERNAL"
+        fi
+
+        # Asked immediately, of the same file, because `--sign` exiting 0 is not
+        # the claim being made — "these bytes carry a signature that holds" is,
+        # and only --verify tests it. Whether the signature names the right
+        # AUTHORITY is verify-signature.sh's question, asked of the tarball in
+        # the smoke; asking it a second way here would be a second opinion free
+        # to drift from the gate that actually blocks the release.
+        if ! "$codesign_tool" --verify --strict "$stage/$bin"; then
+            echo "package: $bin was signed but codesign --verify --strict rejected the result." >&2
+            exit "$EXIT_INTERNAL"
+        fi
+
+        echo "package: signed $bin"
+    done
+else
+    echo "package: binaries are unsigned (dev build — set TETON_SIGN_IDENTITY for release signing)"
+fi
 
 # The licence and readme ride along so an unpacked tarball is self-describing
 # even for someone who never visits the repo (and so Homebrew's `bin.install`

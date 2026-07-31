@@ -20,6 +20,16 @@
 #   4. A backgrounded `teton-code` and a real `teton doctor` complete a handshake:
 #      doctor's OUTPUT names the running daemon and its version.
 #
+# Before those four, on the macOS targets only, each shipped binary must carry a
+# real Developer ID signature (BR-2). The question is put to
+# `verify-signature.sh` and to nothing else — a codesign invocation of this
+# script's own would be a second opinion about what a release signature is, free
+# to drift from the gate the release job runs — and `TETON_SMOKE_TEAM_ID` names
+# the team it must find. Which target this is comes off the tarball's own name,
+# because a path is all this script is given. The Linux target ships unsigned in
+# v1 by design (BR-6, ADR-550-4), and that is PRINTED rather than silently
+# skipped: a gate that says nothing looks exactly like a gate that did not run.
+#
 # Two shapes of assertion deserve their reasons recorded, because both are easy
 # to "simplify" into something that passes when it should not:
 #
@@ -36,11 +46,13 @@
 # Exit codes are a taxonomy, matching the version gate's stance (LESSON-442):
 #
 #   0   PASS       every assertion held against the shipped artifact.
-#   64  EX_USAGE   wrong invocation.
+#   64  EX_USAGE   wrong invocation — including a macOS tarball handed over with
+#                  no TETON_SMOKE_TEAM_ID to check its signature against.
 #   65  FAILED     the smoke RAN and an assertion FAILED — these bytes are bad.
 #   75  UNCHECKED  the smoke could NOT run (no tarball, extraction failed, a
-#                  binary is missing). Nothing was learned about the artifact,
-#                  so it fails rather than passing an unexercised release.
+#                  binary is missing, the signature could not be read). Nothing
+#                  was learned about the artifact, so it fails rather than
+#                  passing an unexercised release.
 
 set -euo pipefail
 
@@ -148,6 +160,76 @@ done
 if command -v file >/dev/null 2>&1; then
     echo "smoke: $(file -b "$extract/teton-code")"
 fi
+
+# --- 0: the shipped macOS binaries are Developer ID signed (BR-2) ----------
+# Numbered 0 because it is a property of the bytes rather than of the program
+# they contain, and because it decides whether the four below are worth running
+# at all — an unsigned macOS release is unshippable however well it behaves.
+#
+# The target triple is read off the tarball's name, the shape package.sh writes:
+# `teton-v<version>-<target>.tar.gz`. Anything that does not name a darwin
+# target is treated as the Linux leg, which is the safe direction to be wrong
+# in — the check is skipped only where codesign has nothing to say.
+tarball_target="$(basename "$tarball")"
+tarball_target="${tarball_target%.tar.gz}"
+name_prefix="teton-v$version-"
+tarball_target="${tarball_target#"$name_prefix"}"
+
+case "$tarball_target" in
+    *apple-darwin*)
+        # A missing team id is a USAGE error, never a skip. Reading "then don't
+        # check" out of an absent argument is how a gate disables itself on
+        # exactly the machine that most needed it (LESSON-443), and an empty
+        # team id is worse still — verify-signature.sh matches it as a literal
+        # substring, and every string contains the empty one.
+        if [ -z "${TETON_SMOKE_TEAM_ID:-}" ]; then
+            echo "smoke: $tarball_target is a macOS target, so both binaries must be checked for a" >&2
+            echo "       Developer ID signature — and TETON_SMOKE_TEAM_ID, which names the team" >&2
+            echo "       they must be signed by, is unset or empty. Nothing was exercised." >&2
+            exit "$EXIT_USAGE"
+        fi
+
+        # Per binary, and on the extracted copies: these are the bytes the four
+        # assertions below run, so they are the bytes whose signature is worth
+        # a verdict (LESSON-455 — both binaries, no per-file drift). Invoked
+        # through `bash` like every other call to these scripts in CI, so a lost
+        # exec bit cannot turn a gate into a 126.
+        sig_unchecked=0
+        for bin in teton teton-code; do
+            sig_status=0
+            bash "$script_dir/verify-signature.sh" "$extract/$bin" "$TETON_SMOKE_TEAM_ID" ||
+                sig_status=$?
+
+            case "$sig_status" in
+                0) pass "$bin is Developer ID signed by team $TETON_SMOKE_TEAM_ID" ;;
+                "$EXIT_FAILED")
+                    fail "$bin in this tarball is not Developer ID signed by team $TETON_SMOKE_TEAM_ID (BR-2)"
+                    ;;
+                *)
+                    # 75 and everything else it could exit with: no codesign, an
+                    # identity that could not be read, a usage error of our own
+                    # making. The signature was not READ, and "could not check"
+                    # is not a pass.
+                    echo "smoke: $bin's signature could not be checked (verify-signature.sh exit $sig_status)." >&2
+                    sig_unchecked=1
+                    ;;
+            esac
+        done
+
+        # A definite rejection outranks an unreadable one, the same ordering
+        # verify-signature.sh applies internally: if one binary was REJECTED,
+        # something was learned about these bytes, and losing that to a 75
+        # because its sibling was unreadable would make the log claim less than
+        # the run knows. Either way the release is blocked.
+        if [ "$sig_unchecked" -ne 0 ] && [ "$failures" -eq 0 ]; then
+            echo "smoke: no signature verdict was reached for $(basename "$tarball") — nothing was learned." >&2
+            exit "$EXIT_UNCHECKED"
+        fi
+        ;;
+    *)
+        echo "smoke: artifact is unsigned in v1 (linux — by design, REQ-550 BR-6)"
+        ;;
+esac
 
 # --- 1 + 2: both binaries report the released version ----------------------
 for bin in teton teton-code; do
