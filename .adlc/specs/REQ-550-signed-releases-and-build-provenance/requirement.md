@@ -171,6 +171,20 @@ human steps explicitly instead of leaving them implicit.
 - REQ id allocated with remote verification (no degradation warning from the
   allocator).
 
+## Verified Inventory (2026-07-31, repo admin UI)
+
+Checked during environment setup, correcting the description's assumption:
+the ONLY repository-level Actions secret is `HOMEBREW_TAP_TOKEN`; there are
+no `GCP_*` repository secrets and no repository variables — `deploy-site.yml`
+authenticates via workload identity federation with no stored cloud secret.
+BR-4's scope is therefore: `HOMEBREW_TAP_TOKEN` (move to `tap-publish`, then
+delete the repo-level copy ONLY after the workflow declares the environment —
+deleting first breaks the next release), the new signing secrets (created
+directly in `release-signing`, never repo-scoped), and the WIF
+`assertion.ref` condition on the GCP side. Environments `release-signing`,
+`tap-publish` (tags `v*.*.*`), and `site-deploy` (tags `v*.*.*` + `main`)
+were created and rule-configured on 2026-07-31.
+
 ## Open Questions
 
 - [ ] OQ-1: Sequencing — provenance + environment-gating need no Apple
