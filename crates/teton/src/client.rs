@@ -840,7 +840,10 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("teton-cli-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(resolve_daemon_binary(Some(&dir)), PathBuf::from("teton-code"));
+        assert_eq!(
+            resolve_daemon_binary(Some(&dir)),
+            PathBuf::from("teton-code")
+        );
 
         // A sibling `teton-code` file is preferred.
         let sibling = dir.join("teton-code");

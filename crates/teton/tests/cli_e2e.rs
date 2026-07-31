@@ -270,8 +270,9 @@ fn daemon_or_skip() -> Option<PathBuf> {
     if daemon.exists() {
         return Some(daemon);
     }
-    let _ = std::io::stderr()
-        .write_all(b"skipping CLI consent e2e: teton-code binary not built (run under --workspace)\n");
+    let _ = std::io::stderr().write_all(
+        b"skipping CLI consent e2e: teton-code binary not built (run under --workspace)\n",
+    );
     None
 }
 
