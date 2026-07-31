@@ -1,7 +1,7 @@
 ---
 id: BUG-146
 title: "First prompt after install fails with a message blaming the local engine for a config/timing problem"
-status: open
+status: resolved
 severity: high
 created: 2026-07-31
 updated: 2026-07-31
@@ -133,3 +133,14 @@ wants its own change.
   stale doc reference
 - `crates/tetond/tests/e2e/consent_matrix.rs` — the starved-turn assertion now
   checks the message names the cause, not merely that an error occurred
+
+## Deployment
+
+Not a deployed service — `teton`/`tetond` ship as Homebrew binaries. The fix is
+on `main` (PR #11, squash `4b43976`) and reaches users with the next tagged
+release; v0.1.0 as installed still carries the misleading message.
+
+## Lessons
+
+- `LESSON-456` — a `_`-discarded error is a silent downgrade; a fallback
+  identifier is not "none"; one classifier per state, not one per surface.
