@@ -256,8 +256,8 @@ honest-`disabled` behavior.
 which serves prebuilt per-platform tarballs from GitHub Releases. The formula's
 source of truth is `packaging/homebrew/teton.rb.tmpl` in THIS repo; the release
 workflow renders it with the tag and the artifacts' real sha256s and pushes it.
-The tap is a publish target, never hand-edited. `brew services` runs `tetond`
-under launchd.
+The tap is a publish target, never hand-edited. `brew services` runs the
+daemon binary (`teton-code` since ADR-007) under launchd.
 
 **Rationale**: a source-build formula would reimpose the Rust + cmake burden the
 one-command install exists to remove; homebrew-core needs notability the project
@@ -274,3 +274,36 @@ formula backwards. The x86_64-darwin leg is cross-compiled and Rosetta-smoked
 native verification. Two hardening items are deliberately deferred and recorded
 in REQ-548: build-provenance attestation, and environment-gated secrets for the
 tap token and the GCP credentials.
+
+### ADR-007: The daemon ships as `teton-code`; the crate and runtime paths do not follow the rename (2026-07-31)
+
+**Decision**: the shipped daemon executable is `teton-code` — a `[[bin]]`
+target rename only (REQ-549, PR #12). Three names deliberately do NOT follow:
+the crate stays `tetond` (so `tetond::` imports and `--features tetond/llama`
+are untouched), the runtime rendezvous filenames stay `tetond.sock`/`.lock`/
+`.log`, and the protocol shape is unchanged (only the handshake's
+`daemon_name` value moved).
+
+**Rationale**: macOS attributes permission dialogs — Keychain, network — to
+the requesting process's executable filename, and the daemon is what resolves
+`keychain://` references at call time (REQ-544 BR-7). "tetond" read as a typo
+at the moment the OS asks the user for trust (LESSON-457). The crate name is
+invisible to users and renaming it would churn every import and build
+invocation for zero user-facing gain. The socket/lock filenames are an
+upgrade-compatibility contract: keeping them stable means a newly-installed
+CLI finds an already-running old daemon rather than racing a second daemon
+against it (the single-instance flock spans versions only if the lock path
+does).
+
+**Consequences**: every surface naming the executable agrees on `teton-code`
+(daemon self-reports, CLI autostart, packaging, release scripts, tests, docs).
+Users see one Keychain re-prompt after upgrading, because ACL grants bind to
+executable identity; without a stable code-signing identity every rebuild
+re-prompts anyway — recorded as REQ-549 OQ-2, to be combined with REQ-548's
+deferred provenance/signing work. Renaming the runtime filenames later is a
+separate migration (REQ-549 OQ-1) that must solve cross-version
+single-instancing before it ships. The interactive startup UX added alongside
+(skyline banner, framed entry prompt) renders strictly through the existing
+`Surface`/`Prompter` seams and is TTY-gated, so non-interactive output remains
+byte-identical — the future ratatui front-end inherits both by implementing
+the same seams.

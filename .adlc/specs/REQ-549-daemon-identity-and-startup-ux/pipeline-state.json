@@ -1,0 +1,51 @@
+{
+  "req": "REQ-549",
+  "branch": "claude/teton-code-permission-display-ac7fa0",
+  "startedAt": "2026-07-31T19:30:00Z",
+  "completed": true,
+  "retroactive": true,
+  "currentPhase": 8,
+  "completedPhases": [4, 6, 7, 8],
+  "skippedPhases": [0, 1, 2, 3, 5],
+  "phaseHistory": [
+    {
+      "phase": 4,
+      "name": "Implemented directly from chat scope, WITHOUT phases 0-3: daemon [[bin]] rename to teton-code across code/tests/packaging/release scripts; banner.rs skyline + identity block; FramedStdinPrompter entry frame; TTY/NO_COLOR gating. Design decisions recorded only in code comments and commit messages.",
+      "completedAt": "2026-07-31T20:45:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "PR #12 opened (two logical commits: rename; banner+frame). Phase 5 (reflect + multi-agent review) was NOT run — self-verification only (clippy, workspace tests, selftest 98/98, live pty run). CI then caught a cargo-fmt failure the skipped verify phase would have caught locally.",
+      "completedAt": "2026-07-31T21:10:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "fmt fix pushed (2cd4130); all 6 CI checks green on macOS + Linux (Linux leg also validated TIOCGWINSZ portability).",
+      "completedAt": "2026-07-31T21:30:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "PR #12 squash-merged to main; remote branch deleted. Requirement.md and this state file backfilled retroactively at user request after the merge.",
+      "completedAt": "2026-07-31T21:33:32Z"
+    },
+    {
+      "phase": 8,
+      "name": "/wrapup complete: LESSON-457 (executable name is a trust surface) + LESSON-458 (skipped pipeline becomes retroactive debt) logged via fallback drafting (adlc-read unavailable); ADR-007 added to context/architecture.md (and ADR-006's stale tetond reference corrected); no ASSUME record (rationale in wrapup log); no deploy (rename ships with the next release tag).",
+      "completedAt": "2026-07-31T22:05:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.claude/worktrees/teton-code-permission-display-ac7fa0",
+      "branch": "claude/teton-code-permission-display-ac7fa0",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/12",
+      "prNumber": 12,
+      "merged": true
+    }
+  },
+  "mergeOrder": ["teton-code"]
+}
