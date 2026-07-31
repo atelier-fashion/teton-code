@@ -50,7 +50,12 @@ claims `teton-code.lock`, and two daemons serve simultaneously.
 
 - Naming any new shipped binary, daemon, helper, or launchd/systemd service.
 - Renaming an existing executable (checklist: bin target vs crate, runtime
-  paths, handshake identity strings, packaging, release scripts, test
-  `CARGO_BIN_EXE_*` references, docs).
+  paths, handshake identity strings, packaging, release scripts, CI workflow
+  YAML, test `CARGO_BIN_EXE_*` references, docs). The REQ-549 sweep covered
+  `*.rs/*.sh/*.tmpl/*.md/*.toml` but not `*.yml` — release.yml's
+  verify-install job still asserted `tetond.log` and failed the v0.1.1
+  release gate until fixed (2fcc5c6, which derives the names from the
+  formula rather than restating them — the [[LESSON-455]] shape: state the
+  property once).
 - Any change that alters executable identity on macOS — expect Keychain
   re-prompts; see REQ-549 OQ-2 (stable signing identity) before users scale.
