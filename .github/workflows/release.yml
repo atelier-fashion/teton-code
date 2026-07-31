@@ -280,7 +280,7 @@ jobs:
 
           case "$status" in
             0)
-              echo "::notice title=Smoke PASSED ($TARGET)::Both binaries report $VERSION, the release build refused TETON_TEST_SEAMS=1, and teton doctor handshook a live tetond."
+              echo "::notice title=Smoke PASSED ($TARGET)::Both binaries report $VERSION, the release build refused TETON_TEST_SEAMS=1, and teton doctor handshook a live teton-code daemon."
               ;;
             65)
               echo "::error title=Smoke FAILED ($TARGET)::A shipped-artifact assertion failed for $tarball — see the log for which one. These bytes must not be released."
@@ -401,7 +401,7 @@ jobs:
             printf -- '- `aarch64-apple-darwin` — built and smoke-tested natively on macOS arm64.\n'
             printf -- '- `x86_64-apple-darwin` — **Rosetta-verified**: cross-compiled on an arm64 runner and smoke-tested under Rosetta 2 (GitHub no longer offers Intel macOS runners). That proves the binary loads and runs its CPU paths; it is not evidence from native Intel hardware.\n'
             printf -- '- `x86_64-unknown-linux-gnu` — built and smoke-tested natively on Linux.\n\n'
-            printf 'Every artifact passed the release smoke gate: `teton` and `tetond` both report %s, the release build refuses `TETON_TEST_SEAMS=1` rather than honouring the test seams, and `teton doctor` completed a live handshake against a freshly started daemon.\n\n' "$VERSION"
+            printf 'Every artifact passed the release smoke gate: `teton` and `teton-code` both report %s, the release build refuses `TETON_TEST_SEAMS=1` rather than honouring the test seams, and `teton doctor` completed a live handshake against a freshly started daemon.\n\n' "$VERSION"
             printf '### Checksums (sha256)\n\n```\n'
             cat staging/checksums.txt
             printf '```\n'
@@ -891,7 +891,7 @@ jobs:
           esac
 
       # AC-6 and BR-6, end to end: launchd runs the daemon, the CLI handshakes
-      # it without anyone invoking tetond by hand, restart survives, stop
+      # it without anyone invoking teton-code by hand, restart survives, stop
       # actually stops, and the logs are where brew says logs are.
       #
       # Every assertion is on doctor's TEXT, never its exit code. `teton doctor`
@@ -954,7 +954,7 @@ jobs:
             || report_and_fail "brew services start FAILED (AC-6)::launchd would not take the service defined by the formula, so the daemon never started. The tap was NOT updated."
 
           line="$(wait_for_daemon)" \
-            || report_and_fail "Daemon never answered after start (AC-6)::brew services start exited 0 but teton doctor never reported a running daemon within ${DEADLINE_SECS}s — without anyone invoking tetond by hand, which is the whole claim. The tap was NOT updated."
+            || report_and_fail "Daemon never answered after start (AC-6)::brew services start exited 0 but teton doctor never reported a running daemon within ${DEADLINE_SECS}s — without anyone invoking teton-code by hand, which is the whole claim. The tap was NOT updated."
 
           case "$line" in
             *"$VERSION"*)
@@ -968,12 +968,26 @@ jobs:
           # BR-6: "where are the logs" must have a brew answer. launchd creates
           # both redirect targets when it spawns the service, so if the daemon
           # is up and these are not here, the formula's log paths are wrong.
+          #
+          # The names are READ FROM THE FORMULA, never restated here. v0.1.1's
+          # first attempt failed on exactly that duplication: the daemon binary
+          # was renamed to teton-code and the template's log_path followed, but
+          # this assertion still looked for tetond.log — a rename that swept
+          # every file it obviously touched and missed the one that restated
+          # the same fact somewhere else. Asking the formula what it promised,
+          # then checking that promise held, is a check that cannot drift.
           log_dir="$(brew --prefix)/var/log/teton"
-          if [ -f "$log_dir/tetond.log" ] && [ -f "$log_dir/tetond.err.log" ]; then
-            echo "::notice title=Daemon logs are under brew var (BR-6)::$log_dir"
+          formula_file="$TAP_DIR/Formula/teton.rb"
+          log_name="$(sed -nE 's|^[[:space:]]*log_path[[:space:]]+var/"log/teton/([^"]+)".*|\1|p' "$formula_file" | head -1)"
+          err_name="$(sed -nE 's|^[[:space:]]*error_log_path[[:space:]]+var/"log/teton/([^"]+)".*|\1|p' "$formula_file" | head -1)"
+          if [ -z "$log_name" ] || [ -z "$err_name" ]; then
+            report_and_fail "Could not read the formula's log paths (BR-6)::Neither log_path nor error_log_path parsed out of $formula_file, so whether the daemon writes where the formula promises is UNKNOWN. The tap was NOT updated."
+          fi
+          if [ -f "$log_dir/$log_name" ] && [ -f "$log_dir/$err_name" ]; then
+            echo "::notice title=Daemon logs are under brew var (BR-6)::$log_dir ($log_name, $err_name — as declared by the formula)"
             ls -l "$log_dir"
           else
-            report_and_fail "Daemon logs are not where the formula says (BR-6)::Expected tetond.log and tetond.err.log under $log_dir. The tap was NOT updated."
+            report_and_fail "Daemon logs are not where the formula says (BR-6)::The formula declares $log_name and $err_name under $log_dir, and launchd did not create them there. The tap was NOT updated."
           fi
 
           brew services restart teton \
