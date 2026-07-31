@@ -26,7 +26,7 @@ Linux selftest can drive them.
 ## Acceptance Criteria
 
 - [ ] Both scripts pass shellcheck and follow smoke.sh's `set -uo pipefail` + explicit exit-constant style
-- [ ] An unforeseen internal failure exits 75, never 65 (LESSON-442: 65 must be unforgeable as "bytes are bad")
+- [ ] An unforeseen internal failure exits 75, never 65 (BR-7; LESSON-442: 65 must be unforgeable as "bytes are bad")
 - [ ] With `TETON_CODESIGN`/`TETON_GH` pointing at stand-ins: rejecting stand-in → 65, absent tool → 75, accepting stand-in → 0 (proven in TASK-025's selftest cases)
 - [ ] Real-tool paths documented in headers: signature gate runs on macOS legs only; attestation gate anywhere `gh` exists
 

@@ -25,7 +25,7 @@ pass the per-target smoke.
 
 - [ ] `package.sh` with `TETON_SIGN_IDENTITY` set and no usable identity fails loudly (non-zero, message names signing) — it must be impossible to produce an unsigned tarball from a signing-requested invocation (BR-2)
 - [ ] `package.sh` without the var behaves byte-identically to today apart from the one informational line
-- [ ] smoke.sh signature assertion uses TASK-021's script (no second codesign invocation path to drift), and its absence of a team-id arg on darwin is a usage error, not a skip
+- [ ] smoke.sh signature assertion (AC-1's per-macOS-target check) uses TASK-021's script (no second codesign invocation path to drift), and its absence of a team-id arg on darwin is a usage error, not a skip
 - [ ] shellcheck clean; selftest still 98+ green (existing cases unbroken)
 
 ## Technical Notes

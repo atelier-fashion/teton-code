@@ -3,9 +3,35 @@
   "branch": "feat/REQ-550-signed-releases-and-build-provenance",
   "startedAt": "2026-07-31T23:55:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
-  "phaseHistory": [],
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Single-repo registry; worktree .worktrees/REQ-550 from origin/main@50d3856; inline manifest advisory (zero in-flight); REQ-id recheck self-pass; draft PR #13 opened",
+      "completedAt": "2026-08-01T00:00:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Spec validated pre-pipeline this session (0 blockers, 2 warnings) and marked approved; unchanged since \u2014 recorded, not re-run",
+      "completedAt": "2026-08-01T00:05:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "/architect ran standalone this session: ADR-550-1..4 + TASK-021..026 at 50d3856 (this branch's base); single-repo reconciliation no-op",
+      "completedAt": "2026-08-01T00:05:30Z"
+    },
+    {
+      "phase": 3,
+      "name": "Architecture+tasks validated: DAG valid, coverage complete; 1 fix loop added explicit BR/AC traceability citations to 4 task files",
+      "completedAt": "2026-08-01T00:10:00Z"
+    }
+  ],
   "integrationBranch": "main",
   "repos": {
     "teton-code": {
@@ -14,14 +40,16 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-550",
       "branch": "feat/REQ-550-signed-releases-and-build-provenance",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/13",
+      "prNumber": 13,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
+  "mergeOrder": [
+    "teton-code"
+  ],
   "phase4": {
     "currentTask": null,
     "completedTasks": [],

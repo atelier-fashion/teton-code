@@ -23,7 +23,7 @@ tool-override seams, since the CI tooling job runs on Linux.
 ## Acceptance Criteria
 
 - [ ] Every new case uses `expect_exit`/`expect_output` and the `make_standins`/`make_tarball` builders' style; suite total rises accordingly and passes on Linux CI
-- [ ] The rejecting-stand-in cases are genuine known-bad fixtures: comment in each names the violation it models (tampered artifact, ad-hoc signature) per LESSON-454's "build the known-bad input and watch it go red"
+- [ ] The rejecting-stand-in cases are genuine known-bad fixtures (BR-5 / AC-3): comment in each names the violation it models (tampered artifact, ad-hoc signature) per LESSON-454's "build the known-bad input and watch it go red"
 - [ ] Assertion provenance audit: no pass condition is satisfiable by harness intervention (no watchdog-supplied exits) — reviewed explicitly in the case comments
 - [ ] shellcheck clean; existing 98 cases untouched and green
 
