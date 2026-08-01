@@ -136,9 +136,17 @@ wants its own change.
 
 ## Deployment
 
-Not a deployed service — `teton`/`tetond` ship as Homebrew binaries. The fix is
-on `main` (PR #11, squash `4b43976`) and reaches users with the next tagged
-release; v0.1.0 as installed still carries the misleading message.
+Not a deployed service — `teton`/`teton-code` ship as Homebrew binaries. The
+fix landed on `main` (PR #11, squash `4b43976`) and **shipped in v0.1.1**
+(2026-07-31), so `brew upgrade teton` now carries it. v0.1.0 still reports the
+misleading message; there is no way to fix an already-installed v0.1.0 other
+than upgrading.
+
+Cutting that release exercised the fix's own subject matter: three attempts,
+each blocked by a gate that named the real cause (a token scoped to the wrong
+repo, then an assertion still looking for the pre-rename log filenames). The
+tap was never updated on a failed attempt, so no user could install a formula
+whose service story was unverified.
 
 ## Lessons
 
