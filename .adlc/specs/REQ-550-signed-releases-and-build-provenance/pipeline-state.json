@@ -2,8 +2,8 @@
   "req": "REQ-550",
   "branch": "feat/REQ-550-signed-releases-and-build-provenance",
   "startedAt": "2026-07-31T23:55:00Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -48,6 +50,16 @@
       "phase": 6,
       "name": "PR #13 body set, [WIP] dropped, flipped to ready; requirement status complete; user sign-off recorded (deferrals confirmed; keychain residual accepted with follow-up REQ to spec)",
       "completedAt": "2026-08-01T03:50:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "CI silence diagnosed as CONFLICTING PR (parallel #14 merged to main touching release.yml \u2014 no merge ref, no pull_request runs; LESSON-461); composed merge per LESSON-449 (#14's publish block wholesale: moved-tag->65, notes refresh; this branch's signing/attestation/pins untouched); combined suite 261/261; all 6 checks green",
+      "completedAt": "2026-08-01T13:05:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "PR #13 squash-merged; branches deleted, worktree torn down; LESSON-460/461 logged; ADR-008 appended; no deploy (ships with next release tag); REQ-551 (import-after-build) specced per user request",
+      "completedAt": "2026-08-01T13:20:00Z"
     }
   ],
   "integrationBranch": "main",
@@ -60,7 +72,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/13",
       "prNumber": 13,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }

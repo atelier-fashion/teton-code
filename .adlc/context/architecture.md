@@ -307,3 +307,35 @@ single-instancing before it ships. The interactive startup UX added alongside
 `Surface`/`Prompter` seams and is TTY-gated, so non-interactive output remains
 byte-identical — the future ratatui front-end inherits both by implementing
 the same seams.
+
+
+### ADR-008: Releases are signed, attested, and environment-gated; gates prove exactly what they claim (2026-08-01)
+
+**Decision**: macOS release binaries are Developer ID signed (Team
+545BU9G9D6) inside the build job via an ephemeral keychain (p12 removed
+seconds after import); all release artifacts — three tarballs AND
+checksums.txt — are attested with `actions/attest-build-provenance` and
+re-verified post-publish with `gh attestation verify --signer-workflow
+atelier-fashion/teton-code/.github/workflows/release.yml` plus a same-run
+sha256 cross-check, in a seam-testable batch script; a failed gate blocks
+`bump-formula` through the needs-graph. Credential-bearing jobs declare
+GitHub environments (release-signing, tap-publish, site-deploy; rules
+`main` + `v*.*.*`), and every action in a credential-bearing job is
+SHA-pinned. Gate exit taxonomy: 0 PASS / 65 FAILED (bytes are bad —
+unforgeable by tool absence, crash, or signal death) / 75 UNCHECKED.
+
+**Rationale**: REQ-550. Signing stabilizes executable identity so Keychain
+grants survive upgrades (ADR-007's residual); attestation binds published
+bytes to this repo's release workflow, not merely to the repo; environment
+gating removes the any-ref-readable tap token. Every gate has known-bad
+selftest fixtures proving it goes red (LESSON-454), driven through
+tool-override seams that refuse to run in CI (LESSON-460 governs fixture
+fidelity).
+
+**Consequences**: the first signed release triggers each user's last
+Keychain re-prompt. One accepted risk (user sign-off 2026-08-01): the
+unlocked keychain is reachable by third-party build scripts during `cargo
+build` — REQ-551 (import-after-build) is the specced fix. Post-merge human
+steps live in docs/release-runbook.md §11 (one green release, then delete
+the repo-level tap token, then the negative probe). AC-6 (grant survival)
+is first observable at the second signed release.

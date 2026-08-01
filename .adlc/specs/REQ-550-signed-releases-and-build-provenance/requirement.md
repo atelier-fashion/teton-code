@@ -81,40 +81,40 @@ human steps explicitly instead of leaving them implicit.
 
 ## Business Rules
 
-- [ ] BR-1: Every macOS binary in every released tarball is signed with the
+- [x] BR-1: Every macOS binary in every released tarball is signed with the
       same Developer ID identity (stable team id) across releases. The
       user-visible contract: a Keychain grant given to release N survives
       upgrade to release N+1 with no re-prompt (informed by LESSON-457,
       REQ-549 OQ-2).
-- [ ] BR-2: A missing or failed signature fails the release loudly — the
+- [x] BR-2: A missing or failed signature fails the release loudly — the
       pipeline must never fall back to shipping ad-hoc-signed binaries
       because the certificate was absent or expired. The guard must not be
       keyed on the certificate's presence (a cert-absent run skipping the
       signing step and passing is the self-disabling-guard shape — informed
       by LESSON-443, LESSON-447).
-- [ ] BR-3: Provenance attestations are generated in the same workflow run
+- [x] BR-3: Provenance attestations are generated in the same workflow run
       that built the artifacts, from the actually-uploaded bytes — never
       re-computed or hand-supplied (mirrors REQ-548 BR-5); `gh attestation
       verify` of every artifact is a release gate and a documented runbook
       step.
-- [ ] BR-4: No release credential remains repository-scoped. Stated as a
+- [x] BR-4: No release credential remains repository-scoped. Stated as a
       property, not a location: EVERY credential-bearing step across ALL
       workflows (`release.yml`, `deploy-site.yml`, and any future one) draws
       its secret from a GitHub Environment whose deployment rules restrict it
       to `v*.*.*` tags and/or `main`, with matching `assertion.ref` WIF
       conditions for cloud credentials (informed by LESSON-455 — the partial
       fix that pins one file is the failure mode here).
-- [ ] BR-5: Every new verification gate is proven by a known-bad fixture in
+- [x] BR-5: Every new verification gate is proven by a known-bad fixture in
       `tools/release/selftest.sh`: a tampered artifact must fail attestation
       verification, an unsigned/ad-hoc binary must fail the signature gate,
       and the selftest asserts both go red (informed by LESSON-454 — a gate
       is only a gate if a known-bad input makes it fail).
-- [ ] BR-6: Signature and attestation checks run per artifact per platform in
+- [x] BR-6: Signature and attestation checks run per artifact per platform in
       the release smoke — a green arm64 leg is not evidence for the x86_64
       tarball (informed by LESSON-433). Linux artifacts are explicitly
       unsigned in v1 and the release notes say so (honesty posture of
       REQ-548 BR-10).
-- [ ] BR-7: New gate scripts classify their exits: "verification FAILED"
+- [x] BR-7: New gate scripts classify their exits: "verification FAILED"
       (tampered/unsigned — blocks release) is a distinct exit code from
       "could not verify" (network/tooling — EXIT 75 UNCHECKED convention),
       and neither collides with an uncaught-failure default (informed by
@@ -130,7 +130,7 @@ human steps explicitly instead of leaving them implicit.
 - [ ] AC-2: `gh attestation verify <artifact> --repo atelier-fashion/teton-code`
       succeeds for every published artifact of a release, in CI and as a
       copy-pasteable runbook command in the README/release notes.
-- [ ] AC-3: The selftest proves both gates can fail: a byte-flipped tarball
+- [x] AC-3: The selftest proves both gates can fail: a byte-flipped tarball
       fails attestation verification and an ad-hoc-signed stand-in fails the
       signature gate, each with the correct exit classification (BR-5, BR-7).
 - [ ] AC-4: `HOMEBREW_TAP_TOKEN` and `GCP_*` no longer appear as repository
@@ -146,6 +146,14 @@ human steps explicitly instead of leaving them implicit.
       exist — staged like REQ-548 AC-4: the criterion is defined now, first
       exercisable at the second signed release, and recorded as unrun until
       then (informed by LESSON-433's unrun-legs-recorded-as-unrun posture).
+
+## Post-merge status (wrapup, 2026-08-01)
+
+Merged as PR #13 (squash). BR-1..7 implemented and CI-proven (selftest
+261/261 incl. #14's composed cases). AC-3 proven. AC-1/AC-2/AC-5 complete
+mechanically; first exercised end-to-end by the next release tag or a
+main-dispatched dry run. AC-4 completes via runbook §11 (steps 3-6 pending,
+in order). AC-6 staged — second signed release. Accepted risk → REQ-551.
 
 ## External Dependencies
 
