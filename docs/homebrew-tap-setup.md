@@ -30,9 +30,9 @@ successful run.
 <https://github.com/atelier-fashion/homebrew-tap> — public, `main`, README +
 MIT LICENSE only, deliberately no `Formula/teton.rb` yet. `brew tap
 atelier-fashion/tap` verified against the empty tap (exit 0) and untapped
-again. Still pending from this document: the token (section 2) — the bump job
-fails loudly until `HOMEBREW_TAP_TOKEN` is set, which is the correct
-pre-first-release state.
+again. The token (section 2) followed on 2026-07-31, on the `tap-publish`
+environment; the repository-level copy is still there and retires on the
+ordered checklist in [release-runbook.md §11](release-runbook.md).
 
 ## 2. The token
 
@@ -64,7 +64,10 @@ The name is load-bearing — `release.yml` reads
 `${{ secrets.HOMEBREW_TAP_TOKEN }}` and nothing else.
 
 **As of REQ-550 the token is environment-scoped.** It lives on the
-`tap-publish` environment (deployment rule: tags matching `v*.*.*`), and
+`tap-publish` environment (deployment rules: tags matching `v*.*.*`, **plus**
+the branch `main` — the dry run in [release-runbook.md §2](release-runbook.md)
+is dispatched from `main` and cannot start a job the environment refuses; BR-4's
+own wording is "`v*.*.*` tags and/or `main`"), and
 `bump-formula` declares `environment: tap-publish` — so the same
 `secrets.HOMEBREW_TAP_TOKEN` reference resolves out of the environment rather
 than the repository, and a workflow that does not declare the environment cannot

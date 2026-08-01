@@ -10,13 +10,15 @@ enforced in smoke.sh/selftest.sh and mapped in release.yml. Selftest builds
 known-bad stand-ins via `make_standins`/`make_tarball` and drives gates red
 deliberately (LESSON-454 lineage).
 
-GitHub-side state (already configured 2026-07-31, recorded in the spec's
-Verified Inventory): environments `release-signing` (tag `v*.*.*`; secrets
+GitHub-side state (configured 2026-07-31, rules amended 2026-08-01, recorded
+in the spec's Verified Inventory): environments `release-signing` (secrets
 `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD`; variable `APPLE_TEAM_ID`),
-`tap-publish` (tag `v*.*.*`; secret `HOMEBREW_TAP_TOKEN` copy), `site-deploy`
-(tag `v*.*.*` + branch `main`). The repo-level `HOMEBREW_TAP_TOKEN` remains
-until the workflow declares environments (deleting first would break the next
-release).
+`tap-publish` (secret `HOMEBREW_TAP_TOKEN` copy) and `site-deploy` — all three
+now carrying the same deployment rules, **tag `v*.*.*` + branch `main`**.
+`site-deploy` always did; `main` was added to the other two during the Phase-5
+verify pass so the mandatory dry run can run at all (see ADR-550-2's
+consequence below). The repo-level `HOMEBREW_TAP_TOKEN` remains until the
+workflow declares environments (deleting first would break the next release).
 
 ## ADR-550-1: Sign in `package.sh` between build and tar, keyed on an explicit signing request — never on certificate presence
 
@@ -54,6 +56,15 @@ hosted runners, leaves no persistent key material, and was the spec's OQ-2
 recommendation. One environment on the whole matrix job beats splitting
 signing into a separate job, which would break package.sh's
 build→sign→tar atomicity.
+
+**Consequence found in verify (2026-08-01)**: putting an environment on the
+whole `build` job also gates *when the job may run at all*, so the initial
+tags-only rule on `release-signing` (and `tap-publish`, for `bump-formula`)
+silently made the `workflow_dispatch` dry run impossible — the jobs were
+blocked before their first step, and the only way to exercise the pipeline was
+to spend a tag. Resolved by adding branch `main` to both rules, which BR-4
+already permits ("`v*.*.*` tags and/or `main`"); every other ref is still
+refused, so the AC-4 negative probe is unaffected.
 
 ## ADR-550-3: Attest and verify in the `release` job; the verify gate blocks the tap bump
 
@@ -100,9 +111,11 @@ verification claim across platforms — each leg proves its own artifact).
 
 ## Corrections to exploration output (recorded for the implementer)
 
-- Signing secrets live in **release-signing**, not tap-publish; tap-publish
-  is **tags-only** (no `main`). The spec's Verified Inventory is
-  authoritative over the mapper's table.
+- Signing secrets live in **release-signing**, not tap-publish. The spec's
+  Verified Inventory is authoritative over the mapper's table. (This bullet
+  originally also said tap-publish was tags-only — superseded 2026-08-01:
+  `main` was added to both `release-signing` and `tap-publish`, per the
+  Grounding note above and ADR-550-2's consequence.)
 - `GCP_*` values are read via WIF config in deploy-site.yml but there are
   **no repo-level GCP secrets** to move; BR-4's remaining work there is the
   `environment: site-deploy` declaration + the WIF `assertion.ref`

@@ -4,7 +4,7 @@ title: "Stable code-signing identity and build provenance for released binaries"
 status: approved
 deployable: true
 created: 2026-07-31
-updated: 2026-07-31
+updated: 2026-08-01
 component: "distribution/release"
 domain: "distribution"
 stack: ["github-actions", "homebrew", "ci", "keychain", "rust"]
@@ -183,8 +183,65 @@ delete the repo-level copy ONLY after the workflow declares the environment —
 deleting first breaks the next release), the new signing secrets (created
 directly in `release-signing`, never repo-scoped), and the WIF
 `assertion.ref` condition on the GCP side. Environments `release-signing`,
-`tap-publish` (tags `v*.*.*`), and `site-deploy` (tags `v*.*.*` + `main`)
-were created and rule-configured on 2026-07-31.
+`tap-publish` and `site-deploy` were created and rule-configured on
+2026-07-31.
+
+**Deployment rules, as of 2026-08-01 — all three environments: tags `v*.*.*`
++ branch `main`.** `site-deploy` was `v*.*.*` + `main` from the start and is
+unchanged. `release-signing` and `tap-publish` were initially tags-only;
+`main` was added during the Phase-5 verify pass because the tags-only setup
+blocked the mandatory dry run — `build` declares
+`environment: release-signing` and `bump-formula` declares
+`environment: tap-publish`, so a `main` dispatch could not start either job
+and the pipeline was untestable except by spending a tag (the exact cost the
+dry run exists to avoid — release-runbook.md §2). BR-4's own wording sanctions
+this: its rule is "`v*.*.*` tags **and/or** `main`". Every other ref is still
+refused, which is what AC-4's negative probe records.
+
+## Deviations (verify pass, 2026-08-01)
+
+Where the implementation departs from the letter of a rule or criterion above,
+recorded here so the departure is a decision on the record rather than a gap
+somebody rediscovers.
+
+1. **BR-6's "in the release smoke" is a location, and the location moved.**
+   Signature checks run per macOS artifact in the build legs' smoke, as
+   written. Attestation checks do **not** — they run in the `release` job
+   (over every published asset, after `gh release create`) and again in
+   `verify-install` (over the brew-downloaded tarball). They have to: nothing
+   is attested until the artifacts are uploaded, so a smoke-time attestation
+   check would verify bytes no attestation covers yet. BR-6's substance —
+   per artifact, per platform, no extrapolating one leg's green to another —
+   holds in both places. Only its stated venue changed (ADR-550-3).
+
+2. **`checksums.txt` is attested and verified, not just the three tarballs.**
+   AC-2 says "every published artifact"; the initial implementation attested
+   only the tarballs, which left the list of hashes as the one published byte
+   sequence with no provenance behind it — precisely the "the release page
+   agrees with itself" gap in this REQ's own description. The gate now attests
+   four subjects and cross-checks each asset's sha256 against the same run's
+   `checksums.txt`, so "attested" and "hashes to the published list" are
+   asserted about one set of bytes. AC-2 is honoured as written.
+
+3. **AC-1 says `codesign -dvv`, corrected inline during Phase 4.** At
+   verbosity 1, codesign prints `TeamIdentifier=` and no `Authority=` line at
+   all, so `-dv` on a correctly signed binary shows no authority and reads as
+   a failure. Verified against the real tool in TASK-021; the criterion text
+   above carries the correction rather than a footnote.
+
+4. **OQ-3 (notarization) and OQ-4 (a `codesign` check in the formula's
+   `test do` block) are both deliberately deferred — decisions, not
+   omissions.** OQ-3: distribution is brew-only, so Gatekeeper quarantine is
+   not on the path any user takes, and notarization would add an Apple service,
+   its credentials and a stapling step for no reachable user benefit; the
+   Assumptions section already names the condition that breaks this (REQ-548
+   OQ-4 adding direct downloads), at which point notarization becomes
+   mandatory. Nothing in this pipeline claims a binary is notarized. OQ-4: the
+   formula's `test do` block runs on every user's machine at install time and
+   is kept fast and network-free; putting a signature check there re-asks, once
+   per installer, the question the release smoke already answered about the
+   same bytes — and the answer is already re-checkable by hand from
+   release-runbook.md §10.
 
 ## Open Questions
 
@@ -201,9 +258,10 @@ were created and rule-configured on 2026-07-31.
       adds notarytool credentials + stapling to the pipeline) or deferred
       until REQ-548 OQ-4 resolves? Related: does the brew install path strip
       the quarantine attribute for these artifacts in practice?
+      **Deferred — see Deviations item 4.**
 - [ ] OQ-4: Should the formula's `test do` block also run
       `codesign --verify`, giving every user machine a local signature check
-      at install time?
+      at install time? **Deferred — see Deviations item 4.**
 
 ## Out of Scope
 
