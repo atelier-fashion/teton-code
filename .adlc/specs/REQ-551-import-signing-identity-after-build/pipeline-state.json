@@ -1,0 +1,32 @@
+{
+  "req": "REQ-551",
+  "branch": "feat/REQ-551-import-signing-identity-after-build",
+  "startedAt": "2026-08-01T14:00:00Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "phaseHistory": [],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-551",
+      "branch": "feat/REQ-551-import-signing-identity-after-build",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
