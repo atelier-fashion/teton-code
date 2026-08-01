@@ -3,14 +3,15 @@
   "branch": "feat/REQ-550-signed-releases-and-build-provenance",
   "startedAt": "2026-07-31T23:55:00Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 7,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6
   ],
   "phaseHistory": [
     {
@@ -42,6 +43,11 @@
       "phase": 5,
       "name": "Verify: 6 agents -> 1 Critical (env rules blocked dry runs; fixed at source via API + docs) + 8 Major + ~15 Minor; 3-agent fix pass; Step-D re-verify (correctness+security) found the fix pass's own Critical (malformed --signer-workflow, empirically proven vs live gh) + 2 High (missed pins) -> round-2 surgical pass; selftest 236->257; final tree mechanically verified green (selftest/shellcheck/actionlint/greps). Halting on reflector user-facing questions before Phase 6.",
       "completedAt": "2026-08-01T03:30:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "PR #13 body set, [WIP] dropped, flipped to ready; requirement status complete; user sign-off recorded (deferrals confirmed; keychain residual accepted with follow-up REQ to spec)",
+      "completedAt": "2026-08-01T03:50:00Z"
     }
   ],
   "integrationBranch": "main",
