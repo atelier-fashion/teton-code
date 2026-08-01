@@ -158,14 +158,23 @@ jobs:
     name: build · smoke (${{ matrix.target }})
     needs: preflight
     runs-on: ${{ matrix.os }}
-    # REQ-550 ADR-550-2: signing secrets resolve only under the
-    # release-signing environment (tag rule v*.*.*)
+    # REQ-550 ADR-550-2: the signing secrets resolve only under the
+    # release-signing environment, whose deployment-branch-and-tag rules admit
+    # exactly two shapes of ref — the `main` BRANCH and `v*.*.*` TAGS. Both are
+    # deliberate. The tag rule is what guards a real release. The `main` rule is
+    # what lets a `workflow_dispatch` dry run from `main` start at all: without
+    # it the whole signing path would be unexercisable without burning a tag,
+    # which is the opposite of what the dry-run mode exists for. A dry run from
+    # `main` therefore DOES reach the certificate — it signs, smokes and attests
+    # real bytes and then publishes none of them. Any other ref (a feature
+    # branch, a fork's ref) is admitted by neither rule and cannot reach the
+    # certificate at all.
     #
     # Declared on the whole matrix job rather than per-leg, because a
     # conditional `environment:` is not expressible in this schema. The Linux
     # leg carries the declaration harmlessly — it never reads either secret —
-    # and the environment's own tag rule is what decides whether this job can
-    # reach the certificate at all.
+    # and the environment's own rules are what decide whether this job can reach
+    # the certificate.
     environment: release-signing
     strategy:
       # One target failing should not hide the state of the other two — a
@@ -201,10 +210,29 @@ jobs:
       # Third-party actions are pinned to a full commit SHA. A tag is a mutable
       # pointer someone else controls, and this job produces the bytes users
       # install — `@v2` moving under us is a supply-chain change nobody in this
-      # repository would see in a diff. First-party `actions/*` stay on their
-      # major tag, matching ci.yml: GitHub owns the runner those actions execute
-      # on, so pinning them defends against a strictly smaller threat than the
-      # upgrade friction costs.
+      # repository would see in a diff. First-party `actions/*` mostly stay on
+      # their major tag, matching ci.yml: GitHub owns the runner those actions
+      # execute on, so pinning them defends against a strictly smaller threat
+      # than the upgrade friction costs.
+      #
+      # That carve-out has two named exceptions, and both are about what the
+      # step can REACH rather than who wrote it:
+      #
+      #   * actions/attest-build-provenance, in the `release` job, is pinned
+      #     because it mints signed claims about our artifacts.
+      #   * actions/checkout is pinned by SHA in the three CREDENTIAL-BEARING
+      #     jobs — `release` (contents/id-token/attestations: write),
+      #     `bump-formula` (holds HOMEBREW_TAP_TOKEN) and `verify-install`
+      #     (attestations: read, and it runs the provenance gate). A checkout
+      #     runs first and runs as the job, so in those three a moved tag would
+      #     execute new code alongside the release-write token, the tap's push
+      #     credential, or the OIDC identity this workflow's provenance is
+      #     signed with.
+      #
+      # The two jobs that hold nothing — `preflight` and this one — keep `@v4`.
+      # The distinction is deliberate: pinning everywhere buys nothing extra
+      # here and pinning nowhere would leave the credentials exposed, so the
+      # line is drawn where the credentials are.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -282,7 +310,25 @@ jobs:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          # The SAME expression the Build step's TETON_SIGN_IDENTITY uses, so
+          # the string this step asserts the keychain contains is the string
+          # package.sh will later ask codesign for — character for character,
+          # from one `format()` call duplicated in two places rather than one
+          # spelling paraphrased into another. Quoted for the same reason it is
+          # quoted there: the identity carries a `: ` that bare YAML would read
+          # as a second mapping key.
+          TETON_SIGN_IDENTITY: "${{ format('Developer ID Application: Atelier Fashion LLC ({0})', vars.APPLE_TEAM_ID) }}"
         run: |
+          # `set +e` EXPLICITLY, not merely "no set -e". GitHub's default shell
+          # for a `run:` block is `bash -e {0}`, so errexit is already on when
+          # this script starts, and under it an unchecked failure aborts the
+          # step carrying that command's own exit status — 1 from `mktemp`, 1
+          # from `uuidgen` — straight past the 65/75 taxonomy this step's
+          # annotations depend on (LESSON-442). Every command below is instead
+          # checked individually so each failure names its own stage. This one
+          # line is the contract that makes those checks reachable; do not
+          # delete it on the theory that `set -e` "was never turned on".
+          set +e
           set -uo pipefail
 
           # Both paths are published to $GITHUB_ENV before anything is created,
@@ -296,8 +342,33 @@ jobs:
             echo "TETON_SIGNING_P12=$p12"
           } >>"$GITHUB_ENV"
 
+          # Checked on its own, and the message deliberately blames the temp
+          # directory rather than the secret: with errexit off, a failed
+          # `mktemp` leaves `$p12` empty and the very next thing this step does
+          # is redirect the decoded certificate into `>""`. That would fail
+          # too, but it would fail as "the certificate is unreadable", which
+          # sends whoever reads the annotation to re-export a .p12 that was
+          # never the problem. RUNNER_TEMP being unwritable is a runner fault,
+          # so this is 75 (nothing was learned), never 65.
+          if [ -z "$p12" ] || [ ! -e "$p12" ]; then
+            echo "::error title=Signing workspace UNCHECKED (BR-2)::'mktemp' could not create a temporary file under RUNNER_TEMP ('$RUNNER_TEMP'), so there is nowhere to decode the certificate to. This is a temp-directory failure on the runner and says NOTHING about MACOS_CERT_P12. Nothing was built."
+            exit 75
+          fi
+
           if [ -z "${MACOS_CERT_P12:-}" ] || [ -z "${MACOS_CERT_PASSWORD:-}" ]; then
-            echo "::error title=Signing identity UNAVAILABLE (BR-2)::MACOS_CERT_P12 and/or MACOS_CERT_PASSWORD resolved empty on a macOS release leg, so no Developer ID identity could be imported and nothing can be signed. Either the release-signing environment did not attach to this run (check the environment's tag rule against '$GITHUB_REF_NAME') or the secrets are missing. Nothing was built."
+            echo "::error title=Signing identity UNAVAILABLE (BR-2)::MACOS_CERT_P12 and/or MACOS_CERT_PASSWORD resolved empty on a macOS release leg, so no Developer ID identity could be imported and nothing can be signed. Either the release-signing environment did not attach to this run — its rules admit the 'main' branch and 'v*.*.*' tags, and this run is on '$GITHUB_REF_NAME' — or the secrets are missing from it. Nothing was built."
+            exit 75
+          fi
+
+          # Guarded because an empty needle is a needle that matches
+          # everything: the assertion at the end of this step is a `case`
+          # glob, and `*""*` accepts any keychain contents at all, including
+          # an empty one. That would turn the one check standing between a
+          # wrong certificate and a full build into a rubber stamp. If the
+          # shared `format()` expression ever renders empty, this step must
+          # say so rather than pass.
+          if [ -z "${TETON_SIGN_IDENTITY:-}" ]; then
+            echo "::error title=Signing identity string is empty (BR-2)::TETON_SIGN_IDENTITY rendered empty, so this step has no identity to assert the imported certificate against and the assertion below would accept anything. Nothing was built."
             exit 75
           fi
 
@@ -314,6 +385,12 @@ jobs:
           # A run-random keychain password. It never leaves this step — the
           # cleanup step deletes the keychain by path, which needs no password
           # — and it is masked so no later `set -x` or error path can echo it.
+          #
+          # The emptiness test below is load-bearing precisely BECAUSE errexit
+          # is off (see `set +e` at the top): a `uuidgen` that is missing or
+          # fails leaves this empty and execution continues, so the check is
+          # what turns that into a named 75 instead of a keychain with no
+          # password.
           keychain_pw="$(uuidgen)"
           if [ -z "$keychain_pw" ]; then
             echo "::error title=Signing keychain UNCHECKED (BR-2)::uuidgen produced no password for the throwaway keychain. Refusing to fall back to a fixed one — an empty or predictable keychain password on a shared runner image is not a thing this pipeline creates. Nothing was built."
@@ -365,6 +442,23 @@ jobs:
             exit 75
           fi
 
+          # The decoded .p12 dies HERE, the instant `security import` has
+          # consumed it — not at the end of the job. Between this line and the
+          # cleanup step sits `cargo build`, which runs the build scripts of
+          # every third-party crate in the dependency tree and a full llama.cpp
+          # cmake, as this user, with $RUNNER_TEMP readable. That is a long
+          # window in which an unencrypted Developer ID PRIVATE KEY would be
+          # sitting in a file any of them could read, for no benefit: the key is
+          # in the keychain now and codesign reads it from there. Narrowing the
+          # window to a few milliseconds is the point.
+          #
+          # The `if: always()` cleanup still removes this path, and stays: this
+          # line only runs when the import succeeded, and the failure paths
+          # above are exactly the ones that leave a decoded key behind. Two
+          # removals, one of which is unconditional — that is the design, not
+          # duplication to tidy up.
+          rm -f "$p12"
+
           # Without this, macOS prompts for keychain access the first time
           # codesign touches the key. There is no one at the runner to click
           # "Always Allow", so the build step would hang until the job timed
@@ -375,6 +469,36 @@ jobs:
             exit 75
           fi
 
+          # Captured BEFORE the search list is replaced, and published so the
+          # cleanup step can put back what was actually there rather than the
+          # guess it used to make. `security list-keychains -d user -s …`
+          # REPLACES the list wholesale, so restoring a hardcoded
+          # `login.keychain` silently drops any other keychain the runner image
+          # had on the path — true today for GitHub's images, an assumption
+          # about someone else's machine tomorrow.
+          #
+          # Not hypothetical: `security list-keychains -d user` returns TWO
+          # entries on a stock macOS user session — the login keychain and
+          # /Library/Keychains/System.keychain — so the old restore was already
+          # dropping one of them on every macOS leg of every release.
+          #
+          # `security` prints one indented, quoted path per line; the sed strips
+          # the indentation and the quotes and the tr flattens it to the single
+          # space-separated line $GITHUB_ENV can carry. That flattening is why
+          # the cleanup re-splits on whitespace, which means a keychain path
+          # containing a space would be restored as two broken paths. No path in
+          # any GitHub macOS image has one, and the previous code could not
+          # represent such a path either; noted so the limit is known rather
+          # than discovered.
+          #
+          # Unchecked on purpose: if this comes back empty the cleanup falls
+          # back to login.keychain and says so, which is strictly the old
+          # behaviour. Failing the build over a bookkeeping read would be worse
+          # than the thing it bookkeeps.
+          prior_keychains="$(security list-keychains -d user \
+            | sed -e 's/^[[:space:]]*//' -e 's/"//g' | tr '\n' ' ')"
+          echo "TETON_PRIOR_KEYCHAINS=$prior_keychains" >>"$GITHUB_ENV"
+
           # login.keychain stays in the search list: removing it is how the
           # rest of the runner's tooling starts failing to find its own certs.
           if ! security list-keychains -d user -s "$keychain" login.keychain; then
@@ -383,18 +507,42 @@ jobs:
           fi
 
           # The assertion, and the reason this step is worth its length: prove
-          # the secret actually contained a Developer ID Application identity
-          # for THIS team before spending a full llama.cpp build discovering it
-          # did not. The team id is matched from the variable, never restated
-          # — the full identity string lives in exactly one place in this file
-          # (the package step's env), so the two cannot drift apart.
+          # the secret actually contained the Developer ID Application identity
+          # this pipeline is going to ASK FOR, before spending a full llama.cpp
+          # build discovering it did not.
+          #
+          # What changed and why it matters: this used to be a `grep -F
+          # "Developer ID Application"` piped into a `grep -Fq "($TEAM)"`, which
+          # asserts only that SOME line mentions the product name and that the
+          # same line ends with the team id. It would pass on
+          # "Developer ID Application: Some Other Org (545BU9G9D6)" — a
+          # different subject entirely, with the right team suffix. What
+          # package.sh hands codesign is not a pair of substrings, it is one
+          # exact string, so that is what gets asserted: the identity is built
+          # HERE from the same `format()` expression the Build step's
+          # TETON_SIGN_IDENTITY uses (see this step's env), so the two steps
+          # cannot drift — they are the same expression written twice, not two
+          # spellings of the same idea.
+          #
+          # `case`, not `grep -Fq`, and the reason is the taxonomy — the same
+          # reasoning verify-signature.sh spells out at its own 65-producing
+          # test. This is the only branch in this step that returns 65 ("the
+          # certificate is wrong"), so it must not be able to fail for a reason
+          # of its own: a grep that is missing, broken, or killed exits
+          # non-zero, `! grep` reads that as "the identity is not there", and
+          # the gate announces a bad certificate on the strength of a missing
+          # tool (LESSON-442). A `case` is the shell itself and has no exit
+          # status to misread. It is also a better -F than -F: the needle is
+          # quoted, so a glob character in a team id or org name stays literal.
           identities="$(security find-identity -v -p codesigning "$keychain" 2>&1 || true)"
           printf '%s\n' "$identities"
-          if ! printf '%s' "$identities" | grep -F "Developer ID Application" \
-              | grep -Fq "($APPLE_TEAM_ID)"; then
-            echo "::error title=No Developer ID identity for team $APPLE_TEAM_ID (BR-2)::MACOS_CERT_P12 imported, but the keychain carries no codesigning identity named 'Developer ID Application: ... ($APPLE_TEAM_ID)' — see the list above. A Mac Development or Apple Distribution certificate is not what a released binary is signed with. Nothing was built."
-            exit 65
-          fi
+          case "$identities" in
+            *"$TETON_SIGN_IDENTITY"*) : ;;
+            *)
+              echo "::error title=No '$TETON_SIGN_IDENTITY' in the keychain (BR-2)::MACOS_CERT_P12 imported, but no codesigning identity in the keychain is named exactly '$TETON_SIGN_IDENTITY' — see the list above for what it does carry. That is the identity package.sh will hand codesign, so a near miss (another org with this team id, a Mac Development or Apple Distribution certificate, a renamed subject) is still a build that cannot sign. Nothing was built."
+              exit 65
+              ;;
+          esac
 
           echo "::notice title=Signing identity ready (BR-2)::A Developer ID Application identity for team $APPLE_TEAM_ID is in a throwaway keychain for this leg. It is destroyed by the cleanup step at the end of the job, on every path."
 
@@ -403,12 +551,19 @@ jobs:
       # program, and `$VERSION` is derived from a git ref. The smoke step below
       # has always done it this way; this one now matches it.
       #
-      # TETON_SIGN_IDENTITY is the ONE place the full identity string is
-      # written, and it is conditioned on the target rather than on whether a
-      # certificate happens to be present (ADR-550-1/BR-2): a macOS leg signs
+      # TETON_SIGN_IDENTITY is conditioned on the target rather than on whether
+      # a certificate happens to be present (ADR-550-1/BR-2): a macOS leg signs
       # or dies, and the Linux leg gets the empty string, which package.sh
       # reads as "dev build, stay ad-hoc" — the honest v1 answer for a target
       # with no signing story (BR-6).
+      #
+      # The `format(...)` call below is written in exactly one other place: the
+      # import step's own TETON_SIGN_IDENTITY, which asserts the keychain
+      # contains this identity before this step spends a build discovering it
+      # does not. They are the same expression, so a change to the org name or
+      # the team-id variable moves both at once — the check and the thing it
+      # checks cannot describe different identities. If you edit one, edit the
+      # other; there is no third copy.
       - name: Build and package
         env:
           TARGET: ${{ matrix.target }}
@@ -506,15 +661,39 @@ jobs:
               || echo "::notice title=No signing keychain to delete::'security delete-keychain $keychain' did not succeed. Either it was never created (the import step failed early) or it is already gone."
           fi
 
-          if [ -n "$p12" ]; then
+          # The BACKSTOP, not the primary removal. On the happy path the import
+          # step deleted this file the moment `security import` consumed it, so
+          # this is a no-op and prints nothing. It earns its place on the
+          # failure paths — a step that died between decoding the .p12 and
+          # importing it is exactly where a private key survives, and that is
+          # the path with no other cleanup on it.
+          if [ -n "$p12" ] && [ -e "$p12" ]; then
             rm -f "$p12" && echo "removed decoded certificate: $p12"
           fi
 
-          # Restore the runner's default search list. The import step replaced
-          # it wholesale, and leaving a deleted keychain named in it makes
-          # every later `security` call on this runner complain.
-          security list-keychains -d user -s login.keychain \
-            || echo "::notice title=Keychain search list not restored::'security list-keychains -d user -s login.keychain' did not succeed. The job is finished either way; this is noted rather than failed."
+          # Restore the search list the import step captured before replacing
+          # it. It replaced the list WHOLESALE, so leaving the throwaway
+          # keychain — now deleted — named in it makes every later `security`
+          # call on this runner complain, and restoring a hardcoded
+          # `login.keychain` would silently drop anything else the runner image
+          # had on the path.
+          prior="${TETON_PRIOR_KEYCHAINS:-}"
+          if [ -z "$prior" ]; then
+            # The import step never reached the capture (it died early, or the
+            # capture itself came back empty). login.keychain is the documented
+            # default on GitHub's macOS images and was this step's unconditional
+            # behaviour before the capture existed, so falling back to it
+            # restores a working runner rather than leaving a dangling entry.
+            prior="login.keychain"
+            echo "::notice title=Keychain search list restored from the default::The runner's original search list was not captured, so 'login.keychain' is being restored instead of whatever was actually there."
+          fi
+
+          # Deliberately unquoted: $prior is a space-separated list of keychain
+          # paths that must reach `security` as separate arguments, which is
+          # the one thing quoting it would prevent.
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s $prior \
+            || echo "::notice title=Keychain search list not restored::'security list-keychains -d user -s $prior' did not succeed. The job is finished either way; this is noted rather than failed."
 
           echo "::notice title=Signing key material removed::No certificate or keychain from this leg survives the job."
 
@@ -533,9 +712,22 @@ jobs:
       # they stay on the one job that has a reason to.
       id-token: write
       attestations: write
+    env:
+      # The `build` matrix has three legs, so a complete release has three
+      # tarballs. Written once, here, because the number appears in an
+      # assertion, in an error message and in the "published" notice, and three
+      # hardcoded 3s are three places to forget when a fourth target lands —
+      # the failure mode being a gate that keeps passing on a release missing a
+      # platform. tools/release/verify-attestations-batch.sh carries the same
+      # expectation for its own inputs.
+      EXPECTED_TARGETS: "3"
     steps:
+      # SHA-pinned, unlike `preflight`'s and `build`'s: this job's token can
+      # write the repository AND mint the OIDC identity our provenance is
+      # signed with, so the first action it runs is not left on a mutable tag.
+      # See the carve-out note in the `build` job above.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # This job's token can write to the repository. `persist-credentials`
           # would leave it in .git/config for every later step to read; `gh`
@@ -569,8 +761,8 @@ jobs:
           find . -maxdepth 1 -type f -name '*.tar.gz' -exec basename {} ';' \
             | sort >"$work/tarballs.txt"
           count="$(grep -c . "$work/tarballs.txt" || true)"
-          if [ "${count:-0}" -ne 3 ]; then
-            echo "::error title=Missing release artifacts::Expected 3 tarballs (one per target) but found ${count:-0}. A release that silently omits a platform is worse than no release — stopping before publish."
+          if [ "${count:-0}" -ne "$EXPECTED_TARGETS" ]; then
+            echo "::error title=Missing release artifacts::Expected $EXPECTED_TARGETS tarballs (one per target) but found ${count:-0}. A release that silently omits a platform is worse than no release — stopping before publish."
             exit 65
           fi
 
@@ -631,7 +823,21 @@ jobs:
       - name: Attest build provenance for the tarballs (AC-2 / ADR-550-3)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: staging/*.tar.gz
+          # checksums.txt is a SUBJECT, not a bystander. It used to be left out,
+          # and that left the one file users are told to trust as the only
+          # published asset with no provenance at all: an attacker who could
+          # replace it on the release page could relist any digests they liked,
+          # and every reader following the runbook's `shasum -c` would verify
+          # against the attacker's numbers and see a pass. Attesting it closes
+          # that: the digest list is now itself covered by a claim naming this
+          # workflow, at this commit, and the gate below re-verifies it as one
+          # of the four subjects.
+          #
+          # Multi-line because `subject-path` takes a newline-separated list of
+          # globs; the action hashes what each one expands to on disk.
+          subject-path: |
+            staging/*.tar.gz
+            staging/checksums.txt
 
       - name: Publish GitHub Release
         env:
@@ -659,10 +865,22 @@ jobs:
             # a literal here and a variable everywhere else on purpose: this
             # job declares no environment, so `vars.APPLE_TEAM_ID` — which
             # lives on `release-signing` — does not resolve in it, and a notes
-            # line that silently rendered "Team ``" would be worse than one
-            # that cannot drift because it is spelled out. If the team ever
-            # changes, this line and the release-signing variable change
-            # together or the smoke gate goes red before anyone reads the notes.
+            # line that silently rendered "Team ``" would be worse than a
+            # spelled-out one.
+            #
+            # Be clear about what that costs, because an earlier version of
+            # this comment was not: this literal is UNVERIFIED AT RUN TIME.
+            # Nothing in this workflow compares it against the team the
+            # binaries were actually signed with. The smoke gate checks the
+            # signature against `vars.APPLE_TEAM_ID`, which is a different
+            # value read from a different place — if the two ever disagree,
+            # every gate in this pipeline still goes green and the release
+            # notes simply state the wrong team. What pins them together is a
+            # consistency case in tools/release/selftest.sh, which reads this
+            # file and the others carrying the id and fails when they diverge.
+            # That check runs in CI, not here. If you change the team id,
+            # changing it in one place is caught by that selftest and by
+            # nothing else in this workflow.
             printf -- '- macOS binaries (`teton` and `teton-code`) are signed with an Apple Developer ID Application certificate (Team `545BU9G9D6`); the release gate verified that signature against these exact tarballs. Linux binaries are **unsigned** in v1.\n\n'
             printf 'Every artifact passed the release smoke gate: `teton` and `teton-code` both report %s, the release build refuses `TETON_TEST_SEAMS=1` rather than honouring the test seams, and `teton doctor` completed a live handshake against a freshly started daemon.\n\n' "$VERSION"
             printf '### Checksums (sha256)\n\n```\n'
@@ -682,17 +900,43 @@ jobs:
             exit 0
           fi
 
-          # --verify-tag: refuse to invent a tag. If the tag is not already on
-          # the remote, something is wrong upstream of here and the fix is not
-          # for this step to create one.
-          gh release create "$TAG" \
-            --verify-tag \
-            --title "teton $VERSION" \
-            --notes-file "$notes" \
+          # Create-if-absent, then upload separately. Both halves are about the
+          # RE-RUN, which is not a hypothetical: the attestation gate, the tap
+          # bump and the install check all run after this step, and any of them
+          # going red leaves a published release behind. "Re-run failed jobs"
+          # is then the obvious next move, and the previous shape of this step
+          # — one `gh release create` carrying its assets — died on
+          # "release already exists" before it could re-upload anything. The
+          # recovery path was to delete the release by hand first, which is the
+          # most dangerous manual step in the runbook sitting on the unhappy
+          # path.
+          #
+          # --verify-tag stays on the create: refuse to invent a tag. If the
+          # tag is not already on the remote, something is wrong upstream of
+          # here and the fix is not for this step to mint one.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Deliberately NOT re-writing the body. The notes rendered above are
+            # a function of the tag and this run's checksums, so on a re-run of
+            # the same tag they are the same notes — and if a human edited the
+            # release text between runs, silently reverting it would be the
+            # surprising behaviour. The ASSETS are what this step re-asserts.
+            echo "::notice title=Release $TAG already exists::Re-using it rather than failing. This is what a re-run after a downstream gate failure looks like; the assets below are re-uploaded and the existing release body is left as it is."
+          else
+            gh release create "$TAG" \
+              --verify-tag \
+              --title "teton $VERSION" \
+              --notes-file "$notes"
+          fi
+
+          # --clobber so a re-run REPLACES the assets instead of failing on
+          # names that already exist. The bytes are this run's staged artifacts,
+          # which the step above attested, so replacing is the correct outcome:
+          # what is served must be what was attested.
+          gh release upload "$TAG" --clobber \
             staging/*.tar.gz \
             staging/checksums.txt
 
-          echo "::notice title=Release published::$TAG is live with 3 tarballs and checksums.txt."
+          echo "::notice title=Release published::$TAG is live with $EXPECTED_TARGETS tarballs and checksums.txt."
 
       # AC-2 / ADR-550-3 — the gate half. The step above CREATED provenance;
       # this one asks GitHub to VERIFY it, against the bytes a user would
@@ -714,9 +958,25 @@ jobs:
       # rather than read out of `staging/`. Verifying the local copies would
       # prove provenance for bytes this job already had; the question worth
       # answering is whether what GitHub is now serving verifies. On a dry run
-      # there is nothing published, so it checks this run's staged tarballs —
-      # the same bytes the attestation above covers — and says which it did.
+      # there is nothing published, so it checks this run's staged files — the
+      # same bytes the attestation above covers — and says which it did.
       # Either way the gate RUNS; there is no mode in which it is skipped.
+      #
+      # EVERY published asset is fetched, checksums.txt included — not just the
+      # tarballs. The batch verifier's first act is to re-derive each tarball's
+      # sha256 and compare it against the line checksums.txt carries for it,
+      # which is a check this step could not previously make at all: it
+      # downloaded only the tarballs, so "the digests GitHub is serving in
+      # checksums.txt describe the tarballs GitHub is serving" was asserted
+      # nowhere in this pipeline.
+      #
+      # The loop that used to live here is gone. Its logic — count the inputs,
+      # verify each one, tally failures separately from non-verdicts, report
+      # every asset before exiting — is now
+      # tools/release/verify-attestations-batch.sh, which the tooling job's
+      # selftest can drive through every branch with stand-ins via TETON_GH. An
+      # inline loop in a workflow is testable only by cutting a release, which
+      # is the reason gates like this one rot unnoticed. Do not re-inline it.
       - name: Verify attestations (gate) (AC-2 / ADR-550-3)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -725,29 +985,35 @@ jobs:
         run: |
           set -uo pipefail
 
+          scratch=""
           if [ "$PUBLISH" = "true" ]; then
-            scratch="$(mktemp -d)"
-            if ! gh release download "$TAG" --dir "$scratch" --pattern '*.tar.gz'; then
-              echo "::error title=Attestation gate UNCHECKED (AC-2)::'gh release download $TAG' failed, so the published assets could not be fetched and nothing was learned about their provenance. That is not a pass — failing rather than letting the tap bump follow an unverified release."
+            # `|| scratch=""` rather than a bare assignment: the runner's shell
+            # is `bash -e`, and an unguarded command substitution that fails
+            # would abort this step with mktemp's own exit 1 — a red gate whose
+            # status says "supply chain" when the truth is "no temp space".
+            scratch="$(mktemp -d)" || scratch=""
+            if [ -z "$scratch" ] || [ ! -d "$scratch" ]; then
+              echo "::error title=Attestation gate UNCHECKED (AC-2)::'mktemp -d' could not create a scratch directory on this runner, so the published assets could not be downloaded. A temp-directory failure says nothing about the artifacts — this is UNCHECKED, not a rejection."
               exit 75
             fi
+            if ! gh release download "$TAG" --dir "$scratch" \
+                --pattern '*.tar.gz' --pattern 'checksums.txt'; then
+              echo "::error title=Attestation gate UNCHECKED (AC-2)::'gh release download $TAG' failed, so the published assets could not be fetched and nothing was learned about their provenance. That is not a pass — failing rather than letting the tap bump follow an unverified release."
+              # `|| true`: errexit is on, and a cleanup that failed would abort
+              # this step with rm's status instead of the 75 the line above
+              # just explained.
+              rm -rf "$scratch" || true
+              exit 75
+            fi
+            dir="$scratch"
             source_note="the assets GitHub is serving for $TAG"
           else
-            # No release exists on a dry run, so the subjects are the tarballs
-            # the attestation step above actually attested.
-            scratch="staging"
-            source_note="this run's staged tarballs (nothing was published)"
-          fi
-
-          # Guarded before the loop: `for f in "$scratch"/*.tar.gz` with no
-          # matches iterates once over the literal glob, and verify-attestation
-          # would report that non-file as UNCHECKED — a true statement about
-          # the wrong thing. "There are no tarballs here" deserves its own
-          # error.
-          count="$(find "$scratch" -maxdepth 1 -type f -name '*.tar.gz' | grep -c . || true)"
-          if [ "${count:-0}" -ne 3 ]; then
-            echo "::error title=Attestation gate UNCHECKED (AC-2)::Expected 3 tarballs to verify but found ${count:-0} in $scratch. A gate that checks two of three assets and reports success is worse than one that does not run."
-            exit 75
+            # No release exists on a dry run, so the subjects are the files the
+            # attestation step above actually attested — which now includes
+            # checksums.txt, so the dry run exercises the digest cross-check
+            # too rather than a reduced version of the gate.
+            dir="staging"
+            source_note="this run's staged tarballs and checksums.txt (nothing was published)"
           fi
 
           # The repository is spelled out rather than taken from
@@ -757,42 +1023,53 @@ jobs:
           # — the check would follow wherever it was copied to instead of
           # naming what it trusts. It is also, letter for letter, the command
           # in the runbook.
-          failed=0
-          unchecked=0
-          for tarball in "$scratch"/*.tar.gz; do
-            status=0
-            bash tools/release/verify-attestation.sh "$tarball" atelier-fashion/teton-code \
-              || status=$?
+          #
+          # The third argument names the workflow file that is allowed to have
+          # signed these claims. Without it, an attestation minted by ANY
+          # workflow in this repository satisfies the gate — including one a
+          # pull request could add — so the assertion would be "someone with
+          # write access built this" rather than "the release pipeline did".
+          status=0
+          bash tools/release/verify-attestations-batch.sh \
+            "$dir" atelier-fashion/teton-code .github/workflows/release.yml \
+            || status=$?
 
-            case "$status" in
-              0)
-                echo "::notice title=Attestation verified ($(basename "$tarball"))::GitHub confirms provenance for these bytes from atelier-fashion/teton-code."
-                ;;
-              65)
-                echo "::error title=Attestation FAILED ($(basename "$tarball"))::gh verified and REJECTED this artifact — either nothing attests these bytes or the attestation that claims to does not verify. Treat this as a supply-chain alarm: the artifact served for $TAG is not the artifact this workflow attested. The tap will NOT be bumped."
-                failed=$((failed + 1))
-                ;;
-              *)
-                echo "::error title=Attestation UNCHECKED ($(basename "$tarball")) (exit $status)::The verification could not reach a verdict — no gh, missing file, or an auth/rate-limit/network failure. Deliberately not reported as a rejection, and deliberately not treated as a pass. The tap will NOT be bumped."
-                unchecked=$((unchecked + 1))
-                ;;
-            esac
-          done
-
-          # Every asset is checked before any exit, for the same reason the
-          # build matrix sets `fail-fast: false`: one bad tarball out of three
-          # and three bad tarballs are very different incidents, and stopping
-          # at the first hides which one this is.
-          if [ "$failed" -gt 0 ]; then
-            echo "::error title=Attestation gate FAILED (AC-2)::$failed of $count released tarballs do not verify against atelier-fashion/teton-code. Checked: $source_note."
-            exit 65
-          fi
-          if [ "$unchecked" -gt 0 ]; then
-            echo "::error title=Attestation gate UNCHECKED (AC-2)::$unchecked of $count tarballs could not be verified at all, so their provenance is unknown. Checked: $source_note."
-            exit 75
+          # Removed here rather than in a trap: only a directory THIS step
+          # created is removable, and `staging/` belongs to the job. Runs after
+          # the verifier and before the exits below so every path is covered.
+          #
+          # `|| true` because errexit is on and $status is already captured: a
+          # failing rm must not overwrite a verdict this step has already
+          # reached. Losing a scratch directory on a runner that is about to be
+          # destroyed is not worth a red gate, and it is certainly not worth a
+          # red gate that reports the wrong reason.
+          if [ -n "$scratch" ]; then
+            rm -rf "$scratch" || true
           fi
 
-          echo "::notice title=Attestation gate PASSED (AC-2)::All $count tarballs carry verifiable build provenance from atelier-fashion/teton-code. Checked: $source_note."
+          # 0/65/anything-else, and the `*` branch is the load-bearing one: a
+          # missing batch script exits 127, a usage error exits 64, and both
+          # must land on UNCHECKED rather than being rounded into either a pass
+          # or a supply-chain alarm (LESSON-442).
+          case "$status" in
+            0)
+              echo "::notice title=Attestation gate PASSED (AC-2)::All $EXPECTED_TARGETS tarballs and checksums.txt carry verifiable build provenance from atelier-fashion/teton-code's release workflow, and each tarball's sha256 matches the line checksums.txt carries for it. Checked: $source_note."
+              ;;
+            65)
+              # Worded to exactly what a 65 proves and no further. It does NOT
+              # establish that anyone tampered with anything, or which asset an
+              # attacker touched; it establishes that one of two claims this
+              # run is supposed to be able to make came back false. Naming the
+              # two claims is what makes the annotation actionable — an alarm
+              # that overstates gets argued with, and then ignored.
+              echo "::error title=Attestation gate FAILED (AC-2)::At least one asset failed verification. What this proves: the bytes are NOT all covered by a build attestation from atelier-fashion/teton-code's own release workflow, and/or a tarball's sha256 does not match the digest checksums.txt lists for it. See the log for which assets and which check. Treat it as a supply-chain alarm until shown otherwise. The tap will NOT be bumped. Checked: $source_note."
+              exit 65
+              ;;
+            *)
+              echo "::error title=Attestation gate UNCHECKED (AC-2) (exit $status)::The verification could not reach a verdict — no gh, a missing or unreadable input, a malformed invocation, or an auth/rate-limit/network failure. Nothing was learned about these bytes. Deliberately not reported as a rejection, and deliberately not treated as a pass. The tap will NOT be bumped. Checked: $source_note."
+              exit "$status"
+              ;;
+          esac
 
   # BR-4: the release is not finished when the Release page appears — it is
   # finished when the tap points at it, and points at something that installs
@@ -810,15 +1087,23 @@ jobs:
     # looks exactly like a gate that passed (LESSON-443).
     runs-on: macos-15
     # REQ-550 BR-4: HOMEBREW_TAP_TOKEN resolves from the tap-publish
-    # environment (tag rule v*.*.*); repo-level copy retired per
-    # docs/release-runbook.md checklist.
+    # environment, whose rules admit exactly two shapes of ref — the `main`
+    # BRANCH and `v*.*.*` TAGS. The repo-level copy of the token is retired per
+    # docs/release-runbook.md's checklist, so this environment is the only place
+    # it lives.
     #
     # Every `secrets.HOMEBREW_TAP_TOKEN` reference below is unchanged in text
     # and different in meaning: with this declaration the name resolves out of
-    # the environment rather than the repository, so the tap's write
-    # credential is reachable only from a run this environment's tag rule
-    # admits. The dry-run path still reads nothing — it exits before the token
-    # is needed and says so.
+    # the environment rather than the repository, so the tap's write credential
+    # is reachable only from a run this environment admits.
+    #
+    # The `main` rule is what lets a dry run from `main` reach this job at all
+    # instead of dying on an environment that refuses the ref — the same reason
+    # release-signing carries it. It does NOT loosen BR-4: a dry run exits this
+    # job before the token is read, and says so, and `needs.preflight.outputs.
+    # publish` is what gates every step that could write the tap. Admitting the
+    # ref and using the credential are two different things, and only the first
+    # is what these rules decide.
     environment: tap-publish
     # The tap is one file in one repository, so writing it is a repo-wide
     # critical section — NOT a per-ref one like the workflow-level group above.
@@ -847,8 +1132,11 @@ jobs:
       # letting it happen is better than catching it.
       HOMEBREW_NO_AUTO_UPDATE: 1
     steps:
+      # SHA-pinned: this job holds HOMEBREW_TAP_TOKEN, a push credential for a
+      # repository every `brew install` reads. See the carve-out note in the
+      # `build` job above.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # This job holds the tap's write credential. Leaving the repository's
           # own token in .git/config for the whole job — through a `brew
@@ -1528,8 +1816,11 @@ jobs:
       # sitting on the runner before `brew install` runs is a difference from
       # the user's machine that would have to be argued about. Nothing above
       # needs the repository; the step below needs one script from it.
+      # SHA-pinned: this job runs the provenance gate a user would run, and
+      # carries `attestations: read` to do it. A moved tag here could change
+      # the script the gate executes. See the carve-out note in `build`.
       - name: Checkout (for the verification script only)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -1572,8 +1863,20 @@ jobs:
             exit 75
           fi
 
+          # verify-attestation.sh directly, not the batch wrapper: this job
+          # verifies ONE asset — the tarball for the architecture it is running
+          # on — and the batch script's contract is a directory holding the
+          # complete release. Passing it a directory of one would be asking it
+          # to fail a completeness check this job is deliberately not making.
+          #
+          # The third argument pins WHICH workflow may have signed the claim,
+          # matching the release job's gate. It matters more here than there:
+          # this step is the one whose command docs/release-runbook.md prints
+          # for a human to run, so an argument the gate uses and the runbook
+          # omits would be a documented command weaker than the one CI runs.
           status=0
-          bash tools/release/verify-attestation.sh "$scratch/$asset" atelier-fashion/teton-code \
+          bash tools/release/verify-attestation.sh "$scratch/$asset" \
+            atelier-fashion/teton-code .github/workflows/release.yml \
             || status=$?
 
           case "$status" in
