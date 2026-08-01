@@ -541,6 +541,16 @@ That is why the identity has to be *stable*, not merely *present* — an unsigne
 release, or one signed by a different team, is a new identity to macOS and every
 grant is asked for again.
 
+**The keychain window — closed 2026-08-01.** The certificate is imported into a
+throwaway keychain inside the `build` job and destroyed before that job ends, so
+no key material survives the run. REQ-551 moved that import to *after* every line
+of third-party code has finished compiling, which closes the accepted risk
+REQ-550 recorded: the keychain now exists only around the seconds of signing,
+instead of spanning the ~30 minutes of `cargo build` and llama.cpp cmake that
+used to run beside it. What still shares the runner with it — the tarball smoke
+and the artifact upload — is written out in the workflow's own residual note,
+because a smaller window is not no window.
+
 ### Checking a signed release by hand
 
 Continuing from §5 — the tarballs are already in `/tmp/rel`:
@@ -628,7 +638,10 @@ Where it surfaces, in the order a run reaches them:
   certificate would not import` (usually a wrong `MACOS_CERT_PASSWORD`, or a
   `.p12` exported without its private key), or `No Developer ID identity for
   team 545BU9G9D6` (it imported, but it is the wrong *kind* of certificate).
-  Nothing is built on that leg.
+  Since REQ-551 that step runs *after* the compile, so its own
+  `Nothing was built.` annotations now overstate the case: the leg did build.
+  What did not happen is any signing — no tarball is written, and nothing from
+  that leg can ship.
 - **`package.sh`, exit `70`** — signing was requested and codesign could not
   carry it out, or it signed and then its own `--verify --strict` rejected the
   result. No tarball is written: a signing-requested build never ships unsigned.

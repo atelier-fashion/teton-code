@@ -1,7 +1,7 @@
 ---
 id: TASK-028
 title: "release.yml: move the import between build and pack; docs truth-flip"
-status: draft
+status: complete
 parent: REQ-551
 created: 2026-08-01
 updated: 2026-08-01

@@ -296,6 +296,55 @@ jobs:
             exit 75
           fi
 
+      # THE SPLIT (ADR-551-1), and the ORDER of the steps below is the whole of
+      # REQ-551. What was a single "Build and package" step on a macOS leg is
+      # now three: compile with no signing identity anywhere on the machine →
+      # import the identity → sign and tar in a step that compiles nothing. The
+      # import step sits BETWEEN the first and the last on purpose. Moving it
+      # back above the build is a REQ-551 regression, not a formatting choice.
+      #
+      # Values reach the shell through `env:`, never by being pasted into the
+      # script body: a `${{ }}` interpolation is a textual splice into the
+      # program, and `$VERSION` is derived from a git ref. The smoke step below
+      # has always done it this way; all three of these match it.
+      #
+      # macOS only. `build` compiles and stages the two binaries under
+      # `dist/stage-<target>/` and stops there: it resolves no signing tool and
+      # never reads TETON_SIGN_IDENTITY, which is why this step carries no
+      # signing env for it to read. The ~30 minutes this spends — every
+      # third-party crate's build script, plus a full llama.cpp cmake, running
+      # as this user — is exactly the window REQ-551 exists to keep a Developer
+      # ID private key out of (BR-1).
+      - name: Build (unsigned)
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          bash tools/release/package.sh "$TARGET" "$VERSION" dist build
+
+      # The Linux leg keeps ONE invocation. `all` is byte for byte what
+      # package.sh did before the phase argument existed (BR-5): there is no
+      # keychain on this leg and no key to keep away from the compiler, so
+      # splitting it would buy nothing and cost a step. TETON_SIGN_IDENTITY is
+      # the empty string — the same value the target ternary produced for this
+      # leg before the split — which package.sh reads as "dev build, stay
+      # ad-hoc": the honest v1 answer for a target with no signing story (BR-6),
+      # said out loud by the smoke rather than silently skipped.
+      #
+      # Deliberately NOT a copy of the `format(...)` identity expression: that
+      # string exists in exactly two places (the import step and "Sign and
+      # package"), and a third spelling of it here would be a third place to
+      # forget.
+      - name: Build and package (Linux, unsigned)
+        if: ${{ !contains(matrix.target, 'apple-darwin') }}
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TETON_SIGN_IDENTITY: ""
+        run: |
+          bash tools/release/package.sh "$TARGET" "$VERSION" dist all
+
       # ADR-550-2: a throwaway keychain, created here and destroyed by the
       # cleanup step at the bottom of this job. Nothing persists on the runner
       # and no key material is ever written outside $RUNNER_TEMP.
@@ -322,13 +371,13 @@ jobs:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-          # The SAME expression the Build step's TETON_SIGN_IDENTITY uses, so
-          # the string this step asserts the keychain contains is the string
-          # package.sh will later ask codesign for — character for character,
-          # from one `format()` call duplicated in two places rather than one
-          # spelling paraphrased into another. Quoted for the same reason it is
-          # quoted there: the identity carries a `: ` that bare YAML would read
-          # as a second mapping key.
+          # The SAME expression the "Sign and package" step's
+          # TETON_SIGN_IDENTITY uses, so the string this step asserts the
+          # keychain contains is the string package.sh will later ask codesign
+          # for — character for character, from one `format()` call duplicated
+          # in two places rather than one spelling paraphrased into another.
+          # Quoted for the same reason it is quoted there: the identity carries
+          # a `: ` that bare YAML would read as a second mapping key.
           TETON_SIGN_IDENTITY: "${{ format('Developer ID Application: Atelier Fashion LLC ({0})', vars.APPLE_TEAM_ID) }}"
         run: |
           # `set +e` EXPLICITLY, not merely "no set -e". GitHub's default shell
@@ -444,10 +493,13 @@ jobs:
           fi
 
           # No arguments: this clears the lock-on-sleep and lock-after-timeout
-          # settings entirely. The default 5-minute timeout would relock the
-          # keychain partway through the llama.cpp build in the next step, and
-          # codesign would then fail against a locked keychain — a signing
-          # failure whose real cause is a clock.
+          # settings entirely. The default 5-minute timeout used to be able to
+          # relock the keychain partway through the llama.cpp build, which no
+          # longer runs after this step (REQ-551) — the only thing between here
+          # and codesign now is the signing step, measured in seconds. The
+          # setting stays anyway: a keychain that relocks for any reason at all
+          # — a queued step, a slow runner, a re-run — fails codesign with a
+          # message about the certificate whose real cause is a clock.
           if ! security set-keychain-settings "$keychain"; then
             echo "::error title=Signing keychain UNCHECKED (BR-2)::'security set-keychain-settings' failed, so the keychain may auto-lock mid-build and codesign would fail for a reason that has nothing to do with the certificate. Nothing was built."
             exit 75
@@ -470,11 +522,13 @@ jobs:
 
           # The decoded .p12 dies HERE, the instant `security import` has
           # consumed it — not at the end of the job. Between this line and the
-          # cleanup step sits `cargo build`, which runs the build scripts of
-          # every third-party crate in the dependency tree and a full llama.cpp
-          # cmake, as this user, with $RUNNER_TEMP readable. That is a long
-          # window in which an unencrypted Developer ID PRIVATE KEY would be
-          # sitting in a file any of them could read, for no benefit: the key is
+          # cleanup step sits everything that is left of this leg: the signing
+          # step, the smoke that runs the binaries this job built, and the
+          # upload. Since REQ-551 that no longer includes `cargo build` — the
+          # build scripts of every third-party crate in the dependency tree and
+          # a full llama.cpp cmake, as this user, with $RUNNER_TEMP readable —
+          # because all of it ran BEFORE this step. The removal stays regardless:
+          # a decoded key has no reason to outlive the import, since the key is
           # in the keychain now and codesign reads it from there. Narrowing the
           # window to a few milliseconds is the point.
           #
@@ -495,17 +549,24 @@ jobs:
           #     unencrypted PRIVATE KEY" sounds.
           #   * The sharper residual is the one this line does NOT close: from
           #     `security import` onward the identity sits in an UNLOCKED
-          #     keychain on the codesign search path, and `cargo build` — every
-          #     third-party build script in the dependency tree, plus a full
-          #     llama.cpp cmake — runs after it as this same user. Anything in
-          #     that build can ask codesign to sign for this identity. Removing
-          #     the .p12 does nothing about that.
+          #     keychain on the codesign search path until the cleanup step
+          #     destroys it. What runs in that window is the signing step, the
+          #     smoke — which executes the binaries this job built, third-party
+          #     library code and all — and the upload. Anything in there can
+          #     still ask codesign to sign for this identity. Removing the .p12
+          #     does nothing about that.
           #
-          # The fix for the second one is to import AFTER the build and sign as
-          # a separate step, which is a restructuring of this job and of
-          # package.sh's contract — out of scope for REQ-550, recorded here so
-          # it is a known accepted risk rather than an oversight rediscovered
-          # by whoever next reads this step.
+          # CLOSED IN PART, 2026-08-01 (REQ-551). The recorded fix for the
+          # second bullet was to import AFTER the build and sign as a separate
+          # step — a restructuring of this job and of package.sh's contract,
+          # which REQ-550 accepted as a known risk rather than an oversight.
+          # That restructuring is this step's POSITION: "Build (unsigned)"
+          # compiles the dependency tree and llama.cpp with no identity
+          # anywhere on the machine, and "Sign and package" runs after this
+          # step. What used to be ~30 minutes of arbitrary third-party build
+          # scripts running beside an unlocked Developer ID key is now the
+          # much shorter list in the bullet above. Not zero — which is why
+          # that bullet stays written out rather than deleted.
           rm -f "$p12"
 
           # Without this, macOS prompts for keychain access the first time
@@ -557,8 +618,13 @@ jobs:
 
           # The assertion, and the reason this step is worth its length: prove
           # the secret actually contained the Developer ID Application identity
-          # this pipeline is going to ASK FOR, before spending a full llama.cpp
-          # build discovering it did not.
+          # this pipeline is going to ASK FOR, rather than letting codesign
+          # discover it did not. Since REQ-551 moved this step below the build,
+          # what it saves is seconds rather than a full llama.cpp compile — the
+          # build has already happened by the time this runs. It is still the
+          # assertion worth having: it names a wrong certificate as a wrong
+          # certificate, in the step that owns the certificate, instead of
+          # surfacing as a codesign failure two steps later.
           #
           # What changed and why it matters: this used to be a `grep -F
           # "Developer ID Application"` piped into a `grep -Fq "($TEAM)"`, which
@@ -619,25 +685,30 @@ jobs:
 
           echo "::notice title=Signing identity ready (BR-2)::A Developer ID Application identity for team $APPLE_TEAM_ID is in a throwaway keychain for this leg. It is destroyed by the cleanup step at the end of the job, on every path."
 
-      # Values reach the shell through `env:`, never by being pasted into the
-      # script body: a `${{ }}` interpolation is a textual splice into the
-      # program, and `$VERSION` is derived from a git ref. The smoke step below
-      # has always done it this way; this one now matches it.
+      # macOS only, and the other half of the split above. `pack` signs the two
+      # staged binaries, verifies its own signatures, tars and hashes them. It
+      # BUILDS nothing: it packs what "Build (unsigned)" staged, and a missing
+      # or half-populated staging directory is a hard 70 rather than a tarball
+      # (ADR-551-1) — a pack that followed no build cannot ship bytes. Seconds
+      # of first-party code where there used to be half an hour of third-party
+      # compilation holding the same unlocked keychain (BR-1). What still
+      # shares the runner with the identity after this step — the smoke, the
+      # upload — is written out in the import step's residual note above,
+      # because "smaller window" is not "no window".
       #
       # TETON_SIGN_IDENTITY is conditioned on the target rather than on whether
       # a certificate happens to be present (ADR-550-1/BR-2): a macOS leg signs
-      # or dies, and the Linux leg gets the empty string, which package.sh
-      # reads as "dev build, stay ad-hoc" — the honest v1 answer for a target
-      # with no signing story (BR-6).
-      #
-      # The `format(...)` call below is written in exactly one other place: the
-      # import step's own TETON_SIGN_IDENTITY, which asserts the keychain
-      # contains this identity before this step spends a build discovering it
-      # does not. They are the same expression, so a change to the org name or
-      # the team-id variable moves both at once — the check and the thing it
-      # checks cannot describe different identities. If you edit one, edit the
-      # other; there is no third copy.
-      - name: Build and package
+      # or dies, and a guard that switches itself off when its input is missing
+      # is not a guard (LESSON-443). The ternary is kept WHOLE even though the
+      # `if:` above already makes this step macOS-only, because it is one half
+      # of a matched pair — the import step's own TETON_SIGN_IDENTITY is the
+      # same `format(...)` call, so the string the keychain was asserted to
+      # contain and the string codesign is handed here cannot describe
+      # different identities. A change to the org name or the team-id variable
+      # moves both at once. If you edit one, edit the other; there is no third
+      # copy.
+      - name: Sign and package
+        if: contains(matrix.target, 'apple-darwin')
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -645,7 +716,7 @@ jobs:
           # read as a second mapping key, not because the expression needs it.
           TETON_SIGN_IDENTITY: "${{ contains(matrix.target, 'apple-darwin') && format('Developer ID Application: Atelier Fashion LLC ({0})', vars.APPLE_TEAM_ID) || '' }}"
         run: |
-          bash tools/release/package.sh "$TARGET" "$VERSION" dist
+          bash tools/release/package.sh "$TARGET" "$VERSION" dist pack
 
       # The gate that decides whether these bytes ship (BR-7/BR-9): version
       # strings, the release build's refusal of TETON_TEST_SEAMS, and a live
