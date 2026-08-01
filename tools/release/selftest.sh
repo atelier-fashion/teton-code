@@ -2192,6 +2192,262 @@ for drift_file in "$README" "$RUNBOOK" "$FORMULA_TEMPLATE" "$RELEASE_WORKFLOW"; 
         grep -Fq -- "$SIG_TEAM_ID" "$drift_file"
 done
 
+# --- the import-after-build ordering in release.yml ------------------------
+#
+# BR-6 / ADR-551-2, and the only structural claim this suite makes about a
+# workflow file. The whole of REQ-551 is a STEP ORDER: on a macOS leg the
+# Developer ID identity is imported AFTER the ~30 minutes of third-party
+# compilation and BEFORE the seconds of signing, so that no crate's build
+# script ever runs beside an unlocked keychain holding a release key (BR-1).
+# YAML cannot express that and actionlint has no opinion about it — release.yml
+# is exactly as valid with the import step first, and until this group existed
+# the only thing holding the order in place was a comment saying it mattered.
+# REQ-550's verify pass is precisely where a comment claiming to be a guard was
+# found not to be one (LESSON-443). This group is the guard; that comment now
+# points at it by name.
+#
+# Three anchors, and they are LOAD-BEARING STRINGS rather than descriptions of
+# strings — a rename is a change to this assertion and belongs in the same
+# commit:
+#
+#   the `dist build` package.sh invocation   the unsigned compile
+#   the import step's `- name:` line         kept verbatim by TASK-028
+#   the `dist pack` package.sh invocation    sign, verify, tar
+#
+# So a missing anchor is a NAMED failure here (order-status 2), never a quiet
+# pass: an assertion that can be satisfied by deleting what it reads is not an
+# assertion, and this file has met that shape before.
+#
+# Which is why AC-4's mutation lives in the suite rather than in a sentence
+# about a mutation somebody performed by hand once and undid. Four known-bad
+# copies of the REAL release.yml are built under $work and graded on every run
+# — the import step moved above the build (the regression itself), the step
+# renamed, and each phase argument dropped — so both directions are proven
+# here, permanently, instead of asserted about a file nobody can re-check. The
+# workflow itself is only ever read; the last case in the group proves that.
+
+group "the import-after-build ordering in release.yml (BR-6 / ADR-551-2)"
+
+# Single-quoted: `$TARGET` and `$VERSION` are release.yml's text, not this
+# script's variables.
+# shellcheck disable=SC2016  # deliberate: these are the workflow's bytes
+ORDER_ANCHOR_BUILD='bash tools/release/package.sh "$TARGET" "$VERSION" dist build'
+ORDER_ANCHOR_IMPORT='- name: Import the Developer ID signing identity'
+# shellcheck disable=SC2016  # deliberate: these are the workflow's bytes
+ORDER_ANCHOR_PACK='bash tools/release/package.sh "$TARGET" "$VERSION" dist pack'
+
+# workflow_line_of <file> <fixed needle> — the line number of the ONE line
+# containing the needle; nothing at all when it appears zero times or more than
+# once.
+#
+# awk's index(), not grep: every anchor here carries `$` and `(`, and a regex
+# reading of them is a different question than the one being asked. Ambiguity
+# is deliberately treated as absence — with two matching lines "the first one"
+# is a guess about which step is meant, and guessing is the failure mode this
+# group exists to remove.
+workflow_line_of() {
+    awk -v needle="$2" '
+        index($0, needle) { hits++; if (hits == 1) line = NR }
+        END { if (hits == 1) print line }
+    ' "$1"
+}
+
+# import_order_check <workflow path> — the assertion itself, as a function so
+# that the same code grades the real workflow and every known-bad copy below.
+# That is the whole reason it is not written inline: a mutation proof that runs
+# different code from the real check proves nothing about the real check.
+#
+# Sets IMPORT_ORDER_VERDICT rather than printing, so a caller can grade a
+# failure without the verdict landing in the suite's output. Returns:
+#
+#   0  build < import < pack — the only shape REQ-551 accepts
+#   1  all three anchors are present and the order is wrong
+#   2  an anchor is missing or ambiguous, or the file could not be read; the
+#      verdict names WHICH, because "renamed" and "reordered" are different
+#      regressions with different fixes
+IMPORT_ORDER_VERDICT=""
+import_order_check() {
+    local wf="$1"
+    local build_ln import_ln pack_ln
+    IMPORT_ORDER_VERDICT=""
+
+    if [ ! -f "$wf" ]; then
+        IMPORT_ORDER_VERDICT="$wf is not a file, so no step order was read."
+        return 2
+    fi
+
+    build_ln="$(workflow_line_of "$wf" "$ORDER_ANCHOR_BUILD")"
+    import_ln="$(workflow_line_of "$wf" "$ORDER_ANCHOR_IMPORT")"
+    pack_ln="$(workflow_line_of "$wf" "$ORDER_ANCHOR_PACK")"
+
+    if [ -z "$build_ln" ]; then
+        IMPORT_ORDER_VERDICT="no single line of $wf reads '$ORDER_ANCHOR_BUILD' — the unsigned-build anchor vanished (phase argument dropped, or the invocation rewritten). Nothing about the step order was checked."
+        return 2
+    fi
+    if [ -z "$import_ln" ]; then
+        IMPORT_ORDER_VERDICT="no single line of $wf reads '$ORDER_ANCHOR_IMPORT' — the import step was renamed or removed. Nothing about the step order was checked."
+        return 2
+    fi
+    if [ -z "$pack_ln" ]; then
+        IMPORT_ORDER_VERDICT="no single line of $wf reads '$ORDER_ANCHOR_PACK' — the signing anchor vanished (phase argument dropped, or the invocation rewritten). Nothing about the step order was checked."
+        return 2
+    fi
+
+    if [ "$build_ln" -lt "$import_ln" ] && [ "$import_ln" -lt "$pack_ln" ]; then
+        IMPORT_ORDER_VERDICT="build l.$build_ln < import l.$import_ln < pack l.$pack_ln"
+        return 0
+    fi
+
+    IMPORT_ORDER_VERDICT="the identity import is not strictly between the two phases: build l.$build_ln, import l.$import_ln, pack l.$pack_ln. A Developer ID key must not be on the machine while cargo builds (BR-1/ADR-551-2)."
+    return 1
+}
+
+# expect_order <expected status> <label> <workflow path>
+expect_order() {
+    local expected="$1" label="$2" wf="$3"
+    local status=0
+    reset_case
+    import_order_check "$wf" || status=$?
+    if [ "$status" -eq "$expected" ]; then
+        report_pass "$label"
+    else
+        report_fail "$label [expected order-status $expected, got $status]" \
+            "$IMPORT_ORDER_VERDICT"
+    fi
+    return 0
+}
+
+# verdict_names <fixed string> — reads the verdict the last expect_order left.
+# `case`, not `grep -qF`, for the reason release.yml's own identity assertion
+# gives at length: a grep that is missing or killed exits non-zero, which would
+# read here as "the verdict does not say that" and turn a tool failure into a
+# report about the workflow (LESSON-442).
+verdict_names() {
+    case "$IMPORT_ORDER_VERDICT" in
+        *"$1"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# workflow_mutate <src> <dst> <needle> <replacement> — <src> copied to <dst>
+# with the FIRST occurrence of the fixed string <needle> replaced. Exits
+# non-zero when the needle was not there at all, so a mutation that silently
+# changed nothing cannot be graded as a known-bad case: that would be a
+# known-bad copy of the GOOD file, reported green.
+workflow_mutate() {
+    awk -v needle="$3" -v repl="$4" '
+        !mutated {
+            p = index($0, needle)
+            if (p) {
+                $0 = substr($0, 1, p - 1) repl substr($0, p + length(needle))
+                mutated = 1
+            }
+        }
+        { print }
+        END { exit(mutated ? 0 : 3) }
+    ' "$1" >"$2"
+}
+
+# expect_order_mutant <name> <needle> <replacement> <expected status> <verdict needle>
+#
+# Builds a known-bad copy under the scratch directory, grades it, and asserts
+# the verdict names what changed. A mutation that would not apply is itself a
+# failure, named as one.
+expect_order_mutant() {
+    local name="$1" needle="$2" repl="$3" expected="$4" verdict_needle="$5"
+    local label="$6"
+    local dst="$order_scratch/$name.yml"
+    if ! workflow_mutate "$RELEASE_WORKFLOW" "$dst" "$needle" "$repl"; then
+        report_fail "$label [the known-bad copy could not be built: release.yml no longer contains '$needle']"
+        return 0
+    fi
+    expect_order "$expected" "$label" "$dst"
+    assert "  ... and the verdict names it: '$verdict_needle'" \
+        verdict_names "$verdict_needle"
+    return 0
+}
+
+order_scratch="$work/release-yml-mutants"
+mkdir -p "$order_scratch"
+order_workflow_before="$(sha256_of "$RELEASE_WORKFLOW")"
+
+# The real file, and the case that goes red the day someone moves the step.
+expect_order 0 "release.yml imports the identity AFTER the build and BEFORE the pack" \
+    "$RELEASE_WORKFLOW"
+
+# Each anchor as its own case, so a rename or a dropped phase argument names
+# ITSELF in the log rather than arriving as one opaque ordering failure.
+assert "the unsigned build is still invoked with the 'build' phase argument" \
+    grep -Fq -- "$ORDER_ANCHOR_BUILD" "$RELEASE_WORKFLOW"
+assert "the import step is still named 'Import the Developer ID signing identity'" \
+    grep -Fq -- "$ORDER_ANCHOR_IMPORT" "$RELEASE_WORKFLOW"
+assert "the signing pass is still invoked with the 'pack' phase argument" \
+    grep -Fq -- "$ORDER_ANCHOR_PACK" "$RELEASE_WORKFLOW"
+
+# KNOWN-BAD, and the reason this group exists: AC-4's mutation, run on every
+# suite run instead of once by hand. The whole import step — from its `- name:`
+# line to the line before the next step's — is lifted out of a copy and
+# reinserted immediately above the step that invokes the `build` phase, which
+# is the pre-REQ-551 workflow and the exact regression a reviewer would wave
+# through as "just moving a step back". The build step's own `- name:` line is
+# DERIVED from the build anchor (the last `- name:` at or above it) rather than
+# spelled out, so this mutation carries no fourth string to keep in sync.
+order_moved="$order_scratch/import-above-build.yml"
+order_move_status=0
+awk -v import_anchor="$ORDER_ANCHOR_IMPORT" -v build_anchor="$ORDER_ANCHOR_BUILD" '
+    { lines[NR] = $0 }
+    /^      - name: / { last_name = NR }
+    !build_step && index($0, build_anchor) { build_step = last_name }
+    !imp_start && index($0, import_anchor) { imp_start = NR }
+    imp_start && !imp_end && NR > imp_start && /^      - name: / { imp_end = NR - 1 }
+    END {
+        if (!imp_start || !build_step || build_step >= imp_start) exit 3
+        if (!imp_end) imp_end = NR
+        for (i = 1; i <= NR; i++) {
+            if (i == build_step)
+                for (j = imp_start; j <= imp_end; j++) print lines[j]
+            if (i >= imp_start && i <= imp_end) continue
+            print lines[i]
+        }
+    }
+' "$RELEASE_WORKFLOW" >"$order_moved" || order_move_status=$?
+
+if [ "$order_move_status" -ne 0 ]; then
+    report_fail "a copy with the import step moved ABOVE the build (AC-4) [the mutation could not be constructed from release.yml, awk exited $order_move_status]"
+else
+    expect_order 1 "a copy with the import step moved ABOVE the build -> RED (AC-4)" \
+        "$order_moved"
+    assert "  ... naming the inversion rather than a missing anchor" \
+        verdict_names "not strictly between"
+fi
+
+# KNOWN-BAD: the step renamed. The anchor is a step NAME, so this is the
+# realistic drift — and the one that must not read as "the order is fine".
+expect_order_mutant renamed-import \
+    "$ORDER_ANCHOR_IMPORT" "- name: Set up code signing" \
+    2 "$ORDER_ANCHOR_IMPORT" \
+    "a copy whose import step is RENAMED -> RED, not a vacuous pass"
+
+# KNOWN-BAD: the phase arguments dropped, which is how the split gets undone
+# one invocation at a time. `dist` alone is package.sh's `all` default — a
+# single step that compiles AND signs, with the identity already imported.
+# shellcheck disable=SC2016  # deliberate: the workflow's bytes, not ours
+expect_order_mutant no-build-phase \
+    "$ORDER_ANCHOR_BUILD" 'bash tools/release/package.sh "$TARGET" "$VERSION" dist' \
+    2 "$ORDER_ANCHOR_BUILD" \
+    "a copy with the 'build' phase argument dropped -> RED"
+# shellcheck disable=SC2016  # deliberate: the workflow's bytes, not ours
+expect_order_mutant no-pack-phase \
+    "$ORDER_ANCHOR_PACK" 'bash tools/release/package.sh "$TARGET" "$VERSION" dist' \
+    2 "$ORDER_ANCHOR_PACK" \
+    "a copy with the 'pack' phase argument dropped -> RED"
+
+# Four mutations, none of them to the tracked file. A suite that edits the
+# workflow it asserts about — even to put it back — is one interrupted run away
+# from a working tree nobody trusts.
+assert "release.yml itself was never written to: every mutation was a copy" \
+    [ "$(sha256_of "$RELEASE_WORKFLOW")" = "$order_workflow_before" ]
+
 # --- summary ---------------------------------------------------------------
 
 total=$((passed + failed))

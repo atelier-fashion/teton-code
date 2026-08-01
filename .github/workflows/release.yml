@@ -365,6 +365,21 @@ jobs:
       # macOS leg either finishes this step with a usable identity or the leg
       # dies — the "should we sign?" predicate is the target, never the
       # availability of the cert (LESSON-443's self-disabling-guard shape).
+      #
+      # WHERE this step sits is the whole of REQ-551, and it is enforced rather
+      # than merely stated: it runs after "Build (unsigned)" and before "Sign
+      # and package" so that no third-party build script ever executes beside
+      # an unlocked keychain holding this key (BR-1). The group
+      # "the import-after-build ordering in release.yml" in
+      # tools/release/selftest.sh reads this file on every PR and fails unless
+      # the import lies strictly between the two package.sh phase invocations
+      # (BR-6 / ADR-551-2) — a comment claiming to be a guard is what
+      # LESSON-443 is about, so this one names the guard instead of being it.
+      # That assertion anchors on three literals: this step's `- name:` line
+      # below, and the `dist build` / `dist pack` arguments on the two steps
+      # around it. Renaming or rewriting any of them turns the selftest red on
+      # purpose — the fix is to move the assertion in the same commit, never to
+      # delete the anchor it lost.
       - name: Import the Developer ID signing identity (BR-2 / ADR-550-2)
         if: contains(matrix.target, 'apple-darwin')
         env:
@@ -412,7 +427,7 @@ jobs:
             echo "TETON_SIGNING_KEYCHAIN=$keychain"
             echo "TETON_SIGNING_P12=$p12"
           } >>"$GITHUB_ENV"; then
-            echo "::error title=Signing workspace UNCHECKED (BR-2)::Could not write the keychain and certificate paths to \$GITHUB_ENV ('$GITHUB_ENV'), so the 'if: always()' cleanup step would not know what to destroy. Refusing to import a Developer ID private key that nothing is guaranteed to clean up. This is a runner fault and says nothing about MACOS_CERT_P12. Nothing was built."
+            echo "::error title=Signing workspace UNCHECKED (BR-2)::Could not write the keychain and certificate paths to \$GITHUB_ENV ('$GITHUB_ENV'), so the 'if: always()' cleanup step would not know what to destroy. Refusing to import a Developer ID private key that nothing is guaranteed to clean up. This is a runner fault and says nothing about MACOS_CERT_P12. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             rm -f "$p12"
             exit 75
           fi
@@ -426,12 +441,12 @@ jobs:
           # never the problem. RUNNER_TEMP being unwritable is a runner fault,
           # so this is 75 (nothing was learned), never 65.
           if [ -z "$p12" ] || [ ! -e "$p12" ]; then
-            echo "::error title=Signing workspace UNCHECKED (BR-2)::'mktemp' could not create a temporary file under RUNNER_TEMP ('$RUNNER_TEMP'), so there is nowhere to decode the certificate to. This is a temp-directory failure on the runner and says NOTHING about MACOS_CERT_P12. Nothing was built."
+            echo "::error title=Signing workspace UNCHECKED (BR-2)::'mktemp' could not create a temporary file under RUNNER_TEMP ('$RUNNER_TEMP'), so there is nowhere to decode the certificate to. This is a temp-directory failure on the runner and says NOTHING about MACOS_CERT_P12. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
           if [ -z "${MACOS_CERT_P12:-}" ] || [ -z "${MACOS_CERT_PASSWORD:-}" ]; then
-            echo "::error title=Signing identity UNAVAILABLE (BR-2)::MACOS_CERT_P12 and/or MACOS_CERT_PASSWORD resolved empty on a macOS release leg, so no Developer ID identity could be imported and nothing can be signed. Either the release-signing environment did not attach to this run — its rules admit the 'main' branch and 'v*.*.*' tags, and this run is on '$GITHUB_REF_NAME' — or the secrets are missing from it. Nothing was built."
+            echo "::error title=Signing identity UNAVAILABLE (BR-2)::MACOS_CERT_P12 and/or MACOS_CERT_PASSWORD resolved empty on a macOS release leg, so no Developer ID identity could be imported and nothing can be signed. Either the release-signing environment did not attach to this run — its rules admit the 'main' branch and 'v*.*.*' tags, and this run is on '$GITHUB_REF_NAME' — or the secrets are missing from it. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -443,7 +458,7 @@ jobs:
           # shared `format()` expression ever renders empty, this step must
           # say so rather than pass.
           if [ -z "${TETON_SIGN_IDENTITY:-}" ]; then
-            echo "::error title=Signing identity string is empty (BR-2)::TETON_SIGN_IDENTITY rendered empty, so this step has no identity to assert the imported certificate against and the assertion below would accept anything. Nothing was built."
+            echo "::error title=Signing identity string is empty (BR-2)::TETON_SIGN_IDENTITY rendered empty, so this step has no identity to assert the imported certificate against and the assertion below would accept anything. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -453,7 +468,7 @@ jobs:
           # nothing, reporting a bad certificate for what is really an
           # unconfigured variable.
           if [ -z "${APPLE_TEAM_ID:-}" ]; then
-            echo "::error title=APPLE_TEAM_ID is not set (BR-2)::The release-signing environment variable APPLE_TEAM_ID resolved empty, so neither the signing identity nor the smoke gate's expected team could be named. Nothing was built."
+            echo "::error title=APPLE_TEAM_ID is not set (BR-2)::The release-signing environment variable APPLE_TEAM_ID resolved empty, so neither the signing identity nor the smoke gate's expected team could be named. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -468,17 +483,17 @@ jobs:
           # password.
           keychain_pw="$(uuidgen)"
           if [ -z "$keychain_pw" ]; then
-            echo "::error title=Signing keychain UNCHECKED (BR-2)::uuidgen produced no password for the throwaway keychain. Refusing to fall back to a fixed one — an empty or predictable keychain password on a shared runner image is not a thing this pipeline creates. Nothing was built."
+            echo "::error title=Signing keychain UNCHECKED (BR-2)::uuidgen produced no password for the throwaway keychain. Refusing to fall back to a fixed one — an empty or predictable keychain password on a shared runner image is not a thing this pipeline creates. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
           echo "::add-mask::$keychain_pw"
 
           if ! printf '%s' "$MACOS_CERT_P12" | base64 --decode >"$p12"; then
-            echo "::error title=Signing certificate UNREADABLE (BR-2)::MACOS_CERT_P12 is not decodable base64, so no .p12 was produced and no identity was imported. Re-encode the certificate with 'base64 -i cert.p12' and update the secret. Nothing was built."
+            echo "::error title=Signing certificate UNREADABLE (BR-2)::MACOS_CERT_P12 is not decodable base64, so no .p12 was produced and no identity was imported. Re-encode the certificate with 'base64 -i cert.p12' and update the secret. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
           if [ ! -s "$p12" ]; then
-            echo "::error title=Signing certificate UNREADABLE (BR-2)::MACOS_CERT_P12 decoded to an empty file, so there is no certificate to import. Nothing was built."
+            echo "::error title=Signing certificate UNREADABLE (BR-2)::MACOS_CERT_P12 decoded to an empty file, so there is no certificate to import. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -488,7 +503,7 @@ jobs:
           # could not be created" and "the certificate would not import" are
           # different problems with different fixes.
           if ! security create-keychain -p "$keychain_pw" "$keychain"; then
-            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security create-keychain' failed, so there is nowhere to import the identity. Nothing was built."
+            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security create-keychain' failed, so there is nowhere to import the identity. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -501,12 +516,12 @@ jobs:
           # — a queued step, a slow runner, a re-run — fails codesign with a
           # message about the certificate whose real cause is a clock.
           if ! security set-keychain-settings "$keychain"; then
-            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security set-keychain-settings' failed, so the keychain may auto-lock mid-build and codesign would fail for a reason that has nothing to do with the certificate. Nothing was built."
+            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security set-keychain-settings' failed, so the keychain may auto-lock before the signing step and codesign would fail for a reason that has nothing to do with the certificate. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
           if ! security unlock-keychain -p "$keychain_pw" "$keychain"; then
-            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security unlock-keychain' failed on the keychain this step just created. Nothing was built."
+            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security unlock-keychain' failed on the keychain this step just created. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -516,7 +531,7 @@ jobs:
           # runner can answer.
           if ! security import "$p12" -k "$keychain" -f pkcs12 \
               -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign; then
-            echo "::error title=Signing certificate would not import (BR-2)::'security import' rejected the decoded MACOS_CERT_P12 — most often a wrong MACOS_CERT_PASSWORD, or a .p12 exported without its private key. Nothing was built."
+            echo "::error title=Signing certificate would not import (BR-2)::'security import' rejected the decoded MACOS_CERT_P12 — most often a wrong MACOS_CERT_PASSWORD, or a .p12 exported without its private key. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -575,7 +590,7 @@ jobs:
           # out rather than fail.
           if ! security set-key-partition-list -S apple-tool:,apple: \
               -s -k "$keychain_pw" "$keychain" >/dev/null; then
-            echo "::error title=Signing key is not usable without a prompt (BR-2)::'security set-key-partition-list' failed, so codesign would block on a keychain-access dialog that nothing on this runner can dismiss. Failing now rather than hanging until the job timeout. Nothing was built."
+            echo "::error title=Signing key is not usable without a prompt (BR-2)::'security set-key-partition-list' failed, so codesign would block on a keychain-access dialog that nothing on this runner can dismiss. Failing now rather than hanging until the job timeout. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -612,7 +627,7 @@ jobs:
           # login.keychain stays in the search list: removing it is how the
           # rest of the runner's tooling starts failing to find its own certs.
           if ! security list-keychains -d user -s "$keychain" login.keychain; then
-            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security list-keychains' failed, so the imported identity is not on the search path codesign consults. Nothing was built."
+            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security list-keychains' failed, so the imported identity is not on the search path codesign consults. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -671,14 +686,14 @@ jobs:
             || fi_status=$?
           printf '%s\n' "$identities"
           if [ "$fi_status" -ne 0 ] || [ -z "$identities" ]; then
-            echo "::error title=Signing identity UNCHECKED (BR-2)::'security find-identity -v -p codesigning' exited $fi_status and/or printed nothing, so the keychain's contents could not be READ. Nothing was learned about MACOS_CERT_P12 — this is a tool failure on the runner, deliberately NOT reported as a wrong certificate. Nothing was built."
+            echo "::error title=Signing identity UNCHECKED (BR-2)::'security find-identity -v -p codesigning' exited $fi_status and/or printed nothing, so the keychain's contents could not be READ. Nothing was learned about MACOS_CERT_P12 — this is a tool failure on the runner, deliberately NOT reported as a wrong certificate. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
           case "$identities" in
             *"$TETON_SIGN_IDENTITY"*) : ;;
             *)
-              echo "::error title=No '$TETON_SIGN_IDENTITY' in the keychain (BR-2)::MACOS_CERT_P12 imported, but no codesigning identity in the keychain is named exactly '$TETON_SIGN_IDENTITY' — see the list above for what it does carry. That is the identity package.sh will hand codesign, so a near miss (another org with this team id, a Mac Development or Apple Distribution certificate, a renamed subject) is still a build that cannot sign. Nothing was built."
+              echo "::error title=No '$TETON_SIGN_IDENTITY' in the keychain (BR-2)::MACOS_CERT_P12 imported, but no codesigning identity in the keychain is named exactly '$TETON_SIGN_IDENTITY' — see the list above for what it does carry. That is the identity package.sh will hand codesign, so a near miss (another org with this team id, a Mac Development or Apple Distribution certificate, a renamed subject) is still a build that cannot sign. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
               exit 65
               ;;
           esac
