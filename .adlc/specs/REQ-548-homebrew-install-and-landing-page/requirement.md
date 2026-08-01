@@ -179,8 +179,8 @@ Rust+cmake burden this REQ exists to remove.
   (fine-grained PAT or deploy key) for the release workflow to push formula
   bumps; macOS arm64, macOS x86_64, and ubuntu runners (all standard GitHub
   Actions hosted runners; cmake preinstalled).
-- DNS control for `tetoncode.ai` (registrar/manager currently unrecorded —
-  Open Question 1).
+- DNS control for `tetoncode.ai` (GoDaddy, nameservers `domaincontrol.com` —
+  Open Question 1, resolved 2026-08-01).
 - Site hosting: the existing Atelier Google Cloud infrastructure
   (user-confirmed); needs the GCP project id, deploy service account /
   workload-identity wiring for CI, and TLS cert provisioning for
@@ -211,8 +211,10 @@ Rust+cmake burden this REQ exists to remove.
 
 ## Open Questions
 
-- [ ] OQ-1: Where is DNS for `tetoncode.ai` managed today (registrar,
+- [x] OQ-1: Where is DNS for `tetoncode.ai` managed today (registrar,
       nameservers)? Blocks AC-7's final hookup, nothing else.
+      **Resolved 2026-08-01:** registrar is GoDaddy; nameservers are
+      `domaincontrol.com` (GoDaddy's default DNS).
 - [ ] OQ-2: Should `brew services` support on Linux (systemd user units) be a
       v1 claim, or is Linux v1 "binaries install; run `tetond` yourself /
       write your own unit"? Recommend the latter, documented honestly (BR-10).
@@ -222,11 +224,33 @@ Rust+cmake burden this REQ exists to remove.
 - [ ] OQ-4: Does the landing page carry any download links besides the brew
       command? If yes, the ad-hoc signing assumption breaks (Gatekeeper
       quarantines browser downloads) and notarization enters scope.
-- [ ] OQ-5: Which GCP surface serves the Atelier website (Cloud Run, Cloud
+- [x] OQ-5: Which GCP surface serves the Atelier website (Cloud Run, Cloud
       Storage + LB/CDN, Firebase Hosting), and under which project id? The
       landing page follows the same pattern; needed at architecture time,
       along with CI deploy credentials (service account or workload
       identity).
+      **Resolved 2026-08-01** (per `docs/site-deploy-runbook.md` §1 intake):
+      - Surface: `gcs` — Cloud Storage behind an external HTTPS load
+        balancer with Cloud CDN, using the runbook §4 resource names
+        (bucket `tetoncode-ai`, URL map `teton-site-lb`, managed cert
+        `teton-site-cert`) plus a reserved global IP.
+      - Project: a dedicated new GCP project, not a shared Atelier one.
+        Its id is deliberately not written here — ADR-548-3 keeps it out
+        of this public repository; the authoritative copy is the repo
+        secret `GCP_PROJECT` (and the GCP console).
+      - CI deploy identity: workload identity federation as the service
+        account held in the repo secret `GCP_SERVICE_ACCOUNT`; the
+        provider's attribute condition was restricted at creation time to
+        `atelier-fashion/teton-code` and refs `refs/heads/main` /
+        `refs/tags/v*`, so runbook §9's REQUIRED-HUMAN item is already done.
+      - Repo config set: secrets `GCP_PROJECT`, `GCP_WIF_PROVIDER`,
+        `GCP_SERVICE_ACCOUNT`; vars `GCP_DEPLOY_SURFACE=gcs`,
+        `GCP_SITE_BUCKET=tetoncode-ai`, `GCP_CDN_URL_MAP=teton-site-lb`.
+      - Lesson from the first configured deploy run: the deploy service
+        account needs `roles/storage.legacyBucketReader` on the bucket in
+        addition to the runbook's `roles/storage.objectAdmin`, because
+        `gcloud storage rsync` calls `storage.buckets.get`. The run failed
+        without it; the runbook §3 roles table now records both.
 
 ## Deferred (verify pass, 2026-07-25)
 

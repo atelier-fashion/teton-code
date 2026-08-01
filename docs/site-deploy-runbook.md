@@ -188,7 +188,7 @@ Roles the service account needs, by surface — grant the narrowest that works:
 
 | Surface | Roles |
 |---------|-------|
-| `gcs` | `roles/storage.objectAdmin` **on the bucket only** (not project-wide); plus `roles/compute.loadBalancerAdmin` if `vars.GCP_CDN_URL_MAP` is set, for cache invalidation |
+| `gcs` | `roles/storage.objectAdmin` **and** `roles/storage.legacyBucketReader`, both **on the bucket only** (not project-wide); plus `roles/compute.loadBalancerAdmin` if `vars.GCP_CDN_URL_MAP` is set, for cache invalidation. `legacyBucketReader` is not optional: `gcloud storage rsync` calls `storage.buckets.get`, which `objectAdmin` does not carry — the first configured deploy run failed on exactly this |
 | `cloud-run` | `roles/run.admin`; `roles/iam.serviceAccountUser` on the Cloud Run runtime service account; `roles/cloudbuild.builds.editor` and `roles/artifactregistry.writer` for `--source` builds |
 
 ### Service-account key (fallback, not recommended)
@@ -511,9 +511,13 @@ workflow — still satisfies it. Closing that means adding `assertion.ref` to th
 condition, and it is a `gcloud`/console action against the Atelier GCP org that
 no workflow in this repository can perform.
 
-- [ ] **Restrict the WIF provider to release refs.** Copy-paste template —
-      substitute `PROJECT_ID`, and the pool/provider names if section 3's
-      defaults (`github`/`github`) were not used:
+- [x] **Restrict the WIF provider to release refs.** Done 2026-08-01: the
+      provider was created with its attribute condition already restricted to
+      `atelier-fashion/teton-code` and refs `refs/heads/main` /
+      `refs/tags/v*` (recorded against OQ-5 in REQ-548's requirement file).
+      Copy-paste template kept for re-creation — substitute `PROJECT_ID`, and
+      the pool/provider names if section 3's defaults (`github`/`github`)
+      were not used:
 
 ```sh
 PROJECT_ID=…            # secrets.GCP_PROJECT
