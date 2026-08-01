@@ -1,7 +1,7 @@
 ---
 id: REQ-551
 title: "Import the signing identity only after untrusted compilation"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-01
 updated: 2026-08-01
