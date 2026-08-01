@@ -4,7 +4,7 @@ title: "One-command Homebrew install and the tetoncode.ai landing page"
 status: complete
 deployable: true
 created: 2026-07-24
-updated: 2026-07-25
+updated: 2026-08-01
 component: "distribution/release"
 domain: "distribution"
 stack: ["rust", "github-actions", "homebrew", "ci", "static-site"]
@@ -236,7 +236,8 @@ pipeline cannot perform or verify. Neither blocks the one-command install; both
 harden the supply chain around it and should be done before the project has
 real users.
 
-- **Build provenance / artifact signing.** `checksums.txt` is published beside
+- **Build provenance / artifact signing.** — **now REQ-550**
+  (`signed-releases-and-build-provenance`, spec approved, in flight). `checksums.txt` is published beside
   the assets it describes, over the same channel, mutable by the same
   principals — a direct-download user verifies only that the release page
   agrees with itself. (Homebrew users are covered: the tap's pinned `sha256`
@@ -244,7 +245,9 @@ real users.
   `actions/attest-build-provenance` in the release job plus
   `gh attestation verify` in the runbook, needing `id-token: write` +
   `attestations: write`.
-- **Environment-gated secrets.** `HOMEBREW_TAP_TOKEN` and the `GCP_*` secrets
+- **Environment-gated secrets.** — folded into REQ-550, whose secret
+  inventory verified only `HOMEBREW_TAP_TOKEN` is repo-scoped and created the
+  environments. `HOMEBREW_TAP_TOKEN` and the `GCP_*` secrets
   are repository secrets, readable by any workflow on any ref. The tap token is
   the highest-value credential in the design — it rewrites the formula every
   `brew install` executes. Fix is GitHub Environments (`tap-publish`,
