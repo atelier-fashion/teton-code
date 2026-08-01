@@ -30,6 +30,26 @@
 # v1 by design (BR-6, ADR-550-4), and that is PRINTED rather than silently
 # skipped: a gate that says nothing looks exactly like a gate that did not run.
 #
+# THE TARGET IS READ FROM AN ALLOWLIST, not a pattern (LESSON-443). This used to
+# be `*apple-darwin*` and a catch-all `*` that printed the Linux line, so any
+# name that was not recognisably darwin — a target added later, a tarball
+# renamed by hand, a `${target}` that expanded to nothing in a workflow, a typo
+# in the release matrix — was announced as "unsigned in v1 (linux)" and shipped
+# with no signature check at all. The catch-all was a fail-open: the one input
+# that most deserved a hard stop got the softest possible answer, and it got it
+# in the release job's log where it reads as normal. The three triples the
+# release actually builds are now spelled out, and ANY other name is 75
+# UNCHECKED. Not a skip, and never the Linux line.
+#
+# `TETON_SMOKE_ASSUME_TARGET` is the seam that keeps selftest.sh's stand-in
+# tarballs — named `teton-v1.2.3-good.tar.gz` and the like, because what they
+# vary is behaviour and not platform — drivable against the allowlist. It is
+# safe by construction rather than by discipline: it is consulted ONLY when the
+# tarball's own name yields no recognised triple, so it cannot re-classify any
+# artifact package.sh produced, which is every artifact in a real release. Its
+# value must itself be one of the three triples, and inside GitHub Actions it is
+# refused unless `TETON_ALLOW_TOOL_SEAM=1` says a harness meant it.
+#
 # Two shapes of assertion deserve their reasons recorded, because both are easy
 # to "simplify" into something that passes when it should not:
 #
@@ -167,16 +187,52 @@ fi
 # at all — an unsigned macOS release is unshippable however well it behaves.
 #
 # The target triple is read off the tarball's name, the shape package.sh writes:
-# `teton-v<version>-<target>.tar.gz`. Anything that does not name a darwin
-# target is treated as the Linux leg, which is the safe direction to be wrong
-# in — the check is skipped only where codesign has nothing to say.
+# `teton-v<version>-<target>.tar.gz`, and it must be one of the three the
+# release builds. See the header for why this is an allowlist and what the
+# catch-all it replaced did.
 tarball_target="$(basename "$tarball")"
 tarball_target="${tarball_target%.tar.gz}"
 name_prefix="teton-v$version-"
 tarball_target="${tarball_target#"$name_prefix"}"
 
+# Did the NAME answer? `case`, not `grep -Eq`, for the reason verify-signature.sh
+# records at its own needle tests: a grep that is missing, broken or killed exits
+# non-zero, and `if ! grep` reads that as "the name is not a release target" — so
+# a broken tool would decide the classification. A `case` is the shell itself and
+# has no exit status to misread.
+name_is_release_target=no
 case "$tarball_target" in
-    *apple-darwin*)
+    aarch64-apple-darwin | x86_64-apple-darwin | x86_64-unknown-linux-gnu)
+        name_is_release_target=yes
+        ;;
+esac
+
+# The seam, applied ONLY where the name failed to answer. Ordered this way on
+# purpose: a tarball called `teton-v1.2.3-aarch64-apple-darwin.tar.gz` is a
+# macOS artifact no matter what the environment claims, so no value of this
+# variable can move a real release artifact off the signature gate.
+if [ "$name_is_release_target" = no ] && [ -n "${TETON_SMOKE_ASSUME_TARGET:-}" ]; then
+    if [ "${GITHUB_ACTIONS:-}" = "true" ] && [ "${TETON_ALLOW_TOOL_SEAM:-}" != "1" ]; then
+        echo "smoke: TETON_SMOKE_ASSUME_TARGET is set inside GitHub Actions and TETON_ALLOW_TOOL_SEAM=1" >&2
+        echo "       is not — refusing to run. Nothing was exercised." >&2
+        exit "$EXIT_USAGE"
+    fi
+    case "${TETON_SMOKE_ASSUME_TARGET}" in
+        aarch64-apple-darwin | x86_64-apple-darwin | x86_64-unknown-linux-gnu) ;;
+        *)
+            echo "smoke: TETON_SMOKE_ASSUME_TARGET must itself be one of the three release targets;" >&2
+            echo "       got '${TETON_SMOKE_ASSUME_TARGET}'. Nothing was exercised." >&2
+            exit "$EXIT_USAGE"
+            ;;
+    esac
+    echo "smoke: '$tarball_target' is not a release target; TETON_SMOKE_ASSUME_TARGET says to treat"
+    echo "       this artifact as ${TETON_SMOKE_ASSUME_TARGET}. This is a TEST seam — a real release"
+    echo "       tarball is named for its target and never reaches this branch."
+    tarball_target="${TETON_SMOKE_ASSUME_TARGET}"
+fi
+
+case "$tarball_target" in
+    aarch64-apple-darwin | x86_64-apple-darwin)
         # A missing team id is a USAGE error, never a skip. Reading "then don't
         # check" out of an absent argument is how a gate disables itself on
         # exactly the machine that most needed it (LESSON-443), and an empty
@@ -226,8 +282,26 @@ case "$tarball_target" in
             exit "$EXIT_UNCHECKED"
         fi
         ;;
-    *)
+    x86_64-unknown-linux-gnu)
+        # Printed, not skipped: a gate that says nothing looks exactly like a
+        # gate that did not run, and shipping Linux unsigned in v1 is a decision
+        # rather than an omission. Reached only by the ONE name that earns it.
         echo "smoke: artifact is unsigned in v1 (linux — by design, REQ-550 BR-6)"
+        ;;
+    *)
+        # The closed fail-open. An unrecognised target means this script does
+        # not know whether these bytes were supposed to be signed, and "I do not
+        # know" is 75 — never the Linux line, which would be a claim, and never
+        # a silent skip, which would be the same claim with the evidence
+        # removed. A fourth release target arriving here is a real possibility;
+        # it should stop the release and be added deliberately, in this case and
+        # in package.sh's matching allowlist, rather than inherit Linux's
+        # unsigned exemption by accident (LESSON-443).
+        echo "smoke: '$tarball_target' is not one of this release's targets (aarch64-apple-darwin," >&2
+        echo "       x86_64-apple-darwin, x86_64-unknown-linux-gnu), so whether these bytes must" >&2
+        echo "       carry a Developer ID signature is unknown — and an unknown signature" >&2
+        echo "       requirement is not a satisfied one. Nothing was exercised." >&2
+        exit "$EXIT_UNCHECKED"
         ;;
 esac
 
@@ -275,12 +349,25 @@ seam_pid=$!
 # every CI step, every `$(...)`.
 (
     sleep "$SEAM_DEADLINE_SECS"
-    # Leave a marker BEFORE killing: the kill is what makes $seam_status
-    # non-zero, so without this a daemon that printed the refusal and then kept
-    # running with the seams honoured — a BR-9 violation, the exact thing this
-    # assertion exists to catch — would be scored as a refusal.
-    : >"$seam_killed"
-    kill -9 "$seam_pid" 2>/dev/null || true
+    # Only claim a kill if there is something to kill. The marker's meaning is
+    # "this daemon was STILL RUNNING at the deadline", and the watchdog is not
+    # always cancelled before it wakes: a daemon that refused instantly leaves
+    # the main script racing to `wait`, report, and kill the watchdog, and on a
+    # loaded runner the watchdog can wake first. Writing the marker
+    # unconditionally made that race a FAIL against a daemon that had already
+    # done exactly what BR-9 asks of it — a flaky red on a good release.
+    #
+    # The residual window (alive at `kill -0`, gone a microsecond later) is
+    # one-directional and it is the safe direction: it can only turn a pass into
+    # a failure, never a failure into a pass.
+    if kill -0 "$seam_pid" 2>/dev/null; then
+        # Marker BEFORE the kill: the kill is what makes $seam_status non-zero,
+        # so without it a daemon that printed the refusal and then kept running
+        # with the seams honoured — a BR-9 violation, the exact thing this
+        # assertion exists to catch — would be scored as a refusal.
+        : >"$seam_killed"
+        kill -9 "$seam_pid" 2>/dev/null || true
+    fi
 ) >/dev/null 2>&1 &
 seam_watchdog=$!
 

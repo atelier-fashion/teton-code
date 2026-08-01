@@ -61,6 +61,24 @@ repo_root="$(cd -- "$script_dir/../.." && pwd)"
 # shellcheck source=tools/release/lib.sh disable=SC1091
 . "$script_dir/lib.sh"
 
+# The seam is a TEST seam, and it is refused where tests do not run — the same
+# guard verify-signature.sh and verify-attestation.sh carry, applied here for a
+# sharper reason than either. Those two report on bytes somebody else made;
+# `TETON_CODESIGN` here names the program that SIGNS the bytes this script is
+# about to publish, so an unexpected value of it in CI does not soften a verdict
+# — it decides what a release signature is. The release workflow sets neither
+# variable, so one appearing on a GitHub Actions run is a mistake or an attack.
+# selftest.sh sets TETON_ALLOW_TOOL_SEAM=1 once, at the top, to say it meant it.
+if [ "${GITHUB_ACTIONS:-}" = "true" ] &&
+    [ -n "${TETON_CODESIGN:-}" ] &&
+    [ "${TETON_ALLOW_TOOL_SEAM:-}" != "1" ]; then
+    echo "package: TETON_CODESIGN is set inside GitHub Actions, and TETON_ALLOW_TOOL_SEAM=1 is not" >&2
+    echo "         — refusing to build. That variable replaces the program that signs the shipped" >&2
+    echo "         binaries, so honouring it here would let an environment variable decide what a" >&2
+    echo "         release signature is. No tarball is written." >&2
+    exit "$EXIT_USAGE"
+fi
+
 if [ "$#" -lt 2 ]; then
     echo "usage: package.sh <target> <version> [outdir]" >&2
     exit "$EXIT_USAGE"

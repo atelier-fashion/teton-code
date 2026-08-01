@@ -79,14 +79,21 @@ sha256_of() {
     # success with an empty digest, and an empty string is what would then be
     # written into checksums.txt or spliced into the formula's `sha256`. Only a
     # well-formed digest counts as having hashed anything.
+    #
+    # The hex test covers the WHOLE string, not a prefix. It used to anchor only
+    # the first eight characters and then check the length, which accepted a
+    # 64-character value whose tail was anything at all — `0f1e2d3c` followed by
+    # 56 characters of a tool's error message is not a digest, and the two
+    # consumers of this function (checksums.txt, the formula's `sha256`) both
+    # take what it prints on trust. Empty is rejected by the length test, since
+    # the empty string contains no character outside [0-9a-f].
     case "$digest" in
-        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
-            if [ "${#digest}" -eq 64 ]; then
-                printf '%s\n' "$digest"
-                return 0
-            fi
-            ;;
+        *[!0-9a-f]*) return 1 ;;
     esac
+    if [ "${#digest}" -eq 64 ]; then
+        printf '%s\n' "$digest"
+        return 0
+    fi
     return 1
 }
 
@@ -106,9 +113,23 @@ sha256_of() {
 #
 # The override argument is how selftest.sh drives the gates on the Linux
 # `tooling` job, where `codesign` does not exist and `gh` has no token
-# (ADR-550-4). It can only change WHICH tool is asked — the caller still
-# classifies whatever answer comes back — so no value of `TETON_CODESIGN` or
-# `TETON_GH` can turn a rejection into a pass.
+# (ADR-550-4).
+#
+# BE PRECISE ABOUT WHAT THAT SEAM CANNOT DO, because the earlier wording here
+# claimed more than is true. It said "no value of TETON_CODESIGN or TETON_GH can
+# turn a rejection into a pass", which is false and dangerously so: a stand-in
+# that prints a Developer ID dump for any input, or a `gh` that exits 0, is
+# exactly a value that turns a rejection into a pass. That is the entire reason
+# selftest.sh can build a KNOWN-GOOD fixture at all.
+#
+# The property that actually holds is narrower, and it is the one the gates
+# rely on: the override changes WHICH tool is asked and nothing else. The
+# caller's CLASSIFICATION — which answer earns 0, which earns 65, which earns
+# 75 — is not reachable from here, so no override can make the gate score an
+# answer differently than it scores the real tool's. Whoever controls the
+# override controls the ANSWER, completely; that is why verify-signature.sh and
+# verify-attestation.sh refuse to honour these variables inside GitHub Actions
+# unless TETON_ALLOW_TOOL_SEAM=1 says a test harness meant it.
 tool_or_unchecked() {
     local tool="${1:-}"
     if [ -z "$tool" ]; then

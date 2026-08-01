@@ -58,6 +58,23 @@ set -euo pipefail
 EXIT_FAILED=1
 EXIT_UNCHECKED=75
 
+# This suite IS the harness the tool seams exist for, and it says so once, here.
+#
+# package.sh, verify-signature.sh, verify-attestation.sh and smoke.sh all refuse
+# to honour their `TETON_CODESIGN` / `TETON_GH` / `TETON_SMOKE_ASSUME_TARGET`
+# overrides when GITHUB_ACTIONS=true, because those variables decide which
+# program signs the release or answers whether it is signed — a value set by
+# anything other than a test harness in CI is a release waved through by an
+# environment variable. This export is the one place that says "a harness set
+# them", and it is deliberately at the top rather than per-case: every case
+# below drives a stand-in, so a per-case opt-in would be forty copies of the
+# same sentence and one of them would eventually be forgotten, turning a real
+# assertion into a 64 nobody read.
+#
+# It is safe to export because it grants nothing on its own: without one of the
+# override variables also set, it changes no behaviour anywhere.
+export TETON_ALLOW_TOOL_SEAM=1
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 
@@ -73,12 +90,16 @@ RENDER_FORMULA="$script_dir/render-formula.sh"
 SMOKE="$script_dir/smoke.sh"
 VERIFY_SIGNATURE="$script_dir/verify-signature.sh"
 VERIFY_ATTESTATION="$script_dir/verify-attestation.sh"
+VERIFY_BATCH="$script_dir/verify-attestations-batch.sh"
 SITE_RENDER="$repo_root/site/render.sh"
 SITE_TEMPLATE="$repo_root/site/index.html"
 FORMULA_TEMPLATE="$repo_root/packaging/homebrew/teton.rb.tmpl"
+RUNBOOK="$repo_root/docs/release-runbook.md"
+README="$repo_root/README.md"
+RELEASE_WORKFLOW="$repo_root/.github/workflows/release.yml"
 
 for required in "$LIB" "$VERIFY" "$PACKAGE" "$RENDER_FORMULA" "$SMOKE" \
-    "$VERIFY_SIGNATURE" "$VERIFY_ATTESTATION" \
+    "$VERIFY_SIGNATURE" "$VERIFY_ATTESTATION" "$VERIFY_BATCH" \
     "$SITE_RENDER" "$SITE_TEMPLATE" "$FORMULA_TEMPLATE"; do
     if [ ! -f "$required" ]; then
         echo "selftest: $required is missing — nothing was tested." >&2
@@ -149,10 +170,28 @@ expect_output() {
     return 0
 }
 
+# CASE_OK / CASE_OUT belong to the LAST expect_exit and to nothing else.
+#
+# Every helper that is not expect_exit clears them, so a stray `expect_output`
+# — one whose expect_exit was deleted, moved, or separated by an assert during
+# an edit — reads an empty CASE_OUT and a CASE_OK of 0, and reports "not
+# checked" instead of silently grading itself against whatever the previous case
+# left behind. Bookkeeping that carries over is how a suite starts asserting
+# against the wrong output and stays green while doing it.
+#
+# Safe for the `assert "…" [ "$CASE_OUT" = "1.2.3" ]` shape this file uses: the
+# caller expands CASE_OUT into argv before assert runs, so the reset here cannot
+# reach it.
+reset_case() {
+    CASE_OK=0
+    CASE_OUT=""
+}
+
 # assert <label> <command...> — passes when the command succeeds.
 assert() {
     local label="$1"
     shift
+    reset_case
     if "$@"; then
         report_pass "$label"
     else
@@ -171,6 +210,7 @@ assert() {
 refute() {
     local label="$1"
     shift
+    reset_case
     if "$@"; then
         report_fail "$label [the command succeeded, and should not have]"
     else
@@ -188,6 +228,7 @@ refute() {
 skipped=0
 skip() {
     skipped=$((skipped + 1))
+    reset_case
     printf '  SKIP  %s\n' "$1"
     return 0
 }
@@ -196,7 +237,7 @@ skip() {
 
 group "syntax (bash -n)"
 for s in "$LIB" "$VERIFY" "$PACKAGE" "$RENDER_FORMULA" "$SMOKE" \
-    "$VERIFY_SIGNATURE" "$VERIFY_ATTESTATION" \
+    "$VERIFY_SIGNATURE" "$VERIFY_ATTESTATION" "$VERIFY_BATCH" \
     "$SITE_RENDER" "${BASH_SOURCE[0]}"; do
     expect_exit 0 "bash -n $(basename "$s")" bash -n "$s"
 done
@@ -459,6 +500,28 @@ make_standins "$work/standin-truncated" 1.2.3 yes yes
 rm -f "$work/standin-truncated/teton-code"
 tar -czf "$work/teton-v1.2.3-truncated.tar.gz" -C "$work/standin-truncated" teton LICENSE README.md
 
+# The stand-in tarballs above are named for the BEHAVIOUR they model — `good`,
+# `wrong-version`, `seams-honoured`, `no-handshake`, `truncated` — because what
+# each one varies is what its binaries do, not which platform they are for. None
+# of those names is a release target, and smoke.sh now refuses an unrecognised
+# target outright (75) instead of quietly filing it under "linux, unsigned".
+#
+# So the fixtures declare their platform out of band. This is the seam
+# smoke.sh's header describes, and it is safe by construction rather than by
+# discipline: smoke.sh consults it ONLY when the tarball's own name yields no
+# recognised triple, so it has no effect at all on `teton-v1.2.3-<triple>.tar.gz`
+# — which is every name package.sh writes, and therefore every artifact in a
+# real release. The darwin and linux tarballs in the signature group below are
+# named for real triples and are classified by those names with this still
+# exported.
+#
+# The alternative considered and rejected: teaching smoke.sh to recognise the
+# stand-in names themselves. That would have put selftest fixture names in a
+# release gate, where a future fixture named after a target would be a silent
+# hole, and where the production path's correctness would depend on a list of
+# test data.
+export TETON_SMOKE_ASSUME_TARGET=x86_64-unknown-linux-gnu
+
 # Deliberately generous for the good pair: the timing assertion below needs a
 # deadline long enough that an orphaned watchdog would be conspicuous.
 export TETON_SMOKE_SEAM_DEADLINE_SECS=10
@@ -519,6 +582,34 @@ expect_exit 75 "a tarball missing teton-code -> 75 UNCHECKED" \
 expect_exit 64 "a nonsense deadline override -> 64" \
     env TETON_SMOKE_SEAM_DEADLINE_SECS=soon bash "$SMOKE" "$tb_good" 1.2.3
 
+# THE CLOSED FAIL-OPEN (LESSON-443). The same known-good tarball, with the
+# platform declaration taken away, so its name — `teton-v1.2.3-good.tar.gz` — is
+# all smoke.sh has to go on. It used to reach a catch-all `*` branch that
+# announced "artifact is unsigned in v1 (linux — by design)" and ran the four
+# behavioural assertions with no signature check whatsoever, which is what a
+# fourth release target, a typo in the matrix, or a `${target}` that expanded to
+# nothing would have got: a green release, and a log line claiming a decision
+# nobody made. It must now be 75 — the gate does not know whether these bytes
+# were supposed to be signed, and "I do not know" is not "they are fine".
+#
+# No TETON_SMOKE_TEAM_ID is set, deliberately: an unrecognised target must stop
+# the run before any question about which team signed it can be reached, so
+# providing one would only obscure which branch produced the 75.
+expect_exit 75 "a tarball whose target is not a release target -> 75 UNCHECKED" \
+    env -u TETON_SMOKE_ASSUME_TARGET bash "$SMOKE" "$tb_good" 1.2.3
+expect_output "  ... and names the target it did not recognise" \
+    "'good' is not one of this release's targets"
+# The specific wrong answer that used to be given, asserted as ABSENT: a linux
+# claim about an artifact whose platform is unknown is a false statement, and it
+# is the one this case exists to keep out of the log.
+assert "  ... and does NOT claim it is the unsigned linux leg" \
+    [ "${CASE_OUT#*unsigned in v1}" = "$CASE_OUT" ]
+
+# The seam itself has to be a release target, or it is just the hole again with
+# an environment variable in front of it.
+expect_exit 64 "a TETON_SMOKE_ASSUME_TARGET that is not a release target -> 64" \
+    env TETON_SMOKE_ASSUME_TARGET=whatever-i-like bash "$SMOKE" "$tb_good" 1.2.3
+
 unset TETON_SMOKE_SEAM_DEADLINE_SECS TETON_SMOKE_HANDSHAKE_DEADLINE_SECS
 
 # --- verify-signature.sh + verify-attestation.sh, as gates -----------------
@@ -561,11 +652,12 @@ SIG_OTHER_TEAM_ID="9Q7XZ4TR2K"
 
 # make_codesign <dir> <mode> -> path to the stand-in on stdout
 #
-# A stand-in `codesign`, answering the two questions verify-signature.sh asks:
-# `--verify --strict` (silent, exit 0, when the seal holds) and `-dvv` (the
+# A stand-in `codesign`, answering the three questions the release scripts ask:
+# `--verify --strict` (silent, exit 0, when the seal holds), `-dvv` (the
 # identity dump, written to STDERR, which is where the real tool writes it and
-# why the gate reads it through 2>&1). The second `v` is why the dumps below
-# carry Authority lines at all — at verbosity 1 codesign prints none.
+# why the gate reads it through 2>&1), and `--force --sign <identity> …`, which
+# is package.sh's signing phase. The second `v` is why the dumps below carry
+# Authority lines at all — at verbosity 1 codesign prints none.
 #
 # The mode names the artifact each fixture models:
 #
@@ -593,6 +685,26 @@ SIG_OTHER_TEAM_ID="9Q7XZ4TR2K"
 #                them. The identity could not be READ, which is 75.
 #   unrunnable   NOT bad bytes: resolvable on PATH, but exec fails (126/127).
 #                The tool vanished between resolution and use.
+#   crash        NOT bad bytes: the tool dies on a signal (exit 139), having
+#                said nothing. A segfault, an OOM kill, a step timeout — every
+#                one of them reachable without touching the artifact, so none
+#                may be scored as a rejection.
+#   dvv-exec     NOT bad bytes, and the nastiest of the lot: --verify accepts,
+#                and then the `-dvv` invocation cannot be EXECUTED and the shell
+#                says so on stderr. That diagnostic is non-empty output naming
+#                neither a Developer ID authority nor a team id, so a gate that
+#                scored the OUTPUT alone read it as a perfectly formed rejection
+#                and announced an unsigned release on the strength of a lost
+#                interpreter — a 65 forged by an exec failure (LESSON-442).
+#   mixed        KNOWN-BAD, statefully: keyed on the binary's NAME, it rejects
+#                `teton` and goes silent on `teton-code`. One rejection and one
+#                unreadable sibling in the same tarball, which must aggregate to
+#                65 — a definite rejection outranks an unreadable one, because
+#                something WAS learned about these bytes.
+#   sign-reject  KNOWN-BAD, on the OTHER side of the fence: `--verify` and
+#                `-dvv` behave, but `--force --sign` fails the way a missing or
+#                expired certificate fails. package.sh must refuse to write a
+#                tarball rather than ship what it could not sign.
 make_codesign() {
     local dir="$1" mode="$2" path
     mkdir -p "$dir"
@@ -616,9 +728,32 @@ mode="$mode"
 team="$SIG_TEAM_ID"
 other="$SIG_OTHER_TEAM_ID"
 
+# Dying before any argument is looked at: a crash is not a verdict about one
+# question, it is the tool not being there for any of them.
+if [ "\$mode" = crash ]; then
+    kill -SEGV \$\$
+fi
+
 case "\${1:-}" in
+    --force | --sign)
+        # package.sh's signing phase:
+        #   codesign --force --sign <identity> --timestamp --options runtime <f>
+        if [ "\$mode" = sign-reject ]; then
+            echo "Warning: unable to build chain to self-signed root for signer" >&2
+            echo "errSecInternalComponent" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
     --verify)
         if [ "\$mode" = reject ]; then
+            echo "\${3:-}: a sealed resource is missing or invalid" >&2
+            exit 1
+        fi
+        # Stateful, keyed on the binary's name rather than on a counter: a
+        # counter would depend on the order the gate happens to walk the pair,
+        # which is exactly the thing the gate is free to change.
+        if [ "\$mode" = mixed ] && [ "\$(basename "\${3:-}")" = teton ]; then
             echo "\${3:-}: a sealed resource is missing or invalid" >&2
             exit 1
         fi
@@ -627,6 +762,17 @@ case "\${1:-}" in
     -dvv)
         if [ "\$mode" = silent ]; then
             exit 0
+        fi
+        # The sibling of the rejected binary in the "mixed" fixture: --verify
+        # accepted it, and its identity cannot be read.
+        if [ "\$mode" = mixed ]; then
+            exit 0
+        fi
+        if [ "\$mode" = dvv-exec ]; then
+            # What the SHELL prints when it cannot execute a program, on the
+            # stream the gate reads, with the status it uses to say so.
+            echo "\$0: /nonexistent/teton-selftest-interpreter: bad interpreter: No such file or directory" >&2
+            exit 127
         fi
         echo "Executable=\${2:-}" >&2
         echo "Identifier=teton" >&2
@@ -676,21 +822,47 @@ EOF
 
 # make_gh <dir> <mode> -> path to the stand-in on stdout
 #
-# A stand-in `gh`, answering `gh attestation verify <artifact> --repo <repo>`:
+# A stand-in `gh`, answering
+# `gh attestation verify --repo <repo> [--signer-workflow <w>] -- <artifact>`:
 #
-#   accept   the subject verifies; gh's summary names the workflow and the tag
-#            the bytes were built from, which is the whole point of asking.
-#   reject   KNOWN-BAD. gh reached a verdict and the verdict is NO — the shape
-#            it takes when a tarball's digest matches no attestation, i.e. the
-#            bytes were changed after they were attested.
-#   error    NOT a verdict: the API could not be reached. This must land on 75,
-#            because an offline runner announcing a supply-chain failure is
-#            both a lie and the reason nobody believes the next alarm.
-#   crash    NOT a verdict: the tool dies on a signal, having said nothing.
-#   forged   NOT a verdict: the tool exits 65 — the gate's own FAILED code —
-#            with no verdict in its output. LESSON-442's collision, in the one
-#            direction that matters: 65 must mean "these bytes are bad" and
-#            must not be inheritable from a subprocess's status.
+#   accept        the subject verifies; gh's summary names the workflow and the
+#                 tag the bytes were built from, which is the point of asking.
+#   silent-accept NOT bad: exit 0 with no output at all. A future gh that stops
+#                 printing a summary, or one whose output was swallowed, must
+#                 still be a PASS — the verdict is the status, and the summary
+#                 is evidence for the log rather than the thing being scored.
+#   reject        KNOWN-BAD. gh reached the attestation store and no attestation
+#                 there covers this digest. `Error: no attestations found` is
+#                 the string gh 2.96.0 actually prints for it, observed against
+#                 the live tool; the earlier fixture here invented a
+#                 "Verification failed: …" line that no version prints.
+#   reject-nomatch  the same verdict in gh's other wording, pinning the second
+#                 alternative of REJECTION_PATTERN so it cannot be deleted
+#                 without a case going red.
+#   notfound      NOT a verdict, and the case that pins the ordering. Observed
+#                 against gh 2.96.0: an artifact whose digest is not in a
+#                 repository's attestation store — including EVERY artifact in a
+#                 repository that has never published one — comes back as an
+#                 HTTP 404 on the attestations endpoint. That 404 is
+#                 indistinguishable from a repo that does not exist, a repo this
+#                 token cannot see, and a degraded API, so it must land on 75.
+#   error         NOT a verdict: the API could not be reached. This must land on
+#                 75, because an offline runner announcing a supply-chain
+#                 failure is both a lie and the reason nobody believes the next
+#                 alarm.
+#   crash         NOT a verdict: the tool dies on a signal, having said nothing.
+#   forged        NOT a verdict: the tool exits 65 — the gate's own FAILED code
+#                 — with no verdict in its output. LESSON-442's collision, in
+#                 the one direction that matters: 65 must mean "these bytes are
+#                 bad" and must not be inheritable from a subprocess's status.
+#   echoargs      not a fixture about verdicts at all: it prints its own argv so
+#                 a case can assert what the gate ASKED, which is the only way
+#                 to test that `--signer-workflow` is forwarded and that `--`
+#                 precedes the artifact.
+#   one-bad       stateful, for the batch gate: rejects the aarch64 tarball and
+#                 accepts the other two.
+#   one-error     stateful likewise: the aarch64 tarball comes back as a network
+#                 failure, the other two verify.
 make_gh() {
     local dir="$1" mode="$2" path
     mkdir -p "$dir"
@@ -704,7 +876,30 @@ make_gh() {
 # and verify-install jobs.
 mode="$mode"
 digest="sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
-subject="\${3:-artifact}"
+
+# The subject is the LAST argument, not \$3. The gate now invokes
+# \`attestation verify --repo R [--signer-workflow W] -- <artifact>\`, so the
+# artifact's position depends on whether a signer workflow was passed; only
+# "last" is stable across both shapes.
+subject="artifact"
+for _a in "\$@"; do subject="\$_a"; done
+
+# The stateful fixtures pick their answer from the subject's name. Done before
+# the case below so each mode stays a single branch.
+case "\$mode" in
+    one-bad)
+        case "\$subject" in
+            *aarch64-apple-darwin*) mode=reject ;;
+            *) mode=accept ;;
+        esac
+        ;;
+    one-error)
+        case "\$subject" in
+            *aarch64-apple-darwin*) mode=error ;;
+            *) mode=accept ;;
+        esac
+        ;;
+esac
 
 case "\$mode" in
     accept)
@@ -718,9 +913,19 @@ case "\$mode" in
         echo "atelier-fashion/teton-code  https://slsa.dev/provenance/v1  .github/workflows/release.yml@refs/tags/v1.2.3"
         exit 0
         ;;
+    silent-accept)
+        exit 0
+        ;;
     reject)
-        echo "Loaded digest \$digest for file://\$subject"
-        echo "Verification failed: no matching attestations found for subject \$digest" >&2
+        echo "Error: no attestations found" >&2
+        exit 1
+        ;;
+    reject-nomatch)
+        echo "Error: no matching attestations found for subject \$digest" >&2
+        exit 1
+        ;;
+    notfound)
+        echo "Error: HTTP 404: Not Found (https://api.github.com/repos/atelier-fashion/teton-code/attestations/\$digest?per_page=30&predicate_type=https%3A%2F%2Fslsa.dev%2Fprovenance%2Fv1)" >&2
         exit 1
         ;;
     error)
@@ -732,6 +937,12 @@ case "\$mode" in
         ;;
     forged)
         exit 65
+        ;;
+    echoargs)
+        printf 'ARGV:'
+        printf ' [%s]' "\$@"
+        printf '\n'
+        exit 0
         ;;
 esac
 
@@ -749,12 +960,22 @@ cs_foreign="$(make_codesign "$work/cs-foreign" foreign)"
 cs_reject="$(make_codesign "$work/cs-reject" reject)"
 cs_silent="$(make_codesign "$work/cs-silent" silent)"
 cs_unrunnable="$(make_codesign "$work/cs-unrunnable" unrunnable)"
+cs_crash="$(make_codesign "$work/cs-crash" crash)"
+cs_dvv_exec="$(make_codesign "$work/cs-dvv-exec" dvv-exec)"
+cs_mixed="$(make_codesign "$work/cs-mixed" mixed)"
+cs_sign_reject="$(make_codesign "$work/cs-sign-reject" sign-reject)"
 
 gh_accept="$(make_gh "$work/gh-accept" accept)"
+gh_silent_accept="$(make_gh "$work/gh-silent-accept" silent-accept)"
 gh_reject="$(make_gh "$work/gh-reject" reject)"
+gh_reject_nomatch="$(make_gh "$work/gh-reject-nomatch" reject-nomatch)"
+gh_notfound="$(make_gh "$work/gh-notfound" notfound)"
 gh_error="$(make_gh "$work/gh-error" error)"
 gh_crash="$(make_gh "$work/gh-crash" crash)"
 gh_forged="$(make_gh "$work/gh-forged" forged)"
+gh_echoargs="$(make_gh "$work/gh-echoargs" echoargs)"
+gh_one_bad="$(make_gh "$work/gh-one-bad" one-bad)"
+gh_one_error="$(make_gh "$work/gh-one-error" one-error)"
 
 # One extracted binary, and the two tarballs whose NAMES decide which leg
 # smoke.sh thinks it is on. Their contents are the same known-good stand-in
@@ -812,13 +1033,54 @@ expect_output "  ... and says the identity could not be read" "printed nothing"
 
 expect_exit 75 "a codesign that resolves but cannot be RUN -> 75 UNCHECKED, not 65" \
     env TETON_CODESIGN="$cs_unrunnable" bash "$VERIFY_SIGNATURE" "$sig_bin" "$SIG_TEAM_ID"
-expect_output "  ... and says so as a tooling failure" "could not be run"
+expect_output "  ... and says so as a tooling failure" "did not run to a verdict"
 
 expect_exit 75 "no codesign on this machine -> 75 UNCHECKED" \
     env TETON_CODESIGN=/nonexistent/codesign bash "$VERIFY_SIGNATURE" "$sig_bin" "$SIG_TEAM_ID"
 expect_output "  ... and says the gate belongs to the macOS legs" "is not on this machine"
 
+# A codesign that DIES ON A SIGNAL. The shell reports that as 128+N — 139 for a
+# segfault — and a plain `-ne 0` test read it as "codesign rejected these
+# bytes", so a crashing tool could announce an unsigned release. Reachable
+# without touching the artifact at all: an OOM kill or a cancelled CI step
+# produces the same status.
+expect_exit 75 "a codesign that dies on a SIGNAL -> 75 UNCHECKED, not a forged 65" \
+    env TETON_CODESIGN="$cs_crash" bash "$VERIFY_SIGNATURE" "$sig_bin" "$SIG_TEAM_ID"
+expect_output "  ... and says it never reached a verdict" "did not run to a verdict"
+
+# The subtler half of the same hole. --verify accepts, and then the SHELL fails
+# to execute the `-dvv` invocation and prints its own diagnostic — non-empty
+# output that names no authority and no team id. Scored as a dump, that reads as
+# a textbook rejection, and the gate would blame the artifact for a lost
+# interpreter.
+expect_exit 75 "a codesign whose -dvv cannot be EXECUTED -> 75, never a forged 65" \
+    env TETON_CODESIGN="$cs_dvv_exec" bash "$VERIFY_SIGNATURE" "$sig_bin" "$SIG_TEAM_ID"
+expect_output "  ... and says the identity was never read, not that it is wrong" \
+    "an identity that was never READ is not an identity that is wrong"
+
+# Rejection outranks unreadability, tested rather than asserted: one binary of
+# the pair is REJECTED and its sibling's identity cannot be read. 75 would be
+# the weaker, less useful claim — something WAS learned about these bytes.
+expect_exit 65 "one binary rejected + one unreadable -> 65, the rejection outranks" \
+    env TETON_CODESIGN="$cs_mixed" bash "$VERIFY_SIGNATURE" "$tb_darwin" "$SIG_TEAM_ID"
+expect_output "  ... and reports the rejection rather than the unreadable sibling" \
+    "are not Developer ID signed by team $SIG_TEAM_ID"
+
+expect_exit 75 "artifact not found -> 75 UNCHECKED" \
+    env TETON_CODESIGN="$cs_accept" bash "$VERIFY_SIGNATURE" "$work/absent-binary" "$SIG_TEAM_ID"
+expect_output "  ... and says nothing was checked" "not found:"
+
 expect_exit 64 "too few arguments -> 64" bash "$VERIFY_SIGNATURE" "$sig_bin"
+expect_exit 64 "an EMPTY artifact argument -> 64, not a confusing 75" \
+    env TETON_CODESIGN="$cs_accept" bash "$VERIFY_SIGNATURE" "" "$SIG_TEAM_ID"
+expect_output "  ... and says no artifact was given" "no artifact given"
+
+# Whitespace in a team id is a call-site mistake — no Apple team id contains
+# any — and it must be a usage error rather than a report that the artifact is
+# unsigned, which is what a needle of " 545BU9G9D6" would have produced.
+expect_exit 64 "a team id containing WHITESPACE -> 64, not a false rejection" \
+    env TETON_CODESIGN="$cs_accept" bash "$VERIFY_SIGNATURE" "$sig_bin" " $SIG_TEAM_ID"
+expect_output "  ... and says why" "must not contain whitespace"
 expect_exit 64 "an EMPTY team id -> 64, refused before anything is checked" \
     env TETON_CODESIGN="$cs_accept" bash "$VERIFY_SIGNATURE" "$sig_bin" ""
 # The same class of hole as smoke.sh's empty version: an empty needle is
@@ -858,12 +1120,54 @@ expect_exit 0 "an artifact gh verifies -> 0" \
 expect_output "  ... and keeps gh's provenance summary in the release log" \
     "https://slsa.dev/provenance/v1"
 
+# The verdict is the STATUS. A gh that verifies and prints nothing is still a
+# pass — the summary is evidence for the log, not the thing being scored — and a
+# gate that required output would go red on a future gh that stopped printing
+# one, in the direction a release gate must never be wrong.
+expect_exit 0 "a gh that verifies SILENTLY (exit 0, no output) -> 0" \
+    env TETON_GH="$gh_silent_accept" bash "$VERIFY_ATTESTATION" "$tb_linux" "$att_repo"
+expect_output "  ... and still says PASS" "PASS"
+
+# What the gate ASKED, not just how it scored the answer. Forwarding
+# --signer-workflow is the difference between "some workflow in this repo
+# attested these bytes" and "the release workflow did", and nothing else here
+# would notice if the argument were dropped on the floor.
+expect_exit 0 "the signer workflow reaches gh as --signer-workflow" \
+    env TETON_GH="$gh_echoargs" bash "$VERIFY_ATTESTATION" "$tb_linux" "$att_repo" \
+    ".github/workflows/release.yml"
+expect_output "  ... as a flag and a value" \
+    "[--signer-workflow] [.github/workflows/release.yml]"
+# `--` before the subject, and AFTER the flags: verified against gh 2.96.0,
+# which reads a `--` placed before `--repo` as making --repo positional and dies
+# with "too many arguments".
+expect_output "  ... with -- closing flag parsing before the artifact path" \
+    "[--] [$tb_linux]"
+expect_output "  ... and it is announced in the log" "signed by .github/workflows/release.yml"
+
+expect_exit 0 "no signer workflow given -> the flag is not passed at all" \
+    env TETON_GH="$gh_echoargs" bash "$VERIFY_ATTESTATION" "$tb_linux" "$att_repo"
+# Not `--signer-workflow ''`: gh enforces that value against the certificate's
+# SubjectAlternativeName, and no certificate's SAN is the empty string, so an
+# empty flag would turn every verification into a failure. Tested with a prefix
+# strip rather than a grep because the needle is a fixed string and this is one
+# expansion the caller performs before `assert` ever runs.
+assert "  ... and no empty --signer-workflow was smuggled in" \
+    [ "${CASE_OUT#*--signer-workflow}" = "$CASE_OUT" ]
+
 # KNOWN-BAD: bytes that no attestation covers, because they are not the bytes
 # that were built. This is the supply-chain alarm, and it must be reachable.
+# `Error: no attestations found` is what gh 2.96.0 prints, observed against the
+# live tool — the fixture used to invent a "Verification failed: …" line.
 expect_exit 65 "a TAMPERED artifact gh rejects -> 65 FAILED" \
     env TETON_GH="$gh_reject" bash "$VERIFY_ATTESTATION" "$att_tampered" "$att_repo"
 expect_output "  ... and says the bytes do not verify" "these bytes do not verify against"
-expect_output "  ... and quotes gh's verdict" "no matching attestations found"
+expect_output "  ... and quotes gh's verdict" "no attestations found"
+
+# gh's other wording for the same verdict. Without this case the second
+# alternative of REJECTION_PATTERN could be deleted and the suite stay green.
+expect_exit 65 "gh's 'no matching attestations' wording is also a rejection -> 65" \
+    env TETON_GH="$gh_reject_nomatch" bash "$VERIFY_ATTESTATION" "$att_tampered" "$att_repo"
+expect_output "  ... and quotes it" "no matching attestations found"
 
 # Everything that is NOT a verdict. Each of these is a failing gh, and none of
 # them may be reported as a supply-chain failure (LESSON-442).
@@ -871,6 +1175,17 @@ expect_exit 75 "gh failing on the NETWORK -> 75 UNCHECKED, not 65" \
     env TETON_GH="$gh_error" bash "$VERIFY_ATTESTATION" "$tb_linux" "$att_repo"
 expect_output "  ... and says why that is deliberate" \
     "must never be announced as a supply-chain alarm"
+
+# THE 404, and the reason UNCHECKED_PATTERN is tested before REJECTION_PATTERN.
+# Observed against gh 2.96.0: a digest that is not in a repository's attestation
+# store — which is every artifact, in every repository that has not published an
+# attestation yet — comes back as an HTTP 404 on the attestations endpoint, not
+# as a verdict. It is indistinguishable from a repo that does not exist, a repo
+# the token cannot see, and a degraded API, so 75 is the only honest score. The
+# release is blocked either way; only the claim in the log differs.
+expect_exit 75 "gh's 404-before-the-first-attestation -> 75 UNCHECKED, not 65" \
+    env TETON_GH="$gh_notfound" bash "$VERIFY_ATTESTATION" "$tb_linux" "$att_repo"
+expect_output "  ... and blames the environment, not the bytes" "an ENVIRONMENT failure"
 
 expect_exit 75 "gh dying on a signal, having said nothing -> 75 UNCHECKED" \
     env TETON_GH="$gh_crash" bash "$VERIFY_ATTESTATION" "$tb_linux" "$att_repo"
@@ -891,8 +1206,130 @@ expect_exit 75 "artifact not found -> 75 UNCHECKED" \
     env TETON_GH="$gh_accept" bash "$VERIFY_ATTESTATION" "$work/absent.tar.gz" "$att_repo"
 
 expect_exit 64 "too few arguments -> 64" bash "$VERIFY_ATTESTATION" "$tb_linux"
+expect_exit 64 "an EMPTY artifact argument -> 64, not a confusing 75" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_ATTESTATION" "" "$att_repo"
+expect_output "  ... and says no artifact was given" "no artifact given"
+
+# Every malformed <owner/repo> shape the guard names, one case each. `gh` will
+# happily search a repository that is not this one, so a typo here is not a
+# harmless mistake: it is a gate verifying provenance against the wrong trust
+# root, and every one of these must be a usage error rather than the UNCHECKED
+# that gh's own argument error would have produced.
+for bad_repo in "" "a/b/c" "/lead" "trail/" ".dot" "-dash"; do
+    expect_exit 64 "a malformed repo '$bad_repo' -> 64" \
+        env TETON_GH="$gh_accept" bash "$VERIFY_ATTESTATION" "$tb_linux" "$bad_repo"
+done
 expect_exit 64 "a repo that is not owner/repo -> 64" \
     env TETON_GH="$gh_accept" bash "$VERIFY_ATTESTATION" "$tb_linux" "teton-code"
+
+# --- verify-attestations-batch.sh ------------------------------------------
+#
+# The gate that asks the per-artifact question of a WHOLE release. What it adds
+# over a loop is the two assertions a loop cannot make: that there are three
+# tarballs, and that checksums.txt describes the bytes actually present. Both
+# failures are silent in a loop — it iterates over what is there and passes.
+
+group "verify-attestations-batch.sh (does a partial or drifted release go red?)"
+
+# batch_dir <name> — a release directory holding the three tarballs and a
+# checksums.txt computed from those exact bytes. Printed on stdout.
+batch_dir() {
+    local name="$1" dir="$work/batch-$1" t
+    mkdir -p "$dir"
+    for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+        printf 'pretend %s tarball for the batch gate\n' "$t" >"$dir/teton-v1.2.3-$t.tar.gz"
+    done
+    : >"$dir/checksums.txt"
+    for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+        printf '%s  %s\n' "$(sha256_of "$dir/teton-v1.2.3-$t.tar.gz")" \
+            "teton-v1.2.3-$t.tar.gz" >>"$dir/checksums.txt"
+    done
+    printf '%s\n' "$dir"
+}
+
+batch_ok="$(batch_dir ok)"
+
+expect_exit 0 "three tarballs, matching checksums, all attested -> 0" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_BATCH" "$batch_ok" "$att_repo"
+expect_output "  ... and says all three passed" "all 3 tarballs"
+
+expect_exit 0 "the signer workflow is forwarded to each artifact's gate" \
+    env TETON_GH="$gh_echoargs" bash "$VERIFY_BATCH" "$batch_ok" "$att_repo" \
+    ".github/workflows/release.yml"
+expect_output "  ... reaching gh" "[--signer-workflow] [.github/workflows/release.yml]"
+
+# KNOWN-BAD: one of three rejected. The other two verify, which is the point —
+# a release is only as attested as its least attested artifact (BR-6).
+expect_exit 65 "1 of 3 artifacts REJECTED -> 65, however green the other two are" \
+    env TETON_GH="$gh_one_bad" bash "$VERIFY_BATCH" "$batch_ok" "$att_repo"
+expect_output "  ... and names the artifact gh rejected" \
+    "gh rejected teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+expect_exit 75 "1 of 3 artifacts UNCHECKED -> 75, never a pass on the other two" \
+    env TETON_GH="$gh_one_error" bash "$VERIFY_BATCH" "$batch_ok" "$att_repo"
+expect_output "  ... and says nothing was learned" "could not be verified against"
+
+# KNOWN-BAD: the tarballs are all attested and checksums.txt describes a
+# different build. gh alone would pass this — it hashes the file in front of it
+# — and the inconsistency would surface as a failed install, weeks later.
+batch_drift="$(batch_dir drift)"
+printf 'a byte the checksums file has never seen\n' \
+    >>"$batch_drift/teton-v1.2.3-x86_64-apple-darwin.tar.gz"
+expect_exit 65 "a tarball that does not match its checksums.txt line -> 65" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_BATCH" "$batch_drift" "$att_repo"
+expect_output "  ... and names the file" \
+    "teton-v1.2.3-x86_64-apple-darwin.tar.gz does not match its checksums.txt line"
+# Named because a message that printed only the digests would be true and
+# useless in a directory of three near-identical names.
+expect_output "  ... and shows both digests" "recorded:"
+
+# KNOWN-BAD, and the one a plain loop cannot catch: an upload that never
+# arrived. Two of three tarballs, both perfect, and every check that runs
+# passes.
+batch_short="$(batch_dir short)"
+rm -f "$batch_short/teton-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+expect_exit 65 "only 2 of 3 tarballs present -> 65, not a pass on the two" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_BATCH" "$batch_short" "$att_repo"
+expect_output "  ... and says a release missing a platform is not a release" \
+    "expected 3 tarballs"
+
+batch_extra="$(batch_dir extra)"
+printf 'a fourth tarball nobody asked for\n' \
+    >"$batch_extra/teton-v1.2.3-riscv64-unknown-linux-gnu.tar.gz"
+expect_exit 65 "a FOURTH tarball -> 65 as well: the count is exact, not a minimum" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_BATCH" "$batch_extra" "$att_repo"
+
+batch_nosums="$(batch_dir nosums)"
+rm -f "$batch_nosums/checksums.txt"
+expect_exit 65 "no checksums.txt -> 65" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_BATCH" "$batch_nosums" "$att_repo"
+expect_output "  ... and says what downstream loses without it" "is missing"
+
+batch_unlisted="$(batch_dir unlisted)"
+printf '%s  %s\n' \
+    "1111111111111111111111111111111111111111111111111111111111111111" \
+    "teton-v1.2.3-some-other-target.tar.gz" >"$batch_unlisted/checksums.txt"
+expect_exit 65 "a tarball with no line in checksums.txt -> 65" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_BATCH" "$batch_unlisted" "$att_repo"
+expect_output "  ... and says the file has no recorded digest" "has no line in checksums.txt"
+
+expect_exit 64 "too few arguments -> 64" bash "$VERIFY_BATCH" "$batch_ok"
+expect_exit 64 "no arguments at all -> 64" bash "$VERIFY_BATCH"
+expect_exit 64 "an empty directory argument -> 64" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_BATCH" "" "$att_repo"
+# A path that is not there is a CALL SITE mistake, not a malformed release, and
+# it is deliberately not the 65 that an empty-but-present directory earns.
+expect_exit 64 "a directory that does not exist -> 64, not 65" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_BATCH" "$work/no-such-release-dir" "$att_repo"
+expect_output "  ... and says so" "not a directory"
+
+# An empty but PRESENT directory is a release-shape failure: it was read, and
+# what was read is not a release. `nullglob` is what makes this 65 rather than a
+# confusing report about a file named `teton-*.tar.gz`.
+mkdir -p "$work/batch-empty"
+expect_exit 65 "an empty release directory -> 65, and no literal-glob nonsense" \
+    env TETON_GH="$gh_accept" bash "$VERIFY_BATCH" "$work/batch-empty" "$att_repo"
+expect_output "  ... having found zero tarballs" "found 0"
 
 # --- the same gates, through smoke.sh --------------------------------------
 #
@@ -948,11 +1385,25 @@ unset TETON_SMOKE_SEAM_DEADLINE_SECS TETON_SMOKE_HANDSHAKE_DEADLINE_SECS
 
 # --- package.sh ------------------------------------------------------------
 #
-# Only the validation that happens BEFORE `cargo build` — this suite does not
-# build. That is the whole of package.sh that can be tested without a toolchain,
-# and it is the part that was previously absent.
+# Two things, and the second used to be described here as impossible.
+#
+# The input validation that happens before `cargo build` needs nothing at all.
+# The SIGNING PHASE happens after it, and the note here used to say that made it
+# untestable without a toolchain — "that is the whole of package.sh that can be
+# tested without a toolchain". It is not: `cargo` is resolved on PATH and the
+# build output is read from `$CARGO_TARGET_DIR`, so a PATH stub that exits 0 and
+# a directory containing two files where the binaries would be drive the whole
+# of the rest of the script — staging, signing, verifying, tarring, hashing.
+# That is where BR-2's real claim lives (a signing-requested build never ships
+# unsigned), and it was going untested behind a sentence saying it could not be
+# reached.
+#
+# What this does NOT test, and must not be read as testing: cargo, the compiler,
+# the produced binaries, or Apple's codesign. The stub builds nothing and the
+# stand-in signs nothing. What is under test is package.sh's own control flow —
+# which failures stop it, and which of them ship a tarball anyway.
 
-group "package.sh (input validation, no build)"
+group "package.sh (input validation and the signing phase, no toolchain)"
 
 expect_exit 64 "too few arguments -> 64" bash "$PACKAGE" aarch64-apple-darwin
 expect_exit 64 "an unknown target triple -> 64, before cargo is invoked" \
@@ -963,6 +1414,105 @@ expect_exit 64 "a prerelease version -> 64" \
     bash "$PACKAGE" aarch64-apple-darwin 1.2.3-rc.1 "$work/pkg"
 expect_exit 64 "a version that is really a path -> 64" \
     bash "$PACKAGE" aarch64-apple-darwin "../../etc" "$work/pkg"
+
+# BR-2's known-bad, and the cheapest of the lot: signing is REQUESTED and the
+# tool is not there. Settled before `cargo build` on purpose, so the answer
+# arrives in seconds rather than after a from-source llama.cpp compile — and 70
+# rather than 75, because this script is the one MAKING the bytes: "could not
+# check" and "did not do it" are different failures.
+expect_exit 70 "signing requested with no codesign -> 70, before anything is built" \
+    env TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN=/nonexistent/codesign \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg"
+expect_output "  ... and refuses to write an indistinguishable tarball" \
+    "Refusing to build a tarball that would be unsigned"
+
+# The PATH stub and the fake build output that make the rest reachable. `cargo`
+# is a bare name package.sh resolves on PATH, and the binaries it stages come
+# from $CARGO_TARGET_DIR/<triple>/release/ — so the two together stand in for a
+# build without being one.
+pkg_stub="$work/pkg-stub"
+mkdir -p "$pkg_stub"
+cat >"$pkg_stub/cargo" <<'EOF'
+#!/usr/bin/env bash
+# selftest stand-in for cargo. Builds nothing and proves nothing about the
+# build; it exists so package.sh's post-build path can be reached at all.
+exit 0
+EOF
+chmod +x "$pkg_stub/cargo"
+
+pkg_target="$work/pkg-target"
+mkdir -p "$pkg_target/aarch64-apple-darwin/release"
+for pkg_bin in teton teton-code; do
+    printf '#!/usr/bin/env bash\nexit 0\n' \
+        >"$pkg_target/aarch64-apple-darwin/release/$pkg_bin"
+    chmod +x "$pkg_target/aarch64-apple-darwin/release/$pkg_bin"
+done
+
+# PATH is PREPENDED, never replaced: package.sh also runs mktemp, cp, tar and a
+# hasher, and a PATH of only the stub would fail on the first of them for a
+# reason that has nothing to do with what is being tested.
+expect_exit 0 "a signing-requested build signs the staged pair and ships -> 0" \
+    env PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-signed"
+# BOTH binaries, named: a signing phase that signed the first and moved on would
+# be identical from the exit code (LESSON-455).
+expect_output "  ... having signed teton" "package: signed teton"
+expect_output "  ... and teton-code too" "package: signed teton-code"
+assert "  ... and the tarball was written" \
+    [ -s "$work/pkg-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
+assert "  ... with its sha256 sidecar" \
+    [ -s "$work/pkg-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz.sha256" ]
+
+# KNOWN-BAD, and the claim BR-2 actually makes: the certificate is missing or
+# expired, `codesign --sign` fails, and NO TARBALL IS WRITTEN. A build that
+# shipped here would produce bytes indistinguishable from a signed release,
+# which is the failure the whole signing story exists to prevent.
+expect_exit 70 "a signing-requested build whose codesign REFUSES -> 70" \
+    env PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_sign_reject" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-signreject"
+expect_output "  ... and says it will not ship unsigned" \
+    "a signing-requested build never ships unsigned"
+refute "  ... and no tarball was left behind" \
+    test -e "$work/pkg-signreject/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# KNOWN-BAD, the other half: signing succeeded and the RESULT does not hold.
+# `--sign` exiting 0 is not the claim being made; "these bytes carry a signature
+# that verifies" is, and only --verify tests it.
+expect_exit 70 "signed but --verify --strict rejects the result -> 70" \
+    env PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_reject" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-verifyreject"
+expect_output "  ... and blames the verify, not the sign" \
+    "codesign --verify --strict rejected the result"
+
+# The unsigned dev build, for contrast: no identity, no signing, and it says so
+# out loud rather than leaving a reader to infer it.
+expect_exit 0 "no TETON_SIGN_IDENTITY -> an unsigned dev build that says so" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN \
+    PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-unsigned"
+expect_output "  ... and names the variable that would have signed it" \
+    "set TETON_SIGN_IDENTITY for release signing"
+
+# KNOWN-BAD: cargo reports success and the binary is not there. An internal
+# inconsistency, worth its own code so it cannot be read as a compile error.
+pkg_target_short="$work/pkg-target-short"
+mkdir -p "$pkg_target_short/aarch64-apple-darwin/release"
+printf '#!/usr/bin/env bash\nexit 0\n' \
+    >"$pkg_target_short/aarch64-apple-darwin/release/teton"
+chmod +x "$pkg_target_short/aarch64-apple-darwin/release/teton"
+expect_exit 70 "cargo succeeds but teton-code is missing -> 70" \
+    env -u TETON_SIGN_IDENTITY \
+    PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target_short" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-short"
+expect_output "  ... and names the binary it did not find" \
+    "cargo reported success but"
 
 # --- lib.sh ----------------------------------------------------------------
 
@@ -1041,6 +1591,46 @@ expect_exit 1 "sha256_of fails when the hasher it picked is broken (no empty dig
 # shellcheck disable=SC2016  # deliberate: the body takes $1/$2 as argv, not interpolation
 expect_exit 1 "sha256_of returns 1, not 127, when no sha256 tool exists" \
     bash -c 'PATH=/nonexistent; . "$1"; sha256_of "$2"' _ "$LIB" "$work/hashme"
+
+# The hex test used to anchor only the first EIGHT characters and then check the
+# length, so any 64-character string starting with eight hex digits was accepted
+# as a digest — `0f1e2d3c` followed by 56 characters of a tool's error message
+# would have been written into checksums.txt and spliced into the formula's
+# `sha256`. Both consumers take what this prints on trust, so the whole string
+# has to be hex.
+hexy="$work/hex-hasher"
+mkdir -p "$hexy"
+cat >"$hexy/shasum" <<'EOF'
+#!/usr/bin/env bash
+# A hasher that "succeeds" with 64 characters of which only the first eight are
+# hex — the shape the old prefix-anchored test could not tell from a digest.
+echo "0f1e2d3c this is not a digest at all, it is 64 characters of prose ok  x"
+EOF
+chmod +x "$hexy/shasum"
+# shellcheck disable=SC2016  # deliberate: argv, not interpolation
+expect_exit 1 "sha256_of rejects a 64-char value that is not hex all the way down" \
+    bash -c 'PATH="$1:$PATH"; . "$2"; sha256_of "$3"' _ "$hexy" "$LIB" "$work/hashme"
+
+# --- cross-file consistency ------------------------------------------------
+#
+# The team id is a LITERAL in five places — this suite, the README, the runbook,
+# the Homebrew formula template and the release workflow — and nothing in the
+# build reads it from a single source. That is the drift surface: a team id
+# changes (a new Apple account, a transferred membership), four of the five are
+# updated, and the fifth tells a user or a gate the wrong thing indefinitely.
+# Pinned here rather than refactored because four of the five are prose and a
+# YAML string; the cheap fix is to make drift go red.
+
+group "cross-file consistency (the literals nothing else pins)"
+
+for drift_file in "$README" "$RUNBOOK" "$FORMULA_TEMPLATE" "$RELEASE_WORKFLOW"; do
+    if [ ! -f "$drift_file" ]; then
+        skip "team id in $(basename "$drift_file") (file is not in this checkout)"
+        continue
+    fi
+    assert "the team id $SIG_TEAM_ID appears in $(basename "$drift_file")" \
+        grep -Fq -- "$SIG_TEAM_ID" "$drift_file"
+done
 
 # --- summary ---------------------------------------------------------------
 

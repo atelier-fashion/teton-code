@@ -22,8 +22,12 @@
 #
 # `TETON_CODESIGN` overrides which tool is asked (default: `codesign`). It
 # exists so selftest.sh can drive every branch below on the Linux `tooling` job
-# with stand-ins. It changes WHO is asked, never how the answer is scored, so
-# no value of it can turn a rejection into a pass.
+# with stand-ins. It changes WHO is asked, never how the answer is scored — but
+# whoever sets it controls the ANSWER completely, so it is a test seam and not a
+# configuration knob. Inside GitHub Actions this gate therefore REFUSES to
+# honour it (exit 64) unless `TETON_ALLOW_TOOL_SEAM=1` is also set, which is
+# selftest.sh saying "I am the harness". A release job has no reason to set
+# either, and a release verified against a stand-in codesign is not verified.
 #
 # Two questions are asked of every binary, and both must hold:
 #
@@ -47,14 +51,17 @@
 # LESSON-442):
 #
 #   0   PASS       every binary checked is Developer ID signed by <team-id>.
-#   64  EX_USAGE   wrong invocation (missing argument, empty team id).
+#   64  EX_USAGE   wrong invocation (missing argument, empty team id), or the
+#                  TETON_CODESIGN test seam offered to a GitHub Actions run that
+#                  did not declare itself a harness.
 #   65  FAILED     the check RAN and REJECTED — these bytes are not signed the
 #                  way a release must be. Blocks the release loudly (BR-2).
 #   75  UNCHECKED  the check could NOT run: no codesign, artifact missing,
-#                  extraction failed, a binary is absent from the tarball, or
-#                  `-dv` printed nothing to read. Nothing was learned, so it
-#                  still fails the release — but it never claims the bytes are
-#                  bad.
+#                  extraction failed, a binary is absent from the tarball,
+#                  either codesign invocation could not be EXECUTED (126/127) or
+#                  died on a signal (>=128), or `-dvv` printed nothing to read.
+#                  Nothing was learned, so it still fails the release — but it
+#                  never claims the bytes are bad.
 #
 # 65 must stay unforgeable as "these bytes are bad" (LESSON-442), which is why
 # `set -e` is deliberately absent below: under it an unhandled non-zero aborts
@@ -83,6 +90,42 @@ fi
 
 usage() {
     echo "usage: verify-signature.sh <binary|tarball> <team-id>" >&2
+}
+
+# The seam is a TEST seam, and it is refused where tests do not run.
+#
+# `TETON_CODESIGN` decides which program answers "is this Developer ID signed",
+# so whoever sets it decides the verdict outright — lib.sh's note is precise
+# about that. Offline, on a developer's machine, that is exactly what selftest.sh
+# needs. Inside GitHub Actions it is an unsigned release waved through by an
+# environment variable, and the release workflow sets neither variable, so an
+# unexpected one there is either a mistake or an attack on the gate.
+#
+# Refused as 64 rather than 75: this is a wrong INVOCATION, not an environment
+# that could not answer, and a caller who meant it has a one-word way to say so.
+# selftest.sh sets TETON_ALLOW_TOOL_SEAM=1 once, at the top, for exactly this.
+if [ "${GITHUB_ACTIONS:-}" = "true" ] &&
+    [ -n "${TETON_CODESIGN:-}" ] &&
+    [ "${TETON_ALLOW_TOOL_SEAM:-}" != "1" ]; then
+    echo "verify-signature: TETON_CODESIGN is set inside GitHub Actions, and TETON_ALLOW_TOOL_SEAM=1" >&2
+    echo "                  is not — refusing to run. That variable replaces the tool whose answer" >&2
+    echo "                  IS this gate's verdict, so honouring it in CI would let an environment" >&2
+    echo "                  variable declare an unsigned release signed. Nothing was checked." >&2
+    usage
+    exit "$EXIT_USAGE"
+fi
+
+# Did the SHELL fail to run the tool, rather than the tool reaching a verdict?
+#
+#   126/127  resolved a moment ago, and has since vanished or lost its exec bit.
+#   >=128    died on a signal N-128 — a segfault, an OOM kill, a CI step timeout.
+#
+# None of the three is evidence about the artifact, and every one of them is
+# reachable without touching the bytes being checked, so scoring any of them as
+# a rejection would be a 65 forged by an environment change (LESSON-442).
+# codesign's own verdicts are small numbers (1, 3); it has no verdict up here.
+could_not_run() {
+    [ "$1" -eq 126 ] || [ "$1" -eq 127 ] || [ "$1" -ge 128 ]
 }
 
 if [ "$#" -lt 2 ]; then
@@ -201,12 +244,11 @@ for target in "${targets[@]}"; do
     verify_status=0
     verify_out="$("$codesign_tool" --verify --strict "$target" 2>&1)" || verify_status=$?
 
-    # 126 and 127 are the SHELL's "could not run it", not codesign's verdict:
-    # the tool resolved a moment ago and has since vanished or lost its exec
-    # bit. Scoring that as a rejection would be a 65 forged by an environment
-    # change rather than by the bytes (LESSON-442).
-    if [ "$verify_status" -eq 126 ] || [ "$verify_status" -eq 127 ]; then
-        echo "verify-signature: '$codesign_tool' could not be run (exit $verify_status) — $name was not checked." >&2
+    # Not codesign's verdict but the shell's "could not run it" — including a
+    # signal death, which used to fall through to the rejection branch below and
+    # score a segfaulting codesign as proof that the bytes are unsigned.
+    if could_not_run "$verify_status"; then
+        echo "verify-signature: '$codesign_tool --verify' did not run to a verdict (exit $verify_status) — $name was not checked." >&2
         unchecked=1
         continue
     fi
@@ -218,12 +260,33 @@ for target in "${targets[@]}"; do
     fi
 
     # `-dvv` writes its identity dump to stderr, hence the 2>&1. What is scored
-    # here is the OUTPUT, not the exit status: everything genuinely unsigned
-    # already died at --verify above, so a `-dvv` that returns non-zero while
-    # still describing the signature is a verdict worth reading, and one that
-    # says nothing at all is a broken tool rather than bad bytes.
+    # here is mostly the OUTPUT rather than the exit status: everything
+    # genuinely unsigned already died at --verify above, so a `-dvv` that
+    # returns non-zero while still describing the signature is a verdict worth
+    # reading, and one that says nothing at all is a broken tool rather than bad
+    # bytes.
+    #
+    # "Mostly", and the exception is this next test, which has to come BEFORE
+    # the needle tests. 126/127/signal-death means the shell never got the tool
+    # running — and it is not silent when that happens: it prints a diagnostic
+    # of its own ("no such file or directory", "bad interpreter"). That
+    # diagnostic is non-empty output that names neither a Developer ID authority
+    # nor the team id, so scored as a dump it reads as a perfectly formed
+    # rejection. This gate would then announce "the signature does not name a
+    # Developer ID Application authority" on the strength of a lost interpreter
+    # — a 65 forged by an exec failure, which is precisely the collision 65 must
+    # stay unforgeable against (LESSON-442).
     display_status=0
     display_out="$("$codesign_tool" -dvv "$target" 2>&1)" || display_status=$?
+
+    if could_not_run "$display_status"; then
+        echo "verify-signature: '$codesign_tool -dvv' did not run to a verdict (exit $display_status) — $name was not checked." >&2
+        echo "                  Whatever it printed is the shell's diagnostic, not an identity dump," >&2
+        echo "                  and an identity that was never READ is not an identity that is wrong." >&2
+        printf '%s\n' "$display_out" | quote
+        unchecked=1
+        continue
+    fi
 
     if [ -z "$display_out" ]; then
         echo "verify-signature: '$codesign_tool -dvv $name' printed nothing (exit $display_status)." >&2
