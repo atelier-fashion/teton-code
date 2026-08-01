@@ -69,11 +69,12 @@ permissions:
   contents: read
 
 env:
-  # The tap coordinates from ADR-548-1, passed explicitly to site/render.sh.
-  # render.sh carries the same string as a convenience default for local
-  # renders, but relying on that default would leave the published install
-  # command defined in two places that can drift apart silently. This workflow
-  # is the thing that publishes, so this workflow states it.
+  # The tap coordinates from ADR-548-1. site/render.sh carries the same string
+  # as DEFAULT_INSTALL_COMMAND and is the owner — it is greppable, testable on
+  # its own, and lives beside the page it stamps. Passing it here is belt and
+  # braces, NOT a second source of truth: tools/release/selftest.sh asserts
+  # this value and render.sh's constant are byte-identical, so the pair cannot
+  # drift the way the log paths did before v0.1.1. Change one and CI reddens.
   INSTALL_COMMAND: brew install atelier-fashion/tap/teton
 
 jobs:
