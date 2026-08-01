@@ -353,6 +353,48 @@ expect_exit 0 "accepts an explicit install command" \
     bash "$site_ok/render.sh" v1.2.3 "brew install teton"
 assert "  ... and stamps it" grep -Fq 'brew install teton' "$site_ok/dist/index.html"
 
+# D-1: the landing page must not name a binary the formula does not install.
+# tetoncode.ai shipped "teton / tetond" for the whole life of v0.1.1 — the
+# daemon had been renamed to teton-code everywhere the rename swept, and the
+# page was the one surface nothing checked. The formula's bin.install line is
+# the owner (it is what lands in a user's PATH); the page is asserted against
+# it rather than against a list restated here.
+installed_bins="$(sed -nE 's|^[[:space:]]*bin\.install[[:space:]]+(.+)$|\1|p' \
+    "$FORMULA_TEMPLATE" | head -1 | tr -d '"' | tr ',' ' ')"
+if [ -z "$installed_bins" ]; then
+    report_fail "site/formula binary cross-check could not read bin.install" \
+        "from $FORMULA_TEMPLATE"
+else
+    for bin_name in $installed_bins; do
+        assert "the page names the installed binary '$bin_name'" \
+            grep -Fq "$bin_name" "$SITE_TEMPLATE"
+    done
+    # The negative half, and the one that would have caught the live bug: the
+    # page must not name a binary that no longer exists.
+    if grep -Fq "tetond" "$SITE_TEMPLATE"; then
+        report_fail "the page names 'tetond', which bin.install does not install" \
+            "$(grep -n 'tetond' "$SITE_TEMPLATE" | head -3)"
+    else
+        report_pass "the page names no binary outside bin.install"
+    fi
+fi
+
+# D-2: the published install command and render.sh's default must be the same
+# string. deploy-site.yml passes the value explicitly; render.sh owns it. Two
+# copies of one fact is exactly the shape that broke v0.1.1's log paths, so the
+# pair is pinned here rather than trusted.
+wf_cmd="$(sed -nE 's|^[[:space:]]*INSTALL_COMMAND:[[:space:]]*(.+)$|\1|p' \
+    "$repo_root/.github/workflows/deploy-site.yml" | head -1)"
+default_cmd="$(sed -nE "s|^readonly DEFAULT_INSTALL_COMMAND='(.+)'$|\\1|p" \
+    "$SITE_RENDER" | head -1)"
+if [ -z "$wf_cmd" ] || [ -z "$default_cmd" ]; then
+    report_fail "install command cross-check could not read both copies" \
+        "workflow='$wf_cmd' render.sh='$default_cmd'"
+else
+    assert "the published install command matches render.sh's default" \
+        [ "$wf_cmd" = "$default_cmd" ]
+fi
+
 expect_exit 64 "no argument -> 64" bash "$site_ok/render.sh"
 expect_exit 64 "a malformed version -> 64" bash "$site_ok/render.sh" "not-a-version"
 expect_exit 64 "an empty version -> 64" bash "$site_ok/render.sh" ""
