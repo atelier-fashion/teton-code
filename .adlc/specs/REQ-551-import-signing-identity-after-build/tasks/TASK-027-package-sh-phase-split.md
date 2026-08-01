@@ -1,7 +1,7 @@
 ---
 id: TASK-027
 title: "package.sh phase argument: build / pack / all"
-status: draft
+status: complete
 parent: REQ-551
 created: 2026-08-01
 updated: 2026-08-01

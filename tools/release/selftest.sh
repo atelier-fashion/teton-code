@@ -1664,6 +1664,14 @@ unset TETON_SMOKE_SEAM_DEADLINE_SECS TETON_SMOKE_HANDSHAKE_DEADLINE_SECS
 # the produced binaries, or Apple's codesign. The stub builds nothing and the
 # stand-in signs nothing. What is under test is package.sh's own control flow —
 # which failures stop it, and which of them ship a tarball anyway.
+#
+# Every case in THIS group drives the default phase, `all`, and not one of them
+# passes a 4th argument. That is deliberate: since ADR-551-1 split the script
+# into `build` and `pack`, these cases are the compatibility contract rather
+# than a description of it — if the split changed what a plain
+# `package.sh <target> <version> <outdir>` prints or produces, they go red
+# without having been edited. The phases themselves are driven separately in
+# the group after this one.
 
 group "package.sh (input validation and the signing phase, no toolchain)"
 
@@ -1676,6 +1684,15 @@ expect_exit 64 "a prerelease version -> 64" \
     bash "$PACKAGE" aarch64-apple-darwin 1.2.3-rc.1 "$work/pkg"
 expect_exit 64 "a version that is really a path -> 64" \
     bash "$PACKAGE" aarch64-apple-darwin "../../etc" "$work/pkg"
+
+# The 4th argument is a selector, not free text: it decides which half of the
+# script runs, and a typo'd `packk` that fell through to a default would run the
+# other half silently — a "build" step that quietly signed, or a "pack" step
+# that quietly rebuilt. Refused with the same code as the other three arguments,
+# and before cargo is invoked.
+expect_exit 64 "an unknown phase -> 64, before cargo is invoked" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg" packk
+expect_output "  ... and lists the phases it knows" "all, build, pack"
 
 # BR-2's known-bad, and the cheapest of the lot: signing is REQUESTED and the
 # tool is not there. Settled before `cargo build` on purpose, so the answer
@@ -1727,6 +1744,12 @@ assert "  ... and the tarball was written" \
     [ -s "$work/pkg-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
 assert "  ... with its sha256 sidecar" \
     [ -s "$work/pkg-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz.sha256" ]
+# The staging directory ADR-551-1 introduced is an implementation detail of the
+# phase boundary, and `all` crosses that boundary in one process — so it must
+# leave the output directory looking exactly as the old mktemp-and-trap version
+# did: one tarball, one sidecar, and no loose signed binaries beside them.
+refute "  ... and nothing staged left behind, as the mktemp directory never was" \
+    test -e "$work/pkg-signed/stage-aarch64-apple-darwin"
 
 # KNOWN-BAD, and the claim BR-2 actually makes: the certificate is missing or
 # expired, `codesign --sign` fails, and NO TARBALL IS WRITTEN. A build that
@@ -1775,6 +1798,281 @@ expect_exit 70 "cargo succeeds but teton-code is missing -> 70" \
     bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-short"
 expect_output "  ... and names the binary it did not find" \
     "cargo reported success but"
+
+# --- package.sh, phase by phase (ADR-551-1) --------------------------------
+#
+# The release workflow now runs `build` and `pack` as two steps with the
+# Developer ID identity imported BETWEEN them, so that the ~30 minutes of
+# compiling third-party sources happens on a runner with no signing identity on
+# it (REQ-551 BR-1). Two properties only exist once the phases are separate,
+# and neither can be observed from an `all` run:
+#
+#   * `build` must not touch signing AT ALL — not resolve the tool, not invoke
+#     it — even when TETON_SIGN_IDENTITY leaks into its environment. That is
+#     what makes the long compile safe to run before an identity exists.
+#   * `pack` must work from a staging directory it did not create, and refuse
+#     when that directory is missing or short a member: a `pack` whose `build`
+#     step never ran must never produce a tarball (BR-2, across the boundary).
+#
+# The stand-ins are the same ones the group above uses, plus two of this
+# group's own.
+
+group "package.sh phases (build / pack / all, no toolchain)"
+
+# A cargo TRIPWIRE, for every case below that drives `pack`. Not the exit-0
+# stub: the claim under test is that the pack phase builds NOTHING, and the
+# honest way to test that is to make building fail loudly and instantly.
+# Leaving the real cargo on PATH would let a regression "pass" by compiling the
+# workspace — llama.cpp from source, minutes of it — which is neither fast nor
+# an assertion. 97 is outside every taxonomy in this repo, so if it ever
+# surfaces it can only have come from here.
+pkg_nocargo="$work/pkg-nocargo"
+mkdir -p "$pkg_nocargo"
+cat >"$pkg_nocargo/cargo" <<'EOF'
+#!/usr/bin/env bash
+echo "selftest: cargo was invoked by a phase that must not build" >&2
+exit 97
+EOF
+chmod +x "$pkg_nocargo/cargo"
+
+# A codesign stand-in that RECORDS: it answers exactly as cs_accept does and
+# appends one line per invocation to a log. "The build phase never invokes the
+# signing tool" is not a claim an exit code can make — a build that resolved
+# codesign and signed with it exits 0 too — so the invocations have to be
+# counted rather than inferred.
+pkg_cs_log="$work/pkg-cs-invocations"
+pkg_cs_recording="$work/pkg-cs-recording/codesign"
+mkdir -p "$(dirname "$pkg_cs_recording")"
+cat >"$pkg_cs_recording" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$pkg_cs_log"
+exec "$cs_accept" "\$@"
+EOF
+chmod +x "$pkg_cs_recording"
+
+# stage_for_pack <outdir> — plants the directory a build phase would have left.
+#
+# Deliberately NOT produced by running the build phase: the point of `pack` is
+# that it works from a staging directory made by a process it never saw, which
+# is exactly what the workflow hands it across the identity-import step. A
+# fixture built by the code under test could not fail in the way this one can.
+stage_for_pack() {
+    local dest="$1/stage-aarch64-apple-darwin" member
+    mkdir -p "$dest"
+    for member in teton teton-code; do
+        printf '#!/usr/bin/env bash\nexit 0\n' >"$dest/$member"
+        chmod +x "$dest/$member"
+    done
+    printf 'MIT\n' >"$dest/LICENSE"
+    printf '# teton\n' >"$dest/README.md"
+}
+
+# `all`, named out loud — what the Linux leg keeps doing, and what a human who
+# reads the usage line might type. Same flow, same lines, same tarball as the
+# default cases above: the argument selects, it does not switch modes.
+expect_exit 0 "an explicit 'all' behaves exactly as the default does -> 0" \
+    env PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-all-explicit" all
+expect_output "  ... having signed teton" "package: signed teton"
+expect_output "  ... and teton-code too" "package: signed teton-code"
+assert "  ... and shipped the tarball" \
+    [ -s "$work/pkg-all-explicit/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
+refute "  ... consuming its own staging directory on the way out" \
+    test -e "$work/pkg-all-explicit/stage-aarch64-apple-darwin"
+
+# `build` alone: it compiles, it stages, and it stops. The identity is set and
+# the signing tool is right there on the seam — and the log below says it was
+# called zero times.
+: >"$pkg_cs_log"
+expect_exit 0 "build alone stages the pair and stops there -> 0" \
+    env PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$pkg_cs_recording" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-build" build
+assert "  ... staging teton where pack will look for it" \
+    [ -x "$work/pkg-build/stage-aarch64-apple-darwin/teton" ]
+assert "  ... and teton-code beside it" \
+    [ -x "$work/pkg-build/stage-aarch64-apple-darwin/teton-code" ]
+assert "  ... with the licence" \
+    [ -f "$work/pkg-build/stage-aarch64-apple-darwin/LICENSE" ]
+assert "  ... and the readme" \
+    [ -f "$work/pkg-build/stage-aarch64-apple-darwin/README.md" ]
+# BR-1, and the property the whole reorder exists for.
+assert "  ... having invoked the signing tool exactly never (BR-1)" \
+    [ ! -s "$pkg_cs_log" ]
+refute "  ... and written no tarball, because packing is not its job" \
+    test -e "$work/pkg-build/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# The same claim from the other side, and the sharper of the two: signing is
+# requested and TETON_CODESIGN names a path that does not exist. On the `all`
+# path that is the 70 above, settled before cargo runs. The build phase must
+# not ask the question AT ALL — a build that resolved the tool would exit 70
+# here, which would mean the long compile could only run on a machine that
+# already had a signing identity, which is the ordering REQ-551 removes.
+expect_exit 0 "build with TETON_SIGN_IDENTITY set resolves no signing tool -> 0" \
+    env PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN=/nonexistent/codesign \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-build-identity" build
+assert "  ... and said nothing about signing, either way" \
+    [ "${CASE_OUT#*package: signed}" = "$CASE_OUT" ]
+
+# The seam guard is a `pack`/`all` guard now, and this pins that as a decision
+# rather than an oversight: the build phase reads TETON_CODESIGN nowhere, so
+# there is nothing here for the variable to decide, and a guard standing over a
+# variable that cannot reach anything teaches the next reader the wrong thing
+# about what it protects. The pack case directly below is where the refusal has
+# to survive, and does.
+expect_exit 0 "build in CI ignores TETON_CODESIGN rather than refusing it -> 0" \
+    env -u TETON_ALLOW_TOOL_SEAM GITHUB_ACTIONS=true \
+    PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_CODESIGN="$cs_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-build-ci" build
+
+stage_for_pack "$work/pkg-pack-seam"
+expect_exit 64 "pack still refuses TETON_CODESIGN in CI -> 64" \
+    env -u TETON_ALLOW_TOOL_SEAM GITHUB_ACTIONS=true \
+    PATH="$pkg_nocargo:$PATH" TETON_CODESIGN="$cs_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-seam" pack
+expect_output "  ... and writes no tarball" "No tarball is written"
+
+# `pack` alone, from a staging directory it did not create: the whole of the
+# signing story above, re-asked at the phase that now owns it.
+stage_for_pack "$work/pkg-pack-signed"
+expect_exit 0 "pack alone signs the staged pair and ships -> 0" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-signed" pack
+expect_output "  ... having signed teton" "package: signed teton"
+expect_output "  ... and teton-code too" "package: signed teton-code"
+assert "  ... and the tarball was written" \
+    [ -s "$work/pkg-pack-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
+assert "  ... with its sha256 sidecar" \
+    [ -s "$work/pkg-pack-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz.sha256" ]
+# The pack phase ships what it was handed and invents nothing: four members,
+# flat, in the order package.sh lists them.
+pkg_pack_members="$(tar -tzf "$work/pkg-pack-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz" | tr '\n' ' ')"
+assert "  ... and the archive holds exactly the four staged members" \
+    [ "$pkg_pack_members" = "teton teton-code LICENSE README.md " ]
+# Consumed on success: signed binaries left loose beside the tarball made from
+# them are a second copy nobody hashed, and a second `pack` would re-ship a
+# build the first one already shipped.
+refute "  ... and the staging directory was consumed" \
+    test -e "$work/pkg-pack-signed/stage-aarch64-apple-darwin"
+
+# KNOWN-BAD at the pack phase, and the claim BR-2 actually makes: the
+# certificate is missing or expired, `codesign --sign` fails, and NO TARBALL IS
+# WRITTEN.
+stage_for_pack "$work/pkg-pack-signreject"
+expect_exit 70 "pack whose codesign REFUSES -> 70" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_sign_reject" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-signreject" pack
+expect_output "  ... and says it will not ship unsigned" \
+    "a signing-requested build never ships unsigned"
+refute "  ... and no tarball was left behind" \
+    test -e "$work/pkg-pack-signreject/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+# The other half of the consume rule, and the reason it is "on success" rather
+# than "always": a FAILED pack keeps the staged build, so fixing the identity
+# and re-running `pack` costs seconds instead of a second from-source compile.
+# Nothing shippable survives — there is no tarball and no sidecar — which is
+# what makes keeping it safe rather than tidy.
+assert "  ... while the staged build survives for a retry" \
+    [ -d "$work/pkg-pack-signreject/stage-aarch64-apple-darwin" ]
+
+# KNOWN-BAD, the other half: signing succeeded and the RESULT does not hold.
+stage_for_pack "$work/pkg-pack-verifyreject"
+expect_exit 70 "pack that signed but --verify --strict rejects the result -> 70" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_reject" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-verifyreject" pack
+expect_output "  ... and blames the verify, not the sign" \
+    "codesign --verify --strict rejected the result"
+
+# The unsigned dev build, at the phase that decides it: no identity, no
+# signing, and it says so out loud rather than leaving a reader to infer it.
+stage_for_pack "$work/pkg-pack-unsigned"
+expect_exit 0 "pack with no TETON_SIGN_IDENTITY -> an unsigned dev build that says so" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-unsigned" pack
+expect_output "  ... and names the variable that would have signed it" \
+    "set TETON_SIGN_IDENTITY for release signing"
+
+# BR-2 across the phase boundary, and the case TASK-027's mutation check
+# breaks: NO staging directory at all, because the build step never ran — it
+# was skipped, cancelled, failed early, or wrote to another outdir. A pack that
+# tarred whatever it found would hand the release job an artifact with the
+# right NAME and nothing inside it, and the name is most of what the rest of
+# the pipeline reads.
+expect_exit 70 "pack with no staging directory at all -> 70" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-nostage" pack
+expect_output "  ... naming the contract it is holding to" \
+    "The pack phase packs what the build phase staged"
+# The needle above is deliberately NOT the whole assertion: the per-member
+# check below the directory check prints it too, so an absent directory would
+# still be refused — with the wrong diagnosis — if the directory check were
+# deleted. (It was: removing that branch alone left this suite green until this
+# line existed.) The first line of each refusal is what separates "there is
+# nothing here" from "what is here is short a member", and an operator reading
+# a red step needs to be told which.
+expect_output "  ... and saying the directory is not there AT ALL, not merely short" \
+    "there is no staged build at"
+refute "  ... and writing no tarball" \
+    test -e "$work/pkg-pack-nostage/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# Half a staging directory, which is the likelier accident: a build that died
+# between the two copies, or a second binary that never linked. A tarball short
+# one binary is worse than no tarball, because it installs.
+stage_for_pack "$work/pkg-pack-half"
+rm -f "$work/pkg-pack-half/stage-aarch64-apple-darwin/teton-code"
+expect_exit 70 "pack with a staging directory short one binary -> 70" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-half" pack
+expect_output "  ... naming the binary that is not there" \
+    "teton-code is missing or not executable"
+expect_output "  ... and the contract, again" \
+    "The pack phase packs what the build phase staged"
+refute "  ... and writing no tarball" \
+    test -e "$work/pkg-pack-half/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# The ride-alongs are held to the same contract as the binaries. `tar` would
+# fail on a missing member by itself — with a status from outside this script's
+# taxonomy and a message about a file rather than about a phase.
+stage_for_pack "$work/pkg-pack-nolicense"
+rm -f "$work/pkg-pack-nolicense/stage-aarch64-apple-darwin/LICENSE"
+expect_exit 70 "pack with a staging directory short its LICENSE -> 70, not a tar error" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-nolicense" pack
+expect_output "  ... naming the member it did not find" "LICENSE is missing"
+
+# The handoff, end to end, in the order the workflow will run it: `build`
+# stages, and a SEPARATE process signs and packs what it left behind. On the
+# real runner the identity is imported between these two invocations, which is
+# the whole of ADR-551-1; nothing else here exercises two phases against one
+# staging directory.
+: >"$pkg_cs_log"
+expect_exit 0 "build, then a second process packs what it staged: the build -> 0" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN \
+    PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-handoff" build
+expect_exit 0 "  ... and the pack that follows it, with the identity now set -> 0" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$pkg_cs_recording" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-handoff" pack
+assert "  ... producing the tarball the runbook expects" \
+    [ -s "$work/pkg-handoff/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
+# Four invocations, not "some": two binaries, each signed and then verified.
+# A count pins the pair AND the verify, which an exit code cannot (LESSON-455),
+# and it pins them to the SECOND process — the log was empty when it started.
+assert "  ... with all four signing-tool invocations made by the pack process" \
+    [ "$(grep -c '' "$pkg_cs_log")" -eq 4 ]
 
 # --- lib.sh ----------------------------------------------------------------
 

@@ -2,12 +2,46 @@
 #
 # Build one release target and assemble its distributable tarball.
 #
-# Usage: tools/release/package.sh <target> <version> [outdir]
+# Usage: tools/release/package.sh <target> <version> [outdir] [phase]
 #
 #   <target>   Rust target triple, e.g. `aarch64-apple-darwin`.
 #   <version>  the release version, with or without a leading `v`. The tarball
 #              is named `teton-v<version>-<target>.tar.gz`.
 #   [outdir]   where the tarball lands; defaults to `<repo>/dist`.
+#   [phase]    `all` (the default), `build` or `pack` — see below.
+#
+# THE PHASES (ADR-551-1). `all` is everything this script has ever done, and it
+# is still what a human and the runbook type. `build` and `pack` are that same
+# work cut at one seam, so the release workflow can put a step BETWEEN them:
+#
+#   build   validate the arguments, `cargo build`, and stage the two binaries
+#           plus LICENSE and README.md into `<outdir>/stage-<target>/`. It
+#           resolves no signing tool, invokes none, and never reads
+#           TETON_SIGN_IDENTITY — that is the whole point of the split. This
+#           phase spends ~30 minutes compiling third-party sources (llama.cpp),
+#           and REQ-551 exists so that no signing identity is on the machine
+#           while it does (BR-1).
+#   pack    sign and verify the staged pair, tar it, hash it. It builds
+#           nothing, and it packs only what a build phase left behind: a
+#           missing or incomplete staging directory is a hard 70, so a `pack`
+#           that followed no `build` can never emit a tarball (the
+#           cross-boundary half of BR-2).
+#   all     `build` then `pack`, in one process — byte for byte what this
+#           script printed and produced before the phase argument existed.
+#
+# The staging directory is DETERMINISTIC — `<outdir>/stage-<target>/`, derived
+# from arguments both invocations already pass — because the two phases are
+# separate processes with no other way to agree on a path; the mktemp directory
+# it replaces could not survive the one boundary it now has to cross. `build`
+# creates it FRESH (anything already there is removed, so a stale binary from
+# an earlier run cannot ride along into a release), and a successful `pack`
+# CONSUMES it, which is why `all` still leaves nothing behind. A FAILED pack
+# leaves it in place on purpose: the bytes are already compiled, the failure is
+# a signing problem to fix and re-`pack`, and there is no tarball or sha256 for
+# a leftover directory to be mistaken for. The price of a deterministic name is
+# that two packages of the SAME target into the SAME outdir must not run at
+# once — the release runs one leg per target per runner, and a human would have
+# to arrange that collision on purpose.
 #
 # The build always carries `--features tetond/llama`. The local inference engine
 # is the product this release exists to install: a tarball built without it
@@ -30,17 +64,21 @@
 # With `TETON_SIGN_IDENTITY` set, both staged binaries are codesigned and
 # verified before the tarball is written, and any failure ends the leg; without
 # it they stay as the linker left them and the script says so. A dev build is
-# not a release, and a release that could not sign is not a release either.
+# not a release, and a release that could not sign is not a release either. All
+# of that is the PACK phase's, and only the pack phase's.
 #
 # Exit codes:
-#   0   the tarball was built and its sha256 recorded.
+#   0   the tarball was built and its sha256 recorded — or, for `build`, the
+#       binaries were compiled and staged for a later `pack`.
 #   64  EX_USAGE — wrong invocation, or an argument that is not what it claims
-#       to be: `version` is pasted into a filesystem path and `target` is handed
-#       to `cargo build --target`, so neither is free text.
+#       to be: `version` is pasted into a filesystem path, `target` is handed
+#       to `cargo build --target`, and `phase` selects which half of this
+#       script runs, so none of the three is free text.
 #   70  EX_SOFTWARE — the build reported success but an expected binary is not
-#       where it should be, or signing was asked for and could not be carried
-#       out. Both are internal inconsistencies rather than compile errors, and
-#       they are worth their own code so neither can be read as one.
+#       where it should be, signing was asked for and could not be carried out,
+#       or the pack phase found no complete staging directory to pack. All are
+#       internal inconsistencies rather than compile errors, and they are worth
+#       their own code so none can be read as one.
 #   75  EX_TEMPFAIL — the tarball was built but could not be hashed, because the
 #       machine has no sha256 tool at all. Distinct from 70 for the same reason
 #       the rest of tools/release/ separates them (LESSON-442): "could not run"
@@ -61,6 +99,26 @@ repo_root="$(cd -- "$script_dir/../.." && pwd)"
 # shellcheck source=tools/release/lib.sh disable=SC1091
 . "$script_dir/lib.sh"
 
+if [ "$#" -lt 2 ]; then
+    echo "usage: package.sh <target> <version> [outdir] [phase]" >&2
+    exit "$EXIT_USAGE"
+fi
+
+target="$1"
+version="${2#v}"
+phase="${4:-all}"
+
+# Settled before anything else, because the phase decides which of the checks
+# below even apply: the seam guard directly under this one belongs to `pack`
+# and `all`, and the signing-tool resolution after it belongs to them too.
+case "$phase" in
+    all | build | pack) ;;
+    *)
+        echo "package: [phase] must be one of all, build, pack; got '$phase'." >&2
+        exit "$EXIT_USAGE"
+        ;;
+esac
+
 # The seam is a TEST seam, and it is refused where tests do not run — the same
 # guard verify-signature.sh and verify-attestation.sh carry, applied here for a
 # sharper reason than either. Those two report on bytes somebody else made;
@@ -69,7 +127,15 @@ repo_root="$(cd -- "$script_dir/../.." && pwd)"
 # — it decides what a release signature is. The release workflow sets neither
 # variable, so one appearing on a GitHub Actions run is a mistake or an attack.
 # selftest.sh sets TETON_ALLOW_TOOL_SEAM=1 once, at the top, to say it meant it.
-if [ "${GITHUB_ACTIONS:-}" = "true" ] &&
+#
+# Asked of `pack` and `all` only. The build phase resolves no signing tool and
+# reads TETON_CODESIGN nowhere, so refusing there would be a guard standing over
+# a variable that cannot reach anything — which teaches the next reader the
+# wrong thing about what this guard is for. The pack phase, in the same job on
+# the same runner, still refuses, and that is where the variable would have
+# decided something.
+if [ "$phase" != build ] &&
+    [ "${GITHUB_ACTIONS:-}" = "true" ] &&
     [ -n "${TETON_CODESIGN:-}" ] &&
     [ "${TETON_ALLOW_TOOL_SEAM:-}" != "1" ]; then
     echo "package: TETON_CODESIGN is set inside GitHub Actions, and TETON_ALLOW_TOOL_SEAM=1 is not" >&2
@@ -78,14 +144,6 @@ if [ "${GITHUB_ACTIONS:-}" = "true" ] &&
     echo "         release signature is. No tarball is written." >&2
     exit "$EXIT_USAGE"
 fi
-
-if [ "$#" -lt 2 ]; then
-    echo "usage: package.sh <target> <version> [outdir]" >&2
-    exit "$EXIT_USAGE"
-fi
-
-target="$1"
-version="${2#v}"
 
 # Both arguments are validated before anything is built, because both leave this
 # script: `version` becomes part of a path this script creates and writes, and
@@ -109,11 +167,17 @@ case "$target" in
         ;;
 esac
 
-# Whether this build CAN sign is settled before it is built, for the reason the
-# target allowlist is: a signing-requested build on a machine without codesign
-# is going to die either way, and dying after a from-source llama.cpp compile
-# only makes the same answer slower and dearer to arrive at. The tool resolved
-# here is the one the staging step below uses.
+# Whether this run CAN sign is settled before anything is built, for the reason
+# the target allowlist is: a signing-requested `all` on a machine without
+# codesign is going to die either way, and dying after a from-source llama.cpp
+# compile only makes the same answer slower and dearer to arrive at. Resolved
+# here rather than inside pack_phase precisely so that `all` asks it first —
+# for a bare `pack` the two positions are the same position, since nothing runs
+# before it.
+#
+# NOT asked when the phase is `build`. A build that resolved the signing tool
+# would fail on a machine that has no identity to sign with, which is the
+# machine REQ-551 wants the long compile to happen on (BR-1).
 #
 # The predicate is the REQUEST, never the availability of a certificate. The
 # release workflow sets TETON_SIGN_IDENTITY unconditionally on both macOS legs
@@ -127,7 +191,7 @@ esac
 # `TETON_CODESIGN` is the same seam verify-signature.sh carries, for the same
 # reason: it changes WHICH tool is asked, never how the answer is scored.
 codesign_tool=""
-if [ -n "${TETON_SIGN_IDENTITY:-}" ]; then
+if [ "$phase" != build ] && [ -n "${TETON_SIGN_IDENTITY:-}" ]; then
     if ! codesign_tool="$(tool_or_unchecked "${TETON_CODESIGN:-}" codesign)"; then
         echo "package: signing was requested (TETON_SIGN_IDENTITY is set) but '${TETON_CODESIGN:-codesign}'" >&2
         echo "         is not on this machine. Refusing to build a tarball that would be unsigned" >&2
@@ -140,93 +204,190 @@ outdir="${3:-$repo_root/dist}"
 mkdir -p "$outdir"
 outdir="$(cd -- "$outdir" && pwd)"
 
-echo "package: building $target (release, --features tetond/llama)"
-cargo build --release --workspace --target "$target" --features tetond/llama
+# The one name both phases compute identically, from arguments they both
+# already carry. Nothing is passed between two separate invocations except
+# these bytes at this path.
+stage="$outdir/stage-$target"
 
-bin_dir="${CARGO_TARGET_DIR:-$repo_root/target}/$target/release"
+# Progress lines that belong to a SPLIT invocation only. `all` must print
+# exactly what it printed before the phase argument existed — the runbook
+# quotes those lines and the selftest reads them — so the two hand-off
+# announcements say nothing there. In a split run they are not decoration:
+# `build` and `pack` are separate steps in a workflow log, and each one needs
+# to name the directory the other depends on.
+phase_note() {
+    if [ "$phase" != all ]; then
+        printf 'package: %s\n' "$1"
+    fi
+}
 
-stage="$(mktemp -d "${TMPDIR:-/tmp}/teton-package.XXXXXX")"
-trap 'rm -rf "$stage"' EXIT
+build_phase() {
+    local bin bin_dir
 
-for bin in teton teton-code; do
-    if [ ! -x "$bin_dir/$bin" ]; then
-        echo "package: cargo reported success but $bin_dir/$bin is missing or not executable." >&2
+    echo "package: building $target (release, --features tetond/llama)"
+    cargo build --release --workspace --target "$target" --features tetond/llama
+
+    bin_dir="${CARGO_TARGET_DIR:-$repo_root/target}/$target/release"
+
+    # Cleared, not merged into: a staging directory left by an earlier run of a
+    # different commit would otherwise contribute whichever member this build
+    # fails to overwrite, and the tarball would carry bytes nobody just built.
+    rm -rf "$stage"
+    mkdir -p "$stage"
+
+    for bin in teton teton-code; do
+        if [ ! -x "$bin_dir/$bin" ]; then
+            echo "package: cargo reported success but $bin_dir/$bin is missing or not executable." >&2
+            exit "$EXIT_INTERNAL"
+        fi
+        cp "$bin_dir/$bin" "$stage/$bin"
+    done
+
+    # The licence and readme ride along so an unpacked tarball is self-describing
+    # even for someone who never visits the repo (and so Homebrew's `bin.install`
+    # has a licence sitting next to the binaries it installs). Staged here rather
+    # than at tar time because the staging directory is the phase boundary: what
+    # `pack` ships is what it finds, and it invents no members of its own.
+    cp "$repo_root/LICENSE" "$stage/LICENSE"
+    cp "$repo_root/README.md" "$stage/README.md"
+
+    phase_note "staged teton, teton-code, LICENSE and README.md in $stage"
+}
+
+pack_phase() {
+    local bin staged sha tarball
+
+    # The cross-boundary half of BR-2. `pack` runs in a process that did not
+    # build anything, so "the binaries are there" is an assumption it has to
+    # test rather than inherit: without this, a pack whose build step never ran
+    # (skipped, failed early, cancelled) would tar whatever it found and hand
+    # the release job a tarball with the right name and the wrong — or no —
+    # contents. Every way of being incomplete is 70, and none of them writes a
+    # tarball.
+    if [ ! -d "$stage" ]; then
+        echo "package: there is no staged build at $stage." >&2
+        echo "         The pack phase packs what the build phase staged: run this script with" >&2
+        echo "         phase 'build' (or 'all') first. A pack that followed no build writes no" >&2
+        echo "         tarball — a release that packages nothing must not look like one." >&2
         exit "$EXIT_INTERNAL"
     fi
-    cp "$bin_dir/$bin" "$stage/$bin"
-done
 
-# The signing phase (ADR-550-1), on the STAGED copies rather than the originals
-# under target/: the tarball below is assembled from this directory, so signing
-# here is what makes the shipped bytes the verified bytes. Signing the build
-# output instead would leave a gap between what was checked and what was tarred.
-#
-# Keyed on the identity again, not on `$codesign_tool` being non-empty. The two
-# are equivalent by construction — the check above exits when they are not — but
-# "sign if a tool happens to be around" is the self-disabling shape (LESSON-443)
-# and should not be what this reads like to whoever edits it next.
-if [ -n "${TETON_SIGN_IDENTITY:-}" ]; then
+    # By -x rather than -e: a staged file that cannot be executed is not a
+    # binary anybody can run out of the tarball.
     for bin in teton teton-code; do
-        # `--options runtime` (the hardened runtime) is what notarization will
-        # require of these binaries (spec OQ-3) and costs nothing before then.
-        # `--force` is there because Apple's linker already ad-hoc signs arm64
-        # Mach-Os at link time and codesign refuses to replace an existing
-        # signature without it; it decides only WHICH signature survives, never
-        # whether one is checked — the --verify below, and verify-signature.sh
-        # in the smoke, still have to accept whatever it produced.
-        if ! "$codesign_tool" --force --sign "$TETON_SIGN_IDENTITY" \
-            --timestamp --options runtime "$stage/$bin"; then
-            echo "package: codesign could not sign $bin with the requested identity." >&2
-            echo "         No tarball is written: a signing-requested build never ships unsigned." >&2
+        if [ ! -x "$stage/$bin" ]; then
+            echo "package: the staged build at $stage is incomplete — $bin is missing or not executable." >&2
+            echo "         The pack phase packs what the build phase staged, and it packs the pair or" >&2
+            echo "         nothing: a tarball short one binary is worse than no tarball, because it" >&2
+            echo "         installs." >&2
             exit "$EXIT_INTERNAL"
         fi
-
-        # Asked immediately, of the same file, because `--sign` exiting 0 is not
-        # the claim being made — "these bytes carry a signature that holds" is,
-        # and only --verify tests it. Whether the signature names the right
-        # AUTHORITY is verify-signature.sh's question, asked of the tarball in
-        # the smoke; asking it a second way here would be a second opinion free
-        # to drift from the gate that actually blocks the release.
-        if ! "$codesign_tool" --verify --strict "$stage/$bin"; then
-            echo "package: $bin was signed but codesign --verify --strict rejected the result." >&2
-            exit "$EXIT_INTERNAL"
-        fi
-
-        echo "package: signed $bin"
     done
-else
-    echo "package: binaries are unsigned (dev build — set TETON_SIGN_IDENTITY for release signing)"
-fi
 
-# The licence and readme ride along so an unpacked tarball is self-describing
-# even for someone who never visits the repo (and so Homebrew's `bin.install`
-# has a licence sitting next to the binaries it installs).
-cp "$repo_root/LICENSE" "$stage/LICENSE"
-cp "$repo_root/README.md" "$stage/README.md"
+    # The ride-alongs, held to the same contract. `tar` would fail on a missing
+    # member by itself, but with a status from outside this script's taxonomy
+    # and a message about a file rather than about a phase.
+    for staged in LICENSE README.md; do
+        if [ ! -f "$stage/$staged" ]; then
+            echo "package: the staged build at $stage is incomplete — $staged is missing." >&2
+            echo "         The pack phase packs what the build phase staged, and every member of" >&2
+            echo "         the tarball comes from there." >&2
+            exit "$EXIT_INTERNAL"
+        fi
+    done
 
-tarball="$outdir/teton-v$version-$target.tar.gz"
+    phase_note "packing the staged build in $stage"
 
-# Members are listed explicitly rather than archiving `.`: it fixes the entry
-# order and keeps the `./` prefix (and any stray dotfile) out of the archive, so
-# the tarball is flat — `teton`, `teton-code`, `LICENSE`, `README.md` at the root.
-# COPYFILE_DISABLE stops macOS's bsdtar from smuggling `._*` AppleDouble xattr
-# members in beside them; it is meaningless, and harmless, on Linux.
-COPYFILE_DISABLE=1 tar -czf "$tarball" -C "$stage" teton teton-code LICENSE README.md
+    # The signing phase (ADR-550-1), on the STAGED copies rather than the
+    # originals under target/: the tarball below is assembled from this
+    # directory, so signing here is what makes the shipped bytes the verified
+    # bytes. Signing the build output instead would leave a gap between what was
+    # checked and what was tarred — and, since REQ-551 split the phases, the
+    # build output need not even be on this machine's disk any more.
+    #
+    # Keyed on the identity again, not on `$codesign_tool` being non-empty. The
+    # two are equivalent by construction — the check above exits when they are
+    # not — but "sign if a tool happens to be around" is the self-disabling
+    # shape (LESSON-443) and should not be what this reads like to whoever edits
+    # it next.
+    if [ -n "${TETON_SIGN_IDENTITY:-}" ]; then
+        for bin in teton teton-code; do
+            # `--options runtime` (the hardened runtime) is what notarization
+            # will require of these binaries (spec OQ-3) and costs nothing
+            # before then. `--force` is there because Apple's linker already
+            # ad-hoc signs arm64 Mach-Os at link time and codesign refuses to
+            # replace an existing signature without it; it decides only WHICH
+            # signature survives, never whether one is checked — the --verify
+            # below, and verify-signature.sh in the smoke, still have to accept
+            # whatever it produced.
+            if ! "$codesign_tool" --force --sign "$TETON_SIGN_IDENTITY" \
+                --timestamp --options runtime "$stage/$bin"; then
+                echo "package: codesign could not sign $bin with the requested identity." >&2
+                echo "         No tarball is written: a signing-requested build never ships unsigned." >&2
+                exit "$EXIT_INTERNAL"
+            fi
 
-# A per-leg sidecar, for this job's log and for anyone re-checking one artifact
-# by hand. It is NOT what ends up in the release: `checksums.txt` is recomputed
-# in the release job from the files actually uploaded (BR-5), so a hash can
-# never describe bytes other than the ones being published.
-#
-# The sidecar's format is `<sha256>  <name>`, which both `shasum -a 256 -c` and
-# `sha256sum -c` read.
-if ! sha="$(sha256_of "$tarball")"; then
-    echo "package: no sha256 tool (shasum, sha256sum, openssl) on PATH." >&2
-    echo "         $(basename "$tarball") was built but has no recorded hash." >&2
-    exit "$EXIT_UNCHECKED"
-fi
-printf '%s  %s\n' "$sha" "$(basename "$tarball")" >"$tarball.sha256"
+            # Asked immediately, of the same file, because `--sign` exiting 0 is
+            # not the claim being made — "these bytes carry a signature that
+            # holds" is, and only --verify tests it. Whether the signature names
+            # the right AUTHORITY is verify-signature.sh's question, asked of the
+            # tarball in the smoke; asking it a second way here would be a second
+            # opinion free to drift from the gate that actually blocks the
+            # release.
+            if ! "$codesign_tool" --verify --strict "$stage/$bin"; then
+                echo "package: $bin was signed but codesign --verify --strict rejected the result." >&2
+                exit "$EXIT_INTERNAL"
+            fi
 
-echo "package: built $(basename "$tarball")"
-echo "package: sha256 $sha"
-printf '%s\n' "$tarball"
+            echo "package: signed $bin"
+        done
+    else
+        echo "package: binaries are unsigned (dev build — set TETON_SIGN_IDENTITY for release signing)"
+    fi
+
+    tarball="$outdir/teton-v$version-$target.tar.gz"
+
+    # Members are listed explicitly rather than archiving `.`: it fixes the entry
+    # order and keeps the `./` prefix (and any stray dotfile) out of the archive, so
+    # the tarball is flat — `teton`, `teton-code`, `LICENSE`, `README.md` at the root.
+    # COPYFILE_DISABLE stops macOS's bsdtar from smuggling `._*` AppleDouble xattr
+    # members in beside them; it is meaningless, and harmless, on Linux.
+    COPYFILE_DISABLE=1 tar -czf "$tarball" -C "$stage" teton teton-code LICENSE README.md
+
+    # A per-leg sidecar, for this job's log and for anyone re-checking one artifact
+    # by hand. It is NOT what ends up in the release: `checksums.txt` is recomputed
+    # in the release job from the files actually uploaded (BR-5), so a hash can
+    # never describe bytes other than the ones being published.
+    #
+    # The sidecar's format is `<sha256>  <name>`, which both `shasum -a 256 -c` and
+    # `sha256sum -c` read.
+    if ! sha="$(sha256_of "$tarball")"; then
+        echo "package: no sha256 tool (shasum, sha256sum, openssl) on PATH." >&2
+        echo "         $(basename "$tarball") was built but has no recorded hash." >&2
+        exit "$EXIT_UNCHECKED"
+    fi
+    printf '%s  %s\n' "$sha" "$(basename "$tarball")" >"$tarball.sha256"
+
+    # Consumed. The staging directory exists to carry one build across one phase
+    # boundary, and it has: keeping it would leave signed binaries loose in the
+    # output directory beside the tarball made from them, and would let a second
+    # `pack` re-ship a build the first one already shipped.
+    rm -rf "$stage"
+
+    echo "package: built $(basename "$tarball")"
+    echo "package: sha256 $sha"
+    printf '%s\n' "$tarball"
+}
+
+case "$phase" in
+    all)
+        build_phase
+        pack_phase
+        ;;
+    build)
+        build_phase
+        ;;
+    pack)
+        pack_phase
+        ;;
+esac
