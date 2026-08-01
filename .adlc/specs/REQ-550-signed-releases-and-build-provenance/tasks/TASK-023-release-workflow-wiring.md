@@ -1,7 +1,7 @@
 ---
 id: TASK-023
 title: "release.yml: keychain import, environments, attestation, verify gates"
-status: draft
+status: complete
 parent: REQ-550
 created: 2026-07-31
 updated: 2026-07-31
