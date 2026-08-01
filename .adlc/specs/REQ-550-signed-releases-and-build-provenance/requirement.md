@@ -123,7 +123,8 @@ human steps explicitly instead of leaving them implicit.
 ## Acceptance Criteria
 
 - [ ] AC-1: On a released tarball: `codesign --verify --strict` and
-      `codesign -dv` show the Developer ID identity and constant team id for
+      `codesign -dvv` (verbosity 2 — `-dv` emits no Authority lines; verified
+      against the real tool in TASK-021) show the Developer ID identity and constant team id for
       `teton` and `teton-code`; the release smoke asserts this per macOS
       target.
 - [ ] AC-2: `gh attestation verify <artifact> --repo atelier-fashion/teton-code`
