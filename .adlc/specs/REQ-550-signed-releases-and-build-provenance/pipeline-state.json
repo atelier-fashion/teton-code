@@ -1,0 +1,83 @@
+{
+  "req": "REQ-550",
+  "branch": "feat/REQ-550-signed-releases-and-build-provenance",
+  "startedAt": "2026-07-31T23:55:00Z",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Single-repo registry; worktree .worktrees/REQ-550 from origin/main@50d3856; inline manifest advisory (zero in-flight); REQ-id recheck self-pass; draft PR #13 opened",
+      "completedAt": "2026-08-01T00:00:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Spec validated pre-pipeline this session (0 blockers, 2 warnings) and marked approved; unchanged since \u2014 recorded, not re-run",
+      "completedAt": "2026-08-01T00:05:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "/architect ran standalone this session: ADR-550-1..4 + TASK-021..026 at 50d3856 (this branch's base); single-repo reconciliation no-op",
+      "completedAt": "2026-08-01T00:05:30Z"
+    },
+    {
+      "phase": 3,
+      "name": "Architecture+tasks validated: DAG valid, coverage complete; 1 fix loop added explicit BR/AC traceability citations to 4 task files",
+      "completedAt": "2026-08-01T00:10:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "6/6 tasks in 4 tiers; selftest 98->153; key deviations accepted: -dvv (verified vs real codesign), --force sign (linker ad-hoc), attest action v4.1.1, development+foreign fixtures from mutation testing",
+      "completedAt": "2026-08-01T01:20:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify: 6 agents -> 1 Critical (env rules blocked dry runs; fixed at source via API + docs) + 8 Major + ~15 Minor; 3-agent fix pass; Step-D re-verify (correctness+security) found the fix pass's own Critical (malformed --signer-workflow, empirically proven vs live gh) + 2 High (missed pins) -> round-2 surgical pass; selftest 236->257; final tree mechanically verified green (selftest/shellcheck/actionlint/greps). Halting on reflector user-facing questions before Phase 6.",
+      "completedAt": "2026-08-01T03:30:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "PR #13 body set, [WIP] dropped, flipped to ready; requirement status complete; user sign-off recorded (deferrals confirmed; keychain residual accepted with follow-up REQ to spec)",
+      "completedAt": "2026-08-01T03:50:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-550",
+      "branch": "feat/REQ-550-signed-releases-and-build-provenance",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/13",
+      "prNumber": 13,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-024",
+      "TASK-021",
+      "TASK-022",
+      "TASK-023",
+      "TASK-025",
+      "TASK-026"
+    ],
+    "failedTasks": []
+  }
+}

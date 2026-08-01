@@ -1,7 +1,7 @@
 ---
 id: TASK-024
 title: "deploy-site.yml: declare the site-deploy environment"
-status: draft
+status: complete
 parent: REQ-550
 created: 2026-07-31
 updated: 2026-07-31

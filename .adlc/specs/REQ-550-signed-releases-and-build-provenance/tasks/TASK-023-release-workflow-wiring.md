@@ -1,7 +1,7 @@
 ---
 id: TASK-023
 title: "release.yml: keychain import, environments, attestation, verify gates"
-status: draft
+status: complete
 parent: REQ-550
 created: 2026-07-31
 updated: 2026-07-31
@@ -21,10 +21,10 @@ release gate plus an end-to-end check in verify-install.
 
 ## Acceptance Criteria
 
-- [ ] actionlint clean; every new third-party action SHA-pinned (REQ-548 audit posture; LESSON-455 property: ALL of them)
+- [ ] actionlint clean and the tag-driven workflow stays one-command end-to-end (AC-5); every new third-party action SHA-pinned (REQ-548 audit posture; LESSON-455 property: ALL of them)
 - [ ] The keychain cleanup step runs on failure paths (`if: always()`)
 - [ ] A darwin leg cannot reach the smoke step unsigned: missing/invalid cert fails the import or package step, never falls through (BR-2)
-- [ ] Attestation gate failure blocks `bump-formula` via the existing needs-graph (no new ordering edge required — assert this in a comment)
+- [ ] Attestation gate failure (AC-2's CI half) blocks `bump-formula` via the existing needs-graph (no new ordering edge required — assert this in a comment)
 - [ ] `secrets.HOMEBREW_TAP_TOKEN` references unchanged in text but now resolve via the tap-publish environment (comment records this)
 
 ## Technical Notes

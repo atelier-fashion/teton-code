@@ -79,13 +79,69 @@ sha256_of() {
     # success with an empty digest, and an empty string is what would then be
     # written into checksums.txt or spliced into the formula's `sha256`. Only a
     # well-formed digest counts as having hashed anything.
+    #
+    # The hex test covers the WHOLE string, not a prefix. It used to anchor only
+    # the first eight characters and then check the length, which accepted a
+    # 64-character value whose tail was anything at all — `0f1e2d3c` followed by
+    # 56 characters of a tool's error message is not a digest, and the two
+    # consumers of this function (checksums.txt, the formula's `sha256`) both
+    # take what it prints on trust. Empty is rejected by the length test, since
+    # the empty string contains no character outside [0-9a-f].
     case "$digest" in
-        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
-            if [ "${#digest}" -eq 64 ]; then
-                printf '%s\n' "$digest"
-                return 0
-            fi
-            ;;
+        *[!0-9a-f]*) return 1 ;;
     esac
+    if [ "${#digest}" -eq 64 ]; then
+        printf '%s\n' "$digest"
+        return 0
+    fi
     return 1
+}
+
+# Print the external tool a gate script should run — the override if one is set,
+# otherwise the default name, resolved on PATH:
+#
+#     codesign="$(tool_or_unchecked "${TETON_CODESIGN:-}" codesign)" || exit "$EXIT_UNCHECKED"
+#
+# Returns 1 when neither resolves to something runnable, for the same reason
+# `sha256_of` returns rather than aborting: the CALLER owns its exit taxonomy.
+# Both gates spell that outcome 75 UNCHECKED today, but a helper that exited on
+# their behalf would be a second place where the taxonomy lives — and the one
+# thing that must never happen is a gate exiting with a code it did not choose
+# (LESSON-442). It also never falls through to running the default name and
+# hoping: a command that is not there fails with 127, which is neither a
+# rejection nor a verdict.
+#
+# The override argument is how selftest.sh drives the gates on the Linux
+# `tooling` job, where `codesign` does not exist and `gh` has no token
+# (ADR-550-4).
+#
+# BE PRECISE ABOUT WHAT THAT SEAM CANNOT DO, because the earlier wording here
+# claimed more than is true. It said "no value of TETON_CODESIGN or TETON_GH can
+# turn a rejection into a pass", which is false and dangerously so: a stand-in
+# that prints a Developer ID dump for any input, or a `gh` that exits 0, is
+# exactly a value that turns a rejection into a pass. That is the entire reason
+# selftest.sh can build a KNOWN-GOOD fixture at all.
+#
+# The property that actually holds is narrower, and it is the one the gates
+# rely on: the override changes WHICH tool is asked and nothing else. The
+# caller's CLASSIFICATION — which answer earns 0, which earns 65, which earns
+# 75 — is not reachable from here, so no override can make the gate score an
+# answer differently than it scores the real tool's. Whoever controls the
+# override controls the ANSWER, completely; that is why verify-signature.sh and
+# verify-attestation.sh refuse to honour these variables inside GitHub Actions
+# unless TETON_ALLOW_TOOL_SEAM=1 says a test harness meant it.
+tool_or_unchecked() {
+    local tool="${1:-}"
+    if [ -z "$tool" ]; then
+        tool="${2:-}"
+    fi
+    if [ -z "$tool" ]; then
+        return 1
+    fi
+
+    # `command -v`, not `[ -x ]`: the default is a bare name to be found on
+    # PATH, while an override is usually a path to a stand-in. This resolves
+    # both shapes, and rejects a path that exists but cannot be executed. `--`
+    # keeps a tool name that begins with `-` from being read as an option.
+    command -v -- "$tool" 2>/dev/null || return 1
 }

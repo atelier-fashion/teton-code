@@ -57,6 +57,46 @@ Remote models run the same everywhere; only the local base-camp model depends on
 your hardware. On Linux, Homebrew installs the binaries, but `brew services` is
 not a v1 claim — run `teton-code` yourself, or write your own systemd user unit.
 
+### Verify a release
+
+Every published release asset carries GitHub build provenance — the three
+tarballs *and* the `checksums.txt` published beside them — and the macOS
+binaries are signed. Both are checkable before you trust the bytes — `<target>`
+is one of the release targets in the table above:
+
+```sh
+# Provenance: GitHub Actions built these exact bytes, from this repository, at a
+# tagged release. The release pipeline runs this command as a gate over every
+# published asset, checksums.txt included.
+gh attestation verify teton-v<X.Y.Z>-<target>.tar.gz --repo atelier-fashion/teton-code
+
+# macOS: the signature holds on BOTH binaries, and names the authority and the
+# team it should. A green check on one binary says nothing about the other.
+tar -xzf teton-v<X.Y.Z>-<target>.tar.gz
+for b in teton teton-code; do
+  codesign --verify --strict "$b" &&
+    codesign -dvv "$b" 2>&1 | grep -E 'Developer ID Application|TeamIdentifier'
+done
+```
+
+Each binary prints these two lines:
+
+```
+Authority=Developer ID Application: Atelier Fashion LLC (545BU9G9D6)
+TeamIdentifier=545BU9G9D6
+```
+
+Both `v`s in `-dvv` are load-bearing: at verbosity 1 codesign prints
+`TeamIdentifier=` and no `Authority=` line at all, so a perfectly signed binary
+reads as anonymous.
+
+Before this repository's first attested release, `gh attestation verify` reports
+no attestations and exits non-zero with an HTTP 404. That is expected until the
+first signed release ships — it means nothing has been attested yet, not that
+your download was tampered with.
+
+Linux artifacts are unsigned in v1; the attestation is the whole check there.
+
 ## What it is
 
 Teton Code is a Claude Code–style agentic coding harness with two
