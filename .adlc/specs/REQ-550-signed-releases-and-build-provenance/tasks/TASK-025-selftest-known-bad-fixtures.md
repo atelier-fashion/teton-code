@@ -1,7 +1,7 @@
 ---
 id: TASK-025
 title: "Selftest known-bad fixtures: both new gates must go red"
-status: draft
+status: complete
 parent: REQ-550
 created: 2026-07-31
 updated: 2026-07-31
