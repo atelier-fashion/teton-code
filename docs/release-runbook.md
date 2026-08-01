@@ -34,7 +34,7 @@ LESSON-447).
 | # | Thing | State | Where | Blocks |
 |---|---|---|---|---|
 | 1 | `atelier-fashion/homebrew-tap` exists, public, `main` | **done** 2026-07-25 | [homebrew-tap-setup.md §1](homebrew-tap-setup.md) | `bump-formula` push |
-| 2 | `HOMEBREW_TAP_TOKEN` set on **this** repository, org-approved if required | **outstanding** | [homebrew-tap-setup.md §2](homebrew-tap-setup.md) | `bump-formula` (exits `75` without it) |
+| 2 | `HOMEBREW_TAP_TOKEN` set on the **`tap-publish` environment**, org-approved if required (repo-level copy retires per §11) | **outstanding** | [homebrew-tap-setup.md §2](homebrew-tap-setup.md) | `bump-formula` (exits `75` without it) |
 | 3 | A dry run has gone green end to end | **outstanding** | §2 below | everything — do not skip |
 | 4 | GCP secrets for the site | outstanding (OQ-5) | [site-deploy-runbook.md §2](site-deploy-runbook.md) | `tetoncode.ai` only; a release is fine without them |
 
@@ -166,14 +166,23 @@ gh release view "$TAG" --json assets --jq '.assets[].name'
 mkdir -p /tmp/rel && gh release download "$TAG" --dir /tmp/rel --clobber
 (cd /tmp/rel && shasum -a 256 -c checksums.txt)
 
-# 3. The tap resolves the formula AT THE TAG. The formula carries no `version`
+# 3. The published bytes carry GitHub build provenance: this workflow, at this
+#    commit, in this repository, built exactly them. The checksums above prove
+#    the assets match a list published beside them; this proves who made them.
+#    Letter for letter the command the `release` job runs as a gate and the
+#    README hands users (AC-2).
+for t in /tmp/rel/*.tar.gz; do
+  gh attestation verify "$t" --repo atelier-fashion/teton-code
+done
+
+# 4. The tap resolves the formula AT THE TAG. The formula carries no `version`
 #    stanza on purpose (brew audit rejects one that agrees with the URL scan),
 #    so this is Homebrew's own reading of the rendered URLs — the same assertion
 #    the bump job makes before it pushes (BR-3).
 brew info --json=v2 --formula atelier-fashion/tap/teton \
   | jq -r '.formulae[0].versions.stable'        # == X.Y.Z
 
-# 4. The tap's history shows the bump, and only the bump.
+# 5. The tap's history shows the bump, and only the bump.
 gh api repos/atelier-fashion/homebrew-tap/commits --jq '.[0].commit.message'
 ```
 
@@ -190,6 +199,13 @@ teton doctor                    # daemon: running, and the version matches
 refuses for an untrusted tap; `brew trust atelier-fashion/tap` once if it does.
 The fully-qualified install above never needs it — see
 [homebrew-tap-setup.md §4](homebrew-tap-setup.md).
+
+The macOS signature is the other half of step 3's question — provenance says who
+built these bytes, the signature says who vouches for them on the machine that
+runs them. It has a section of its own (§10) because certificate renewal has a
+procedure of its own. AC-6, the Keychain-grant survival that signature buys, is
+**staged**: it needs two consecutively signed releases before it can be run at
+all, and is recorded as unrun until the second one (§10).
 
 Finally, the site. Once `bump-formula` has pushed the tap, this workflow
 **dispatches** [`deploy-site.yml`](../.github/workflows/deploy-site.yml) — an
@@ -414,3 +430,210 @@ updated**, so no user can install the broken formula: `brew install` still
 serves the previous release. Fix forward with a patch release; the failure
 log's `brew services list` + daemon logs are the
 starting point.
+
+---
+
+## 10. Signing identity (BR-1)
+
+Both macOS binaries in both macOS tarballs are signed with an Apple **Developer
+ID Application** certificate belonging to team `545BU9G9D6`. Linux binaries are
+unsigned in v1, and the release notes say so rather than leaving it to be
+inferred (BR-6). Nothing here is notarized: that is a separate Apple service and
+a separate claim, and this pipeline does not make it.
+
+**The contract, stated the way a user experiences it:** a Keychain grant given
+to release N survives the upgrade to release N+1 with no fresh consent prompt.
+That is why the identity has to be *stable*, not merely *present* — an unsigned
+release, or one signed by a different team, is a new identity to macOS and every
+grant is asked for again.
+
+### Checking a signed release by hand
+
+Continuing from §5 — the tarballs are already in `/tmp/rel`:
+
+```sh
+TAG=vX.Y.Z
+mkdir -p /tmp/rel-check
+tar -xzf "/tmp/rel/teton-$TAG-aarch64-apple-darwin.tar.gz" -C /tmp/rel-check
+
+# 1. The signature is structurally valid and covers the bytes as shipped.
+codesign --verify --strict /tmp/rel-check/teton /tmp/rel-check/teton-code
+
+# 2. It names an authority and a team — which (1) does not test. An ad-hoc
+#    signature passes (1) while naming nobody at all.
+codesign -dvv /tmp/rel-check/teton 2>&1 | grep -E 'Identifier|Authority'
+```
+
+That grep prints:
+
+```
+Identifier=teton
+Authority=Developer ID Application: Atelier Fashion LLC (545BU9G9D6)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=545BU9G9D6
+```
+
+`-dvv`, and the second `v` is load-bearing: at verbosity 1 codesign prints
+`TeamIdentifier=` but no `Authority=` lines at all, so `-dv` on a perfectly
+signed binary shows no authority and reads as a failure. These are the same two
+questions `tools/release/verify-signature.sh` asks of every macOS tarball in the
+release smoke — this is the laptop-side spelling of the gate, not a second
+opinion.
+
+Repeat for `x86_64-apple-darwin`. A green check on the arm64 tarball is not
+evidence about the Intel one (LESSON-433), and a green check on `teton` is not
+evidence about `teton-code`.
+
+### What stays constant — and why renewal is not a user-visible event
+
+Two things, and the certificate is neither of them:
+
+- the team id, `545BU9G9D6`;
+- the binary identifiers, `teton` and `teton-code` — codesign derives them from
+  the file names, so renaming a shipped binary is a signing change even when
+  nothing about the signing changed (LESSON-457).
+
+The designated requirement anchors on exactly those, plus Apple's own anchor.
+Read it off a shipped binary rather than taking it on trust:
+
+```sh
+codesign -d --requirements - /tmp/rel-check/teton
+```
+
+It names the identifier and the team OU. There is no serial number in it and no
+expiry date. So **renewing the Developer ID Application certificate does not
+re-prompt users**: the new leaf signs the same identifier for the same team, and
+macOS matches the requirement, not the particular certificate that satisfied it
+last time. Changing the team, renaming a binary, or shipping unsigned is what
+breaks a grant — and none of those is something a renewal does.
+
+### When the certificate is expired or absent (BR-2)
+
+The release fails, loudly, at the first step that needs the identity. That is
+the design, not an accident: there is no branch anywhere in this pipeline that
+notices a missing certificate and carries on unsigned. The "should we sign?"
+predicate is the target triple — macOS release leg ⇒ sign or die — never the
+certificate's availability, because a guard that switches itself off when its
+input is missing is not a guard (LESSON-443).
+
+Where it surfaces, in the order a run reaches them:
+
+- **the `build` job's "Import the Developer ID signing identity" step** —
+  `Signing identity UNAVAILABLE` (the secrets resolved empty — check the
+  `release-signing` environment's tag rule against the ref), `Signing
+  certificate UNREADABLE` (`MACOS_CERT_P12` is not decodable base64), `Signing
+  certificate would not import` (usually a wrong `MACOS_CERT_PASSWORD`, or a
+  `.p12` exported without its private key), or `No Developer ID identity for
+  team 545BU9G9D6` (it imported, but it is the wrong *kind* of certificate).
+  Nothing is built on that leg.
+- **`package.sh`, exit `70`** — signing was requested and codesign could not
+  carry it out, or it signed and then its own `--verify --strict` rejected the
+  result. No tarball is written: a signing-requested build never ships unsigned.
+- **the macOS smoke's signature gate** — `65`, these bytes are not signed the
+  way a release must be; `75`, the gate could not run and nothing was learned.
+  Both stop the release.
+
+The fix:
+
+1. Renew the **Developer ID Application** certificate for team `545BU9G9D6` in
+   the Apple developer portal. A Mac Development or Apple Distribution
+   certificate is not what a released binary is signed with, and the import step
+   checks which one it got.
+2. Export it from Keychain Access as a `.p12` **with its private key**, then
+   base64 it: `base64 -i cert.p12 | pbcopy`.
+3. Update `MACOS_CERT_P12` (the base64) and `MACOS_CERT_PASSWORD` on the
+   **`release-signing` environment** — Settings → Environments → `release-signing`
+   → *Environment secrets*. Not repository secrets: a signing credential any
+   workflow on any branch can read is exactly what the environment exists to
+   prevent (BR-4, and §11).
+4. Re-run the failed jobs.
+
+Never bypass the gate to unblock a release: not by unsetting
+`TETON_SIGN_IDENTITY`, not by dropping the `environment:` declaration, not by
+publishing a run that skipped signing. A release published unsigned after a
+signed one re-prompts every user who has granted the daemon Keychain access, and
+the next release cannot undo that — the prompt already happened.
+
+### AC-6 — Keychain-grant survival (staged)
+
+AC-6 is the human check for the contract at the top of this section, and it
+cannot be run until two consecutively signed releases exist: with one, there is
+nothing to upgrade *from*. It is therefore **defined now and recorded as
+unrun** — the same posture as AC-4 in §6 and the unrun platform legs in §8, for
+the same reason: a criterion nobody could have exercised is recorded as
+unexercised, never assumed and never quietly dropped.
+
+First exercisable at the **second** signed release, from a machine still running
+the first one that has already granted the daemon Keychain access. Copy this
+block into that release's sign-off with the defaults as written, and edit only
+the lines you actually ran.
+
+```
+AC-6 sign-off — Keychain-grant survival, teton vX.Y.Z (upgraded from vA.B.C)
+---------------------------------------------------------------------------
+Status            :  unrun            ( unrun | pass | fail )
+Verified by       :
+Date              :
+Prior release     :                   (the signed release the grant was given to)
+Grant established :  unrun            (a Keychain prompt was raised and accepted
+                                       while running the PRIOR release)
+brew upgrade + brew services restart : unrun
+Re-prompt observed:  unrun            (no prompt == pass; any prompt == fail)
+Team id, both releases : unrun         (codesign -dvv on each; must be identical)
+Notes / findings  :
+```
+
+---
+
+## 11. Secret retirement (REQ-550 AC-4)
+
+`HOMEBREW_TAP_TOKEN` currently exists twice: as a repository secret, which is
+how it has always resolved, and on the `tap-publish` environment, which is how
+`bump-formula` resolves it now that the job declares `environment: tap-publish`.
+AC-4 is met when the repository-level copy is gone *and* a dispatch from a
+non-release ref has been shown to be unable to reach the environment one.
+
+The order below is not a preference. Deleting the repository secret before step
+2 breaks the next release: until the workflow that declares
+`environment: tap-publish` is on the tag's own commit, the bump job running from
+that tag is still being served by the repository-level copy, and removing it
+takes the token away from the only job that needs it (`75`, "the release is
+published but the formula cannot be pushed" — §9).
+
+- [ ] **1. REQ-550 is merged to `main`.** The environment declarations have to
+      be in the workflow file before they can be on a tag.
+- [ ] **2. One release completes green end to end**, `bump-formula` included,
+      from a real `vX.Y.Z` tag cut after that merge. This is the step that
+      proves *environment* resolution: a green bump on a tag whose commit
+      carries the `environment: tap-publish` declaration is the only evidence
+      that the token is reachable from the environment. Nothing before this
+      point distinguishes "resolved from the environment" from "resolved from
+      the repository".
+- [ ] **3. Delete the repository-level `HOMEBREW_TAP_TOKEN`** — Settings →
+      Secrets and variables → Actions → the repository secret → *Remove*. The
+      `tap-publish` environment secret stays; it is the one the bump now uses.
+- [ ] **4. Run the AC-4 negative probe and record the refusal.** Environment
+      protection rules are GitHub-side settings, so the only durable evidence
+      that the tag rule works is a run that was refused by it. On a throwaway
+      branch, add a minimal workflow — `workflow_dispatch` only, one job,
+      `environment: tap-publish`, one trivial step — and dispatch it from that
+      branch. Record what GitHub does: the job does not start, and the run
+      reports the deployment as blocked by the environment's protection rules.
+      Screenshot it, put the run URL in REQ-550's AC-4, then delete the branch.
+      A probe that *succeeds* is the finding, not a mistake to retry — it means
+      the tag rule is not what it is supposed to be, and the retirement is not
+      done.
+- [ ] **5. Record the environment settings state in REQ-550.** For each of
+      `release-signing`, `tap-publish` and `site-deploy`: the deployment branch
+      and tag rules, the secret and variable *names* each carries (names only —
+      never values), and any required reviewers. None of this configuration
+      lives in the repository, so a screenshot plus a written table in the REQ
+      is the entire record a future reader gets. Date it; settings drift
+      silently and nothing in CI notices.
+
+AC-4 also names `GCP_*`. There is nothing to delete there: per this REQ's
+architecture note no `GCP_*` secret was ever set at repository level (the site
+deploy is still blocked on OQ-5), `deploy-site.yml` declares
+`environment: site-deploy`, and what remains is the GCP-side attribute condition
+on the workload identity provider — [site-deploy-runbook.md](site-deploy-runbook.md).

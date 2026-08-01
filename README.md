@@ -57,6 +57,25 @@ Remote models run the same everywhere; only the local base-camp model depends on
 your hardware. On Linux, Homebrew installs the binaries, but `brew services` is
 not a v1 claim — run `teton-code` yourself, or write your own systemd user unit.
 
+### Verify a release
+
+Every release artifact carries GitHub build provenance, and the macOS binaries
+are signed. Both are checkable before you trust the bytes — `<target>` is one of
+the release targets in the table above:
+
+```sh
+# Provenance: GitHub Actions built these exact bytes, from this repository, at a
+# tagged release. The release pipeline runs this same command as a gate.
+gh attestation verify teton-v<X.Y.Z>-<target>.tar.gz --repo atelier-fashion/teton-code
+
+# macOS: the signature holds, and it names the team it should.
+tar -xzf teton-v<X.Y.Z>-<target>.tar.gz
+codesign --verify --strict teton teton-code && codesign -dvv teton 2>&1 | grep TeamIdentifier
+# TeamIdentifier=545BU9G9D6
+```
+
+Linux artifacts are unsigned in v1; the attestation is the whole check there.
+
 ## What it is
 
 Teton Code is a Claude Code–style agentic coding harness with two

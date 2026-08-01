@@ -1,7 +1,7 @@
 ---
 id: TASK-026
 title: "Docs, runbook verification commands, and repo-secret retirement plan"
-status: draft
+status: complete
 parent: REQ-550
 created: 2026-07-31
 updated: 2026-07-31

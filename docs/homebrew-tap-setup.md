@@ -63,6 +63,17 @@ Value:  github_pat_...
 The name is load-bearing — `release.yml` reads
 `${{ secrets.HOMEBREW_TAP_TOKEN }}` and nothing else.
 
+**As of REQ-550 the token is environment-scoped.** It lives on the
+`tap-publish` environment (deployment rule: tags matching `v*.*.*`), and
+`bump-formula` declares `environment: tap-publish` — so the same
+`secrets.HOMEBREW_TAP_TOKEN` reference resolves out of the environment rather
+than the repository, and a workflow that does not declare the environment cannot
+read the token at all (BR-4). Put it there — Settings → Environments →
+`tap-publish` → *Environment secrets* — rather than in the repository-secret box
+above. The repository-level copy is retired on the ordered checklist in
+[release-runbook.md §11](release-runbook.md), after a release has gone green
+from the environment; deleting it earlier breaks the next bump.
+
 ### When it expires
 
 The bump job fails, loudly, and the release run goes red (BR-4). That is the
