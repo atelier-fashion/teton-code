@@ -211,12 +211,25 @@ gh api repos/atelier-fashion/homebrew-tap/commits --jq '.[0].commit.message'
 Step 3 is the command the README hands users, run over every asset at once
 instead of one named file. The CI gate makes the same call against the same set
 of assets, and additionally pins
-`--signer-workflow .github/workflows/release.yml` — a constraint no user can be
-expected to type, and the one that stops some *other* workflow in this
-repository from being an acceptable signer. It also cross-checks each asset's
-sha256 against the `checksums.txt` that same run computed, so "attested" and
-"hashes to the published list" are asserted about one set of bytes rather than
-two.
+
+```sh
+--signer-workflow atelier-fashion/teton-code/.github/workflows/release.yml
+```
+
+— a constraint no user can be expected to type, and the one that stops some
+*other* workflow in this repository from being an acceptable signer. It also
+cross-checks each asset's sha256 against the `checksums.txt` that same run
+computed, so "attested" and "hashes to the published list" are asserted about
+one set of bytes rather than two.
+
+**That value is fully qualified, and it has to be.** `gh` matches it against
+the certificate's SAN, which is the whole
+`https://github.com/<owner>/<repo>/<path>@<ref>` URI — the bare
+`.github/workflows/release.yml` matches no certificate at all. It does not fail
+as a rejection; it comes back as `Error: verifying with issuer "sigstore.dev"`,
+which the gate correctly scores `75` UNCHECKED, on every asset, on every
+release. If the gate ever starts reporting UNCHECKED for everything with that
+error text, suspect this argument before suspecting GitHub.
 
 **Before this repository's first attested release, step 3 exits non-zero with an
 HTTP 404** — GitHub has no attestations to serve. That is the correct answer to
@@ -441,6 +454,12 @@ serves, not the local copies. So when it goes red the release exists, and
 the previous version and `brew install` keeps handing out the previous release.
 Nothing unverified reached a user; the state is *published but not advertised*,
 which is the invariant working, not breaking.
+
+**Residual, stated plainly:** this gate proves the assets were good *at the
+moment it ran*, and `bump-formula` downloads them again afterwards to compute
+the formula's hashes — so an asset replaced in the window between the two is
+not caught here at all, and is caught only by `verify-install`, which runs
+after the tap has already moved.
 
 The two exit codes are different findings and take different actions:
 

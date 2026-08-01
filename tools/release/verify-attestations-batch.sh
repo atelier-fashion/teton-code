@@ -3,7 +3,7 @@
 # Verify that a WHOLE release carries provenance (BR-3/BR-5/BR-6) — that the
 # directory about to be published contains exactly the three tarballs a complete
 # release has, that `checksums.txt` describes those exact bytes, and that GitHub
-# attests every one of them.
+# attests every one of them, checksums.txt included.
 #
 # Usage: tools/release/verify-attestations-batch.sh <dir> <owner/repo> [signer-workflow]
 #
@@ -14,7 +14,25 @@
 #   [signer-workflow]  optional, forwarded to verify-attestation.sh as
 #                      `--signer-workflow`. It binds the attestation to a
 #                      workflow inside that repository rather than to the
-#                      repository alone.
+#                      repository alone. gh matches it against the whole
+#                      `https://github.com/<owner>/<repo>/<path>@<ref>` SAN, so
+#                      callers pass the FULLY QUALIFIED
+#                      `<owner>/<repo>/.github/workflows/<file>` — a bare path
+#                      compiles to a regex that matches no certificate, which
+#                      makes every subject land 75 rather than 0.
+#
+# FOUR SUBJECTS, NOT THREE. The three tarballs are verified, and then
+# checksums.txt is verified as a subject in its own right. Without that last
+# one the gate has a hole with a name: checksums.txt is the file every
+# downstream consumer — the Homebrew formula, a human following the runbook —
+# compares a download against, and an unattested checksums.txt beside three
+# attested tarballs means an attacker who can replace release assets can
+# publish their own digests for their own bytes and nothing in this pipeline
+# would notice. The tarball loop cross-checks each tarball against
+# checksums.txt, which proves the file is INTERNALLY consistent; only the
+# attestation proves it came from this repository's release workflow.
+# EXPECTED_TARBALLS stays 3 — that is a count of tarballs — while the number
+# of subjects that pass through verify-attestation.sh is 4.
 #
 # WHY A BATCH SCRIPT EXISTS AT ALL. verify-attestation.sh proves ONE artifact
 # per invocation, deliberately: per BR-6 and LESSON-433 a verified arm64 tarball
@@ -41,12 +59,14 @@
 #
 # Exit codes are the same taxonomy the gates it calls use (BR-7, LESSON-442):
 #
-#   0   PASS       three tarballs, checksums agreeing, every one attested.
+#   0   PASS       three tarballs, checksums agreeing, all four subjects
+#                  attested.
 #   64  EX_USAGE   wrong invocation: missing argument, or <dir> is not a
 #                  directory. A bad call site, not a bad release.
 #   65  FAILED     something was READ and it is wrong: the wrong number of
-#                  tarballs, no checksums.txt, a checksum that does not match
-#                  its file, or gh rejecting an artifact. Blocks the release.
+#                  tarballs, no checksums.txt, a name listed twice in
+#                  checksums.txt, a checksum that does not match its file, or
+#                  gh rejecting a subject. Blocks the release.
 #   75  UNCHECKED  something could not be read at all: no sha256 tool, or a
 #                  verify-attestation.sh run that reached no verdict (no gh, no
 #                  token, network, API 4xx/5xx). Also blocks the release — the
@@ -87,6 +107,11 @@ EXIT_UNCHECKED=75
 # smoke.sh's target allowlists, or the gate keeps passing on a release missing a
 # platform.
 EXPECTED_TARBALLS=3
+
+# What actually passes through verify-attestation.sh: every tarball, plus
+# checksums.txt. Derived rather than written as `4` so a fourth build target
+# cannot leave this saying three while four tarballs are checked.
+VERIFIED_SUBJECTS=$((EXPECTED_TARBALLS + 1))
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -159,7 +184,7 @@ shopt -s nullglob
 tarballs=("$dir"/teton-*.tar.gz)
 shopt -u nullglob
 
-echo "verify-attestations-batch: $dir — expecting $EXPECTED_TARBALLS attested tarballs from $repo"
+echo "verify-attestations-batch: $dir — expecting $EXPECTED_TARBALLS tarballs and checksums.txt, $VERIFIED_SUBJECTS attested subjects from $repo"
 
 if [ "${#tarballs[@]}" -ne "$EXPECTED_TARBALLS" ]; then
     echo "verify-attestations-batch: FAILED — expected $EXPECTED_TARBALLS tarballs matching" >&2
@@ -196,8 +221,21 @@ fi
 # merely contains this one. The format is `<sha256>  <name>`, which both
 # `shasum -a 256 -c` and `sha256sum -c` read, and whose binary-mode variant
 # marks the name with a leading `*`.
+#
+# THE WHOLE FILE IS READ, and every match counted, rather than returning at the
+# first hit. A checksums.txt that lists one name TWICE is ambiguous about which
+# digest this release publishes, and a first-match reader resolves that
+# ambiguity silently — it would accept a file whose first line matches the
+# bytes on disk and whose second line, the one a consumer's `shasum -c` may
+# just as well act on, does not. That is precisely the shape an attacker
+# appending to a checksums file would produce, and it is not something this
+# gate gets to shrug at.
+#
+#   0  exactly one line names <want>; its digest is on stdout.
+#   1  no line names it.
+#   2  more than one does; the COUNT is on stdout, for the caller's message.
 recorded_digest() {
-    local want="$1" line sha name
+    local want="$1" line sha name found="" hits=0
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
             '' | '#'*) continue ;;
@@ -206,11 +244,58 @@ recorded_digest() {
         name="${line##*[[:space:]]}"
         name="${name#\*}"
         if [ "$name" = "$want" ]; then
-            printf '%s\n' "$sha"
-            return 0
+            hits=$((hits + 1))
+            found="$sha"
         fi
     done <"$checksums"
-    return 1
+
+    if [ "$hits" -eq 0 ]; then
+        return 1
+    fi
+    # Duplicates are rejected whether or not the digests agree. Two identical
+    # lines are merely a broken writer, but this gate cannot tell that from the
+    # dangerous case without trusting the very file it is auditing, and "the
+    # duplicate happened to be harmless" is not a property a release should be
+    # published on.
+    if [ "$hits" -gt 1 ]; then
+        printf '%s\n' "$hits"
+        return 2
+    fi
+    printf '%s\n' "$found"
+    return 0
+}
+
+# One subject through verify-attestation.sh, scored into the two counters the
+# aggregation at the bottom reads. A function rather than a second copy of the
+# forwarding fork below: checksums.txt must be verified under EXACTLY the
+# constraints the tarballs were, and two spellings of that rule would
+# eventually stop agreeing.
+verify_attestation_of() {
+    local subject="$1" name="$2" status=0
+
+    # Invoked through `bash` like every other call to these scripts in CI, so a
+    # lost exec bit cannot turn a gate into a 126. The signer workflow is
+    # forwarded only when there is one: passing an empty third argument would
+    # make verify-attestation.sh hand gh `--signer-workflow ''`.
+    if [ -n "$signer_workflow" ]; then
+        bash "$VERIFY_ATTESTATION" "$subject" "$repo" "$signer_workflow" || status=$?
+    else
+        bash "$VERIFY_ATTESTATION" "$subject" "$repo" || status=$?
+    fi
+
+    case "$status" in
+        0) : ;;
+        "$EXIT_FAILED")
+            echo "verify-attestations-batch: FAILED — gh rejected $name." >&2
+            failed=1
+            ;;
+        *)
+            # 75, and everything else it could exit with, 64 included. The
+            # verdict was not reached, and "could not check" is not a pass.
+            echo "verify-attestations-batch: UNCHECKED — no provenance verdict for $name (verify-attestation.sh exit $status)." >&2
+            unchecked=1
+            ;;
+    esac
 }
 
 failed=0
@@ -233,13 +318,26 @@ for tarball in "${tarballs[@]}"; do
     fi
 
     expected=""
-    if ! expected="$(recorded_digest "$name")"; then
-        echo "verify-attestations-batch: FAILED — $name has no line in checksums.txt." >&2
-        echo "                           The file is being published with no recorded digest, so" >&2
-        echo "                           nothing downstream can tell these bytes from other bytes." >&2
-        failed=1
-        continue
-    fi
+    rd_status=0
+    expected="$(recorded_digest "$name")" || rd_status=$?
+    case "$rd_status" in
+        0) : ;;
+        2)
+            echo "verify-attestations-batch: FAILED — $name is listed $expected times in checksums.txt." >&2
+            echo "                           A name with more than one recorded digest does not say what" >&2
+            echo "                           this release publishes, and which line a consumer's" >&2
+            echo "                           'shasum -c' acts on is not something this gate controls." >&2
+            failed=1
+            continue
+            ;;
+        *)
+            echo "verify-attestations-batch: FAILED — $name has no line in checksums.txt." >&2
+            echo "                           The file is being published with no recorded digest, so" >&2
+            echo "                           nothing downstream can tell these bytes from other bytes." >&2
+            failed=1
+            continue
+            ;;
+    esac
 
     # Both sides come from the same family of tools (shasum / sha256sum /
     # openssl), all of which print lowercase hex, and lib.sh's sha256_of refuses
@@ -258,31 +356,21 @@ for tarball in "${tarballs[@]}"; do
     echo "verify-attestations-batch: $name — sha256 matches checksums.txt"
 
     # --- GitHub attests these bytes ----------------------------------------
-    # Invoked through `bash` like every other call to these scripts in CI, so a
-    # lost exec bit cannot turn a gate into a 126. The signer workflow is
-    # forwarded only when there is one: passing an empty third argument would
-    # make verify-attestation.sh hand gh `--signer-workflow ''`.
-    status=0
-    if [ -n "$signer_workflow" ]; then
-        bash "$VERIFY_ATTESTATION" "$tarball" "$repo" "$signer_workflow" || status=$?
-    else
-        bash "$VERIFY_ATTESTATION" "$tarball" "$repo" || status=$?
-    fi
-
-    case "$status" in
-        0) : ;;
-        "$EXIT_FAILED")
-            echo "verify-attestations-batch: FAILED — gh rejected $name." >&2
-            failed=1
-            ;;
-        *)
-            # 75, and everything else it could exit with, 64 included. The
-            # verdict was not reached, and "could not check" is not a pass.
-            echo "verify-attestations-batch: UNCHECKED — no provenance verdict for $name (verify-attestation.sh exit $status)." >&2
-            unchecked=1
-            ;;
-    esac
+    verify_attestation_of "$tarball" "$name"
 done
+
+# --- and GitHub attests checksums.txt itself -------------------------------
+# The fourth subject. Run AFTER the loop and unconditionally — not skipped
+# because a tarball already failed — for the reason the loop `continue`s
+# instead of exiting: every subject is reported before a verdict is returned,
+# so one bad asset does not hide the state of the others.
+#
+# There is no sha256 cross-check to make here, and none is implied: a file
+# cannot record its own digest. What this proves is the other half —
+# checksums.txt came from this repository's release workflow rather than from
+# whoever last had write access to the release page.
+echo "verify-attestations-batch: checksums.txt — verifying its own provenance"
+verify_attestation_of "$checksums" "checksums.txt"
 
 if [ "$failed" -ne 0 ]; then
     echo "verify-attestations-batch: FAILED — $dir does not verify against $repo. The release is blocked." >&2
@@ -295,4 +383,4 @@ if [ "$unchecked" -ne 0 ]; then
     exit "$EXIT_UNCHECKED"
 fi
 
-echo "verify-attestations-batch: PASS — all $EXPECTED_TARBALLS tarballs in $dir match checksums.txt and are attested by $repo."
+echo "verify-attestations-batch: PASS — all $EXPECTED_TARBALLS tarballs in $dir match checksums.txt, and all $VERIFIED_SUBJECTS subjects (the tarballs and checksums.txt itself) are attested by $repo."

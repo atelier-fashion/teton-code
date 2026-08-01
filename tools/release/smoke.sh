@@ -217,6 +217,32 @@ if [ "$name_is_release_target" = no ] && [ -n "${TETON_SMOKE_ASSUME_TARGET:-}" ]
         echo "       is not — refusing to run. Nothing was exercised." >&2
         exit "$EXIT_USAGE"
     fi
+
+    # The seam's premise is "the name carries a triple this script does not
+    # recognise". There is a second way to arrive here that looks identical and
+    # is not: the `${tarball_target#"$name_prefix"}` strip above SILENTLY does
+    # nothing when the prefix does not match, so a tarball whose name says a
+    # different version than $version leaves `$tarball_target` holding the whole
+    # basename — still starting with `teton-v`. That is not an unrecognised
+    # triple, it is a mismatch between the artifact and the version this run is
+    # about, and letting the seam paper over it would take a
+    # `teton-v9.9.9-aarch64-apple-darwin.tar.gz` handed to a v1.2.3 run and
+    # exercise it as whatever the environment named — hiding exactly the
+    # wrong-artifact accident this gate exists to catch.
+    #
+    # 75, not 64: the call was well formed and the file was read; what could not
+    # be established is which artifact this is. Nothing was learned about it.
+    case "$tarball_target" in
+        teton-v*)
+            echo "smoke: refusing TETON_SMOKE_ASSUME_TARGET for '$(basename "$tarball")'." >&2
+            echo "       The '$name_prefix' prefix did not strip, so this name does not belong to" >&2
+            echo "       version $version — '$tarball_target' is the whole basename, not a target" >&2
+            echo "       triple. That is a version/name MISMATCH, not an unrecognised platform, and" >&2
+            echo "       the seam is not allowed to rename it into agreement. Nothing was exercised." >&2
+            exit "$EXIT_UNCHECKED"
+            ;;
+    esac
+
     case "${TETON_SMOKE_ASSUME_TARGET}" in
         aarch64-apple-darwin | x86_64-apple-darwin | x86_64-unknown-linux-gnu) ;;
         *)

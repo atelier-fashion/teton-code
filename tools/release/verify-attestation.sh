@@ -26,6 +26,18 @@
 #                      it pass one and the ones that do not must still be able
 #                      to ask the weaker question.
 #
+#                      PASS IT FULLY QUALIFIED:
+#                      `<owner>/<repo>/.github/workflows/<file>`, not the bare
+#                      `.github/workflows/<file>`. gh compiles this value into
+#                      a regex and matches it against the certificate's SAN,
+#                      which is the whole
+#                      `https://github.com/<owner>/<repo>/<path>@<ref>` URI. A
+#                      bare path matches no certificate, so every subject comes
+#                      back with `Error: verifying with issuer "sigstore.dev"`
+#                      and this script scores it 75 — a gate that can never
+#                      pass, which is indistinguishable at a glance from a gate
+#                      that is merely flaky. See REJECTION_PATTERN below.
+#
 # WHERE THE REAL TOOL RUNS: anywhere `gh` exists — the release job and the
 # verify-install job both run it, on every platform. Unlike the signature gate
 # this one is not macOS-only, because attestations describe the build rather
@@ -83,10 +95,27 @@ EXIT_UNCHECKED=75
 #                              `Error: no attestations found` (exit 1), for a
 #                              repository that has attestations but none for
 #                              these bytes.
-#   no matching attestations   gh's other wording for the same verdict, kept
-#                              because it is the phrase that appears once
-#                              attestations were fetched and then filtered
-#                              (predicate type, signer workflow) to nothing.
+#   no matching attestations   gh's other wording for the same verdict. Kept
+#                              because gh does print it, but see the correction
+#                              below for what it is NOT.
+#
+# WHAT A SIGNER-WORKFLOW FILTER ACTUALLY PRINTS — this comment used to claim
+# that attestations fetched and then filtered (predicate type, signer workflow)
+# down to nothing produce "no matching attestations". Observed against a live
+# gh, that is wrong. A `--signer-workflow` value that eliminates every
+# candidate comes back as
+#
+#   Error: verifying with issuer "sigstore.dev"
+#
+# with no verdict phrase in it at all — so it matches neither pattern here and
+# lands on this script's final UNCHECKED (75). That is the correct outcome and
+# the reason it is worth writing down: a mis-specified `--signer-workflow`
+# (notably the BARE `.github/workflows/release.yml` instead of the fully
+# qualified `<owner>/<repo>/.github/workflows/release.yml` — see the usage
+# note) does not fail loudly as a rejection. It fails as a permanent 75, on
+# every artifact, in every release. If this gate has started reporting
+# UNCHECKED for everything with that error text, suspect the argument before
+# suspecting GitHub.
 #
 # WHAT WAS REMOVED, AND WHY. This pattern used to also carry "verification
 # failed" and "failed to verify". Both are substrings of environment failures
@@ -172,6 +201,20 @@ if [ "${GITHUB_ACTIONS:-}" = "true" ] &&
     usage
     exit "$EXIT_USAGE"
 fi
+
+# Did the SHELL fail to run the tool, rather than the tool reaching a verdict?
+# The same guard verify-signature.sh carries, for the same reason:
+#
+#   126/127  resolved a moment ago, and has since vanished or lost its exec bit.
+#   >=128    died on a signal N-128 — a segfault, an OOM kill, a CI step timeout.
+#
+# None of the three is evidence about the artifact, and every one of them is
+# reachable without touching the bytes being checked, so scoring any of them as
+# a rejection would be a 65 forged by an environment change (LESSON-442). gh's
+# own verdicts are small numbers (1); it has no verdict up here.
+could_not_run() {
+    [ "$1" -eq 126 ] || [ "$1" -eq 127 ] || [ "$1" -ge 128 ]
+}
 
 if [ "$#" -lt 2 ]; then
     echo "verify-attestation: too few arguments — nothing was verified." >&2
@@ -263,6 +306,27 @@ if [ "$gh_status" -eq 0 ]; then
     fi
     echo "verify-attestation: PASS — $(basename "$artifact") verifies against $repo."
     exit 0
+fi
+
+# BEFORE any pattern is consulted, and the ordering is the whole point. When
+# the shell cannot run gh — 126, 127, or a signal death — it is not silent: it
+# prints a diagnostic of its own ("no such file or directory", "bad
+# interpreter", "Killed"). That diagnostic is non-empty output which matches
+# neither pattern below, so today it would fall through to the final UNCHECKED,
+# which is the right verdict reached by luck: it survives only as long as
+# nothing that a shell or a kernel prints ever happens to contain a phrase from
+# REJECTION_PATTERN. Deciding it here on the STATUS makes it structural, and it
+# is the same guard, in the same position, that verify-signature.sh places
+# ahead of its own needle tests (LESSON-442).
+if could_not_run "$gh_status"; then
+    echo "verify-attestation: UNCHECKED — '$gh_tool' did not run to a verdict (exit $gh_status), so nothing" >&2
+    echo "                    was learned about $(basename "$artifact"). Whatever appears below is the" >&2
+    echo "                    shell's own diagnostic — a missing binary, a lost exec bit, or a process" >&2
+    echo "                    killed by a signal — and not gh's answer about these bytes." >&2
+    if [ -n "$gh_out" ]; then
+        printf '%s\n' "$gh_out" | quote
+    fi
+    exit "$EXIT_UNCHECKED"
 fi
 
 # Environment first, and it OUTRANKS the rejection pattern below. A run that

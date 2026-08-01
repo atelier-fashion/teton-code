@@ -89,8 +89,13 @@ jobs:
       # this run's OIDC identity. Nothing else in the job needs the token.
       id-token: write
     steps:
+      # SHA-pinned, matching release.yml's carve-out: this job is
+      # credential-bearing (`environment: site-deploy` plus `id-token: write`,
+      # which it exchanges for a live GCP credential), and a checkout runs
+      # first and runs as the job — a moved tag would execute new code with
+      # that exchange available to it.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Nothing in this job pushes; don't leave the token in .git/config
           # across the gcloud auth and buildpack steps below.
@@ -214,8 +219,13 @@ jobs:
       # Moving this below the auth step — or widening `path:` to the workspace —
       # would publish a long-lived service-account key as a downloadable
       # artifact on a public repository.
+      #
+      # SHA-pinned for the same reason the checkout above is, and with a
+      # sharper edge: this step publishes a downloadable artifact from a job
+      # that holds a GCP credential, so a moved tag here chooses what gets
+      # uploaded.
       - name: Upload the rendered site
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: site-dist
           path: site/dist
