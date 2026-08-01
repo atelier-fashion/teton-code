@@ -419,15 +419,43 @@ jobs:
             exit 0
           fi
 
-          # --verify-tag: refuse to invent a tag. If the tag is not already on
-          # the remote, something is wrong upstream of here and the fix is not
-          # for this step to create one.
-          gh release create "$TAG" \
-            --verify-tag \
-            --title "teton $VERSION" \
-            --notes-file "$notes" \
-            staging/*.tar.gz \
-            staging/checksums.txt
+          # Idempotent on purpose. `gh release create` errors on an existing
+          # release, so before this a run that published the page and then
+          # failed at the tap could only be retried by DELETING the release —
+          # which is what v0.1.1 had to do. The publish is the cheap, early
+          # half of a release; the expensive, fallible half is everything
+          # after it, and that half has to be re-runnable.
+          # One list, one title: the create and retry branches below must
+          # publish exactly the same set, and a fourth asset added to one arm
+          # only would be invisible — the staged-tarball count upstream counts
+          # what was BUILT, not what was uploaded.
+          assets=(staging/*.tar.gz staging/checksums.txt)
+          title="teton $VERSION"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A release already exists for this tag. That is a retry only if it
+            # describes the same commit this run built; a tag that has MOVED
+            # under a published release is ambiguous — the bytes on the page
+            # would no longer be the bytes of the tag people can check out —
+            # so it stops rather than quietly re-pointing anything.
+            tag_sha="$(git rev-parse "refs/tags/$TAG^{commit}" 2>/dev/null || true)"
+            if [ -n "$tag_sha" ] && [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "::error title=Release exists for a different commit::$TAG is already published, but it now resolves to $tag_sha while this run built $GITHUB_SHA. Re-pointing a published release at different bytes is not something this workflow will do silently. Delete the release and re-cut the tag, or investigate why the tag moved."
+              exit 65
+            fi
+            echo "::notice title=Release already exists — re-uploading this run's artifacts::$TAG was already published (a retry of a run that failed after publishing). Its assets are being replaced with the ones THIS run built and smoked, so the page and the checksums stay the same bytes the later jobs verify."
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --title "$title" --notes-file "$notes"
+          else
+            # --verify-tag: refuse to invent a tag. If the tag is not already on
+            # the remote, something is wrong upstream of here and the fix is not
+            # for this step to create one.
+            gh release create "$TAG" \
+              --verify-tag \
+              --title "$title" \
+              --notes-file "$notes" \
+              "${assets[@]}"
+          fi
 
           echo "::notice title=Release published::$TAG is live with 3 tarballs and checksums.txt."
 
@@ -799,18 +827,47 @@ jobs:
           # as well, so a URL that ever contained one would have been fetched as
           # two half-URLs, and both halves would have 404'd into a confusing
           # failure rather than an honest one.
-          unreachable=0
+          # Fetch and HASH, not just HEAD. A reachability probe proves the URL
+          # serves something; it cannot prove the `sha256` written beside that
+          # URL describes it. render-formula.sh builds the url_* and sha_*
+          # variables in two independent passes keyed only by matching
+          # identifier names, so a mispairing is a plain edit away — and only
+          # the arm64 pair is ever proven downstream, because arm64 is the one
+          # platform `brew install` runs on in this pipeline. The x86_64 legs
+          # would have shipped a formula whose checksum fails on a user's
+          # machine, with every gate here green.
+          #
+          # The sha is read from the formula line following its URL, which is
+          # exactly the pairing Homebrew itself will act on — the check reads
+          # the artifact the same way the consumer does.
+          bad_pairs=0
+          probe_dir="$(mktemp -d)"
           while IFS= read -r url; do
             [ -n "$url" ] || continue
-            if curl -fsSIL --retry 3 --retry-delay 2 -o /dev/null "$url"; then
-              echo "reachable: $url"
-            else
-              echo "::error title=Formula URL is not fetchable::$url returned no successful response. brew install would fail on whichever platform that URL serves. The tap was NOT updated."
-              unreachable=$((unreachable + 1))
+            expected="$(grep -A1 -F "$url" "$TAP_DIR/Formula/teton.rb" \
+              | sed -nE 's|^[[:space:]]*sha256[[:space:]]+"([0-9a-f]{64})".*|\1|p' | head -1)"
+            if [ -z "$expected" ]; then
+              echo "::error title=Formula URL carries no sha256::$url has no 64-hex sha256 on the line after it, so what brew would verify against is unknown. The tap was NOT updated."
+              bad_pairs=$((bad_pairs + 1))
+              continue
             fi
+            if ! curl -fsSL --retry 3 --retry-delay 2 -o "$probe_dir/a.tar.gz" "$url"; then
+              echo "::error title=Formula URL is not fetchable::$url returned no successful response. brew install would fail on whichever platform that URL serves. The tap was NOT updated."
+              bad_pairs=$((bad_pairs + 1))
+              continue
+            fi
+            actual="$(shasum -a 256 "$probe_dir/a.tar.gz" | awk '{ print $1 }')"
+            if [ "$actual" = "$expected" ]; then
+              echo "verified: $url"
+            else
+              echo "::error title=Formula sha256 does not describe its URL::$url hashes to $actual but the formula pairs it with $expected. brew install would refuse this artifact on whichever platform that URL serves. The tap was NOT updated."
+              bad_pairs=$((bad_pairs + 1))
+            fi
+            rm -f "$probe_dir/a.tar.gz"
           done <<<"$urls"
+          rm -rf "$probe_dir"
 
-          [ "$unreachable" -eq 0 ] || exit 65
+          [ "$bad_pairs" -eq 0 ] || exit 65
 
       # ---------------------------------------------------------------------
       # AC-5 and AC-6's mechanical evidence, gathered from a machine that
@@ -976,11 +1033,16 @@ jobs:
           # every file it obviously touched and missed the one that restated
           # the same fact somewhere else. Asking the formula what it promised,
           # then checking that promise held, is a check that cannot drift.
-          log_dir="$(brew --prefix)/var/log/teton"
+          # The whole path is captured, not just the basename: the directory is
+          # the formula's fact too, and hardcoding `var/log/teton` here would
+          # have left half the duplication this derivation exists to remove.
           formula_file="$TAP_DIR/Formula/teton.rb"
-          log_name="$(sed -nE 's|^[[:space:]]*log_path[[:space:]]+var/"log/teton/([^"]+)".*|\1|p' "$formula_file" | head -1)"
-          err_name="$(sed -nE 's|^[[:space:]]*error_log_path[[:space:]]+var/"log/teton/([^"]+)".*|\1|p' "$formula_file" | head -1)"
-          if [ -z "$log_name" ] || [ -z "$err_name" ]; then
+          log_rel="$(sed -nE 's|^[[:space:]]*log_path[[:space:]]+var/"([^"]+)".*|\1|p' "$formula_file" | head -1)"
+          err_rel="$(sed -nE 's|^[[:space:]]*error_log_path[[:space:]]+var/"([^"]+)".*|\1|p' "$formula_file" | head -1)"
+          log_name="$(basename "${log_rel:-}")"
+          err_name="$(basename "${err_rel:-}")"
+          log_dir="$(brew --prefix)/var/$(dirname "${log_rel:-x/y}")"
+          if [ -z "$log_rel" ] || [ -z "$err_rel" ]; then
             report_and_fail "Could not read the formula's log paths (BR-6)::Neither log_path nor error_log_path parsed out of $formula_file, so whether the daemon writes where the formula promises is UNKNOWN. The tap was NOT updated."
           fi
           if [ -f "$log_dir/$log_name" ] && [ -f "$log_dir/$err_name" ]; then

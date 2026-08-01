@@ -126,7 +126,7 @@ that users' `brew install` may already have resolved.
 |---|---|---|---|
 | `preflight` | ubuntu | Compares the tag against `[workspace.package] version` (BR-3) and decides `publish` | `64` the versions disagree; any other non-zero, the check could not run — either way nothing is built |
 | `build` (×3) | macos-15 ×2, ubuntu | Builds with `--features tetond/llama`, packages a flat tarball, then smokes the **unpacked tarball**: both binaries report the version, the release build refuses `TETON_TEST_SEAMS=1` (BR-9), `teton doctor` handshakes a live `tetond` | `65` an assertion failed; `75` the smoke could not run. `fail-fast: false` — you learn about all three targets, not the first |
-| `release` | ubuntu | Recomputes `checksums.txt` from the uploaded artifacts (BR-5), renders notes, `gh release create --verify-tag` | fewer than 3 tarballs (`75`); a dry run stops here and prints what it would have published |
+| `release` | ubuntu | Recomputes `checksums.txt` from the uploaded artifacts (BR-5), renders notes, `gh release create --verify-tag` | fewer than 3 tarballs (`65`); a dry run stops here and prints what it would have published |
 | `bump-formula` | macos-15 | Re-downloads the published assets and re-checks them against the published `checksums.txt`; renders `Formula/teton.rb`; asserts Homebrew resolves it at the tag; `brew style` + `brew audit`; fetches all three URLs; then — **before the push** — installs the rendered formula, runs `brew test` (AC-5) and `brew services start` → `doctor` → `restart` → `stop` (AC-6); only then commits and pushes the tap | any of the above. Nothing here is `continue-on-error` — BR-4. The install/service gates run pre-push deliberately: a broken `service` block fails with the tap still pointing at the previous good release, and its messages say so ("The tap was NOT updated") |
 | `verify-install` | macos-15 | Post-push **reachability** evidence only: `brew install atelier-fashion/tap/teton` on a runner that has never seen the tap, `brew test`, version check — proving the one-command auto-tap path works against the *live* tap (BR-1). The functional service gates already ran in `bump-formula` | any step. Covers **macOS arm64 only** — a green run here is not evidence about Intel or Linux (LESSON-433) |
 
@@ -221,7 +221,7 @@ teton doctor        # confirm the RUNNING daemon reports the new version
 ```
 
 The restart is the part worth writing down. `brew upgrade` replaces the binaries
-on disk; a `tetond` that is already running is still the old binary until
+on disk; a `teton-code` that is already running is still the old binary until
 something restarts it, and every symptom of that is confusing (a CLI on the new
 version talking to a daemon on the old one). Do not rely on the upgrade to
 restart the service for you — run the restart, and confirm with `doctor`, which
@@ -332,7 +332,7 @@ Verified by       :
 Date              :
 Machine           :                   (distro, glibc version, RAM)
 brew install      :  unrun            (Homebrew on Linux)
-Daemon started    :  unrun            (run `tetond` yourself — `brew services`
+Daemon started    :  unrun            (run `teton-code` yourself — `brew services`
                                        is NOT a v1 claim on Linux, OQ-2)
 teton doctor      :  unrun
 First-run proposal:  unrun            (CPU-only inference on this platform)
@@ -375,7 +375,7 @@ cross-compile-and-Rosetta-smoke approach in question, and it would be visible in
 the `softwareupdate` output rather than inferred from this exit code. Read that
 step's log before concluding anything about the ADR.
 
-**`Missing release artifacts` (`75`)** — fewer than three tarballs reached the
+**`Missing release artifacts` (`65`)** — fewer than three tarballs reached the
 `release` job. A release that silently omits a platform is worse than no
 release. Find the build leg that did not upload.
 

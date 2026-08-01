@@ -257,9 +257,12 @@ jobs:
       # run" must never be confused (LESSON-442, ADR-548-4). Any non-zero code
       # fails the job; the codes only change what the log says happened.
       #
+      # These are selftest.sh's own codes (its header is the authority); they
+      # are NOT tools/release/'s 64/65 taxonomy. The suite is a test runner, so
+      # it uses a runner's convention: 1 means "a case failed".
+      #
       #   0   passed.
-      #   64  red, ::error::. The harness was invoked wrongly.
-      #   65  red, ::error::. A script under test behaved wrongly. A real bug.
+      #   1   red, ::error::. A script under test behaved wrongly. A real bug.
       #   75  red, ::warning::. The harness could not run. Nothing was learned,
       #                         which is not a pass.
       - name: Release tooling self-test (tools/release/selftest.sh)
@@ -282,14 +285,14 @@ jobs:
             0)
               echo "::notice title=Release tooling self-test::PASSED — every script under tools/release/ behaved as specified on both its success and its failure paths."
               ;;
-            64)
-              echo "::error title=Release tooling self-test MISINVOKED::tools/release/selftest.sh rejected its own invocation (64). The harness did not test anything; fix the call in this job."
+            1)
+              echo "::error title=Release tooling self-test FAILED::A script under tools/release/ behaved wrongly. This is a real defect in the release pipeline — see the failing case in the log. Do not cut a tag until it is green."
               ;;
             75)
               echo "::warning title=Release tooling self-test UNVERIFIED::tools/release/selftest.sh could not run (75), so the release scripts were NOT exercised this run. This is NOT a passing result — it is the absence of one."
               ;;
             *)
-              echo "::error title=Release tooling self-test FAILED::A script under tools/release/ behaved wrongly (exit $status). This is a real defect in the release pipeline — see the log for the failing case. Do not cut a tag until it is green."
+              echo "::error title=Release tooling self-test exited $status::selftest.sh returned a code it does not document (its header defines 0, 1 and 75). Treated as a failure, because an unrecognised code is not a pass."
               ;;
           esac
           exit "$status"
