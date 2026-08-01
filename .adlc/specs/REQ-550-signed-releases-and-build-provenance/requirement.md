@@ -1,7 +1,7 @@
 ---
 id: REQ-550
 title: "Stable code-signing identity and build provenance for released binaries"
-status: approved
+status: complete
 deployable: true
 created: 2026-07-31
 updated: 2026-08-01
@@ -199,6 +199,11 @@ this: its rule is "`v*.*.*` tags **and/or** `main`". Every other ref is still
 refused, which is what AC-4's negative probe records.
 
 ## Deviations (verify pass, 2026-08-01)
+
+> User sign-off 2026-08-01: deferrals of OQ-3 (notarization) and OQ-4
+> (formula `test do` codesign check) confirmed. The unlocked-keychain-during-
+> build residual (ADR-550-2 consequence) is ACCEPTED for this release, with a
+> proper fix (import-after-build) to be specced as a follow-up REQ.
 
 Where the implementation departs from the letter of a rule or criterion above,
 recorded here so the departure is a decision on the record rather than a gap
