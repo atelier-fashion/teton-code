@@ -10,17 +10,21 @@ frontier-model money only where frontier-model intelligence matters.**
 
 ```sh
 brew install atelier-fashion/tap/teton
-brew services start teton
 teton
 ```
 
 That is the whole install: two binaries — `teton` (CLI) and `teton-code` (the
-daemon `brew services` runs under launchd) — with no Rust toolchain, no cmake,
-and no feature flags to get right.
+daemon) — with no Rust toolchain, no cmake, and no feature flags to get right.
+On its first run `teton` notices there is no daemon and offers to register
+`teton-code` with launchd (`brew services start teton`, run for you) so it
+starts now and survives reboots; press return to accept, or decline and it
+starts an unmanaged daemon for the session and never asks again. The manual
+`brew services start teton` keeps working, before or instead of the offer.
 
-If `brew services start teton` refuses with a tap-trust error, run
+If the service registration refuses with a tap-trust error, run
 `brew trust atelier-fashion/tap` once — Homebrew 6 treats the fully-qualified
-name in the install command as self-authorizing, but not the short name.
+name in the install command as self-authorizing, but not the short name that
+`brew services` resolves.
 
 **The model arrives on first run, with your consent.** The install ships no
 weights. The first `teton` run proposes a local model matched to your hardware
