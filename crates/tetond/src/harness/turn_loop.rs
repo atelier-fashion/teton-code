@@ -47,6 +47,7 @@ use super::completion::{
 };
 use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN};
 use super::permissions::{PermissionDecision, PermissionGate};
+use super::reply::StreamGate;
 use super::tools::{ToolContext, ToolOutcome, ToolRegistry};
 
 /// Tools that count as a verification step after an edit.
@@ -148,7 +149,14 @@ impl Default for HarnessConfig {
             summarize_threshold_tokens: 1_500,
             max_tools: Some(5),
             require_verification: true,
-            gen_params: GenParams::default(),
+            // Agent turns need room for prose plus a complete tool call. The
+            // 256-token `GenParams` default is sized for the local tier's
+            // summarize/classify duties and cut tool calls mid-JSON (BUG-147);
+            // the reply scanner ends well-formed turns long before this cap.
+            gen_params: GenParams {
+                max_tokens: 1_024,
+                temperature: 0.2,
+            },
         }
     }
 }
@@ -391,14 +399,32 @@ pub async fn run_session_turn_with_source(
         // local text engine and the system + role-typed messages for a remote chat
         // provider. The provenance hook is invoked here exactly as before.
         let prompt = ctx.prepare(hook);
+        // BUG-147: the gate streams prose live but holds back candidate tool
+        // calls (the tool status line presents them) and suppresses fabricated
+        // transcript frames, so the user never sees raw JSON or fake results.
+        let mut stream_gate = StreamGate::new();
         let produced = {
-            let mut on_token = |token: &str| events.agent_message(token);
+            let mut on_token = |token: &str| {
+                if let Some(out) = stream_gate.push(token) {
+                    events.agent_message(&out);
+                }
+            };
             source
                 .produce_turn(&prompt, &provenance, config, tools, &exposed, &mut on_token)
-                .await?
-        };
+                .await
+        }?;
         turns += 1;
-        let SourceTurn { text, decision, .. } = produced;
+        let SourceTurn {
+            text,
+            decision,
+            dropped_calls,
+            ..
+        } = produced;
+        // A held tail is the final answer only on an end-of-turn; on a tool
+        // call (or malformed call) it is the JSON itself and stays hidden.
+        if let Some(tail) = stream_gate.finish(matches!(decision, TurnDecision::EndTurn { .. })) {
+            events.agent_message(&tail);
+        }
 
         match decision {
             TurnDecision::EndTurn { final_text } => {
@@ -533,6 +559,22 @@ pub async fn run_session_turn_with_source(
                         } else {
                             folded
                         };
+                        // BUG-147: never drop extra tool calls silently — the
+                        // model can't tell an ignored call from a lost result
+                        // and re-emits the same batch every turn. The notice is
+                        // harness-authored, so it rides OUTSIDE the untrusted
+                        // frame.
+                        let folded = if dropped_calls > 0 {
+                            format!(
+                                "{folded}\n\nNote: your reply contained {dropped_calls} \
+                                 additional tool call(s) that were NOT executed — this \
+                                 harness runs exactly one tool per reply. Only the first \
+                                 call ran (its result is above). Issue the others one at \
+                                 a time if you still need them."
+                            )
+                        } else {
+                            folded
+                        };
                         ctx.push_tool_result_prov(name, provenance, folded);
                         ctx.truncate_to_budget();
                         continue;
@@ -604,104 +646,6 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     s
 }
 
-/// What the local text parser made of one model reply. The remote path decides
-/// this directly from the provider's structured events instead of parsing text.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ParsedTurn {
-    /// A well-formed call to a known tool.
-    ToolCall {
-        /// Tool name.
-        name: String,
-        /// Argument object.
-        arguments: Value,
-    },
-    /// No tool call — the model's final answer.
-    EndTurn(String),
-    /// Something tool-call-shaped but invalid (unknown tool, non-object args).
-    Malformed(String),
-}
-
-/// Parse a model reply into a tool call, an end-of-turn answer, or a malformed
-/// call. A reply is a tool call only if it contains a JSON object with a `tool`
-/// (or `name`) key; anything else is treated as the final answer.
-pub(crate) fn parse_turn(text: &str, known_tools: &[&str]) -> ParsedTurn {
-    for candidate in json_object_candidates(text) {
-        let Ok(value) = serde_json::from_str::<Value>(&candidate) else {
-            continue;
-        };
-        let name = value
-            .get("tool")
-            .or_else(|| value.get("name"))
-            .and_then(Value::as_str);
-        let Some(name) = name else {
-            // JSON without a tool key: not a tool call. Keep scanning in case a
-            // real call follows; if none is found this becomes an end-of-turn.
-            continue;
-        };
-
-        let arguments = value
-            .get("arguments")
-            .or_else(|| value.get("input"))
-            .or_else(|| value.get("args"))
-            .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-
-        if !known_tools.contains(&name) {
-            return ParsedTurn::Malformed(format!("`{name}` is not an available tool"));
-        }
-        if !arguments.is_object() {
-            return ParsedTurn::Malformed(format!("arguments for `{name}` must be a JSON object"));
-        }
-        return ParsedTurn::ToolCall {
-            name: name.to_owned(),
-            arguments,
-        };
-    }
-    ParsedTurn::EndTurn(text.trim().to_owned())
-}
-
-/// Extract every top-level `{...}` object substring, ignoring braces inside JSON
-/// strings. Robust to prose or code fences around the object.
-fn json_object_candidates(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (i, &b) in bytes.iter().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => {
-                if depth == 0 {
-                    start = i;
-                }
-                depth += 1;
-            }
-            b'}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    // Brace boundaries are ASCII, so the slice is UTF-8 safe.
-                    out.push(text[start..=i].to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// A short human title for a tool call (drives the `tool_call` event title).
 fn describe_call(call: &ToolCall) -> String {
     match call.name.as_str() {
@@ -764,53 +708,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_a_plain_tool_call() {
-        let parsed = parse_turn(
-            r#"{"tool":"read","arguments":{"path":"a.rs"}}"#,
-            &["read", "edit"],
-        );
-        assert_eq!(
-            parsed,
-            ParsedTurn::ToolCall {
-                name: "read".to_owned(),
-                arguments: serde_json::json!({ "path": "a.rs" }),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_a_fenced_tool_call_with_prose() {
-        let text = "I'll read the file.\n```json\n{\"tool\": \"read\", \"input\": {\"path\": \"a.rs\"}}\n```";
-        let parsed = parse_turn(text, &["read"]);
-        assert!(matches!(parsed, ParsedTurn::ToolCall { .. }));
-    }
-
-    #[test]
-    fn plain_text_is_end_of_turn() {
-        let parsed = parse_turn("All done. The file now returns 2.", &["read"]);
-        assert_eq!(
-            parsed,
-            ParsedTurn::EndTurn("All done. The file now returns 2.".to_owned())
-        );
-    }
-
-    #[test]
-    fn unknown_tool_is_malformed_not_end_of_turn() {
-        let parsed = parse_turn(r#"{"tool":"delete_everything","arguments":{}}"#, &["read"]);
-        assert!(matches!(parsed, ParsedTurn::Malformed(_)));
-    }
-
-    #[test]
-    fn non_object_arguments_are_malformed() {
-        let parsed = parse_turn(r#"{"tool":"read","arguments":"a.rs"}"#, &["read"]);
-        assert!(matches!(parsed, ParsedTurn::Malformed(_)));
-    }
-
-    #[test]
-    fn braces_inside_strings_do_not_break_scanning() {
-        let cands = json_object_candidates(r#"{"tool":"grep","arguments":{"pattern":"a}b{c"}}"#);
-        assert_eq!(cands.len(), 1);
-        assert!(serde_json::from_str::<Value>(&cands[0]).is_ok());
+    fn default_config_leaves_room_for_a_full_tool_call() {
+        // BUG-147: the 256-token GenParams default (a summarize/classify
+        // budget) cut agent tool calls mid-JSON. Agent turns get real room; the
+        // reply scanner ends well-formed turns long before the cap.
+        let config = HarnessConfig::default();
+        assert!(config.gen_params.max_tokens >= 1_024);
     }
 
     #[test]

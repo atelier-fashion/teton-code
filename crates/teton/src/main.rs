@@ -334,6 +334,9 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool) -> anyhow::Result<()> {
             SessionCreateParams {
                 mode: SessionMode::Freeform,
                 phase: None,
+                // BUG-147: the daemon runs under launchd (cwd `/`); the tool
+                // jail must be THIS terminal's directory, so send it.
+                cwd: std::env::current_dir().ok(),
             },
             &mut ctx,
         )?;

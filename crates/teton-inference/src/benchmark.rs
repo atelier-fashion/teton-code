@@ -132,6 +132,7 @@ pub fn run_benchmark(
             if first_token.is_none() {
                 first_token = Some(start.elapsed());
             }
+            true
         })?;
         total_tokens += u64::from(completion.completion_tokens);
     }

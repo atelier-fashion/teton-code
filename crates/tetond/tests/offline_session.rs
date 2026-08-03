@@ -56,7 +56,7 @@ impl Engine for ScriptedEngine {
         &self,
         prompt: &str,
         params: &GenParams,
-        on_token: &mut dyn FnMut(&str),
+        on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion, EngineError> {
         let idx = self.calls.fetch_add(1, Ordering::SeqCst);
         let text = self
@@ -65,13 +65,19 @@ impl Engine for ScriptedEngine {
             .cloned()
             .unwrap_or_else(|| "Done.".to_owned());
 
+        let full = text;
+        let mut text = String::new();
         let mut completion_tokens = 0u32;
-        for token in text.split_inclusive(' ') {
+        for token in full.split_inclusive(' ') {
             if completion_tokens >= params.max_tokens {
                 break;
             }
-            on_token(token);
+            let keep_going = on_token(token);
+            text.push_str(token);
             completion_tokens += 1;
+            if !keep_going {
+                break;
+            }
         }
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
         Ok(Completion {

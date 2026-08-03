@@ -57,7 +57,7 @@ impl Engine for GatedEngine {
         &self,
         _prompt: &str,
         _params: &GenParams,
-        _on_token: &mut dyn FnMut(&str),
+        _on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion, EngineError> {
         self.started.send(()).ok();
         let _ = self.release.recv_timeout(GATE_FALLBACK);

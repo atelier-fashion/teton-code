@@ -284,6 +284,7 @@ fn spawn_prompt_turn(
                 summary.session_id.clone(),
                 summary.mode,
                 summary.phase,
+                summary.cwd.clone(),
                 prompt,
             )
             .await;
@@ -527,7 +528,27 @@ fn handle_session_create(daemon: &Daemon, id: Id, params: Value) -> String {
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
 
-    match daemon.sessions.create(params.mode, params.phase) {
+    // BUG-147: the cwd becomes this session's tool jail. Refuse a relative or
+    // nonexistent one up front — jailing tools to a directory that isn't there
+    // reproduces the every-tool-fails session this validates against.
+    if let Some(cwd) = &params.cwd {
+        if !cwd.is_absolute() {
+            return error_string(
+                id,
+                error_code::INVALID_PARAMS,
+                "cwd must be an absolute path",
+            );
+        }
+        if !cwd.is_dir() {
+            return error_string(
+                id,
+                error_code::INVALID_PARAMS,
+                "cwd does not exist or is not a directory",
+            );
+        }
+    }
+
+    match daemon.sessions.create(params.mode, params.phase, params.cwd) {
         Ok(summary) => {
             // Broadcast a session-scoped event so subscribed peers learn of the
             // new session. Entering a structured session's first phase is a

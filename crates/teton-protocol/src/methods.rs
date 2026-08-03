@@ -40,6 +40,13 @@ pub struct SessionCreateParams {
     /// Starting phase; required in structured mode, `None` in freeform.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub phase: Option<Phase>,
+    /// The client's working directory — the repo this session's tools are
+    /// jailed to (BUG-147). The daemon runs under launchd with cwd `/`, so
+    /// without this every tool call ran against the filesystem root. Absolute
+    /// path; when absent the daemon falls back to its own (env-derived) root.
+    /// ACP equivalent: `session/new`'s `cwd`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// Result of [`SessionCreateParams`].
@@ -67,6 +74,10 @@ pub struct SessionSummary {
     /// Optional human-facing title.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub title: Option<String>,
+    /// The working directory this session's tools are jailed to (BUG-147);
+    /// `None` on sessions created by clients that did not send one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// List every session the daemon holds (surface-parity rule, BR-4).
@@ -645,10 +656,20 @@ mod tests {
         round_trip(&SessionCreateParams {
             mode: SessionMode::Structured,
             phase: Some(Phase::Spec),
+            cwd: Some(std::path::PathBuf::from("/Users/dev/repo")),
         });
         round_trip(&SessionCreateResult {
             session_id: SessionId::from("s1"),
         });
+    }
+
+    #[test]
+    fn session_create_without_a_cwd_still_deserializes() {
+        // Wire compatibility (BUG-147): an older client that sends no `cwd`
+        // must still create a session — the field defaults to None.
+        let params: SessionCreateParams =
+            serde_json::from_str(r#"{"mode":"freeform"}"#).unwrap();
+        assert_eq!(params.cwd, None);
     }
 
     #[test]
@@ -660,6 +681,7 @@ mod tests {
                 mode: SessionMode::Freeform,
                 phase: None,
                 title: Some("hack".to_owned()),
+                cwd: Some(std::path::PathBuf::from("/Users/dev/repo")),
             }],
         });
     }
@@ -675,6 +697,7 @@ mod tests {
                 mode: SessionMode::Structured,
                 phase: Some(Phase::Implement),
                 title: None,
+                cwd: None,
             },
         });
     }

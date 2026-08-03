@@ -221,7 +221,7 @@ impl Engine for ScriptedFileEngine {
         &self,
         prompt: &str,
         params: &GenParams,
-        on_token: &mut dyn FnMut(&str),
+        on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion, EngineError> {
         let idx = self.calls.fetch_add(1, Ordering::SeqCst);
         let text = self
@@ -238,13 +238,21 @@ impl Engine for ScriptedFileEngine {
             text
         };
 
+        let full = text;
+        // Mirror the real backends: an early stop (caller returned `false`)
+        // or the cap truncates the completion to what was actually emitted.
+        let mut text = String::new();
         let mut completion_tokens = 0u32;
-        for token in text.split_inclusive(' ') {
+        for token in full.split_inclusive(' ') {
             if completion_tokens >= params.max_tokens {
                 break;
             }
-            on_token(token);
+            let keep_going = on_token(token);
+            text.push_str(token);
             completion_tokens += 1;
+            if !keep_going {
+                break;
+            }
         }
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
         Ok(Completion {
@@ -1087,6 +1095,7 @@ impl DaemonRuntime {
         session_id: SessionId,
         mode: SessionMode,
         phase: Option<ProtoPhase>,
+        session_cwd: Option<PathBuf>,
         prompt: String,
     ) -> Result<PromptTurnResult, RpcError> {
         let turn_id = teton_protocol::TurnId::from(format!(
@@ -1158,7 +1167,11 @@ impl DaemonRuntime {
         // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
         // semantics are decided.
         let tools = self.build_tools(events, &session_id).await;
-        let tool_ctx = ToolContext::new(&self.repo_root);
+        // BUG-147: jail this session's tools to the CLIENT's working directory.
+        // The daemon-global `repo_root` is only a fallback for clients that did
+        // not send one — under launchd it is `/`, which is what had every tool
+        // call running against the filesystem root.
+        let tool_ctx = ToolContext::new(session_cwd.as_deref().unwrap_or(&self.repo_root));
         let gate = PermissionGate::new(
             session_id.clone(),
             self.permission_config.clone(),
@@ -2943,7 +2956,7 @@ mod tests {
         let script = "first reply\n---\nsecond reply\n---\nthird";
         let engine = ScriptedFileEngine::from_script("m", script);
         let params = GenParams::default();
-        let mut sink = |_: &str| {};
+        let mut sink = |_: &str| true;
         assert_eq!(
             engine.complete("p", &params, &mut sink).unwrap().text,
             "first reply"
@@ -2989,7 +3002,7 @@ mod tests {
         let engine =
             ScriptedFileEngine::from_script("m", "Done. The tool said: {{LAST_TOOL_RESULT}}");
         let params = GenParams::default();
-        let mut sink = |_: &str| {};
+        let mut sink = |_: &str| true;
         let prompt =
             "SYSTEM\n\nTool (mcp__demo__echo):\nechoed from the demo MCP server\n\nAssistant:\n";
         let out = engine.complete(prompt, &params, &mut sink).unwrap().text;
