@@ -1,7 +1,7 @@
 ---
 id: TASK-032
 title: "Mode-aware fabrication markers for ReplyScanner and StreamGate"
-status: draft
+status: complete
 parent: REQ-554
 created: 2026-08-03
 updated: 2026-08-03
@@ -27,18 +27,18 @@ unchanged. All existing flat-mode tests keep passing unchanged.
 
 ## Acceptance Criteria
 
-- [ ] ChatML mode: a reply emitting `<|im_start|>user` (the model fabricating
+- [x] ChatML mode: a reply emitting `<|im_start|>user` (the model fabricating
       the next turn) is cut before context and never displayed by the gate —
       the AC-4 test, covering both scanner cut and gate suppression.
-- [ ] ChatML mode: `<|im_end|>` at a line start ends the turn (defense in
+- [x] ChatML mode: `<|im_end|>` at a line start ends the turn (defense in
       depth behind the engine's EOG handling).
-- [ ] ChatML mode: flat markers do NOT fire — a reply containing `User:` at a
+- [x] ChatML mode: flat markers do NOT fire — a reply containing `User:` at a
       line start streams through untouched (BR-4 false-stop test).
-- [ ] Flat mode: behavior is byte-identical — every existing reply.rs test
+- [x] Flat mode: behavior is byte-identical — every existing reply.rs test
       passes without modification.
-- [ ] `<tool-result` is a marker in BOTH modes (harness-authored envelope is
+- [x] `<tool-result` is a marker in BOTH modes (harness-authored envelope is
       fabricatable in any mode).
-- [ ] The tool-call JSON stop works identically in both modes.
+- [x] The tool-call JSON stop works identically in both modes.
 
 ## Technical Notes
 

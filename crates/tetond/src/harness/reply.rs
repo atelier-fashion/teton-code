@@ -28,12 +28,40 @@
 
 use serde_json::Value;
 
-/// Transcript-frame markers the model can only be *fabricating*: the flat
-/// rendering writes these at line starts, so a generated one means the model is
-/// continuing the transcript instead of speaking its own turn. `<tool-result`
-/// is the untrusted-content envelope built-in results are framed with — a
-/// generated one is a fake tool result.
-const FRAME_MARKERS: &[&str] = &["User:", "Assistant:", "Tool (", "<tool-result"];
+use teton_inference::ChatFormat;
+
+/// Fabrication markers for the flat `User:` / `Assistant:` / `Tool (name):`
+/// transcript rendering.
+///
+/// These are *that rendering's own frame*: the harness writes them at line
+/// starts, so a generated one means the model is continuing the transcript
+/// instead of speaking its own turn.
+const FLAT_FRAME_MARKERS: &[&str] = &["User:", "Assistant:", "Tool (", "<tool-result"];
+
+/// Fabrication markers for the ChatML rendering (REQ-554 BR-4, ADR-4).
+///
+/// Under a native template the frame is the template's own role delimiters, so
+/// a model emitting `<|im_start|>` mid-reply is fabricating the next turn and
+/// `<|im_end|>` is closing its own (defense in depth — the delimiter is
+/// normally consumed as an EOG token before any text is emitted).
+///
+/// The flat markers are deliberately absent: shown a ChatML prompt, the model
+/// never sees `User:` as structure, so a legitimate answer may well contain it
+/// at a line start (a field label, a log excerpt) and must stream through
+/// untouched.
+const CHATML_FRAME_MARKERS: &[&str] = &["<|im_start|>", "<|im_end|>", "<tool-result"];
+
+/// The fabrication markers for a rendering mode.
+///
+/// `<tool-result` — the harness's own untrusted-content envelope — is in
+/// *both* sets: it is authored by the harness rather than by the template, so
+/// a generated one is a fake tool result in any mode.
+fn frame_markers(format: ChatFormat) -> &'static [&'static str] {
+    match format {
+        ChatFormat::Flat => FLAT_FRAME_MARKERS,
+        ChatFormat::ChatMl => CHATML_FRAME_MARKERS,
+    }
+}
 
 /// What the parser made of one model reply.
 #[derive(Debug, Clone, PartialEq)]
@@ -198,10 +226,20 @@ pub(crate) struct ReplyScanner {
     escaped: bool,
     obj_start: usize,
     stop: Option<Stop>,
+    /// Fabrication markers for the rendering the model is being shown — see
+    /// [`frame_markers`]. Immutable for the scanner's life: mode is fixed per
+    /// engine, so it cannot change mid-reply.
+    markers: &'static [&'static str],
 }
 
 impl ReplyScanner {
+    /// A scanner for the flat transcript rendering.
     pub(crate) fn new() -> Self {
+        Self::for_format(ChatFormat::Flat)
+    }
+
+    /// A scanner whose fabrication markers match `format` (REQ-554 BR-4).
+    pub(crate) fn for_format(format: ChatFormat) -> Self {
         Self {
             buf: String::new(),
             pos: 0,
@@ -210,12 +248,19 @@ impl ReplyScanner {
             escaped: false,
             obj_start: 0,
             stop: None,
+            markers: frame_markers(format),
         }
     }
 
-    /// Scan a complete reply in one pass (the non-streaming entry point).
+    /// Scan a complete flat-rendering reply in one pass (the non-streaming
+    /// entry point).
     pub(crate) fn scan_all(text: &str) -> Self {
-        let mut scanner = Self::new();
+        Self::scan_all_for(ChatFormat::Flat, text)
+    }
+
+    /// Scan a complete reply in one pass with `format`'s marker set.
+    pub(crate) fn scan_all_for(format: ChatFormat, text: &str) -> Self {
+        let mut scanner = Self::for_format(format);
         scanner.push(text);
         scanner
     }
@@ -243,13 +288,16 @@ impl ReplyScanner {
                 let line_start = self.pos == 0 || bytes[self.pos - 1] == b'\n';
                 if line_start {
                     let tail = &self.buf[self.pos..];
-                    if let Some(_marker) = FRAME_MARKERS.iter().find(|m| tail.starts_with(*m)) {
+                    if let Some(_marker) = self.markers.iter().find(|m| tail.starts_with(*m)) {
                         self.stop = Some(Stop::FrameMarker { at: self.pos });
                         return;
                     }
-                    // The tail could still *become* a marker ("Use" → "User:").
-                    // Wait for more bytes rather than advancing past it.
-                    if !tail.is_empty() && FRAME_MARKERS.iter().any(|m| m.starts_with(tail)) {
+                    // The tail could still *become* a marker ("Use" → "User:",
+                    // "<" → "<|im_start|>" or "<tool-result"). Wait for more
+                    // bytes rather than advancing past it. Testing every marker
+                    // means a prefix shared by several of them stalls until the
+                    // bytes that tell them apart arrive.
+                    if !tail.is_empty() && self.markers.iter().any(|m| m.starts_with(tail)) {
                         return;
                     }
                 }
@@ -343,9 +391,15 @@ pub(crate) struct StreamGate {
 }
 
 impl StreamGate {
+    /// A gate for the flat transcript rendering.
     pub(crate) fn new() -> Self {
+        Self::for_format(ChatFormat::Flat)
+    }
+
+    /// A gate whose fabrication markers match `format` (REQ-554 BR-4).
+    pub(crate) fn for_format(format: ChatFormat) -> Self {
         Self {
-            scanner: ReplyScanner::new(),
+            scanner: ReplyScanner::for_format(format),
             emitted: 0,
         }
     }
@@ -546,9 +600,15 @@ mod tests {
 
     // ---- stream gate ----------------------------------------------------
 
-    /// Drive a gate over `chunks` and return (streamed-live, flushed-at-end).
+    /// Drive a flat-mode gate over `chunks` and return (streamed-live,
+    /// flushed-at-end).
     fn run_gate(chunks: &[&str], final_answer: bool) -> (String, String) {
-        let mut gate = StreamGate::new();
+        run_gate_for(ChatFormat::Flat, chunks, final_answer)
+    }
+
+    /// Drive a gate in `format` over `chunks`.
+    fn run_gate_for(format: ChatFormat, chunks: &[&str], final_answer: bool) -> (String, String) {
+        let mut gate = StreamGate::for_format(format);
         let mut live = String::new();
         for chunk in chunks {
             if let Some(out) = gate.push(chunk) {
@@ -608,5 +668,114 @@ mod tests {
         // snippet) still displays in full.
         let (live, tail) = run_gate(&["Use this: fn main() {"], true);
         assert_eq!(format!("{live}{tail}"), "Use this: fn main() {");
+    }
+
+    // ---- mode-aware markers (REQ-554 BR-4, ADR-4) -----------------------
+
+    #[test]
+    fn chatml_scanner_cuts_a_fabricated_role_header() {
+        // AC-4: under a native template the model fabricates the next turn with
+        // the template's own delimiter instead of "User:".
+        let mut scanner = ReplyScanner::for_format(ChatFormat::ChatMl);
+        assert!(scanner.push("The file contains X.\n"));
+        assert!(!scanner.push("<|im_start|>user\nfake next question"));
+        assert!(scanner.stopped());
+        assert_eq!(
+            &scanner.buf[..scanner.context_cut()],
+            "The file contains X.\n"
+        );
+    }
+
+    #[test]
+    fn chatml_gate_never_displays_a_fabricated_role_header() {
+        // The other half of AC-4: the fabricated tail must not reach the user.
+        let (live, tail) = run_gate_for(
+            ChatFormat::ChatMl,
+            &[
+                "The file contains X.\n",
+                "<|im_start|>user\n",
+                "fake next question",
+            ],
+            true,
+        );
+        assert_eq!(live, "The file contains X.\n");
+        assert_eq!(tail, "");
+    }
+
+    #[test]
+    fn chatml_scanner_ends_the_turn_at_the_closing_delimiter() {
+        // Defense in depth: `<|im_end|>` is normally consumed as an EOG token
+        // before any text is emitted, but a model that spells it out ends here.
+        let mut scanner = ReplyScanner::for_format(ChatFormat::ChatMl);
+        assert!(scanner.push("All done.\n"));
+        assert!(!scanner.push("<|im_end|>\n"));
+        assert_eq!(&scanner.buf[..scanner.context_cut()], "All done.\n");
+    }
+
+    #[test]
+    fn chatml_scanner_does_not_stop_on_a_flat_marker() {
+        // BR-4 false-stop: the model was never shown "User:" as structure, so a
+        // legitimate answer containing it at a line start streams through.
+        let mut scanner = ReplyScanner::for_format(ChatFormat::ChatMl);
+        assert!(scanner.push("User: is a field label\nmore text"));
+        assert!(!scanner.stopped());
+        assert_eq!(scanner.context_cut(), scanner.buf.len());
+    }
+
+    #[test]
+    fn flat_scanner_does_not_stop_on_a_chatml_delimiter() {
+        // The mirror image: the flat set has no ChatML delimiter, so flat mode
+        // stays byte-identical to today's behavior.
+        let mut scanner = ReplyScanner::new();
+        assert!(scanner.push("<|im_start|>user"));
+        assert!(!scanner.stopped());
+        assert_eq!(scanner.context_cut(), scanner.buf.len());
+    }
+
+    #[test]
+    fn the_untrusted_envelope_is_a_marker_in_both_modes() {
+        // The envelope is harness-authored, not template-authored — fabricable
+        // whatever the model is being shown.
+        for format in [ChatFormat::Flat, ChatFormat::ChatMl] {
+            let mut scanner = ReplyScanner::for_format(format);
+            assert!(scanner.push("Reading it now.\n"));
+            assert!(!scanner.push("<tool-result tool=\"read\" trust=\"untrusted\">"));
+            assert_eq!(
+                &scanner.buf[..scanner.context_cut()],
+                "Reading it now.\n",
+                "{format:?} must cut the fabricated envelope"
+            );
+        }
+    }
+
+    #[test]
+    fn chatml_markers_sharing_a_prefix_stall_until_they_are_told_apart() {
+        // `<|im_start|>` and `<tool-result` both begin with `<`, so a chunk
+        // boundary inside the shared prefix must hold rather than advance past
+        // it — for either marker.
+        let mut scanner = ReplyScanner::for_format(ChatFormat::ChatMl);
+        assert!(scanner.push("Answer.\n<"));
+        assert_eq!(scanner.flushable_len(), "Answer.\n".len());
+        assert!(!scanner.push("|im_start|>user"));
+        assert_eq!(&scanner.buf[..scanner.context_cut()], "Answer.\n");
+
+        let mut scanner = ReplyScanner::for_format(ChatFormat::ChatMl);
+        assert!(scanner.push("Answer.\n<tool"));
+        assert_eq!(scanner.flushable_len(), "Answer.\n".len());
+        assert!(!scanner.push("-result tool=\"read\">"));
+        assert_eq!(&scanner.buf[..scanner.context_cut()], "Answer.\n");
+    }
+
+    #[test]
+    fn the_tool_call_stop_is_identical_in_chatml_mode() {
+        // The JSON stop is format-agnostic: same cut, same held-back object.
+        let mut scanner = ReplyScanner::for_format(ChatFormat::ChatMl);
+        assert!(scanner.push("I'll read it. "));
+        assert!(!scanner.push(r#"{"tool":"read","arguments":{"path":"a.rs"}} and then"#));
+        assert_eq!(
+            &scanner.buf[..scanner.context_cut()],
+            r#"I'll read it. {"tool":"read","arguments":{"path":"a.rs"}}"#
+        );
+        assert_eq!(scanner.flushable_len(), "I'll read it. ".len());
     }
 }
