@@ -234,6 +234,13 @@ pub(crate) struct ReplyScanner {
 
 impl ReplyScanner {
     /// A scanner for the flat transcript rendering.
+    ///
+    /// Test-only since REQ-554 TASK-033: production callers now pass the
+    /// serving engine's format explicitly ([`Self::for_format`]), because a
+    /// scanner whose markers do not match the rendering on screen is exactly
+    /// the BR-4 failure. This alias survives only to keep the flat-mode
+    /// containment tests below reading as they did under BUG-147.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::for_format(ChatFormat::Flat)
     }
@@ -253,7 +260,8 @@ impl ReplyScanner {
     }
 
     /// Scan a complete flat-rendering reply in one pass (the non-streaming
-    /// entry point).
+    /// entry point). Test-only for the same reason as [`Self::new`].
+    #[cfg(test)]
     pub(crate) fn scan_all(text: &str) -> Self {
         Self::scan_all_for(ChatFormat::Flat, text)
     }
@@ -391,11 +399,6 @@ pub(crate) struct StreamGate {
 }
 
 impl StreamGate {
-    /// A gate for the flat transcript rendering.
-    pub(crate) fn new() -> Self {
-        Self::for_format(ChatFormat::Flat)
-    }
-
     /// A gate whose fabrication markers match `format` (REQ-554 BR-4).
     pub(crate) fn for_format(format: ChatFormat) -> Self {
         Self {

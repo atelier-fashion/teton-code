@@ -1,7 +1,7 @@
 ---
 id: TASK-033
 title: "Wire ChatFormat through the local source, summarizer, loader report, and smoke"
-status: draft
+status: complete
 parent: REQ-554
 created: 2026-08-03
 updated: 2026-08-03
@@ -44,21 +44,21 @@ drives one native-template turn on a real GGUF (AC-6).
 
 ## Acceptance Criteria
 
-- [ ] With `MockEngine::with_chat_format(ChatMl)`, the string handed to
+- [x] With `MockEngine::with_chat_format(ChatMl)`, the string handed to
       `Engine::complete` is the ChatML rendering (contains `<|im_start|>`,
       lacks the flat frame); with a default mock it is `prompt.flat`
       byte-identical (AC-1 wiring / AC-5 CI pin).
-- [ ] `summarize_if_large` under a ChatMl engine sends a ChatML-wrapped duty
+- [x] `summarize_if_large` under a ChatMl engine sends a ChatML-wrapped duty
       prompt; under Flat, today's exact prompt (BR-7).
-- [ ] The turn loop's gate suppresses `<|im_start|>` fabrication end-to-end
+- [x] The turn loop's gate suppresses `<|im_start|>` fabrication end-to-end
       (AC-4's loop-level half, via the wiring test or reuse of TASK-032's
       gate test at source level).
-- [ ] Loader logs the flat-fallback line exactly once for a real engine
+- [x] Loader logs the flat-fallback line exactly once for a real engine
       reporting Flat; no log from scripted/mock paths (AC-3) — pinned where
       testable, otherwise asserted by inspection in the PR description.
-- [ ] All BUG-147 containment tests and the full existing suite pass
+- [x] All BUG-147 containment tests and the full existing suite pass
       unchanged (BR-3, AC-7).
-- [ ] `cargo test --workspace` and clippy green; the new smoke compiles under
+- [x] `cargo test --workspace` and clippy green; the new smoke compiles under
       `--features tetond/llama` (run manually, `#[ignore]`d in CI).
 
 ## Technical Notes

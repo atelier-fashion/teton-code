@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
-use teton_inference::{Engine, EngineError};
+use teton_inference::{ChatFormat, Engine, EngineError};
 use teton_protocol::{Phase, ProviderId, SessionId};
 use teton_providers::{
     Message, Provider, Role, TokenUsage, ToolSpec, Transport, TurnEvent, TurnRequest,
@@ -44,6 +44,7 @@ use crate::egress::{Egress, EgressContext, Provenance};
 use super::context::{
     ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance, ToolProvenance,
 };
+use super::render;
 use super::reply::{parse_reply, ParsedTurn, ReplyScanner};
 use super::tools::ToolRegistry;
 use super::turn_loop::{HarnessConfig, HarnessError};
@@ -120,6 +121,27 @@ pub trait CompletionSource: Send {
         exposed: &[&str],
         on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
     ) -> Result<SourceTurn, HarnessError>;
+
+    /// The prompt rendering the model behind this source is actually shown
+    /// (REQ-554 ADR-4).
+    ///
+    /// The turn loop reads it to build a [`StreamGate`](super::reply::StreamGate)
+    /// whose fabrication markers match the delimiters on screen. Mismatched
+    /// markers fail in both directions: flat markers under a templated prompt cut
+    /// a legitimate answer that happens to start a line with `User:`, and missing
+    /// template markers under a templated prompt let a fabricated
+    /// `<|im_start|>user` turn stream straight to the user.
+    ///
+    /// Defaults to [`ChatFormat::Flat`], which is right for every source that is
+    /// not a local text engine. [`RemoteProviderSource`] stays `Flat` on purpose:
+    /// fabrication markers are a *local text parsing* concern — a remote turn's
+    /// tool calls arrive as structured [`TurnEvent::ToolCall`] events and its
+    /// prose as `TextDelta`s, so there is no transcript rendering in the text for
+    /// a marker to describe, and the provider owns its own wire format. The
+    /// default also keeps every test source compiling unchanged.
+    fn chat_format(&self) -> ChatFormat {
+        ChatFormat::Flat
+    }
 }
 
 /// The local-tier source: drives the [`Engine`] behind a shared `Arc<Mutex<_>>`
@@ -129,18 +151,37 @@ pub trait CompletionSource: Send {
 /// inside [`tokio::task::spawn_blocking`], whose closure must be `'static`.
 pub struct LocalEngineSource {
     engine: Arc<Mutex<dyn Engine>>,
+    /// The rendering the loaded engine speaks (REQ-554 ADR-2), read once at
+    /// construction. **Immutable for this source's life**: the format is a
+    /// property of the committed engine, resolved at load time from its GGUF
+    /// template, and a committed engine is never re-templated.
+    format: ChatFormat,
 }
 
 impl LocalEngineSource {
-    /// A source over the shared local `engine`.
+    /// A source over the shared local `engine`, rendering for whatever chat
+    /// format that engine reports.
+    ///
+    /// The engine is locked **once**, here, to cache its
+    /// [`ChatFormat`](teton_inference::ChatFormat). Mode is immutable per source
+    /// (ADR-2): it is resolved once per engine load, and a source is rebuilt per
+    /// turn-run from the same committed engine, so "once per source" and "once
+    /// per load" agree. Caching also keeps the per-turn path free of a metadata
+    /// lock — a real completion holds this mutex for seconds, so asking the
+    /// engine its format mid-turn would queue behind inference.
     #[must_use]
     pub fn new(engine: Arc<Mutex<dyn Engine>>) -> Self {
-        Self { engine }
+        let format = engine.lock().expect("engine mutex poisoned").chat_format();
+        Self { engine, format }
     }
 }
 
 #[async_trait]
 impl CompletionSource for LocalEngineSource {
+    fn chat_format(&self) -> ChatFormat {
+        self.format
+    }
+
     async fn produce_turn(
         &mut self,
         prompt: &PreparedPrompt,
@@ -150,7 +191,12 @@ impl CompletionSource for LocalEngineSource {
         exposed: &[&str],
         on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
     ) -> Result<SourceTurn, HarnessError> {
-        // The local text engine consumes the flat single-string rendering.
+        // REQ-554 BR-1: render the *already role-typed* prompt for the format
+        // the loaded model actually speaks — its native ChatML template when the
+        // GGUF carries one, the flat transcript (byte-identical to before) when
+        // it does not. This rendered string is what `complete` tokenizes, so the
+        // engine's typed over-window refusal inherently measures the prompt
+        // including template overhead (BR-5).
         //
         // Real inference rides the blocking pool (E-3): a llama.cpp completion
         // holds a core for seconds, so run inline it would park this tokio
@@ -159,17 +205,20 @@ impl CompletionSource for LocalEngineSource {
         // its token stream is bridged back over a channel so the caller's
         // `on_token` sink still observes tokens (and first-token latency) live.
         let engine = Arc::clone(&self.engine);
-        let flat = prompt.flat.clone();
+        let rendered = render::render_prompt(self.format, prompt);
+        let format = self.format;
         let params = config.gen_params;
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let task = tokio::task::spawn_blocking(move || {
             // BUG-147: the scanner ends the turn at the first complete tool
             // call or at a fabricated transcript frame — a weak model left to
             // run would go on to invent tool results and future turns (and burn
-            // seconds of inference producing them).
-            let mut scanner = ReplyScanner::new();
+            // seconds of inference producing them). Its marker set follows the
+            // rendering (BR-4): the frames the model can fabricate are the ones
+            // it was just shown.
+            let mut scanner = ReplyScanner::for_format(format);
             let guard = engine.lock().expect("engine mutex poisoned");
-            guard.complete(&flat, &params, &mut |token| {
+            guard.complete(&rendered, &params, &mut |token| {
                 // A closed receiver means the caller went away; keep completing
                 // (spawn_blocking is not cancellable) and drop the token.
                 let _ = token_tx.send(token.to_owned());
@@ -190,7 +239,7 @@ impl CompletionSource for LocalEngineSource {
         // parse the *clean* reply. Everything past the first tool call — the
         // hallucinated continuation — never reaches context.
         let mut text = completion.text;
-        text.truncate(ReplyScanner::scan_all(&text).context_cut());
+        text.truncate(ReplyScanner::scan_all_for(self.format, &text).context_cut());
         let parsed = parse_reply(&text, exposed);
         let decision = match parsed.turn {
             ParsedTurn::ToolCall { name, arguments } => TurnDecision::ToolCall { name, arguments },
@@ -402,7 +451,7 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
-    use teton_inference::MockEngine;
+    use teton_inference::{Completion, GenParams, MockEngine};
     use teton_providers::{
         CapabilityProfile, ProviderError, StopReason, ToolCall, TransportError, TransportRequest,
         TransportResponse, TurnCompletion, TurnStream,
@@ -419,6 +468,80 @@ mod tests {
             system: String::new(),
             messages: Vec::new(),
         }
+    }
+
+    /// An [`Engine`] that records the exact prompt string it is handed and
+    /// reports a configured [`ChatFormat`].
+    ///
+    /// `MockEngine::with_chat_format` reports the format but throws the prompt
+    /// away, and the prompt is precisely what REQ-554 pins: AC-5's CI check is
+    /// that the string the engine tokenizes — and therefore window-checks — IS
+    /// the rendered one, which is only observable by capturing it.
+    struct CapturingEngine {
+        format: ChatFormat,
+        response: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// The shared engine handle [`LocalEngineSource`] takes, paired with the
+    /// buffer the prompts it is handed land in.
+    type CapturingLocal = (Arc<Mutex<dyn Engine>>, Arc<Mutex<Vec<String>>>);
+
+    /// A [`CapturingEngine`] reporting `format` and answering `response`, ready
+    /// to hand to [`LocalEngineSource::new`], and its capture buffer.
+    fn capturing_engine(format: ChatFormat, response: &str) -> CapturingLocal {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(CapturingEngine {
+            format,
+            response: response.to_owned(),
+            seen: Arc::clone(&seen),
+        }));
+        (engine, seen)
+    }
+
+    impl Engine for CapturingEngine {
+        fn model_id(&self) -> &str {
+            "capturing"
+        }
+        fn complete(
+            &self,
+            prompt: &str,
+            _params: &GenParams,
+            on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<Completion, EngineError> {
+            self.seen
+                .lock()
+                .expect("capture mutex poisoned")
+                .push(prompt.to_owned());
+            on_token(&self.response);
+            Ok(Completion {
+                text: self.response.clone(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+        fn chat_format(&self) -> ChatFormat {
+            self.format
+        }
+    }
+
+    /// A user → assistant → tool-result conversation, prepared. Its *flat*
+    /// rendering carries the `User:`/`Assistant:`/`Tool (` labels, so "the flat
+    /// frame is absent" below tests a real difference rather than an artifact of
+    /// an empty conversation.
+    fn tool_using_prompt() -> PreparedPrompt {
+        let mut ctx = ContextManager::new("SYSTEM PROMPT", 10_000);
+        ctx.push_user("read a.rs");
+        ctx.push_model(r#"{"tool":"read","arguments":{"path":"a.rs"}}"#);
+        ctx.push_tool_result("read", Some("a.rs".to_owned()), "file body");
+        ctx.prepare(&mut crate::harness::context::NoopProvenanceHook)
+    }
+
+    /// The one prompt the capturing engine was handed.
+    fn only_prompt(seen: &Arc<Mutex<Vec<String>>>) -> String {
+        let seen = seen.lock().expect("capture mutex poisoned");
+        assert_eq!(seen.len(), 1, "one turn must issue one completion");
+        seen[0].clone()
     }
 
     /// A provider whose single turn streams some text and then **two** tool calls
@@ -645,6 +768,108 @@ mod tests {
             TurnDecision::EndTurn { final_text } => assert!(final_text.contains("All done")),
             other => panic!("expected end of turn, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_chatml_engine_is_handed_the_rendered_prompt_not_the_flat_one() {
+        // REQ-554 AC-1 / AC-5's CI pin: the string handed to `Engine::complete`
+        // — the one the engine tokenizes and window-checks — is the ChatML
+        // *rendering*, not `prompt.flat`. Capturing it is the only way to see
+        // that; a test that only asserted the turn parsed would pass with the
+        // flat string still going out.
+        let (engine, seen) = capturing_engine(
+            ChatFormat::ChatMl,
+            r#"{"tool":"read","arguments":{"path":"a.rs"}}"#,
+        );
+        let mut source = LocalEngineSource::new(engine);
+        assert_eq!(
+            source.chat_format(),
+            ChatFormat::ChatMl,
+            "the source must adopt the committed engine's format (ADR-2)"
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let prompt = tool_using_prompt();
+
+        let turn = source
+            .produce_turn(
+                &prompt,
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect("local turn");
+
+        let sent = only_prompt(&seen);
+        assert!(
+            sent.contains("<|im_start|>"),
+            "the engine was not shown the template's role delimiters: {sent}"
+        );
+        assert_eq!(
+            sent,
+            render::render_prompt(ChatFormat::ChatMl, &prompt),
+            "the engine must receive exactly the renderer's output"
+        );
+        // The flat frame must not survive into template mode — and the flat
+        // rendering of this same prompt does carry it, so this is a real
+        // difference (BUG-147: a model shown `Tool (` writes `Tool (`).
+        assert!(!sent.contains("\nUser:\n"), "flat user label leaked");
+        assert!(
+            !sent.contains("\nAssistant:\n"),
+            "flat assistant label leaked"
+        );
+        assert!(!sent.contains("\nTool ("), "flat tool label leaked");
+        assert!(prompt.flat.contains("\nUser:\n") && prompt.flat.contains("\nTool (read):\n"));
+        // ...and the turn still parses: the containment runs in template mode.
+        match turn.decision {
+            TurnDecision::ToolCall { name, .. } => assert_eq!(name, "read"),
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flat_engine_is_handed_prompt_flat_byte_for_byte() {
+        // BR-2: the fallback is not a re-derivation — the engine gets the exact
+        // string `prepare()` already produced, which is what keeps every
+        // scripted fixture and the flat `{{LAST_TOOL_RESULT}}` parsing valid.
+        let (engine, seen) = capturing_engine(ChatFormat::Flat, "All done.");
+        let mut source = LocalEngineSource::new(engine);
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let prompt = tool_using_prompt();
+
+        source
+            .produce_turn(
+                &prompt,
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect("local turn");
+
+        assert_eq!(only_prompt(&seen), prompt.flat);
+        // AC-7: a plain test double inherits `Flat` from the trait default, so
+        // it takes this same path with no edit of its own.
+        let mock: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::new("mock")));
+        assert_eq!(LocalEngineSource::new(mock).chat_format(), ChatFormat::Flat);
+    }
+
+    #[tokio::test]
+    async fn a_remote_source_reports_the_flat_default() {
+        // ADR-4: fabrication markers describe a *local text* rendering. A remote
+        // turn's tool calls arrive as structured events, so the remote source
+        // stays on the trait default and the turn loop's gate is unchanged for
+        // it.
+        let provider = TwoToolProvider;
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let source = RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-1");
+        assert_eq!(source.chat_format(), ChatFormat::Flat);
     }
 
     #[test]

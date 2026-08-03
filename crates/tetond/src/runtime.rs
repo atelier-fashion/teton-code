@@ -2466,6 +2466,26 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
         // one is dropped here (unmapping the weights); the failure memo is
         // recorded by `apply_consent_outcome` from the outcome this becomes.
         if duty.is_pass() {
+            // REQ-554 BR-2/AC-3: a model whose GGUF carries no template this
+            // build recognizes serves on the flat transcript rendering, and
+            // that downgrade is reported — once, naming the model — never
+            // silently (LESSON-447: a best-effort fallback must fail loudly, or
+            // the tier quietly runs on the format that produced BUG-147).
+            //
+            // Reported here rather than at `commit`: this is the last point the
+            // loader holds the engine itself. Past `stage` it lives behind
+            // `StagedEngines`' private map and then the serving slot, and
+            // `StagedEngines` is shared with the seam's `FakeEngineLoader`, so
+            // logging there would make a `MockEngine` claim a degraded template
+            // — test doubles are flat by design, not degraded. Scripted engines
+            // reach no loader at all (E-5), so they cannot log either. Fires
+            // once per successful load of a duty-passing engine.
+            if engine.chat_format() == teton_inference::ChatFormat::Flat {
+                eprintln!(
+                    "tetond: model {model_name}: no recognized chat template; \
+                     using flat transcript rendering"
+                );
+            }
             self.staged.stage(
                 model_name,
                 Arc::new(Mutex::new(engine)) as Arc<Mutex<dyn Engine>>,

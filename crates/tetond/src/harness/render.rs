@@ -48,13 +48,6 @@
 //! needs to pre-account for it. [`CHATML_PER_MESSAGE_OVERHEAD_BYTES`] documents
 //! how small and how bounded that overhead is.
 
-// The three `#[allow(dead_code)]`s below are load-bearing only until TASK-033
-// wires this module's callers (`LocalEngineSource::produce_turn` and
-// `summarize_if_large`). Until then the renderer is reachable from its tests but
-// not from the daemon, and CI's `-D warnings` would fail the build. They are
-// deliberately per-item rather than a module-wide allow, so the module keeps
-// reporting genuinely dead helpers, and TASK-033 deletes all three.
-
 use teton_inference::ChatFormat;
 
 use super::context::{MessageRole, PreparedPrompt};
@@ -89,7 +82,6 @@ const CHATML_GENERATION_CUE: &str = "<|im_start|>assistant\n";
 /// Pinned by `chatml_per_message_overhead_is_bounded_by_the_const`, which
 /// measures rendered-minus-content bytes on a real rendering rather than
 /// trusting the arithmetic above.
-#[allow(dead_code)] // consumed by TASK-033's budget accounting
 pub(crate) const CHATML_PER_MESSAGE_OVERHEAD_BYTES: usize =
     CHATML_START.len() + "assistant".len() + 1 + CHATML_END.len();
 
@@ -126,7 +118,6 @@ fn push_chatml_message(out: &mut String, role: &str, text: &str) {
 /// holds on arrival (AC-2) and this function never re-merges. Rendering stays a
 /// pure structural transform of a prompt that was assembled once, for both tiers.
 #[must_use]
-#[allow(dead_code)] // called by `LocalEngineSource::produce_turn` in TASK-033
 pub(crate) fn render_prompt(format: ChatFormat, prompt: &PreparedPrompt) -> String {
     match format {
         ChatFormat::Flat => prompt.flat.clone(),
@@ -168,7 +159,6 @@ pub(crate) fn render_prompt(format: ChatFormat, prompt: &PreparedPrompt) -> Stri
 /// the one call whose output feeds straight back into context — on the degraded
 /// format.
 #[must_use]
-#[allow(dead_code)] // called by `summarize_if_large` in TASK-033
 pub(crate) fn render_duty(format: ChatFormat, instruction: &str) -> String {
     match format {
         ChatFormat::Flat => instruction.to_owned(),

@@ -595,7 +595,15 @@ pub async fn summarize_if_large(
     let result = tokio::task::spawn_blocking(move || {
         let params = GenParams::default();
         let guard = engine.lock().expect("engine mutex poisoned");
-        guard.complete(&prompt, &params, &mut |_| true)
+        // REQ-554 BR-7: a duty prompt gets the same template treatment an agent
+        // turn does — templating turns but not duties would leave the
+        // summarizer, whose output feeds straight back into context, on the
+        // degraded format. The format is read from the guard already held here,
+        // inside the blocking task: taking a second lock on the async path to
+        // ask the engine its format would park a tokio worker behind whatever
+        // completion currently owns the mutex (LESSON-448).
+        let rendered = super::render::render_duty(guard.chat_format(), &prompt);
+        guard.complete(&rendered, &params, &mut |_| true)
     })
     .await;
     let mechanical = |error: String| SummarizeOutcome {
@@ -849,6 +857,135 @@ mod tests {
             "summarizer prompt was {} bytes — unbounded input reached the engine",
             seen[0]
         );
+    }
+
+    /// An engine that records the **whole** duty prompt it was handed and
+    /// reports a configured [`teton_inference::ChatFormat`] — the two facts
+    /// BR-7 is about. [`PromptLenEngine`] above only keeps the length.
+    struct DutyPromptEngine {
+        format: teton_inference::ChatFormat,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// The shared engine handle `summarize_if_large` takes, paired with the
+    /// buffer the prompts it is handed land in.
+    type CapturingDuty = (Arc<Mutex<dyn Engine>>, Arc<Mutex<Vec<String>>>);
+
+    /// A [`DutyPromptEngine`] reporting `format`, ready to hand to
+    /// `summarize_if_large`, and its capture buffer.
+    fn duty_prompt_engine(format: teton_inference::ChatFormat) -> CapturingDuty {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(DutyPromptEngine {
+            format,
+            seen: Arc::clone(&seen),
+        }));
+        (engine, seen)
+    }
+
+    impl Engine for DutyPromptEngine {
+        fn model_id(&self) -> &str {
+            "duty-prompt"
+        }
+        fn complete(
+            &self,
+            prompt: &str,
+            _params: &GenParams,
+            _on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<teton_inference::Completion, teton_inference::EngineError> {
+            self.seen
+                .lock()
+                .expect("seen poisoned")
+                .push(prompt.to_owned());
+            Ok(teton_inference::Completion {
+                text: "SUMMARY".to_owned(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+        fn chat_format(&self) -> teton_inference::ChatFormat {
+            self.format
+        }
+    }
+
+    /// The one prompt `summarize_if_large` handed the capturing engine.
+    fn only_duty_prompt(seen: &Arc<Mutex<Vec<String>>>) -> String {
+        let seen = seen.lock().expect("seen poisoned");
+        assert_eq!(seen.len(), 1, "the duty must issue exactly one completion");
+        seen[0].clone()
+    }
+
+    /// The summarizer prompt as it read before REQ-554 — the untemplated
+    /// instruction plus the window-bounded tool output. Spelled out here rather
+    /// than reused from the production code so a change to that string has to
+    /// be made deliberately in two places (BR-2's "exactly today's behavior").
+    fn flat_duty_prompt(tool: &str, text: &str) -> String {
+        let bounded = truncate_middle(text, SUMMARIZER_INPUT_MAX_BYTES);
+        format!(
+            "Summarize the following `{tool}` tool output in a few lines, preserving \
+             file paths, symbol names, and any errors. Output only the summary.\n\n{bounded}"
+        )
+    }
+
+    #[tokio::test]
+    async fn a_chatml_engine_gets_a_template_wrapped_duty_prompt() {
+        // REQ-554 BR-7: the summarizer is a duty, not an agent turn, but it runs
+        // on the same instruct model — so it gets the same template. Leaving it
+        // flat would put the one call whose output feeds straight back into
+        // context on the degraded format.
+        let (engine, seen) = duty_prompt_engine(teton_inference::ChatFormat::ChatMl);
+        let big = "word ".repeat(2_000);
+
+        let out = summarize_if_large(&engine, "read", &big, 50).await;
+
+        assert!(out.text.contains("SUMMARY"));
+        assert!(out.engine_error.is_none());
+        let prompt = only_duty_prompt(&seen);
+        assert!(
+            prompt.starts_with("<|im_start|>user\nSummarize the following `read` tool output"),
+            "duty prompt was not opened as a ChatML user message: {}",
+            &prompt[..prompt.len().min(80)]
+        );
+        assert!(
+            prompt.ends_with("<|im_end|>\n<|im_start|>assistant\n"),
+            "duty prompt does not close the user turn and hand the model the floor"
+        );
+        // The instruction itself is untouched inside the wrapper — templating
+        // changes the framing, never the duty.
+        assert!(prompt.contains("Output only the summary."));
+    }
+
+    #[tokio::test]
+    async fn a_flat_engine_gets_todays_exact_duty_prompt() {
+        // BR-2: the fallback preserves current behavior *exactly*. Asserted as
+        // byte equality against the instruction the pre-REQ-554 code built, not
+        // as "contains" — a stray wrapper would pass a looser check.
+        let (engine, seen) = duty_prompt_engine(teton_inference::ChatFormat::Flat);
+        let big = "word ".repeat(2_000);
+
+        let out = summarize_if_large(&engine, "read", &big, 50).await;
+
+        assert!(out.text.contains("SUMMARY"));
+        assert_eq!(only_duty_prompt(&seen), flat_duty_prompt("read", &big));
+    }
+
+    #[tokio::test]
+    async fn the_default_engine_format_leaves_the_duty_prompt_flat() {
+        // AC-7: a test double inherits `ChatFormat::Flat` from the trait default
+        // and therefore takes the untemplated path with no edit of its own.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(PromptLenEngine {
+            seen: Arc::clone(&seen),
+        }));
+        let big = "word ".repeat(2_000);
+
+        let _ = summarize_if_large(&engine, "read", &big, 50).await;
+
+        let seen = seen.lock().expect("seen poisoned");
+        assert_eq!(seen.len(), 1);
+        // `PromptLenEngine` keeps only the length, which is enough here: a
+        // ChatML wrapping cannot be byte-neutral, so an unwrapped length is
+        // proof the default took the flat path.
+        assert_eq!(seen[0], flat_duty_prompt("read", &big).len());
     }
 
     #[tokio::test]
