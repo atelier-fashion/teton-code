@@ -25,7 +25,8 @@
 #           nothing, and it packs only what a build phase left behind: a
 #           missing, incomplete or ALTERED staging directory is a hard 70, so a
 #           `pack` that followed no `build` can never emit a tarball (the
-#           cross-boundary half of BR-2).
+#           cross-boundary half of BR-2). It signs COPIES, never the stage —
+#           see pack_phase.
 #   all     `build` then `pack`, in one process — ON THE SUCCESS PATH, byte for
 #           byte what this script printed and produced before the phase
 #           argument existed. That equivalence is about a run that works: the
@@ -40,24 +41,45 @@
 # it replaces could not survive the one boundary it now has to cross. `build`
 # creates it FRESH BEFORE IT COMPILES (see build_phase: the clear is a
 # precondition, not tidying-up), and a successful `pack` CONSUMES it, which is
-# why `all` still leaves nothing behind. A FAILED pack leaves it in place on
-# purpose: the bytes are already compiled, the failure is a signing problem to
-# fix and re-`pack`, and there is no tarball or sha256 for a leftover directory
-# to be mistaken for. The price of a deterministic name is that two packages of
-# the SAME target into the SAME outdir must not run at once — the release runs
-# one leg per target per runner, and a human would have to arrange that
-# collision on purpose.
+# why `all` still leaves nothing behind. The price of a deterministic name is
+# that two packages of the SAME target into the SAME outdir must not run at
+# once — the release runs one leg per target per runner, and a human would have
+# to arrange that collision on purpose.
 #
-# What crosses that boundary is a directory on disk, and a directory on disk is
-# not self-authenticating: between the two invocations sits a step that imports
-# a Developer ID private key, and after it anything that can write to `<outdir>`
-# can choose what gets signed. So `build` records what it staged in
-# `<stage>/.stage-meta` — the version it was building and a sha256 per member —
-# and `pack` re-hashes every member and refuses the lot on any mismatch, BEFORE
-# it signs. The bytes that get a release signature are then the bytes the build
-# produced, or nothing is signed at all. `.stage-meta` is the handoff's own
-# bookkeeping and never ships: the tarball's members are listed explicitly, and
-# that list is exactly the four the build staged.
+# A FAILED pack leaves the stage EXACTLY AS THE BUILD LEFT IT, and that is a
+# property of how pack is written rather than a hope about where it died:
+# `pack` never writes into the staging directory at all. It copies the two
+# binaries to a scratch directory, signs and verifies THOSE, and tars the
+# scratch pair beside the stage's LICENSE and README.md. So every pack failure
+# — the signing tool missing, `--sign` refusing, `--verify` rejecting, the
+# tarball unhashable — leaves four members whose digests still match
+# `.stage-meta`, which is what makes "fix the identity and re-`pack`" a real
+# recovery instead of a suggestion. (Before the scratch copy existed, a
+# codesign that modified the file and then failed its own verify left a stage
+# that the next pack's manifest check would refuse — the retry the runbook
+# promised could not work.) There is no tarball or sha256 for a leftover
+# directory to be mistaken for.
+#
+# What crosses that boundary is a directory on disk, so `build` records what it
+# staged in `<stage>/.stage-meta` — the version it was building and a sha256 per
+# member — and `pack` re-hashes every member and refuses the lot on any
+# mismatch, BEFORE it signs.
+#
+# BE PRECISE ABOUT WHAT THAT BUYS, because "the bytes that get signed are the
+# bytes that were built" is a stronger sentence than this file can support.
+# `.stage-meta` is UNAUTHENTICATED: it is an ordinary file inside the directory
+# it describes. It detects a STALE, PARTIAL, VERSION-SKEWED or ACCIDENTALLY
+# ALTERED stage — a build that half-finished, a leftover from another commit, a
+# re-`pack` at the wrong version, a file somebody edited — and those are the
+# failures that actually happen. It does NOT survive an adversary who can write
+# to `<outdir>`: anything that can swap a binary can rewrite the manifest line
+# beside it, and the check passes. That axis is not this file's to close; its
+# control is the build-provenance attestation (ADR-550-3), which records which
+# workflow, at which commit, on which runner produced the published bytes.
+#
+# `.stage-meta` is the handoff's own bookkeeping and never ships: the tarball's
+# members are listed explicitly, and that list is exactly the four the build
+# staged.
 #
 # The build always carries `--features tetond/llama`. The local inference engine
 # is the product this release exists to install: a tarball built without it
@@ -93,18 +115,23 @@
 #   70  EX_SOFTWARE — the build reported success but an expected binary is not
 #       where it should be, signing was asked for and could not be carried out,
 #       or the pack phase found no complete, matching staging directory to pack
-#       (absent, short a member, built for a different version, or altered since
-#       it was built). All are internal inconsistencies rather than compile
-#       errors, and they are worth their own code so none can be read as one.
-#   75  EX_TEMPFAIL — a sha256 could not be computed, because the machine has no
-#       sha256 tool at all: `build` cannot record what it staged, or `pack`
-#       cannot check it, or the finished tarball cannot be hashed. Distinct from
-#       70 for the same reason the rest of tools/release/ separates them
-#       (LESSON-442): "could not run" is not "ran and found a problem". No
-#       shippable-looking artifact survives any of the three — the tarball is
-#       REMOVED before this exit, because a tarball with no recorded hash beside
-#       it is indistinguishable, to everything downstream, from one nobody
-#       hashed on purpose.
+#       (absent, short a member, a member that is a symlink or a directory
+#       rather than a regular file, built for a different version, or altered
+#       since it was built). All are internal inconsistencies rather than
+#       compile errors, and they are worth their own code so none can be read as
+#       one.
+#   75  EX_TEMPFAIL — something this script needs from the machine was not
+#       there. Either a sha256 could not be computed, because the machine has no
+#       sha256 tool at all (`build` cannot record what it staged, `pack` cannot
+#       check it, or the finished tarball cannot be hashed), or `pack` could not
+#       create the scratch directory it signs in. Distinct from 70 for the same
+#       reason the rest of tools/release/ separates them (LESSON-442): "could
+#       not run" is not "ran and found a problem". No shippable-looking artifact
+#       survives any of them — the tarball is REMOVED before this exit, because
+#       a tarball with no recorded hash beside it is indistinguishable, to
+#       everything downstream, from one nobody hashed on purpose; and a `build`
+#       that cannot write its manifest removes the whole half-made stage rather
+#       than leaving an unlabelled one for a later `pack` to find.
 #   *   whatever `cargo build` exited with, propagated unchanged.
 
 set -euo pipefail
@@ -145,16 +172,26 @@ fi
 # There is no way to tell the two intentions apart from here, so the ambiguous
 # one is refused. Anyone who genuinely wants an output directory with one of
 # these three names can say `./pack`.
-case "${3:-}" in
-    all | build | pack)
-        echo "package: '$3' is a PHASE name, and the phase is the fourth argument — the third" >&2
-        echo "         is [outdir]. Taken literally this would write the release into a directory" >&2
-        echo "         named '$3' and then run the default phase 'all', compiling and signing in" >&2
-        echo "         one step. Refusing rather than guessing which you meant." >&2
-        echo "         did you mean: package.sh <target> <version> <outdir> $3" >&2
-        exit "$EXIT_USAGE"
-        ;;
-esac
+#
+# GATED ON `$# -eq 3`, and that gate is the whole of what makes this a refusal
+# of an AMBIGUITY rather than a ban on three directory names. With four
+# arguments there is nothing to disambiguate — the caller has spelled the phase
+# out in the slot the phase lives in — so `package.sh <target> <version> pack
+# pack` is an ordinary pack into a directory called `pack`, and refusing it
+# would be this script declining to do exactly what it was unambiguously asked.
+if [ "$#" -eq 3 ]; then
+    case "$3" in
+        all | build | pack)
+            echo "package: '$3' is a PHASE name, and the phase is the fourth argument — the third" >&2
+            echo "         is [outdir]. Taken literally this would write the release into a directory" >&2
+            echo "         named '$3' and then run the default phase 'all', compiling and signing in" >&2
+            echo "         one step. Refusing rather than guessing which you meant." >&2
+            echo "         did you mean: package.sh <target> <version> <outdir> $3" >&2
+            echo "         (an output directory really named '$3' can be spelled './$3')" >&2
+            exit "$EXIT_USAGE"
+            ;;
+    esac
+fi
 
 target="$1"
 version="${2#v}"
@@ -248,6 +285,15 @@ if [ "$phase" != build ] && [ -n "${TETON_SIGN_IDENTITY:-}" ]; then
         echo "package: signing was requested (TETON_SIGN_IDENTITY is set) but '${TETON_CODESIGN:-codesign}'" >&2
         echo "         is not on this machine. Refusing to build a tarball that would be unsigned" >&2
         echo "         and indistinguishable from a signed one." >&2
+        # Said out loud because the sentence above is otherwise baffling on a
+        # machine that plainly HAS /usr/bin/codesign: an unoverridden tool name
+        # must resolve to an absolute path, so a shell function or alias of the
+        # same name — which `$BASH_ENV` can plant from outside this process —
+        # reads as "no such tool" rather than as the signer.
+        if [ -z "${TETON_CODESIGN:-}" ]; then
+            echo "         (A bare 'codesign' that resolves to a shell function, alias or builtin" >&2
+            echo "         rather than to a file is refused here, deliberately — see lib.sh.)" >&2
+        fi
         exit "$EXIT_INTERNAL"
     fi
 fi
@@ -273,8 +319,28 @@ phase_note() {
     fi
 }
 
+# The scratch directory `pack` signs in, and the trap that removes it.
+#
+# DELIBERATELY NOT `local` to pack_phase. A trap body runs after the function
+# that installed it has returned, when a local is out of scope — and under
+# `set -u` that is an "unbound variable" abort inside the EXIT handler, which is
+# the one piece of this script that must not be able to fail. (It did: every
+# successful pack exited 1 from the trap.) Script scope, initialised empty, and
+# the remover tolerates the empty value so the trap is harmless on the paths
+# that never reach pack_phase.
+scratch=""
+remove_pack_scratch() {
+    if [ -n "$scratch" ]; then
+        rm -rf "$scratch"
+    fi
+    # Unconditionally 0: this runs as the last thing before the script exits,
+    # and a cleanup that could not remove a temp directory must not rewrite the
+    # exit code the phase above it chose.
+    return 0
+}
+
 build_phase() {
-    local bin bin_dir member digest
+    local bin bin_dir member digest meta_tmp
 
     # FIRST, before the compiler runs — the clear is a PRECONDITION of this
     # phase, not tidying-up at the end of it.
@@ -326,17 +392,37 @@ build_phase() {
     # `pack` refuses a stage with no manifest, so an unwritten one only moves
     # the same failure ~30 minutes later, onto a machine that by then has a
     # signing key on it. The build is the cheap place to find out.
-    printf 'version %s\n' "$version" >"$stage/.stage-meta"
+    #
+    # Written to a TEMP NAME and moved into place, so `.stage-meta` either does
+    # not exist or is complete — never a header and two of four digest lines. A
+    # partially written manifest is the one shape `pack` grades wrongly: its
+    # per-member lookup finds no digest for the missing lines and reports the
+    # bytes as ALTERED, which sends whoever reads it hunting for tampering that
+    # never happened. `mv` within one directory is atomic on every filesystem
+    # this runs on.
+    #
+    # And when a digest cannot be computed the WHOLE STAGE goes, not just the
+    # half-written manifest: what would otherwise be left is four plausible
+    # members with no manifest, which is exactly the shape `pack` refuses with
+    # "this stage was not written by this script's build phase" — a true
+    # sentence with a misleading cause. Nothing here is worth keeping; the
+    # binaries are still under target/ and the next build re-stages them.
+    meta_tmp="$stage/.stage-meta.partial"
+    printf 'version %s\n' "$version" >"$meta_tmp"
     for member in teton teton-code LICENSE README.md; do
         if ! digest="$(sha256_of "$stage/$member")"; then
             echo "package: no sha256 tool (shasum, sha256sum, openssl) on PATH, so the staged" >&2
             echo "         build cannot record what it staged. The pack phase verifies that" >&2
             echo "         manifest before it signs anything, and refuses a stage without one —" >&2
             echo "         failing here rather than handing the next phase an unverifiable stage." >&2
+            echo "         The half-made staging directory has been REMOVED: a stage with no" >&2
+            echo "         manifest is one a later pack would refuse for the wrong reason." >&2
+            rm -rf "$stage"
             exit "$EXIT_UNCHECKED"
         fi
-        printf '%s  %s\n' "$digest" "$member" >>"$stage/.stage-meta"
+        printf '%s  %s\n' "$digest" "$member" >>"$meta_tmp"
     done
+    mv "$meta_tmp" "$stage/.stage-meta"
 
     phase_note "staged teton, teton-code, LICENSE and README.md in $stage"
 }
@@ -358,6 +444,51 @@ pack_phase() {
         echo "         tarball — a release that packages nothing must not look like one." >&2
         exit "$EXIT_INTERNAL"
     fi
+
+    # WHAT KIND OF FILE each member is, asked before anything reads, hashes,
+    # signs or tars one. Every later check in this phase takes "these are four
+    # regular files" for granted, and each of them fails differently and wrongly
+    # when it is not:
+    #
+    #   * a SYMLINK passes `-f` and `-x` (both follow it), hashes as whatever it
+    #     points at, and is then either followed out of the staging directory by
+    #     tar or archived as a dangling link — so the bytes that were checked and
+    #     the bytes that ship are two different questions with one answer.
+    #   * a DIRECTORY passes `-x` (directories are searchable), and the first
+    #     thing to notice would be `sha256_of` failing on it — which this script
+    #     spells 75, "no sha256 tool on this machine". That is a masked failure
+    #     with the wrong diagnosis and the wrong exit code: nothing is wrong with
+    #     the machine.
+    #   * anything else that is not a regular file (a fifo, a socket, a device)
+    #     has the same problem from the other end.
+    #
+    # Each is 70 and names itself. A MISSING member deliberately falls through
+    # to the two loops below, which say "missing" in the words their own callers
+    # already read.
+    for member in teton teton-code LICENSE README.md; do
+        if [ -h "$stage/$member" ]; then
+            echo "package: the staged $member at $stage is a symlink, not a regular file." >&2
+            echo "         The pack phase hashes, signs and ships the members it was handed, and a" >&2
+            echo "         symlink makes those three different files: it is checked as its target," >&2
+            echo "         and archived as a link or as bytes from outside the staging directory." >&2
+            echo "         The build phase copies real files there; this stage is not one it wrote." >&2
+            exit "$EXIT_INTERNAL"
+        fi
+        if [ -d "$stage/$member" ]; then
+            echo "package: the staged $member at $stage is a directory, not a regular file." >&2
+            echo "         Named here rather than left to fail later: a directory is executable and" >&2
+            echo "         readable, so it passes every completeness check below, and the first thing" >&2
+            echo "         to object would be the manifest's hasher — reporting 'no sha256 tool on" >&2
+            echo "         this machine' (75) about a machine that is perfectly fine." >&2
+            exit "$EXIT_INTERNAL"
+        fi
+        if [ -e "$stage/$member" ] && [ ! -f "$stage/$member" ]; then
+            echo "package: the staged $member at $stage exists and is not a regular file." >&2
+            echo "         The pack phase ships four regular files. A fifo, a socket or a device node" >&2
+            echo "         at one of those names is not something to hash, sign or archive." >&2
+            exit "$EXIT_INTERNAL"
+        fi
+    done
 
     # By -x rather than -e: a staged file that cannot be executed is not a
     # binary anybody can run out of the tarball.
@@ -383,14 +514,30 @@ pack_phase() {
         fi
     done
 
-    # The staging directory is COMPLETE, by the two guards above. This is the
+    # The staging directory is COMPLETE, by the guards above. This is the
     # separate question of whether it is the one this build phase left — asked
-    # BEFORE a single byte is signed, because a signature is a claim about
-    # provenance and the whole of what stands between the two phases is a
-    # directory anything on the runner can write to. Between `build` and here
-    # sits the step that imports a Developer ID private key; a stage swapped
-    # after it would be signed with a real identity and be indistinguishable
-    # from a release for the rest of its life.
+    # BEFORE a single byte is signed, because the whole of what stands between
+    # the two phases is a directory on disk, and a directory on disk does not
+    # speak for itself.
+    #
+    # WHAT THIS CHECK IS, said at its real strength. `.stage-meta` is an
+    # ACCIDENT DETECTOR, and the accidents are the ones that happen: a stage
+    # left by an earlier run of another commit, a build that died between two
+    # copies, a re-`pack` asked for a different version, a member somebody
+    # edited or replaced while debugging. Any of those reaches this point
+    # looking exactly like a good stage — four executable members — and this is
+    # what makes them stop here instead of inside a signed tarball.
+    #
+    # WHAT IT IS NOT: authentication. The manifest is an ordinary file inside
+    # the directory it describes, written by nothing that can prove it wrote it.
+    # Anything with write access to `<outdir>` can swap a binary AND rewrite its
+    # digest line, and this loop will agree with both. Between `build` and here
+    # sits the step that imports a Developer ID private key, so it would be
+    # convenient to read this as "only the built bytes can get a release
+    # signature" — it is not that, and writing it down as that is how a control
+    # gets trusted for a job it cannot do. The axis this does not cover has its
+    # own control: the build-provenance attestation (ADR-550-3) records which
+    # workflow, at which commit, on which runner produced the published bytes.
     #
     # Three ways it can fail, each named separately, because they are three
     # different accidents with three different fixes.
@@ -439,12 +586,59 @@ pack_phase() {
 
     phase_note "packing the staged build in $stage"
 
-    # The signing phase (ADR-550-1), on the STAGED copies rather than the
-    # originals under target/: the tarball below is assembled from this
-    # directory, so signing here is what makes the shipped bytes the verified
-    # bytes. Signing the build output instead would leave a gap between what was
-    # checked and what was tarred — and, since REQ-551 split the phases, the
-    # build output need not even be on this machine's disk any more.
+    # THE SCRATCH COPY, and the reason the staging directory is read-only to
+    # this phase from here on.
+    #
+    # `codesign` MODIFIES THE FILE IT SIGNS. Signing in place meant that any
+    # failure after the first `--sign` left the stage holding bytes the manifest
+    # above no longer describes — most sharply when `--sign` succeeded and
+    # `--verify --strict` then rejected the result, which is precisely the
+    # failure a re-`pack` is supposed to recover from. The next `pack` would
+    # re-hash a modified `teton`, find a mismatch, and report the staged binary
+    # as ALTERED SINCE THE BUILD: a true statement about the bytes, a false
+    # story about what happened, and a recovery path the runbook promised that
+    # could not work. Half the pair could be signed and half not, and nothing
+    # downstream could tell.
+    #
+    # So the two binaries are copied out, and everything that writes happens to
+    # the copies. What the stage gets from this phase is one `rm -rf` on the
+    # success path (the consume, at the bottom) and nothing else, on any path.
+    # A failed pack therefore leaves four members whose digests still match
+    # `.stage-meta` — the same directory the build wrote, byte for byte — and
+    # re-`pack` genuinely re-runs only the signing.
+    #
+    # 75 rather than 70 when the scratch directory cannot be made: no temp
+    # directory is the machine failing to provide something, not this script
+    # finding an inconsistency (LESSON-442, and sysexits' own reading of
+    # EX_TEMPFAIL). Nothing has been signed and no tarball exists.
+    if ! scratch="$(mktemp -d "${TMPDIR:-/tmp}/teton-pack-$target.XXXXXXXX")" ||
+        [ ! -d "$scratch" ]; then
+        echo "package: could not create a scratch directory under '${TMPDIR:-/tmp}' to sign in." >&2
+        echo "         The pack phase signs COPIES of the staged binaries so that a failure" >&2
+        echo "         cannot leave the staging directory half-signed; with nowhere to put them" >&2
+        echo "         there is nothing to sign. Nothing was signed and no tarball was written." >&2
+        exit "$EXIT_UNCHECKED"
+    fi
+    # Installed AFTER the directory exists. `EXIT` alone, not the signal list:
+    # this script runs under `set -e` and every exit below goes through it.
+    trap remove_pack_scratch EXIT
+
+    for bin in teton teton-code; do
+        if ! cp "$stage/$bin" "$scratch/$bin"; then
+            echo "package: could not copy the staged $bin into $scratch." >&2
+            echo "         Nothing was signed and no tarball was written; the staging directory is" >&2
+            echo "         untouched, so a re-pack is still the whole of the recovery." >&2
+            exit "$EXIT_INTERNAL"
+        fi
+    done
+
+    # The signing phase (ADR-550-1), on the scratch copies of the STAGED
+    # binaries rather than on the originals under target/: the tarball below is
+    # assembled from these exact files, so signing here is what makes the
+    # shipped bytes the verified bytes. Signing the build output instead would
+    # leave a gap between what was checked and what was tarred — and, since
+    # REQ-551 split the phases, the build output need not even be on this
+    # machine's disk any more.
     #
     # Keyed on the identity again, not on `$codesign_tool` being non-empty. The
     # two are equivalent by construction — the check above exits when they are
@@ -462,7 +656,7 @@ pack_phase() {
             # below, and verify-signature.sh in the smoke, still have to accept
             # whatever it produced.
             if ! "$codesign_tool" --force --sign "$TETON_SIGN_IDENTITY" \
-                --timestamp --options runtime "$stage/$bin"; then
+                --timestamp --options runtime "$scratch/$bin"; then
                 echo "package: codesign could not sign $bin with the requested identity." >&2
                 echo "         No tarball is written: a signing-requested build never ships unsigned." >&2
                 exit "$EXIT_INTERNAL"
@@ -475,7 +669,7 @@ pack_phase() {
             # tarball in the smoke; asking it a second way here would be a second
             # opinion free to drift from the gate that actually blocks the
             # release.
-            if ! "$codesign_tool" --verify --strict "$stage/$bin"; then
+            if ! "$codesign_tool" --verify --strict "$scratch/$bin"; then
                 echo "package: $bin was signed but codesign --verify --strict rejected the result." >&2
                 exit "$EXIT_INTERNAL"
             fi
@@ -498,9 +692,19 @@ pack_phase() {
     # user like a checksum they should trust. `checksums.txt` in the release is the
     # thing that speaks to them. THIS LIST IS THE TARBALL'S CONTRACT — adding a name
     # here changes what every installed copy contains.
+    #
+    # TWO `-C`s, one member list. The binaries come from the scratch directory —
+    # they are the copies that were signed and verified above, and the stage's
+    # originals are deliberately not the ones that ship — and the ride-alongs
+    # come from the stage, where nothing ever needed to modify them. The list and
+    # its ORDER are unchanged from when both halves came from one directory;
+    # `-C` applies to the names that follow it, in both bsdtar and GNU tar.
+    #
     # COPYFILE_DISABLE stops macOS's bsdtar from smuggling `._*` AppleDouble xattr
     # members in beside them; it is meaningless, and harmless, on Linux.
-    COPYFILE_DISABLE=1 tar -czf "$tarball" -C "$stage" teton teton-code LICENSE README.md
+    COPYFILE_DISABLE=1 tar -czf "$tarball" \
+        -C "$scratch" teton teton-code \
+        -C "$stage" LICENSE README.md
 
     # A per-leg sidecar, for this job's log and for anyone re-checking one artifact
     # by hand. It is NOT what ends up in the release: `checksums.txt` is recomputed
@@ -515,7 +719,14 @@ pack_phase() {
         echo "         in this script leaves no artifact behind, and an unhashed tarball sitting" >&2
         echo "         in the output directory looks exactly like a finished one to the upload" >&2
         echo "         step, to a human re-running a leg, and to a glob." >&2
-        rm -f "$tarball"
+        # The SIDECAR goes with it. This run never wrote one — that is the next
+        # line, which is not reached — but an earlier run of the same target and
+        # version did, and leaving it is worse than leaving the tarball was: a
+        # `<name>.tar.gz.sha256` with no `<name>.tar.gz` beside it is a hash of
+        # bytes nobody can produce, and if a later run does produce different
+        # bytes it is a hash of the WRONG ones, sitting exactly where a human
+        # checking by hand would look for the right one.
+        rm -f "$tarball" "$tarball.sha256"
         exit "$EXIT_UNCHECKED"
     fi
     printf '%s  %s\n' "$sha" "$(basename "$tarball")" >"$tarball.sha256"

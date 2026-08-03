@@ -140,6 +140,47 @@ merged pipeline finds the difference here instead of deriving it.
   tarball comes out of the staging directory and `tar` failing on a missing one
   would report a file, from outside `package.sh`'s exit taxonomy, rather than
   reporting a phase. Wider than specified, in the direction the rule points.
+- **`package.sh` grew changes the ADRs never described**, listed here so that
+  reconciling the merged script against ADR-551-1 does not require diffing them
+  line by line. All of them arrived in the verify passes (2026-08-03):
+  - **`.stage-meta`**, the handoff manifest (version + a sha256 per member),
+    written atomically via a temp name and removed with the whole half-made
+    stage when a digest cannot be computed. Its framing in the code and the
+    runbook is deliberately narrow: it detects a **stale, partial,
+    version-skewed or accidentally altered** stage, and it is
+    **unauthenticated** — anything that can write `<outdir>` rewrites the
+    manifest too. That axis stays with the provenance attestation
+    (ADR-550-3); the manifest is not a second one.
+  - **The scratch-sign design.** `pack` copies the two binaries to a
+    trap-cleaned scratch directory, signs and verifies *those*, and tars them
+    beside the stage's `LICENSE`/`README.md` — the member list and its order
+    are unchanged. `codesign` rewrites the file it signs, so signing in place
+    made "a failed pack keeps the stage for a cheap retry" false in exactly
+    the case it was written for (`--sign` succeeds, `--verify` rejects): the
+    retry hit the manifest check and was refused as a tampered stage. The
+    stage is now written by `pack` on one path only — the success-path
+    consume.
+  - **Argument refusals**: a fifth argument, and a *three*-argument invocation
+    whose `[outdir]` is a phase name (`package.sh <target> <version> pack` is
+    an `all` into a directory called `pack` — the pre-REQ-551 ordering reached
+    by a typo). Gated on `$# -eq 3`, so a spelled-out fourth argument makes it
+    an ordinary pack into `./pack`.
+  - **Per-member file-type checks** in the pack guard: symlink, directory, and
+    anything else that is not a regular file, each `70` naming itself. Without
+    them a directory member surfaces as `75` "no sha256 tool on this machine",
+    which is the wrong code and the wrong diagnosis.
+  - **`lib.sh`'s `tool_or_unchecked`** rejects a non-absolute resolution when
+    no override was given: an exported shell function planted through
+    `$BASH_ENV` resolves as a bare name, and would otherwise *be* the signer.
+- **The three identity-touching workflow steps carry an environment preamble**
+  that no ADR describes (import, sign-and-package, early destroy): `BASH_ENV`/
+  `ENV`/`CDPATH` unset, the tools' shell functions unset, `PATH` pinned to the
+  system directories, and `security` invoked absolutely. The reorder put those
+  steps *downstream* of untrusted compilation while `$GITHUB_ENV`/
+  `$GITHUB_PATH` are applied between steps. Recorded with its limit: this
+  closes the in-band channels only — a persistent background process from the
+  build is runner-level compromise, which OQ-1 (split jobs) is the recorded
+  answer to and this REQ does not claim to address.
 
 ## External Dependencies
 

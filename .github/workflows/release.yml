@@ -405,6 +405,55 @@ jobs:
           # a `: ` that bare YAML would read as a second mapping key.
           TETON_SIGN_IDENTITY: "${{ format('Developer ID Application: Atelier Fashion LLC ({0})', vars.APPLE_TEAM_ID) }}"
         run: |
+          # THE PREAMBLE, and it is here because of where this step now sits.
+          #
+          # REQ-551 moved the identity import BELOW the compile, which is the
+          # whole point — but it also put this step DOWNSTREAM OF UNTRUSTED
+          # CODE. Every third-party crate's build script and the whole of
+          # llama.cpp's cmake ran as this user before this line, and the runner
+          # applies `$GITHUB_ENV` and `$GITHUB_PATH` BETWEEN steps: anything
+          # they appended is already in this step's environment and already
+          # ahead of the system directories on PATH. This is the step that holds
+          # the raw certificate and its password, so the in-band channels are
+          # closed before anything sensitive runs:
+          #
+          #   * BASH_ENV/ENV/CDPATH are unset. Bash sources `$BASH_ENV` before a
+          #     non-interactive script's first line, so a build script that
+          #     wrote BASH_ENV to $GITHUB_ENV gets its file sourced ahead of this
+          #     body — HONESTLY: that sourcing has ALREADY HAPPENED by the time
+          #     this line runs, and cannot be prevented from inside the script it
+          #     precedes. What it plants is what these lines neutralise: the
+          #     variable is unset so nothing further sources it, the functions it
+          #     may have defined are removed, and the absolute paths below do not
+          #     consult PATH or the function table at all. CDPATH goes because it
+          #     silently changes where a `cd` lands.
+          #   * the shell FUNCTIONS that could shadow the tools this step runs
+          #     are removed. `export -f security` is a real thing an earlier step
+          #     can arrange, and a function beats both PATH and a builtin.
+          #   * PATH is REPLACED, not prepended. This step runs mktemp, base64,
+          #     uuidgen, security, sed, tr and rm — every one of them in
+          #     /usr/bin or /bin — so it needs nothing the runner image adds, and
+          #     prepending would leave the inherited entries reachable for
+          #     anything spelled without a path.
+          #
+          # Every invocation below is ABSOLUTE anyway. The unsets and the PATH
+          # are defence in depth; `/usr/bin/security` is the thing that cannot be
+          # redirected by a function, an alias or a PATH entry at all.
+          #
+          # WHAT THIS DOES NOT CLOSE, so the paragraph above is not read as more
+          # than it is: a PERSISTENT BACKGROUND PROCESS started during the build
+          # — one that outlives its step and is still running while the key is on
+          # the machine — is runner-level compromise, and no preamble inside a
+          # `run:` body addresses it. That is out of this REQ's threat model and
+          # named in the spec as OQ-1: splitting build and sign into separate
+          # JOBS is the fix for it, and it is recorded as future hardening rather
+          # than pretended away here. Byte integrity is a third axis with a third
+          # control — the build-provenance attestation (AC-2 / ADR-550-3) — and
+          # nothing in this step substitutes for it.
+          unset BASH_ENV ENV CDPATH || true
+          unset -f security base64 uuidgen mktemp codesign tar shasum sed tr rm 2>/dev/null || true
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
           # `set +e` EXPLICITLY, not merely "no set -e". GitHub's default shell
           # for a `run:` block is `bash -e {0}`, so errexit is already on when
           # this script starts, and under it an unchecked failure aborts the
@@ -432,13 +481,13 @@ jobs:
           # may reuse. 75, not 65: an unwritable $GITHUB_ENV says nothing
           # whatsoever about the certificate.
           keychain="$RUNNER_TEMP/teton-signing-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.keychain-db"
-          p12="$(mktemp "$RUNNER_TEMP/teton-signing-cert.XXXXXXXX")"
+          p12="$(/usr/bin/mktemp "$RUNNER_TEMP/teton-signing-cert.XXXXXXXX")"
           if ! {
             echo "TETON_SIGNING_KEYCHAIN=$keychain"
             echo "TETON_SIGNING_P12=$p12"
           } >>"$GITHUB_ENV"; then
             echo "::error title=Signing workspace UNCHECKED (BR-2)::Could not write the keychain and certificate paths to \$GITHUB_ENV ('$GITHUB_ENV'), so the 'if: always()' cleanup step would not know what to destroy. Refusing to import a Developer ID private key that nothing is guaranteed to clean up. This is a runner fault and says nothing about MACOS_CERT_P12. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
-            rm -f "$p12"
+            /bin/rm -f "$p12"
             exit 75
           fi
 
@@ -491,14 +540,14 @@ jobs:
           # fails leaves this empty and execution continues, so the check is
           # what turns that into a named 75 instead of a keychain with no
           # password.
-          keychain_pw="$(uuidgen)"
+          keychain_pw="$(/usr/bin/uuidgen)"
           if [ -z "$keychain_pw" ]; then
             echo "::error title=Signing keychain UNCHECKED (BR-2)::uuidgen produced no password for the throwaway keychain. Refusing to fall back to a fixed one — an empty or predictable keychain password on a shared runner image is not a thing this pipeline creates. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
           echo "::add-mask::$keychain_pw"
 
-          if ! printf '%s' "$MACOS_CERT_P12" | base64 --decode >"$p12"; then
+          if ! printf '%s' "$MACOS_CERT_P12" | /usr/bin/base64 --decode >"$p12"; then
             echo "::error title=Signing certificate UNREADABLE (BR-2)::MACOS_CERT_P12 is not decodable base64, so no .p12 was produced and no identity was imported. Re-encode the certificate with 'base64 -i cert.p12' and update the secret. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
@@ -512,8 +561,8 @@ jobs:
           # which command failed but never which STAGE — and "the keychain
           # could not be created" and "the certificate would not import" are
           # different problems with different fixes.
-          if ! security create-keychain -p "$keychain_pw" "$keychain"; then
-            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security create-keychain' failed, so there is nowhere to import the identity. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
+          if ! /usr/bin/security create-keychain -p "$keychain_pw" "$keychain"; then
+            echo "::error title=Signing keychain UNCHECKED (BR-2)::'/usr/bin/security create-keychain' failed, so there is nowhere to import the identity. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -525,13 +574,13 @@ jobs:
           # setting stays anyway: a keychain that relocks for any reason at all
           # — a queued step, a slow runner, a re-run — fails codesign with a
           # message about the certificate whose real cause is a clock.
-          if ! security set-keychain-settings "$keychain"; then
-            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security set-keychain-settings' failed, so the keychain may auto-lock before the signing step and codesign would fail for a reason that has nothing to do with the certificate. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
+          if ! /usr/bin/security set-keychain-settings "$keychain"; then
+            echo "::error title=Signing keychain UNCHECKED (BR-2)::'/usr/bin/security set-keychain-settings' failed, so the keychain may auto-lock before the signing step and codesign would fail for a reason that has nothing to do with the certificate. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
-          if ! security unlock-keychain -p "$keychain_pw" "$keychain"; then
-            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security unlock-keychain' failed on the keychain this step just created. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
+          if ! /usr/bin/security unlock-keychain -p "$keychain_pw" "$keychain"; then
+            echo "::error title=Signing keychain UNCHECKED (BR-2)::'/usr/bin/security unlock-keychain' failed on the keychain this step just created. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -539,9 +588,9 @@ jobs:
           # temp file with no extension; -T /usr/bin/codesign is what allows
           # package.sh's codesign to use the key without a UI prompt that no
           # runner can answer.
-          if ! security import "$p12" -k "$keychain" -f pkcs12 \
+          if ! /usr/bin/security import "$p12" -k "$keychain" -f pkcs12 \
               -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign; then
-            echo "::error title=Signing certificate would not import (BR-2)::'security import' rejected the decoded MACOS_CERT_P12 — most often a wrong MACOS_CERT_PASSWORD, or a .p12 exported without its private key. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
+            echo "::error title=Signing certificate would not import (BR-2)::'/usr/bin/security import' rejected the decoded MACOS_CERT_P12 — most often a wrong MACOS_CERT_PASSWORD, or a .p12 exported without its private key. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -615,15 +664,15 @@ jobs:
           # package" runs after this step. The verify pass then added the early
           # destroy, which is what makes "the window covers only first-party
           # signing code" (BR-1) literally true rather than nearly true.
-          rm -f "$p12"
+          /bin/rm -f "$p12"
 
           # Without this, macOS prompts for keychain access the first time
           # codesign touches the key. There is no one at the runner to click
           # "Always Allow", so the build step would hang until the job timed
           # out rather than fail.
-          if ! security set-key-partition-list -S apple-tool:,apple: \
+          if ! /usr/bin/security set-key-partition-list -S apple-tool:,apple: \
               -s -k "$keychain_pw" "$keychain" >/dev/null; then
-            echo "::error title=Signing key is not usable without a prompt (BR-2)::'security set-key-partition-list' failed, so codesign would block on a keychain-access dialog that nothing on this runner can dismiss. Failing now rather than hanging until the job timeout. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
+            echo "::error title=Signing key is not usable without a prompt (BR-2)::'/usr/bin/security set-key-partition-list' failed, so codesign would block on a keychain-access dialog that nothing on this runner can dismiss. Failing now rather than hanging until the job timeout. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -653,14 +702,14 @@ jobs:
           # back to login.keychain and says so, which is strictly the old
           # behaviour. Failing the build over a bookkeeping read would be worse
           # than the thing it bookkeeps.
-          prior_keychains="$(security list-keychains -d user \
-            | sed -e 's/^[[:space:]]*//' -e 's/"//g' | tr '\n' ' ')"
+          prior_keychains="$(/usr/bin/security list-keychains -d user \
+            | /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/"//g' | /usr/bin/tr '\n' ' ')"
           echo "TETON_PRIOR_KEYCHAINS=$prior_keychains" >>"$GITHUB_ENV"
 
           # login.keychain stays in the search list: removing it is how the
           # rest of the runner's tooling starts failing to find its own certs.
-          if ! security list-keychains -d user -s "$keychain" login.keychain; then
-            echo "::error title=Signing keychain UNCHECKED (BR-2)::'security list-keychains' failed, so the imported identity is not on the search path codesign consults. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
+          if ! /usr/bin/security list-keychains -d user -s "$keychain" login.keychain; then
+            echo "::error title=Signing keychain UNCHECKED (BR-2)::'/usr/bin/security list-keychains' failed, so the imported identity is not on the search path codesign consults. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -715,11 +764,11 @@ jobs:
           # that was READ SUCCESSFULLY and came back non-empty can support the
           # 65 below.
           fi_status=0
-          identities="$(security find-identity -v -p codesigning "$keychain" 2>&1)" \
+          identities="$(/usr/bin/security find-identity -v -p codesigning "$keychain" 2>&1)" \
             || fi_status=$?
           printf '%s\n' "$identities"
           if [ "$fi_status" -ne 0 ] || [ -z "$identities" ]; then
-            echo "::error title=Signing identity UNCHECKED (BR-2)::'security find-identity -v -p codesigning' exited $fi_status and/or printed nothing, so the keychain's contents could not be READ. Nothing was learned about MACOS_CERT_P12 — this is a tool failure on the runner, deliberately NOT reported as a wrong certificate. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
+            echo "::error title=Signing identity UNCHECKED (BR-2)::'/usr/bin/security find-identity -v -p codesigning' exited $fi_status and/or printed nothing, so the keychain's contents could not be READ. Nothing was learned about MACOS_CERT_P12 — this is a tool failure on the runner, deliberately NOT reported as a wrong certificate. The build already finished — this fails the leg before anything is signed, and the binaries it produced are discarded with the job."
             exit 75
           fi
 
@@ -771,21 +820,46 @@ jobs:
           # $GITHUB_ENV and $GITHUB_PATH, and the runner applies both BETWEEN
           # steps — so whatever it wrote is already in this step's environment
           # and already ahead of the system directories on PATH by the time
-          # this line runs. Two lines close that:
+          # this line runs. These lines close the IN-BAND channels:
           #
           #   * the tool seams are unset, so package.sh cannot be pointed at
           #     someone else's `codesign` by an inherited TETON_CODESIGN, and
           #     its own in-CI refusal of that seam cannot be waved through by
           #     an inherited TETON_ALLOW_TOOL_SEAM;
+          #   * BASH_ENV/ENV/CDPATH go too. Bash sources `$BASH_ENV` before a
+          #     non-interactive script's first line, so an inherited one is read
+          #     ahead of this body AND ahead of `bash tools/release/package.sh`
+          #     below. Unsetting it here is what keeps package.sh from being
+          #     handed a pre-populated shell; what it may already have planted
+          #     into THIS shell is handled by the line under it.
+          #   * the shell FUNCTIONS that could shadow the tools this step's work
+          #     depends on are removed — a function beats PATH and beats a
+          #     builtin, and `export -f codesign` is something an earlier step
+          #     can arrange.
           #   * the system directories go FIRST on PATH, so codesign, tar and
           #     shasum resolve to /usr/bin regardless of what was prepended.
           #
           # LESSON-460's family: a guard that ambient environment can defeat is
           # not a guard. package.sh's seam refusal is the guard; this is what
           # keeps its inputs from being chosen by the step it is guarding
-          # against. $PATH is extended rather than replaced because this step
-          # still needs the runner's own toolchain entries behind them.
-          unset TETON_CODESIGN TETON_ALLOW_TOOL_SEAM
+          # against. (lib.sh's `tool_or_unchecked` carries the matching half:
+          # an unoverridden tool name must resolve to an ABSOLUTE PATH, so a
+          # surviving function or alias reads as "no such tool" rather than as
+          # the signer.) $PATH is extended rather than replaced because this
+          # step still needs the runner's own toolchain entries behind them.
+          #
+          # BE HONEST ABOUT THE RESIDUAL. This closes the channels that run
+          # THROUGH this step's environment. It does not close a PERSISTENT
+          # BACKGROUND PROCESS started during the build and still running while
+          # the key is on the machine — that is runner-level compromise, it is
+          # outside this REQ's threat model, and the spec records the fix as
+          # OQ-1 (split build and sign into separate JOBS) rather than
+          # pretending a `run:` preamble reaches it. Nor does it say anything
+          # about the BYTES: what "Build (unsigned)" staged is what gets signed,
+          # and the control on that axis is the build-provenance attestation
+          # (AC-2 / ADR-550-3), not these lines.
+          unset TETON_CODESIGN TETON_ALLOW_TOOL_SEAM BASH_ENV ENV CDPATH
+          unset -f codesign tar shasum security 2>/dev/null || true
           export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
           bash tools/release/package.sh "$TARGET" "$VERSION" dist pack
@@ -820,6 +894,19 @@ jobs:
       - name: Destroy the signing keychain (early)
         if: contains(matrix.target, 'apple-darwin')
         run: |
+          # The same preamble the import step carries, for the same reason and
+          # with the same honest limit: this step runs downstream of the
+          # compile, `$GITHUB_ENV`/`$GITHUB_PATH` are applied between steps, and
+          # a `security` that resolves to an inherited shell function would make
+          # this step REPORT a destroyed keychain without destroying one — which
+          # is worse than not running it, because the notice at the bottom is
+          # what BR-1's claim rests on. Everything below runs from /usr/bin.
+          # (A persistent background process from the build is runner-level
+          # compromise and out of scope here too — spec OQ-1.)
+          unset BASH_ENV ENV CDPATH || true
+          unset -f security rm 2>/dev/null || true
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
           set -uo pipefail
 
           # Both may be unset — the import step publishes them before it
@@ -832,14 +919,30 @@ jobs:
           # existing: a guard that switches itself off when its input looks
           # absent is LESSON-443's shape, and a skip here would leave the
           # identity alive through the smoke while this step reported success.
-          # `-e` grades the OUTCOME instead of deciding whether to try.
+          #
+          # GRADED ON THE POST-CONDITION, not on the tool's exit status. What
+          # BR-1 needs is the keychain GONE; `security delete-keychain` exiting
+          # 0 is evidence for that and not the thing itself, and a delete that
+          # returns success while the file is still on disk (a keychain held
+          # open elsewhere, a locked volume) would otherwise be reported as a
+          # closed window that is still open. `$destroyed` is set from `[ ! -e ]`
+          # and from nothing else, and it is what decides whether the closing
+          # notice may be printed at all — one step must not emit a warning
+          # saying the identity may have survived AND a notice saying it did
+          # not.
+          destroyed=0
           if [ -n "$keychain" ]; then
-            if security delete-keychain "$keychain"; then
+            delete_status=0
+            /usr/bin/security delete-keychain "$keychain" || delete_status=$?
+
+            if [ -e "$keychain" ]; then
+              echo "::warning title=Signing keychain not destroyed early::'security delete-keychain $keychain' exited $delete_status and the file is STILL ON DISK, so the identity may outlive this step and the narrowed window is wider than this step claims. The 'if: always()' cleanup at the end of this job tries again. Warned rather than failed: the bytes are already signed and stopping the leg here would not remove anything."
+            elif [ "$delete_status" -eq 0 ]; then
               echo "deleted keychain: $keychain"
-            elif [ -e "$keychain" ]; then
-              echo "::warning title=Signing keychain not destroyed early::'security delete-keychain $keychain' did not succeed and the file is still on disk, so the identity may outlive this step and the narrowed window is wider than it claims. The 'if: always()' cleanup at the end of this job tries again. Warned rather than failed: the bytes are already signed and stopping the leg here would not remove anything."
+              destroyed=1
             else
-              echo "::notice title=No signing keychain to delete::'security delete-keychain $keychain' did not succeed and nothing is at that path — either it was never created or it is already gone."
+              echo "::notice title=No signing keychain to delete::'security delete-keychain $keychain' exited $delete_status and nothing is at that path — either it was never created or it is already gone."
+              destroyed=1
             fi
           fi
 
@@ -849,7 +952,7 @@ jobs:
           # successful leg reaches, and it should not depend on a removal two
           # steps up having happened.
           if [ -n "$p12" ] && [ -e "$p12" ]; then
-            rm -f "$p12" && echo "removed decoded certificate: $p12"
+            /bin/rm -f "$p12" && echo "removed decoded certificate: $p12"
           fi
 
           # Restore the search list the import step captured before replacing
@@ -866,10 +969,17 @@ jobs:
           # paths that must reach `security` as separate arguments, which is
           # the one thing quoting it would prevent.
           # shellcheck disable=SC2086
-          security list-keychains -d user -s $prior \
+          /usr/bin/security list-keychains -d user -s $prior \
             || echo "::notice title=Keychain search list not restored::'security list-keychains -d user -s $prior' did not succeed. The keychain itself is gone either way; this is noted rather than failed."
 
-          echo "::notice title=Signing key material removed (BR-1)::The signing keychain was destroyed the moment signing finished. Everything after this step — the tarball smoke and the artifact upload — runs with no Developer ID identity on this runner."
+          # CONDITIONAL, and that is the point of grading the delete on its
+          # post-condition above. This notice is what BR-1's "the window closes
+          # here" rests on; printing it beside a warning that the keychain is
+          # still on disk would put two contradictory annotations on one step and
+          # let a reader pick the reassuring one.
+          if [ "$destroyed" -eq 1 ]; then
+            echo "::notice title=Signing key material removed (BR-1)::The signing keychain was destroyed the moment signing finished. Everything after this step — the tarball smoke and the artifact upload — runs with no Developer ID identity on this runner."
+          fi
 
       # The gate that decides whether these bytes ship (BR-7/BR-9): version
       # strings, the release build's refusal of TETON_TEST_SEAMS, and a live
@@ -952,6 +1062,16 @@ jobs:
       - name: Destroy the signing keychain
         if: always() && contains(matrix.target, 'apple-darwin')
         run: |
+          # The same preamble as the import and early-destroy steps. Weakest
+          # case of the three — by the time this runs the key is normally
+          # already gone — but it is the step that covers the FAILURE paths,
+          # which are exactly the runs where an earlier step did something
+          # unexpected, and a `security` shadowed by an inherited shell function
+          # would turn this backstop into a no-op that says it worked.
+          unset BASH_ENV ENV CDPATH || true
+          unset -f security rm 2>/dev/null || true
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
           set -uo pipefail
 
           # Both may be unset: this step also runs when the import step never
@@ -962,7 +1082,7 @@ jobs:
           p12="${TETON_SIGNING_P12:-}"
 
           if [ -n "$keychain" ]; then
-            security delete-keychain "$keychain" \
+            /usr/bin/security delete-keychain "$keychain" \
               && echo "deleted keychain: $keychain" \
               || echo "::notice title=No signing keychain to delete::'security delete-keychain $keychain' did not succeed. Either it was never created (the import step failed early) or it is already gone."
           fi
@@ -974,7 +1094,7 @@ jobs:
           # importing it is exactly where a private key survives, and that is
           # the path with no other cleanup on it.
           if [ -n "$p12" ] && [ -e "$p12" ]; then
-            rm -f "$p12" && echo "removed decoded certificate: $p12"
+            /bin/rm -f "$p12" && echo "removed decoded certificate: $p12"
           fi
 
           # Restore the search list the import step captured before replacing
@@ -998,7 +1118,7 @@ jobs:
           # paths that must reach `security` as separate arguments, which is
           # the one thing quoting it would prevent.
           # shellcheck disable=SC2086
-          security list-keychains -d user -s $prior \
+          /usr/bin/security list-keychains -d user -s $prior \
             || echo "::notice title=Keychain search list not restored::'security list-keychains -d user -s $prior' did not succeed. The job is finished either way; this is noted rather than failed."
 
           echo "::notice title=Signing key material removed::No certificate or keychain from this leg survives the job."
@@ -1171,7 +1291,7 @@ jobs:
             printf -- '- `aarch64-apple-darwin` — built and smoke-tested natively on macOS arm64.\n'
             printf -- '- `x86_64-apple-darwin` — **Rosetta-verified**: cross-compiled on an arm64 runner and smoke-tested under Rosetta 2 (GitHub no longer offers Intel macOS runners). That proves the binary loads and runs its CPU paths; it is not evidence from native Intel hardware.\n'
             printf -- '- `x86_64-unknown-linux-gnu` — built and smoke-tested natively on Linux.\n\n'
-            # BR-6, stated at exactly the strength that is true. The team id is
+            # REQ-550 BR-6, stated at exactly the strength that is true. The team id is
             # a literal here and a variable everywhere else on purpose: this
             # job declares no environment, so `vars.APPLE_TEAM_ID` — which
             # lives on `release-signing` — does not resolve in it, and a notes
@@ -1917,7 +2037,7 @@ jobs:
               ;;
           esac
 
-      # AC-6 and BR-6, end to end: launchd runs the daemon, the CLI handshakes
+      # AC-6 and REQ-548 BR-6, end to end: launchd runs the daemon, the CLI handshakes
       # it without anyone invoking teton-code by hand, restart survives, stop
       # actually stops, and the logs are where brew says logs are.
       #
@@ -1926,7 +2046,7 @@ jobs:
       # probe — so an exit-code assertion would pass against a service that
       # never started, which is precisely what this step exists to catch. Same
       # stance, same reason, as tools/release/smoke.sh.
-      - name: services start · doctor · restart · stop (AC-6 / BR-6)
+      - name: services start · doctor · restart · stop (AC-6 / REQ-548 BR-6)
         if: needs.preflight.outputs.publish == 'true'
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -1992,7 +2112,7 @@ jobs:
               ;;
           esac
 
-          # BR-6: "where are the logs" must have a brew answer. launchd creates
+          # REQ-548 BR-6: "where are the logs" must have a brew answer. launchd creates
           # both redirect targets when it spawns the service, so if the daemon
           # is up and these are not here, the formula's log paths are wrong.
           #

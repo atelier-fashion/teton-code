@@ -91,10 +91,34 @@ The accepted-risk comment near the p12 `rm` and runbook §10's residual
 note flip to "closed by REQ-551". `.adlc/context/architecture.md` ADR-008's
 accepted-risk consequence gets its closing note at wrapup.
 
-Added after this list was written (verify pass, 2026-08-03), so the frozen
-surface is not read as "nothing else was added": the
-`Destroy the signing keychain (early)` step and, in `Sign and package`, an
-`unset TETON_CODESIGN TETON_ALLOW_TOOL_SEAM` plus a system-first `PATH`
-export — the earlier build step can append to `$GITHUB_ENV`/`$GITHUB_PATH`,
-which the runner applies between steps, so the seam guard has to be
-un-defeatable from ambient environment (LESSON-460's family).
+Added after this list was written (verify passes, 2026-08-03), so the frozen
+surface is not read as "nothing else was added".
+
+In `release.yml`: the `Destroy the signing keychain (early)` step, which grades
+its delete on the POST-CONDITION (`[ ! -e ]`) and emits the closing BR-1 notice
+only on a graded success, so one step cannot warn that the identity may have
+survived and announce that it did not. And an environment preamble on all three
+identity-touching steps (import, `Sign and package`, early destroy):
+`unset TETON_CODESIGN TETON_ALLOW_TOOL_SEAM BASH_ENV ENV CDPATH`, `unset -f` for
+the tools each one runs, a system-directory `PATH`, and `security` invoked as
+`/usr/bin/security`. The earlier build step can append to `$GITHUB_ENV`/
+`$GITHUB_PATH`, which the runner applies between steps, so the seam guard has to
+be un-defeatable from ambient environment (LESSON-460's family) — and the
+reorder is what put these steps downstream of that build in the first place.
+Stated at its limit: this closes the IN-BAND channels; a persistent background
+process started during the build is runner-level compromise, out of scope here,
+and OQ-1's split-jobs option is the recorded answer to it.
+
+In `package.sh`/`lib.sh`: the `.stage-meta` handoff manifest (framed as an
+accident detector, explicitly not authentication — see the requirement's
+Deviations), the scratch-sign design that keeps `pack` from ever writing into
+the staging directory, the argument refusals (a fifth argument; a phase name in
+the `[outdir]` slot, gated on `$# -eq 3`), per-member file-type checks, and
+`tool_or_unchecked`'s absolute-path rule for unoverridden tool names. Each is
+enumerated in the requirement's Deviations so the merged scripts need not be
+diffed against these ADRs to find them.
+
+Every one of these controls is asserted by `tools/release/selftest.sh` and
+mutation-proven: the round-2 pass added them and the round-3 pass found the
+suite stayed green with each of them deleted, which is the shape a comment
+claiming to be a guard has (LESSON-443/LESSON-454).

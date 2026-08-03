@@ -166,7 +166,7 @@ and "it could not run" can never be confused (LESSON-442, ADR-548-4):
 | `64` | the check RAN and the inputs are wrong (version mismatch, bad invocation, an unfilled `{{PLACEHOLDER}}`) |
 | `65` | it RAN and FAILED — these bytes are bad |
 | `75` | it could NOT run. Nothing was learned, which is not a pass |
-| `70` | (`package.sh` only) the build reported success but an expected binary is missing — or, since REQ-551, a pack-phase contract failure (missing/stale/tampered staging, signing or verify rejection); §9 lists them |
+| `70` | (`package.sh` only) the build reported success but an expected binary is missing — or, since REQ-551, a pack-phase contract failure (staging that is absent, short a member, version-skewed, altered since the build, or holding a symlink/directory where a regular file belongs; signing or verify rejection); §9 lists them |
 
 ---
 
@@ -562,10 +562,27 @@ failure-path backstop: it covers an import that died halfway, a cancelled job,
 or a signing step that failed before the early destroy could run. On a green leg
 it finds nothing and says so.
 
+Moving the import *below* the build also moved it **downstream of untrusted
+code**, so the three steps that touch the identity (import, sign, early destroy)
+each open with the same preamble: `BASH_ENV`/`ENV`/`CDPATH` unset, the shell
+functions that could shadow their tools removed, `PATH` set to the system
+directories, and every `security` call spelled `/usr/bin/security`. That closes
+the **in-band** channels — a build script can append to `$GITHUB_ENV` and
+`$GITHUB_PATH`, and the runner applies both *between* steps. It does not close a
+**persistent background process** started during the build and still running
+while the key is on the machine: that is runner-level compromise, it is outside
+this REQ's threat model, and the recorded fix is OQ-1 — splitting build and sign
+into separate *jobs* — kept as future hardening rather than pretended away.
+
 What REQ-551 does *not* claim: the build is still untrusted, and it still
 determines the bytes the identity vouches for. Narrowing the key's reach is a
 different axis from trusting the compile — the control on that axis is the
-build-provenance attestation (§5), not this window.
+build-provenance attestation (§5), not this window. `package.sh`'s
+`.stage-meta` manifest is on the same footing: it detects a stale, partial,
+version-skewed or accidentally altered staging directory, which is what actually
+goes wrong, but it is **unauthenticated** — anything that can swap a staged
+binary can rewrite the digest line beside it — so it is an accident detector,
+not a second attestation.
 
 ### Checking a signed release by hand
 
@@ -666,13 +683,19 @@ The list below starts where the identity does:
 - **`package.sh`, exit `70`** — signing was requested and codesign could not
   carry it out, or it signed and then its own `--verify --strict` rejected the
   result. No tarball is written: a signing-requested build never ships unsigned.
-  Recovery does not need a rebuild: the staged binaries are still on the runner
-  (a failed `pack` deliberately leaves `dist/stage-<target>/` in place), and
-  `tools/release/package.sh <target> <version> dist pack` re-runs *only* the
-  signing phase — the phase arguments exist since REQ-551. In CI that means
-  *Re-run failed jobs* recompiles, which is the honest cost of a fresh runner;
-  on a machine where you are reproducing the failure by hand, re-`pack` and skip
-  the 30-minute build.
+  Recovery does not need a rebuild, and that is now literally true rather than
+  nearly true: `pack` signs **copies** of the staged binaries in a scratch
+  directory and never writes into `dist/stage-<target>/` at all, so *any* pack
+  failure leaves the stage exactly as the build left it — four members whose
+  digests still match `.stage-meta`. `tools/release/package.sh <target>
+  <version> dist pack` then re-runs *only* the signing phase (the phase
+  arguments exist since REQ-551). Before the scratch copy, the sharpest case did
+  not recover: `codesign --sign` rewrites the file it signs, so a `--sign` that
+  succeeded followed by a `--verify` that rejected left modified bytes in the
+  stage, and the retry was refused by the manifest check as a *tampered* stage —
+  true about the bytes, wrong about what happened. In CI, *Re-run failed jobs*
+  recompiles, which is the honest cost of a fresh runner; on a machine where you
+  are reproducing the failure by hand, re-`pack` and skip the 30-minute build.
 - **the macOS smoke's signature gate** — `65`, these bytes are not signed the
   way a release must be; `75`, the gate could not run and nothing was learned.
   Both stop the release.
