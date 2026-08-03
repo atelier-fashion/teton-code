@@ -4,7 +4,7 @@ title: "Import the signing identity only after untrusted compilation"
 status: complete
 deployable: true
 created: 2026-08-01
-updated: 2026-08-01
+updated: 2026-08-03
 component: "distribution/release"
 domain: "distribution"
 stack: ["github-actions", "ci", "keychain", "rust"]
@@ -57,29 +57,29 @@ established must survive the restructuring.
 
 ## Business Rules
 
-- [ ] BR-1: No signing credential material (imported identity, unlocked
+- [x] BR-1: No signing credential material (imported identity, unlocked
       keychain, decoded p12) exists on the runner while any third-party
       code (`build.rs`, cmake, or any dependency-supplied process) executes.
       Stated as a property over the whole job, not a step ordering in one
       file (informed by LESSON-455, REQ-550).
-- [ ] BR-2: REQ-550 BR-2 survives unchanged: signing stays keyed on the
+- [x] BR-2: REQ-550 BR-2 survives unchanged: signing stays keyed on the
       explicit request (`TETON_SIGN_IDENTITY`), never on cert/tool presence,
       and a signing-requested run can never produce an unsigned tarball —
       including across the new phase boundary (a build phase that succeeds
       followed by a sign phase that never runs must fail the leg, not ship;
       informed by LESSON-443, LESSON-447).
-- [ ] BR-3: The sign→verify→tar ordering is preserved: the bytes entering
+- [x] BR-3: The sign→verify→tar ordering is preserved: the bytes entering
       the tarball are the bytes `codesign --verify --strict` accepted, with
       no untrusted execution between verify and tar (informed by
       LESSON-445's stage-then-commit shape).
-- [ ] BR-4: `package.sh`'s contract change keeps its selftest coverage:
+- [x] BR-4: `package.sh`'s contract change keeps its selftest coverage:
       every existing signing case (sign-accept, sign-reject, verify-reject,
       tool-missing → 70, unsigned-dev note) keeps passing or has an
       equivalent against the new phase interface, and the known-bad fixtures
       still drive the gates red (informed by LESSON-454, REQ-550 BR-5).
-- [ ] BR-5: The `workflow_dispatch` dry-run path (from `main`, no tag)
+- [x] BR-5: The `workflow_dispatch` dry-run path (from `main`, no tag)
       continues to build, sign, smoke, attest, and verify end-to-end.
-- [ ] BR-6: The new ordering is mechanically asserted, not commented: an
+- [x] BR-6: The new ordering is mechanically asserted, not commented: an
       automated check (selftest case or CI lint) fails if the import step
       precedes the build step in `release.yml`'s job structure — a comment
       claiming the ordering is not a guard (informed by LESSON-443,
@@ -88,7 +88,7 @@ established must survive the restructuring.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: In `release.yml`, the identity-import step executes after the
+- [x] AC-1: In `release.yml`, the identity-import step executes after the
       step that runs `cargo build` (and any other dependency-executing
       step) on both macOS legs; the keychain-open window covers only
       first-party signing/packaging code. Verified by reading the job's
@@ -96,14 +96,14 @@ established must survive the restructuring.
 - [ ] AC-2: A full release (or main-dispatched dry run) goes green
       end-to-end with the restructured job: build → import → sign → verify
       → tar → smoke → attest → verify-attestations.
-- [ ] AC-3: `tools/release/selftest.sh` remains fully green with coverage
+- [x] AC-3: `tools/release/selftest.sh` remains fully green with coverage
       equivalent to REQ-550's final state (257 cases at time of writing),
       including the package.sh phase-contract cases under the new
       interface.
-- [ ] AC-4: A deliberate ordering regression (moving the import step above
+- [x] AC-4: A deliberate ordering regression (moving the import step above
       the build step) makes BR-6's assertion fail — proven once with the
       known-bad mutation and recorded (informed by LESSON-454).
-- [ ] AC-5: shellcheck + actionlint clean; no new secret-interpolation
+- [x] AC-5: shellcheck + actionlint clean; no new secret-interpolation
       into `run:` bodies; the `if: always()` keychain cleanup still covers
       all failure paths of the narrowed window.
 

@@ -333,9 +333,15 @@ tool-override seams that refuse to run in CI (LESSON-460 governs fixture
 fidelity).
 
 **Consequences**: the first signed release triggers each user's last
-Keychain re-prompt. One accepted risk (user sign-off 2026-08-01): the
-unlocked keychain is reachable by third-party build scripts during `cargo
-build` — REQ-551 (import-after-build) is the specced fix. Post-merge human
+Keychain re-prompt. The 2026-08-01 accepted risk (unlocked keychain
+reachable by third-party build scripts during `cargo build`) was CLOSED by
+REQ-551 (2026-08-03): the identity now exists only for import → sign →
+early-destroy, every credential step scrubs the forward-flowing environment
+channels (BASH_ENV, exported functions, PATH — LESSON-463) and uses absolute
+tool paths, and all of it is self-asserted by in-suite workflow mutants
+(selftest 407 cases; LESSON-464). Residual: a persistent background process
+planted during the build is runner-level compromise, out of threat model —
+job isolation is the future fix if it ever enters scope. Post-merge human
 steps live in docs/release-runbook.md §11 (one green release, then delete
 the repo-level tap token, then the negative probe). AC-6 (grant survival)
 is first observable at the second signed release.

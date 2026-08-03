@@ -2,15 +2,18 @@
   "req": "REQ-551",
   "branch": "feat/REQ-551-import-signing-identity-after-build",
   "startedAt": "2026-08-01T14:00:00Z",
-  "completed": false,
-  "currentPhase": 6,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -42,6 +45,21 @@
       "phase": 5,
       "name": "Verify: 6 agents -> 1 process Critical (unpushed branch; pushed) + 5 Major + ~18 minor; fix pass (early keychain destroy per reflector Q1, env scrub, stage integrity); Step-D re-verify found round-2's own Critical (unscrubbed import step downstream of untrusted build, BASH_ENV/function-shadowing \u2014 empirically proven) + High/Medium -> round-3 hardening (absolute tools, scratch-sign recovery, all controls self-asserted); selftest 323->407; closure proven via the reports' own attack recipes, re-run first-hand",
       "completedAt": "2026-08-03T18:00:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "PR #16 body set (footprint preserved), [WIP] dropped, flipped ready; requirement complete",
+      "completedAt": "2026-08-03T14:05:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "CI green on final head (6 checks); MERGEABLE CLEAN; mergeable polled alongside checks per LESSON-461",
+      "completedAt": "2026-08-03T14:12:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "PR #16 squash-merged (4c72328); worktree+branches torn down; LESSON-463/464 logged; ADR-008 accepted-risk closed; AC-2 staged for post-merge dry run",
+      "completedAt": "2026-08-03T14:25:00Z"
     }
   ],
   "integrationBranch": "main",
@@ -54,7 +72,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/16",
       "prNumber": 16,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
