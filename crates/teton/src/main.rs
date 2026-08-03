@@ -31,6 +31,7 @@ mod keychain;
 mod model_ui;
 mod prompt;
 mod render;
+mod service;
 mod session_ui;
 mod uninstall;
 
@@ -309,7 +310,10 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool) -> anyhow::Result<()> {
         );
     }
 
-    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    // The session path may first offer to register the launchd service (the
+    // install-side mirror of `teton uninstall`); every subcommand keeps the
+    // plain autostart.
+    let mut conn = client::ensure_connected_session(paths, &mut surface, &mut prompter)?;
 
     {
         let mut ctx = UiContext {

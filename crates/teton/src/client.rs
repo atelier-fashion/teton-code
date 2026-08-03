@@ -431,13 +431,9 @@ pub fn ensure_connected(
     surface.line(LineKind::Info, "no daemon reachable — starting teton-code…");
     spawn_daemon(&paths.log)?;
 
-    for _ in 0..POLL_ATTEMPTS {
-        thread::sleep(POLL_INTERVAL);
-        if let Ok(mut conn) = Connection::connect(&paths.socket) {
-            conn.handshake()?;
-            surface.line(LineKind::Info, "daemon started.");
-            return Ok(conn);
-        }
+    if let Some(conn) = poll_for_daemon(paths)? {
+        surface.line(LineKind::Info, "daemon started.");
+        return Ok(conn);
     }
     // H-1 (E-4): the daemon we just spawned had no terminal, so whatever it said
     // on the way down went to its log and nowhere else. The commonest cause by
@@ -455,6 +451,56 @@ pub fn ensure_connected(
             paths.log.display()
         ),
     }
+}
+
+/// The interactive-session variant of [`ensure_connected`]: before falling
+/// back to a direct (unmanaged) spawn, give a brew-installed `teton` the
+/// chance to register the launchd service instead — the consent-first absorb
+/// of `brew services start teton` (see [`crate::service`]). Every gate that
+/// makes the offer inapplicable (non-macOS, piped stdin, dev build, recorded
+/// decline) falls straight through to the plain path, byte-identical.
+pub fn ensure_connected_session(
+    paths: &DaemonPaths,
+    surface: &mut dyn Surface,
+    prompter: &mut dyn Prompter,
+) -> anyhow::Result<Connection> {
+    if let Ok(mut conn) = Connection::connect(&paths.socket) {
+        conn.handshake()?;
+        return Ok(conn);
+    }
+    if crate::service::offer_registration(paths, surface, prompter) {
+        if let Some(conn) = poll_for_daemon(paths)? {
+            surface.line(
+                LineKind::Info,
+                "daemon registered with launchd and started — it will survive reboots.",
+            );
+            return Ok(conn);
+        }
+        // launchd accepted the service but no socket appeared in time. The
+        // direct path below spawns its own daemon (a second instance exits 0
+        // with "already running", so a slow service start races harmlessly)
+        // and owns the log-quoting diagnostics for a daemon that dies on boot.
+        surface.line(
+            LineKind::Notice,
+            "the service was registered but the daemon has not answered yet — trying a direct \
+             start.",
+        );
+    }
+    ensure_connected(paths, surface)
+}
+
+/// Poll the socket until a daemon answers the handshake, or give up after
+/// [`POLL_ATTEMPTS`]. `Ok(None)` is "nobody came up", not an error — the
+/// caller owns the diagnostics for its own start path.
+fn poll_for_daemon(paths: &DaemonPaths) -> anyhow::Result<Option<Connection>> {
+    for _ in 0..POLL_ATTEMPTS {
+        thread::sleep(POLL_INTERVAL);
+        if let Ok(mut conn) = Connection::connect(&paths.socket) {
+            conn.handshake()?;
+            return Ok(Some(conn));
+        }
+    }
+    Ok(None)
 }
 
 /// How many bytes of the daemon log to quote back on an autostart failure.
