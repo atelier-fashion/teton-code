@@ -3,15 +3,21 @@
   "branch": "feat/REQ-554-local-native-chat-template",
   "startedAt": "2026-08-03T21:42:55Z",
   "completed": false,
-  "currentPhase": 1,
+  "currentPhase": 2,
   "completedPhases": [
-    0
+    0,
+    1
   ],
   "phaseHistory": [
     {
       "phase": 0,
       "name": "Resolve Repos + Worktrees + Preflight",
       "completedAt": "2026-08-03T21:43:11Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-03T21:43:26Z"
     }
   ],
   "integrationBranch": "main",
