@@ -1,7 +1,7 @@
 ---
 id: BUG-147
 title: "Agent session unusable: tools jailed to /, hallucinated tool results streamed raw, dropped calls loop"
-status: open
+status: resolved
 severity: critical
 created: 2026-08-03
 updated: 2026-08-03
@@ -133,3 +133,9 @@ Four interlocking fixes, one per root cause:
 - `crates/tetond/src/harness/context.rs`, `harness/mod.rs`,
   `tests/offline_session.rs`, `tests/nonblocking_inference.rs` — signature
   and module updates
+
+## Deployment
+
+n/a — plain OSS flow (PR-gated CI on `main`, no staging/production service
+pipeline). The fix ships in the next tagged release; local users pick it up
+via `brew upgrade teton`.
