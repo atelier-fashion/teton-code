@@ -1,7 +1,7 @@
 ---
 id: TASK-030
 title: "ChatFormat enum, pure template detection, and Engine::chat_format() metadata"
-status: draft
+status: complete
 parent: REQ-554
 created: 2026-08-03
 updated: 2026-08-03
@@ -32,17 +32,17 @@ engine.
 
 ## Acceptance Criteria
 
-- [ ] `detect_chat_format` returns `ChatMl` for a ChatML-style template string
+- [x] `detect_chat_format` returns `ChatMl` for a ChatML-style template string
       (containing `<|im_start|>`) and `Flat` for an empty/unrecognized one —
       unit-tested without the `llama` feature.
-- [ ] `Engine::chat_format()` has a `Flat` default: `MockEngine::new`,
+- [x] `Engine::chat_format()` has a `Flat` default: `MockEngine::new`,
       `ScriptedFileEngine`, and every test engine compile unchanged and report
       `Flat`.
-- [ ] `MockEngine::with_chat_format(ChatFormat::ChatMl)` reports `ChatMl`.
-- [ ] `LlamaEngine::load` stores the detected format and `chat_format()`
+- [x] `MockEngine::with_chat_format(ChatFormat::ChatMl)` reports `ChatMl`.
+- [x] `LlamaEngine::load` stores the detected format and `chat_format()`
       returns it (compile-verified under `--features llama`; behavior pinned
       by the TASK-033 smoke).
-- [ ] `cargo test -p teton-inference` green; workspace compiles.
+- [x] `cargo test -p teton-inference` green; workspace compiles.
 
 ## Technical Notes
 

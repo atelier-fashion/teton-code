@@ -47,7 +47,9 @@ pub use benchmark::{
 };
 pub use catalog::{Catalog, ModelEntry, TierBand};
 pub use download::{DownloadConfig, DownloadError, Downloader, RangeFetcher};
-pub use engine::{Completion, Engine, EngineError, GenParams, MockEngine};
+pub use engine::{
+    detect_chat_format, ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine,
+};
 /// SHA-256 over files and byte slices — the integrity primitive behind BR-6.
 ///
 /// Re-exported (rather than the whole `hash` module made public) so the daemon's
