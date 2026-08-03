@@ -69,7 +69,10 @@ const CHATML_ANCHORED_MARKERS: &[&str] =
 /// Unlike `User:`, these strings carry no false-stop risk against ordinary
 /// prose; the deliberate trade-off is that an answer *quoting* a delimiter
 /// (e.g. documentation about ChatML) is cut at the quote.
-const TEMPLATE_CONTROL_MARKERS: &[&str] = &["<|im_start|>", "<|im_end|>"];
+/// Kept in step with the renderer's [`CONTROL_TOKEN_SPELLINGS`](super::render)
+/// for the turn-structural subset: what content is defused *going in* is what
+/// the model must not be allowed to emit *coming out*.
+const TEMPLATE_CONTROL_MARKERS: &[&str] = &["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
 
 /// The fabrication-marker sets for a rendering mode: `(line_anchored,
 /// position_independent)`.
