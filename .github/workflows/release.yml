@@ -2013,13 +2013,13 @@ jobs:
           err_name="$(basename "${err_rel:-}")"
           log_dir="$(brew --prefix)/var/$(dirname "${log_rel:-x/y}")"
           if [ -z "$log_rel" ] || [ -z "$err_rel" ]; then
-            report_and_fail "Could not read the formula's log paths (REQ-550 BR-6)::Neither log_path nor error_log_path parsed out of $formula_file, so whether the daemon writes where the formula promises is UNKNOWN. The tap was NOT updated."
+            report_and_fail "Could not read the formula's log paths (REQ-548 BR-6)::Neither log_path nor error_log_path parsed out of $formula_file, so whether the daemon writes where the formula promises is UNKNOWN. The tap was NOT updated."
           fi
           if [ -f "$log_dir/$log_name" ] && [ -f "$log_dir/$err_name" ]; then
-            echo "::notice title=Daemon logs are under brew var (REQ-550 BR-6)::$log_dir ($log_name, $err_name — as declared by the formula)"
+            echo "::notice title=Daemon logs are under brew var (REQ-548 BR-6)::$log_dir ($log_name, $err_name — as declared by the formula)"
             ls -l "$log_dir"
           else
-            report_and_fail "Daemon logs are not where the formula says (REQ-550 BR-6)::The formula declares $log_name and $err_name under $log_dir, and launchd did not create them there. The tap was NOT updated."
+            report_and_fail "Daemon logs are not where the formula says (REQ-548 BR-6)::The formula declares $log_name and $err_name under $log_dir, and launchd did not create them there. The tap was NOT updated."
           fi
 
           brew services restart teton \
