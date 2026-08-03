@@ -115,6 +115,22 @@ sha256_of() {
 # `tooling` job, where `codesign` does not exist and `gh` has no token
 # (ADR-550-4).
 #
+# WHEN NO OVERRIDE WAS GIVEN, a resolution that is not an ABSOLUTE PATH is
+# rejected as if the tool were absent. `command -v` answers about more than
+# files: an exported shell function, an alias, or a builtin of the same name
+# resolves as a BARE NAME, and the caller then runs that instead of the program
+# it asked for. That is reachable from outside the process — bash sources
+# `$BASH_ENV` before a non-interactive script's first line, so
+# `BASH_ENV=/tmp/x bash tools/release/package.sh …`, with `/tmp/x` defining and
+# exporting a `codesign()`, used to hand package.sh a "signing tool" that is a
+# shell function chosen by ambient environment. `/*` or nothing: the default
+# name has to name a file on disk.
+#
+# An OVERRIDE is deliberately still allowed to be relative (`./stand-ins/
+# codesign`), because an override is already the caller saying which program to
+# run — it is the seam, and whoever sets it controls the answer completely (see
+# below). The absolute-path rule protects the case where nobody said anything.
+#
 # BE PRECISE ABOUT WHAT THAT SEAM CANNOT DO, because the earlier wording here
 # claimed more than is true. It said "no value of TETON_CODESIGN or TETON_GH can
 # turn a rejection into a pass", which is false and dangerously so: a stand-in
@@ -131,9 +147,10 @@ sha256_of() {
 # verify-attestation.sh refuse to honour these variables inside GitHub Actions
 # unless TETON_ALLOW_TOOL_SEAM=1 says a test harness meant it.
 tool_or_unchecked() {
-    local tool="${1:-}"
+    local tool="${1:-}" resolved overridden=1
     if [ -z "$tool" ]; then
         tool="${2:-}"
+        overridden=0
     fi
     if [ -z "$tool" ]; then
         return 1
@@ -143,5 +160,22 @@ tool_or_unchecked() {
     # PATH, while an override is usually a path to a stand-in. This resolves
     # both shapes, and rejects a path that exists but cannot be executed. `--`
     # keeps a tool name that begins with `-` from being read as an option.
-    command -v -- "$tool" 2>/dev/null || return 1
+    resolved="$(command -v -- "$tool" 2>/dev/null)" || return 1
+    if [ -z "$resolved" ]; then
+        return 1
+    fi
+
+    # The default name must have resolved to a FILE. A function, an alias or a
+    # builtin comes back as the bare name it was asked about, and running that
+    # runs whatever the environment planted — see the note above. Unavailable
+    # semantics rather than a distinct outcome, because to the caller "there is
+    # no such program" is exactly what this is.
+    if [ "$overridden" -eq 0 ]; then
+        case "$resolved" in
+            /*) ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    printf '%s\n' "$resolved"
 }

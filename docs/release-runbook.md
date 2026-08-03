@@ -166,7 +166,7 @@ and "it could not run" can never be confused (LESSON-442, ADR-548-4):
 | `64` | the check RAN and the inputs are wrong (version mismatch, bad invocation, an unfilled `{{PLACEHOLDER}}`) |
 | `65` | it RAN and FAILED — these bytes are bad |
 | `75` | it could NOT run. Nothing was learned, which is not a pass |
-| `70` | (`package.sh` only) the build reported success but an expected binary is missing |
+| `70` | (`package.sh` only) the build reported success but an expected binary is missing — or, since REQ-551, a pack-phase contract failure (staging that is absent, short a member, version-skewed, altered since the build, or holding a symlink/directory where a regular file belongs; signing or verify rejection); §9 lists them |
 
 ---
 
@@ -541,6 +541,49 @@ That is why the identity has to be *stable*, not merely *present* — an unsigne
 release, or one signed by a different team, is a new identity to macOS and every
 grant is asked for again.
 
+**The keychain window — the signing step, and nothing else.** The certificate is
+imported into a throwaway keychain inside the `build` job, and that keychain is
+destroyed in the step immediately after signing, so no key material survives the
+run. REQ-551 moved the import to *after* every line of third-party code has
+finished compiling; its verify pass then added the early destroy. Together they
+close the accepted risk REQ-550 recorded, and the resulting claim is literal
+rather than approximate:
+
+- the identity exists from the import step's `list-keychains` call through the
+  `Sign and package` step — seconds of first-party code, all of it in this
+  repository — and is gone at `Destroy the signing keychain (early)`;
+- the ~30 minutes of `cargo build` and llama.cpp cmake run **before** the
+  import, with no signing credential anywhere on the machine;
+- the tarball **smoke and the artifact upload run after the destroy**, with no
+  keychain present. They used to sit inside the window; they no longer do.
+
+The `if: always()` cleanup at the end of the job stays, and is now a
+failure-path backstop: it covers an import that died halfway, a cancelled job,
+or a signing step that failed before the early destroy could run. On a green leg
+it finds nothing and says so.
+
+Moving the import *below* the build also moved it **downstream of untrusted
+code**, so the three steps that touch the identity (import, sign, early destroy)
+each open with the same preamble: `BASH_ENV`/`ENV`/`CDPATH` unset, the shell
+functions that could shadow their tools removed, `PATH` set to the system
+directories, and every `security` call spelled `/usr/bin/security`. That closes
+the **in-band** channels — a build script can append to `$GITHUB_ENV` and
+`$GITHUB_PATH`, and the runner applies both *between* steps. It does not close a
+**persistent background process** started during the build and still running
+while the key is on the machine: that is runner-level compromise, it is outside
+this REQ's threat model, and the recorded fix is OQ-1 — splitting build and sign
+into separate *jobs* — kept as future hardening rather than pretended away.
+
+What REQ-551 does *not* claim: the build is still untrusted, and it still
+determines the bytes the identity vouches for. Narrowing the key's reach is a
+different axis from trusting the compile — the control on that axis is the
+build-provenance attestation (§5), not this window. `package.sh`'s
+`.stage-meta` manifest is on the same footing: it detects a stale, partial,
+version-skewed or accidentally altered staging directory, which is what actually
+goes wrong, but it is **unauthenticated** — anything that can swap a staged
+binary can rewrite the digest line beside it — so it is an accident detector,
+not a second attestation.
+
 ### Checking a signed release by hand
 
 Continuing from §5 — the tarballs are already in `/tmp/rel`:
@@ -618,7 +661,11 @@ predicate is the target triple — macOS release leg ⇒ sign or die — never t
 certificate's availability, because a guard that switches itself off when its
 input is missing is not a guard (LESSON-443).
 
-Where it surfaces, in the order a run reaches them:
+Where it surfaces, in the order a run reaches them. Note that since REQ-551 the
+compile happens first, so a `package.sh` exit `70` from the **build** phase —
+cargo reported success but a binary is missing from `target/<triple>/release/` —
+is reached *before* the import step and has nothing to do with signing at all.
+The list below starts where the identity does:
 
 - **the `build` job's "Import the Developer ID signing identity" step** —
   `Signing identity UNAVAILABLE` (the secrets resolved empty — check the
@@ -628,10 +675,27 @@ Where it surfaces, in the order a run reaches them:
   certificate would not import` (usually a wrong `MACOS_CERT_PASSWORD`, or a
   `.p12` exported without its private key), or `No Developer ID identity for
   team 545BU9G9D6` (it imported, but it is the wrong *kind* of certificate).
-  Nothing is built on that leg.
+  Since REQ-551 this step runs *after* the compile, and its annotations say so:
+  they read *"The build already finished — this fails the leg before anything is
+  signed, and the binaries it produced are discarded with the job."* The leg did
+  build; what did not happen is any signing, so no tarball is written and
+  nothing from that leg can ship.
 - **`package.sh`, exit `70`** — signing was requested and codesign could not
   carry it out, or it signed and then its own `--verify --strict` rejected the
   result. No tarball is written: a signing-requested build never ships unsigned.
+  Recovery does not need a rebuild, and that is now literally true rather than
+  nearly true: `pack` signs **copies** of the staged binaries in a scratch
+  directory and never writes into `dist/stage-<target>/` at all, so *any* pack
+  failure leaves the stage exactly as the build left it — four members whose
+  digests still match `.stage-meta`. `tools/release/package.sh <target>
+  <version> dist pack` then re-runs *only* the signing phase (the phase
+  arguments exist since REQ-551). Before the scratch copy, the sharpest case did
+  not recover: `codesign --sign` rewrites the file it signs, so a `--sign` that
+  succeeded followed by a `--verify` that rejected left modified bytes in the
+  stage, and the retry was refused by the manifest check as a *tampered* stage —
+  true about the bytes, wrong about what happened. In CI, *Re-run failed jobs*
+  recompiles, which is the honest cost of a fresh runner; on a machine where you
+  are reproducing the failure by hand, re-`pack` and skip the 30-minute build.
 - **the macOS smoke's signature gate** — `65`, these bytes are not signed the
   way a release must be; `75`, the gate could not run and nothing was learned.
   Both stop the release.

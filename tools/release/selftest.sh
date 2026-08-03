@@ -98,9 +98,15 @@ RUNBOOK="$repo_root/docs/release-runbook.md"
 README="$repo_root/README.md"
 RELEASE_WORKFLOW="$repo_root/.github/workflows/release.yml"
 
+# RELEASE_WORKFLOW is in this list and README/RUNBOOK are not, and the
+# difference is what happens without it. The ordering group below does not merely
+# read the workflow — it hashes it (`sha256_of`) and mutates copies of it under
+# `set -e`, so an absent file aborts the whole suite mid-run with a status that
+# says nothing about why. The two prose files are only ever grepped, inside a
+# loop that already skips a missing one by name.
 for required in "$LIB" "$VERIFY" "$PACKAGE" "$RENDER_FORMULA" "$SMOKE" \
     "$VERIFY_SIGNATURE" "$VERIFY_ATTESTATION" "$VERIFY_BATCH" \
-    "$SITE_RENDER" "$SITE_TEMPLATE" "$FORMULA_TEMPLATE"; do
+    "$SITE_RENDER" "$SITE_TEMPLATE" "$FORMULA_TEMPLATE" "$RELEASE_WORKFLOW"; do
     if [ ! -f "$required" ]; then
         echo "selftest: $required is missing — nothing was tested." >&2
         exit "$EXIT_UNCHECKED"
@@ -1664,6 +1670,31 @@ unset TETON_SMOKE_SEAM_DEADLINE_SECS TETON_SMOKE_HANDSHAKE_DEADLINE_SECS
 # the produced binaries, or Apple's codesign. The stub builds nothing and the
 # stand-in signs nothing. What is under test is package.sh's own control flow —
 # which failures stop it, and which of them ship a tarball anyway.
+#
+# Every case in THIS group drives the default phase, `all`, and not one of them
+# passes a 4th argument. That is deliberate: since ADR-551-1 split the script
+# into `build` and `pack`, these cases are the compatibility contract rather
+# than a description of it — if the split changed what a plain
+# `package.sh <target> <version> <outdir>` prints or produces, they go red
+# without having been edited. The phases themselves are driven separately in
+# the group after this one.
+
+# A cargo TRIPWIRE, defined HERE rather than beside the phase group that first
+# needed it, because "before cargo is invoked" is a claim the group below makes
+# too and could not previously enforce. Not the exit-0 stub: this one fails
+# loudly and instantly, so a case that says a refusal happens before the build
+# can be graded on it rather than trusted. Leaving the real cargo on PATH would
+# let a regression "pass" by compiling the workspace — llama.cpp from source,
+# minutes of it — which is neither fast nor an assertion. 97 is outside every
+# taxonomy in this repo, so if it ever surfaces it can only have come from here.
+pkg_nocargo="$work/pkg-nocargo"
+mkdir -p "$pkg_nocargo"
+cat >"$pkg_nocargo/cargo" <<'EOF'
+#!/usr/bin/env bash
+echo "selftest: cargo was invoked by a phase that must not build" >&2
+exit 97
+EOF
+chmod +x "$pkg_nocargo/cargo"
 
 group "package.sh (input validation and the signing phase, no toolchain)"
 
@@ -1676,6 +1707,42 @@ expect_exit 64 "a prerelease version -> 64" \
     bash "$PACKAGE" aarch64-apple-darwin 1.2.3-rc.1 "$work/pkg"
 expect_exit 64 "a version that is really a path -> 64" \
     bash "$PACKAGE" aarch64-apple-darwin "../../etc" "$work/pkg"
+
+# The 4th argument is a selector, not free text: it decides which half of the
+# script runs, and a typo'd `packk` that fell through to a default would run the
+# other half silently — a "build" step that quietly signed, or a "pack" step
+# that quietly rebuilt. Refused with the same code as the other three arguments,
+# and before cargo is invoked.
+#
+# Run with the cargo TRIPWIRE on PATH, so "before cargo is invoked" is enforced
+# rather than asserted: a package.sh that validated the phase after building
+# would exit 97 here, not 64. The claim was in this label from the start and
+# nothing was checking it.
+expect_exit 64 "an unknown phase -> 64, before cargo is invoked" \
+    env PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg" packk
+expect_output "  ... and lists the phases it knows" "all, build, pack"
+
+# The collision the 4th argument created, and the likeliest way to type it: the
+# phase is the FOURTH argument, so `package.sh <target> <version> pack` is an
+# `all` writing into a directory named `pack` — a run that compiles AND signs in
+# one step, on a machine that by then holds a Developer ID key, and exits 0
+# while doing it. That is the pre-REQ-551 ordering reached by a typo, so it is
+# refused rather than guessed at.
+for pkg_collide in all build pack; do
+    expect_exit 64 "'$pkg_collide' as the THIRD argument -> 64, not an outdir named '$pkg_collide'" \
+        env PATH="$pkg_nocargo:$PATH" \
+        bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$pkg_collide"
+    expect_output "  ... suggesting the invocation that was meant" \
+        "did you mean: package.sh <target> <version> <outdir> $pkg_collide"
+done
+
+# A fifth argument is a caller believing in a flag this script does not have.
+# Ignoring it would let them read the wrong story out of a green step.
+expect_exit 64 "a fifth argument -> 64 rather than being ignored" \
+    env PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg" pack --sign
+expect_output "  ... saying how many it takes" "takes at most four and ignores none"
 
 # BR-2's known-bad, and the cheapest of the lot: signing is REQUESTED and the
 # tool is not there. Settled before `cargo build` on purpose, so the answer
@@ -1727,6 +1794,12 @@ assert "  ... and the tarball was written" \
     [ -s "$work/pkg-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
 assert "  ... with its sha256 sidecar" \
     [ -s "$work/pkg-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz.sha256" ]
+# The staging directory ADR-551-1 introduced is an implementation detail of the
+# phase boundary, and `all` crosses that boundary in one process — so it must
+# leave the output directory looking exactly as the old mktemp-and-trap version
+# did: one tarball, one sidecar, and no loose signed binaries beside them.
+refute "  ... and nothing staged left behind, as the mktemp directory never was" \
+    test -e "$work/pkg-signed/stage-aarch64-apple-darwin"
 
 # KNOWN-BAD, and the claim BR-2 actually makes: the certificate is missing or
 # expired, `codesign --sign` fails, and NO TARBALL IS WRITTEN. A build that
@@ -1775,6 +1848,709 @@ expect_exit 70 "cargo succeeds but teton-code is missing -> 70" \
     bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-short"
 expect_output "  ... and names the binary it did not find" \
     "cargo reported success but"
+
+# --- package.sh, phase by phase (ADR-551-1) --------------------------------
+#
+# The release workflow now runs `build` and `pack` as two steps with the
+# Developer ID identity imported BETWEEN them, so that the ~30 minutes of
+# compiling third-party sources happens on a runner with no signing identity on
+# it (REQ-551 BR-1). Two properties only exist once the phases are separate,
+# and neither can be observed from an `all` run:
+#
+#   * `build` must not touch signing AT ALL — not resolve the tool, not invoke
+#     it — even when TETON_SIGN_IDENTITY leaks into its environment. That is
+#     what makes the long compile safe to run before an identity exists.
+#   * `pack` must work from a staging directory it did not create, and refuse
+#     when that directory is missing or short a member: a `pack` whose `build`
+#     step never ran must never produce a tarball (BR-2, across the boundary).
+#
+# The stand-ins are the same ones the group above uses, plus two of this
+# group's own.
+
+group "package.sh phases (build / pack / all, no toolchain)"
+
+# `$pkg_nocargo` — the cargo tripwire every case below that drives `pack` runs
+# with — is defined above the previous group, which needs it too.
+
+# A codesign stand-in that RECORDS: it answers exactly as cs_accept does and
+# appends one line per invocation to a log. "The build phase never invokes the
+# signing tool" is not a claim an exit code can make — a build that resolved
+# codesign and signed with it exits 0 too — so the invocations have to be
+# counted rather than inferred.
+pkg_cs_log="$work/pkg-cs-invocations"
+pkg_cs_recording="$work/pkg-cs-recording/codesign"
+mkdir -p "$(dirname "$pkg_cs_recording")"
+cat >"$pkg_cs_recording" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$pkg_cs_log"
+exec "$cs_accept" "\$@"
+EOF
+chmod +x "$pkg_cs_recording"
+
+# stage_meta_write <stage dir> <version> — the `.stage-meta` manifest a build
+# phase writes last: the version it was building, then a sha256 per member.
+#
+# Spelled out here rather than copied from a build run for the same reason the
+# fixture below is: this suite has to be able to write a manifest that is WRONG.
+stage_meta_write() {
+    local dest="$1" meta_version="$2" member digest
+    printf 'version %s\n' "$meta_version" >"$dest/.stage-meta"
+    for member in teton teton-code LICENSE README.md; do
+        digest="$(sha256_of "$dest/$member")"
+        printf '%s  %s\n' "$digest" "$member" >>"$dest/.stage-meta"
+    done
+}
+
+# stage_for_pack <outdir> [version] — plants the directory a build phase would
+# have left, manifest and all. [version] defaults to 1.2.3, the version every
+# case in this group packages.
+#
+# Deliberately NOT produced by running the build phase: the point of `pack` is
+# that it works from a staging directory made by a process it never saw, which
+# is exactly what the workflow hands it across the identity-import step. A
+# fixture built by the code under test could not fail in the way this one can.
+stage_for_pack() {
+    local dest="$1/stage-aarch64-apple-darwin" member
+    mkdir -p "$dest"
+    for member in teton teton-code; do
+        printf '#!/usr/bin/env bash\nexit 0\n' >"$dest/$member"
+        chmod +x "$dest/$member"
+    done
+    printf 'MIT\n' >"$dest/LICENSE"
+    printf '# teton\n' >"$dest/README.md"
+    stage_meta_write "$dest" "${2:-1.2.3}"
+}
+
+# stage_matches_meta <stage dir> — 0 when every member still hashes to the
+# digest `.stage-meta` records for it.
+#
+# The question "did the pack phase write into the staging directory?" asked
+# directly, rather than inferred from an exit code. package.sh's recovery story
+# — a failed pack costs seconds to retry, not a 30-minute recompile — is exactly
+# the claim that the stage survives UNCHANGED, and nothing else in this suite
+# can tell an untouched stage from one whose binaries were rewritten by a
+# codesign that then failed.
+stage_matches_meta() {
+    local dest="$1" member want got
+    if [ ! -f "$dest/.stage-meta" ]; then
+        return 1
+    fi
+    for member in teton teton-code LICENSE README.md; do
+        if ! got="$(sha256_of "$dest/$member")"; then
+            return 1
+        fi
+        want="$(awk -v m="$member" 'NR > 1 && $2 == m { print $1 }' "$dest/.stage-meta")"
+        if [ -z "$want" ] || [ "$want" != "$got" ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# make_mutating_codesign <path> <exit status its --verify returns>
+#
+# A codesign stand-in that MODIFIES THE FILE IT SIGNS, which is the one property
+# of Apple's tool package.sh's recovery design turns on: `--sign` rewrites the
+# binary, so a `--verify` that then rejects it leaves changed bytes behind. Not
+# a signature and no evidence about codesign — the side effect, reproduced, so
+# that "a failed pack leaves the stage as the build left it" can be tested
+# rather than asserted.
+#
+# The file is the LAST argument, which is how package.sh invokes it:
+# `codesign --force --sign <identity> --timestamp --options runtime <file>`.
+make_mutating_codesign() {
+    local path="$1" verify_status="$2"
+    mkdir -p "$(dirname "$path")"
+    cat >"$path" <<EOF
+#!/usr/bin/env bash
+target=""
+for a in "\$@"; do target="\$a"; done
+
+case "\${1:-}" in
+    --force | --sign)
+        printf 'SIGNED-BY-STANDIN\n' >>"\$target"
+        exit 0
+        ;;
+    --verify)
+        exit $verify_status
+        ;;
+esac
+
+echo "mutating codesign stand-in: unexpected invocation: \$*" >&2
+exit 2
+EOF
+    chmod +x "$path"
+}
+
+pkg_cs_mutate_reject="$work/pkg-cs-mutate-reject/codesign"
+make_mutating_codesign "$pkg_cs_mutate_reject" 1
+pkg_cs_mutate_accept="$work/pkg-cs-mutate-accept/codesign"
+make_mutating_codesign "$pkg_cs_mutate_accept" 0
+
+# `all`, named out loud — what the Linux leg keeps doing, and what a human who
+# reads the usage line might type. Same flow, same lines, same tarball as the
+# default cases above: the argument selects, it does not switch modes.
+expect_exit 0 "an explicit 'all' behaves exactly as the default does -> 0" \
+    env PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-all-explicit" all
+expect_output "  ... having signed teton" "package: signed teton"
+expect_output "  ... and teton-code too" "package: signed teton-code"
+assert "  ... and shipped the tarball" \
+    [ -s "$work/pkg-all-explicit/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
+refute "  ... consuming its own staging directory on the way out" \
+    test -e "$work/pkg-all-explicit/stage-aarch64-apple-darwin"
+
+# `build` alone: it compiles, it stages, and it stops. The identity is set and
+# the signing tool is right there on the seam — and the log below says it was
+# called zero times.
+: >"$pkg_cs_log"
+expect_exit 0 "build alone stages the pair and stops there -> 0" \
+    env PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$pkg_cs_recording" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-build" build
+assert "  ... staging teton where pack will look for it" \
+    [ -x "$work/pkg-build/stage-aarch64-apple-darwin/teton" ]
+assert "  ... and teton-code beside it" \
+    [ -x "$work/pkg-build/stage-aarch64-apple-darwin/teton-code" ]
+assert "  ... with the licence" \
+    [ -f "$work/pkg-build/stage-aarch64-apple-darwin/LICENSE" ]
+assert "  ... and the readme" \
+    [ -f "$work/pkg-build/stage-aarch64-apple-darwin/README.md" ]
+# BR-1, and the property the whole reorder exists for.
+assert "  ... having invoked the signing tool exactly never (BR-1)" \
+    [ ! -s "$pkg_cs_log" ]
+refute "  ... and written no tarball, because packing is not its job" \
+    test -e "$work/pkg-build/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# The same claim from the other side, and the sharper of the two: signing is
+# requested and TETON_CODESIGN names a path that does not exist. On the `all`
+# path that is the 70 above, settled before cargo runs. The build phase must
+# not ask the question AT ALL — a build that resolved the tool would exit 70
+# here, which would mean the long compile could only run on a machine that
+# already had a signing identity, which is the ordering REQ-551 removes.
+expect_exit 0 "build with TETON_SIGN_IDENTITY set resolves no signing tool -> 0" \
+    env PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN=/nonexistent/codesign \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-build-identity" build
+assert "  ... and said nothing about signing, either way" \
+    [ "${CASE_OUT#*package: signed}" = "$CASE_OUT" ]
+
+# The seam guard is a `pack`/`all` guard now, and this pins that as a decision
+# rather than an oversight: the build phase reads TETON_CODESIGN nowhere, so
+# there is nothing here for the variable to decide, and a guard standing over a
+# variable that cannot reach anything teaches the next reader the wrong thing
+# about what it protects. The pack case directly below is where the refusal has
+# to survive, and does.
+expect_exit 0 "build in CI ignores TETON_CODESIGN rather than refusing it -> 0" \
+    env -u TETON_ALLOW_TOOL_SEAM GITHUB_ACTIONS=true \
+    PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    TETON_CODESIGN="$cs_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-build-ci" build
+
+# The staging directory is CLEARED, not merged into — and the clear is a
+# PRECONDITION of the build rather than the end of it. This plants the mess an
+# earlier run of a different commit would leave: a member that belongs to no
+# build at all, and a `teton` whose bytes are not the ones this build produces.
+# A build phase that merged would ship both.
+pkg_stale="$work/pkg-stale"
+mkdir -p "$pkg_stale/stage-aarch64-apple-darwin"
+printf 'this belonged to no build\n' \
+    >"$pkg_stale/stage-aarch64-apple-darwin/leftover-from-another-commit"
+printf '#!/usr/bin/env bash\necho STALE-BINARY\n' \
+    >"$pkg_stale/stage-aarch64-apple-darwin/teton"
+chmod +x "$pkg_stale/stage-aarch64-apple-darwin/teton"
+expect_exit 0 "build clears a stale staging directory rather than merging into it -> 0" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN \
+    PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$pkg_stale" build
+refute "  ... so the file that belonged to no build is gone" \
+    test -e "$pkg_stale/stage-aarch64-apple-darwin/leftover-from-another-commit"
+refute "  ... and the stale teton was replaced, not left in place" \
+    grep -q STALE-BINARY "$pkg_stale/stage-aarch64-apple-darwin/teton"
+
+# The same guarantee at the moment it actually matters, and the one the clear's
+# POSITION decides: the compile FAILS. With the clear after `cargo build` the
+# script exits here with the previous run's stage untouched — four members, a
+# manifest, and nothing for the pack step to object to — so a failed build
+# followed by a pack ships the last build's binaries under this build's name.
+# Cleared first, there is nothing to pack, and `pack` says so.
+pkg_failcargo="$work/pkg-failcargo"
+mkdir -p "$pkg_failcargo"
+cat >"$pkg_failcargo/cargo" <<'EOF'
+#!/usr/bin/env bash
+echo "selftest: stand-in cargo failing the way a broken compile does" >&2
+exit 101
+EOF
+chmod +x "$pkg_failcargo/cargo"
+
+stage_for_pack "$work/pkg-buildfail"
+expect_exit 101 "a build whose cargo FAILS propagates cargo's own status" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN \
+    PATH="$pkg_failcargo:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-buildfail" build
+refute "  ... having already cleared the previous run's staged teton" \
+    test -e "$work/pkg-buildfail/stage-aarch64-apple-darwin/teton"
+refute "  ... and its manifest with it" \
+    test -e "$work/pkg-buildfail/stage-aarch64-apple-darwin/.stage-meta"
+expect_exit 70 "  ... so a pack after a FAILED build has nothing to pack -> 70" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-buildfail" pack
+expect_output "  ... naming the contract it is holding to" \
+    "The pack phase packs what the build phase staged"
+refute "  ... and writing no tarball" \
+    test -e "$work/pkg-buildfail/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+stage_for_pack "$work/pkg-pack-seam"
+expect_exit 64 "pack still refuses TETON_CODESIGN in CI -> 64" \
+    env -u TETON_ALLOW_TOOL_SEAM GITHUB_ACTIONS=true \
+    PATH="$pkg_nocargo:$PATH" TETON_CODESIGN="$cs_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-seam" pack
+expect_output "  ... and writes no tarball" "No tarball is written"
+
+# `pack` alone, from a staging directory it did not create: the whole of the
+# signing story above, re-asked at the phase that now owns it.
+stage_for_pack "$work/pkg-pack-signed"
+expect_exit 0 "pack alone signs the staged pair and ships -> 0" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-signed" pack
+expect_output "  ... having signed teton" "package: signed teton"
+expect_output "  ... and teton-code too" "package: signed teton-code"
+assert "  ... and the tarball was written" \
+    [ -s "$work/pkg-pack-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
+assert "  ... with its sha256 sidecar" \
+    [ -s "$work/pkg-pack-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz.sha256" ]
+# The pack phase ships what it was handed and invents nothing: four members,
+# flat, in the order package.sh lists them.
+pkg_pack_members="$(tar -tzf "$work/pkg-pack-signed/teton-v1.2.3-aarch64-apple-darwin.tar.gz" | tr '\n' ' ')"
+assert "  ... and the archive holds exactly the four staged members" \
+    [ "$pkg_pack_members" = "teton teton-code LICENSE README.md " ]
+# Consumed on success: signed binaries left loose beside the tarball made from
+# them are a second copy nobody hashed, and a second `pack` would re-ship a
+# build the first one already shipped.
+refute "  ... and the staging directory was consumed" \
+    test -e "$work/pkg-pack-signed/stage-aarch64-apple-darwin"
+
+# KNOWN-BAD at the pack phase, and the claim BR-2 actually makes: the
+# certificate is missing or expired, `codesign --sign` fails, and NO TARBALL IS
+# WRITTEN.
+stage_for_pack "$work/pkg-pack-signreject"
+expect_exit 70 "pack whose codesign REFUSES -> 70" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_sign_reject" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-signreject" pack
+expect_output "  ... and says it will not ship unsigned" \
+    "a signing-requested build never ships unsigned"
+refute "  ... and no tarball was left behind" \
+    test -e "$work/pkg-pack-signreject/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+# The other half of the consume rule, and the reason it is "on success" rather
+# than "always": a FAILED pack keeps the staged build, so fixing the identity
+# and re-running `pack` costs seconds instead of a second from-source compile.
+# Nothing shippable survives — there is no tarball and no sidecar — which is
+# what makes keeping it safe rather than tidy.
+assert "  ... while the staged build survives for a retry" \
+    [ -d "$work/pkg-pack-signreject/stage-aarch64-apple-darwin" ]
+
+# KNOWN-BAD, the other half: signing succeeded and the RESULT does not hold.
+stage_for_pack "$work/pkg-pack-verifyreject"
+expect_exit 70 "pack that signed but --verify --strict rejects the result -> 70" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$cs_reject" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-verifyreject" pack
+expect_output "  ... and blames the verify, not the sign" \
+    "codesign --verify --strict rejected the result"
+refute "  ... writing no tarball" \
+    test -e "$work/pkg-pack-verifyreject/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+# Kept for a retry here as well, and asserted rather than assumed: "a failed
+# pack keeps the stage" is a claim about the pack phase, not about one branch of
+# it, and the two failures leave by different exits.
+assert "  ... while the staged build survives for a retry" \
+    [ -d "$work/pkg-pack-verifyreject/stage-aarch64-apple-darwin" ]
+
+# The signing tool missing, at the phase that now resolves it. The `all` case
+# above covers the same refusal reached from a different entry point; both
+# matter, because the resolution happens ONCE, at the top of the script, and a
+# rearrangement that lost the `$phase != build` condition would break exactly
+# one of them.
+stage_for_pack "$work/pkg-pack-nocodesign"
+expect_exit 70 "pack with signing requested and no codesign -> 70" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN=/nonexistent/codesign \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-nocodesign" pack
+expect_output "  ... and refuses to write an indistinguishable tarball" \
+    "Refusing to build a tarball that would be unsigned"
+refute "  ... writing no tarball" \
+    test -e "$work/pkg-pack-nocodesign/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+assert "  ... while the staged build survives for a retry" \
+    [ -d "$work/pkg-pack-nocodesign/stage-aarch64-apple-darwin" ]
+
+# The unsigned dev build, at the phase that decides it: no identity, no
+# signing, and it says so out loud rather than leaving a reader to infer it.
+stage_for_pack "$work/pkg-pack-unsigned"
+expect_exit 0 "pack with no TETON_SIGN_IDENTITY -> an unsigned dev build that says so" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-unsigned" pack
+expect_output "  ... and names the variable that would have signed it" \
+    "set TETON_SIGN_IDENTITY for release signing"
+
+# BR-2 across the phase boundary, and the case TASK-027's mutation check
+# breaks: NO staging directory at all, because the build step never ran — it
+# was skipped, cancelled, failed early, or wrote to another outdir. A pack that
+# tarred whatever it found would hand the release job an artifact with the
+# right NAME and nothing inside it, and the name is most of what the rest of
+# the pipeline reads.
+expect_exit 70 "pack with no staging directory at all -> 70" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-nostage" pack
+expect_output "  ... naming the contract it is holding to" \
+    "The pack phase packs what the build phase staged"
+# The needle above is deliberately NOT the whole assertion: the per-member
+# check below the directory check prints it too, so an absent directory would
+# still be refused — with the wrong diagnosis — if the directory check were
+# deleted. (It was: removing that branch alone left this suite green until this
+# line existed.) The first line of each refusal is what separates "there is
+# nothing here" from "what is here is short a member", and an operator reading
+# a red step needs to be told which.
+expect_output "  ... and saying the directory is not there AT ALL, not merely short" \
+    "there is no staged build at"
+refute "  ... and writing no tarball" \
+    test -e "$work/pkg-pack-nostage/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# Half a staging directory, which is the likelier accident: a build that died
+# between the two copies, or a second binary that never linked. A tarball short
+# one binary is worse than no tarball, because it installs.
+stage_for_pack "$work/pkg-pack-half"
+rm -f "$work/pkg-pack-half/stage-aarch64-apple-darwin/teton-code"
+expect_exit 70 "pack with a staging directory short one binary -> 70" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-half" pack
+expect_output "  ... naming the binary that is not there" \
+    "teton-code is missing or not executable"
+expect_output "  ... and the contract, again" \
+    "The pack phase packs what the build phase staged"
+refute "  ... and writing no tarball" \
+    test -e "$work/pkg-pack-half/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# The ride-alongs are held to the same contract as the binaries. `tar` would
+# fail on a missing member by itself — with a status from outside this script's
+# taxonomy and a message about a file rather than about a phase.
+stage_for_pack "$work/pkg-pack-nolicense"
+rm -f "$work/pkg-pack-nolicense/stage-aarch64-apple-darwin/LICENSE"
+expect_exit 70 "pack with a staging directory short its LICENSE -> 70, not a tar error" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-nolicense" pack
+expect_output "  ... naming the member it did not find" "LICENSE is missing"
+
+# WHAT KIND OF FILE each member is, which every other check in the pack phase
+# takes for granted. A member is present, executable and hashes correctly and is
+# still not something to ship.
+#
+# A SYMLINK is the sharp one, because it passes everything: `-f` and `-x` both
+# follow it, and it hashes as its TARGET — so the manifest agrees, and the file
+# that gets signed and the bytes that were checked stop being the same question.
+# The fixture points at the real staged binary, so the digest genuinely matches
+# and nothing but the type check can refuse it.
+stage_for_pack "$work/pkg-pack-symlink"
+mv "$work/pkg-pack-symlink/stage-aarch64-apple-darwin/teton" \
+    "$work/pkg-pack-symlink/teton-elsewhere"
+ln -s "$work/pkg-pack-symlink/teton-elsewhere" \
+    "$work/pkg-pack-symlink/stage-aarch64-apple-darwin/teton"
+expect_exit 70 "pack whose staged teton is a SYMLINK -> 70" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-symlink" pack
+expect_output "  ... naming it as a symlink rather than as a missing member" \
+    "is a symlink, not a regular file"
+refute "  ... and writing no tarball" \
+    test -e "$work/pkg-pack-symlink/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# A DIRECTORY where a binary should be, and the case that pins the TAXONOMY
+# rather than merely the refusal. A directory is executable, so it sails past
+# the completeness check; the next thing to touch it is the manifest's hasher,
+# and `sha256_of` failing is spelled 75 — "this machine has no sha256 tool" —
+# about a machine that has three. 70, naming the directory, or the operator
+# reading the log goes looking for a broken runner.
+stage_for_pack "$work/pkg-pack-dirmember"
+rm -f "$work/pkg-pack-dirmember/stage-aarch64-apple-darwin/teton"
+mkdir -p "$work/pkg-pack-dirmember/stage-aarch64-apple-darwin/teton"
+expect_exit 70 "pack whose staged teton is a DIRECTORY -> 70, not the 75 a hasher would report" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-dirmember" pack
+expect_output "  ... naming it as a directory" "is a directory, not a regular file"
+
+# The other half of the collision guard, and the half that keeps it a refusal of
+# an AMBIGUITY rather than a ban on three directory names: with FOUR arguments
+# the phase is spelled where the phase lives, so `<target> <version> pack pack`
+# is an ordinary pack into a directory called `pack` and must simply work. The
+# `$# -eq 3` gate is the whole of the difference, and nothing else here would
+# notice it being widened to `${3:-}`.
+mkdir -p "$work/pkg-collide4"
+stage_for_pack "$work/pkg-collide4/pack"
+# Driven from a `cd` into the scratch directory because the outdir is RELATIVE
+# — `pack`, literally — and this suite must not create one in the repository.
+# shellcheck disable=SC2016  # deliberate: the body reads argv, not our variables
+expect_exit 0 "'pack' as the third argument WITH a fourth -> an ordinary pack into ./pack" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash -c 'cd "$1" || exit 1; exec bash "$2" aarch64-apple-darwin 1.2.3 pack pack' \
+    _ "$work/pkg-collide4" "$PACKAGE"
+assert "  ... writing the tarball into the directory really named 'pack'" \
+    [ -s "$work/pkg-collide4/pack/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
+
+# THE RECOVERY, and the reason the pack phase signs COPIES.
+#
+# `codesign` rewrites the file it signs. Signing the staged binaries in place
+# meant that the sharpest failure — `--sign` succeeded, `--verify --strict`
+# rejected the result — left the stage holding bytes the manifest no longer
+# described, so the retry the runbook promises ("fix the identity and re-`pack`,
+# it costs seconds") ran into the manifest check and was refused as a TAMPERED
+# stage. The failure said "these bytes are not the ones the build staged", which
+# was true and was the wrong story.
+#
+# Three claims in one sequence, and only the middle one is new: the failure is
+# still 70, the stage is still byte-for-byte what the build wrote, and a second
+# pack with a working signer ships. The stand-ins MUTATE, so a pack that signed
+# in place could not pass all three.
+stage_for_pack "$work/pkg-scratch-sign"
+expect_exit 70 "pack whose file-MUTATING codesign fails its own --verify -> 70" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$pkg_cs_mutate_reject" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-scratch-sign" pack
+expect_output "  ... and blames the verify, not the sign" \
+    "codesign --verify --strict rejected the result"
+assert "  ... while the staged bytes STILL match .stage-meta: pack wrote nothing into the stage" \
+    stage_matches_meta "$work/pkg-scratch-sign/stage-aarch64-apple-darwin"
+expect_exit 0 "  ... so a re-pack with an accepting signer ships, with no rebuild -> 0" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$pkg_cs_mutate_accept" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-scratch-sign" pack
+mkdir -p "$work/pkg-scratch-extract"
+tar -xzf "$work/pkg-scratch-sign/teton-v1.2.3-aarch64-apple-darwin.tar.gz" \
+    -C "$work/pkg-scratch-extract" teton 2>/dev/null || true
+assert "  ... and the SHIPPED teton carries the signer's bytes, not the stage's unsigned ones" \
+    grep -q SIGNED-BY-STANDIN "$work/pkg-scratch-extract/teton"
+# Exactly once. Twice would mean the second pack signed a file the FIRST pack
+# had already written to — which is the in-place behaviour this design removed,
+# reachable again the day someone points codesign back at "$stage/$bin".
+assert "  ... exactly once, so the retry signed a fresh copy of the pristine stage" \
+    [ "$(grep -c SIGNED-BY-STANDIN "$work/pkg-scratch-extract/teton")" -eq 1 ]
+
+# --- the staged-build manifest ---------------------------------------------
+#
+# Completeness is one question; PROVENANCE is a different one, and the phase
+# split is what made the second one askable. The staging directory is the only
+# thing that crosses the boundary, it is an ordinary directory in `dist/`, and
+# the step that sits on that boundary imports a Developer ID private key. So
+# between `build` and `pack` there is a window in which anything that can write
+# to `dist/` chooses what gets a real release signature — and every case above
+# would be perfectly happy about it, because a swapped binary is still four
+# executable members.
+#
+# `build` therefore records what it staged (`.stage-meta`: the version, and a
+# sha256 per member) and `pack` re-hashes and compares BEFORE it signs. These
+# cases are the three ways that can go wrong, and each has to name itself: "no
+# manifest", "another version's build" and "these bytes changed" have three
+# different causes and three different fixes.
+
+stage_for_pack "$work/pkg-pack-nometa"
+rm -f "$work/pkg-pack-nometa/stage-aarch64-apple-darwin/.stage-meta"
+expect_exit 70 "pack of a complete stage with NO .stage-meta -> 70" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-nometa" pack
+expect_output "  ... naming the manifest it did not find" "carries no .stage-meta"
+expect_output "  ... and the contract it is holding to" \
+    "The pack phase packs what the build phase staged"
+refute "  ... writing no tarball" \
+    test -e "$work/pkg-pack-nometa/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# From a REAL build phase from here on: a manifest the code under test wrote is
+# the only evidence that what it writes is what it later accepts. A fixture
+# could agree with a mistake in both halves at once.
+expect_exit 0 "build records what it staged in .stage-meta -> 0" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN \
+    PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-tamper" build
+assert "  ... writing the manifest beside the members" \
+    [ -f "$work/pkg-tamper/stage-aarch64-apple-darwin/.stage-meta" ]
+assert "  ... naming the version it was building on the first line" \
+    [ "$(head -n 1 "$work/pkg-tamper/stage-aarch64-apple-darwin/.stage-meta")" = "version 1.2.3" ]
+assert "  ... and one digest line per shipped member" \
+    [ "$(grep -c '' "$work/pkg-tamper/stage-aarch64-apple-darwin/.stage-meta")" -eq 5 ]
+
+# THE case this manifest exists for: the staged binary is replaced between the
+# two phases — which on the real runner means after the Developer ID identity
+# has been imported. A pack that signed it would hand out a genuinely signed,
+# genuinely trusted artifact containing bytes no build produced.
+#
+# Driven through the RECORDING signing stand-in, with the log emptied first,
+# because the exit code is only half the claim: a check that ran after the
+# signing loop would also exit 70, having by then put a Developer ID signature
+# on a substituted binary. Four lines in that log and a 70 is a different — and
+# much worse — outcome than no lines and a 70, and only the log can tell them
+# apart (LESSON-455).
+: >"$pkg_cs_log"
+printf '#!/usr/bin/env bash\necho SUBSTITUTED\n' \
+    >"$work/pkg-tamper/stage-aarch64-apple-darwin/teton"
+expect_exit 70 "pack whose staged teton changed since the build -> 70" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$pkg_cs_recording" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-tamper" pack
+expect_output "  ... naming the member that changed" \
+    "the staged teton at"
+expect_output "  ... and saying it is not what the build staged" \
+    "is not the one the build phase staged"
+assert "  ... having invoked the signing tool exactly never: it refuses BEFORE it signs" \
+    [ ! -s "$pkg_cs_log" ]
+refute "  ... and writing no tarball" \
+    test -e "$work/pkg-tamper/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+# The version skew the deterministic stage name makes possible: the directory is
+# keyed on the TARGET only, so a stage built for 1.2.3 is sitting exactly where
+# a pack for 9.9.9 looks. Packing it would put one release's binaries inside a
+# tarball named for another — and downstream, the name is most of what is read.
+expect_exit 0 "build for 1.2.3 -> 0" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN \
+    PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-version-skew" build
+expect_exit 70 "  ... and a pack of that stage asked for 9.9.9 -> 70" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nocargo:$PATH" \
+    bash "$PACKAGE" aarch64-apple-darwin 9.9.9 "$work/pkg-version-skew" pack
+expect_output "  ... naming the version the stage was built for" \
+    "was built for version '1.2.3'"
+expect_output "  ... and the one this pack was asked for" \
+    "asked for version '9.9.9'"
+refute "  ... writing no tarball under either version" \
+    test -e "$work/pkg-version-skew/teton-v9.9.9-aarch64-apple-darwin.tar.gz"
+
+# --- when the machine cannot hash at all -----------------------------------
+#
+# `pack` re-hashes the staged members, so a machine with no sha256 tool cannot
+# answer the question this phase now asks before signing. That is 75 and not 70
+# for the reason the rest of tools/release/ spells out (LESSON-442): "could not
+# check" is not "checked and found a problem". What must hold either way is that
+# nothing shippable survives.
+#
+# The PATH here is MINIMAL rather than prepended — a stub cannot hide a tool
+# that is already there — so it is built out of symlinks to exactly the
+# externals package.sh reaches for, minus every hasher. `env PATH=… bash` finds
+# `bash` through the new PATH too, which is why bash itself is on the list.
+pkg_nosha="$work/pkg-nosha"
+mkdir -p "$pkg_nosha"
+pkg_nosha_ok=1
+for pkg_tool in bash dirname mkdir rm cp grep awk tar basename; do
+    if pkg_tool_path="$(command -v "$pkg_tool" 2>/dev/null)"; then
+        ln -sf "$pkg_tool_path" "$pkg_nosha/$pkg_tool"
+    else
+        pkg_nosha_ok=0
+    fi
+done
+for pkg_tool in shasum sha256sum openssl; do
+    if [ -e "$pkg_nosha/$pkg_tool" ]; then
+        pkg_nosha_ok=0
+    fi
+done
+
+if [ "$pkg_nosha_ok" -ne 1 ]; then
+    skip "pack with no sha256 tool at all -> 75 (this machine is missing a tool the stub PATH needs)"
+else
+    stage_for_pack "$work/pkg-pack-nosha"
+    expect_exit 75 "pack on a PATH with no sha256 tool -> 75, and it stops before signing" \
+        env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN PATH="$pkg_nosha" \
+        bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-nosha" pack
+    expect_output "  ... saying it could not check what it was about to pack" \
+        "cannot be checked against the manifest its build wrote"
+    refute "  ... and writing no tarball" \
+        test -e "$work/pkg-pack-nosha/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+fi
+
+# The other 75, and the one fix-4 is about: the members hashed fine and the
+# finished TARBALL cannot be. Reached with a `shasum` stand-in that defers to
+# the real one for everything except a `.tar.gz`, because a PATH with no hasher
+# at all never gets this far — the manifest check above stops it first. What is
+# under test is the cleanup: a tarball with no sidecar beside it is, to the
+# upload step and to a glob, indistinguishable from a finished one.
+pkg_noshatar="$work/pkg-noshatar"
+mkdir -p "$pkg_noshatar"
+if pkg_real_shasum="$(command -v shasum 2>/dev/null)"; then
+    cat >"$pkg_noshatar/shasum" <<EOF
+#!/usr/bin/env bash
+# selftest stand-in for shasum: honest about the staged members, mute about the
+# tarball, so that exactly one of package.sh's two hashing sites fails.
+for arg; do
+    case "\$arg" in
+        *.tar.gz) exit 3 ;;
+    esac
+done
+exec "$pkg_real_shasum" "\$@"
+EOF
+    chmod +x "$pkg_noshatar/shasum"
+    stage_for_pack "$work/pkg-pack-noshatar"
+    # A SIDECAR FROM AN EARLIER RUN, planted before the failing one. Without it
+    # "no sidecar was left behind" is a claim about a file that was never
+    # written — this refusal happens at the line that would have written it — and
+    # the assertion passes on a package.sh that removes nothing. With it the
+    # assertion is about a REMOVAL, which is the behaviour being tested: a
+    # `.tar.gz.sha256` with no `.tar.gz` beside it is a hash of bytes nobody can
+    # produce, sitting exactly where a human re-checking one artifact by hand
+    # looks for the right one.
+    printf '%s  %s\n' \
+        "0000000000000000000000000000000000000000000000000000000000000000" \
+        "teton-v1.2.3-aarch64-apple-darwin.tar.gz" \
+        >"$work/pkg-pack-noshatar/teton-v1.2.3-aarch64-apple-darwin.tar.gz.sha256"
+    expect_exit 75 "pack whose finished tarball cannot be hashed -> 75" \
+        env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN \
+        PATH="$pkg_noshatar:$pkg_nocargo:$PATH" \
+        bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-pack-noshatar" pack
+    expect_output "  ... saying the tarball was removed rather than left" \
+        "has been REMOVED"
+    refute "  ... and the unhashed tarball really is gone" \
+        test -e "$work/pkg-pack-noshatar/teton-v1.2.3-aarch64-apple-darwin.tar.gz"
+    refute "  ... and the STALE sidecar from the earlier run went with it" \
+        test -e "$work/pkg-pack-noshatar/teton-v1.2.3-aarch64-apple-darwin.tar.gz.sha256"
+else
+    skip "pack whose finished tarball cannot be hashed -> 75 (no shasum to stand in front of)"
+fi
+
+# The handoff, end to end, in the order the workflow will run it: `build`
+# stages, and a SEPARATE process signs and packs what it left behind. On the
+# real runner the identity is imported between these two invocations, which is
+# the whole of ADR-551-1; nothing else here exercises two phases against one
+# staging directory.
+: >"$pkg_cs_log"
+expect_exit 0 "build, then a second process packs what it staged: the build -> 0" \
+    env -u TETON_SIGN_IDENTITY -u TETON_CODESIGN \
+    PATH="$pkg_stub:$PATH" CARGO_TARGET_DIR="$pkg_target" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-handoff" build
+expect_exit 0 "  ... and the pack that follows it, with the identity now set -> 0" \
+    env PATH="$pkg_nocargo:$PATH" \
+    TETON_SIGN_IDENTITY="Developer ID Application: Atelier Fashion LLC ($SIG_TEAM_ID)" \
+    TETON_CODESIGN="$pkg_cs_recording" \
+    bash "$PACKAGE" aarch64-apple-darwin 1.2.3 "$work/pkg-handoff" pack
+assert "  ... producing the tarball the runbook expects" \
+    [ -s "$work/pkg-handoff/teton-v1.2.3-aarch64-apple-darwin.tar.gz" ]
+# The member list, asked of the ONE tarball in this suite whose staging
+# directory a real build phase produced — which is to say the only one that ever
+# had a `.stage-meta` in it. `.stage-meta` is the phase boundary's own
+# bookkeeping; shipping it would put a checksum file inside the artifact that
+# looks, to a user, like something to trust. Four members, flat, in the order
+# package.sh lists them — the same list as before the manifest existed.
+pkg_handoff_members="$(tar -tzf "$work/pkg-handoff/teton-v1.2.3-aarch64-apple-darwin.tar.gz" | tr '\n' ' ')"
+assert "  ... holding exactly the four shipped members, manifest excluded" \
+    [ "$pkg_handoff_members" = "teton teton-code LICENSE README.md " ]
+# Four invocations, not "some": two binaries, each signed and then verified.
+# A count pins the pair AND the verify, which an exit code cannot (LESSON-455),
+# and it pins them to the SECOND process — the log was empty when it started.
+assert "  ... with all four signing-tool invocations made by the pack process" \
+    [ "$(grep -c '' "$pkg_cs_log")" -eq 4 ]
 
 # --- lib.sh ----------------------------------------------------------------
 
@@ -1893,6 +2669,764 @@ for drift_file in "$README" "$RUNBOOK" "$FORMULA_TEMPLATE" "$RELEASE_WORKFLOW"; 
     assert "the team id $SIG_TEAM_ID appears in $(basename "$drift_file")" \
         grep -Fq -- "$SIG_TEAM_ID" "$drift_file"
 done
+
+# --- the import-after-build ordering in release.yml ------------------------
+#
+# BR-6 / ADR-551-2, and the only structural claim this suite makes about a
+# workflow file. The whole of REQ-551 is a STEP ORDER: on a macOS leg the
+# Developer ID identity is imported AFTER the ~30 minutes of third-party
+# compilation and BEFORE the seconds of signing, so that no crate's build
+# script ever runs beside an unlocked keychain holding a release key (BR-1).
+# YAML cannot express that and actionlint has no opinion about it — release.yml
+# is exactly as valid with the import step first, and until this group existed
+# the only thing holding the order in place was a comment saying it mattered.
+# REQ-550's verify pass is precisely where a comment claiming to be a guard was
+# found not to be one (LESSON-443). This group is the guard; that comment now
+# points at it by name.
+#
+# Three anchors, and they are LOAD-BEARING STRINGS rather than descriptions of
+# strings — a rename is a change to this assertion and belongs in the same
+# commit:
+#
+#   the `dist build` package.sh invocation   the unsigned compile
+#   the import step's `- name:` line         kept verbatim by TASK-028
+#   the `dist pack` package.sh invocation    sign, verify, tar
+#
+# So a missing anchor is a NAMED failure here (order-status 2), never a quiet
+# pass: an assertion that can be satisfied by deleting what it reads is not an
+# assertion, and this file has met that shape before.
+#
+# Which is why AC-4's mutation lives in the suite rather than in a sentence
+# about a mutation somebody performed by hand once and undid. Four known-bad
+# copies of the REAL release.yml are built under $work and graded on every run
+# — the import step moved above the build (the regression itself), the step
+# renamed, and each phase argument dropped — so both directions are proven
+# here, permanently, instead of asserted about a file nobody can re-check. The
+# workflow itself is only ever read; the last case in the group proves that.
+
+group "the import-after-build ordering in release.yml (BR-6 / ADR-551-2)"
+
+# Single-quoted: `$TARGET` and `$VERSION` are release.yml's text, not this
+# script's variables.
+# shellcheck disable=SC2016  # deliberate: these are the workflow's bytes
+ORDER_ANCHOR_BUILD='bash tools/release/package.sh "$TARGET" "$VERSION" dist build'
+ORDER_ANCHOR_IMPORT='- name: Import the Developer ID signing identity'
+# shellcheck disable=SC2016  # deliberate: these are the workflow's bytes
+ORDER_ANCHOR_PACK='bash tools/release/package.sh "$TARGET" "$VERSION" dist pack'
+# " (early)" is LOAD-BEARING in this needle. The plain
+# "- name: Destroy the signing keychain" matches TWO lines — the early destroy
+# and the `if: always()` backstop — and a two-hit needle is refused as ambiguous
+# by workflow_line_of, so an anchor without the suffix would report the step as
+# duplicated on a perfectly correct file.
+ORDER_ANCHOR_DESTROY='- name: Destroy the signing keychain (early)'
+ORDER_ANCHOR_SMOKE='- name: Smoke the tarball (BR-7/BR-9)'
+
+# workflow_line_of <file> <fixed needle> — the line number of the ONE line
+# containing the needle. Prints NOTHING when it appears zero times, and
+# `ambiguous:<n>` when it appears more than once.
+#
+# awk's index(), not grep: every anchor here carries `$` and `(`, and a regex
+# reading of them is a different question than the one being asked.
+#
+# Ambiguity is still REFUSED — with two matching lines "the first one" is a
+# guess about which step is meant, and guessing is the failure mode this group
+# exists to remove — but it is no longer refused by printing nothing. The two
+# outcomes had one spelling and therefore one diagnosis, and the diagnosis was
+# the wrong one: a workflow that grew a SECOND `dist pack` invocation (a retry
+# step, a second matrix leg, a copied step somebody forgot to edit) was reported
+# as "the signing anchor vanished", which is the opposite of what happened and
+# sends whoever reads it looking for a deletion. Callers must therefore treat
+# any non-numeric value as "no single line", which every caller here does by
+# case rather than by arithmetic.
+workflow_line_of() {
+    awk -v needle="$2" '
+        index($0, needle) { hits++; if (hits == 1) line = NR }
+        END {
+            if (hits == 1) print line
+            else if (hits > 1) print "ambiguous:" hits
+        }
+    ' "$1"
+}
+
+# anchor_unique <workflow> <anchor> <workflow_line_of result> <what a missing
+# one means> — 0 when the result is a line number, otherwise 1 with
+# IMPORT_ORDER_VERDICT set to the diagnosis.
+#
+# One function for both non-numeric outcomes, so the three anchors cannot drift
+# into three different accounts of the same two problems.
+anchor_unique() {
+    local wf="$1" anchor="$2" got="$3" missing_means="$4"
+    case "$got" in
+        ambiguous:*)
+            IMPORT_ORDER_VERDICT="'$anchor' appears ${got#ambiguous:} times in $wf — no longer unique, so which line it names would be a guess. Nothing about the step order was checked."
+            return 1
+            ;;
+        '')
+            IMPORT_ORDER_VERDICT="no line of $wf reads '$anchor' — $missing_means Nothing about the step order was checked."
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# workflow_contains <file> <fixed needle> — 0 when at least one line contains
+# it. `index()` rather than grep, for the reason every other reader in this
+# group gives: the needles here carry `$`, `(` and `/`, and a regex reading of
+# them asks a different question.
+workflow_contains() {
+    awk -v needle="$2" '
+        index($0, needle) { found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "$1"
+}
+
+# workflow_run_start <file> <a step's `- name:` line number> — the line number
+# of that step's own `run:` block header, or nothing when the step has none
+# (a `uses:` step) — the scan stops at the NEXT step's `- name:` line, so it can
+# never report a later step's body as this one's.
+workflow_run_start() {
+    awk -v start="$2" '
+        NR <= start { next }
+        /^      - name: / { exit }
+        /^[[:space:]]*run:[[:space:]]*[|>]/ { print NR; exit }
+    ' "$1"
+}
+
+# workflow_run_before <file> <line number> — the LAST `run:` block header
+# strictly above <line number>, which is how a command line is traced back to
+# the body it lives in without parsing YAML.
+workflow_run_before() {
+    awk -v stop="$2" '
+        NR >= stop { exit }
+        /^[[:space:]]*run:[[:space:]]*[|>]/ { last = NR }
+        END { if (last) print last }
+    ' "$1"
+}
+
+# workflow_has_scrub <file> <after> <before> <extra token, or ""> <max
+# non-comment lines to read, 0 = all>
+#
+# 0 when the region strictly between <after> and <before> holds BOTH:
+#
+#   * an `unset` line naming BASH_ENV (and <extra token>, when one is given);
+#   * an `export PATH=` line whose value STARTS with /usr/bin — prepending is
+#     the whole point, and a PATH that merely mentions /usr/bin somewhere is the
+#     shape the scrub exists to reject.
+#
+# Comments and blank lines are skipped, so the check is about what the step
+# RUNS. <max> exists for the import step, where the requirement is that the
+# preamble comes FIRST: with a limit of 3 a scrub moved below the first
+# `security` call no longer satisfies this, which is the property that matters —
+# BASH_ENV planted by the build has to be neutralised before anything sensitive
+# runs, not eventually.
+workflow_has_scrub() {
+    awk -v from="$2" -v to="$3" -v extra="$4" -v maxn="$5" '
+        NR <= from { next }
+        NR >= to { exit }
+        { s = $0; sub(/^[ \t]+/, "", s) }
+        s == "" { next }
+        substr(s, 1, 1) == "#" { next }
+        {
+            seen++
+            if (maxn > 0 && seen > maxn) exit
+            if (substr(s, 1, 6) == "unset " && index(s, "BASH_ENV") &&
+                (extra == "" || index(s, extra))) unset_ok = 1
+            if (substr(s, 1, 12) == "export PATH=") {
+                v = substr(s, 13)
+                sub(/^"/, "", v)
+                if (substr(v, 1, 8) == "/usr/bin") path_ok = 1
+            }
+        }
+        END { exit((unset_ok && path_ok) ? 0 : 1) }
+    ' "$1"
+}
+
+# workflow_security_before_build <file> <the unsigned build's line number> —
+# the line number of the FIRST non-comment line inside ANY `run:` block above
+# it that runs a `security ` command; nothing when there is none.
+#
+# THE EMBARGO, and it is deliberately not anchored on a step name or on a
+# particular subcommand. The four `expect_keychain_op_after_build` cases below
+# pin four exact invocations, which leaves the whole space of other spellings:
+# a `security import` with different arguments, a `security create-keychain`
+# with a differently-named password variable, an importer written as a helper
+# script — every one of them puts a private key on the machine before the
+# compile and passes those four cases. So the token is `security ` with nothing
+# else demanded of it, in the region where NO reason to run it exists.
+#
+# `run:` block membership is tracked by INDENTATION: a block opens at
+# `run: |` / `run: >` and holds every line indented further than that key, which
+# is what YAML's block scalar means and is enough here without a parser.
+# Comment lines are excluded, because this group's whole subject is prose that
+# discusses `security` sitting next to code that runs it.
+workflow_security_before_build() {
+    awk -v stop="$2" '
+        NR >= stop { exit }
+        {
+            line = $0
+            match(line, /^ */)
+            ind = RLENGTH
+            if (in_run) {
+                if (line ~ /^[[:space:]]*$/) next
+                if (ind <= run_ind) {
+                    in_run = 0
+                } else {
+                    s = line
+                    sub(/^[ \t]+/, "", s)
+                    if (substr(s, 1, 1) == "#") next
+                    if (index(line, "security ")) { print NR; exit }
+                    next
+                }
+            }
+            if (line ~ /^[[:space:]]*run:[[:space:]]*[|>]/) {
+                in_run = 1
+                run_ind = ind
+            }
+        }
+    ' "$1"
+}
+
+# import_order_check <workflow path> — the assertion itself, as a function so
+# that the same code grades the real workflow and every known-bad copy below.
+# That is the whole reason it is not written inline: a mutation proof that runs
+# different code from the real check proves nothing about the real check.
+#
+# Sets IMPORT_ORDER_VERDICT rather than printing, so a caller can grade a
+# failure without the verdict landing in the suite's output. Returns:
+#
+#   0  every property below holds — the only shape REQ-551 accepts
+#   1  every anchor is present and a PROPERTY does not hold (an order, a
+#      position, a missing scrub, a `security` call before the build)
+#   2  an anchor is missing or ambiguous, or the file could not be read; the
+#      verdict names WHICH, because "renamed", "duplicated" and "reordered" are
+#      three regressions with three different fixes
+#
+# The properties, and THE ORDER THEY ARE ASKED IN IS LOAD-BEARING. The
+# import-above-build regression trips the embargo too — moving the import step
+# above the build is precisely a `security` call before the build — so the
+# ordering question has to be settled first or the flagship mutation would be
+# reported as an embargo violation and every reader would be sent to the wrong
+# fix.
+#
+#   1. build < import < pack           the reorder itself (BR-1/ADR-551-2)
+#   2. pack < early destroy < smoke    the window's far edge: the identity is
+#                                      gone before anything runs the freshly
+#                                      built binaries
+#   3. the signing step's env scrub     TETON_CODESIGN/BASH_ENV unset, system
+#                                      directories first on PATH
+#   4. the import step's preamble       the same, FIRST in its body, and its
+#                                      keychain calls spelled absolutely
+#   5. no `security` before the build   the catch-all the four exact-invocation
+#                                      cases below cannot express
+IMPORT_ORDER_VERDICT=""
+import_order_check() {
+    local wf="$1"
+    local build_ln import_ln pack_ln destroy_ln smoke_ln
+    local sign_run_ln import_run_ln embargo_ln
+    IMPORT_ORDER_VERDICT=""
+
+    if [ ! -f "$wf" ]; then
+        IMPORT_ORDER_VERDICT="$wf is not a file, so no step order was read."
+        return 2
+    fi
+
+    build_ln="$(workflow_line_of "$wf" "$ORDER_ANCHOR_BUILD")"
+    import_ln="$(workflow_line_of "$wf" "$ORDER_ANCHOR_IMPORT")"
+    pack_ln="$(workflow_line_of "$wf" "$ORDER_ANCHOR_PACK")"
+    destroy_ln="$(workflow_line_of "$wf" "$ORDER_ANCHOR_DESTROY")"
+    smoke_ln="$(workflow_line_of "$wf" "$ORDER_ANCHOR_SMOKE")"
+
+    anchor_unique "$wf" "$ORDER_ANCHOR_BUILD" "$build_ln" \
+        "the unsigned-build anchor vanished (phase argument dropped, or the invocation rewritten)." ||
+        return 2
+    anchor_unique "$wf" "$ORDER_ANCHOR_IMPORT" "$import_ln" \
+        "the import step was renamed or removed." ||
+        return 2
+    anchor_unique "$wf" "$ORDER_ANCHOR_PACK" "$pack_ln" \
+        "the signing anchor vanished (phase argument dropped, or the invocation rewritten)." ||
+        return 2
+    anchor_unique "$wf" "$ORDER_ANCHOR_DESTROY" "$destroy_ln" \
+        "the EARLY keychain destroy was renamed or removed — it is the step that closes BR-1's window, and the 'if: always()' backstop at the bottom of the job does not close it before the smoke." ||
+        return 2
+    anchor_unique "$wf" "$ORDER_ANCHOR_SMOKE" "$smoke_ln" \
+        "the smoke step was renamed or removed, so 'the identity is gone before anything runs the built binaries' has no step to be measured against." ||
+        return 2
+
+    if ! { [ "$build_ln" -lt "$import_ln" ] && [ "$import_ln" -lt "$pack_ln" ]; }; then
+        IMPORT_ORDER_VERDICT="the identity import is not strictly between the two phases: build l.$build_ln, import l.$import_ln, pack l.$pack_ln. A Developer ID key must not be on the machine while cargo builds (BR-1/ADR-551-2)."
+        return 1
+    fi
+
+    if ! { [ "$pack_ln" -lt "$destroy_ln" ] && [ "$destroy_ln" -lt "$smoke_ln" ]; }; then
+        IMPORT_ORDER_VERDICT="the early keychain destroy is not strictly between the pack and the smoke: pack l.$pack_ln, destroy l.$destroy_ln, smoke l.$smoke_ln. The smoke EXECUTES the binaries this job built, so an identity that is still on the machine when it runs puts third-party code back inside the window REQ-551 narrowed (BR-1)."
+        return 1
+    fi
+
+    sign_run_ln="$(workflow_run_before "$wf" "$pack_ln")"
+    if [ -z "$sign_run_ln" ]; then
+        IMPORT_ORDER_VERDICT="no 'run:' block header precedes the signing invocation at l.$pack_ln, so the signing step's body could not be located and its environment scrub was not checked."
+        return 1
+    fi
+    if ! workflow_has_scrub "$wf" "$sign_run_ln" "$pack_ln" TETON_CODESIGN 0; then
+        IMPORT_ORDER_VERDICT="the signing step's environment scrub is gone: between its 'run:' at l.$sign_run_ln and the pack invocation at l.$pack_ln there is no 'unset' naming both TETON_CODESIGN and BASH_ENV, or no 'export PATH=' starting at /usr/bin. The build step can append to \$GITHUB_ENV/\$GITHUB_PATH and the runner applies both BETWEEN steps, so without those lines package.sh's seam refusal is defeatable from the step it guards against."
+        return 1
+    fi
+
+    import_run_ln="$(workflow_run_start "$wf" "$import_ln")"
+    if [ -z "$import_run_ln" ]; then
+        IMPORT_ORDER_VERDICT="the import step at l.$import_ln has no 'run:' block, so its preamble could not be checked."
+        return 1
+    fi
+    # Bounded by the pack line only as a backstop; the real bound is the
+    # three-non-comment-line limit, which is what makes this "FIRST in the body"
+    # rather than "somewhere in the step".
+    if ! workflow_has_scrub "$wf" "$import_run_ln" "$pack_ln" "" 3; then
+        IMPORT_ORDER_VERDICT="the import step's preamble is gone or is no longer first: the first three non-comment lines after its 'run:' at l.$import_run_ln do not include an 'unset' naming BASH_ENV and an 'export PATH=' starting at /usr/bin. This is the step that holds the raw certificate and its password, and it runs downstream of every third-party build script in the tree."
+        return 1
+    fi
+    if ! workflow_contains "$wf" '/usr/bin/security import'; then
+        IMPORT_ORDER_VERDICT="the import step no longer spells its keychain calls absolutely — no line reads '/usr/bin/security import'. An unqualified 'security' can be shadowed by an exported shell function or a PATH entry an earlier step wrote, which is exactly what the preamble exists to make impossible."
+        return 1
+    fi
+
+    embargo_ln="$(workflow_security_before_build "$wf" "$build_ln")"
+    if [ -n "$embargo_ln" ]; then
+        IMPORT_ORDER_VERDICT="line $embargo_ln runs a 'security' command inside a run: block BEFORE the unsigned build at l.$build_ln. Whatever it is spelled, a keychain operation there puts credentials on the machine while cargo compiles third-party sources (BR-1) — the four exact-invocation cases below cannot see a differently-spelled importer, and this is what catches it."
+        return 1
+    fi
+
+    IMPORT_ORDER_VERDICT="build l.$build_ln < import l.$import_ln < pack l.$pack_ln < early destroy l.$destroy_ln < smoke l.$smoke_ln; both scrubs present; nothing runs 'security' before the build"
+    return 0
+}
+
+# expect_order <expected status> <label> <workflow path>
+expect_order() {
+    local expected="$1" label="$2" wf="$3"
+    local status=0
+    reset_case
+    import_order_check "$wf" || status=$?
+    if [ "$status" -eq "$expected" ]; then
+        report_pass "$label"
+    else
+        report_fail "$label [expected order-status $expected, got $status]" \
+            "$IMPORT_ORDER_VERDICT"
+    fi
+    return 0
+}
+
+# verdict_names <fixed string> — reads the verdict the last expect_order left.
+# `case`, not `grep -qF`, for the reason release.yml's own identity assertion
+# gives at length: a grep that is missing or killed exits non-zero, which would
+# read here as "the verdict does not say that" and turn a tool failure into a
+# report about the workflow (LESSON-442).
+verdict_names() {
+    case "$IMPORT_ORDER_VERDICT" in
+        *"$1"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# workflow_mutate <src> <dst> <needle> <replacement> — <src> copied to <dst>
+# with the FIRST occurrence of the fixed string <needle> replaced. Exits
+# non-zero when the needle was not there at all, so a mutation that silently
+# changed nothing cannot be graded as a known-bad case: that would be a
+# known-bad copy of the GOOD file, reported green.
+workflow_mutate() {
+    awk -v needle="$3" -v repl="$4" '
+        !mutated {
+            p = index($0, needle)
+            if (p) {
+                $0 = substr($0, 1, p - 1) repl substr($0, p + length(needle))
+                mutated = 1
+            }
+        }
+        { print }
+        END { exit(mutated ? 0 : 3) }
+    ' "$1" >"$2"
+}
+
+# expect_order_mutant <name> <needle> <replacement> <expected status>
+#                     <verdict needle> <label>
+#
+# SIX parameters, and the sixth is the one the label is built from — this
+# comment listed five for as long as the function had six, which is how a reader
+# ends up passing the label into <verdict needle> and grading a case against its
+# own name.
+#
+# Builds a known-bad copy under the scratch directory, grades it, and asserts
+# the verdict names what changed. A mutation that would not apply is itself a
+# failure, named as one.
+expect_order_mutant() {
+    local name="$1" needle="$2" repl="$3" expected="$4" verdict_needle="$5"
+    local label="$6"
+    local dst="$order_scratch/$name.yml"
+    if ! workflow_mutate "$RELEASE_WORKFLOW" "$dst" "$needle" "$repl"; then
+        report_fail "$label [the known-bad copy could not be built: release.yml no longer contains '$needle']"
+        return 0
+    fi
+    expect_order "$expected" "$label" "$dst"
+    assert "  ... and the verdict names it: '$verdict_needle'" \
+        verdict_names "$verdict_needle"
+    return 0
+}
+
+# workflow_step_relocate <src> <dst> <step anchor> <destination anchor>
+#
+# <src> copied to <dst> with the whole step whose `- name:` line contains
+# <step anchor> lifted out — from that line to the line before the next step's
+# — and reinserted immediately before the `- name:` line containing
+# <destination anchor>. An EMPTY destination deletes the step instead.
+#
+# The sibling of workflow_mutate, for the mutations a single-line replacement
+# cannot express: "this step is gone" and "this step is in the wrong place" are
+# both whole-step edits, and both are regressions a reviewer would plausibly
+# wave through. Exits 3 when an anchor is not there or the destination is inside
+# the step being moved, so a mutation that changed nothing — or changed
+# something incoherent — cannot be graded as a known-bad case.
+workflow_step_relocate() {
+    awk -v step_anchor="$3" -v dest_anchor="$4" '
+        { lines[NR] = $0 }
+        /^      - name: / {
+            if (!s_start && index($0, step_anchor)) s_start = NR
+            else if (s_start && !s_end) s_end = NR - 1
+            if (dest_anchor != "" && !d_line && index($0, dest_anchor)) d_line = NR
+        }
+        END {
+            if (!s_start) exit 3
+            if (!s_end) s_end = NR
+            if (dest_anchor != "") {
+                if (!d_line) exit 3
+                if (d_line >= s_start && d_line <= s_end) exit 3
+            }
+            for (i = 1; i <= NR; i++) {
+                if (dest_anchor != "" && i == d_line)
+                    for (j = s_start; j <= s_end; j++) print lines[j]
+                if (i >= s_start && i <= s_end) continue
+                print lines[i]
+            }
+        }
+    ' "$1" >"$2"
+}
+
+# expect_order_relocation <name> <step anchor> <destination anchor>
+#                         <expected status> <verdict needle> <label>
+#
+# workflow_step_relocate's grader, shaped exactly like expect_order_mutant so
+# the two kinds of known-bad copy read the same in the log.
+expect_order_relocation() {
+    local name="$1" step_anchor="$2" dest_anchor="$3" expected="$4"
+    local verdict_needle="$5" label="$6"
+    local dst="$order_scratch/$name.yml"
+    if ! workflow_step_relocate "$RELEASE_WORKFLOW" "$dst" "$step_anchor" "$dest_anchor"; then
+        report_fail "$label [the known-bad copy could not be built from release.yml: '$step_anchor' or '$dest_anchor' is not a step name in it]"
+        return 0
+    fi
+    expect_order "$expected" "$label" "$dst"
+    assert "  ... and the verdict names it: '$verdict_needle'" \
+        verdict_names "$verdict_needle"
+    return 0
+}
+
+order_scratch="$work/release-yml-mutants"
+mkdir -p "$order_scratch"
+order_workflow_before="$(sha256_of "$RELEASE_WORKFLOW")"
+
+# The real file, and the case that goes red the day someone moves the step.
+expect_order 0 "release.yml imports the identity AFTER the build and BEFORE the pack" \
+    "$RELEASE_WORKFLOW"
+
+# Each anchor as its own case, so a rename or a dropped phase argument names
+# ITSELF in the log rather than arriving as one opaque ordering failure.
+assert "the unsigned build is still invoked with the 'build' phase argument" \
+    grep -Fq -- "$ORDER_ANCHOR_BUILD" "$RELEASE_WORKFLOW"
+assert "the import step is still named 'Import the Developer ID signing identity'" \
+    grep -Fq -- "$ORDER_ANCHOR_IMPORT" "$RELEASE_WORKFLOW"
+assert "the signing pass is still invoked with the 'pack' phase argument" \
+    grep -Fq -- "$ORDER_ANCHOR_PACK" "$RELEASE_WORKFLOW"
+assert "the early keychain destroy is still a step, named '(early)'" \
+    grep -Fq -- "$ORDER_ANCHOR_DESTROY" "$RELEASE_WORKFLOW"
+assert "the smoke step is still named 'Smoke the tarball (BR-7/BR-9)'" \
+    grep -Fq -- "$ORDER_ANCHOR_SMOKE" "$RELEASE_WORKFLOW"
+# The absolute spelling, as its own case, so a `security` that quietly loses its
+# /usr/bin names ITSELF here rather than arriving as one opaque order failure.
+assert "the import step calls security by absolute path" \
+    grep -Fq -- "/usr/bin/security import" "$RELEASE_WORKFLOW"
+
+# KNOWN-BAD, and the reason this group exists: AC-4's mutation, run on every
+# suite run instead of once by hand. The whole import step — from its `- name:`
+# line to the line before the next step's — is lifted out of a copy and
+# reinserted immediately above the step that invokes the `build` phase, which
+# is the pre-REQ-551 workflow and the exact regression a reviewer would wave
+# through as "just moving a step back". The build step's own `- name:` line is
+# DERIVED from the build anchor (the last `- name:` at or above it) rather than
+# spelled out, so this mutation carries no fourth string to keep in sync.
+order_moved="$order_scratch/import-above-build.yml"
+order_move_status=0
+awk -v import_anchor="$ORDER_ANCHOR_IMPORT" -v build_anchor="$ORDER_ANCHOR_BUILD" '
+    { lines[NR] = $0 }
+    /^      - name: / { last_name = NR }
+    !build_step && index($0, build_anchor) { build_step = last_name }
+    !imp_start && index($0, import_anchor) { imp_start = NR }
+    imp_start && !imp_end && NR > imp_start && /^      - name: / { imp_end = NR - 1 }
+    END {
+        if (!imp_start || !build_step || build_step >= imp_start) exit 3
+        if (!imp_end) imp_end = NR
+        for (i = 1; i <= NR; i++) {
+            if (i == build_step)
+                for (j = imp_start; j <= imp_end; j++) print lines[j]
+            if (i >= imp_start && i <= imp_end) continue
+            print lines[i]
+        }
+    }
+' "$RELEASE_WORKFLOW" >"$order_moved" || order_move_status=$?
+
+if [ "$order_move_status" -ne 0 ]; then
+    report_fail "a copy with the import step moved ABOVE the build (AC-4) [the mutation could not be constructed from release.yml, awk exited $order_move_status]"
+else
+    expect_order 1 "a copy with the import step moved ABOVE the build -> RED (AC-4)" \
+        "$order_moved"
+    assert "  ... naming the inversion rather than a missing anchor" \
+        verdict_names "not strictly between"
+fi
+
+# KNOWN-BAD: the step renamed. The anchor is a step NAME, so this is the
+# realistic drift — and the one that must not read as "the order is fine".
+expect_order_mutant renamed-import \
+    "$ORDER_ANCHOR_IMPORT" "- name: Set up code signing" \
+    2 "$ORDER_ANCHOR_IMPORT" \
+    "a copy whose import step is RENAMED -> RED, not a vacuous pass"
+
+# KNOWN-BAD: the phase arguments dropped, which is how the split gets undone
+# one invocation at a time. `dist` alone is package.sh's `all` default — a
+# single step that compiles AND signs, with the identity already imported.
+# shellcheck disable=SC2016  # deliberate: the workflow's bytes, not ours
+expect_order_mutant no-build-phase \
+    "$ORDER_ANCHOR_BUILD" 'bash tools/release/package.sh "$TARGET" "$VERSION" dist' \
+    2 "$ORDER_ANCHOR_BUILD" \
+    "a copy with the 'build' phase argument dropped -> RED"
+# shellcheck disable=SC2016  # deliberate: the workflow's bytes, not ours
+expect_order_mutant no-pack-phase \
+    "$ORDER_ANCHOR_PACK" 'bash tools/release/package.sh "$TARGET" "$VERSION" dist' \
+    2 "$ORDER_ANCHOR_PACK" \
+    "a copy with the 'pack' phase argument dropped -> RED"
+
+# KNOWN-BAD: an anchor that appears TWICE. The realistic shape is a step copied
+# rather than moved — a retry, a second matrix leg, a paste somebody meant to
+# edit — and it is the case a line-number check is quietest about, because "the
+# first match" is still a number and still compares. Before the ambiguity
+# sentinel existed this file reported it as the anchor having VANISHED, which is
+# the opposite diagnosis and sends the reader hunting for a deletion.
+#
+# The replacement carries a `\n`, which `awk -v` turns into a real newline: the
+# one matching line becomes two identical ones.
+# shellcheck disable=SC2016  # deliberate: the workflow's bytes, not ours
+expect_order_mutant duplicated-pack \
+    "$ORDER_ANCHOR_PACK" "$ORDER_ANCHOR_PACK\\n          $ORDER_ANCHOR_PACK" \
+    2 "appears 2 times" \
+    "a copy with the pack anchor DUPLICATED -> RED as ambiguous, not as missing"
+
+# KNOWN-BAD: the EARLY DESTROY deleted outright. Every control this group grew
+# in REQ-551's third pass was, until these four cases existed, entirely
+# unguarded — the round-2 review added the steps and the round-3 review proved
+# by mutation that deleting them left the suite green. A control nothing can
+# fail is a comment.
+#
+# The whole step is lifted out rather than renamed, because "somebody removed
+# the cleanup" is the regression, and it must not be reachable by a mutation
+# this suite cannot construct. What is left behind is the `if: always()`
+# backstop, which runs after the smoke and the upload — a workflow that still
+# destroys the keychain, just not before the binaries are executed.
+expect_order_relocation no-early-destroy \
+    "$ORDER_ANCHOR_DESTROY" "" \
+    2 "$ORDER_ANCHOR_DESTROY" \
+    "a copy with the early keychain destroy step DELETED -> RED"
+
+# KNOWN-BAD: the same step kept, moved after the smoke. This is the quieter
+# regression of the two — every anchor is present, the step still exists, the
+# job still cleans up — and it puts the smoke, which EXECUTES the freshly built
+# binaries, back inside the window. A name-only check cannot see it, which is
+# why the position is graded rather than the presence.
+expect_order_relocation destroy-after-smoke \
+    "$ORDER_ANCHOR_DESTROY" "- name: Upload target artifact" \
+    1 "not strictly between the pack and the smoke" \
+    "a copy with the early destroy MOVED after the smoke -> RED"
+
+# KNOWN-BAD: the signing step's environment scrub deleted. The line is replaced
+# with a shell no-op rather than removed, so the mutation is a one-line edit of
+# exactly the kind a reviewer waves through as tidying.
+expect_order_mutant no-sign-scrub \
+    "unset TETON_CODESIGN TETON_ALLOW_TOOL_SEAM BASH_ENV ENV CDPATH" ":" \
+    1 "environment scrub is gone" \
+    "a copy with the signing step's env scrub deleted -> RED"
+
+# KNOWN-BAD: an importer BEFORE the build, spelled differently from the four
+# invocations `expect_keychain_op_after_build` pins. This is the hole the
+# embargo closes: those four cases match exact argument lists, so a keychain
+# operation written any other way — a different subcommand, different variable
+# names, a helper script — sails past all of them while putting credentials on
+# the machine for the whole compile.
+#
+# `\n` in the replacement is turned into real newlines by `awk -v`, so one line
+# becomes a whole inserted step.
+expect_order_mutant security-before-build \
+    "      - name: Build (unsigned)" \
+    "      - name: Warm up the keychain (known-bad)\\n        run: |\\n          security list-keychains -d user\\n      - name: Build (unsigned)" \
+    1 "BEFORE the unsigned build" \
+    "a copy with a differently-spelled security call BEFORE the build -> RED"
+
+# Nine mutations, none of them to the tracked file. A suite that edits the
+# workflow it asserts about — even to put it back — is one interrupted run away
+# from a working tree nobody trusts.
+assert "release.yml itself was never written to: every mutation was a copy" \
+    [ "$(sha256_of "$RELEASE_WORKFLOW")" = "$order_workflow_before" ]
+
+# --- what the ordering is FOR ----------------------------------------------
+#
+# The three anchors above pin an order between two package.sh invocations and a
+# step NAME. A step name is a label, and a label is not a behaviour: the import
+# step could keep its name, keep its position, and have its keychain work moved
+# into a differently-named step above the build — and every case above would
+# still be green while a Developer ID private key sat on the machine for the
+# whole of the compile, which is the one thing BR-1 forbids.
+#
+# So these cases anchor on the KEYCHAIN OPERATIONS themselves, wherever they
+# live: each must appear exactly once in the workflow, and after the unsigned
+# build. Each needle is the invocation, spelled precisely enough to exclude the
+# prose that discusses it — `security import` alone appears on several lines of
+# release.yml, most of them comments and error text, and an assertion that
+# counted those would be counting sentences.
+#
+# THE IMPORT NEEDLE IS ABSOLUTE — `/usr/bin/security import "$p12"`, not
+# `security import "$p12"` — because that is now the spelling, and a needle that
+# accepted either would go on passing after the /usr/bin were dropped. An
+# unqualified `security` is resolvable by an exported shell function or a PATH
+# entry that the untrusted build step wrote to `$GITHUB_PATH`, so the absolute
+# path is a control and not a style choice. (The other three needles below
+# match either spelling as substrings; this one pins the property.)
+#
+# `delete-keychain` and `list-keychains` are deliberately NOT pinned this way:
+# destroying the keychain is something the workflow may reasonably do in more
+# than one place (early, and again in an always() cleanup), so "exactly once" is
+# the wrong shape for them. Creating, unlocking, importing into and unlocking
+# the KEY are the operations that put a usable private key on the machine, and
+# those are once-only by construction.
+
+group "the keychain operations themselves are after the build (BR-1)"
+
+# expect_keychain_op_after_build <label> <needle>
+expect_keychain_op_after_build() {
+    local label="$1" needle="$2"
+    local build_ln op_ln
+    reset_case
+    build_ln="$(workflow_line_of "$RELEASE_WORKFLOW" "$ORDER_ANCHOR_BUILD")"
+    op_ln="$(workflow_line_of "$RELEASE_WORKFLOW" "$needle")"
+    case "$build_ln" in
+        '' | ambiguous:*)
+            report_fail "$label [no single line of release.yml invokes the unsigned build, so 'after the build' has no line to be after: $ORDER_ANCHOR_BUILD]"
+            return 0
+            ;;
+    esac
+    case "$op_ln" in
+        '')
+            report_fail "$label [no line of release.yml runs: $needle]"
+            return 0
+            ;;
+        ambiguous:*)
+            report_fail "$label [release.yml runs it on ${op_ln#ambiguous:} lines — it must happen once, in one place: $needle]"
+            return 0
+            ;;
+    esac
+    if [ "$op_ln" -gt "$build_ln" ]; then
+        report_pass "$label"
+    else
+        report_fail "$label [line $op_ln runs it, and the unsigned build is line $build_ln — the key is on the machine while cargo runs (BR-1)]"
+    fi
+    return 0
+}
+
+# shellcheck disable=SC2016  # deliberate: the workflow's bytes, not ours
+expect_keychain_op_after_build \
+    "the signing keychain is CREATED after the unsigned build, once" \
+    'security create-keychain -p "$keychain_pw"'
+# shellcheck disable=SC2016  # deliberate: the workflow's bytes, not ours
+expect_keychain_op_after_build \
+    "the signing keychain is UNLOCKED after the unsigned build, once" \
+    'security unlock-keychain -p "$keychain_pw"'
+# shellcheck disable=SC2016  # deliberate: the workflow's bytes, not ours
+expect_keychain_op_after_build \
+    "the Developer ID .p12 is IMPORTED after the unsigned build, once, by absolute path" \
+    '/usr/bin/security import "$p12"'
+expect_keychain_op_after_build \
+    "the private key is made usable without a prompt after the unsigned build, once" \
+    'security set-key-partition-list -S apple-tool:,apple:'
+
+# --- the `if:` predicates that decide whether any of it runs ----------------
+#
+# Every ordering assertion in this file is about line NUMBERS, and a step that
+# is skipped has line numbers too. `if: contains(matrix.target, 'apple-darwin')`
+# on the import step is what makes the order above a statement about the macOS
+# legs rather than about a file; flip it to `false`, or to a target expression
+# that matches nothing, and the identity is never imported, the pack step signs
+# nothing, and the leg ships unsigned binaries with every case above still
+# green. (`package.sh` refuses to ship unsigned when TETON_SIGN_IDENTITY is set,
+# which is the backstop — but a workflow whose steps silently stop running is
+# worth catching where it is written.)
+#
+# The predicate is pinned as the line IMMEDIATELY AFTER each step's `- name:`,
+# which is both where GitHub Actions convention puts it and what makes "this
+# predicate belongs to that step" checkable without a YAML parser. An exact
+# string, indentation included: a `!` or a different matrix key is the whole
+# bug, and a fuzzy match is how it survives.
+
+group "the darwin/linux step predicates in release.yml"
+
+IF_DARWIN="        if: contains(matrix.target, 'apple-darwin')"
+IF_NOT_DARWIN="        if: \${{ !contains(matrix.target, 'apple-darwin') }}"
+
+# expect_if_predicate <label> <step-name anchor> <expected `if:` line>
+expect_if_predicate() {
+    local label="$1" anchor="$2" want="$3"
+    local ln got
+    reset_case
+    ln="$(workflow_line_of "$RELEASE_WORKFLOW" "$anchor")"
+    case "$ln" in
+        '')
+            report_fail "$label [no line of release.yml reads: $anchor]"
+            return 0
+            ;;
+        ambiguous:*)
+            report_fail "$label [${ln#ambiguous:} lines of release.yml read it, so which step carries the predicate is a guess: $anchor]"
+            return 0
+            ;;
+    esac
+    got="$(awk -v n="$((ln + 1))" 'NR == n' "$RELEASE_WORKFLOW")"
+    if [ "$got" = "$want" ]; then
+        report_pass "$label"
+    else
+        report_fail "$label [line $((ln + 1)), the line under that step's name, is not the expected predicate]" \
+            "expected: $want
+got:      $got"
+    fi
+    return 0
+}
+
+expect_if_predicate "the unsigned build runs on the darwin legs and only those" \
+    "- name: Build (unsigned)" "$IF_DARWIN"
+expect_if_predicate "the identity import runs on the darwin legs and only those" \
+    "$ORDER_ANCHOR_IMPORT" "$IF_DARWIN"
+expect_if_predicate "the sign-and-pack step runs on the darwin legs and only those" \
+    "- name: Sign and package" "$IF_DARWIN"
+# The early destroy is NOT `always()`, deliberately — it is the happy-path
+# narrowing and the `if: always()` step at the bottom of the job is the
+# failure-path backstop. Pinned for the reason every predicate here is: a
+# `false`, a negation or a drifted matrix key leaves the step in the file, in
+# the right place, and never run, with every position case above still green.
+expect_if_predicate "the early keychain destroy runs on the darwin legs and only those" \
+    "$ORDER_ANCHOR_DESTROY" "$IF_DARWIN"
+# The negated form, which is the half that keeps the Linux leg from being run
+# TWICE — once by its own step and once by a darwin step whose predicate drifted.
+expect_if_predicate "the Linux one-shot step runs on everything that is NOT darwin" \
+    "- name: Build and package (Linux, unsigned)" "$IF_NOT_DARWIN"
 
 # --- summary ---------------------------------------------------------------
 

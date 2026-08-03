@@ -1,7 +1,7 @@
 ---
 id: REQ-551
 title: "Import the signing identity only after untrusted compilation"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-01
 updated: 2026-08-01
@@ -30,8 +30,10 @@ regardless); the unlocked keychain is the sharper capability and is untouched.
 This REQ closes that window: no signing credential material — imported
 identity, unlocked keychain, or decoded p12 — may exist on the runner while
 any untrusted code executes. The identity arrives only after compilation
-completes, immediately before the sign→verify→tar sequence, and every
-guarantee REQ-550 established must survive the restructuring.
+completes, immediately before the sign→verify→tar sequence
+(import → sign → early destroy; the tarball smoke and the artifact upload
+run afterwards with no keychain present), and every guarantee REQ-550
+established must survive the restructuring.
 
 ## System Model
 
@@ -104,6 +106,81 @@ guarantee REQ-550 established must survive the restructuring.
 - [ ] AC-5: shellcheck + actionlint clean; no new secret-interpolation
       into `run:` bodies; the `if: always()` keychain cleanup still covers
       all failure paths of the narrowed window.
+
+## Deviations (verify pass, 2026-08-03)
+
+Recorded rather than silently absorbed, so a reader comparing the spec to the
+merged pipeline finds the difference here instead of deriving it.
+
+- **AC-2 is staged, not skipped.** "A full release (or main-dispatched dry run)
+  goes green end-to-end with the restructured job" cannot be exercised from
+  this REQ's branch: the `release-signing` and `tap-publish` environments admit
+  exactly two ref shapes — the `main` branch and `v*.*.*` tags — so a dispatch
+  from `feat/REQ-551-…` is refused by the deployment rules before the job
+  starts, and there is no ref this branch could dispatch from that would reach
+  the certificate. First exercised by the post-merge dry run from `main`, or by
+  the next real release, whichever comes first. This is the same posture and
+  the same precedent REQ-550 set for its own environment-gated criteria (see
+  runbook §11 steps 2/4/6): a criterion nobody *could* have run is recorded as
+  unrun, never assumed and never quietly dropped.
+- **ADR-551-1's "moved verbatim" means the executable body, not the whole
+  step.** The import step's shell body is byte-identical to REQ-550's — checked
+  by the reflector, not asserted — and its `- name:` line is unchanged, which
+  is what the ordering assertion keys on. What did change is 16 annotation
+  strings inside it, retargeted under TASK-029's recorded scope extension:
+  before the reorder they told the reader "Nothing was built," which stopped
+  being true the moment the compile moved above the import. They now say the
+  build already finished and the leg fails before anything is signed. Correcting
+  a message that had become false is not a deviation from "verbatim"; leaving it
+  in place to preserve the word would have been.
+- **The cross-boundary staging guard is a superset of what ADR-551-1
+  specified.** The ADR describes `pack` refusing a missing or incomplete
+  staging directory in terms of the two binaries. As implemented it also checks
+  the ride-alongs — `LICENSE` and `README.md` — because every member of the
+  tarball comes out of the staging directory and `tar` failing on a missing one
+  would report a file, from outside `package.sh`'s exit taxonomy, rather than
+  reporting a phase. Wider than specified, in the direction the rule points.
+- **`package.sh` grew changes the ADRs never described**, listed here so that
+  reconciling the merged script against ADR-551-1 does not require diffing them
+  line by line. All of them arrived in the verify passes (2026-08-03):
+  - **`.stage-meta`**, the handoff manifest (version + a sha256 per member),
+    written atomically via a temp name and removed with the whole half-made
+    stage when a digest cannot be computed. Its framing in the code and the
+    runbook is deliberately narrow: it detects a **stale, partial,
+    version-skewed or accidentally altered** stage, and it is
+    **unauthenticated** — anything that can write `<outdir>` rewrites the
+    manifest too. That axis stays with the provenance attestation
+    (ADR-550-3); the manifest is not a second one.
+  - **The scratch-sign design.** `pack` copies the two binaries to a
+    trap-cleaned scratch directory, signs and verifies *those*, and tars them
+    beside the stage's `LICENSE`/`README.md` — the member list and its order
+    are unchanged. `codesign` rewrites the file it signs, so signing in place
+    made "a failed pack keeps the stage for a cheap retry" false in exactly
+    the case it was written for (`--sign` succeeds, `--verify` rejects): the
+    retry hit the manifest check and was refused as a tampered stage. The
+    stage is now written by `pack` on one path only — the success-path
+    consume.
+  - **Argument refusals**: a fifth argument, and a *three*-argument invocation
+    whose `[outdir]` is a phase name (`package.sh <target> <version> pack` is
+    an `all` into a directory called `pack` — the pre-REQ-551 ordering reached
+    by a typo). Gated on `$# -eq 3`, so a spelled-out fourth argument makes it
+    an ordinary pack into `./pack`.
+  - **Per-member file-type checks** in the pack guard: symlink, directory, and
+    anything else that is not a regular file, each `70` naming itself. Without
+    them a directory member surfaces as `75` "no sha256 tool on this machine",
+    which is the wrong code and the wrong diagnosis.
+  - **`lib.sh`'s `tool_or_unchecked`** rejects a non-absolute resolution when
+    no override was given: an exported shell function planted through
+    `$BASH_ENV` resolves as a bare name, and would otherwise *be* the signer.
+- **The three identity-touching workflow steps carry an environment preamble**
+  that no ADR describes (import, sign-and-package, early destroy): `BASH_ENV`/
+  `ENV`/`CDPATH` unset, the tools' shell functions unset, `PATH` pinned to the
+  system directories, and `security` invoked absolutely. The reorder put those
+  steps *downstream* of untrusted compilation while `$GITHUB_ENV`/
+  `$GITHUB_PATH` are applied between steps. Recorded with its limit: this
+  closes the in-band channels only — a persistent background process from the
+  build is runner-level compromise, which OQ-1 (split jobs) is the recorded
+  answer to and this REQ does not claim to address.
 
 ## External Dependencies
 

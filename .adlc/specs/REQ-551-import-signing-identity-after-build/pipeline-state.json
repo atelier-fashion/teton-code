@@ -1,0 +1,74 @@
+{
+  "req": "REQ-551",
+  "branch": "feat/REQ-551-import-signing-identity-after-build",
+  "startedAt": "2026-08-01T14:00:00Z",
+  "completed": false,
+  "currentPhase": 6,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Worktree .worktrees/REQ-551 from origin/main@4497205; manifest advisory (zero remote in-flight; parallel local session noted); id recheck self-pass; draft PR #16",
+      "completedAt": "2026-08-01T14:05:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Spec validated: APPROVED, 0 blockers, 1 warning (file-specific BRs, house style)",
+      "completedAt": "2026-08-01T14:10:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "ADR-551-1 (same-job reorder via package.sh phase arg build/pack/all) + ADR-551-2 (mutation-proven ordering assertion); TASK-027..029 chain; 2 focused explorers (mapper role subsumed, deviation stated); footprint published to PR #16",
+      "completedAt": "2026-08-01T14:30:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Architecture+tasks validated: chain DAG, full BR/AC coverage, 0 blockers",
+      "completedAt": "2026-08-01T14:32:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "3/3 tasks sequential chain; selftest 310->323 (13 permanent ordering cases incl. in-suite known-bad mutations); annotation truth-fix; all-phase byte-compat proven vs HEAD",
+      "completedAt": "2026-08-01T15:30:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify: 6 agents -> 1 process Critical (unpushed branch; pushed) + 5 Major + ~18 minor; fix pass (early keychain destroy per reflector Q1, env scrub, stage integrity); Step-D re-verify found round-2's own Critical (unscrubbed import step downstream of untrusted build, BASH_ENV/function-shadowing \u2014 empirically proven) + High/Medium -> round-3 hardening (absolute tools, scratch-sign recovery, all controls self-asserted); selftest 323->407; closure proven via the reports' own attack recipes, re-run first-hand",
+      "completedAt": "2026-08-03T18:00:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-551",
+      "branch": "feat/REQ-551-import-signing-identity-after-build",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/16",
+      "prNumber": 16,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-027",
+      "TASK-028",
+      "TASK-029"
+    ],
+    "failedTasks": []
+  }
+}
