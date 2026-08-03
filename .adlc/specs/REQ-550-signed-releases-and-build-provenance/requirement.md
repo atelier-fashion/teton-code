@@ -141,7 +141,7 @@ human steps explicitly instead of leaving them implicit.
 - [x] AC-5 (PROVEN 2026-08-03, v0.1.2 — tag push to published tap with zero manual steps): The tag-driven release workflow is green end-to-end with signing
       and attestation on all three targets, with no manual step beyond tag
       push (preserves REQ-548 AC-3).
-- [ ] AC-6: Keychain-grant survival across an upgrade (BR-1's user-visible
+- [x] AC-6 (PASSED 2026-08-03, human-verified: v0.1.2 -> v0.1.3 upgrade + service restart produced NO Keychain re-prompt; sign-off block in runbook §10): Keychain-grant survival across an upgrade (BR-1's user-visible
       contract) is human-verified once two consecutively signed releases
       exist — staged like REQ-548 AC-4: the criterion is defined now, first
       exercisable at the second signed release, and recorded as unrun until

@@ -721,7 +721,7 @@ publishing a run that skipped signing. A release published unsigned after a
 signed one re-prompts every user who has granted the daemon Keychain access, and
 the next release cannot undo that — the prompt already happened.
 
-### AC-6 — Keychain-grant survival (staged)
+### AC-6 — Keychain-grant survival (PASSED 2026-08-03)
 
 AC-6 is the human check for the contract at the top of this section, and it
 cannot be run until two consecutively signed releases exist: with one, there is
@@ -736,18 +736,22 @@ block into that release's sign-off with the defaults as written, and edit only
 the lines you actually ran.
 
 ```
-AC-6 sign-off — Keychain-grant survival, teton vX.Y.Z (upgraded from vA.B.C)
+AC-6 sign-off — Keychain-grant survival, teton v0.1.3 (upgraded from v0.1.2)
 ---------------------------------------------------------------------------
-Status            :  unrun            ( unrun | pass | fail )
-Verified by       :
-Date              :
-Prior release     :                   (the signed release the grant was given to)
-Grant established :  unrun            (a Keychain prompt was raised and accepted
-                                       while running the PRIOR release)
-brew upgrade + brew services restart : unrun
-Re-prompt observed:  unrun            (no prompt == pass; any prompt == fail)
-Team id, both releases : unrun         (codesign -dvv on each; must be identical)
-Notes / findings  :
+Status            :  pass
+Verified by       :  Brett (user-confirmed in session)
+Date              :  2026-08-03
+Prior release     :  v0.1.2            (first Developer ID signed release)
+Grant established :  yes               (Keychain prompt raised and accepted
+                                       while running v0.1.2)
+brew upgrade + brew services restart : run
+Re-prompt observed:  NO — pass         (the grant survived the upgrade)
+Team id, both releases : 545BU9G9D6    (identical; asserted per-release by the
+                                       smoke's signature gate)
+Notes / findings  :  The user-visible contract of REQ-550 BR-1 holds: the
+                     v0.1.2 prompt was the LAST one. This closes the arc that
+                     began with REQ-549 ("why is teton code coming across as
+                     'tetond' when asking for permissions?").
 ```
 
 ---
