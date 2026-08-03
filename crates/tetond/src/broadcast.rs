@@ -165,6 +165,11 @@ impl Subscription {
     /// knows publishing has finished can drain deterministically instead of
     /// polling `recv` under a wall-clock timeout (the assertion shape that
     /// goes flaky first under CI scheduler pressure — LESSON-450).
+    ///
+    /// `None` conflates "empty right now" with "ended" — use [`Self::recv`]
+    /// when that distinction matters, and [`Self::is_lagged`] to tell an
+    /// eviction from a disconnect. A caller that loops on this without an
+    /// end condition of its own would busy-spin on a live, empty queue.
     pub fn try_recv(&mut self) -> Option<EventEnvelope> {
         self.rx.try_recv().ok()
     }

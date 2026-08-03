@@ -314,22 +314,35 @@ impl ContextManager {
     /// that catches what the whitespace heuristic undercounts.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        // REQ-554 BR-5: charge a per-block rendering reserve. The estimate must
-        // bound the RENDERED prompt, and every rendering adds frame bytes the
-        // block text does not carry — flat labels (`Tool (name):\n`, ~8-20 B) or
-        // ChatML delimiters (≤33 B/message plus the generation cue). The byte
-        // budget runs at roughly 1× the engine window in the conservative
-        // ≳2-bytes-per-BPE-token currency (LESSON-446), so this overhead is NOT
-        // absorbed by headroom; charging a flat, format-independent reserve
-        // keeps the estimate a true upper bound in both modes without teaching
-        // this type about rendering formats.
+        // REQ-554 BR-5: charge a per-block rendering reserve plus the fixed
+        // per-prompt terms. Every rendering adds frame bytes the block text
+        // does not carry — flat labels (`Tool (name):\n`) or ChatML delimiters
+        // (≤33 B/message) — and the byte budget runs at roughly 1× the engine
+        // window in the conservative ≳2-bytes-per-BPE-token currency
+        // (LESSON-446), so this overhead is NOT absorbed by headroom.
+        //
+        // This is a *conservative estimate*, not a proven bound: content
+        // carrying many control-token spellings grows ~10% at render time
+        // (each defused spelling gains one byte), which lands after this
+        // measurement. The consequence of an underestimate is the engine's
+        // typed over-window refusal — an error, never the GGML abort
+        // (LESSON-444) — and such content is pathological by construction.
+        let fixed = RENDER_OVERHEAD_RESERVE_BYTES
+            + if self.truncated {
+                // The truncation note and the synthetic leading user turn
+                // `prepare()` injects, both charged only when truncation is
+                // what makes them appear.
+                TRUNCATION_NOTE_BYTES + CONTINUATION_USER_TURN.len()
+            } else {
+                0
+            };
         self.system.len()
             + self
                 .blocks
                 .iter()
                 .map(|b| b.text.len() + RENDER_OVERHEAD_RESERVE_BYTES)
                 .sum::<usize>()
-            + RENDER_OVERHEAD_RESERVE_BYTES
+            + fixed
     }
 
     /// Drop the oldest blocks until the estimate fits **both** budgets (tokens
@@ -510,6 +523,11 @@ pub(crate) const TOOL_RESULT_LABEL_PREFIX: &str = "Tool result (";
 /// estimate format-independent (and a true upper bound in both modes).
 pub(crate) const RENDER_OVERHEAD_RESERVE_BYTES: usize = 64;
 
+/// Bytes the "earlier conversation was truncated" note adds to the system
+/// prompt once truncation has happened — charged by `estimated_bytes` only
+/// then, since that is when `prepare()` appends it.
+const TRUNCATION_NOTE_BYTES: usize = 64;
+
 /// Approximate token count by whitespace splitting (matches the mock engine's
 /// prompt-token heuristic, so budgets are consistent end to end).
 #[must_use]
@@ -659,15 +677,21 @@ pub async fn summarize_if_large(
         engine_error: Some(error),
     };
     match result {
-        Ok(Ok((completion, format))) => {
+        Ok(Ok((completion, _format))) => {
             // REQ-554 verify: the duty's output feeds straight back into
-            // context, so it gets the same fabrication cut an agent turn gets —
-            // a summarizer that emits `<|im_start|>user…` must not smuggle a
-            // forged turn into context (the turn path cuts at
+            // context, so a summarizer emitting `<|im_start|>user…` must not
+            // smuggle a forged turn in (the turn path cuts at
             // `LocalEngineSource::produce_turn`; this is the duty-path twin).
+            //
+            // Control tokens ONLY, not the format's full marker set: a summary
+            // of a transcript — or of this repo's own source — legitimately
+            // contains `Assistant:` at a line start, and cutting there would
+            // silently truncate a correct summary (re-verify finding). The
+            // control tokens are never legitimate output in either rendering,
+            // so the format does not enter into it.
             let mut summary = completion.text;
             summary
-                .truncate(super::reply::ReplyScanner::scan_all_for(format, &summary).context_cut());
+                .truncate(super::reply::ReplyScanner::scan_control_tokens(&summary).context_cut());
             SummarizeOutcome {
                 text: format!(
                     "[summarized {tool} output — {} tokens elided]\n{}",

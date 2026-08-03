@@ -298,6 +298,31 @@ impl ReplyScanner {
         scanner
     }
 
+    /// A scanner watching ONLY the template control tokens — no prose-shaped
+    /// anchored markers.
+    ///
+    /// For the summarizer duty (REQ-554 re-verify): a summary legitimately
+    /// reproduces `Assistant:` or `Tool (` when it summarizes a transcript, a
+    /// chat log, or this repo's own source, and cutting there would silently
+    /// truncate a correct summary. The injection axis the duty cut exists for
+    /// is the control tokens — those are never legitimate output — so the
+    /// duty watches those alone.
+    pub(crate) fn scan_control_tokens(text: &str) -> Self {
+        let mut scanner = Self {
+            buf: String::new(),
+            pos: 0,
+            depth: 0,
+            in_string: false,
+            escaped: false,
+            obj_start: 0,
+            stop: None,
+            anchored: &[],
+            floating: TEMPLATE_CONTROL_MARKERS,
+        };
+        scanner.push(text);
+        scanner
+    }
+
     /// Append a streamed chunk and process it. Returns `false` when the turn is
     /// over and generation should stop.
     pub(crate) fn push(&mut self, chunk: &str) -> bool {
