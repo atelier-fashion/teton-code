@@ -93,7 +93,7 @@ established must survive the restructuring.
       step) on both macOS legs; the keychain-open window covers only
       first-party signing/packaging code. Verified by reading the job's
       step order AND by BR-6's mechanical assertion.
-- [ ] AC-2: A full release (or main-dispatched dry run) goes green
+- [x] AC-2 (PROVEN 2026-08-03, run 30821899290 — main-dispatched dry run: all legs green; both macOS binaries Developer ID signed by 545BU9G9D6; keychain destroyed before smoke/upload; attest+verify green): A full release (or main-dispatched dry run) goes green
       end-to-end with the restructured job: build → import → sign → verify
       → tar → smoke → attest → verify-attestations.
 - [x] AC-3: `tools/release/selftest.sh` remains fully green with coverage
