@@ -44,6 +44,27 @@ the `teton-code` already running is still the old one until something restarts i
 and `teton doctor` names the running daemon's version so you can tell which one
 answered.
 
+### Uninstalling
+
+```sh
+teton uninstall
+```
+
+One command, the whole chain: it stops the `brew services` daemon, deletes the
+state directory (`~/Library/Application Support/teton` — the downloaded model,
+cost history, and config), removes the daemon logs and any provider keys in the
+macOS keychain, and finishes with `brew uninstall teton`. It shows the full
+plan — with the size of what it's about to delete — and asks once before
+touching anything; `--keep-data` preserves the state directory for a later
+reinstall, and `--yes` answers the prompt for unattended runs.
+
+This is a `teton` subcommand rather than a `brew uninstall` hook on purpose:
+Homebrew formulae have no uninstall hook (that's cask-only), and
+`brew uninstall` doesn't even stop a running service — run bare, it removes
+the binaries and strands the daemon, the model, and the logs. If you've
+already done that, the leftovers are `brew services stop teton`,
+`~/Library/Application Support/teton`, and `$(brew --prefix)/var/log/teton`.
+
 ### What runs where
 
 | Platform | Release target | Local inference |
