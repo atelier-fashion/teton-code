@@ -133,7 +133,7 @@ human steps explicitly instead of leaving them implicit.
 - [x] AC-3: The selftest proves both gates can fail: a byte-flipped tarball
       fails attestation verification and an ad-hoc-signed stand-in fails the
       signature gate, each with the correct exit classification (BR-5, BR-7).
-- [~] AC-4 (steps 1-5 of runbook §11 done 2026-08-03 incl. negative probe run 30832422680; step 6 BLOCKED on re-adding the tap-publish environment token — see runbook): `HOMEBREW_TAP_TOKEN` and `GCP_*` no longer appear as repository
+- [x] AC-4 (PROVEN 2026-08-03: negative half — probe run 30832422680 refused with zero steps; positive half — bump-formula rerun green on run 30831179493 with the environment holding the ONLY token copy; repo-level copy deleted; full sequence in runbook §11): `HOMEBREW_TAP_TOKEN` and `GCP_*` no longer appear as repository
       secrets; a manually-dispatched workflow on a non-release ref cannot
       read them (verified by a deliberate failing probe run, recorded in the
       REQ). Environment protection rules are screenshotted/recorded since
