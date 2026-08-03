@@ -1,7 +1,7 @@
 ---
 id: TASK-031
 title: "First-party ChatML renderer for PreparedPrompt and duty prompts"
-status: draft
+status: complete
 parent: REQ-554
 created: 2026-08-03
 updated: 2026-08-03
@@ -27,26 +27,26 @@ wraps a duty instruction (summarizer) as a single user-message conversation
 
 ## Acceptance Criteria
 
-- [ ] ChatML rendering of a system + user + assistant + tool-result
+- [x] ChatML rendering of a system + user + assistant + tool-result
       conversation contains `<|im_start|>system`, `<|im_start|>user`,
       `<|im_start|>assistant`, `<|im_end|>` delimiters and ends with the
       bare `<|im_start|>assistant\n` cue (AC-1).
-- [ ] The rendered ChatML string does NOT contain the flat structural frame:
+- [x] The rendered ChatML string does NOT contain the flat structural frame:
       no `\nUser:\n`, `\nAssistant:\n`, or `\nTool (` block labels (AC-1).
       (Tool-result *content* — including its `<tool-result>` envelope — rides
       inside a user message verbatim, per AC-2.)
-- [ ] Tool results appear as user-role messages, and consecutive same-role
+- [x] Tool results appear as user-role messages, and consecutive same-role
       messages arrive pre-merged from `prepare()` — the renderer asserts/relies
       on alternation rather than re-merging (AC-2).
-- [ ] `render_prompt(Flat, p)` returns exactly `p.flat` (fallback is
+- [x] `render_prompt(Flat, p)` returns exactly `p.flat` (fallback is
       byte-identical).
-- [ ] `render_duty(ChatMl, "Summarize…")` produces a one-user-message ChatML
+- [x] `render_duty(ChatMl, "Summarize…")` produces a one-user-message ChatML
       conversation ending with the assistant cue; `render_duty(Flat, i)`
       returns `i` unchanged (BR-7).
-- [ ] Every ChatML message's added delimiter bytes ≤
+- [x] Every ChatML message's added delimiter bytes ≤
       `CHATML_PER_MESSAGE_OVERHEAD_BYTES` — pinned by a test that measures
       rendered-minus-content length per message (BR-5 accounting, AC-8).
-- [ ] All tests run in default CI builds (no `llama` feature) — AC-8.
+- [x] All tests run in default CI builds (no `llama` feature) — AC-8.
 
 ## Technical Notes
 

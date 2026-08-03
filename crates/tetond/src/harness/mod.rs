@@ -23,6 +23,9 @@
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
 //!   lets one loop run either tier.
+//! - [`render`] — prompt rendering for the local tier (REQ-554): the model's
+//!   native ChatML template when the loaded GGUF carries one, the flat
+//!   `User:`/`Assistant:` transcript as the visible fallback.
 //! - [`reply`] — model-reply scanning (BUG-147): the turn-boundary scanner that
 //!   stops a weak model at its first tool call instead of letting it fabricate
 //!   the rest of the transcript, the parse that reports dropped extra calls,
@@ -34,6 +37,7 @@
 pub mod completion;
 pub mod context;
 pub mod permissions;
+pub(crate) mod render;
 pub(crate) mod reply;
 pub mod tools;
 pub mod turn_loop;
