@@ -1,7 +1,7 @@
 ---
 id: REQ-554
 title: "Local tier renders prompts through the model's native chat template"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-03
 updated: 2026-08-03
