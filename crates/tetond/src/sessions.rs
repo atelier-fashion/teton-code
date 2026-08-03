@@ -169,7 +169,10 @@ mod tests {
                 Some(PathBuf::from("/Users/dev/my-repo")),
             )
             .unwrap();
-        assert_eq!(s.cwd.as_deref(), Some(std::path::Path::new("/Users/dev/my-repo")));
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some(std::path::Path::new("/Users/dev/my-repo"))
+        );
         assert_eq!(
             reg.get(&s.session_id).unwrap().cwd,
             Some(PathBuf::from("/Users/dev/my-repo"))

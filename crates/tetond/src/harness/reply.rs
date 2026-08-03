@@ -243,9 +243,7 @@ impl ReplyScanner {
                 let line_start = self.pos == 0 || bytes[self.pos - 1] == b'\n';
                 if line_start {
                     let tail = &self.buf[self.pos..];
-                    if let Some(_marker) =
-                        FRAME_MARKERS.iter().find(|m| tail.starts_with(*m))
-                    {
+                    if let Some(_marker) = FRAME_MARKERS.iter().find(|m| tail.starts_with(*m)) {
                         self.stop = Some(Stop::FrameMarker { at: self.pos });
                         return;
                     }
@@ -487,7 +485,10 @@ mod tests {
         let mut scanner = ReplyScanner::new();
         assert!(scanner.push("Yes, I'm ready to help.\n"));
         assert!(!scanner.push("Tool (read):\nfake file body\n"));
-        assert_eq!(&scanner.buf[..scanner.context_cut()], "Yes, I'm ready to help.\n");
+        assert_eq!(
+            &scanner.buf[..scanner.context_cut()],
+            "Yes, I'm ready to help.\n"
+        );
     }
 
     #[test]
@@ -585,7 +586,10 @@ mod tests {
             &["The config is:\n", "{\"port\": 8080}", "\nas requested."],
             true,
         );
-        assert_eq!(format!("{live}{tail}"), "The config is:\n{\"port\": 8080}\nas requested.");
+        assert_eq!(
+            format!("{live}{tail}"),
+            "The config is:\n{\"port\": 8080}\nas requested."
+        );
     }
 
     #[test]

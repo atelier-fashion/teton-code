@@ -667,8 +667,7 @@ mod tests {
     fn session_create_without_a_cwd_still_deserializes() {
         // Wire compatibility (BUG-147): an older client that sends no `cwd`
         // must still create a session — the field defaults to None.
-        let params: SessionCreateParams =
-            serde_json::from_str(r#"{"mode":"freeform"}"#).unwrap();
+        let params: SessionCreateParams = serde_json::from_str(r#"{"mode":"freeform"}"#).unwrap();
         assert_eq!(params.cwd, None);
     }
 

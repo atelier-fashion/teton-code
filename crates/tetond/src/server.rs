@@ -548,7 +548,10 @@ fn handle_session_create(daemon: &Daemon, id: Id, params: Value) -> String {
         }
     }
 
-    match daemon.sessions.create(params.mode, params.phase, params.cwd) {
+    match daemon
+        .sessions
+        .create(params.mode, params.phase, params.cwd)
+    {
         Ok(summary) => {
             // Broadcast a session-scoped event so subscribed peers learn of the
             // new session. Entering a structured session's first phase is a
