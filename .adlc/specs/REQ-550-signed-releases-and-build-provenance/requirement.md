@@ -158,11 +158,14 @@ in order). AC-6 staged — second signed release. Accepted risk → REQ-551.
 ## Post-audit note (2026-08-03)
 
 Three `GCP_*` repository secrets (GCP_PROJECT, GCP_SERVICE_ACCOUNT,
-GCP_WIF_PROVIDER) now exist at repo scope — added during the site/DNS work
-after this spec's Verified Inventory was taken. They are WIF *identifiers*,
-not key material, so the exposure is low; BR-4's property still wants them
-environment-scoped under site-deploy. Recorded as a follow-up, deliberately
-not moved mid-DNS-cutover.
+GCP_WIF_PROVIDER) appeared at repo scope during the site/DNS work.
+RESOLVED 2026-08-03: migrated to the site-deploy environment (values
+recovered from GCP itself — they are WIF identifiers, not key material),
+repo-level copies deleted, and environment-only resolution proven by a
+green main-dispatched deploy (run 30835455409). The repository now holds
+ZERO repo-scoped Actions secrets — BR-4's end state across every workflow.
+Names only recorded here; values live in GCP and the environment
+(the public-repo rule).
 
 ## External Dependencies
 

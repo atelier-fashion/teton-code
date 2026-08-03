@@ -555,3 +555,16 @@ condition is wrong — read it back with the command above before touching
 anything in this repository. A rejected token fails at
 `google-github-actions/auth`, which is identity, not the missing-role
 authorization failure described in section 8.
+
+
+### Secret scoping (completed 2026-08-03)
+
+`GCP_PROJECT`, `GCP_SERVICE_ACCOUNT`, `GCP_WIF_PROVIDER` live as
+**environment secrets on `site-deploy`** (names only here — the values are
+GCP-side identifiers, recoverable from the project itself, never committed
+to this public repo). Repository-level copies were deleted after the
+environment copies were verified, and environment-only resolution was
+proven by a green `main`-dispatched deploy (run 30835455409). The
+repository holds no repo-scoped Actions secrets at all; every credential
+resolves through an environment whose deployment rules gate the ref
+(REQ-550 BR-4).
