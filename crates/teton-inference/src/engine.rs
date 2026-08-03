@@ -78,6 +78,12 @@ pub trait Engine: Send {
     /// token as it is produced (so callers can measure first-token latency and
     /// stream output).
     ///
+    /// `on_token` returns whether generation should **continue**: `false` stops
+    /// the completion early, and the returned [`Completion::text`] contains only
+    /// what was emitted up to the stop. This is how the harness ends a weak
+    /// model's turn at its first tool call instead of letting it run on and
+    /// fabricate the rest of the transcript (BUG-147).
+    ///
     /// # Errors
     /// Returns [`EngineError::Unavailable`] when the local tier is not serving,
     /// or [`EngineError::Backend`] on an inference failure.
@@ -85,7 +91,7 @@ pub trait Engine: Send {
         &self,
         prompt: &str,
         params: &GenParams,
-        on_token: &mut dyn FnMut(&str),
+        on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion, EngineError>;
 }
 
@@ -160,7 +166,7 @@ impl Engine for MockEngine {
         &self,
         prompt: &str,
         params: &GenParams,
-        on_token: &mut dyn FnMut(&str),
+        on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion, EngineError> {
         if let Availability::Unavailable(reason) = &self.availability {
             return Err(EngineError::Unavailable {
@@ -168,14 +174,22 @@ impl Engine for MockEngine {
             });
         }
 
-        let text = self.response_for(prompt);
+        let full = self.response_for(prompt);
+        // Text reflects what was actually emitted: an early stop (caller
+        // returned `false`) or the max_tokens cap truncates it, matching the
+        // real backend's contract.
+        let mut text = String::new();
         let mut completion_tokens = 0u32;
-        for token in text.split_inclusive(' ') {
+        for token in full.split_inclusive(' ') {
             if completion_tokens >= params.max_tokens {
                 break;
             }
-            on_token(token);
+            let keep_going = on_token(token);
+            text.push_str(token);
             completion_tokens += 1;
+            if !keep_going {
+                break;
+            }
         }
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
         Ok(Completion {
@@ -358,7 +372,7 @@ mod llama {
             &self,
             prompt: &str,
             params: &GenParams,
-            on_token: &mut dyn FnMut(&str),
+            on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<Completion, EngineError> {
             let ctx_params = LlamaContextParams::default()
                 .with_n_ctx(std::num::NonZeroU32::new(self.n_ctx))
@@ -426,11 +440,18 @@ mod llama {
                 // A token that only *starts* a multi-byte character yields an
                 // empty piece (its bytes are held in the decoder) — nothing to
                 // stream yet, but it still counts as a generated token.
+                let mut keep_going = true;
                 if !piece.is_empty() {
-                    on_token(&piece);
+                    keep_going = on_token(&piece);
                     text.push_str(&piece);
                 }
                 completion_tokens += 1;
+                if !keep_going {
+                    // The caller ended the turn (e.g. the first tool call
+                    // completed); stop decoding — the tail flush below still
+                    // accounts for any held partial character.
+                    break;
+                }
 
                 batch.clear();
                 batch
@@ -527,6 +548,7 @@ mod tests {
         let completion = engine
             .complete("hello there world", &GenParams::default(), &mut |t| {
                 streamed.push_str(t);
+                true
             })
             .expect("mock completes");
         assert_eq!(engine.model_id(), "mock-3b");
@@ -540,10 +562,10 @@ mod tests {
     fn mock_is_deterministic() {
         let engine = MockEngine::new("mock-3b");
         let a = engine
-            .complete("same prompt", &GenParams::default(), &mut |_| {})
+            .complete("same prompt", &GenParams::default(), &mut |_| true)
             .unwrap();
         let b = engine
-            .complete("same prompt", &GenParams::default(), &mut |_| {})
+            .complete("same prompt", &GenParams::default(), &mut |_| true)
             .unwrap();
         assert_eq!(a, b);
     }
@@ -556,8 +578,31 @@ mod tests {
             temperature: 0.0,
         };
         let mut count = 0;
-        let completion = engine.complete("x", &params, &mut |_| count += 1).unwrap();
+        let completion = engine
+            .complete("x", &params, &mut |_| {
+                count += 1;
+                true
+            })
+            .unwrap();
         assert_eq!(count, 3);
+        assert_eq!(completion.completion_tokens, 3);
+    }
+
+    #[test]
+    fn a_false_from_on_token_stops_generation_early() {
+        // BUG-147: the harness ends a turn at the first complete tool call by
+        // returning `false`; the completion's text is what was emitted, not the
+        // full response the model would have gone on to fabricate.
+        let engine = MockEngine::with_response("mock", "one two three four five six seven");
+        let mut seen = String::new();
+        let completion = engine
+            .complete("x", &GenParams::default(), &mut |t| {
+                seen.push_str(t);
+                !seen.contains("three")
+            })
+            .unwrap();
+        assert_eq!(completion.text, "one two three ");
+        assert_eq!(completion.text, seen);
         assert_eq!(completion.completion_tokens, 3);
     }
 
@@ -565,7 +610,7 @@ mod tests {
     fn unavailable_mock_returns_the_typed_error() {
         let engine = MockEngine::unavailable("mock-3b", "unloaded under memory pressure");
         let err = engine
-            .complete("anything", &GenParams::default(), &mut |_| {})
+            .complete("anything", &GenParams::default(), &mut |_| true)
             .unwrap_err();
         match err {
             EngineError::Unavailable { reason } => {
@@ -575,7 +620,7 @@ mod tests {
         }
         // The Display form is the user-facing "local tier unavailable" string.
         assert!(engine
-            .complete("x", &GenParams::default(), &mut |_| {})
+            .complete("x", &GenParams::default(), &mut |_| true)
             .unwrap_err()
             .to_string()
             .starts_with("local tier unavailable"));

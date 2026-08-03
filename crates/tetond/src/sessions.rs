@@ -6,6 +6,7 @@
 //! session list stays identical for everyone. This module is the skeleton's
 //! session store; prompt-turn and phase-gate machinery land in later tasks.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -31,7 +32,9 @@ impl SessionRegistry {
     /// Creates a session and returns its summary.
     ///
     /// Structured sessions are pinned to a phase; freeform sessions carry no
-    /// phase regardless of any phase passed in (BR-3).
+    /// phase regardless of any phase passed in (BR-3). `cwd` is the client's
+    /// working directory — the session's tool jail (BUG-147); `None` falls back
+    /// to the daemon's env-derived root at turn time.
     ///
     /// # Errors
     ///
@@ -41,6 +44,7 @@ impl SessionRegistry {
         &self,
         mode: SessionMode,
         phase: Option<Phase>,
+        cwd: Option<PathBuf>,
     ) -> Result<SessionSummary, &'static str> {
         let phase = match mode {
             SessionMode::Structured => match phase {
@@ -56,6 +60,7 @@ impl SessionRegistry {
             mode,
             phase,
             title: None,
+            cwd,
         };
         self.sessions
             .lock()
@@ -116,10 +121,10 @@ mod tests {
     #[test]
     fn structured_session_requires_a_phase() {
         let reg = SessionRegistry::new();
-        assert!(reg.create(SessionMode::Structured, None).is_err());
+        assert!(reg.create(SessionMode::Structured, None, None).is_err());
 
         let s = reg
-            .create(SessionMode::Structured, Some(Phase::Spec))
+            .create(SessionMode::Structured, Some(Phase::Spec), None)
             .unwrap();
         assert_eq!(s.mode, SessionMode::Structured);
         assert_eq!(s.phase, Some(Phase::Spec));
@@ -129,7 +134,7 @@ mod tests {
     fn freeform_session_never_carries_a_phase() {
         let reg = SessionRegistry::new();
         let s = reg
-            .create(SessionMode::Freeform, Some(Phase::Spec))
+            .create(SessionMode::Freeform, Some(Phase::Spec), None)
             .unwrap();
         assert_eq!(s.phase, None);
     }
@@ -139,8 +144,8 @@ mod tests {
         let reg = SessionRegistry::new();
         assert!(reg.is_empty());
 
-        let a = reg.create(SessionMode::Freeform, None).unwrap();
-        let b = reg.create(SessionMode::Freeform, None).unwrap();
+        let a = reg.create(SessionMode::Freeform, None, None).unwrap();
+        let b = reg.create(SessionMode::Freeform, None, None).unwrap();
 
         let list = reg.list();
         assert_eq!(list.len(), 2);
@@ -153,10 +158,35 @@ mod tests {
     }
 
     #[test]
+    fn a_session_remembers_its_cwd() {
+        // BUG-147: the cwd is the session's tool jail — it must survive from
+        // session/create through get() to the prompt turn.
+        let reg = SessionRegistry::new();
+        let s = reg
+            .create(
+                SessionMode::Freeform,
+                None,
+                Some(PathBuf::from("/Users/dev/my-repo")),
+            )
+            .unwrap();
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some(std::path::Path::new("/Users/dev/my-repo"))
+        );
+        assert_eq!(
+            reg.get(&s.session_id).unwrap().cwd,
+            Some(PathBuf::from("/Users/dev/my-repo"))
+        );
+        // A client that sends none stores none (daemon-root fallback applies).
+        let bare = reg.create(SessionMode::Freeform, None, None).unwrap();
+        assert_eq!(bare.cwd, None);
+    }
+
+    #[test]
     fn session_ids_are_unique() {
         let reg = SessionRegistry::new();
-        let a = reg.create(SessionMode::Freeform, None).unwrap();
-        let b = reg.create(SessionMode::Freeform, None).unwrap();
+        let a = reg.create(SessionMode::Freeform, None, None).unwrap();
+        let b = reg.create(SessionMode::Freeform, None, None).unwrap();
         assert_ne!(a.session_id, b.session_id);
     }
 }

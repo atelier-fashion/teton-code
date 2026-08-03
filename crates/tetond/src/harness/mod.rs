@@ -23,6 +23,10 @@
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
 //!   lets one loop run either tier.
+//! - [`reply`] — model-reply scanning (BUG-147): the turn-boundary scanner that
+//!   stops a weak model at its first tool call instead of letting it fabricate
+//!   the rest of the transcript, the parse that reports dropped extra calls,
+//!   and the display gate that keeps raw tool-call JSON out of the stream.
 //! - [`turn_loop`] — the loop itself (named `turn_loop` because `loop` is a
 //!   keyword): context assembly, model call, tool dispatch, result folding, and
 //!   bounded termination.
@@ -30,6 +34,7 @@
 pub mod completion;
 pub mod context;
 pub mod permissions;
+pub(crate) mod reply;
 pub mod tools;
 pub mod turn_loop;
 

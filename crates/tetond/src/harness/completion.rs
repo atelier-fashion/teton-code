@@ -44,8 +44,9 @@ use crate::egress::{Egress, EgressContext, Provenance};
 use super::context::{
     ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance, ToolProvenance,
 };
+use super::reply::{parse_reply, ParsedTurn, ReplyScanner};
 use super::tools::ToolRegistry;
-use super::turn_loop::{parse_turn, HarnessConfig, HarnessError, ParsedTurn};
+use super::turn_loop::{HarnessConfig, HarnessError};
 
 /// What the model decided this turn — the single vocabulary the loop switches on,
 /// regardless of whether a local engine or a remote provider produced it.
@@ -71,17 +72,26 @@ pub enum TurnDecision {
     },
 }
 
-/// One model turn produced by a [`CompletionSource`]: the assistant's full text,
+/// One model turn produced by a [`CompletionSource`]: the assistant's text,
 /// what it decided to do, and the token usage (populated for remote turns; the
 /// local tier is free and reports zero).
 #[derive(Debug, Clone)]
 pub struct SourceTurn {
-    /// The assistant's full text for this turn (may be empty for a pure tool call).
+    /// The assistant's text for this turn (may be empty for a pure tool call).
+    ///
+    /// Already **cleaned** by the source (BUG-147): a local reply is cut at the
+    /// end of its first tool call or at a fabricated transcript frame, so a
+    /// weak model's hallucinated continuation never reaches context.
     pub text: String,
     /// The model's decision.
     pub decision: TurnDecision,
     /// Token usage, when the source knows it (remote). `0/0` for the local tier.
     pub usage: TokenUsage,
+    /// Tool calls the model issued *beyond* the first this turn. The reduced
+    /// harness runs one tool per turn; the loop folds a notice back so the
+    /// model knows the rest did not run (BUG-147 — silently dropping them is
+    /// what caused the re-emit loop).
+    pub dropped_calls: u32,
 }
 
 /// A source of model turns for the turn loop: local engine or remote provider.
@@ -153,11 +163,17 @@ impl CompletionSource for LocalEngineSource {
         let params = config.gen_params;
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let task = tokio::task::spawn_blocking(move || {
+            // BUG-147: the scanner ends the turn at the first complete tool
+            // call or at a fabricated transcript frame — a weak model left to
+            // run would go on to invent tool results and future turns (and burn
+            // seconds of inference producing them).
+            let mut scanner = ReplyScanner::new();
             let guard = engine.lock().expect("engine mutex poisoned");
             guard.complete(&flat, &params, &mut |token| {
                 // A closed receiver means the caller went away; keep completing
                 // (spawn_blocking is not cancellable) and drop the token.
                 let _ = token_tx.send(token.to_owned());
+                scanner.push(token)
             })
         });
         while let Some(token) = token_rx.recv().await {
@@ -169,12 +185,19 @@ impl CompletionSource for LocalEngineSource {
         let completion = task.await.map_err(|_| {
             EngineError::Backend("the local inference task did not complete".to_owned())
         })??;
-        let text = completion.text;
-        let decision = match parse_turn(&text, exposed) {
+        // Cut the reply at the turn boundary (re-scanned over the final text —
+        // deterministic, and independent of how the stream was chunked), then
+        // parse the *clean* reply. Everything past the first tool call — the
+        // hallucinated continuation — never reaches context.
+        let mut text = completion.text;
+        text.truncate(ReplyScanner::scan_all(&text).context_cut());
+        let parsed = parse_reply(&text, exposed);
+        let decision = match parsed.turn {
             ParsedTurn::ToolCall { name, arguments } => TurnDecision::ToolCall { name, arguments },
             ParsedTurn::EndTurn(final_text) => TurnDecision::EndTurn { final_text },
             ParsedTurn::Malformed(reason) => TurnDecision::Malformed { reason },
         };
+        text.truncate(parsed.clean_len);
         Ok(SourceTurn {
             text,
             decision,
@@ -182,6 +205,7 @@ impl CompletionSource for LocalEngineSource {
                 input_tokens: u64::from(completion.prompt_tokens),
                 output_tokens: u64::from(completion.completion_tokens),
             },
+            dropped_calls: parsed.dropped_calls,
         })
     }
 }
@@ -291,6 +315,7 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
 
         let mut text = String::new();
         let mut tool_call: Option<TurnDecision> = None;
+        let mut dropped_calls = 0u32;
         let mut usage = TokenUsage::default();
         while let Some(event) = stream.next().await {
             match event? {
@@ -299,14 +324,16 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
                     text.push_str(&delta);
                 }
                 // MVP: the reduced harness runs one tool per turn, so the first
-                // assembled call wins; later parallel calls this turn are ignored.
+                // assembled call wins; later parallel calls this turn are
+                // counted so the loop can tell the model they did not run
+                // (BUG-147 — a silent drop makes the model re-emit them).
                 TurnEvent::ToolCall(call) if tool_call.is_none() => {
                     tool_call = Some(TurnDecision::ToolCall {
                         name: call.name,
                         arguments: call.arguments,
                     });
                 }
-                TurnEvent::ToolCall(_) => {}
+                TurnEvent::ToolCall(_) => dropped_calls += 1,
                 TurnEvent::Completed(completion) => {
                     usage = completion.usage;
                 }
@@ -320,6 +347,7 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             text,
             decision,
             usage,
+            dropped_calls,
         })
     }
 }
@@ -490,6 +518,8 @@ mod tests {
             }
             other => panic!("expected the first tool call to be kept, got {other:?}"),
         }
+        // The dropped second call is counted so the loop can tell the model.
+        assert_eq!(turn.dropped_calls, 1);
         // The turn's text streamed through and usage came from the terminal event.
         assert!(streamed.contains("planning two things"));
         assert_eq!(

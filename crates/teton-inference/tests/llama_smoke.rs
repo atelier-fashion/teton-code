@@ -30,7 +30,10 @@ fn llama_engine_streams_a_completion() {
                 max_tokens: 8,
                 temperature: 0.0,
             },
-            &mut |token| streamed.push_str(token),
+            &mut |token| {
+                streamed.push_str(token);
+                true
+            },
         )
         .expect("completion succeeds");
 

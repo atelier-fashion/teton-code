@@ -595,7 +595,7 @@ pub async fn summarize_if_large(
     let result = tokio::task::spawn_blocking(move || {
         let params = GenParams::default();
         let guard = engine.lock().expect("engine mutex poisoned");
-        guard.complete(&prompt, &params, &mut |_| {})
+        guard.complete(&prompt, &params, &mut |_| true)
     })
     .await;
     let mechanical = |error: String| SummarizeOutcome {
@@ -819,7 +819,7 @@ mod tests {
             &self,
             prompt: &str,
             _params: &GenParams,
-            _on_token: &mut dyn FnMut(&str),
+            _on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<teton_inference::Completion, teton_inference::EngineError> {
             self.seen.lock().expect("seen poisoned").push(prompt.len());
             Ok(teton_inference::Completion {
