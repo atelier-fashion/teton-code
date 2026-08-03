@@ -769,9 +769,9 @@ that tag is still being served by the repository-level copy, and removing it
 takes the token away from the only job that needs it (`75`, "the release is
 published but the formula cannot be pushed" — §9).
 
-- [ ] **1. REQ-550 is merged to `main`.** The environment declarations have to
+- [x] *(2026-08-01, PR #13)* **1. REQ-550 is merged to `main`.** The environment declarations have to
       be in the workflow file before they can be on a tag.
-- [ ] **2. One release completes green end to end**, `bump-formula` included,
+- [x] *(2026-08-03, v0.1.2 — all jobs green incl. bump-formula and verify-install)* **2. One release completes green end to end**, `bump-formula` included,
       from a real `vX.Y.Z` tag cut after that merge. What this proves is that
       the workflow still works with the environment declared — and nothing
       more. It does **not** prove which copy of the token served it. Both
@@ -780,10 +780,10 @@ published but the formula cannot be pushed" — §9).
       been used, and no log line says which. The positive proof of environment
       resolution comes at step 6, once the repository copy is gone. Step 2 is
       the safety check before the deletion, not the evidence for it.
-- [ ] **3. Delete the repository-level `HOMEBREW_TAP_TOKEN`** — Settings →
+- [x] *(2026-08-03, deleted via API; post-deletion listing then showed the intro's premise was wrong — see step 6)* **3. Delete the repository-level `HOMEBREW_TAP_TOKEN`** — Settings →
       Secrets and variables → Actions → the repository secret → *Remove*. The
       `tap-publish` environment secret stays; it is the one the bump now uses.
-- [ ] **4. Run the AC-4 negative probe and record the refusal.** Environment
+- [x] *(2026-08-03, run 30832422680 on probe/ac4-tap-publish-refusal: conclusion failure, zero steps executed — refused before the job started; push-triggered rather than workflow_dispatch because GitHub does not index dispatch-only workflows living solely on a branch; API job record stands in for the screenshot; branch deleted)* **4. Run the AC-4 negative probe and record the refusal.** Environment
       protection rules are GitHub-side settings, so the only durable evidence
       that they work is a run that was refused by them. On a throwaway branch —
       not `main`, which the rules deliberately admit (§2), and not a tag — add a
@@ -795,14 +795,14 @@ published but the formula cannot be pushed" — §9).
       A probe that *succeeds* is the finding, not a mistake to retry — it means
       the rules are not what they are supposed to be, and the retirement is not
       done.
-- [ ] **5. Record the environment settings state in REQ-550.** For each of
+- [x] *(2026-08-03, recorded in REQ-550 via API listing — names only)* **5. Record the environment settings state in REQ-550.** For each of
       `release-signing`, `tap-publish` and `site-deploy`: the deployment branch
       and tag rules, the secret and variable *names* each carries (names only —
       never values), and any required reviewers. None of this configuration
       lives in the repository, so a screenshot plus a written table in the REQ
       is the entire record a future reader gets. Date it; settings drift
       silently and nothing in CI notices.
-- [ ] **6. The first release AFTER the deletion goes green through
+- [ ] **BLOCKED 2026-08-03, in exactly the shape this step's last sentence anticipates: post-deletion verification found `tap-publish` holds NO token copy — the environment paste never landed, so v0.1.2's green bump was served by the (now deleted) repository copy. Remediation per this step: add `HOMEBREW_TAP_TOKEN` to the `tap-publish` environment, then re-run v0.1.2's `bump-formula` job — a green rerun with the environment as the only copy is the positive proof.** **6. The first release AFTER the deletion goes green through
       `bump-formula`.** This is the run that proves environment resolution —
       the positive half of AC-4, and the claim step 2 could not make. With no
       repository-level copy left, a green bump can only mean the token resolved
