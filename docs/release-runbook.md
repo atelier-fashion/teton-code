@@ -166,7 +166,7 @@ and "it could not run" can never be confused (LESSON-442, ADR-548-4):
 | `64` | the check RAN and the inputs are wrong (version mismatch, bad invocation, an unfilled `{{PLACEHOLDER}}`) |
 | `65` | it RAN and FAILED — these bytes are bad |
 | `75` | it could NOT run. Nothing was learned, which is not a pass |
-| `70` | (`package.sh` only) the build reported success but an expected binary is missing |
+| `70` | (`package.sh` only) the build reported success but an expected binary is missing — or, since REQ-551, a pack-phase contract failure (missing/stale/tampered staging, signing or verify rejection); §9 lists them |
 
 ---
 
