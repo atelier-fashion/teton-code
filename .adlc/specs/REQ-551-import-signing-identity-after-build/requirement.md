@@ -30,8 +30,10 @@ regardless); the unlocked keychain is the sharper capability and is untouched.
 This REQ closes that window: no signing credential material — imported
 identity, unlocked keychain, or decoded p12 — may exist on the runner while
 any untrusted code executes. The identity arrives only after compilation
-completes, immediately before the sign→verify→tar sequence, and every
-guarantee REQ-550 established must survive the restructuring.
+completes, immediately before the sign→verify→tar sequence
+(import → sign → early destroy; the tarball smoke and the artifact upload
+run afterwards with no keychain present), and every guarantee REQ-550
+established must survive the restructuring.
 
 ## System Model
 
@@ -104,6 +106,40 @@ guarantee REQ-550 established must survive the restructuring.
 - [ ] AC-5: shellcheck + actionlint clean; no new secret-interpolation
       into `run:` bodies; the `if: always()` keychain cleanup still covers
       all failure paths of the narrowed window.
+
+## Deviations (verify pass, 2026-08-03)
+
+Recorded rather than silently absorbed, so a reader comparing the spec to the
+merged pipeline finds the difference here instead of deriving it.
+
+- **AC-2 is staged, not skipped.** "A full release (or main-dispatched dry run)
+  goes green end-to-end with the restructured job" cannot be exercised from
+  this REQ's branch: the `release-signing` and `tap-publish` environments admit
+  exactly two ref shapes — the `main` branch and `v*.*.*` tags — so a dispatch
+  from `feat/REQ-551-…` is refused by the deployment rules before the job
+  starts, and there is no ref this branch could dispatch from that would reach
+  the certificate. First exercised by the post-merge dry run from `main`, or by
+  the next real release, whichever comes first. This is the same posture and
+  the same precedent REQ-550 set for its own environment-gated criteria (see
+  runbook §11 steps 2/4/6): a criterion nobody *could* have run is recorded as
+  unrun, never assumed and never quietly dropped.
+- **ADR-551-1's "moved verbatim" means the executable body, not the whole
+  step.** The import step's shell body is byte-identical to REQ-550's — checked
+  by the reflector, not asserted — and its `- name:` line is unchanged, which
+  is what the ordering assertion keys on. What did change is 16 annotation
+  strings inside it, retargeted under TASK-029's recorded scope extension:
+  before the reorder they told the reader "Nothing was built," which stopped
+  being true the moment the compile moved above the import. They now say the
+  build already finished and the leg fails before anything is signed. Correcting
+  a message that had become false is not a deviation from "verbatim"; leaving it
+  in place to preserve the word would have been.
+- **The cross-boundary staging guard is a superset of what ADR-551-1
+  specified.** The ADR describes `pack` refusing a missing or incomplete
+  staging directory in terms of the two binaries. As implemented it also checks
+  the ride-alongs — `LICENSE` and `README.md` — because every member of the
+  tarball comes out of the staging directory and `tar` failing on a missing one
+  would report a file, from outside `package.sh`'s exit taxonomy, rather than
+  reporting a phase. Wider than specified, in the direction the rule points.
 
 ## External Dependencies
 
