@@ -679,7 +679,7 @@ impl DaemonRuntime {
     ///
     /// Reached only from the [`HarnessError::NoTierAvailable`] arm — the route
     /// named a provider this daemon does not have and the local slot was empty.
-    /// "Nothing could serve it" is one condition with five very different
+    /// "Nothing could serve it" is one condition with six very different
     /// causes, and the daemon can tell them apart: it published exactly this
     /// classification on the lifecycle stream at startup. The precedence below
     /// is [`startup_lifecycle`]'s, deliberately — a turn failure and the
@@ -729,6 +729,18 @@ impl DaemonRuntime {
                 "the local tier was declined, so it will not serve turns; \
                  `teton model set <name>` changes that.{add_provider}"
             );
+        }
+
+        // Accepted, and the install is in flight right now (M-2's claim is
+        // held). Read BEFORE `consent_required()`, which stays true until the
+        // weights verify — so during the whole download the fall-through
+        // branch would tell the user their accept did nothing.
+        if selection
+            .as_ref()
+            .and_then(|s| s.model_name.as_deref())
+            .is_some_and(|name| self.consent.install_in_flight(name))
+        {
+            return format!("{}{add_provider}", installing_local_model_reason(&model_id));
         }
 
         // BR-1: proposed and unanswered. The session runs, the tier does not.
@@ -1809,6 +1821,7 @@ fn probe_local_tier(
 /// | the probe ran | `probed` (always) |
 /// | below the floor / no fitting entry | `disabled`, with the probe's reason |
 /// | a proposal is open, or weights are missing | `awaiting_decision` |
+/// | accepted, download/install in flight | `disabled`, saying it is running |
 /// | the tier was declined (BR-4) | `disabled`, saying so |
 /// | weights installed, nothing in this build can load them | `disabled`, saying so |
 /// | an engine is loaded and serving | `ready` |
@@ -1895,15 +1908,30 @@ fn startup_lifecycle(
         return lifecycle;
     }
 
-    let declined = consent
-        .current_selection()
+    let selection = consent.current_selection();
+    let declined = selection
+        .as_ref()
         .is_some_and(|selection| selection.declined_local);
+    let installing = selection
+        .as_ref()
+        .and_then(|selection| selection.model_name.as_deref())
+        .is_some_and(|name| consent.install_in_flight(name));
     let stage = if declined {
         // BR-4: a settled, deliberate absence. Not a failure and not a prompt.
         ModelLifecycleStage::Disabled {
             reason: "the local tier was declined; sessions run remote-only. \
                      `teton model set <name>` changes that."
                 .to_owned(),
+        }
+    } else if installing {
+        // Accepted, bytes in flight. Read BEFORE `consent_required()`, which
+        // stays true until the weights verify: a client attaching mid-download
+        // must not be told the proposal is still unanswered. The stage is the
+        // `disabled`-with-reason shape the in-flight *load* below already
+        // uses; the live byte counts arrive separately as `download` events
+        // from the installer's own progress stream.
+        ModelLifecycleStage::Disabled {
+            reason: installing_local_model_reason(&model_id),
         }
     } else if consent.consent_required() {
         // BR-1: proposed and unanswered, or answered but the weights are gone.
@@ -2157,6 +2185,20 @@ impl StagedEngines {
             .expect("staged map poisoned")
             .remove(model_name);
     }
+}
+
+/// The explanation for a tier whose accepted install is still in flight: the
+/// answer exists, the bytes are moving, and the tier opens on its own once
+/// they verify and load. Distinct from the unanswered-proposal sentence on
+/// purpose — telling a user who just said yes that they "have not answered"
+/// reads as their accept having been lost. Names the model but no path
+/// (BR-11).
+fn installing_local_model_reason(model_id: &str) -> String {
+    format!(
+        "{model_id} was accepted and its download/install is running now — \
+         the local tier opens when it completes; `teton model status` shows \
+         progress."
+    )
 }
 
 /// The replay-time explanation for verified weights whose load has not finished:
@@ -3049,7 +3091,7 @@ mod tests {
         );
     }
 
-    /// BUG-146: "nothing could serve this turn" has five very different
+    /// BUG-146: "nothing could serve this turn" has six very different
     /// causes, and the message must name the one that actually applies —
     /// the reported bug was a loading tier being blamed as a broken engine.
     ///
@@ -3206,6 +3248,109 @@ mod tests {
                 "no path may ride the turn's failure message; got: {msg}"
             );
         }
+    }
+
+    /// The first-run window the v0.1.3 report came from: the user answered Y,
+    /// the download is running, and a prompt arrives before the tier opens.
+    /// `consent_required()` stays true until the weights verify, so without
+    /// the in-flight branch the refusal told exactly this user their proposal
+    /// "has not been answered yet" — their accept, apparently lost.
+    #[test]
+    fn unserved_turn_reason_during_an_in_flight_install_says_so() {
+        use crate::model_consent::{InstallError, WeightsInstaller};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use teton_core::entities::{ModelSelection, SelectionSource};
+        use teton_inference::catalog::ModelEntry;
+        use teton_protocol::methods::InstallStatus;
+
+        /// An installer that parks until the test releases it — a transfer
+        /// genuinely in flight — and reports the partial-file state a real
+        /// mid-download machine has on disk.
+        struct ParkedInstaller {
+            release: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+        impl WeightsInstaller for ParkedInstaller {
+            fn install(&self, _entry: &ModelEntry) -> Result<(), InstallError> {
+                let rx = self
+                    .release
+                    .lock()
+                    .expect("release slot poisoned")
+                    .take()
+                    .expect("a single install");
+                let _ = rx.recv();
+                Err(InstallError::Io {
+                    detail: "released by the test".to_owned(),
+                })
+            }
+            fn status(&self, _entry: &ModelEntry) -> InstallStatus {
+                InstallStatus::Partial
+            }
+        }
+
+        let catalog = Catalog::bundled();
+        let model = catalog
+            .models
+            .first()
+            .expect("the bundled catalog is non-empty")
+            .name
+            .clone();
+        let store = Arc::new(SelectionStore::in_memory());
+        store
+            .record(&ModelSelection::accepted(&model, SelectionSource::Probe, 1))
+            .expect("in-memory record");
+        let (release, parked) = mpsc::channel::<()>();
+        let gate = ModelConsentGate::new(
+            HardwareProfile {
+                ram_bytes: 48 * GIB,
+                free_disk_bytes: 500 * GIB,
+                gpu: GpuClass::AppleSilicon,
+            },
+            catalog,
+            LocalModelConfig::default(),
+            Arc::new(EventBus::new()),
+            Arc::new(PendingModelDecisions::new()),
+            store,
+            Arc::new(ParkedInstaller {
+                release: Mutex::new(Some(parked)),
+            }),
+        );
+        let runtime = Arc::new(DaemonRuntime {
+            consent: Arc::new(gate),
+            ..DaemonRuntime::minimal()
+        });
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let install = {
+            let runtime = Arc::clone(&runtime);
+            rt.spawn(async move { runtime.install_selected_model().await })
+        };
+        // Wait for the install claim — the very signal the classifier reads.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runtime.consent.install_in_flight(&model) {
+            assert!(
+                Instant::now() < deadline,
+                "the parked install was never claimed"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let msg = runtime.unserved_turn_reason(&Config::default());
+        assert!(
+            msg.contains("download/install is running"),
+            "a turn refused mid-install must say the install is in flight; got: {msg}"
+        );
+        assert!(
+            !msg.contains("has not been answered"),
+            "an accepted proposal must never be reported as unanswered; got: {msg}"
+        );
+        assert!(
+            msg.contains("teton provider add"),
+            "with no remote provider, the message must name the way out; got: {msg}"
+        );
+
+        drop(release);
+        rt.block_on(install).expect("the parked install task");
     }
 
     /// A `Ready` outcome opens the tier on the slot's *fact*, not the loader's
