@@ -292,16 +292,24 @@
     <section aria-labelledby="install-h">
       <h2 id="install-h">Install</h2>
       <pre class="install"><code>{{INSTALL_COMMAND}}</code></pre>
-      <p class="step-label">Then start the daemon and open the CLI:</p>
-      <pre><code>brew services start teton
-teton</code></pre>
-      <p class="meta">If Homebrew answers that the tap is not trusted, run
-        <code>brew trust atelier-fashion/tap</code> once — the install command
-        above is self-authorizing because it names the tap in full, and the
-        short name <code>teton</code> is not.</p>
+      <p class="step-label">Then just open the CLI:</p>
+      <pre><code>teton</code></pre>
+      <p class="meta">The first run notices there is no daemon and offers to
+        register <code>teton-code</code> with launchd for you
+        (<code>brew services start teton</code>) so it starts now and survives
+        reboots — press return to accept, or decline and it starts an unmanaged
+        daemon for the session. The manual command keeps working, before or
+        instead of the offer.</p>
+      <p class="meta">If Homebrew answers that the tap is not trusted when the
+        service is registered, run <code>brew trust atelier-fashion/tap</code>
+        once — the install command above is self-authorizing because it names
+        the tap in full, and the short name <code>teton</code> is not.</p>
       <p class="meta">Latest release v{{VERSION}}. Two binaries —
         <code>teton</code> (CLI) and <code>teton-code</code> (daemon). No Rust
-        toolchain, no cmake, no build step.</p>
+        toolchain, no cmake, no build step. Leaving is one command too:
+        <code>teton uninstall</code> removes the service, the model and its
+        data, the binaries, and the tap — after showing you the plan and
+        asking once.</p>
     </section>
 
     <section aria-labelledby="promises-h">
