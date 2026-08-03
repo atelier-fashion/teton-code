@@ -37,7 +37,13 @@ use teton_inference::ChatFormat;
 /// starts, so a generated one at a line start means the model is continuing
 /// the transcript instead of speaking its own turn. Anchoring is load-bearing
 /// here — ordinary prose can contain `User:` mid-line.
-const FLAT_ANCHORED_MARKERS: &[&str] = &["User:", "Assistant:", "Tool (", "<tool-result"];
+///
+/// Shared with the *input* side: [`super::render::neutralize_frame_labels`]
+/// defuses this same set in untrusted content, so what the model must not be
+/// allowed to emit is exactly what content is not allowed to introduce
+/// (BUG-148). One constant, so the two directions cannot drift apart.
+pub(super) const FLAT_ANCHORED_MARKERS: &[&str] =
+    &["User:", "Assistant:", "Tool (", "<tool-result"];
 
 /// Line-anchored fabrication markers for the ChatML rendering (REQ-554 BR-4,
 /// ADR-4): the harness-authored labels a ChatML prompt shows the model —
@@ -45,7 +51,10 @@ const FLAT_ANCHORED_MARKERS: &[&str] = &["User:", "Assistant:", "Tool (", "<tool
 /// writes at the head of a tool-bearing user turn ([`TOOL_RESULT_LABEL_PREFIX`],
 /// the ChatML counterpart of flat's `Tool (`). A generated one is a fake
 /// tool result (the BUG-147 fabrication axis).
-const CHATML_ANCHORED_MARKERS: &[&str] =
+///
+/// Also shared with [`super::render::neutralize_frame_labels`] — see
+/// [`FLAT_ANCHORED_MARKERS`].
+pub(super) const CHATML_ANCHORED_MARKERS: &[&str] =
     &["<tool-result", super::context::TOOL_RESULT_LABEL_PREFIX];
 
 /// Position-independent markers: the ChatML control-token spellings.
