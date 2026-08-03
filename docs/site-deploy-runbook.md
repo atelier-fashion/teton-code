@@ -74,7 +74,12 @@ operate instead of two.
 GCS: is there a Cloud CDN in front, and if so what is the URL map called?
 
 Record the answers in REQ-548's requirement file when they land, so OQ-5 closes
-against evidence rather than memory.
+against evidence rather than memory. **Record them redacted** (LESSON-462):
+this is a public repository, and ADR-548-3 keeps the project id out of it on
+purpose. Write *where each value lives* ("project id: repo secret
+`GCP_PROJECT`"), not the value itself — inline only names this runbook already
+uses in its own commands, and nothing else identifying (project id/number, IPs,
+service-account emails).
 
 ---
 
