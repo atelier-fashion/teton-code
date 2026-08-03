@@ -32,6 +32,7 @@ mod model_ui;
 mod prompt;
 mod render;
 mod session_ui;
+mod uninstall;
 
 use client::{Connection, UiContext};
 use keychain::Keychain;
@@ -52,7 +53,8 @@ struct Cli {
     /// Answer the first-run local-model prompt with "accept" and read no input
     /// (REQ-547 BR-5): the explicit opt-in for unattended/CI runs. Also supplies
     /// the second confirmation `teton model set` needs for a model above this
-    /// machine's RAM floor (BR-3).
+    /// machine's RAM floor (BR-3), and the deletion confirmation of
+    /// `teton uninstall`.
     #[arg(long, short = 'y', global = true)]
     yes: bool,
 
@@ -92,6 +94,15 @@ enum Command {
     Cost,
     /// Diagnose the daemon, socket, model state, and providers.
     Doctor,
+    /// Remove Teton Code from this machine: stop the daemon, delete its data
+    /// and logs, and `brew uninstall` the binaries — the whole chain, confirmed
+    /// up front.
+    Uninstall {
+        /// Keep the state directory (the downloaded model, cost history, and
+        /// config); remove only the service, logs, and binaries.
+        #[arg(long)]
+        keep_data: bool,
+    },
 }
 
 /// `teton model …` (AC-9)
@@ -263,6 +274,7 @@ fn main() -> ExitCode {
             } => run_policy_set(&paths, phase.into(), provider, fallback),
             PolicyAction::Show => run_policy_show(&paths),
         },
+        Some(Command::Uninstall { keep_data }) => run_uninstall(&paths, keep_data, cli.yes),
     };
 
     match result {
@@ -659,6 +671,17 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
          path of its own (BR-1).",
     );
     Ok(())
+}
+
+/// `teton uninstall`: show the removal plan, confirm, run it (see the
+/// `uninstall` module docs for why this exists — Homebrew formulae have no
+/// uninstall hook, so `brew uninstall teton` alone strands the daemon, the
+/// model, and the logs).
+fn run_uninstall(paths: &DaemonPaths, keep_data: bool, auto_accept: bool) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut prompter = StdinPrompter::new();
+    let plan = uninstall::Plan::build(paths, keep_data, uninstall::brew_prefix());
+    uninstall::run(paths, &plan, auto_accept, &mut surface, &mut prompter)
 }
 
 /// `teton cost`: render the daemon's authoritative persisted cost report (AC-4,
