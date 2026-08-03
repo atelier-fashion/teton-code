@@ -3,9 +3,17 @@
   "branch": "feat/REQ-554-local-native-chat-template",
   "startedAt": "2026-08-03T21:42:55Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
-  "phaseHistory": [],
+  "currentPhase": 1,
+  "completedPhases": [
+    0
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Worktrees + Preflight",
+      "completedAt": "2026-08-03T21:43:11Z"
+    }
+  ],
   "integrationBranch": "main",
   "repos": {
     "teton-code": {
@@ -14,13 +22,19 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.claude/worktrees/apple-cert-password-reset-8442b5/.worktrees/REQ-554",
       "branch": "feat/REQ-554-local-native-chat-template",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/31",
+      "prNumber": 31,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
-  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] }
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
 }
