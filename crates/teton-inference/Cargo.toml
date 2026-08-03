@@ -21,7 +21,13 @@ toml = "0.8"
 thiserror = "2"
 
 # Real inference backend — optional, gated behind the `llama` feature above.
-llama-cpp-2 = { version = "0.1.151", optional = true }
+# Pinned EXACTLY, not caret: this version hardcodes `parse_special = true` in
+# `str_to_token`, which is why the harness renderer must defuse control-token
+# spellings in untrusted content (REQ-554). A silent minor bump could change
+# that flag in either direction — removing the reason the control exists, or
+# adding a second tokenizer path it does not cover. Re-audit the pairing when
+# raising this.
+llama-cpp-2 = { version = "=0.1.151", optional = true }
 # Stateful UTF-8 decoding for streamed token pieces — a single BPE token can end
 # mid-way through a multi-byte character, so the decoder must outlive the whole
 # stream (`PieceDecoder` in engine.rs, which decodes the raw piece bytes itself

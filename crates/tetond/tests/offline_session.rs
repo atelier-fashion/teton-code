@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use teton_inference::{Completion, Engine, EngineError, GenParams};
+use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams};
 use teton_protocol::methods::StopReason;
 use teton_protocol::SessionId;
 
@@ -154,7 +154,15 @@ async fn offline_read_edit_verify_completes_with_zero_egress() {
     let mut sub = bus.subscribe(256);
 
     let outcome = run_session_turn(
-        &engine, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook,
+        &engine,
+        ChatFormat::Flat,
+        &tools,
+        &tool_ctx,
+        &gate,
+        &events,
+        &mut ctx,
+        &config,
+        &mut hook,
     )
     .await
     .expect("local turn completes");
@@ -251,7 +259,15 @@ async fn a_failing_verify_after_an_edit_does_not_satisfy_the_gate() {
     let mut hook = tetond::harness::NoopProvenanceHook;
 
     let outcome = run_session_turn(
-        &engine, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook,
+        &engine,
+        ChatFormat::Flat,
+        &tools,
+        &tool_ctx,
+        &gate,
+        &events,
+        &mut ctx,
+        &config,
+        &mut hook,
     )
     .await
     .expect("local turn completes");
@@ -312,7 +328,15 @@ async fn malformed_tool_calls_do_not_cause_an_unbounded_loop() {
     let mut hook = tetond::harness::NoopProvenanceHook;
 
     let outcome = run_session_turn(
-        &engine, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook,
+        &engine,
+        ChatFormat::Flat,
+        &tools,
+        &tool_ctx,
+        &gate,
+        &events,
+        &mut ctx,
+        &config,
+        &mut hook,
     )
     .await
     .expect("loop terminates");

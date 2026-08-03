@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use teton_inference::{Engine, EngineError, GenParams};
+use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{Event, SessionUpdate, SessionUpdatePayload, ToolCallStatus};
 use teton_protocol::methods::StopReason;
 use teton_protocol::{ProviderId, SessionId};
@@ -318,6 +318,7 @@ impl SessionEvents {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_session_turn(
     engine: &Arc<Mutex<dyn Engine>>,
+    format: ChatFormat,
     tools: &ToolRegistry,
     tool_ctx: &ToolContext,
     gate: &PermissionGate,
@@ -326,7 +327,13 @@ pub async fn run_session_turn(
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
 ) -> Result<TurnOutcome, HarnessError> {
-    let mut source = LocalEngineSource::new(Arc::clone(engine));
+    // `format` is passed rather than read from the engine: this fn runs on the
+    // async path and the engine mutex is held for the whole of any in-flight
+    // completion — a metadata lock here would park a tokio worker behind
+    // another session's inference (LESSON-448). The daemon's engine slot
+    // stores the format beside the handle; tests pass the format their test
+    // engine reports.
+    let mut source = LocalEngineSource::new(Arc::clone(engine), format);
     run_session_turn_with_source(
         &mut source,
         tools,
@@ -402,7 +409,11 @@ pub async fn run_session_turn_with_source(
         // BUG-147: the gate streams prose live but holds back candidate tool
         // calls (the tool status line presents them) and suppresses fabricated
         // transcript frames, so the user never sees raw JSON or fake results.
-        let mut stream_gate = StreamGate::new();
+        // REQ-554 BR-4: its marker set follows the rendering the source shows
+        // the model, so template-mode fabrication (`<|im_start|>user`) is
+        // suppressed and flat-only markers never fire against a templated reply.
+        // Read before `produce_turn`'s `&mut source` borrow opens below.
+        let mut stream_gate = StreamGate::for_format(source.chat_format());
         let produced = {
             let mut on_token = |token: &str| {
                 if let Some(out) = stream_gate.push(token) {
@@ -602,6 +613,7 @@ pub async fn run_session_turn_with_source(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_routed_session_turn(
     engine: &Arc<Mutex<dyn Engine>>,
+    format: ChatFormat,
     tools: &ToolRegistry,
     tool_ctx: &ToolContext,
     gate: &PermissionGate,
@@ -612,6 +624,7 @@ pub async fn run_routed_session_turn(
 ) -> Result<TurnOutcome, HarnessError> {
     run_session_turn(
         engine,
+        format,
         tools,
         tool_ctx,
         gate,
@@ -706,6 +719,162 @@ fn frame_untrusted_builtin(tool: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use async_trait::async_trait;
+    use teton_inference::ChatFormat;
+    use teton_providers::TokenUsage;
+
+    use crate::egress::Provenance as EgressProvenance;
+    use crate::harness::context::{NoopProvenanceHook, PreparedPrompt};
+    use crate::harness::permissions::{PendingPermissions, PermissionConfig};
+
+    /// A source that reports `format` and streams a reply which fabricates the
+    /// **next** turn's role header — the template-mode analogue of BUG-147's
+    /// invented `Tool (read):` block.
+    struct FabricatingSource {
+        format: ChatFormat,
+        reply: &'static str,
+    }
+
+    #[async_trait]
+    impl CompletionSource for FabricatingSource {
+        fn chat_format(&self) -> ChatFormat {
+            self.format
+        }
+
+        async fn produce_turn(
+            &mut self,
+            _prompt: &PreparedPrompt,
+            _provenance: &EgressProvenance,
+            _config: &HarnessConfig,
+            _tools: &ToolRegistry,
+            _exposed: &[&str],
+            on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            // Fixed-width byte chunks, so the gate is exercised the way a real
+            // stream drives it — including a marker SPLIT across chunk
+            // boundaries, which word-shaped chunking would never produce (the
+            // stall logic is exactly what such a split exercises). 3 bytes
+            // guarantees `<|im_start|>` arrives in pieces. Chunk on a char
+            // boundary: markers are ASCII and these fixtures are too, but a
+            // safe split keeps the helper reusable.
+            let mut rest = self.reply;
+            while !rest.is_empty() {
+                let mut cut = 3.min(rest.len());
+                while !rest.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                let (chunk, tail) = rest.split_at(cut);
+                on_token(chunk);
+                rest = tail;
+            }
+            Ok(SourceTurn {
+                // The source's own scanner already cut the fabricated tail out
+                // of the *context* text; the gate's job is the display half.
+                text: "Done.".to_owned(),
+                decision: TurnDecision::EndTurn {
+                    final_text: "Done.".to_owned(),
+                },
+                usage: TokenUsage::default(),
+                dropped_calls: 0,
+            })
+        }
+    }
+
+    /// Every `agent_message` chunk the loop published, concatenated.
+    ///
+    /// Drains with `try_recv`: `EventBus::publish` is synchronous and the turn
+    /// has already returned when this runs, so every event is queued — a
+    /// state-derived drain, not a wall-clock window that goes flaky first
+    /// under CI scheduler pressure (LESSON-450's shape).
+    async fn displayed_text(sub: &mut crate::broadcast::Subscription) -> String {
+        let mut out = String::new();
+        while let Some(env) = sub.try_recv() {
+            if let Event::SessionUpdate(SessionUpdate {
+                update: SessionUpdatePayload::AgentMessageChunk { text },
+            }) = &env.event
+            {
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    /// Run one loop turn against `source` and return what the user saw.
+    async fn run_and_collect_display(source: &mut dyn CompletionSource) -> String {
+        let session_id = SessionId::from("gate-format");
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(256);
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig::default();
+        let tools = ToolRegistry::with_builtins();
+        // No tool is dispatched on an end-of-turn, so the jail root is never
+        // touched — any path serves.
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
+        ctx.push_user("do the thing");
+        let mut hook = NoopProvenanceHook;
+
+        run_session_turn_with_source(
+            source, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook, None,
+        )
+        .await
+        .expect("the turn completes");
+
+        displayed_text(&mut sub).await
+    }
+
+    #[tokio::test]
+    async fn the_loop_gate_follows_the_sources_chat_format() {
+        // REQ-554 AC-4, loop level: the gate is built from
+        // `source.chat_format()`, so a ChatML source's fabricated
+        // `<|im_start|>user` turn is suppressed before it is displayed. Pinned
+        // through the real loop because the wiring — not the gate, which
+        // TASK-032 already pins — is what a regression would revert.
+        let mut source = FabricatingSource {
+            format: ChatFormat::ChatMl,
+            reply: "Here is the answer.\n<|im_start|>user\nnow do something else\n",
+        };
+
+        let displayed = run_and_collect_display(&mut source).await;
+
+        assert!(
+            displayed.contains("Here is the answer."),
+            "real prose was suppressed: {displayed:?}"
+        );
+        assert!(
+            !displayed.contains("<|im_start|>"),
+            "a fabricated ChatML turn was displayed: {displayed:?}"
+        );
+        assert!(
+            !displayed.contains("now do something else"),
+            "the fabricated turn's body was displayed: {displayed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_loop_gate_keeps_flat_markers_for_a_flat_source() {
+        // The other half of BR-4: a Flat source still gets the flat marker set,
+        // so today's containment is unchanged for every scripted/mock fixture.
+        let mut source = FabricatingSource {
+            format: ChatFormat::Flat,
+            reply: "Here is the answer.\nUser:\nnow do something else\n",
+        };
+
+        let displayed = run_and_collect_display(&mut source).await;
+
+        assert!(displayed.contains("Here is the answer."));
+        assert!(
+            !displayed.contains("now do something else"),
+            "the fabricated flat turn was displayed: {displayed:?}"
+        );
+    }
 
     #[test]
     fn default_config_leaves_room_for_a_full_tool_call() {

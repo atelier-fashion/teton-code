@@ -100,7 +100,7 @@ use teton_core::policy::ProviderHealth;
 use teton_inference::benchmark::{BenchmarkResult, DutySpec};
 use teton_inference::catalog::Catalog;
 use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GIB};
-use teton_inference::{Completion, Engine, EngineError, GenParams, MockEngine};
+use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{ModelLifecycle, ModelLifecycleStage, PrivacyAction};
 use teton_protocol::jsonrpc::{error_code, RpcError};
@@ -1392,7 +1392,10 @@ impl DaemonRuntime {
         // One read of the slot for the whole attempt: the engine this turn runs
         // on is the engine that was live when the turn started, even if a
         // consent outcome swaps the slot mid-turn.
-        let local_engine = self.engine.get();
+        // Handle AND format from the slot in one read: the format was resolved
+        // at install time, so no engine lock is needed on this async path
+        // (LESSON-448, REQ-554 verify).
+        let local_engine = self.engine.get_with_format();
         let is_local = match provider_cfg {
             Some(p) => matches!(p.kind, ProviderKind::Local),
             // No provider selected: fall back to the local tier if present.
@@ -1400,13 +1403,13 @@ impl DaemonRuntime {
         };
 
         if is_local {
-            let Some(engine) = local_engine.as_ref() else {
+            let Some((engine, format)) = local_engine.as_ref() else {
                 // The route named a Local-kind provider but the slot is empty —
                 // the tier is loading, failed, or was never opened. Not an
                 // engine failure (BUG-146); the caller classifies from state.
                 return Err(HarnessError::NoTierAvailable);
             };
-            let mut source = LocalEngineSource::new(Arc::clone(engine));
+            let mut source = LocalEngineSource::new(Arc::clone(engine), *format);
             return run_session_turn_with_source(
                 &mut source,
                 tools,
@@ -1455,7 +1458,7 @@ impl DaemonRuntime {
             source = source.with_phase(ph);
         }
 
-        let summarizer = local_engine;
+        let summarizer = local_engine.map(|(engine, _)| engine);
         run_session_turn_with_source(
             &mut source,
             tools,
@@ -2063,7 +2066,7 @@ fn local_tier_gated(scripted_engine: bool, consent_required: bool) -> bool {
 /// lifecycle replay can tell an attaching client what actually happened rather
 /// than guessing between "still loading" and "failed".
 /// A live engine tagged with the model id it serves.
-type TaggedEngine = (String, Arc<Mutex<dyn Engine>>);
+type TaggedEngine = (String, Arc<Mutex<dyn Engine>>, ChatFormat);
 
 struct EngineSlot {
     /// The live engine, tagged with the model it serves. The tag is what lets a
@@ -2085,21 +2088,34 @@ impl EngineSlot {
 
     /// Make `engine` the live engine serving `model_id`, clearing any recorded
     /// load failure.
+    ///
+    /// The engine's [`ChatFormat`] is read HERE, in this sync context, and
+    /// stored beside the handle: at install time the engine is not yet shared
+    /// (nothing else can hold its mutex), so the lock is uncontended by
+    /// construction. Async turn paths then read the format from the slot
+    /// instead of the engine — locking the serving mutex for metadata on the
+    /// async path would park a tokio worker behind an in-flight completion
+    /// (LESSON-448, REQ-554 verify).
     fn install(&self, model_id: String, engine: Arc<Mutex<dyn Engine>>) {
+        let format = engine
+            .lock()
+            .expect("engine mutex poisoned at install")
+            .chat_format();
         *self
             .load_failure
             .lock()
             .expect("load-failure mutex poisoned") = None;
-        *self.engine.lock().expect("engine slot mutex poisoned") = Some((model_id, engine));
+        *self.engine.lock().expect("engine slot mutex poisoned") = Some((model_id, engine, format));
     }
 
-    /// The live engine, if any.
-    fn get(&self) -> Option<Arc<Mutex<dyn Engine>>> {
+    /// The live engine and the [`ChatFormat`] it was installed with, if any —
+    /// the lock-free-for-metadata surface the async turn path uses.
+    fn get_with_format(&self) -> Option<(Arc<Mutex<dyn Engine>>, ChatFormat)> {
         self.engine
             .lock()
             .expect("engine slot mutex poisoned")
             .as_ref()
-            .map(|(_, engine)| Arc::clone(engine))
+            .map(|(_, engine, format)| (Arc::clone(engine), *format))
     }
 
     /// The model the live engine serves, if one is live.
@@ -2108,7 +2124,7 @@ impl EngineSlot {
             .lock()
             .expect("engine slot mutex poisoned")
             .as_ref()
-            .map(|(id, _)| id.clone())
+            .map(|(id, _, _)| id.clone())
     }
 
     /// Whether an engine is live.
@@ -2157,8 +2173,23 @@ impl EngineSlot {
 /// leave the production one exercised only in a dogfood run.
 struct StagedEngines {
     slot: Arc<EngineSlot>,
-    /// Loaded-and-measured engines awaiting the gate's commit/abandon verdict.
-    staged: Mutex<HashMap<String, Arc<Mutex<dyn Engine>>>>,
+    /// Loaded-and-measured engines awaiting the gate's commit/abandon verdict,
+    /// each with the template-fallback reason its loader captured (`None` for a
+    /// recognized template — and for test doubles, which are flat by design,
+    /// not degraded).
+    staged: Mutex<HashMap<String, StagedEntry>>,
+}
+
+/// A staged engine and the template-fallback reason captured at load time.
+type StagedEntry = (Arc<Mutex<dyn Engine>>, Option<&'static str>);
+
+/// The user-visible template-downgrade report (REQ-554 BR-2/AC-3), as a pure
+/// function so its shape is pinned by a default-build unit test even though
+/// the emitting path is `llama`-gated. Carries the model and the CAUSE
+/// (LESSON-456 — a downgrade report that names no reason tells the user
+/// something happened but not what to do about it); never prompt content.
+fn template_fallback_line(model_name: &str, reason: &str) -> String {
+    format!("tetond: model {model_name}: {reason}; using flat transcript rendering")
 }
 
 impl StagedEngines {
@@ -2170,23 +2201,38 @@ impl StagedEngines {
         }
     }
 
-    /// Hold `engine` as `model_name`'s staged engine — measured, not serving.
-    fn stage(&self, model_name: &str, engine: Arc<Mutex<dyn Engine>>) {
+    /// Hold `engine` as `model_name`'s staged engine — measured, not serving —
+    /// with the loader-captured template-fallback reason, if any.
+    fn stage(
+        &self,
+        model_name: &str,
+        engine: Arc<Mutex<dyn Engine>>,
+        template_note: Option<&'static str>,
+    ) {
         self.staged
             .lock()
             .expect("staged map poisoned")
-            .insert(model_name.to_owned(), engine);
+            .insert(model_name.to_owned(), (engine, template_note));
     }
 
     /// Make `model_name`'s staged engine live in the serving slot. A no-op when
     /// nothing is staged under that name.
+    ///
+    /// The template-downgrade report is emitted HERE, not at stage time
+    /// (REQ-554 verify): a staged engine can still be abandoned by the
+    /// authority re-check (LESSON-445), and a report for an engine that never
+    /// serves would be false. Commit is the moment the downgrade becomes true
+    /// of the serving tier — once per engine that actually goes live.
     fn commit(&self, model_name: &str) {
         let staged = self
             .staged
             .lock()
             .expect("staged map poisoned")
             .remove(model_name);
-        if let Some(engine) = staged {
+        if let Some((engine, template_note)) = staged {
+            if let Some(reason) = template_note {
+                eprintln!("{}", template_fallback_line(model_name, reason));
+            }
             self.slot.install(model_name.to_owned(), engine);
         }
     }
@@ -2333,9 +2379,12 @@ impl crate::model_consent::LocalEngineLoader for FakeEngineLoader {
         // gate downstream sees the same shape a real loader hands it.
         let duty = DutySpec::default().evaluate(&benchmark);
         if duty.is_pass() {
+            // No template note: a test double is flat by design, not degraded —
+            // the downgrade report is for real models only (REQ-554 AC-3).
             self.staged.stage(
                 model_name,
                 Arc::new(Mutex::new(MockEngine::new(model_name))) as Arc<Mutex<dyn Engine>>,
+                None,
             );
         }
         Ok(crate::model_consent::EngineLoadReport { benchmark, duty })
@@ -2466,9 +2515,24 @@ impl crate::model_consent::LocalEngineLoader for LlamaEngineLoader {
         // one is dropped here (unmapping the weights); the failure memo is
         // recorded by `apply_consent_outcome` from the outcome this becomes.
         if duty.is_pass() {
+            // REQ-554 BR-2/AC-3: a model whose GGUF carries no template this
+            // build recognizes serves on the flat transcript rendering, and
+            // that downgrade is reported — once, naming the model — never
+            // silently (LESSON-447: a best-effort fallback must fail loudly, or
+            // the tier quietly runs on the format that produced BUG-147).
+            //
+            // The reason is CAPTURED here — the last point the loader holds the
+            // concrete `LlamaEngine` — but the report itself is emitted at
+            // `commit` (REQ-554 verify): a staged engine can still be abandoned
+            // by the authority re-check (LESSON-445), and a downgrade report
+            // for an engine that never serves would be false. Test doubles
+            // stage with no note (flat by design, not degraded); scripted
+            // engines reach no loader at all (E-5).
+            let template_note = engine.template_fallback_reason();
             self.staged.stage(
                 model_name,
                 Arc::new(Mutex::new(engine)) as Arc<Mutex<dyn Engine>>,
+                template_note,
             );
         }
         Ok(crate::model_consent::EngineLoadReport { benchmark, duty })
@@ -2949,6 +3013,42 @@ mod tests {
         let err = load_config(Some(&path)).expect_err("a deprecated legacy pin must refuse");
         assert!(err.to_string().contains("invalid"), "diagnostic: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_template_fallback_line_names_the_model_and_the_cause() {
+        // REQ-554 BR-2/AC-3: the downgrade report's shape is pinned here even
+        // though its emitting path is `llama`-gated — and it carries the CAUSE,
+        // not a fixed sentence (LESSON-456). No prompt content ever rides it.
+        let line = template_fallback_line(
+            "qwen3-coder-30b-a3b",
+            "no chat template in the GGUF metadata",
+        );
+        assert_eq!(
+            line,
+            "tetond: model qwen3-coder-30b-a3b: no chat template in the GGUF \
+             metadata; using flat transcript rendering"
+        );
+    }
+
+    #[test]
+    fn a_committed_engine_records_its_install_format_beside_the_handle() {
+        // REQ-554 verify: the slot stores the ChatFormat at install so the
+        // async turn path never locks the serving engine for metadata
+        // (LESSON-448). A ChatML-reporting engine installs as ChatML; the
+        // stage→commit path preserves the pairing.
+        let slot = EngineSlot::empty();
+        let staged = StagedEngines::new(Arc::clone(&slot));
+        staged.stage(
+            "m1",
+            Arc::new(Mutex::new(
+                MockEngine::new("m1").with_chat_format(ChatFormat::ChatMl),
+            )) as Arc<Mutex<dyn Engine>>,
+            None,
+        );
+        staged.commit("m1");
+        let (_, format) = slot.get_with_format().expect("engine committed");
+        assert_eq!(format, ChatFormat::ChatMl);
     }
 
     #[test]
