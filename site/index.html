@@ -14,7 +14,9 @@
 
   Constraints this file must keep:
     - fully self-contained: no external scripts, fonts, stylesheets, analytics
-    - no JavaScript required (there is none)
+    - JavaScript is optional, progressive-enhancement only: the page's own
+      content and function (including copying a command by hand) works with
+      it disabled; the inline copy-to-clipboard script only adds a shortcut
     - legible with CSS disabled: semantic headings, real <pre>/<table>
     - claims limited to what the shipped binaries do (BR-10)
 -->
@@ -147,6 +149,7 @@
   /* --- code --------------------------------------------------------- */
 
   pre {
+    position: relative;
     margin: 0 0 1rem;
     padding: 0.95rem 1.1rem;
     background: var(--surface);
@@ -158,6 +161,28 @@
   pre.install {
     border-left: 3px solid var(--accent);
   }
+
+  /* Room for the copy button so it doesn't sit on top of a long command;
+     only applied when the inline script actually adds the button. */
+  pre[data-copy] { padding-right: 3.4rem; }
+
+  .copy-btn {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    padding: 0.28rem 0.6rem;
+    font-family: inherit;
+    font-size: 0.72rem;
+    line-height: 1.2;
+    color: var(--muted);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .copy-btn:hover  { color: var(--text); border-color: var(--accent); }
+  .copy-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .copy-btn.copied { color: var(--accent); border-color: var(--accent); }
 
   code, pre {
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
@@ -265,7 +290,9 @@
        never misrepresents the command. */
     body { padding-left: 1.15rem; padding-right: 1.15rem; }
     pre { padding: 0.85rem 0.8rem; }
+    pre[data-copy] { padding-right: 2.9rem; }
     pre code { font-size: 0.78rem; }
+    .copy-btn { top: 0.4rem; right: 0.4rem; padding: 0.22rem 0.5rem; font-size: 0.66rem; }
   }
 </style>
 </head>
@@ -277,10 +304,15 @@
     <p class="tagline">An AI coding agent that routes work across a range of
       models — so you spend frontier-model money only where frontier-model
       intelligence matters.</p>
-    <svg class="ridge" width="800" height="76" viewBox="0 0 800 76"
+    <!-- The range's three named peaks, left to right in real south-to-north
+         order and rising in real relative height: South Teton, Middle
+         Teton, then Grand Teton tallest and rightmost — not a generic
+         wave, so don't "smooth" this into an arbitrary zigzag. -->
+    <svg class="ridge" width="800" height="90" viewBox="0 0 800 90"
          preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg"
          aria-hidden="true" focusable="false">
-      <path d="M0 76 L96 40 L150 54 L246 14 L318 46 L392 26 L470 58 L548 30 L628 50 L700 34 L800 76 Z"
+      <path d="M0 90 L70 66 L130 82 L190 44 L250 68 L320 76 L390 34 L450 60
+               L520 72 L580 30 L610 50 L660 6 L710 46 L800 90 Z"
             fill="currentColor" fill-opacity="0.10"
             stroke="currentColor" stroke-opacity="0.55" stroke-width="1.5"
             stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
@@ -291,9 +323,9 @@
 
     <section aria-labelledby="install-h">
       <h2 id="install-h">Install</h2>
-      <pre class="install"><code>{{INSTALL_COMMAND}}</code></pre>
+      <pre class="install" data-copy><code>{{INSTALL_COMMAND}}</code></pre>
       <p class="step-label">Then just open the CLI:</p>
-      <pre><code>teton</code></pre>
+      <pre data-copy><code>teton</code></pre>
       <p class="meta">The first run notices there is no daemon and offers to
         register <code>teton-code</code> with launchd for you
         (<code>brew services start teton</code>) so it starts now and survives
@@ -402,5 +434,57 @@
   </footer>
 
 </div>
+<script>
+// Progressive enhancement only: every pre[data-copy] block is already
+// plain, selectable text, so a user with JS disabled loses nothing but
+// this shortcut button.
+(function () {
+  function copyText(text, btn) {
+    function done(ok) {
+      window.clearTimeout(btn._copyResetTimer);
+      btn.textContent = ok ? 'Copied' : 'Copy failed';
+      btn.classList.toggle('copied', ok);
+      btn._copyResetTimer = window.setTimeout(function () {
+        btn.textContent = 'Copy';
+        btn.classList.remove('copied');
+      }, 1600);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { done(true); },
+        function () { done(false); }
+      );
+      return;
+    }
+    // Fallback for browsers without the async Clipboard API.
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    done(ok);
+  }
+
+  document.querySelectorAll('pre[data-copy]').forEach(function (pre) {
+    var code = pre.querySelector('code');
+    if (!code) return;
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.setAttribute('aria-label', 'Copy command to clipboard');
+    btn.setAttribute('aria-live', 'polite');
+    btn.addEventListener('click', function () {
+      copyText(code.textContent, btn);
+    });
+    pre.appendChild(btn);
+  });
+})();
+</script>
 </body>
 </html>
