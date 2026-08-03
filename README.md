@@ -53,17 +53,19 @@ teton uninstall
 One command, the whole chain: it stops the `brew services` daemon, deletes the
 state directory (`~/Library/Application Support/teton` — the downloaded model,
 cost history, and config), removes the daemon logs and any provider keys in the
-macOS keychain, and finishes with `brew uninstall teton`. It shows the full
-plan — with the size of what it's about to delete — and asks once before
-touching anything; `--keep-data` preserves the state directory for a later
-reinstall, and `--yes` answers the prompt for unattended runs.
+macOS keychain, runs `brew uninstall teton`, and removes the tap registration
+(skipped automatically if another formula from the tap is still installed). It
+shows the full plan — with the size of what it's about to delete — and asks
+once before touching anything; `--keep-data` preserves the state directory for
+a later reinstall, and `--yes` answers the prompt for unattended runs.
 
 This is a `teton` subcommand rather than a `brew uninstall` hook on purpose:
 Homebrew formulae have no uninstall hook (that's cask-only), and
 `brew uninstall` doesn't even stop a running service — run bare, it removes
 the binaries and strands the daemon, the model, and the logs. If you've
 already done that, the leftovers are `brew services stop teton`,
-`~/Library/Application Support/teton`, and `$(brew --prefix)/var/log/teton`.
+`~/Library/Application Support/teton`, `$(brew --prefix)/var/log/teton`, and
+`brew untap atelier-fashion/tap`.
 
 ### What runs where
 

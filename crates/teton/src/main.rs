@@ -680,7 +680,9 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
 fn run_uninstall(paths: &DaemonPaths, keep_data: bool, auto_accept: bool) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut prompter = StdinPrompter::new();
-    let plan = uninstall::Plan::build(paths, keep_data, uninstall::brew_prefix());
+    let brew_prefix = uninstall::brew_prefix();
+    let tap_registered = brew_prefix.is_some() && uninstall::tap_registered();
+    let plan = uninstall::Plan::build(paths, keep_data, brew_prefix, tap_registered);
     uninstall::run(paths, &plan, auto_accept, &mut surface, &mut prompter)
 }
 
