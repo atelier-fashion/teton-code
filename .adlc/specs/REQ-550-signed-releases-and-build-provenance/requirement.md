@@ -122,23 +122,23 @@ human steps explicitly instead of leaving them implicit.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: On a released tarball: `codesign --verify --strict` and
+- [x] AC-1 (PROVEN 2026-08-03, v0.1.2 — release smoke green per macOS target; first-hand codesign --verify --strict + Authority=Developer ID Application: Atelier Fashion LLC (545BU9G9D6) on the released arm64 tarball): On a released tarball: `codesign --verify --strict` and
       `codesign -dvv` (verbosity 2 — `-dv` emits no Authority lines; verified
       against the real tool in TASK-021) show the Developer ID identity and constant team id for
       `teton` and `teton-code`; the release smoke asserts this per macOS
       target.
-- [ ] AC-2: `gh attestation verify <artifact> --repo atelier-fashion/teton-code`
+- [x] AC-2 (PROVEN 2026-08-03, v0.1.2 — release-gate and verify-install attestation checks green on published assets): `gh attestation verify <artifact> --repo atelier-fashion/teton-code`
       succeeds for every published artifact of a release, in CI and as a
       copy-pasteable runbook command in the README/release notes.
 - [x] AC-3: The selftest proves both gates can fail: a byte-flipped tarball
       fails attestation verification and an ad-hoc-signed stand-in fails the
       signature gate, each with the correct exit classification (BR-5, BR-7).
-- [ ] AC-4: `HOMEBREW_TAP_TOKEN` and `GCP_*` no longer appear as repository
+- [~] AC-4 (steps 1-5 of runbook §11 done 2026-08-03 incl. negative probe run 30832422680; step 6 BLOCKED on re-adding the tap-publish environment token — see runbook): `HOMEBREW_TAP_TOKEN` and `GCP_*` no longer appear as repository
       secrets; a manually-dispatched workflow on a non-release ref cannot
       read them (verified by a deliberate failing probe run, recorded in the
       REQ). Environment protection rules are screenshotted/recorded since
       GitHub settings are not in-repo state.
-- [ ] AC-5: The tag-driven release workflow is green end-to-end with signing
+- [x] AC-5 (PROVEN 2026-08-03, v0.1.2 — tag push to published tap with zero manual steps): The tag-driven release workflow is green end-to-end with signing
       and attestation on all three targets, with no manual step beyond tag
       push (preserves REQ-548 AC-3).
 - [ ] AC-6: Keychain-grant survival across an upgrade (BR-1's user-visible
@@ -154,6 +154,15 @@ Merged as PR #13 (squash). BR-1..7 implemented and CI-proven (selftest
 mechanically; first exercised end-to-end by the next release tag or a
 main-dispatched dry run. AC-4 completes via runbook §11 (steps 3-6 pending,
 in order). AC-6 staged — second signed release. Accepted risk → REQ-551.
+
+## Post-audit note (2026-08-03)
+
+Three `GCP_*` repository secrets (GCP_PROJECT, GCP_SERVICE_ACCOUNT,
+GCP_WIF_PROVIDER) now exist at repo scope — added during the site/DNS work
+after this spec's Verified Inventory was taken. They are WIF *identifiers*,
+not key material, so the exposure is low; BR-4's property still wants them
+environment-scoped under site-deploy. Recorded as a follow-up, deliberately
+not moved mid-DNS-cutover.
 
 ## External Dependencies
 
