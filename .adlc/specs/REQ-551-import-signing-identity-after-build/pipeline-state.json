@@ -3,13 +3,14 @@
   "branch": "feat/REQ-551-import-signing-identity-after-build",
   "startedAt": "2026-08-01T14:00:00Z",
   "completed": false,
-  "currentPhase": 5,
+  "currentPhase": 6,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "phaseHistory": [
     {
@@ -36,6 +37,11 @@
       "phase": 4,
       "name": "3/3 tasks sequential chain; selftest 310->323 (13 permanent ordering cases incl. in-suite known-bad mutations); annotation truth-fix; all-phase byte-compat proven vs HEAD",
       "completedAt": "2026-08-01T15:30:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify: 6 agents -> 1 process Critical (unpushed branch; pushed) + 5 Major + ~18 minor; fix pass (early keychain destroy per reflector Q1, env scrub, stage integrity); Step-D re-verify found round-2's own Critical (unscrubbed import step downstream of untrusted build, BASH_ENV/function-shadowing \u2014 empirically proven) + High/Medium -> round-3 hardening (absolute tools, scratch-sign recovery, all controls self-asserted); selftest 323->407; closure proven via the reports' own attack recipes, re-run first-hand",
+      "completedAt": "2026-08-03T18:00:00Z"
     }
   ],
   "integrationBranch": "main",
