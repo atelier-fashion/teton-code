@@ -19,7 +19,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use teton_inference::{Completion, Engine, EngineError, GenParams};
+use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams};
 use teton_protocol::methods::StopReason;
 use teton_protocol::SessionId;
 
@@ -126,7 +126,15 @@ async fn a_slow_local_turn_does_not_stall_an_unrelated_task() {
             let events = SessionEvents::new(bus, session_id);
             let mut hook = NoopProvenanceHook;
             run_session_turn(
-                &engine, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook,
+                &engine,
+                ChatFormat::Flat,
+                &tools,
+                &tool_ctx,
+                &gate,
+                &events,
+                &mut ctx,
+                &config,
+                &mut hook,
             )
             .await
         }

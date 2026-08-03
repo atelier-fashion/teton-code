@@ -83,18 +83,30 @@ pub enum ChatFormat {
 
 /// The rendering family implied by a GGUF `tokenizer.chat_template` string.
 ///
-/// A template carrying the ChatML role delimiter (`<|im_start|>`) is
-/// [`ChatFormat::ChatMl`]; everything else — an empty string, absent metadata,
-/// an unrecognized family — is [`ChatFormat::Flat`], the fallback (REQ-554
-/// BR-2). Recognition is delimiter matching, not Jinja evaluation.
+/// A template is [`ChatFormat::ChatMl`] only when it carries **both** ChatML
+/// delimiters (`<|im_start|>` and `<|im_end|>`) and none of the dialect
+/// separators this renderer cannot reproduce (`<|im_sep|>`, the Phi-4 family —
+/// which *contains* `<|im_start|>` but expects a separator where our renderer
+/// writes a newline). Everything else — an empty string, absent metadata, an
+/// unrecognized or merely-mentioning template — is [`ChatFormat::Flat`], the
+/// fallback (REQ-554 BR-2). Misclassifying toward `ChatMl` is the dangerous
+/// direction: it renders a format the model was not trained on with no further
+/// fallback, so detection is corroborated rather than a single substring
+/// (REQ-554 verify). Recognition is delimiter matching, not Jinja evaluation.
 ///
 /// Detection is deliberately a pure function over the template *string* rather
 /// than an FFI probe, so the matcher is pinned by the default/CI suite with no
 /// `llama` feature and no weights on disk (REQ-554 ADR-1/AC-8). The
-/// feature-gated `LlamaEngine` is only its caller.
+/// feature-gated `LlamaEngine` is only its caller. The template string is
+/// third-party bytes (ADR-005 trusts the quantizer), so the matcher must be
+/// total and cheap on adversarial input — `contains` on three fixed needles
+/// is O(n), allocation-free, and cannot panic.
 #[must_use]
 pub fn detect_chat_format(template: &str) -> ChatFormat {
-    if template.contains("<|im_start|>") {
+    let chatml = template.contains("<|im_start|>")
+        && template.contains("<|im_end|>")
+        && !template.contains("<|im_sep|>");
+    if chatml {
         ChatFormat::ChatMl
     } else {
         ChatFormat::Flat
@@ -167,23 +179,28 @@ pub struct MockEngine {
 }
 
 impl MockEngine {
-    /// A ready mock serving `model_id`.
-    pub fn new(model_id: impl Into<String>) -> Self {
+    /// The shared base every public constructor builds on: available, no canned
+    /// response, flat rendering. One site owns the defaults so the constructors
+    /// cannot drift apart.
+    fn base(model_id: String) -> Self {
         Self {
-            model_id: model_id.into(),
+            model_id,
             availability: Availability::Available,
             canned: None,
             chat_format: ChatFormat::Flat,
         }
     }
 
+    /// A ready mock serving `model_id`.
+    pub fn new(model_id: impl Into<String>) -> Self {
+        Self::base(model_id.into())
+    }
+
     /// A ready mock that always returns `response`, regardless of the prompt.
     pub fn with_response(model_id: impl Into<String>, response: impl Into<String>) -> Self {
         Self {
-            model_id: model_id.into(),
-            availability: Availability::Available,
             canned: Some(response.into()),
-            chat_format: ChatFormat::Flat,
+            ..Self::base(model_id.into())
         }
     }
 
@@ -191,10 +208,8 @@ impl MockEngine {
     /// [`EngineError::Unavailable`] — models an unloaded local tier.
     pub fn unavailable(model_id: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
-            model_id: model_id.into(),
             availability: Availability::Unavailable(reason.into()),
-            canned: None,
-            chat_format: ChatFormat::Flat,
+            ..Self::base(model_id.into())
         }
     }
 
@@ -405,6 +420,11 @@ mod llama {
         model: LlamaModel,
         n_ctx: u32,
         chat_format: ChatFormat,
+        /// Why this engine fell back to [`ChatFormat::Flat`], when it did —
+        /// carried for the loader's user-visible downgrade report (REQ-554
+        /// BR-2, LESSON-456: never discard the reason a degradation happened).
+        /// `None` when a template was recognized.
+        template_fallback_reason: Option<&'static str>,
     }
 
     impl LlamaEngine {
@@ -432,18 +452,44 @@ mod llama {
             let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
             let model = LlamaModel::load_from_file(backend, path, &model_params)
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
-            let chat_format = model
-                .chat_template(None)
-                .ok()
-                .and_then(|template| template.to_str().map(detect_chat_format).ok())
-                .unwrap_or(ChatFormat::Flat);
+            // Every failure mode resolves to Flat, but the CAUSE is kept, not
+            // discarded (LESSON-456): the loader interpolates it into the
+            // user-visible fallback report, so "no template at all" and "a
+            // template we can't reproduce" read differently.
+            let (chat_format, template_fallback_reason) = match model.chat_template(None) {
+                Err(_) => (
+                    ChatFormat::Flat,
+                    Some("no chat template in the GGUF metadata"),
+                ),
+                Ok(template) => match template.to_str() {
+                    Err(_) => (
+                        ChatFormat::Flat,
+                        Some("the GGUF chat template is not valid UTF-8"),
+                    ),
+                    Ok(text) => match detect_chat_format(text) {
+                        ChatFormat::ChatMl => (ChatFormat::ChatMl, None),
+                        ChatFormat::Flat => {
+                            (ChatFormat::Flat, Some("unrecognized chat template family"))
+                        }
+                    },
+                },
+            };
             Ok(Self {
                 model_id: model_id.into(),
                 backend,
                 model,
                 n_ctx,
                 chat_format,
+                template_fallback_reason,
             })
+        }
+
+        /// Why this engine is on the flat fallback, when it is (REQ-554 BR-2).
+        /// The loader interpolates this into the downgrade report it emits at
+        /// commit time; `None` means a template was recognized.
+        #[must_use]
+        pub fn template_fallback_reason(&self) -> Option<&'static str> {
+            self.template_fallback_reason
         }
     }
 
@@ -470,6 +516,15 @@ mod llama {
                 .new_context(self.backend, ctx_params)
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
 
+            // BEHAVIORAL DEPENDENCY (REQ-554 security): llama-cpp-2 0.1.151's
+            // `str_to_token` hardcodes `parse_special = true`, so control-token
+            // spellings ANYWHERE in this string tokenize as real ChatML control
+            // tokens, not text. The harness renderer is the compensating
+            // control — it defuses those spellings in untrusted content before
+            // they reach this call (`tetond`'s `neutralize_control_tokens`).
+            // Re-audit that pairing if this binding is ever bumped: an upstream
+            // flip of that flag silently changes the injection posture in
+            // either direction.
             let tokens = self
                 .model
                 .str_to_token(prompt, AddBos::Always)
@@ -714,7 +769,31 @@ mod tests {
             .starts_with("local tier unavailable"));
     }
 
-    /// A ChatML template is recognized from its role delimiter alone — no
+    /// A ChatML dialect this renderer cannot reproduce falls back to Flat:
+    /// Phi-4's template CONTAINS `<|im_start|>` but separates role from
+    /// content with `<|im_sep|>` where our renderer writes a newline —
+    /// rendering it as plain ChatML would silently feed the model a format it
+    /// was not trained on, with no further fallback (REQ-554 verify).
+    #[test]
+    fn a_chatml_dialect_with_im_sep_falls_back_to_flat() {
+        let template = "{% for message in messages %}\
+                        <|im_start|>{{ message['role'] }}<|im_sep|>\
+                        {{ message['content'] }}<|im_end|>{% endfor %}\
+                        <|im_start|>assistant<|im_sep|>";
+        assert_eq!(detect_chat_format(template), ChatFormat::Flat);
+    }
+
+    /// A template that merely *mentions* the opening delimiter without the
+    /// closing one is not ChatML — detection is corroborated, not a single
+    /// substring (REQ-554 verify).
+    #[test]
+    fn a_template_mentioning_im_start_alone_falls_back_to_flat() {
+        let template = "{# legacy: some models used <|im_start|> here #}\
+                        {% for m in messages %}[INST]{{ m['content'] }}[/INST]{% endfor %}";
+        assert_eq!(detect_chat_format(template), ChatFormat::Flat);
+    }
+
+    /// A ChatML template is recognized from its role delimiters — no
     /// Jinja evaluation, no `llama` feature, no weights (REQ-554 ADR-1/AC-8).
     #[test]
     fn a_chatml_template_string_is_detected() {

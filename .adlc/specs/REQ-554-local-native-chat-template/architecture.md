@@ -58,15 +58,18 @@ fixture set without a single edit. Mode is immutable per engine instance
 (resolved at load, LESSON-445's stage/commit means the committed engine's
 format is the serving format).
 
-**Fallback visibility (BR-2/AC-3)**: the *loader path* in `tetond` (the
-post-verify engine install, ADR-006) checks `chat_format()` after a real
-engine loads and, on `Flat`, emits exactly one log line naming the model and
-reason (`tetond: model <id>: no recognized chat template; using flat
-transcript rendering`). Chosen over a new protocol event: the spec allows
-either surface; a log line needs no protocol change and satisfies "visible,
-once per load". Scripted/mock engines do not log — the report exists for real
-models (test doubles are flat by design, not degraded). A future protocol
-event can wrap this same site.
+**Fallback visibility (BR-2/AC-3, amended at verify)**: `LlamaEngine::load`
+*captures* the downgrade cause (`template_fallback_reason()` — missing
+template, non-UTF-8 template, unrecognized family; LESSON-456 forbids
+collapsing them into one fixed sentence), the loader stages it beside the
+engine, and `StagedEngines::commit` emits exactly one log line
+(`template_fallback_line(model, reason)`, a pure fn pinned by a default-build
+unit test) when the engine actually goes live — not at stage time, where a
+superseded flow could report a downgrade for an engine that never serves
+(LESSON-445). Chosen over a new protocol event: the spec allows either
+surface; a log line needs no protocol change. Scripted/mock engines stage
+with no note — flat by design, not degraded. A future protocol event can
+wrap the same commit site.
 
 ### ADR-3: Rendering happens at the completion source; `PreparedPrompt` is unchanged
 
@@ -83,31 +86,60 @@ signatures and outputs are untouched.
 **Rationale**: keeps the flat rendering byte-identical (the fallback contract
 and the tests that pin it), adds no third shape to `PreparedPrompt`, and puts
 the format decision exactly where the engine handle already lives. Budget
-note (BR-5): the engine's typed over-window refusal (LESSON-444/446) runs on
-the *rendered* string because that is what `complete()` tokenizes — template
-overhead is inherently counted. ChatML overhead is bounded and small
-(≤ ~40 bytes/message, `CHATML_PER_MESSAGE_OVERHEAD_BYTES` documents it)
-against the byte budget's ≥2× headroom (16 KiB budget vs 32 KiB window
-currency); the CI pin for AC-5 is a prompt-capturing mock proving the
-window-checked string IS the rendered one.
+note (BR-5, corrected at verify): the engine's typed over-window refusal
+(LESSON-444/446) runs on the *rendered* string because that is what
+`complete()` tokenizes — template overhead is inherently counted there. The
+context byte budget does NOT enjoy the ≥2× headroom an earlier draft of this
+document claimed — 32,768 budget bytes sit at roughly 1× the engine window in
+the conservative ≳2-bytes-per-BPE-token currency — so `estimated_bytes()`
+charges a flat per-block `RENDER_OVERHEAD_RESERVE_BYTES` (64 B, covering
+ChatML's 33 delimiter bytes plus labels in either mode), keeping the estimate
+a true upper bound without teaching `ContextManager` about formats. AC-5 is
+pinned in CI both ways: a prompt-capturing mock proves the engine receives
+the rendered string, and a window-enforcing mock proves a prompt that fits
+flat but crosses the window on template overhead gets the typed refusal.
+
+**Content neutralization (added at verify — Critical fix)**: `llama-cpp-2`'s
+`str_to_token` hardcodes `parse_special = true`, so ChatML control-token
+spellings anywhere in the prompt tokenize as REAL control tokens. Untrusted
+content (tool results are repo bytes) could therefore mint a forged
+`<|im_start|>system` turn the model was trained to obey — a containment
+escape below the level any textual envelope can reach. The renderer is the
+single choke point: `neutralize_control_tokens` defuses the spellings
+(`<|im_start|>` → `<|im_start_|>`, likewise `<|im_end|>`/`<|endoftext|>`) in
+message and duty content before wrapping; harness-authored delimiters are
+appended outside it. The flat rendering's equivalent exposure is pre-existing
+on `main` (same tokenizer flag, no ChatML grammar to complete) and is filed
+as a follow-up rather than silently changing the byte-identical fallback
+contract here.
 
 ### ADR-4: The fabrication-marker set follows the rendering mode
 
-**Decision**: `ReplyScanner::for_format(ChatFormat)` /
-`StreamGate::for_format(ChatFormat)` select the marker set: Flat keeps
+**Decision (amended at verify)**: markers are split into **line-anchored**
+and **position-independent** sets. Anchored: Flat keeps
 `["User:", "Assistant:", "Tool (", "<tool-result"]`; ChatMl uses
-`["<|im_start|>", "<|im_end|>", "<tool-result"]`. `<tool-result` stays in
-both (the harness's own untrusted envelope is fabricatable in any mode).
-Flat markers must NOT fire in ChatML mode (a legit answer may contain
-`User:` at a line start). The turn loop learns the mode via a new defaulted
-`CompletionSource::chat_format()` (local source returns its cached value;
-remote stays Flat). Marker sets are hardcoded per family (OQ-2, resolved).
+`["<tool-result", TOOL_RESULT_LABEL_PREFIX]` (the tool-result label
+`prepare()` writes, derived from one shared constant so label and marker
+cannot drift). Position-independent, in **both** sets: the template control
+tokens `<|im_start|>`/`<|im_end|>`, matched at any offset — the renderer
+shows `<|im_end|>` to the model mid-line, so line anchoring would never fire
+on the shape the model reproduces; and a flat-fallback model (stripped GGUF
+metadata) can still be ChatML-native, so the flat set must catch its
+delimiters too. Anchored flat markers still must not fire on prose
+(`User:` mid-line), which anchoring preserves. The turn loop learns the mode
+via a defaulted `CompletionSource::chat_format()`; the local source's value
+is a constructor parameter supplied from the daemon's engine slot (which
+stores the `ChatFormat` beside the handle at install) — never a lock on the
+async path (LESSON-448). Marker sets are hardcoded per family (OQ-2,
+resolved).
 
-**Rationale**: BR-4. The JSON tool-call stop is format-agnostic and
-unchanged; `<|im_end|>` is normally consumed as an EOG token before any text
-is emitted, so its presence in the marker set is defense in depth, not the
-primary terminator. BUG-147 containment is preserved verbatim in both modes
-(BR-3).
+**Rationale**: BR-4 + the verify findings. The JSON tool-call stop is
+format-agnostic and unchanged. The summarizer duty's output takes the same
+scan-and-cut before entering context (its output feeds straight back in).
+BUG-147 containment is preserved in both modes (BR-3); the one deliberate
+flat-mode change is that template control tokens now also stop a flat turn —
+they are never legitimate output in any mode, and storing one would
+re-tokenize it as real frame next turn.
 
 ## Scope notes
 

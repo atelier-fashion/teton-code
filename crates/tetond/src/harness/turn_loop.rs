@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use teton_inference::{Engine, EngineError, GenParams};
+use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{Event, SessionUpdate, SessionUpdatePayload, ToolCallStatus};
 use teton_protocol::methods::StopReason;
 use teton_protocol::{ProviderId, SessionId};
@@ -318,6 +318,7 @@ impl SessionEvents {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_session_turn(
     engine: &Arc<Mutex<dyn Engine>>,
+    format: ChatFormat,
     tools: &ToolRegistry,
     tool_ctx: &ToolContext,
     gate: &PermissionGate,
@@ -326,7 +327,13 @@ pub async fn run_session_turn(
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
 ) -> Result<TurnOutcome, HarnessError> {
-    let mut source = LocalEngineSource::new(Arc::clone(engine));
+    // `format` is passed rather than read from the engine: this fn runs on the
+    // async path and the engine mutex is held for the whole of any in-flight
+    // completion — a metadata lock here would park a tokio worker behind
+    // another session's inference (LESSON-448). The daemon's engine slot
+    // stores the format beside the handle; tests pass the format their test
+    // engine reports.
+    let mut source = LocalEngineSource::new(Arc::clone(engine), format);
     run_session_turn_with_source(
         &mut source,
         tools,
@@ -606,6 +613,7 @@ pub async fn run_session_turn_with_source(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_routed_session_turn(
     engine: &Arc<Mutex<dyn Engine>>,
+    format: ChatFormat,
     tools: &ToolRegistry,
     tool_ctx: &ToolContext,
     gate: &PermissionGate,
@@ -616,6 +624,7 @@ pub async fn run_routed_session_turn(
 ) -> Result<TurnOutcome, HarnessError> {
     run_session_turn(
         engine,
+        format,
         tools,
         tool_ctx,
         gate,
@@ -742,10 +751,22 @@ mod tests {
             _exposed: &[&str],
             on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
         ) -> Result<SourceTurn, HarnessError> {
-            // Token-at-a-time, so the gate is exercised incrementally the way a
-            // real stream drives it — not handed the whole reply at once.
-            for chunk in self.reply.split_inclusive(' ') {
+            // Fixed-width byte chunks, so the gate is exercised the way a real
+            // stream drives it — including a marker SPLIT across chunk
+            // boundaries, which word-shaped chunking would never produce (the
+            // stall logic is exactly what such a split exercises). 3 bytes
+            // guarantees `<|im_start|>` arrives in pieces. Chunk on a char
+            // boundary: markers are ASCII and these fixtures are too, but a
+            // safe split keeps the helper reusable.
+            let mut rest = self.reply;
+            while !rest.is_empty() {
+                let mut cut = 3.min(rest.len());
+                while !rest.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                let (chunk, tail) = rest.split_at(cut);
                 on_token(chunk);
+                rest = tail;
             }
             Ok(SourceTurn {
                 // The source's own scanner already cut the fabricated tail out
@@ -761,11 +782,14 @@ mod tests {
     }
 
     /// Every `agent_message` chunk the loop published, concatenated.
+    ///
+    /// Drains with `try_recv`: `EventBus::publish` is synchronous and the turn
+    /// has already returned when this runs, so every event is queued — a
+    /// state-derived drain, not a wall-clock window that goes flaky first
+    /// under CI scheduler pressure (LESSON-450's shape).
     async fn displayed_text(sub: &mut crate::broadcast::Subscription) -> String {
         let mut out = String::new();
-        while let Ok(Some(env)) =
-            tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await
-        {
+        while let Some(env) = sub.try_recv() {
             if let Event::SessionUpdate(SessionUpdate {
                 update: SessionUpdatePayload::AgentMessageChunk { text },
             }) = &env.event

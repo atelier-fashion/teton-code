@@ -159,19 +159,19 @@ pub struct LocalEngineSource {
 }
 
 impl LocalEngineSource {
-    /// A source over the shared local `engine`, rendering for whatever chat
-    /// format that engine reports.
+    /// A source over the shared local `engine`, rendering for `format`.
     ///
-    /// The engine is locked **once**, here, to cache its
-    /// [`ChatFormat`](teton_inference::ChatFormat). Mode is immutable per source
-    /// (ADR-2): it is resolved once per engine load, and a source is rebuilt per
-    /// turn-run from the same committed engine, so "once per source" and "once
-    /// per load" agree. Caching also keeps the per-turn path free of a metadata
-    /// lock — a real completion holds this mutex for seconds, so asking the
-    /// engine its format mid-turn would queue behind inference.
+    /// The format is a **parameter, not a lock**: this constructor runs on the
+    /// async path (`run_session_turn`, the routed attempt), and the engine
+    /// mutex is held for the entire seconds-long duration of any in-flight
+    /// completion — locking here to ask the engine its format would park a
+    /// tokio worker behind another session's inference (LESSON-448; REQ-554
+    /// verify). The caller supplies the format resolved when the engine was
+    /// installed (the daemon's engine slot stores it beside the handle), which
+    /// cannot disagree with the engine: the slot replaces handle and format
+    /// together, and a committed engine is never re-templated (ADR-2).
     #[must_use]
-    pub fn new(engine: Arc<Mutex<dyn Engine>>) -> Self {
-        let format = engine.lock().expect("engine mutex poisoned").chat_format();
+    pub fn new(engine: Arc<Mutex<dyn Engine>>, format: ChatFormat) -> Self {
         Self { engine, format }
     }
 }
@@ -720,7 +720,7 @@ mod tests {
             "mock",
             r#"{"tool":"read","arguments":{"path":"a.rs"}}"#,
         )));
-        let mut source = LocalEngineSource::new(engine);
+        let mut source = LocalEngineSource::new(engine, ChatFormat::Flat);
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let mut streamed = String::new();
@@ -749,7 +749,7 @@ mod tests {
             "mock",
             "All done, nothing more to do.",
         )));
-        let mut source = LocalEngineSource::new(engine);
+        let mut source = LocalEngineSource::new(engine, ChatFormat::Flat);
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let prompt = flat_prompt("prompt");
@@ -781,7 +781,7 @@ mod tests {
             ChatFormat::ChatMl,
             r#"{"tool":"read","arguments":{"path":"a.rs"}}"#,
         );
-        let mut source = LocalEngineSource::new(engine);
+        let mut source = LocalEngineSource::new(engine, ChatFormat::ChatMl);
         assert_eq!(
             source.chat_format(),
             ChatFormat::ChatMl,
@@ -836,7 +836,7 @@ mod tests {
         // string `prepare()` already produced, which is what keeps every
         // scripted fixture and the flat `{{LAST_TOOL_RESULT}}` parsing valid.
         let (engine, seen) = capturing_engine(ChatFormat::Flat, "All done.");
-        let mut source = LocalEngineSource::new(engine);
+        let mut source = LocalEngineSource::new(engine, ChatFormat::Flat);
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let prompt = tool_using_prompt();
@@ -857,7 +857,110 @@ mod tests {
         // AC-7: a plain test double inherits `Flat` from the trait default, so
         // it takes this same path with no edit of its own.
         let mock: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::new("mock")));
-        assert_eq!(LocalEngineSource::new(mock).chat_format(), ChatFormat::Flat);
+        assert_eq!(
+            LocalEngineSource::new(mock, ChatFormat::Flat).chat_format(),
+            ChatFormat::Flat
+        );
+    }
+
+    /// An engine that mirrors `LlamaEngine`'s over-window refusal in byte
+    /// currency: `complete` returns the typed backend error when the prompt it
+    /// is handed exceeds `window_bytes`. Reports ChatML so the source renders.
+    struct WindowedEngine {
+        window_bytes: usize,
+        format: ChatFormat,
+    }
+
+    impl Engine for WindowedEngine {
+        fn model_id(&self) -> &str {
+            "windowed"
+        }
+        fn chat_format(&self) -> ChatFormat {
+            self.format
+        }
+        fn complete(
+            &self,
+            prompt: &str,
+            _params: &GenParams,
+            on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<teton_inference::Completion, EngineError> {
+            if prompt.len() > self.window_bytes {
+                return Err(EngineError::Backend(format!(
+                    "prompt of {} bytes exceeds this engine's window ({})",
+                    prompt.len(),
+                    self.window_bytes
+                )));
+            }
+            on_token("ok");
+            Ok(teton_inference::Completion {
+                text: "ok".to_owned(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_over_window_rendered_prompt_is_refused_with_the_typed_error() {
+        // AC-5, pinned in the always-on suite (REQ-554 verify): a prompt sized
+        // to fit the window as flat text but to CROSS it once ChatML overhead
+        // is added must be refused with the typed error — proving the
+        // window-checked string is the RENDERED one, template overhead
+        // included, and that the refusal is an error, never a crash.
+        let content = "a".repeat(100);
+        let prompt = PreparedPrompt {
+            flat: content.clone(),
+            system: String::new(),
+            messages: vec![crate::harness::context::StructuredMessage {
+                role: MessageRole::User,
+                text: content,
+            }],
+        };
+        // Flat length 100; ChatML adds the user wrap + generation cue
+        // (12+4+1+11+22 = 50 bytes). A 120-byte window admits one, not the other.
+        let window_bytes = 120;
+
+        let chatml: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(WindowedEngine {
+            window_bytes,
+            format: ChatFormat::ChatMl,
+        }));
+        let mut source = LocalEngineSource::new(chatml, ChatFormat::ChatMl);
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let err = source
+            .produce_turn(
+                &prompt,
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect_err("the rendered prompt crosses the window");
+        assert!(
+            matches!(&err, HarnessError::Engine(EngineError::Backend(m)) if m.contains("exceeds")),
+            "expected the typed over-window refusal, got {err:?}"
+        );
+
+        // The SAME prompt under flat rendering fits — the overhead is what
+        // crossed the window.
+        let flat: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(WindowedEngine {
+            window_bytes,
+            format: ChatFormat::Flat,
+        }));
+        let mut source = LocalEngineSource::new(flat, ChatFormat::Flat);
+        source
+            .produce_turn(
+                &prompt,
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect("the flat rendering fits the same window");
     }
 
     #[tokio::test]
@@ -899,7 +1002,7 @@ mod tests {
         // The tool result is folded into a user turn, annotated so the model knows
         // it is tool output.
         assert_eq!(prepared.messages[2].role, MessageRole::User);
-        assert!(prepared.messages[2].text.contains("read tool result"));
+        assert!(prepared.messages[2].text.contains("Tool result (read):"));
         assert!(prepared.messages[2].text.contains("file body"));
 
         // Alternation holds: no two adjacent messages share a role.

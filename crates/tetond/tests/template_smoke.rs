@@ -75,8 +75,11 @@ async fn a_templated_turn_yields_one_well_formed_tool_call() {
     ctx.push_user("Read the file src/main.rs so you can tell me what it does. Use a tool.");
     let prompt = ctx.prepare(&mut NoopProvenanceHook);
 
+    // The format is passed the way the daemon's engine slot passes it —
+    // resolved from the engine at install, never locked for on the async path.
+    let format = engine.chat_format();
     let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(engine));
-    let mut source = LocalEngineSource::new(engine);
+    let mut source = LocalEngineSource::new(engine, format);
     assert_eq!(source.chat_format(), ChatFormat::ChatMl);
 
     let mut streamed = String::new();

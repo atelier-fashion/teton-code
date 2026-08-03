@@ -160,6 +160,15 @@ impl Subscription {
         self.rx.recv().await
     }
 
+    /// The next already-queued event, or `None` when the queue is empty right
+    /// now. Never waits: `EventBus::publish` is synchronous, so a caller that
+    /// knows publishing has finished can drain deterministically instead of
+    /// polling `recv` under a wall-clock timeout (the assertion shape that
+    /// goes flaky first under CI scheduler pressure — LESSON-450).
+    pub fn try_recv(&mut self) -> Option<EventEnvelope> {
+        self.rx.try_recv().ok()
+    }
+
     /// Whether the bus evicted this subscription for falling behind.
     #[must_use]
     pub fn is_lagged(&self) -> bool {
