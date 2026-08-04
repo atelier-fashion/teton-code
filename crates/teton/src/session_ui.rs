@@ -6,6 +6,9 @@
 //! fragments, tool calls and diffs render as lines, and every control event
 //! (`route_decided`, `privacy_block`, `provider_degraded`, `phase_transition`,
 //! `model_lifecycle`) becomes a one-line notice (the BR-5 legibility promise).
+//! Routing notices are diagnostic chrome, not warnings, so they render only when
+//! [`SessionState::verbose`] is set (`--verbose`); privacy and degradation
+//! notices always render.
 //!
 //! Permission requests are handled separately by [`resolve_permission`], which
 //! needs an input source: it renders the prompt, reads a decision, and returns
@@ -73,6 +76,9 @@ pub struct SessionState {
     pub cost: CostMeter,
     /// Model proposals this client has already taken up (REQ-547).
     model_seen: HashSet<RequestId>,
+    /// Show routing notices (`route [...]`). Off by default so the transcript
+    /// is just the conversation; `--verbose` turns it on.
+    pub verbose: bool,
 }
 
 impl SessionState {
@@ -121,7 +127,9 @@ pub fn render_event(
             EventOutcome::Rendered
         }
         Event::RouteDecided(rd) => {
-            surface.line(LineKind::Notice, &format_route(rd));
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_route(rd));
+            }
             EventOutcome::Rendered
         }
         Event::PrivacyBlock(pb) => {
@@ -477,6 +485,7 @@ mod tests {
     fn control_events_render_as_one_line_notices() {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
+        state.verbose = true;
 
         let events = [
             Event::RouteDecided(RouteDecided {
@@ -506,6 +515,38 @@ mod tests {
         assert!(surface.any_line_contains(LineKind::Notice, "re-routed to the local tier"));
         assert!(surface.any_line_contains(LineKind::Notice, "degraded: flaky"));
         assert!(surface.any_line_contains(LineKind::Notice, "fell back to anthropic"));
+    }
+
+    #[test]
+    fn route_notices_are_suppressed_by_default_but_warnings_still_render() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        let events = [
+            Event::RouteDecided(RouteDecided {
+                phase: None,
+                provider_id: ProviderId::from("local"),
+                model: None,
+                reason: "coding turn goes to the default provider".to_owned(),
+            }),
+            Event::PrivacyBlock(PrivacyBlock {
+                path: "secrets/prod.env".to_owned(),
+                provider_id: ProviderId::from("anthropic"),
+                action: PrivacyAction::ReroutedToLocal,
+            }),
+            Event::ProviderDegraded(ProviderDegraded {
+                provider_id: ProviderId::from("flaky"),
+                failure_class: FailureClass::Timeout,
+                fallback_id: None,
+            }),
+        ];
+        for event in events {
+            render_event(&envelope(event), &mut surface, &mut state);
+        }
+
+        assert!(!surface.any_line_contains(LineKind::Notice, "route ["));
+        assert!(surface.any_line_contains(LineKind::Notice, "privacy: secrets/prod.env"));
+        assert!(surface.any_line_contains(LineKind::Notice, "degraded: flaky"));
     }
 
     #[test]
