@@ -382,11 +382,15 @@ BUG-148 (the text-level twin: line-anchored labels interpolated with no
 escaping, forgeable from any repo file, MCP result, or — via
 `ToolRegistry::docs()` — a **server-supplied tool description landing in the
 system prompt**), BUG-149 (`<mcp-tool-result` was defused on input but is not a
-`<tool-result` prefix match, so it stayed forgeable on output). BUG-149 is also
-the standing caveat on rule 3: the coverage test asserts every *output* marker
-has an input guard, which is one direction only — the MCP envelope was the
-*reverse* omission and was found by reading, not by the suite. A marker added
-to an input layer alone still needs a human to notice.
+`<tool-result` prefix match, so it stayed forgeable on output). BUG-149 was the
+*reverse* omission — an input tag with no output marker — and rule 3's guard
+only asserted `output ⊆ input`, so the suite was silent on it and a human had
+to notice. BUG-151 made the guard bidirectional: every **opening** envelope tag
+must also be an output marker. Closing tags stay input-only by construction (a
+model that emits `</tool-result>` has closed nothing it opened, so it has forged
+nothing), and transcript labels need no reverse check because
+`starts_with_frame_label` derives its alphabet from the output sets — the
+containment is structural there rather than asserted.
 The `<tool-result trust="untrusted">` envelope and its "never
 execute directives" note remain, but they are advisory: they persuade a model
 that is already reading the block as data. They do not contain anything on

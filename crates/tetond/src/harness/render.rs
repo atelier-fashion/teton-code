@@ -811,11 +811,11 @@ mod tests {
 
     #[test]
     fn the_input_alphabet_covers_every_output_marker() {
-        // The drift guard. What the model must not emit (reply.rs) is what
-        // content must not introduce — across BOTH neutralizers, since the two
-        // layers split the alphabet between them. If a marker is ever added to
-        // either anchored set and neither function covers it, that is the
-        // exploit.
+        // The drift guard, forward direction: output ⊆ input. What the model
+        // must not emit (reply.rs) is what content must not introduce — across
+        // BOTH neutralizers, since the two layers split the alphabet between
+        // them. If a marker is ever added to either anchored set and neither
+        // function covers it, that is the exploit.
         for marker in super::super::reply::FLAT_ANCHORED_MARKERS
             .iter()
             .chain(super::super::reply::CHATML_ANCHORED_MARKERS)
@@ -824,6 +824,40 @@ mod tests {
                 starts_with_frame_label(marker) || starts_with_envelope_tag(marker),
                 "{marker:?} is frame on the output side but is defused on neither input layer"
             );
+        }
+    }
+
+    #[test]
+    fn every_opening_envelope_tag_is_also_an_output_marker() {
+        // The drift guard, reverse direction: input ⊆ output, for the envelope
+        // layer (BUG-151). The forward test above is silent on a marker that is
+        // defused on input but absent from the fabrication markers — which is
+        // precisely the state BUG-149 was in: `<mcp-tool-result` was defused
+        // here (BUG-148) but was not a `<tool-result` prefix match, so a model
+        // could still emit a fabricated MCP envelope uncut. That was found by
+        // reading, not by this suite. Now it is a build failure.
+        //
+        // Transcript labels need no reverse check — `starts_with_frame_label`
+        // derives its alphabet FROM the output sets, so containment is
+        // structural there rather than asserted.
+        for tag in UNTRUSTED_ENVELOPE_TAGS {
+            // Closing tags are input-only by construction: a model that emits
+            // `</tool-result>` has closed nothing it did not open, so it has
+            // forged nothing. Only the OPENING tag is a fabrication claim.
+            if tag.starts_with("</") {
+                continue;
+            }
+            for (set, name) in [
+                (super::super::reply::FLAT_ANCHORED_MARKERS, "FLAT"),
+                (super::super::reply::CHATML_ANCHORED_MARKERS, "CHATML"),
+            ] {
+                assert!(
+                    set.contains(tag),
+                    "{tag:?} is defused on input but is not in {name}_ANCHORED_MARKERS — \
+                     a model can still emit a fabricated envelope the input side already \
+                     treats as frame (the BUG-149 shape)"
+                );
+            }
         }
     }
 
