@@ -113,6 +113,21 @@ on `main` (same tokenizer flag, no ChatML grammar to complete) and is filed
 as a follow-up rather than silently changing the byte-identical fallback
 contract here.
 
+**Follow-up closed (BUG-148, 2026-08-04)**: the tokenizer-level half of that
+flat exposure was in fact closed inside REQ-554 itself — the re-verify moved
+`neutralize_control_tokens` onto **both** render arms, because `Flat` is where
+a ChatML-*vocab* model lands when its template is absent or declined. What
+remained was a distinct, *text*-level variant: `assemble()` interpolated
+untrusted content between the line-anchored `User:` / `Assistant:` /
+`Tool (name):` labels with no escaping, so a repo file body could render as a
+byte-perfect forged turn pair. BUG-148 closes it with two neutralizers placed
+at the layers that author each frame (`neutralize_frame_labels` at
+`assemble`/`prepare`; `neutralize_envelope_tags` at the envelope writers) —
+NOT in `render_prompt`, whose `Flat` arm sees the already-assembled string and
+so cannot tell forged frame from the harness's own. The byte-identity contract
+this ADR protects is preserved: matching is flush-left only, so ordinary
+content still renders identically. See context ADR-009 and LESSON-477.
+
 ### ADR-4: The fabrication-marker set follows the rendering mode
 
 **Decision (amended at verify)**: markers are split into **line-anchored**
