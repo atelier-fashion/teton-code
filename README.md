@@ -36,6 +36,23 @@ Afterwards, `teton doctor` diagnoses the daemon, its socket, the model state and
 your providers; the daemon's own logs live under
 `$(brew --prefix)/var/log/teton/`.
 
+### In the session
+
+Inside an interactive `teton` session, `/`-prefixed lines are commands, not
+prompts:
+
+| Command | Effect |
+|---|---|
+| `/help` | List the commands (and the escape hatch below) |
+| `/cost` | The live cost meter — same report as `teton cost` |
+| `/model` | One line naming the model the local tier is on |
+| `/model set <name>` | Change the local model (typed input only; asks before an above-RAM-floor pick) |
+| `/verbose` | Toggle routing and turn-end notices for this session |
+| `/quit` | End the session (same as Ctrl-D) |
+
+To send a prompt that genuinely starts with a slash — a pasted path, say —
+double it: `//usr/local/bin/x — why?` asks the model about `/usr/local/bin/x`.
+
 ### Upgrading
 
 ```sh

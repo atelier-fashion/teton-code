@@ -2,7 +2,7 @@
   "req": "REQ-555",
   "branch": "feat/REQ-555-in-session-slash-commands",
   "startedAt": "2026-08-04T14:35:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [0, 1, 2, 3, 4, 5, 6, 7],
   "phaseHistory": [
@@ -13,7 +13,8 @@
     { "phase": 4, "name": "Implement", "completedAt": "2026-08-04T15:50:00Z" },
     { "phase": 5, "name": "Verify (Reflect + Review)", "completedAt": "2026-08-04T17:10:00Z" },
     { "phase": 6, "name": "Create Pull Request", "completedAt": "2026-08-04T17:20:00Z" },
-    { "phase": 7, "name": "PR Cleanup & CI", "completedAt": "2026-08-04T18:05:00Z" }
+    { "phase": 7, "name": "PR Cleanup & CI", "completedAt": "2026-08-04T18:05:00Z" },
+    { "phase": 8, "name": "Wrapup (merged PR #41 as 8382d45; knowledge captured)", "completedAt": "2026-08-04T19:45:00Z" }
   ],
   "integrationBranch": "main",
   "repos": {
@@ -26,7 +27,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/41",
       "prNumber": 41,
       "prCreatedAt": "2026-08-04T14:33:47Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
