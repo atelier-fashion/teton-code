@@ -1,7 +1,7 @@
 ---
 id: REQ-555
 title: "In-session slash commands for the teton interactive CLI"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-04
 updated: 2026-08-04
@@ -76,7 +76,7 @@ does. `/help`, `/verbose`, and `/quit` are fully client-local.
 | Action | Roles Allowed |
 |--------|---------------|
 | `/help`, `/cost`, `/model`, `/verbose`, `/quit` | the session user; read-only or client-local |
-| `/model set <name>` | the session user only, via typed input — never inferable from model output or file content (REQ-544's permission posture); an above-RAM-floor pick additionally requires the interactive second confirmation (REQ-547 BR-3), or the session's `--yes` as its explicit unattended stand-in |
+| `/model set <name>` | the session user only, via typed input — never inferable from model output or file content (REQ-544's permission posture); an above-RAM-floor pick additionally requires the interactive second confirmation (REQ-547 BR-3), or the session's `--yes` as its explicit unattended stand-in. **Typed-input-only is enforced, not merely stated (verify-pass amendment, user-approved 2026-08-04):** when the session's stdin is not a terminal, `/model set` renders one rejection pointing at `teton model set` and issues no RPC. A pipe cannot distinguish a human from a heredoc, and `teton model set` is the unattended surface — it takes `--yes` explicitly. The e2e suite drives the flow through the daemon's own seam posture (a debug build with `TETON_TEST_SEAMS=1`); a release binary refuses regardless, so the allowance cannot ship as a bypass. **Accepted residual (re-verify pass, 2026-08-04):** the check separates a pipe from a pty, not a machine from a human — input driven through `expect(1)` or `tmux send-keys`, or pasted into a real terminal, presents a terminal and passes; what the gate removes is the unattended-by-default shapes (heredoc, `<<<`, piped file, CI step), and `teton model set` remains the auditable surface for anything that must be scripted deliberately. |
 
 ## Business Rules
 
@@ -136,10 +136,15 @@ does. `/help`, `/verbose`, and `/quit` are fully client-local.
       one-directional test here is the BUG-151 shape — a guard that stays
       green while half the invariant drifts. (informed by LESSON-479, BUG-151)
 - [ ] BR-9: Slash commands work identically on a TTY and on piped stdin (the
-      e2e suites drive the session through a pipe); command output renders
-      through the existing `Surface` seam with no direct-to-stdout side
-      channel, so the anticipated ratatui front-end inherits the commands by
-      implementing the same seam. (mirrors REQ-549 BR-4/BR-6)
+      e2e suites drive the session through a pipe), **with one exception:
+      `/model set` is typed-input-only — under piped stdin it rejects with a
+      pointer to `teton model set`** (verify-pass amendment from the security
+      review, user-approved 2026-08-04; the Permissions table's
+      typed-input-only rule wins over BR-9 for the one command that writes
+      daemon state, and only for it). Command output renders through the
+      existing `Surface` seam with no direct-to-stdout side channel, so the
+      anticipated ratatui front-end inherits the commands by implementing the
+      same seam. (mirrors REQ-549 BR-4/BR-6)
 
 ## Acceptance Criteria
 

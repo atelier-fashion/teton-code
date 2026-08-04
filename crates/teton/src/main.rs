@@ -15,11 +15,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use teton_protocol::jsonrpc::error_code;
+use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    ConfigGetParams, ConfigSetParams, ConfigUpdate, CostQueryParams, ModelListParams,
-    ModelSetParams, ModelStatusParams, PrivacyBoundaryConfig, PromptBlock, PromptTurnParams,
-    ProviderConfig, RoutingRule, SessionCreateParams,
+    ConfigGetParams, ConfigSetParams, ConfigUpdate, CostQueryParams, CostQueryResult,
+    CostReportView, ModelListParams, ModelListResult, ModelSetParams, ModelStatusParams,
+    ModelStatusResult, PrivacyBoundaryConfig, ProviderConfig, RoutingRule, SessionCreateParams,
 };
 use teton_protocol::{Phase, PrivacyMode, ProviderId, ProviderKind, SessionMode};
 
@@ -55,8 +55,10 @@ struct Cli {
     /// Answer the first-run local-model prompt with "accept" and read no input
     /// (REQ-547 BR-5): the explicit opt-in for unattended/CI runs. Also supplies
     /// the second confirmation `teton model set` needs for a model above this
-    /// machine's RAM floor (BR-3), and the deletion confirmation of
-    /// `teton uninstall`.
+    /// machine's RAM floor (BR-3), the same confirmation for the in-session
+    /// `/model set <name>` (REQ-555 BR-4b — one flow, so the session inherits
+    /// the flag as the explicit unattended stand-in and consumes no input line
+    /// for the question), and the deletion confirmation of `teton uninstall`.
     #[arg(long, short = 'y', global = true)]
     yes: bool,
 
@@ -308,6 +310,12 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
     // The banner is for humans at a terminal. Piped stdout (the e2e suites,
     // shell composition) sees the same byte stream it always did.
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    // The *other* half of "interactive", read once here at the edge and carried
+    // on the context (REQ-555): where the entry lines come from, which is what
+    // the `/model set` gate turns on. Two different questions — a session may
+    // well have a piped stdin and a terminal stdout — so neither flag is
+    // derivable from the other, and a handler must never read either itself.
+    let typed_input = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let color = interactive && banner::color_enabled();
     if interactive {
         banner::print(
@@ -331,6 +339,7 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             answer_permissions: true,
             answer_model_proposals: true,
             auto_accept_model: auto_accept,
+            typed_input,
         };
 
         // A proposal raised before this client attached is never replayed as an
@@ -360,7 +369,10 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
         };
         ctx.surface.line(
             LineKind::Info,
-            &format!("session {session_id} ready (freeform). Type a prompt; Ctrl-D to end."),
+            &format!(
+                "session {session_id} ready (freeform). Type a prompt or /help for commands; \
+                 Ctrl-D to end."
+            ),
         );
         if interactive {
             // A blank line so the entry area sits clear of the status text.
@@ -400,12 +412,10 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                 // (BR-1b); a plain prompt is the trimmed line's own bytes.
                 slash::Input::EscapedPrompt(text) | slash::Input::Prompt(text) => text,
             };
-            let params = PromptTurnParams {
-                session_id: session_id.clone(),
-                prompt: vec![PromptBlock::Text {
-                    text: prompt_text.to_owned(),
-                }],
-            };
+            // Built by the classifier's own module, so the bytes on the wire are
+            // the bytes it classified (AC-7 / AC-7b) rather than a second
+            // reading of the line taken here.
+            let params = slash::prompt_turn_params(&session_id, prompt_text);
             match conn.call(params, &mut ctx)? {
                 Ok(res) => {
                     // Gated on session state, not on the `--verbose` flag, so
@@ -471,25 +481,59 @@ pub(crate) fn query_and_render_cost(
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
 ) -> anyhow::Result<()> {
-    match conn.call(CostQueryParams::default(), ctx)? {
-        Ok(res) => cost_ui::render_report_view(&res.report, ctx.surface),
-        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
-            LineKind::Notice,
-            "this daemon build does not expose the cost/query method yet; no authoritative \
-             cost report is available.",
-        ),
-        Err(err) => ctx.surface.line(
-            LineKind::Error,
-            &format!("cost query failed: {}", err.message),
-        ),
+    let answered = conn.call(CostQueryParams::default(), ctx)?;
+    if let Some(report) = cost_report_or_report(answered, ctx.surface) {
+        cost_ui::render_report_view(&report, ctx.surface);
     }
     Ok(())
+}
+
+/// Unwrap a `cost/query` answer, rendering the daemon's failure arms.
+///
+/// The counterpart of [`model_status_or_report`], and for the same reason: a
+/// daemon too old to serve the method — or one that answers with an error —
+/// must say the same thing on `teton cost`, on the session-end summary, and on
+/// the in-session `/cost` (REQ-555 BR-4). All three run
+/// [`query_and_render_cost`], so they already shared these strings; splitting
+/// the arms out is what makes them *testable* without a socket, which is the
+/// half that was missing.
+///
+/// `None` means the reason is already on the surface and the caller renders
+/// nothing further.
+fn cost_report_or_report(
+    answered: Result<CostQueryResult, RpcError>,
+    surface: &mut dyn Surface,
+) -> Option<CostReportView> {
+    match answered {
+        Ok(res) => Some(res.report),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
+            surface.line(
+                LineKind::Notice,
+                "this daemon build does not expose the cost/query method yet; no authoritative \
+                 cost report is available.",
+            );
+            None
+        }
+        Err(err) => {
+            surface.line(
+                LineKind::Error,
+                &format!("cost query failed: {}", err.message),
+            );
+            None
+        }
+    }
 }
 
 /// A context for a one-shot command: it renders the daemon's broadcasts but
 /// answers nothing. Permission requests and model proposals belong to whichever
 /// interactive session owns them — a `teton cost` running in another terminal
 /// must not silently answer a prompt the user is looking at elsewhere.
+///
+/// `typed_input` is read here too, though no subcommand consults it: the field
+/// belongs to the slash handlers, and no slash command runs under a passive
+/// context. Filling it with the same edge check the session makes keeps it an
+/// honest description of the process rather than a placeholder that would
+/// quietly become a gate answer if a future caller did read it.
 fn passive_ctx<'a>(
     surface: &'a mut dyn Surface,
     state: &'a mut SessionState,
@@ -502,6 +546,7 @@ fn passive_ctx<'a>(
         answer_permissions: false,
         answer_model_proposals: false,
         auto_accept_model: false,
+        typed_input: std::io::IsTerminal::is_terminal(&std::io::stdin()),
     }
 }
 
@@ -637,7 +682,7 @@ pub(crate) fn apply_model_set(
 fn decide_model_set(
     name: &str,
     assume_yes: bool,
-    list: &teton_protocol::methods::ModelListResult,
+    list: &ModelListResult,
     surface: &mut dyn Surface,
     prompter: &mut dyn Prompter,
 ) -> Option<ModelSetParams> {
@@ -698,27 +743,50 @@ fn run_model_status(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-    match conn.call(ModelStatusParams::default(), &mut ctx)? {
-        Ok(status) => {
-            let base_dir = paths.socket.parent();
-            let path = match (base_dir, status.install.as_ref()) {
-                (Some(base), Some(install)) => {
-                    Some(model_ui::weights_path(base, &install.model_name))
-                }
-                _ => None,
-            };
-            model_ui::render_status(&status, path.as_deref(), ctx.surface);
-        }
-        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
-            LineKind::Notice,
-            "this daemon build does not expose model/status yet.",
-        ),
-        Err(err) => ctx.surface.line(
-            LineKind::Error,
-            &format!("could not read the model status: {}", err.message),
-        ),
+    let answered = conn.call(ModelStatusParams::default(), &mut ctx)?;
+    if let Some(status) = model_status_or_report(answered, ctx.surface) {
+        let base_dir = paths.socket.parent();
+        let path = match (base_dir, status.install.as_ref()) {
+            (Some(base), Some(install)) => Some(model_ui::weights_path(base, &install.model_name)),
+            _ => None,
+        };
+        model_ui::render_status(&status, path.as_deref(), ctx.surface);
     }
     Ok(())
+}
+
+/// Unwrap a `model/status` answer, rendering the daemon's failure arms.
+///
+/// The **one** place those two arms are worded (REQ-555 BR-4): `teton model
+/// status` and the in-session `/model` are both call sites, so a daemon too old
+/// to serve the method — or one that answers with an error — says the same thing
+/// on both surfaces. Only the success rendering differs between them, which is
+/// exactly what D-6 says differs.
+///
+/// `None` means the reason is already on the surface and the caller renders
+/// nothing further. Taking the answered `Result` rather than the connection is
+/// what lets both arms be unit-tested with no socket.
+fn model_status_or_report(
+    answered: Result<ModelStatusResult, RpcError>,
+    surface: &mut dyn Surface,
+) -> Option<ModelStatusResult> {
+    match answered {
+        Ok(status) => Some(status),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
+            surface.line(
+                LineKind::Notice,
+                "this daemon build does not expose model/status yet.",
+            );
+            None
+        }
+        Err(err) => {
+            surface.line(
+                LineKind::Error,
+                &format!("could not read the model status: {}", err.message),
+            );
+            None
+        }
+    }
 }
 
 /// `teton doctor`: daemon status, socket path, model state, providers.
@@ -1314,6 +1382,120 @@ mod tests {
             "openai-compatible"
         );
         assert_eq!(privacy_label(PrivacyMode::LocalOnly), "local-only");
+    }
+
+    // REQ-555 BR-4: `teton model status` and the in-session `/model` share these
+    // two failure arms, so a daemon too old for the method — or one that answers
+    // with an error — says the same thing on both surfaces. Testable at all
+    // because the helper takes the *answered* result rather than the connection;
+    // the success arm needs no test here, since each caller renders its own.
+    #[test]
+    fn a_failed_model_status_is_reported_the_same_way_for_both_surfaces() {
+        let mut surface = RecordingSurface::new();
+        let too_old = model_status_or_report(
+            Err(RpcError::new(
+                error_code::METHOD_NOT_FOUND,
+                "no such method",
+            )),
+            &mut surface,
+        );
+        assert!(too_old.is_none(), "nothing to render from a refused method");
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["this daemon build does not expose model/status yet."]
+        );
+
+        let mut surface = RecordingSurface::new();
+        let refused = model_status_or_report(
+            Err(RpcError::new(
+                error_code::INTERNAL_ERROR,
+                "store unreadable",
+            )),
+            &mut surface,
+        );
+        assert!(refused.is_none());
+        assert_eq!(
+            surface.lines_of(LineKind::Error),
+            vec!["could not read the model status: store unreadable"],
+            "the daemon's own reason must survive to the user (LESSON-456)"
+        );
+
+        // And an answer passes straight through, so each surface renders its own
+        // shape from the same payload.
+        let mut surface = RecordingSurface::new();
+        let status = ModelStatusResult {
+            selection: None,
+            install: None,
+            pending_proposal: None,
+        };
+        assert!(model_status_or_report(Ok(status), &mut surface).is_some());
+        assert!(
+            surface.calls.is_empty(),
+            "a successful status renders nothing of its own here: {:?}",
+            surface.calls
+        );
+    }
+
+    // The same shape for the cost surfaces (REQ-555 BR-4): `teton cost`, the
+    // session-end summary and the in-session `/cost` are three call sites of
+    // `query_and_render_cost`, so a daemon too old for `cost/query` — or one
+    // that answers with an error — must say one thing on all three. The arms
+    // were already shared; taking the *answered* result is what lets them be
+    // asserted without a socket, which is the half a live-daemon e2e cannot
+    // reach on purpose.
+    #[test]
+    fn a_failed_cost_query_is_reported_the_same_way_for_every_cost_surface() {
+        let mut surface = RecordingSurface::new();
+        let too_old = cost_report_or_report(
+            Err(RpcError::new(
+                error_code::METHOD_NOT_FOUND,
+                "no such method",
+            )),
+            &mut surface,
+        );
+        assert!(too_old.is_none(), "nothing to render from a refused method");
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![
+                "this daemon build does not expose the cost/query method yet; no authoritative \
+                 cost report is available."
+            ]
+        );
+
+        let mut surface = RecordingSurface::new();
+        let refused = cost_report_or_report(
+            Err(RpcError::new(error_code::INTERNAL_ERROR, "ledger locked")),
+            &mut surface,
+        );
+        assert!(refused.is_none());
+        assert_eq!(
+            surface.lines_of(LineKind::Error),
+            vec!["cost query failed: ledger locked"],
+            "the daemon's own reason must survive to the user (LESSON-456)"
+        );
+
+        // And a report passes straight through untouched — every figure is the
+        // daemon's, so this helper must not reshape one (REQ-544 M-7).
+        let mut surface = RecordingSurface::new();
+        let report = CostReportView {
+            total_calls: 3,
+            baseline_model: "anthropic/claude-opus-4".to_owned(),
+            ..CostReportView::default()
+        };
+        assert_eq!(
+            cost_report_or_report(
+                Ok(CostQueryResult {
+                    report: report.clone()
+                }),
+                &mut surface
+            ),
+            Some(report)
+        );
+        assert!(
+            surface.calls.is_empty(),
+            "a successful query renders nothing of its own here: {:?}",
+            surface.calls
+        );
     }
 
     // -----------------------------------------------------------------------

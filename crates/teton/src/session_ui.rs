@@ -7,8 +7,12 @@
 //! (`route_decided`, `privacy_block`, `provider_degraded`, `phase_transition`,
 //! `model_lifecycle`) becomes a one-line notice (the BR-5 legibility promise).
 //! Routing notices are diagnostic chrome, not warnings, so they render only when
-//! [`SessionState::verbose`] is set (`--verbose`); privacy and degradation
-//! notices always render.
+//! [`SessionState::verbose`] is set; privacy and degradation notices always
+//! render. That flag has two mutators and one meaning: the `--verbose` flag
+//! initialises it at startup, and the in-session `/verbose` command toggles it
+//! live (REQ-555 BR-5, D-5). The turn-end line reads the same flag, so both
+//! surfaces move together rather than one following the flag and the other the
+//! command.
 //!
 //! Permission requests are handled separately by [`resolve_permission`], which
 //! needs an input source: it renders the prompt, reads a decision, and returns
@@ -76,8 +80,11 @@ pub struct SessionState {
     pub cost: CostMeter,
     /// Model proposals this client has already taken up (REQ-547).
     model_seen: HashSet<RequestId>,
-    /// Show routing notices (`route [...]`). Off by default so the transcript
-    /// is just the conversation; `--verbose` turns it on.
+    /// Show routing notices (`route [...]`) and the turn-end line. Off by
+    /// default so the transcript is just the conversation. Two mutators, one
+    /// flag: `--verbose` initialises it when the session starts, and the
+    /// in-session `/verbose` command toggles it mid-session (REQ-555 BR-5).
+    /// Session-scoped either way — nothing here is persisted.
     pub verbose: bool,
 }
 

@@ -190,6 +190,18 @@ impl TestDaemon {
         self.run_cli_with_stdin(teton, args, "")
     }
 
+    /// Run `teton <args...>` and return its **stdout alone**.
+    ///
+    /// The suite's default capture concatenates stdout and stderr, which is the
+    /// right haystack for "did this run say X anywhere". It is the wrong
+    /// *needle*: AC-2 compares one surface's rendering against the other's own
+    /// bytes, and a needle carrying a diagnostic that only ever goes to stderr
+    /// would fail a comparison the rendering passed — or, worse, quietly widen
+    /// what counts as a match.
+    fn run_cli_stdout(&self, teton: &Path, args: &[&str]) -> String {
+        self.run_cli_streams(teton, args, "", CliSeams::Off).0
+    }
+
     /// Run `teton <args...>` with `stdin` piped in, so an *interactive* prompt
     /// can be answered by the test the way a user answers it.
     ///
@@ -197,6 +209,20 @@ impl TestDaemon {
     /// loop (the CLI treats EOF as "done", never as an answer).
     fn run_cli_with_stdin(&self, teton: &Path, args: &[&str], stdin: &str) -> String {
         self.run_cli_capture(teton, args, stdin).0
+    }
+
+    /// As [`Self::run_cli_with_stdin`], but with the CLI told it is under test
+    /// control (`TETON_TEST_SEAMS=1`).
+    ///
+    /// Only the `/model set` tests need it. That command is typed-input-only
+    /// (REQ-555 spec Permissions, security review 2026-08-04): on piped stdin it
+    /// refuses and points at `teton model set`, unless a **debug** build finds
+    /// this switch set — the same posture the daemon takes towards its own seams
+    /// (`tetond`'s `test_seams_enabled`). A release binary refuses either way,
+    /// so this allowance cannot ship as a bypass.
+    fn run_cli_seamed(&self, teton: &Path, args: &[&str], stdin: &str) -> String {
+        self.run_cli_capture_seamed(teton, args, stdin, CliSeams::On)
+            .0
     }
 
     /// As [`Self::run_cli_with_stdin`], but also returning the process's exit
@@ -208,12 +234,44 @@ impl TestDaemon {
         args: &[&str],
         stdin: &str,
     ) -> (String, std::process::ExitStatus) {
-        let mut child = Command::new(teton)
+        self.run_cli_capture_seamed(teton, args, stdin, CliSeams::Off)
+    }
+
+    fn run_cli_capture_seamed(
+        &self,
+        teton: &Path,
+        args: &[&str],
+        stdin: &str,
+        seams: CliSeams,
+    ) -> (String, std::process::ExitStatus) {
+        let (mut combined, stderr, status) = self.run_cli_streams(teton, args, stdin, seams);
+        combined.push_str(&stderr);
+        (combined, status)
+    }
+
+    /// The one place a CLI process is actually run: stdout, stderr and status,
+    /// kept apart. Every other runner here is a view over this.
+    fn run_cli_streams(
+        &self,
+        teton: &Path,
+        args: &[&str],
+        stdin: &str,
+        seams: CliSeams,
+    ) -> (String, String, std::process::ExitStatus) {
+        let mut command = Command::new(teton);
+        command
             .args(args)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        match seams {
+            CliSeams::On => command.env("TETON_TEST_SEAMS", "1"),
+            // Removed rather than simply not set: a developer who exports the
+            // switch in their shell must still run the test CI runs.
+            CliSeams::Off => command.env_remove("TETON_TEST_SEAMS"),
+        };
+        let mut child = command
             .spawn()
             .unwrap_or_else(|e| panic!("spawn teton {args:?}: {e}"));
         child
@@ -225,10 +283,22 @@ impl TestDaemon {
         let output = child
             .wait_with_output()
             .unwrap_or_else(|e| panic!("run teton {args:?}: {e}"));
-        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
-        (combined, output.status)
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status,
+        )
     }
+}
+
+/// Whether a CLI process is told it is under test control.
+///
+/// The suite's default is `Off`, because every command except `/model set` is
+/// pipe-friendly (BR-9) and must be tested as it ships.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CliSeams {
+    On,
+    Off,
 }
 
 /// A TCP port with nothing listening on it: bound to learn a free number, then
@@ -605,10 +675,21 @@ const TURN_REPLIES: &[&str] = &[
 /// Assert that no prompt turn was attempted at all (BR-1).
 ///
 /// Observed from outside the process, "no `prompt/turn` was issued" is the
-/// absence of everything a turn produces: the scripted engine's reply (which a
-/// served turn always prints), a routing notice, the turn-end line, and every
-/// way a turn can fail. A command that reached the model would trip at least one
-/// of these — including on a daemon that refused to serve it.
+/// absence of everything a turn produces. Which markers carry that weight
+/// depends on the session, and it is worth being exact about it:
+///
+///   * [`TURN_REPLIES`] and `prompt failed` are the **load-bearing** guards in
+///     every session, quiet or verbose. A turn that the scripted engine served
+///     prints its reply; a turn the daemon refused prints the failure. One of
+///     the two happens for any line that reached `prompt/turn`.
+///   * `does not execute prompt turns yet` covers a daemon too old to run turns
+///     at all — also unconditional.
+///   * `route [` and `turn ended` only ever render in a **verbose** session
+///     (REQ-555 D-5), so in the quiet sessions this helper is called from today
+///     they are vacuously absent. They are kept for a caller that toggles
+///     `/verbose` before the line under test, where they become the earliest
+///     evidence a turn started; they are not what makes a quiet session's
+///     assertion true.
 fn assert_no_turn_ran(output: &str, what: &str) {
     for reply in TURN_REPLIES {
         assert!(
@@ -647,9 +728,11 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
 
     let session = daemon.run_cli_with_stdin(&teton, &[], "/frobnicate\n/help\n");
 
-    // AC-6: one actionable line naming `/help`, and no RPC behind it.
+    // AC-6: one actionable line naming `/help`, and no RPC behind it. The
+    // command is quoted as it was typed rather than rebuilt from the parsed
+    // name, so the echo cannot invent a spelling the user did not use.
     assert!(
-        session.contains("unknown command: /frobnicate"),
+        session.contains("unknown command: `/frobnicate`"),
         "an unknown command must name what was typed; output:\n{session}"
     );
     assert!(
@@ -696,15 +779,52 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
     assert_no_turn_ran(&session, "`/frobnicate` and `/help`");
 }
 
-/// AC-2, e2e leg: a mid-session `/cost` renders the daemon's whole report.
+/// The line the cost report opens with, and the anchor AC-2's two surfaces are
+/// compared on.
+const COST_MARKER: &str = "── cost summary ──";
+
+/// Everything a run printed from its **first** cost-summary marker onward.
 ///
-/// The count is what makes this an assertion rather than a coincidence: the
+/// For `teton cost` — read from stdout alone below — that is exactly the report:
+/// `run_cost` renders it last. For a session it is the `/cost` command's report
+/// followed by the rest of the session, which is why the comparison below is
+/// `starts_with` and not `contains`. A session always contains a correct report
+/// at its *end* (the session-end summary), so "somewhere in the output" would be
+/// satisfied by a `/cost` that rendered nothing of the kind.
+fn cost_report_from_first_marker<'a>(output: &'a str, what: &str) -> &'a str {
+    let at = output
+        .find(COST_MARKER)
+        .unwrap_or_else(|| panic!("{what} printed no cost report; output:\n{output}"));
+    &output[at..]
+}
+
+/// AC-2, e2e leg: a mid-session `/cost` renders the daemon's whole report, and
+/// renders it identically to `teton cost` against the same daemon.
+///
+/// Two claims, and they need different evidence.
+///
+/// The count is what makes the first an assertion rather than a coincidence: the
 /// session-end summary renders the report once on its own, so a session where
 /// `/cost` did nothing still contains one. Two means the command rendered its
 /// own — through `query_and_render_cost`, the single function behind every cost
-/// surface (BR-4). Which figures appear is pinned against the renderer in
-/// `cost_ui`'s unit tests; what this proves is that the in-session command is a
-/// call site of it.
+/// surface (BR-4).
+///
+/// The second is the AC's actual words — "the same rendering `teton cost`
+/// produces for the same daemon state" — and no single-process test can make it.
+/// So the subcommand is run against this same daemon, and the session's **first**
+/// report — the `/cost` command's — must open with the subcommand's whole block,
+/// byte for byte. The daemon's ledger is empty and unchanged between the two
+/// runs, so a difference could only come from the client rendering it twice over.
+/// AC-2 says this must not be asserted "by string coincidence", and it is not:
+/// the needle is the other surface's own bytes, not a string this test wrote
+/// down.
+///
+/// Anchoring on the first marker is load-bearing. A `contains` would be
+/// satisfied by the session-end summary, which renders correctly no matter what
+/// `/cost` did — the assertion would be green against a `/cost` that printed its
+/// own parallel report. (Checked by mutation, 2026-08-04: a hand-rolled
+/// in-session rendering that kept both anchor strings passed `contains` and dies
+/// on `starts_with`.)
 #[test]
 fn slash_cost_renders_the_daemons_report_mid_session() {
     let Some(daemon) = daemon_or_skip() else {
@@ -716,7 +836,7 @@ fn slash_cost_renders_the_daemons_report_mid_session() {
     let session = daemon.run_cli_with_stdin(&teton, &[], "/cost\n");
 
     assert_eq!(
-        session.matches("── cost summary ──").count(),
+        session.matches(COST_MARKER).count(),
         2,
         "/cost must render the report on top of the session-end one; output:\n{session}"
     );
@@ -727,6 +847,20 @@ fn slash_cost_renders_the_daemons_report_mid_session() {
         2,
         "/cost must render the daemon's savings baseline, not a stub; output:\n{session}"
     );
+
+    // The cross-process half: the same daemon, asked the same question by the
+    // subcommand. Its **stdout alone** is the needle — the rendering under test
+    // is what the subcommand prints, and appending its stderr would put bytes
+    // into the comparison that the session's `/cost` was never asked to produce.
+    let subcommand = daemon.run_cli_stdout(&teton, &["cost"]);
+    let report = cost_report_from_first_marker(&subcommand, "`teton cost`");
+    let in_session = cost_report_from_first_marker(&session, "the session");
+    assert!(
+        in_session.starts_with(report),
+        "the in-session report differs from `teton cost`'s.\n\
+         --- teton cost ---\n{report}\n--- in session ---\n{in_session}"
+    );
+
     assert_no_turn_ran(&session, "`/cost`");
 }
 
@@ -819,6 +953,16 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
     // And the counts, which is what makes the three segments an exclusive
     // partition rather than three independent searches: exactly one of the three
     // turns was ever narrated.
+    //
+    // These two `== 1`s originally rested on empirically-stable ordering; the
+    // daemon's per-client writer has since been fixed to order a client's
+    // events ahead of the response that follows them (PR #42, spun off from
+    // the REQ-555 review), so the ordering is now guaranteed and pinned by
+    // tetond's own event_response_ordering suite. Both markers remain
+    // FIFO-bound to their own turn. If a line ever moves across a segment
+    // boundary again, the regression is in the daemon's writer; do NOT weaken
+    // these counts to `>= 1`, which would let a toggle that narrated every
+    // turn pass.
     assert_eq!(
         session.matches("route [").count(),
         1,
@@ -856,6 +1000,15 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
 ///
 /// (On a TTY the prompter's EOF-vs-Enter cursor chrome legitimately differs;
 /// the AC puts that out of scope, and this suite never sees it.)
+///
+/// If the whole-output equality ever flakes, the cause to look for is the
+/// handshake: everything before the session-ready line is replayed startup
+/// chatter from two different daemons, and only the two `TestDaemon`s being
+/// freshly spawned makes it identical. The fallback that keeps the AC's own
+/// claim intact is to compare from the session-ready line onward
+/// (`split_once("ready (freeform)")`) — that is the session-end output AC-5
+/// actually asks about. Weakening it further (comparing only the cost block)
+/// would stop testing that `/quit` and Ctrl-D leave through the same path.
 #[test]
 fn slash_quit_ends_the_session_exactly_as_ctrl_d_does() {
     let Some(daemon_bin) = daemon_or_skip() else {
@@ -982,6 +1135,13 @@ fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
 /// The `n` on its own line is the second confirmation's answer. If a regression
 /// stopped asking, that line would fall through to the entry loop as a prompt —
 /// which `assert_no_turn_ran` catches at the end.
+///
+/// This is one of the two tests in the file that run the CLI *seamed*
+/// ([`TestDaemon::run_cli_seamed`]) — the other is the `--yes` waiver below, and
+/// both are seamed for the same reason. `/model set` is refused on non-terminal
+/// stdin and would otherwise decline a piped session outright; the refusal
+/// itself is the next test's subject, and the gate's own decision is a unit test
+/// in `slash.rs`.
 #[test]
 fn slash_model_set_runs_the_shared_flow_against_a_live_daemon() {
     let Some(daemon) = daemon_or_skip() else {
@@ -990,7 +1150,7 @@ fn slash_model_set_runs_the_shared_flow_against_a_live_daemon() {
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
-    let session = daemon.run_cli_with_stdin(
+    let session = daemon.run_cli_seamed(
         &teton,
         &[],
         "/model set definitely-not-a-model\n\
@@ -1054,4 +1214,115 @@ fn slash_model_set_runs_the_shared_flow_against_a_live_daemon() {
     // None of it was a prompt: `/model set` is the one command that writes
     // daemon state, and it still never spends a model call (BR-1).
     assert_no_turn_ran(&session, "the /model set session");
+}
+
+/// The TTY gate, end to end (spec Permissions; security review 2026-08-04):
+/// without the test seam, a piped `/model set` refuses and changes nothing.
+///
+/// This is the shipped behaviour — the test above is the exception, not this
+/// one. `/model set` is the only in-session command that writes daemon state,
+/// and the Permissions table says that write belongs to the session user "via
+/// typed input — never inferable from model output or file content". A pipe
+/// cannot distinguish a human from a heredoc, so the command declines and names
+/// the surface that does the same job unattended.
+///
+/// What proves "nothing changed" is the `/model` that follows: it runs on the
+/// same connection immediately afterwards and must not name the model the
+/// refused line asked for. A gate that rejected loudly but set the selection
+/// anyway would pass every assertion but that one.
+#[test]
+fn a_piped_model_set_is_refused_and_changes_nothing() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    // Deliberately NOT seamed: `run_cli_with_stdin` removes the switch from the
+    // CLI's environment, so this is what a released binary does with a pipe.
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "/model set qwen2.5-coder-1.5b\n\
+         /model\n",
+    );
+
+    assert!(
+        session.contains("/model set is typed-input-only"),
+        "a piped /model set must be refused; output:\n{session}"
+    );
+    assert!(
+        session.contains("teton model set"),
+        "the refusal must point at the shell command that does it; output:\n{session}"
+    );
+
+    // Nothing changed: no `model/set` success line, and the `/model` that
+    // follows does not read the refused name back. What is *not* claimed here is
+    // where in the handler the refusal happened — nothing below distinguishes
+    // "refused before `model/list` was asked" from "asked, then refused", and
+    // for a valid catalog name neither ordering prints anything of its own. The
+    // gate's position is `slash.rs`'s to state; this test's evidence is that no
+    // state moved.
+    assert!(
+        !session.contains("selection: qwen2.5-coder-1.5b"),
+        "a refused /model set reached model/set; output:\n{session}"
+    );
+    assert!(
+        !session.contains("model: qwen2.5-coder-1.5b"),
+        "the follow-up /model read back the refused selection; output:\n{session}"
+    );
+    // And the session carried on: the `/model` after it answered.
+    assert!(
+        session.contains("model: "),
+        "the entry loop must keep accepting input after the refusal; output:\n{session}"
+    );
+
+    assert_no_turn_ran(&session, "a refused /model set");
+}
+
+/// `--yes` waives the in-session above-RAM-floor confirmation, and consumes no
+/// input line doing it (REQ-547 BR-3 / REQ-555 BR-4b; user-approved 2026-08-04).
+///
+/// The session inherits the flag because `/model set` runs the *same*
+/// `apply_model_set` the subcommand runs — the Permissions table names `--yes`
+/// the explicit unattended stand-in for the second confirmation, and one flow
+/// means the session cannot answer that question differently from the shell.
+///
+/// The load-bearing half is the last line. With `--yes` the flow asks nothing,
+/// so the `/model` that follows must reach the *entry loop* and read the new
+/// selection back. If the confirmation were still asked, `/model` would be eaten
+/// as its answer and the read-back would never appear — which is exactly how a
+/// waiver that only *looks* applied would show up.
+#[test]
+fn yes_waives_the_in_session_above_floor_confirmation_without_eating_a_line() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    // 20.0 GiB RAM floor against the fixture's 16 GiB probe: above the floor,
+    // so the BR-3 gate is live and something has to answer it.
+    let session = daemon.run_cli_seamed(
+        &teton,
+        &["-y"],
+        "/model set qwen3-coder-30b-a3b\n\
+         /model\n",
+    );
+
+    assert!(
+        session.contains("--yes supplies the second confirmation (BR-3)"),
+        "--yes must say it answered the RAM-floor question; output:\n{session}"
+    );
+    assert!(
+        session.contains("selection: qwen3-coder-30b-a3b (user override)"),
+        "--yes must let the above-floor pick through; output:\n{session}"
+    );
+    assert!(
+        session.contains("model: qwen3-coder-30b-a3b (user override)"),
+        "the following /model must reach the entry loop and read the new \
+         selection back — no question consumed it; output:\n{session}"
+    );
+
+    assert_no_turn_ran(&session, "the --yes /model set session");
 }

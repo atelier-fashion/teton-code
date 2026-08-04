@@ -121,7 +121,11 @@ currently drives `/model set` through a live daemon end to end. Adding that leg
 belongs to TASK-037's file, not this one.
 
 **Mutation-checked (LESSON-441/464 — a new guard needs its own known-bad).**
-Three mutations, each reverted after the red was observed:
+Three mutations, each reverted after the red was observed. The panic line
+numbers quoted below were captured *before* the Phase-5 verify pass added its
+doc comments (~6–8 lines of offset against the committed source); the tests
+themselves are named here and all pass at HEAD, which is the claim that
+matters — the line numbers are a transcript, not an index.
 
 | Mutation | Test that went red |
 |---|---|

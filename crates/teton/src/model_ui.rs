@@ -390,10 +390,19 @@ pub fn render_status(
                 surface.line(LineKind::Info, &format!("weights:   {}", path.display()));
             }
         }
-        None => surface.line(
-            LineKind::Info,
-            "install:   nothing selected, so nothing is installed.",
-        ),
+        // No install record at all. What that *means* depends on whether
+        // anything is selected, and the two readings must not be confused: with
+        // a selection in force the honest line is the same one `/model` prints
+        // for this payload, through the same [`install_words`], so the report
+        // and the one-liner cannot describe one `model/status` differently
+        // (REQ-555 BR-4).
+        None => {
+            let text = match selected_name(status.selection.as_ref()) {
+                Some(name) => format!("install:   {name} — {}", install_words(None, name)),
+                None => "install:   nothing selected, so nothing is installed.".to_owned(),
+            };
+            surface.line(LineKind::Info, &text);
+        }
     }
     if let Some(proposal) = &status.pending_proposal {
         // Name it. `teton model status` is a report, not a prompt, so it does not
@@ -459,13 +468,20 @@ fn current_model_line(status: &ModelStatusResult) -> String {
 }
 
 /// The install state of the *selected* model, in the words [`install_label`]
-/// already uses.
+/// already uses. Shared by both `model/status` renderings, so the report and the
+/// `/model` one-liner cannot word one payload differently.
 ///
-/// The name check is the point: `install` describes whichever weights the daemon
-/// has on disk, which after a fresh `model set` is not yet the selected model.
-/// Attributing those weights to the new selection would report a model as
-/// `verified` when nothing of it has been downloaded — the misattribution shape
-/// of BUG-146, in one line the user has no way to cross-check.
+/// The name check is a **protocol-drift guard, not a live fix**. Today the
+/// daemon derives `install` from the selection itself (`ModelConsent::
+/// current_install` reads `store.current()`, then that selection's model name),
+/// so `install.model_name != selected` cannot occur against a matching daemon
+/// build. It is checked anyway because the payload's two halves are independent
+/// on the wire and a client renders whatever arrives: were a future daemon to
+/// report whichever weights are on disk — after a `model set`, the *previous*
+/// model — attributing them to the new selection would call it `verified` when
+/// nothing of it has been downloaded, the misattribution shape of BUG-146, in
+/// one line the user has no way to cross-check. The guard costs one comparison;
+/// the drift it anticipates costs a wrong answer about the user's machine.
 fn install_words(install: Option<&InstallStateView>, selected: &str) -> &'static str {
     match install {
         Some(install) if install.model_name == selected => install_label(install.status),
@@ -1156,6 +1172,33 @@ mod tests {
         assert!(notice.contains("needs 8.0 GiB RAM"), "{notice}");
     }
 
+    // REQ-555 BR-4: one payload, two renderings, one set of words. A selection
+    // the daemon holds no install record for used to read "nothing selected, so
+    // nothing is installed" in the full report while `/model` said "not
+    // installed yet" — two answers to one question, and the report's was false
+    // about the half the user came for.
+    #[test]
+    fn the_report_and_the_one_liner_agree_when_a_selection_has_no_install_record() {
+        let status = status_with(
+            Some(selected("qwen2.5-coder-3b", SelectionSource::Probe)),
+            None,
+        );
+        let mut surface = RecordingSurface::new();
+        render_status(&status, None, &mut surface);
+        let report = surface.lines_of(LineKind::Info).join("\n");
+        assert!(
+            report.contains("install:   qwen2.5-coder-3b — not installed yet"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("nothing selected"),
+            "the report claimed nothing was selected while naming a selection: {report}"
+        );
+        // The same words the one-liner uses for the same payload, from the same
+        // function — not two spellings that happen to agree today.
+        assert!(one_line(&status).ends_with("not installed yet"));
+    }
+
     /// A `model/status` with a live selection and, optionally, weights on disk.
     fn status_with(
         selection: Option<ModelSelectionView>,
@@ -1317,12 +1360,14 @@ mod tests {
         );
     }
 
-    // The install record describes whichever weights are on disk, which right
-    // after a `model set` is the PREVIOUS model. Reporting the new selection as
-    // `verified` on the strength of the old model's weights would be a one-line
-    // lie the user cannot cross-check.
+    // A protocol-drift guard, pinned against a payload today's daemon does not
+    // send: it derives `install` from the selection, so the two names always
+    // agree. The client renders whatever arrives, though, and a daemon that
+    // began reporting whichever weights are on disk would otherwise have this
+    // line call a freshly selected model `verified` on the strength of the
+    // previous model's weights — a one-line claim the user cannot cross-check.
     #[test]
-    fn current_model_line_never_attributes_another_models_install_state() {
+    fn current_model_line_would_not_attribute_another_models_install_state() {
         let status = status_with(
             Some(selected("qwen3-coder-30b", SelectionSource::UserOverride)),
             Some(InstallStateView {
