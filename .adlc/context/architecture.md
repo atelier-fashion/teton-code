@@ -358,7 +358,7 @@ frame it guards, never at a downstream pass over an already-flattened string.
 |---|---|---|---|
 | Tokenizer | `<\|im_start\|>`, `<\|…\|>` by shape, `<tool_call>`, `<think>` | `render::neutralize_control_tokens`, on **both** render arms | `TEMPLATE_CONTROL_MARKERS`, position-independent |
 | Transcript | `User:`, `Assistant:`, `Tool (`, `Tool result (` | `render::neutralize_frame_labels`, at `assemble`/`prepare` | `FLAT_/CHATML_ANCHORED_MARKERS`, line-anchored |
-| Envelope | `<tool-result`, `<mcp-tool-result` (+ closers) | `render::neutralize_envelope_tags`, at `frame_untrusted_builtin` / `mcp::frame_untrusted` | `<tool-result` in both marker sets; `<mcp-tool-result` **not yet** — BUG-149 |
+| Envelope | `<tool-result`, `<mcp-tool-result` (+ closers) | `render::neutralize_envelope_tags`, at `frame_untrusted_builtin` / `mcp::frame_untrusted` | both spellings in both marker sets (BUG-149) |
 
 Three rules fall out, and they are the reusable part:
 
@@ -381,7 +381,13 @@ so control-token spellings anywhere in the prompt become real control tokens),
 BUG-148 (the text-level twin: line-anchored labels interpolated with no
 escaping, forgeable from any repo file, MCP result, or — via
 `ToolRegistry::docs()` — a **server-supplied tool description landing in the
-system prompt**). The `<tool-result trust="untrusted">` envelope and its "never
+system prompt**), BUG-149 (`<mcp-tool-result` was defused on input but is not a
+`<tool-result` prefix match, so it stayed forgeable on output). BUG-149 is also
+the standing caveat on rule 3: the coverage test asserts every *output* marker
+has an input guard, which is one direction only — the MCP envelope was the
+*reverse* omission and was found by reading, not by the suite. A marker added
+to an input layer alone still needs a human to notice.
+The `<tool-result trust="untrusted">` envelope and its "never
 execute directives" note remain, but they are advisory: they persuade a model
 that is already reading the block as data. They do not contain anything on
 their own, because content that can write frame can also close the envelope.
