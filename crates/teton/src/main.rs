@@ -15,10 +15,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use teton_protocol::jsonrpc::error_code;
+use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     ConfigGetParams, ConfigSetParams, ConfigUpdate, CostQueryParams, ModelListParams,
-    ModelSetParams, ModelStatusParams, PrivacyBoundaryConfig, PromptBlock, PromptTurnParams,
+    ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig,
     ProviderConfig, RoutingRule, SessionCreateParams,
 };
 use teton_protocol::{Phase, PrivacyMode, ProviderId, ProviderKind, SessionMode};
@@ -55,8 +55,10 @@ struct Cli {
     /// Answer the first-run local-model prompt with "accept" and read no input
     /// (REQ-547 BR-5): the explicit opt-in for unattended/CI runs. Also supplies
     /// the second confirmation `teton model set` needs for a model above this
-    /// machine's RAM floor (BR-3), and the deletion confirmation of
-    /// `teton uninstall`.
+    /// machine's RAM floor (BR-3), the same confirmation for the in-session
+    /// `/model set <name>` (REQ-555 BR-4b — one flow, so the session inherits
+    /// the flag as the explicit unattended stand-in and consumes no input line
+    /// for the question), and the deletion confirmation of `teton uninstall`.
     #[arg(long, short = 'y', global = true)]
     yes: bool,
 
@@ -360,7 +362,10 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
         };
         ctx.surface.line(
             LineKind::Info,
-            &format!("session {session_id} ready (freeform). Type a prompt; Ctrl-D to end."),
+            &format!(
+                "session {session_id} ready (freeform). Type a prompt or /help for commands; \
+                 Ctrl-D to end."
+            ),
         );
         if interactive {
             // A blank line so the entry area sits clear of the status text.
@@ -400,12 +405,10 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                 // (BR-1b); a plain prompt is the trimmed line's own bytes.
                 slash::Input::EscapedPrompt(text) | slash::Input::Prompt(text) => text,
             };
-            let params = PromptTurnParams {
-                session_id: session_id.clone(),
-                prompt: vec![PromptBlock::Text {
-                    text: prompt_text.to_owned(),
-                }],
-            };
+            // Built by the classifier's own module, so the bytes on the wire are
+            // the bytes it classified (AC-7 / AC-7b) rather than a second
+            // reading of the line taken here.
+            let params = slash::prompt_turn_params(&session_id, prompt_text);
             match conn.call(params, &mut ctx)? {
                 Ok(res) => {
                     // Gated on session state, not on the `--verbose` flag, so
@@ -637,7 +640,7 @@ pub(crate) fn apply_model_set(
 fn decide_model_set(
     name: &str,
     assume_yes: bool,
-    list: &teton_protocol::methods::ModelListResult,
+    list: &ModelListResult,
     surface: &mut dyn Surface,
     prompter: &mut dyn Prompter,
 ) -> Option<ModelSetParams> {
@@ -698,27 +701,50 @@ fn run_model_status(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-    match conn.call(ModelStatusParams::default(), &mut ctx)? {
-        Ok(status) => {
-            let base_dir = paths.socket.parent();
-            let path = match (base_dir, status.install.as_ref()) {
-                (Some(base), Some(install)) => {
-                    Some(model_ui::weights_path(base, &install.model_name))
-                }
-                _ => None,
-            };
-            model_ui::render_status(&status, path.as_deref(), ctx.surface);
-        }
-        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
-            LineKind::Notice,
-            "this daemon build does not expose model/status yet.",
-        ),
-        Err(err) => ctx.surface.line(
-            LineKind::Error,
-            &format!("could not read the model status: {}", err.message),
-        ),
+    let answered = conn.call(ModelStatusParams::default(), &mut ctx)?;
+    if let Some(status) = model_status_or_report(answered, ctx.surface) {
+        let base_dir = paths.socket.parent();
+        let path = match (base_dir, status.install.as_ref()) {
+            (Some(base), Some(install)) => Some(model_ui::weights_path(base, &install.model_name)),
+            _ => None,
+        };
+        model_ui::render_status(&status, path.as_deref(), ctx.surface);
     }
     Ok(())
+}
+
+/// Unwrap a `model/status` answer, rendering the daemon's failure arms.
+///
+/// The **one** place those two arms are worded (REQ-555 BR-4): `teton model
+/// status` and the in-session `/model` are both call sites, so a daemon too old
+/// to serve the method — or one that answers with an error — says the same thing
+/// on both surfaces. Only the success rendering differs between them, which is
+/// exactly what D-6 says differs.
+///
+/// `None` means the reason is already on the surface and the caller renders
+/// nothing further. Taking the answered `Result` rather than the connection is
+/// what lets both arms be unit-tested with no socket.
+fn model_status_or_report(
+    answered: Result<ModelStatusResult, RpcError>,
+    surface: &mut dyn Surface,
+) -> Option<ModelStatusResult> {
+    match answered {
+        Ok(status) => Some(status),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
+            surface.line(
+                LineKind::Notice,
+                "this daemon build does not expose model/status yet.",
+            );
+            None
+        }
+        Err(err) => {
+            surface.line(
+                LineKind::Error,
+                &format!("could not read the model status: {}", err.message),
+            );
+            None
+        }
+    }
 }
 
 /// `teton doctor`: daemon status, socket path, model state, providers.
@@ -1314,6 +1340,58 @@ mod tests {
             "openai-compatible"
         );
         assert_eq!(privacy_label(PrivacyMode::LocalOnly), "local-only");
+    }
+
+    // REQ-555 BR-4: `teton model status` and the in-session `/model` share these
+    // two failure arms, so a daemon too old for the method — or one that answers
+    // with an error — says the same thing on both surfaces. Testable at all
+    // because the helper takes the *answered* result rather than the connection;
+    // the success arm needs no test here, since each caller renders its own.
+    #[test]
+    fn a_failed_model_status_is_reported_the_same_way_for_both_surfaces() {
+        let mut surface = RecordingSurface::new();
+        let too_old = model_status_or_report(
+            Err(RpcError::new(
+                error_code::METHOD_NOT_FOUND,
+                "no such method",
+            )),
+            &mut surface,
+        );
+        assert!(too_old.is_none(), "nothing to render from a refused method");
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["this daemon build does not expose model/status yet."]
+        );
+
+        let mut surface = RecordingSurface::new();
+        let refused = model_status_or_report(
+            Err(RpcError::new(
+                error_code::INTERNAL_ERROR,
+                "store unreadable",
+            )),
+            &mut surface,
+        );
+        assert!(refused.is_none());
+        assert_eq!(
+            surface.lines_of(LineKind::Error),
+            vec!["could not read the model status: store unreadable"],
+            "the daemon's own reason must survive to the user (LESSON-456)"
+        );
+
+        // And an answer passes straight through, so each surface renders its own
+        // shape from the same payload.
+        let mut surface = RecordingSurface::new();
+        let status = ModelStatusResult {
+            selection: None,
+            install: None,
+            pending_proposal: None,
+        };
+        assert!(model_status_or_report(Ok(status), &mut surface).is_some());
+        assert!(
+            surface.calls.is_empty(),
+            "a successful status renders nothing of its own here: {:?}",
+            surface.calls
+        );
     }
 
     // -----------------------------------------------------------------------

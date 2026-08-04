@@ -75,13 +75,38 @@ from `install_label`, both asserted against those functions rather than against
 hard-coded strings, so `teton model status` and `/model` cannot word the same
 state differently (BR-4, LESSON-456).
 
-One case the task did not enumerate is covered because it is a real
-misattribution risk: `install` describes whichever weights are on disk, which
-immediately after a `model set` is the *previous* model. `install_words` matches
-`install.model_name` against the selection and falls back to "not installed yet"
-when they differ — otherwise `/model` would report a freshly selected model as
-`verified` on the strength of another model's weights, in one line the user has
-no way to cross-check (the BUG-146 shape).
+One case the task did not enumerate is covered as a **protocol-drift guard, not
+a live fix** (corrected during the Phase-5 verify pass, 2026-08-04 — the
+original wording here claimed a risk that today's daemon cannot produce):
+`ModelConsent::current_install` derives the install record *from the selection*
+(`store.current()`, then that selection's model name), so
+`install.model_name != selected` cannot occur against a matching daemon build.
+The two halves of the payload are independent on the wire, though, and the
+client renders whatever arrives — so `install_words` matches
+`install.model_name` against the selection and falls back to "not installed
+yet" when they differ. Were a future daemon to report whichever weights are on
+disk (after a `model set`, the *previous* model), `/model` would otherwise call
+a freshly selected model `verified` on the strength of another model's weights,
+in one line the user has no way to cross-check (the BUG-146 shape). The test is
+named for what it guards:
+`current_model_line_would_not_attribute_another_models_install_state`.
+
+**Wording parity for one payload (verify-pass fix, 2026-08-04).** With a
+selection in force and no install record, `render_status` used to print
+"install:   nothing selected, so nothing is installed" — false about the half
+the user came for — while `/model` said "not installed yet". Both now render
+that case through `install_words`, and
+`the_report_and_the_one_liner_agree_when_a_selection_has_no_install_record`
+pins the pair.
+
+**Shared failure arms (verify-pass fix, 2026-08-04).** The `model/status`
+METHOD_NOT_FOUND and RpcError arms existed twice — once in `run_model_status`,
+once in `slash::handle_model`. They are now one function,
+`main.rs::model_status_or_report`, which takes the *answered* `Result` (not the
+`Connection`) and so is unit-tested with no socket:
+`a_failed_model_status_is_reported_the_same_way_for_both_surfaces`. Each caller
+still renders its own success shape, which is the whole of what D-6 says differs
+between the two surfaces.
 
 **BR-1 pin.** Handlers cannot be unit-tested end-to-end (`Connection` needs a
 live socket), so the unit leg pins the classifier: the table-reachability test

@@ -35,9 +35,19 @@
 //! non-command line reaches the prompt path unchanged. A one-directional test
 //! here would be the BUG-151 shape — a guard that stays green while half the
 //! invariant drifts (LESSON-479).
+//!
+//! One command is deliberately narrower than BR-9's "identical on a TTY and on
+//! piped stdin": `/model set` is **typed-input-only** (spec Permissions;
+//! security review 2026-08-04). It is the only command that changes daemon
+//! state, and the Permissions table says the change must never be inferable
+//! from anything but a human typing it — so when the session's stdin is not a
+//! terminal it renders one rejection pointing at `teton model set` and sends
+//! nothing. Every other command is pipe-friendly exactly as BR-9 says.
 
-use teton_protocol::jsonrpc::error_code;
-use teton_protocol::methods::ModelStatusParams;
+use std::io::IsTerminal;
+
+use teton_protocol::methods::{ModelStatusParams, PromptBlock, PromptTurnParams};
+use teton_protocol::SessionId;
 
 use crate::client::{Connection, UiContext};
 use crate::model_ui;
@@ -50,6 +60,13 @@ const ESCAPE_FOOTER: &str =
 /// The tail every rejected command line carries, so an unknown command and a
 /// misused one point at the same place (BR-2).
 const HELP_HINT: &str = "type /help for the commands this session knows.";
+
+/// The one line a piped `/model set` gets back (spec Permissions, security
+/// review 2026-08-04). It names the shell command that does the same thing,
+/// because "refused" without a remedy is a dead end.
+const MODEL_SET_TYPED_ONLY: &str =
+    "/model set is typed-input-only: this session's input is not a terminal, so nothing was \
+     changed — run `teton model set <name>` in a shell instead.";
 
 /// The bucket a non-empty entry line falls into. Every line lands in exactly
 /// one (BR-8).
@@ -169,6 +186,14 @@ const COMMANDS: &[CommandSpec] = &[
 /// `input` is already trimmed and non-empty: the entry loop trims the line and
 /// skips empty input before classifying, exactly as it did before slash
 /// commands existed.
+///
+/// The name is matched **exactly** after the leading `/` (spec System Model):
+/// whitespace between the slash and the first word is not tolerated, so `/ help`
+/// is not `/help`. It is still a command line — a leading `/` is what makes a
+/// line a command (BR-1) — it is simply one that names no row, so it is rejected
+/// with the unknown-command hint and never dispatched and never prompted. Being
+/// lenient here would mean two spellings reach one handler, and the one the user
+/// did not intend is the one nobody tests.
 #[must_use]
 pub fn classify(input: &str) -> Input<'_> {
     let Some(rest) = input.strip_prefix('/') else {
@@ -180,8 +205,36 @@ pub fn classify(input: &str) -> Input<'_> {
     if rest.starts_with('/') {
         return Input::EscapedPrompt(rest);
     }
-    let (name, args) = split_name(rest.trim(), COMMANDS);
+    if rest.starts_with(char::is_whitespace) {
+        // The whole remainder becomes the "name" so the rejection can quote the
+        // line as it was typed: `/ /foo` echoes as `/ /foo`, never as `//foo`,
+        // which is the escape hatch's spelling and would point at a different
+        // feature entirely.
+        return Input::Command {
+            name: rest,
+            args: "",
+        };
+    }
+    let (name, args) = split_name(rest, COMMANDS);
     Input::Command { name, args }
+}
+
+/// Build the `prompt/turn` request a classified prompt line becomes.
+///
+/// The **one** place the entry loop turns a line into a request, so what reaches
+/// the daemon is the classifier's output and nothing else: a plain line arrives
+/// byte-identically to what was typed (AC-7) and an escaped line arrives with
+/// exactly the leading pair collapsed (AC-7b). `text` is the payload of an
+/// [`Input::Prompt`] or [`Input::EscapedPrompt`]; a command never reaches here
+/// at all (BR-1).
+#[must_use]
+pub fn prompt_turn_params(session_id: &SessionId, text: &str) -> PromptTurnParams {
+    PromptTurnParams {
+        session_id: session_id.clone(),
+        prompt: vec![PromptBlock::Text {
+            text: text.to_owned(),
+        }],
+    }
 }
 
 /// Run a classified command line, or render the reason it cannot run.
@@ -207,29 +260,56 @@ pub fn dispatch(
     }
 }
 
-/// Split a command line into its name and trailing argument. The longest table
-/// name the line starts with on a word boundary wins, so `/model set gemma`
-/// resolves to the `model set` row rather than to `model` with a stray
-/// argument; a line matching no row keeps its first word as the name so the
-/// unknown-command hint can quote what was typed.
+/// Split a command line into its name and trailing argument. The table name
+/// matching the most leading *words* wins, so `/model set gemma` resolves to the
+/// `model set` row rather than to `model` with a stray argument; a line matching
+/// no row keeps its first word as the name so the unknown-command hint can quote
+/// what was typed.
+///
+/// Matching is word-wise rather than literal, so the whitespace *between* a
+/// two-word name's words is normalised: `model  set x` and `model<TAB>set x`
+/// reach the same row a single space does. A literal `strip_prefix` would send
+/// them to the `model` row instead and answer a mistyped-but-unambiguous line
+/// with "takes no arguments", which describes neither what was typed nor what to
+/// do about it.
 ///
 /// The table is a parameter so the longest-match rule is pinned by a fixture
-/// table now, rather than waiting for TASK-036 to add the real two-word row.
+/// table as well as by the real one.
 fn split_name<'a>(line: &'a str, table: &'static [CommandSpec]) -> (&'a str, &'a str) {
     let matched = table
         .iter()
-        .filter(|spec| {
-            line.strip_prefix(spec.name)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-        })
-        .max_by_key(|spec| spec.name.len());
-    if let Some(spec) = matched {
-        return (spec.name, line[spec.name.len()..].trim());
+        .filter_map(|spec| match_name_words(line, spec.name).map(|args| (spec, args)))
+        .max_by_key(|(spec, _)| spec.name.split_whitespace().count());
+    if let Some((spec, args)) = matched {
+        return (spec.name, args);
     }
     match line.split_once(char::is_whitespace) {
         Some((name, args)) => (name, args.trim()),
         None => (line, ""),
     }
+}
+
+/// The argument left over when `line` opens with `name`'s words, or `None` when
+/// it does not.
+///
+/// The first word must sit at the very start of the line — [`classify`] has
+/// already stripped the `/` and refuses a space after it, and this keeps that
+/// exactness true of the table match itself. Later words may be separated by any
+/// run of whitespace, and each word must end on a word boundary so `modelling`
+/// never matches `model`.
+fn match_name_words<'a>(line: &'a str, name: &'static str) -> Option<&'a str> {
+    let mut rest = line;
+    for (index, word) in name.split_whitespace().enumerate() {
+        if index > 0 {
+            rest = rest.trim_start();
+        }
+        let after = rest.strip_prefix(word)?;
+        if !(after.is_empty() || after.starts_with(char::is_whitespace)) {
+            return None;
+        }
+        rest = after;
+    }
+    Some(rest.trim())
 }
 
 /// What a command line resolves to before any handler runs. Separate from
@@ -249,18 +329,39 @@ enum Resolution<'a> {
 /// Look a classified command name up in the table. Pure.
 fn resolve<'a>(name: &str, args: &'a str) -> Resolution<'a> {
     let Some(spec) = COMMANDS.iter().find(|spec| spec.name == name) else {
-        return Resolution::Rejected(format!("unknown command: /{name} — {HELP_HINT}"));
+        return Resolution::Rejected(format!(
+            "unknown command: `{}` — {HELP_HINT}",
+            typed_token(name)
+        ));
     };
     match spec.args {
-        Args::None if !args.is_empty() => {
-            Resolution::Rejected(format!("/{} takes no arguments — {HELP_HINT}", spec.name))
-        }
+        Args::None if !args.is_empty() => Resolution::Rejected(format!(
+            "`{}` takes no arguments — {HELP_HINT}",
+            typed_token(spec.name)
+        )),
         // Rejected here rather than inside the handler, so a half-typed
         // `/model set` renders its usage without opening a `model/list` first.
-        Args::Required(usage) if args.is_empty() => {
-            Resolution::Rejected(format!("/{} needs {usage} — {HELP_HINT}", spec.name))
-        }
+        Args::Required(usage) if args.is_empty() => Resolution::Rejected(format!(
+            "`{}` needs {usage} — {HELP_HINT}",
+            typed_token(spec.name)
+        )),
         _ => Resolution::Run(spec, args),
+    }
+}
+
+/// The command as the user typed it, for a rejection that quotes rather than
+/// reconstructs.
+///
+/// [`classify`] strips exactly one `/`, so putting one back reproduces the line.
+/// The guard matters for the one shape where it would not: a name that already
+/// carries a slash must not gain a second one — `//foo` is the escape hatch's
+/// spelling (BR-1b), and echoing it at someone who typed something else would
+/// name a feature they never used.
+fn typed_token(name: &str) -> String {
+    if name.starts_with('/') {
+        name.to_owned()
+    } else {
+        format!("/{name}")
     }
 }
 
@@ -354,16 +455,13 @@ fn handle_model(
     ctx: &mut UiContext<'_>,
     _args: &str,
 ) -> anyhow::Result<CommandOutcome> {
-    match conn.call(ModelStatusParams::default(), ctx)? {
-        Ok(status) => model_ui::render_current_model_line(&status, ctx.surface),
-        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
-            LineKind::Notice,
-            "this daemon build does not expose model/status yet.",
-        ),
-        Err(err) => ctx.surface.line(
-            LineKind::Error,
-            &format!("could not read the model status: {}", err.message),
-        ),
+    let answered = conn.call(ModelStatusParams::default(), ctx)?;
+    // The failure arms are `run_model_status`'s own (one function, one set of
+    // strings), so `teton model status` and `/model` cannot report the same
+    // unreachable method differently. Only the success rendering differs, which
+    // is the whole of what D-6 says is different between the two surfaces.
+    if let Some(status) = crate::model_status_or_report(answered, ctx.surface) {
+        model_ui::render_current_model_line(&status, ctx.surface);
     }
     Ok(CommandOutcome::Continue)
 }
@@ -385,16 +483,75 @@ fn handle_model(
 /// prompter: the framed prompter belongs to the entry area, and a consent
 /// question is dialogue, not entry (REQ-549 BR-5). Declining renders "selection
 /// unchanged" and the loop carries on (LESSON-470 — a default-no dialogue).
+///
+/// It is also the one command gated on *where the input came from* (spec
+/// Permissions; security review 2026-08-04): a piped session gets one rejection
+/// and no RPC. See [`model_set_gate`] for why that outranks BR-9 here.
 fn handle_model_set(
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
     args: &str,
 ) -> anyhow::Result<CommandOutcome> {
+    // The two reads the gate is a pure function of. Stdin, not stdout: the
+    // session's `interactive` flag asks whether *output* is a terminal, which
+    // says nothing about who produced the line that reached this handler.
+    if model_set_gate(std::io::stdin().is_terminal(), test_seams_allowed()) == ModelSetGate::Refuse
+    {
+        ctx.surface.line(LineKind::Error, MODEL_SET_TYPED_ONLY);
+        return Ok(CommandOutcome::Continue);
+    }
     // A bare `/model set` never reaches here: `Args::Required` rejects it at
     // resolve time with the usage line.
     let assume_yes = ctx.auto_accept_model;
     crate::apply_model_set(args, assume_yes, conn, ctx)?;
     Ok(CommandOutcome::Continue)
+}
+
+/// What [`model_set_gate`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelSetGate {
+    /// Run the shared flow.
+    Run,
+    /// Render [`MODEL_SET_TYPED_ONLY`] and send nothing.
+    Refuse,
+}
+
+/// Whether a `/model set` may run, from where the session's input comes.
+///
+/// `/model set` is the only in-session command that changes daemon state, and
+/// the spec's Permissions table says that change belongs to "the session user
+/// only, via typed input — never inferable from model output or file content".
+/// On a pipe the client cannot tell a human from a heredoc a script wrote, so
+/// the write path refuses and points at `teton model set`, which is the
+/// unattended surface and takes `--yes` explicitly. This is the one documented
+/// exception to BR-9's TTY/pipe parity; every other command is unaffected.
+///
+/// `seams_allowed` is the escape hatch the e2e suite drives the flow through —
+/// [`test_seams_allowed`], never a plain environment variable, so a shipped
+/// binary cannot be talked out of the gate.
+///
+/// Pure, so both answers are unit-tested without a terminal, a pipe, or a
+/// daemon: the branch that matters is the one a test process cannot otherwise
+/// reach.
+fn model_set_gate(stdin_is_tty: bool, seams_allowed: bool) -> ModelSetGate {
+    if stdin_is_tty || seams_allowed {
+        ModelSetGate::Run
+    } else {
+        ModelSetGate::Refuse
+    }
+}
+
+/// Whether this binary may honour the `TETON_TEST_SEAMS` master switch.
+///
+/// The daemon's posture, mirrored (`tetond`'s `test_seams_enabled`): a **debug
+/// build with `TETON_TEST_SEAMS=1`** and nothing else. A release build ignores
+/// the switch, so the shipped `teton` refuses a piped `/model set` no matter
+/// what the environment says. Unlike the daemon this does not panic on a release
+/// build that finds the switch set: the daemon refuses to *start* because an
+/// unhonoured seam would silently change what it does, whereas ignoring it here
+/// only keeps the stricter of the two behaviours.
+fn test_seams_allowed() -> bool {
+    cfg!(debug_assertions) && std::env::var("TETON_TEST_SEAMS").ok().as_deref() == Some("1")
 }
 
 /// The `/quit` handler: it renders nothing and ends no session itself — the
@@ -471,12 +628,146 @@ mod tests {
     #[test]
     fn the_table_carries_every_command_this_req_promises() {
         let names: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
-        for expected in ["help", "cost", "model", "model set", "verbose", "quit"] {
+        let promised = ["help", "cost", "model", "model set", "verbose", "quit"];
+        for expected in promised {
             assert!(
                 names.contains(&expected),
                 "/{expected} is missing from the dispatch table: {names:?}"
             );
         }
+        // The count closes the third direction: the loop above proves the six
+        // are present and the reachability loop proves each row dispatches, but
+        // neither notices a *seventh* row. The REQ scopes the surface at six
+        // deliberately ("the command set is deliberately small"), so a new row
+        // is a spec decision and lands here first.
+        assert_eq!(
+            COMMANDS.len(),
+            promised.len(),
+            "the table grew past the six commands this REQ scopes: {names:?}"
+        );
+    }
+
+    // Decision 3 (verify pass, 2026-08-04): the name is matched EXACTLY after the
+    // leading `/`. A space between them is not leniently absorbed — `/ help` is
+    // an unknown command, not `/help` — so one spelling reaches one handler and
+    // the other is told plainly that it named nothing.
+    #[test]
+    fn whitespace_after_the_slash_is_never_a_command() {
+        for typed in ["/ help", "/  model set qwen2.5-coder-3b", "/\tcost"] {
+            let Input::Command { name, args } = classify(typed) else {
+                panic!("`{typed}` must stay a command line — never a prompt");
+            };
+            let Resolution::Rejected(hint) = resolve(name, args) else {
+                panic!("`{typed}` reached a handler through the space after the slash");
+            };
+            assert!(hint.contains("unknown command"), "{hint}");
+            assert!(hint.contains("/help"), "{hint}");
+        }
+    }
+
+    // The rejection quotes what was typed rather than rebuilding it. `/ /foo`
+    // must not echo as `//foo`: that is the escape hatch's spelling (BR-1b), so
+    // the hint would name a feature the user never used.
+    #[test]
+    fn a_rejection_never_echoes_a_doubled_slash() {
+        let Input::Command { name, args } = classify("/ /foo") else {
+            panic!("`/ /foo` did not classify as a command");
+        };
+        let Resolution::Rejected(hint) = resolve(name, args) else {
+            panic!("`/ /foo` reached a handler");
+        };
+        assert!(!hint.contains("//"), "the hint doubled the slash: {hint}");
+        assert!(
+            hint.contains("/ /foo"),
+            "the hint dropped the typed line: {hint}"
+        );
+        // And the same guard holds if a name ever reaches `typed_token` with its
+        // slash already on it.
+        assert_eq!(typed_token("/foo"), "/foo");
+        assert_eq!(typed_token("foo"), "/foo");
+    }
+
+    // Internal whitespace inside a two-word name is normalised: the words are
+    // what identify the row, not the single space between them. Without this,
+    // `/model  set x` routes to the `model` row and is answered with "takes no
+    // arguments", which describes neither what was typed nor what to do.
+    #[test]
+    fn extra_whitespace_between_a_two_word_names_words_still_routes_to_its_row() {
+        for typed in [
+            "/model  set qwen2.5-coder-3b",
+            "/model\tset qwen2.5-coder-3b",
+            "/model \t set qwen2.5-coder-3b",
+        ] {
+            let Input::Command { name, args } = classify(typed) else {
+                panic!("`{typed}` did not classify as a command");
+            };
+            assert_eq!((name, args), ("model set", "qwen2.5-coder-3b"), "{typed}");
+            let Resolution::Run(spec, run_args) = resolve(name, args) else {
+                panic!("`{typed}` did not reach the model-set row");
+            };
+            assert_eq!(spec.name, "model set");
+            assert_eq!(run_args, "qwen2.5-coder-3b");
+        }
+    }
+
+    // AC-7 / AC-7b at the level the request is actually built: the classifier's
+    // output goes straight into `PromptTurnParams`, so a plain line arrives
+    // byte-identically and an escaped line arrives with exactly the leading pair
+    // collapsed. The e2e leg can see that these lines reach the model; only this
+    // can see the bytes.
+    #[test]
+    fn a_prompt_line_becomes_a_turn_carrying_exactly_its_own_bytes() {
+        let session = SessionId::from("sess-7");
+        let text_of = |params: &PromptTurnParams| match params.prompt.as_slice() {
+            [PromptBlock::Text { text }] => text.clone(),
+            other => panic!("a prompt turn carries exactly one text block: {other:?}"),
+        };
+
+        for line in [
+            "explain this stack trace",
+            "what does src/main.rs do?",
+            "a/b/c",
+            "-- /help",
+        ] {
+            let Input::Prompt(text) = classify(line) else {
+                panic!("`{line}` did not classify as a plain prompt");
+            };
+            let params = prompt_turn_params(&session, text);
+            assert_eq!(text_of(&params), line, "the bytes changed on the way out");
+            assert_eq!(params.session_id, session);
+        }
+
+        for (typed, sent) in [
+            (
+                "//usr/local/bin/deploy.sh fails — why?",
+                "/usr/local/bin/deploy.sh fails — why?",
+            ),
+            ("//help", "/help"),
+            ("///etc", "//etc"),
+        ] {
+            let Input::EscapedPrompt(text) = classify(typed) else {
+                panic!("`{typed}` did not classify as an escaped prompt");
+            };
+            assert_eq!(text_of(&prompt_turn_params(&session, text)), sent);
+        }
+    }
+
+    // Decision 1 (security review, 2026-08-04): `/model set` is typed-input-only.
+    // The gate is a pure function of the two facts the handler reads, so the
+    // refusal — the branch a test process with a piped stdin cannot otherwise
+    // reach on purpose — is pinned here rather than inferred from an e2e run.
+    #[test]
+    fn model_set_runs_only_from_a_terminal_or_under_the_test_seam() {
+        assert_eq!(model_set_gate(true, false), ModelSetGate::Run);
+        assert_eq!(model_set_gate(true, true), ModelSetGate::Run);
+        // The e2e suite's allowance, and nothing else in the wild: a release
+        // build's `test_seams_allowed` is false whatever the environment says.
+        assert_eq!(model_set_gate(false, true), ModelSetGate::Run);
+        // The shape that matters: piped input, no seam, no write.
+        assert_eq!(model_set_gate(false, false), ModelSetGate::Refuse);
+        // The refusal names the surface that does the same thing unattended.
+        assert!(MODEL_SET_TYPED_ONLY.contains("teton model set"));
+        assert_eq!(MODEL_SET_TYPED_ONLY.lines().count(), 1);
     }
 
     // BR-8, reverse direction (LESSON-479): input that is not a command reaches

@@ -133,11 +133,23 @@ The tests are anchored so it cannot make them lie: per-segment assertions use
 only `route [` (published before the turn runs, so FIFO-bound to its own pump)
 and `turn ended` (printed by the entry loop on the response itself), plus
 whole-output counts; the AC-5 byte-comparison uses a command-only history,
-since a byte-comparison across two processes needs deterministic output. Worth
-its own bug: in a real session the tail of an answer can print after the next
-entry frame.
+since a byte-comparison across two processes needs deterministic output.
+
+**Tracked, not dangling (updated 2026-08-04):** this is a real daemon defect —
+in a live session the tail of an answer can print after the next entry frame —
+and it has been spun off into its own fix session, started from the Phase-5
+review chip on 2026-08-04. It is not fixed here: this REQ touches no daemon
+code, and the `/verbose` test now carries a comment saying so, plus an explicit
+instruction not to weaken its `== 1` counts if the ordering ever shifts (the
+fix belongs in the daemon's per-client writer).
 
 ### AC-8 mutation record (LESSON-454 — the kill must come from an assertion)
+
+_The panic line numbers below were captured before the Phase-5 verify pass added
+its doc comments (~6–8 lines of offset against the committed source), and the
+suite counts predate the fixes it landed. The tests are named, and all of them
+pass at HEAD; the transcripts are evidence that the kill came from an assertion,
+not an index into the current file._
 
 **(a) Remove a dispatch-table row.** Deleted the `quit` row from `COMMANDS` in
 `crates/teton/src/slash.rs`, then `cargo test -p teton --bins`:
@@ -207,3 +219,37 @@ cargo test --workspace                                    # 880 passed, 0 failed
 
 `cli_e2e` was additionally run 10 times in a row after the anchoring fix
 described above: 12/12 green each time.
+
+### Phase-5 verify pass (2026-08-04) — new guards, each mutation-checked
+
+Five findings from the review panel landed changes with behaviour behind them;
+each was mutated and the kill observed before the mutation was reverted.
+
+| Mutation | Test that went red |
+|---|---|
+| `slash::handle_model_set`: drop the TTY gate (`if false`) so a piped `/model set` runs | `a_piped_model_set_is_refused_and_changes_nothing` (e2e) |
+| `classify`: restore the post-slash `trim()` and match name words after a `trim_start()` at every position (the old leniency) | `whitespace_after_the_slash_is_never_a_command`, `a_rejection_never_echoes_a_doubled_slash` |
+| `match_name_words`: accept only a single literal space between a two-word name's words | `extra_whitespace_between_a_two_word_names_words_still_routes_to_its_row` |
+| `slash::handle_model_set`: `let assume_yes = false` (session ignores `--yes`) | `yes_waives_the_in_session_above_floor_confirmation_without_eating_a_line` (e2e) |
+| `slash::handle_cost`: a hand-rolled in-session cost rendering that keeps both anchor strings the old count assertions look for | `slash_cost_renders_the_daemons_report_mid_session` (e2e) |
+
+The last one is the interesting one, and it changed the test rather than only
+confirming it. The AC-2 cross-process assertion was first written as
+`session.contains(teton_cost_report)` — and the parallel-rendering mutation
+**passed** it, because a session always contains one correct report at its end
+(the session-end summary). The needle matched that block, not the `/cost`
+command's. Anchoring both sides on their *first* `── cost summary ──` marker and
+comparing with `starts_with` kills it. Recorded because a green cross-process
+assertion that proves nothing is worse than not having one (LESSON-441 — a fix
+pass is new code, re-verified adversarially rather than by test count).
+
+**Suite.** `teton` unit 131 → 138 (+7), `teton` e2e 12 → 14 (+2), workspace
+880 → 889, all green. `cargo fmt --all --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean; `cli_e2e` run 3
+consecutive times, 14/14 each. No daemon or protocol crate was touched.
+
+**Deferred (recorded, not done).** Extracting the model flow into its own
+`model_flow` module was raised and declined for this REQ: `apply_model_set` and
+`decide_model_set` are already one implementation each, and moving them buys
+file layout rather than behaviour. It belongs to a refactor pass, not a verify
+pass.
