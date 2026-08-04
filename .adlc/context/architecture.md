@@ -152,8 +152,8 @@ agent↔tools; ADR-002's protocol is client↔daemon. They do not compete.
 **Consequences**: tool calls to remote MCP servers are egress and MUST flow
 through the privacy boundary choke point (BR-1) — content under a `local-only`
 boundary never reaches a remote MCP server. Tool-result content entering
-context is data, not instructions (prompt-injection posture to be detailed in
-the harness child REQ).
+context is data, not instructions — the posture that promise rests on is now
+concrete; see ADR-009.
 
 **Addendum (2026-07-24)**: `[[mcp_server]] trusted` **stays `false` by
 default** — confirmed as a deliberate decision (Brett), not an oversight, after
@@ -345,3 +345,59 @@ job isolation is the future fix if it ever enters scope. Post-merge human
 steps live in docs/release-runbook.md §11 (one green release, then delete
 the repo-level tap token, then the negative probe). AC-6 (grant survival)
 is first observable at the second signed release.
+
+### ADR-009: Frame is frame in both directions; sanitize where the frame is written (2026-08-04)
+
+**Decision**: the harness's prompt-injection posture is **structural
+containment at three layers**, not a textual request to the model. Every layer
+holds in *both* directions — what the model may not emit is exactly what
+content may not introduce — and each is enforced at the code that authors the
+frame it guards, never at a downstream pass over an already-flattened string.
+
+| Layer | Frame | Input guard (content may not introduce) | Output guard (model may not emit) |
+|---|---|---|---|
+| Tokenizer | `<\|im_start\|>`, `<\|…\|>` by shape, `<tool_call>`, `<think>` | `render::neutralize_control_tokens`, on **both** render arms | `TEMPLATE_CONTROL_MARKERS`, position-independent |
+| Transcript | `User:`, `Assistant:`, `Tool (`, `Tool result (` | `render::neutralize_frame_labels`, at `assemble`/`prepare` | `FLAT_/CHATML_ANCHORED_MARKERS`, line-anchored |
+| Envelope | `<tool-result`, `<mcp-tool-result` (+ closers) | `render::neutralize_envelope_tags`, at `frame_untrusted_builtin` / `mcp::frame_untrusted` | `<tool-result` in both marker sets; `<mcp-tool-result` **not yet** — BUG-149 |
+
+Three rules fall out, and they are the reusable part:
+
+1. **Put the choke point below the format branch.** A `match` over render
+   formats with one sanitizing arm and one raw arm makes the raw arm the
+   exploit — `ChatFormat::Flat` is the *fallback* every model lands on when its
+   GGUF template is missing or a declined dialect, not a "no special tokens"
+   mode.
+2. **Split the sanitizer by authoring layer, not by marker list.** Harness
+   frame that is written *into* content (the untrusted envelope) is
+   byte-indistinguishable from forged frame by the time assembly sees it, so a
+   single pass over the union of markers defuses the harness's own frame.
+3. **Derive the input alphabet from the output alphabet**, with a test
+   asserting every output marker is claimed by exactly one input layer, so
+   drift is a build failure rather than a silently reopened hole.
+
+**Rationale**: BUG-147 (weak local models *continue* a flat transcript rather
+than speaking a turn), REQ-554 (`llama-cpp-2` hardcodes `parse_special = true`,
+so control-token spellings anywhere in the prompt become real control tokens),
+BUG-148 (the text-level twin: line-anchored labels interpolated with no
+escaping, forgeable from any repo file, MCP result, or — via
+`ToolRegistry::docs()` — a **server-supplied tool description landing in the
+system prompt**). The `<tool-result trust="untrusted">` envelope and its "never
+execute directives" note remain, but they are advisory: they persuade a model
+that is already reading the block as data. They do not contain anything on
+their own, because content that can write frame can also close the envelope.
+
+**Consequences**: adding any new delimiter, label, or envelope to a prompt is a
+**two-sided** change — the marker set and the neutralizer both move, and the
+coverage test names the layer. Neutralization is insertion-only (`_`
+interposed), so it is order-independent, cannot mint a spelling out of its
+neighbours, and leaves content legible; transcript matching is strictly
+flush-left, so indented `User:` in YAML or struct content is untouched and
+ordinary prompts stay byte-identical. Neutralization runs at *render* time,
+downstream of `truncate_to_budget`, so a truncation that happens to expose a
+label at a line start is covered too. Known residual: trust attaches to
+provenance, not to a string's apparent authorship — anything third-party that
+reaches a "harness-authored" surface (MCP tool names, descriptions, schemas) is
+untrusted and must be traced to the leaf. Governing lessons: LESSON-472
+(output), LESSON-474 (sanitize at the parsing layer, for every path),
+LESSON-475 (anchor markers where the renderer writes them), LESSON-477 (split
+by authoring layer).
