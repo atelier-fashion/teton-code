@@ -737,16 +737,20 @@ fn slash_cost_renders_the_daemons_report_mid_session() {
 /// "the notices render somewhere" would stay green if they rendered for the
 /// wrong turn, which is exactly the drift a session-scoped toggle can suffer.
 ///
-/// What the segments are anchored on matters, because one thing here has no
-/// fixed position. The daemon's per-client writer drains two independent
-/// producers — request responses and the broadcast event stream — so a turn's
-/// trailing streamed text can be queued *after* that turn's own response and
-/// then render at the head of the next pump, one command later. The routing
-/// notice cannot move like that (`route_decided` is published before the turn
-/// runs, and the client's pump is FIFO up to the response it is waiting for) and
-/// neither can the turn-end line (the entry loop prints it on the response
-/// itself). So the per-segment assertions below are made on those two markers
-/// only; that the turns ran at all is asserted over the whole output, in order.
+/// What the segments are anchored on matters. The daemon's per-client writer
+/// drains two independent producers — request responses and the broadcast
+/// event stream — and before the daemon's `EventFence`
+/// (`tetond::server`, pinned by `tetond/tests/event_response_ordering.rs`),
+/// a turn's trailing streamed text could be queued *after* that turn's own
+/// response and render at the head of the next pump, one command later. The
+/// fence now orders a turn's events ahead of its response, but this test keeps
+/// its anchoring on the two markers whose position never depended on that
+/// ordering — the routing notice (`route_decided` is published before the turn
+/// runs, and the client's pump is FIFO up to the response it is waiting for)
+/// and the turn-end line (the entry loop prints it on the response itself) —
+/// so it stays correct about what it is about, the `/verbose` toggle, rather
+/// than doubling as a second ordering test. That the turns ran at all is
+/// asserted over the whole output, in order.
 #[test]
 fn slash_verbose_toggles_the_route_notice_around_real_turns() {
     let Some(daemon) = daemon_or_skip() else {
@@ -838,15 +842,17 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
 /// stronger claim than the AC's "identical session-end output", and it is the
 /// honest one here: a pipe has no input echo to subtract.
 ///
-/// The shared history is two RPC-bearing commands rather than a model turn, and
-/// the reason is the ordering property documented on the `/verbose` test above:
-/// a turn's trailing streamed text is queued by a different producer than the
-/// turn's response, so its position in the byte stream is not reproducible across
-/// two processes. Comparing two runs bytewise requires a history whose output is
-/// deterministic; what AC-5 is about — that `/quit` leaves through the session-end
-/// path Ctrl-D leaves through, rather than a parallel shutdown — is unaffected by
-/// which commands preceded it, and the cost summary here is the daemon's real
-/// one, over the session's real (empty) ledger.
+/// The shared history is two RPC-bearing commands rather than a model turn, for
+/// the reason documented on the `/verbose` test above: a turn's streamed text
+/// and its response come from different producers, and although the daemon's
+/// `EventFence` now orders a turn's own events ahead of its response, token
+/// chunking within the stream is still not a byte-for-byte contract worth
+/// leaning a whole-output equality on. Comparing two runs bytewise requires a
+/// history whose output is deterministic; what AC-5 is about — that `/quit`
+/// leaves through the session-end path Ctrl-D leaves through, rather than a
+/// parallel shutdown — is unaffected by which commands preceded it, and the
+/// cost summary here is the daemon's real one, over the session's real (empty)
+/// ledger.
 ///
 /// (On a TTY the prompter's EOF-vs-Enter cursor chrome legitimately differs;
 /// the AC puts that out of scope, and this suite never sees it.)

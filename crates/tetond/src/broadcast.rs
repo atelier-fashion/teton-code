@@ -8,7 +8,7 @@
 //! sends it a [`SUBSCRIPTION_LAGGED_METHOD`] notice and closes. A slow client
 //! can thus never buffer unboundedly nor stall the publisher or its peers.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -36,6 +36,7 @@ struct SubscriberHandle {
     id: u64,
     tx: mpsc::Sender<EventEnvelope>,
     lagged: Arc<AtomicBool>,
+    delivered: Arc<AtomicU64>,
 }
 
 struct Inner {
@@ -66,6 +67,7 @@ impl EventBus {
     pub fn subscribe(self: &Arc<Self>, capacity: usize) -> Subscription {
         let (tx, rx) = mpsc::channel(capacity);
         let lagged = Arc::new(AtomicBool::new(false));
+        let delivered = Arc::new(AtomicU64::new(0));
 
         let id = {
             let mut inner = self.inner.lock().expect("event bus mutex poisoned");
@@ -75,6 +77,7 @@ impl EventBus {
                 id,
                 tx,
                 lagged: Arc::clone(&lagged),
+                delivered: Arc::clone(&delivered),
             });
             id
         };
@@ -83,6 +86,7 @@ impl EventBus {
             id,
             rx,
             lagged,
+            delivered,
             bus: Arc::clone(self),
         }
     }
@@ -101,7 +105,14 @@ impl EventBus {
 
         inner.subscribers.retain(|handle| {
             match handle.tx.try_send(envelope.clone()) {
-                Ok(()) => true,
+                Ok(()) => {
+                    // Delivery count, not publish count: an event this
+                    // subscriber never received (published pre-subscribe, or
+                    // dropped on eviction) must not be waited for by anyone
+                    // holding the counter (see `Subscription::delivered_counter`).
+                    handle.delivered.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // Slow client: evict rather than buffer unboundedly. The
                     // flag lets the client's forwarder emit a lagged notice
@@ -149,6 +160,7 @@ pub struct Subscription {
     id: u64,
     rx: mpsc::Receiver<EventEnvelope>,
     lagged: Arc<AtomicBool>,
+    delivered: Arc<AtomicU64>,
     bus: Arc<EventBus>,
 }
 
@@ -178,6 +190,21 @@ impl Subscription {
     #[must_use]
     pub fn is_lagged(&self) -> bool {
         self.lagged.load(Ordering::SeqCst)
+    }
+
+    /// The live count of events the bus has queued into this subscription's
+    /// channel so far. `publish` increments it synchronously (under the bus
+    /// lock, after a successful delivery), so once a publisher returns, a load
+    /// of this counter covers everything it just published.
+    ///
+    /// This is the event side of the server's event/response ordering fence:
+    /// a task that drains this subscription counts what it has *taken out*, and
+    /// a response is held until that count catches up to what was put in (see
+    /// `server::EventFence`). Kept as a shared handle so the counter stays
+    /// readable after the `Subscription` itself moves into the drain task.
+    #[must_use]
+    pub fn delivered_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.delivered)
     }
 }
 

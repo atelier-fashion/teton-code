@@ -7,8 +7,22 @@
 //! channel fed by both request responses and broadcast events. A client must
 //! complete the [`handshake`] before any other method is accepted. Sessions and
 //! the event bus live in the shared [`Daemon`], so they outlive any one client.
+//!
+//! ## Event/response ordering
+//!
+//! Responses and events reach the outbound channel from *different* producers —
+//! request handlers push responses directly, while [`forward_events`] relays
+//! broadcast events from this client's bus subscription. Left unordered, a
+//! turn's final streamed `session_update` could be queued *after* the turn's
+//! own response, and a strictly-FIFO client (the CLI's pump) would then render
+//! it one command late — after the next prompt, or after the session-end cost
+//! summary. [`EventFence`] closes that race: before a post-handshake response
+//! is enqueued, the sender waits until every event the bus had already
+//! delivered to this client has been moved to the outbound channel. Events a
+//! handler publishes therefore always precede its response on the wire.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -16,7 +30,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use teton_protocol::events::{DaemonClientAttach, Event, PhaseTransition};
@@ -137,6 +151,39 @@ pub async fn serve(listener: UnixListener, daemon: Arc<Daemon>) -> std::io::Resu
     }
 }
 
+/// The per-client event/response ordering fence (see the module docs).
+///
+/// `delivered` counts events the bus has queued into this client's
+/// subscription; `forwarded` reports how many of them [`forward_events`] has
+/// moved to the outbound channel. [`Self::sync`] holds a response until the
+/// forwarder catches up to everything delivered so far, which is what keeps a
+/// response from overtaking an event that was published before it.
+#[derive(Clone)]
+struct EventFence {
+    delivered: Arc<AtomicU64>,
+    forwarded: watch::Receiver<u64>,
+}
+
+impl EventFence {
+    /// Wait until every event already delivered to this client's subscription
+    /// has been handed to the outbound writer.
+    ///
+    /// This cannot wait for an event the client will never get: the target is
+    /// the *delivered* count (not the bus-wide publish count), and if the
+    /// forwarder ends first — teardown, or a lag eviction — the watch closes
+    /// and the wait ends. It can only stall while the outbound channel is
+    /// full, i.e. while the response it is ordering could not be enqueued
+    /// anyway.
+    async fn sync(mut self) {
+        let target = self.delivered.load(Ordering::SeqCst);
+        while *self.forwarded.borrow_and_update() < target {
+            if self.forwarded.changed().await.is_err() {
+                break; // the forwarder is gone; nothing left to order against
+            }
+        }
+    }
+}
+
 /// Drives one client connection from handshake to disconnect.
 async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
     let (read_half, write_half) = stream.into_split();
@@ -146,6 +193,7 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
     let mut reader = BufReader::new(read_half);
     let mut handshaked = false;
     let mut forwarder: Option<JoinHandle<()>> = None;
+    let mut fence: Option<EventFence> = None;
     // In-flight `session/prompt` executions. A prompt turn is run on its own task
     // so the reader loop stays free to process the `permission/respond` that
     // unblocks the harness permission gate mid-turn (otherwise the loop would
@@ -205,7 +253,16 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
             // error response is already queued and the client stays unauthenticated.
             if let Some(sub) = do_handshake(&daemon, id, params, &out_tx) {
                 handshaked = true;
-                forwarder = Some(tokio::spawn(forward_events(sub, out_tx.clone())));
+                let (forwarded_tx, forwarded_rx) = watch::channel(0u64);
+                fence = Some(EventFence {
+                    delivered: sub.delivered_counter(),
+                    forwarded: forwarded_rx,
+                });
+                forwarder = Some(tokio::spawn(forward_events(
+                    sub,
+                    out_tx.clone(),
+                    forwarded_tx,
+                )));
             }
             continue;
         }
@@ -213,7 +270,7 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
         // `session/prompt` runs on its own task (see `prompt_tasks`); every other
         // method dispatches synchronously and replies immediately.
         if method == PromptTurnParams::METHOD {
-            if let Some(handle) = spawn_prompt_turn(&daemon, id, params, &out_tx) {
+            if let Some(handle) = spawn_prompt_turn(&daemon, id, params, &out_tx, fence.clone()) {
                 // Prune completed turns before tracking a new one so the vector
                 // does not grow unbounded across a long-lived connection's turns
                 // (REQ-544 minor). Only still-running handles are kept, to be
@@ -225,6 +282,12 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
         }
 
         if let Some(response) = dispatch(&daemon, id, method, params) {
+            // Any event the handler just published (e.g. `session/create`'s
+            // phase transition) must be on the outbound channel before its
+            // response — see the module docs on ordering.
+            if let Some(fence) = fence.clone() {
+                fence.sync().await;
+            }
             let _ = out_tx.send(response).await;
         }
     }
@@ -243,13 +306,17 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
 
 /// Spawns a `session/prompt` turn on its own task. The turn streams events over
 /// the shared bus while it runs and sends its terminal response (or error) over
-/// `out_tx` when it finishes. Returns the task handle so teardown can abandon it,
-/// or `None` when the request could not be started (an error response is queued).
+/// `out_tx` when it finishes — after `fence` confirms every event the turn
+/// published (its final streamed text included) has reached the outbound
+/// channel, so the response cannot overtake them on the wire. Returns the task
+/// handle so teardown can abandon it, or `None` when the request could not be
+/// started (an error response is queued).
 fn spawn_prompt_turn(
     daemon: &Arc<Daemon>,
     id: Id,
     params: Value,
     out_tx: &mpsc::Sender<String>,
+    fence: Option<EventFence>,
 ) -> Option<JoinHandle<()>> {
     let params: PromptTurnParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -292,6 +359,12 @@ fn spawn_prompt_turn(
             Ok(res) => ok_string(id, &res),
             Err(err) => error_from(id, err),
         };
+        // The turn has finished publishing; hold its response until the
+        // forwarder has moved everything it streamed onto the outbound
+        // channel, or a FIFO client renders the turn's tail one command late.
+        if let Some(fence) = fence {
+            fence.sync().await;
+        }
         let _ = out.send(response).await;
     }))
 }
@@ -590,9 +663,18 @@ fn handle_session_attach(daemon: &Daemon, id: Id, params: Value) -> String {
 }
 
 /// Forwards broadcast events from `sub` to the client's outbound channel until
-/// the subscription ends. If the bus evicted it for lagging, emits a final
-/// [`SUBSCRIPTION_LAGGED_METHOD`] notice before stopping.
-async fn forward_events(mut sub: Subscription, out_tx: mpsc::Sender<String>) {
+/// the subscription ends, reporting its progress on `forwarded` (the
+/// [`EventFence`] watermark: how many delivered events have reached the
+/// outbound channel). Dropping the sender on exit is load-bearing — it is what
+/// releases any response still waiting on the fence. If the bus evicted the
+/// subscription for lagging, emits a final [`SUBSCRIPTION_LAGGED_METHOD`]
+/// notice before stopping.
+async fn forward_events(
+    mut sub: Subscription,
+    out_tx: mpsc::Sender<String>,
+    forwarded: watch::Sender<u64>,
+) {
+    let mut count: u64 = 0;
     loop {
         match sub.recv().await {
             Some(envelope) => {
@@ -602,6 +684,10 @@ async fn forward_events(mut sub: Subscription, out_tx: mpsc::Sender<String>) {
                         break; // client's writer is gone
                     }
                 }
+                // Counted even when serialization failed: the event will never
+                // be sent, so nothing should wait on it.
+                count += 1;
+                let _ = forwarded.send(count);
             }
             None => {
                 if sub.is_lagged() {
