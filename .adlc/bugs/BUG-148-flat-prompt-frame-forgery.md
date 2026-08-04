@@ -208,6 +208,8 @@ model that *emits* a fabricated MCP envelope is not cut by the scanner. That is 
 output-side gap (the BUG-147 axis), independent of this input-side fix, and is left for a
 separate change rather than widened into this one.
 
+Filed and fixed as **BUG-149** (`.adlc/bugs/BUG-149-mcp-envelope-not-a-fabrication-marker.md`).
+
 ## Deployment
 
 PR #32, squash-merged to `main`. No runtime deploy applies: this repo is the plain OSS
