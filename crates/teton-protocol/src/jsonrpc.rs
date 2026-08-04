@@ -229,6 +229,17 @@ pub mod error_code {
     /// the remote egress was blocked (REQ-544 M-1). A specific, content-free
     /// privacy signal — never a generic `INTERNAL_ERROR`.
     pub const PRIVACY_BLOCKED: i64 = -32004;
+    /// A turn arrived while the local tier was still coming up — its weights are
+    /// downloading, or they are installed and the daemon is loading and
+    /// benchmarking them — and nothing else could serve it.
+    ///
+    /// Split out of [`UNKNOWN_PROVIDER`] because it is the one unserved-turn
+    /// state that **resolves on its own**: the user has nothing to fix and
+    /// nothing to answer, only to wait. A client renders it as a waiting notice
+    /// rather than as a failure; every other unserved-turn cause — declined,
+    /// unanswered, below the RAM floor, load failed, no loader — needs an action
+    /// and keeps [`UNKNOWN_PROVIDER`].
+    pub const TIER_WARMING: i64 = -32005;
 }
 
 #[cfg(test)]

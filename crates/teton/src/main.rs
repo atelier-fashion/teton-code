@@ -296,6 +296,39 @@ fn main() -> ExitCode {
     }
 }
 
+/// The headline a turn that arrived while the local tier was still coming up
+/// renders under (BUG-152).
+///
+/// The daemon's own sentence follows it and carries the detail — which model,
+/// how far along it is, and what someone who does not want to wait can do
+/// instead. This says only the part that decides whether to read the rest: no
+/// action is required, and the tier is on its way.
+const TIER_WARMING_HEADLINE: &str = "model still loading —";
+
+/// Render a `prompt/turn` the daemon answered with an error.
+///
+/// Two classes, told apart by the daemon's own code rather than by re-reading
+/// its sentence here (BUG-152). A tier that is still coming up — weights
+/// downloading, or loaded and being benchmarked — is not a failure: nothing
+/// broke, the user has nothing to fix, and the state ends by itself. It renders
+/// as a [`LineKind::Notice`], the same class as the startup lifecycle lines it
+/// is a continuation of. Everything else is a real failure and keeps the error
+/// line and its `prompt failed:` prefix.
+///
+/// Split out of the entry loop so both arms are testable without a socket, for
+/// the reason [`cost_report_or_report`] is: the arms *are* the behaviour, and a
+/// branch only an e2e can reach is a branch that gets asserted on by accident.
+fn render_turn_failure(err: &RpcError, surface: &mut dyn Surface) {
+    if err.code == error_code::TIER_WARMING {
+        surface.line(
+            LineKind::Notice,
+            &format!("{TIER_WARMING_HEADLINE} {}", err.message),
+        );
+    } else {
+        surface.line(LineKind::Error, &format!("prompt failed: {}", err.message));
+    }
+}
+
 /// The default experience: an interactive freeform session (AC-1).
 ///
 /// This is the client that owns the first-run model prompt: it answers permission
@@ -440,9 +473,7 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                     );
                     break;
                 }
-                Err(err) => ctx
-                    .surface
-                    .line(LineKind::Error, &format!("prompt failed: {}", err.message)),
+                Err(err) => render_turn_failure(&err, ctx.surface),
             }
         }
     }
@@ -1434,6 +1465,65 @@ mod tests {
             "a successful status renders nothing of its own here: {:?}",
             surface.calls
         );
+    }
+
+    // BUG-152: the first prompt of a session often lands while the local tier
+    // is still loading its weights, and reporting that as `error: prompt
+    // failed:` told the user something had broken when nothing had. The split
+    // is on the daemon's code — the client never re-reads the sentence for
+    // keywords, which would be a second classifier for one state (LESSON-456).
+    #[test]
+    fn a_warming_tier_is_a_notice_and_every_other_refusal_is_still_an_error() {
+        let mut surface = RecordingSurface::new();
+        render_turn_failure(
+            &RpcError::new(
+                error_code::TIER_WARMING,
+                "qwen3-coder-30b-a3b's weights are installed and verified; the daemon is \
+                 loading and benchmarking them now. Retry in a moment.",
+            ),
+            &mut surface,
+        );
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "a tier on its way up is not a failure: {:?}",
+            surface.calls
+        );
+        let notices = surface.lines_of(LineKind::Notice);
+        assert_eq!(notices.len(), 1, "exactly one line: {notices:?}");
+        assert!(
+            notices[0].starts_with(TIER_WARMING_HEADLINE),
+            "the waiting headline leads, so it is what scans: {}",
+            notices[0]
+        );
+        // The daemon's own sentence survives whole (LESSON-456): the headline
+        // is added in front of the reason, never in place of it.
+        assert!(
+            notices[0].contains("loading and benchmarking them now")
+                && notices[0].contains("Retry in a moment."),
+            "the daemon's reason must reach the user intact: {}",
+            notices[0]
+        );
+
+        // The other side of the split: everything that is genuinely broken —
+        // or that needs the user to do something — still reads as an error.
+        for code in [
+            error_code::UNKNOWN_PROVIDER,
+            error_code::INTERNAL_ERROR,
+            error_code::PRIVACY_BLOCKED,
+        ] {
+            let mut surface = RecordingSurface::new();
+            render_turn_failure(&RpcError::new(code, "the tier was declined"), &mut surface);
+            assert_eq!(
+                surface.lines_of(LineKind::Error),
+                vec!["prompt failed: the tier was declined"],
+                "code {code} must keep the failure line"
+            );
+            assert!(
+                surface.lines_of(LineKind::Notice).is_empty(),
+                "code {code} is not a waiting state: {:?}",
+                surface.calls
+            );
+        }
     }
 
     // The same shape for the cost surfaces (REQ-555 BR-4): `teton cost`, the

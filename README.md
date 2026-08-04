@@ -48,7 +48,7 @@ prompts:
 | `/model` | One line naming the model the local tier is on |
 | `/model set <name>` | Change the local model (typed input only; asks before an above-RAM-floor pick) |
 | `/verbose` | Toggle routing and turn-end notices for this session |
-| `/quit` | End the session (same as Ctrl-D) |
+| `/quit` (or `/exit`) | End the session (same as Ctrl-D) |
 
 To send a prompt that genuinely starts with a slash — a pasted path, say —
 double it: `//usr/local/bin/x — why?` asks the model about `/usr/local/bin/x`.

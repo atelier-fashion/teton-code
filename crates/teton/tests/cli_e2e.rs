@@ -678,10 +678,12 @@ const TURN_REPLIES: &[&str] = &[
 /// absence of everything a turn produces. Which markers carry that weight
 /// depends on the session, and it is worth being exact about it:
 ///
-///   * [`TURN_REPLIES`] and `prompt failed` are the **load-bearing** guards in
-///     every session, quiet or verbose. A turn that the scripted engine served
-///     prints its reply; a turn the daemon refused prints the failure. One of
-///     the two happens for any line that reached `prompt/turn`.
+///   * [`TURN_REPLIES`], `prompt failed` and `model still loading` are the
+///     **load-bearing** guards in every session, quiet or verbose. A turn that
+///     the scripted engine served prints its reply; a turn the daemon refused
+///     prints the failure, or — when the local tier was still coming up
+///     (BUG-152) — the waiting notice that replaced it. One of the three
+///     happens for any line that reached `prompt/turn`.
 ///   * `does not execute prompt turns yet` covers a daemon too old to run turns
 ///     at all — also unconditional.
 ///   * `route [` and `turn ended` only ever render in a **verbose** session
@@ -701,6 +703,10 @@ fn assert_no_turn_ran(output: &str, what: &str) {
         "route [",
         "turn ended",
         "prompt failed",
+        // The literal of `main`'s `TIER_WARMING_HEADLINE`: a refusal that took
+        // the BUG-152 path renders this instead of `prompt failed`, and a guard
+        // that only knew the old string would go quiet exactly there.
+        "model still loading",
         "does not execute prompt turns yet",
     ] {
         assert!(
@@ -768,6 +774,17 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
             "`{name}` is missing from /help with its summary; output:\n{session}"
         );
     }
+
+    // BR-7 covers the alias too: `/exit` dispatches, so `/help` names it — on
+    // the `/quit` row, not as a seventh entry of its own.
+    let quit_line = session
+        .lines()
+        .find(|line| line.contains("/quit"))
+        .unwrap_or_else(|| panic!("/help listed no /quit row; output:\n{session}"));
+    assert!(
+        quit_line.contains("/exit"),
+        "/help must name /exit on the /quit row; got: {quit_line}"
+    );
 
     // AC-7b's documentation half: the escape hatch is one footer line.
     assert!(
@@ -975,10 +992,14 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
     );
 }
 
-/// AC-5: `/quit` ends the session exactly as Ctrl-D does.
+/// AC-5: `/quit` ends the session exactly as Ctrl-D does — and so does `/exit`.
 ///
-/// Two fresh daemons run the *same* history and then part ways only at the last
-/// line: one session types `/quit`, the other closes stdin. In piped mode the
+/// Three fresh daemons run the *same* history and then part ways only at the last
+/// line: one session types `/quit`, one types `/exit`, the other closes stdin.
+/// `/exit` is an alias of the `quit` row rather than a row of its own, so it
+/// cannot leave by a different path — but it is the spelling a user actually
+/// typed when they asked to leave (BUG-153), and "leaves like Ctrl-D does" is
+/// the claim worth holding at the binary rather than at the table. In piped mode the
 /// framed prompter degrades to a plain one and echoes nothing it read, so the two
 /// runs are comparable as whole byte streams rather than as extracted summaries —
 /// identical banner, identical session id (each daemon is fresh), identical
@@ -1022,9 +1043,23 @@ fn slash_quit_ends_the_session_exactly_as_ctrl_d_does() {
         quit_daemon.run_cli_capture(&teton, &[], &format!("{history}/quit\n"));
     drop(quit_daemon);
 
+    let exit_daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
+    let (exit, exit_status) =
+        exit_daemon.run_cli_capture(&teton, &[], &format!("{history}/exit\n"));
+    drop(exit_daemon);
+
     let eof_daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
     let (eof, eof_status) = eof_daemon.run_cli_capture(&teton, &[], history);
     drop(eof_daemon);
+
+    // The reported failure was `/exit` reaching the model, which replied
+    // conversationally instead of leaving. Both halves are asserted: nothing
+    // answered it, and nothing was said about it on the way out.
+    assert_no_turn_ran(&exit, "/exit");
+    assert!(
+        !exit.contains("unknown command"),
+        "/exit must be a command this session knows; output:\n{exit}"
+    );
 
     // The session-end summary is there at all — a `/quit` that skipped it would
     // otherwise be "identical" to a Ctrl-D that skipped it too.
@@ -1043,9 +1078,15 @@ fn slash_quit_ends_the_session_exactly_as_ctrl_d_does() {
         "/quit and Ctrl-D must produce the same session output.\n\
          --- /quit ---\n{quit}\n--- ctrl-d ---\n{eof}"
     );
+    assert_eq!(
+        exit, eof,
+        "/exit must produce the same session output as Ctrl-D — no extra line, \
+         no reply, just the exit.\n--- /exit ---\n{exit}\n--- ctrl-d ---\n{eof}"
+    );
     assert!(
-        quit_status.success() && eof_status.success(),
-        "both paths must exit 0; /quit: {quit_status:?}, ctrl-d: {eof_status:?}"
+        quit_status.success() && exit_status.success() && eof_status.success(),
+        "every path must exit 0; /quit: {quit_status:?}, /exit: {exit_status:?}, \
+         ctrl-d: {eof_status:?}"
     );
 }
 

@@ -11,7 +11,10 @@
 //!
 //! [`COMMANDS`] is the single artifact that both dispatches and generates
 //! `/help` (BR-7): a command cannot exist without appearing in `/help`, and
-//! `/help` cannot list a command that does not dispatch. Handlers render only
+//! `/help` cannot list a command that does not dispatch. Aliases are part of
+//! that same artifact — [`split_name`] canonicalises `/exit` to the `quit` row
+//! before anything looks it up, so a second spelling adds no second handler and
+//! no second `/help` entry. Handlers render only
 //! through the [`Surface`] seam — no direct-to-stdout side channel, so a
 //! ratatui front-end inherits the commands by implementing the same seam
 //! (BR-9) — and they return a [`CommandOutcome`] rather than exiting, so
@@ -135,6 +138,16 @@ struct CommandSpec {
     /// the longest matching name wins in [`split_name`], so a subcommand row is
     /// added without touching the classifier.
     name: &'static str,
+    /// Other spellings that reach this row. [`split_name`] canonicalises them to
+    /// [`Self::name`], so an alias adds a way to *type* a command and never a
+    /// second row, a second handler, or a second `/help` entry (BR-7).
+    ///
+    /// Aliases exist for the one command a user reaches for under a habit
+    /// formed elsewhere: `/exit` is what other REPLs call `/quit`, and a shell
+    /// that answers it with "unknown command" is answering a question the user
+    /// asked correctly. They are not a general synonym mechanism — a command
+    /// worth a second name is worth a table row.
+    aliases: &'static [&'static str],
     /// The one line `/help` prints for this command.
     summary: &'static str,
     /// What the row does with a trailing argument.
@@ -143,17 +156,26 @@ struct CommandSpec {
     handler: Handler,
 }
 
+impl CommandSpec {
+    /// Every spelling that reaches this row, canonical name first.
+    fn spellings(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.name).chain(self.aliases.iter().copied())
+    }
+}
+
 /// Every slash command, in `/help` order. The dispatcher matches against this
 /// array and `/help` renders from it, so the two cannot drift (BR-7).
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "help",
+        aliases: &[],
         summary: "List the commands this session knows.",
         args: Args::None,
         handler: handle_help,
     },
     CommandSpec {
         name: "cost",
+        aliases: &[],
         summary: "Show the daemon's cost report, exactly as `teton cost` does.",
         args: Args::None,
         handler: handle_cost,
@@ -164,12 +186,14 @@ const COMMANDS: &[CommandSpec] = &[
         // seeing the argument. Anything else trailing `/model` is a typo and is
         // rejected here rather than being read as a model name.
         name: "model",
+        aliases: &[],
         summary: "Show the model the local tier is currently on.",
         args: Args::None,
         handler: handle_model,
     },
     CommandSpec {
         name: "model set",
+        aliases: &[],
         summary: "Switch the local tier to a catalog model: /model set <name>.",
         args: Args::Required(
             "a catalog name — `/model set <name>`, and `teton model list` names them",
@@ -178,12 +202,20 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "verbose",
+        aliases: &[],
         summary: "Toggle the routing and turn-end notices for this session.",
         args: Args::None,
         handler: handle_verbose,
     },
     CommandSpec {
         name: "quit",
+        // BUG-153: `/exit` is the same command under the name most other REPLs
+        // give it. A user who types it has said exactly what they want;
+        // answering with "unknown command" — or, on a build without this table,
+        // sending it to the model, which replies conversationally and does not
+        // exit — is the BUG-146 shape: the harness was asked and something else
+        // answered.
+        aliases: &["exit"],
         summary: "End the session, exactly as Ctrl-D does.",
         args: Args::None,
         handler: handle_quit,
@@ -282,14 +314,27 @@ pub fn dispatch(
 /// with "takes no arguments", which describes neither what was typed nor what to
 /// do about it.
 ///
+/// An [alias](CommandSpec::aliases) is matched here alongside the canonical
+/// name and returns [`CommandSpec::name`], so everything downstream — [`resolve`],
+/// the handler, and the rejection text — sees the one spelling the table knows.
+/// `/exit` therefore cannot dispatch differently from `/quit`: it *is* `/quit`
+/// by the time either is looked up.
+///
 /// The table is a parameter so the longest-match rule is pinned by a fixture
 /// table as well as by the real one.
 fn split_name<'a>(line: &'a str, table: &'static [CommandSpec]) -> (&'a str, &'a str) {
     let matched = table
         .iter()
-        .filter_map(|spec| match_name_words(line, spec.name).map(|args| (spec, args)))
-        .max_by_key(|(spec, _)| spec.name.split_whitespace().count());
-    if let Some((spec, args)) = matched {
+        .filter_map(|spec| {
+            spec.spellings()
+                .find_map(|spelling| Some((spelling, match_name_words(line, spelling)?)))
+                .map(|(spelling, args)| (spec, spelling, args))
+        })
+        // Keyed on the spelling that actually matched, not on the row's
+        // canonical name: a one-word alias on a two-word row must not win a
+        // longest-match contest it did not enter.
+        .max_by_key(|(_, spelling, _)| spelling.split_whitespace().count());
+    if let Some((spec, _, args)) = matched {
         return (spec.name, args);
     }
     match line.split_once(char::is_whitespace) {
@@ -419,6 +464,10 @@ fn render_rejection(hint: &str, surface: &mut dyn Surface) {
 
 /// `/help`: the command list, generated from [`COMMANDS`] (BR-7), plus the one
 /// footer line documenting the `//` escape (BR-1b).
+///
+/// Aliases are rendered from the same rows, so BR-7 covers them too: a spelling
+/// that dispatches cannot be absent from `/help`, and `/help` cannot promise one
+/// that does not dispatch.
 fn render_help(surface: &mut dyn Surface) {
     // Names pad to the widest row, so a later two-word row (`model set`)
     // re-aligns the whole list instead of breaking out of it.
@@ -428,9 +477,23 @@ fn render_help(surface: &mut dyn Surface) {
         .max()
         .unwrap_or(0);
     for spec in COMMANDS {
+        // The alias is a tail clause rather than a second column: it belongs to
+        // one row, and widening the name column for it would push every other
+        // summary right for a fact about `/quit`.
+        let also = match spec.aliases {
+            [] => String::new(),
+            aliases => format!(
+                " (also {})",
+                aliases
+                    .iter()
+                    .map(|alias| format!("/{alias}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         surface.line(
             LineKind::Info,
-            &format!("/{:<width$}  {}", spec.name, spec.summary),
+            &format!("/{:<width$}  {}{also}", spec.name, spec.summary),
         );
     }
     surface.line(LineKind::Info, ESCAPE_FOOTER);
@@ -673,24 +736,83 @@ mod tests {
                 Args::None => "",
                 Args::Required(_) => "qwen2.5-coder-3b",
             };
-            let typed = format!("/{} {expected_args}", spec.name);
-            let typed = typed.trim_end();
-            let Input::Command { name, args } = classify(typed) else {
-                panic!("`{typed}` did not classify as a command");
-            };
-            assert_eq!(name, spec.name);
-            assert_eq!(args, expected_args);
-            let Resolution::Run(resolved, run_args) = resolve(name, args) else {
-                panic!("`{typed}` classified as a command but did not dispatch");
-            };
-            assert_eq!(resolved.name, spec.name);
-            assert_eq!(run_args, expected_args);
-            assert!(
-                !resolved.summary.is_empty(),
-                "/{} would appear in /help with no summary",
-                spec.name
-            );
+            // Every spelling, not just the canonical one: an alias that is in
+            // the table but unreachable from typed input is the same defect as
+            // an unreachable row, and it fails here for the same reason.
+            for spelling in spec.spellings() {
+                let typed = format!("/{spelling} {expected_args}");
+                let typed = typed.trim_end();
+                let Input::Command { name, args } = classify(typed) else {
+                    panic!("`{typed}` did not classify as a command");
+                };
+                // An alias canonicalises on the way through, so what dispatches
+                // is the row's own name whichever spelling was typed.
+                assert_eq!(name, spec.name);
+                assert_eq!(args, expected_args);
+                let Resolution::Run(resolved, run_args) = resolve(name, args) else {
+                    panic!("`{typed}` classified as a command but did not dispatch");
+                };
+                assert_eq!(resolved.name, spec.name);
+                assert_eq!(run_args, expected_args);
+                assert!(
+                    !resolved.summary.is_empty(),
+                    "/{} would appear in /help with no summary",
+                    spec.name
+                );
+            }
         }
+    }
+
+    // BR-7 for the aliases: `/help` is generated from the same rows that
+    // dispatch, so a spelling that works must be listed. The `/quit` row is the
+    // only one carrying an alias today, and the promise it makes is concrete —
+    // someone who types `/exit` out of habit ends the session.
+    #[test]
+    fn help_lists_every_alias_that_dispatches() {
+        let mut surface = RecordingSurface::new();
+        render_help(&mut surface);
+        let listing = surface.lines_of(LineKind::Info).join("\n");
+        for spec in COMMANDS {
+            for alias in spec.aliases {
+                assert!(
+                    listing.contains(&format!("/{alias}")),
+                    "/{alias} dispatches but /help never mentions it:\n{listing}"
+                );
+            }
+        }
+        // Both directions, as everything else in this module is pinned
+        // (LESSON-479): the listing must not promise a spelling that is not in
+        // the table either.
+        assert!(
+            COMMANDS
+                .iter()
+                .any(|spec| spec.aliases.contains(&"exit") && spec.name == "quit"),
+            "/exit must resolve to the quit row, not to a row of its own"
+        );
+    }
+
+    // BUG-153: `/exit` is what the user typed to leave, and on the build they
+    // were running it reached the model, which answered
+    // conversationally and did not exit. It must resolve to the *same row* as
+    // `/quit` — not to a parallel one that happens to return `Quit` today and
+    // could drift tomorrow. Same row ⇒ same handler ⇒ the same silent exit,
+    // which `slash_quit_and_ctrl_d_leave_by_the_same_path` pins end to end.
+    #[test]
+    fn exit_resolves_to_the_very_same_row_as_quit() {
+        let Input::Command { name, args } = classify("/exit") else {
+            panic!("`/exit` must be a command line, never a prompt");
+        };
+        assert_eq!(name, "quit", "`/exit` must canonicalise to the quit row");
+        let (Resolution::Run(from_exit, exit_args), Resolution::Run(from_quit, quit_args)) =
+            (resolve(name, args), resolve("quit", ""))
+        else {
+            panic!("`/exit` or `/quit` did not dispatch");
+        };
+        assert!(
+            std::ptr::eq(from_exit, from_quit),
+            "`/exit` reached a different row than `/quit`"
+        );
+        assert_eq!(exit_args, quit_args, "neither spelling takes an argument");
     }
 
     // The loop above proves every row in the table is reachable — and stays
@@ -931,13 +1053,20 @@ mod tests {
     fn a_two_word_row_wins_over_its_one_word_prefix() {
         const FIXTURE: &[CommandSpec] = &[
             CommandSpec {
+                // A one-word alias on the one-word row, spelled so that it is
+                // also a prefix of the two-word row's first word: if the
+                // longest-match key were taken from the row's canonical name
+                // rather than from the spelling that matched, this alias would
+                // start winning lines that belong to `model set`.
                 name: "model",
+                aliases: &["mo"],
                 summary: "show the current model",
                 args: Args::None,
                 handler: handle_help,
             },
             CommandSpec {
                 name: "model set",
+                aliases: &[],
                 summary: "change the current model",
                 args: Args::Required("a catalog name"),
                 handler: handle_help,
@@ -949,6 +1078,9 @@ mod tests {
             ("model set", "gemma-3")
         );
         assert_eq!(split_name("model", FIXTURE), ("model", ""));
+        // An alias canonicalises to its row's name, argument intact.
+        assert_eq!(split_name("mo", FIXTURE), ("model", ""));
+        assert_eq!(split_name("mo now", FIXTURE), ("model", "now"));
         // A row name is only a match on a word boundary.
         assert_eq!(split_name("modelling", FIXTURE), ("modelling", ""));
         assert_eq!(split_name("frobnicate now", FIXTURE), ("frobnicate", "now"));
@@ -969,7 +1101,19 @@ mod tests {
         );
         for (spec, line) in COMMANDS.iter().zip(&lines) {
             assert!(line.starts_with(&format!("/{}", spec.name)), "{line}");
-            assert!(line.ends_with(spec.summary), "{line}");
+            // The summary is the line's body; a row carrying aliases appends
+            // its "(also …)" clause after it, so the assertion is about where
+            // the summary sits rather than about the line ending there.
+            assert!(line.contains(spec.summary), "{line}");
+            let tail = line.split_once(spec.summary).expect("the summary").1;
+            match spec.aliases {
+                [] => assert!(tail.is_empty(), "a row with no alias trails: {line}"),
+                aliases => {
+                    for alias in aliases {
+                        assert!(tail.contains(&format!("/{alias}")), "{line}");
+                    }
+                }
+            }
         }
         assert_eq!(lines.last(), Some(&ESCAPE_FOOTER));
         assert!(ESCAPE_FOOTER.contains("//"));

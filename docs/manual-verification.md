@@ -229,6 +229,9 @@ kill %1 && ./target/release/tetond &
       re-benchmarks before `ready` — expect the tier to open some tens of
       seconds after start for a multi-GB model, with the honest
       "loading and benchmarking" reason replayed in the window before it does
+- [ ] a prompt typed *inside* that window comes back as a `>> model still
+      loading — …` notice, not as an `error:` line (BUG-152), and the session
+      keeps accepting input; the same prompt retyped after `ready` is served
 
 ---
 
