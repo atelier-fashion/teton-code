@@ -33,8 +33,15 @@ raise the event. Nothing in the release pipeline depends on it. And you can
 always run the workflow by hand (Actions → Deploy site → Run workflow) for a
 site copy fix or an infrastructure change.
 
-**Right now it cannot finish.** The GCP coordinates are REQ-548's Open Question
-5 and nobody has answered it, so the workflow's last step fails with:
+**This is live.** The GCP coordinates were REQ-548's Open Question 5; it was
+answered 2026-08-01 (§1), and the site has deployed for real on every release
+since **v0.1.5**. `GCP_PROJECT`, `GCP_SERVICE_ACCOUNT` and `GCP_WIF_PROVIDER`
+are secrets on the `site-deploy` environment, with no repository-level copy of
+any of them.
+
+The blocked path below is still reachable and still deliberate — it is what you
+get if that configuration goes missing, and what every release through v0.1.4
+got:
 
 ```
 site deploy blocked: required GCP configuration is not set in this repository (not set: …)
@@ -46,14 +53,27 @@ fix: docs/site-deploy-runbook.md
 That failure is deliberate (ADR-548-3, LESSON-447). The alternative — a skipped
 step or a green job that deployed nothing — makes "the deploy is passing" stop
 meaning "the site is current", and that is a lie you only discover from a user.
-Working through this runbook is what turns it green.
+Seeing it **today** means the configuration was removed or the environment's
+deployment rules refused the ref; it is a finding, not the starting state.
 
 ---
 
-## 1. OQ-5 intake
+## 1. OQ-5 intake — **answered 2026-08-01**
 
-Three answers are needed, and only someone with access to the Atelier GCP org
-can give them. Everything else in this runbook follows from them.
+The three questions below are **closed**. Their answers are recorded, redacted,
+against OQ-5 in
+[REQ-548's requirement file](../.adlc/specs/REQ-548-homebrew-install-and-landing-page/requirement.md):
+surface `gcs` (Cloud Storage behind an external HTTPS load balancer with Cloud
+CDN, §4's resource names), a dedicated GCP project whose id lives only in the
+`GCP_PROJECT` secret, and workload identity federation as the CI deploy
+identity — with the provider's attribute condition already restricted to this
+repository and to `refs/heads/main` / `refs/tags/v*`, which closes §9's
+REQUIRED-HUMAN item.
+
+They are kept here rather than deleted because they are the questions to
+re-answer if the site ever moves surfaces or projects — and because the
+redaction rule below (LESSON-462) governs how the answers get recorded next
+time too.
 
 **Q1. Which GCP surface serves the Atelier website today?**
 `cloud-run`, or Cloud Storage behind an external load balancer (`gcs`)? The
