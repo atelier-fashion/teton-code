@@ -1,7 +1,7 @@
 ---
 id: TASK-034
 title: "Slash input classifier, dispatch table, and client-local commands (/help, /verbose, /quit, // escape)"
-status: draft
+status: complete
 parent: REQ-555
 created: 2026-08-04
 updated: 2026-08-04
@@ -38,21 +38,45 @@ surfaces.
 
 ## Acceptance Criteria
 
-- [ ] `classify` is pure and total: command / escaped-prompt / plain-prompt,
+- [x] `classify` is pure and total: command / escaped-prompt / plain-prompt,
       with empty input skipped before classification exactly as today (BR-8)
-- [ ] `//text` reaches the prompt path with exactly one leading `/` removed;
+- [x] `//text` reaches the prompt path with exactly one leading `/` removed;
       slashes elsewhere untouched (BR-1b)
-- [ ] `/help` output is generated from the dispatch table (BR-7) and includes
+- [x] `/help` output is generated from the dispatch table (BR-7) and includes
       the escape-hatch footer line
-- [ ] `/verbose` toggles BOTH the route-notice gate and the turn-ended line
+- [x] `/verbose` toggles BOTH the route-notice gate and the turn-ended line
       live (spec AC-4 groundwork; D-5)
-- [ ] `/quit` returns through the same post-loop path as Ctrl-D — session-end
+- [x] `/quit` returns through the same post-loop path as Ctrl-D — session-end
       cost summary renders, no `process::exit` (BR-6)
-- [ ] Unknown `/foo` prints one actionable hint naming /help; no RPC issued;
+- [x] Unknown `/foo` prints one actionable hint naming /help; no RPC issued;
       loop continues (BR-2, AC-6)
-- [ ] Both directions of the classification invariant are pinned by tests
+- [x] Both directions of the classification invariant are pinned by tests
       (LESSON-479 — name the direction in each test comment)
-- [ ] `cargo test -p teton` green; fmt + clippy clean
+- [x] `cargo test -p teton` green; fmt + clippy clean
+
+## Verification Notes
+
+- Unit coverage lands in `slash.rs` (8 tests, 106 → 114 in `teton`). Both
+  directions of the BR-8 invariant were mutation-checked by hand: deleting the
+  `//` branch from `classify` reddens
+  `the_double_slash_escape_collapses_only_the_leading_pair`, and making the
+  `quit` row unreachable from `resolve` reddens
+  `every_table_row_is_reachable_from_a_typed_command_line`. The formal AC-8
+  mutation record is TASK-037's.
+- Both `/verbose` gates now read one flag: routing notices already gated on
+  `SessionState::verbose` (`session_ui.rs`), and the turn-ended line was moved
+  off the `verbose` fn parameter onto `ctx.state.verbose` (D-5). The
+  end-to-end proof that a mid-session toggle changes the *next* turn's output
+  is spec AC-4, a scripted-session test in TASK-037.
+- `/quit` is a `break` out of the entry loop — the same edge the `while let`
+  takes on EOF — so the post-loop session-end cost summary is shared by
+  construction; no `process::exit` was added. The byte-comparable EOF-vs-`/quit`
+  assertion is spec AC-5, also TASK-037.
+- The `Connection`-taking handler signature (shared with TASK-035/036) cannot
+  be invoked in a unit test without a daemon, so the table lookup (`resolve`),
+  the `/help` renderer, the `/verbose` toggle, and the rejection renderer are
+  separate connection-free functions that `dispatch` calls; the handlers
+  themselves are one-line wrappers over them.
 
 ## Technical Notes
 

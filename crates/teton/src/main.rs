@@ -33,6 +33,7 @@ mod prompt;
 mod render;
 mod service;
 mod session_ui;
+mod slash;
 mod uninstall;
 
 use client::{Connection, UiContext};
@@ -383,15 +384,34 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             if text.is_empty() {
                 continue;
             }
+            // Slash commands are intercepted before any RPC is built (BR-1), so
+            // a command never reaches the model, the transcript, or the meter.
+            let prompt_text = match slash::classify(text) {
+                slash::Input::Command { name, args } => {
+                    match slash::dispatch(name, args, &mut conn, &mut ctx)? {
+                        slash::CommandOutcome::Continue => continue,
+                        // `/quit` leaves through the same post-loop path Ctrl-D
+                        // takes — session-end cost summary, no `process::exit`
+                        // and no parallel shutdown to drift from it (BR-6).
+                        slash::CommandOutcome::Quit => break,
+                    }
+                }
+                // The escape hatch has already collapsed its leading pair
+                // (BR-1b); a plain prompt is the trimmed line's own bytes.
+                slash::Input::EscapedPrompt(text) | slash::Input::Prompt(text) => text,
+            };
             let params = PromptTurnParams {
                 session_id: session_id.clone(),
                 prompt: vec![PromptBlock::Text {
-                    text: text.to_owned(),
+                    text: prompt_text.to_owned(),
                 }],
             };
             match conn.call(params, &mut ctx)? {
                 Ok(res) => {
-                    if verbose {
+                    // Gated on session state, not on the `--verbose` flag, so
+                    // `/verbose` governs this line and the routing notices from
+                    // one source of truth (D-5); the flag only initialises it.
+                    if ctx.state.verbose {
                         ctx.surface.line(
                             LineKind::Info,
                             &format!("turn ended ({:?}).", res.stop_reason),

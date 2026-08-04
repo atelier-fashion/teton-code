@@ -29,7 +29,7 @@
   },
   "mergeOrder": ["teton-code"],
   "phase4": {
-    "currentTask": null,
+    "currentTask": "TASK-034",
     "completedTasks": [],
     "failedTasks": []
   }
