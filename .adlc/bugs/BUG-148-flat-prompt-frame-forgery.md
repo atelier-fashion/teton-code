@@ -1,7 +1,7 @@
 ---
 id: BUG-148
 title: "Untrusted content can forge turn boundaries in the flat prompt frame"
-status: open
+status: resolved
 severity: high
 created: 2026-08-03
 updated: 2026-08-03
@@ -195,7 +195,7 @@ that happens to expose a label at a line start is also covered.
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace` (32 test binaries, all ok), `cargo test -p tetond --test e2e`
-  (28 passed) — the four commands CI runs.
+  (28 passed) — the four commands CI runs. All six CI checks green on PR #32.
 - 11 new tests, including the end-to-end forged-turn-pair regression, the envelope escape
   on both the built-in and MCP paths, the hostile MCP tool description, the
   `last_tool_result_body` hijack, multibyte-boundary safety, and the two anti-drift
@@ -207,6 +207,15 @@ that happens to expose a label at a line start is also covered.
 model that *emits* a fabricated MCP envelope is not cut by the scanner. That is an
 output-side gap (the BUG-147 axis), independent of this input-side fix, and is left for a
 separate change rather than widened into this one.
+
+## Deployment
+
+PR #32, squash-merged to `main`. No runtime deploy applies: this repo is the plain OSS
+PR-gated-CI flow (`conventions.md` — it does **not** use the staging-first Cloud Run
+pipeline of other `atelier-fashion` repos, and ships no `.adlc/config.yml`, no
+`stack.backends`, and no iOS target). The fix reaches users with the next release build of
+the daemon; an already-installed `teton-code` daemon keeps the vulnerable rendering until
+upgraded.
 
 ## Files Changed
 
