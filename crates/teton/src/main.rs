@@ -28,6 +28,7 @@ mod client;
 mod cost_ui;
 mod firstrun;
 mod keychain;
+mod loading;
 mod model_ui;
 mod prompt;
 mod render;

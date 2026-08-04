@@ -53,7 +53,9 @@
   ],
   "phase4": {
     "currentTask": null,
-    "completedTasks": [],
+    "completedTasks": [
+      "TASK-039"
+    ],
     "failedTasks": []
   }
 }

@@ -1,7 +1,7 @@
 ---
 id: TASK-039
 title: "LoadingIndicator: a pure state machine whose frames need no terminal"
-status: draft
+status: complete
 parent: REQ-556
 created: 2026-08-04
 updated: 2026-08-04
