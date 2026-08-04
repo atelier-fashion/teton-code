@@ -954,15 +954,15 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
     // partition rather than three independent searches: exactly one of the three
     // turns was ever narrated.
     //
-    // These two `== 1`s rest on an ordering that is empirically stable rather
-    // than guaranteed. Both markers are FIFO-bound to their own turn (see the
-    // doc comment above), which is why they were chosen — but the daemon's
-    // per-client writer draining two producers is a real defect, not a property
-    // this suite relies on being absent, and it is being fixed in its own
-    // session (spun off from the REQ-555 review, 2026-08-04). If it ever moves
-    // one of these lines across a segment boundary, the fix belongs in the
-    // daemon's writer; do NOT weaken these counts to `>= 1`, which would let a
-    // toggle that narrated every turn pass.
+    // These two `== 1`s originally rested on empirically-stable ordering; the
+    // daemon's per-client writer has since been fixed to order a client's
+    // events ahead of the response that follows them (PR #42, spun off from
+    // the REQ-555 review), so the ordering is now guaranteed and pinned by
+    // tetond's own event_response_ordering suite. Both markers remain
+    // FIFO-bound to their own turn. If a line ever moves across a segment
+    // boundary again, the regression is in the daemon's writer; do NOT weaken
+    // these counts to `>= 1`, which would let a toggle that narrated every
+    // turn pass.
     assert_eq!(
         session.matches("route [").count(),
         1,

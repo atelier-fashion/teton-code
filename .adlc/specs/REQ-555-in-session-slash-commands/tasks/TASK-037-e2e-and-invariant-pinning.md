@@ -135,13 +135,14 @@ and `turn ended` (printed by the entry loop on the response itself), plus
 whole-output counts; the AC-5 byte-comparison uses a command-only history,
 since a byte-comparison across two processes needs deterministic output.
 
-**Tracked, not dangling (updated 2026-08-04):** this is a real daemon defect —
-in a live session the tail of an answer can print after the next entry frame —
-and it has been spun off into its own fix session, started from the Phase-5
-review chip on 2026-08-04. It is not fixed here: this REQ touches no daemon
-code, and the `/verbose` test now carries a comment saying so, plus an explicit
-instruction not to weaken its `== 1` counts if the ordering ever shifts (the
-fix belongs in the daemon's per-client writer).
+**Tracked and RESOLVED (updated 2026-08-04):** this was a real daemon defect —
+in a live session the tail of an answer could print after the next entry
+frame. It was spun off into its own fix session from the Phase-5 review chip
+and landed on `main` as PR #42 (`fix(tetond): order a client's events ahead of
+the response that follows them`, with its own `event_response_ordering` e2e
+suite) while this REQ was in verify. This branch was rebased onto that fix;
+the `/verbose` test's `== 1` counts are now backed by a guaranteed ordering
+rather than an empirical one, and its comment says so.
 
 ### AC-8 mutation record (LESSON-454 — the kill must come from an assertion)
 
