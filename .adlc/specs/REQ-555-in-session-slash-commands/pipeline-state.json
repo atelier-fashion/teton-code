@@ -1,0 +1,36 @@
+{
+  "req": "REQ-555",
+  "branch": "feat/REQ-555-in-session-slash-commands",
+  "startedAt": "2026-08-04T14:35:00Z",
+  "completed": false,
+  "currentPhase": 4,
+  "completedPhases": [0, 1, 2, 3],
+  "phaseHistory": [
+    { "phase": 0, "name": "Resolve Repos + Worktrees + Preflight + Draft PR", "completedAt": "2026-08-04T14:36:00Z" },
+    { "phase": 1, "name": "Validate Requirement Spec", "completedAt": "2026-08-04T14:38:00Z" },
+    { "phase": 2, "name": "Architect & Break Into Tasks", "completedAt": "2026-08-04T14:52:00Z" },
+    { "phase": 3, "name": "Validate Architecture & Tasks", "completedAt": "2026-08-04T14:54:00Z" }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-555",
+      "branch": "feat/REQ-555-in-session-slash-commands",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/41",
+      "prNumber": 41,
+      "prCreatedAt": "2026-08-04T14:33:47Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": "TASK-037",
+    "completedTasks": ["TASK-034", "TASK-035", "TASK-036"],
+    "failedTasks": []
+  }
+}

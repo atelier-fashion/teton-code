@@ -22,6 +22,15 @@
 //!   client showed up. A client that sees both the event and the polled proposal
 //!   de-duplicates on the shared `request_id` and prompts exactly once.
 //!
+//! The `model/status` payload has two renderings and one source of fact:
+//! [`render_status`] is the full `teton model status` report, and
+//! [`render_current_model_line`] is the single line the in-session `/model`
+//! command prints (REQ-555 D-6). The one-liner is a *narrower rendering of the
+//! same response*, never a second query or a cached copy (REQ-555 BR-4), and it
+//! borrows the report's own vocabularies — [`firstrun::source_label`] and
+//! [`install_label`] — so the two surfaces cannot word the same state
+//! differently.
+//!
 //! Everything is a pure function of a protocol payload plus a [`Prompter`], so
 //! every path above — including the double-confirm and the abort — is unit-tested
 //! against scripted answers with no daemon and no socket.
@@ -30,8 +39,8 @@ use std::path::{Path, PathBuf};
 
 use teton_protocol::events::{CatalogEntryView, ModelSelectionProposed, ProposedModel};
 use teton_protocol::methods::{
-    InstallStatus, ModelConfirmOutcome, ModelConfirmParams, ModelListEntry, ModelListResult,
-    ModelSelectionView, ModelStatusResult,
+    InstallStateView, InstallStatus, ModelConfirmOutcome, ModelConfirmParams, ModelListEntry,
+    ModelListResult, ModelSelectionView, ModelStatusResult,
 };
 use teton_protocol::RequestId;
 
@@ -409,6 +418,61 @@ pub fn render_status(
     }
 }
 
+/// Render the current model as **exactly one** [`LineKind::Info`] line, for the
+/// in-session `/model` command (REQ-555 AC-3, D-6).
+///
+/// A deliberately concise rendering of the *same* `model/status` payload
+/// [`render_status`] renders in full — never a second query and never a cached
+/// copy (REQ-555 BR-4), so the two surfaces cannot describe the same daemon
+/// state differently. The source suffix comes from [`firstrun::source_label`]
+/// and the install words from [`install_label`], the same two vocabularies the
+/// full report uses, so a wording change lands on both surfaces at once
+/// (LESSON-456).
+///
+/// Every state gets a line, including the ones with no model to name: a
+/// declined local tier says so, and so does a machine with no decision recorded
+/// yet. Printing nothing would leave the user unable to tell "no local model"
+/// from "the command did not work" (AC-3).
+pub fn render_current_model_line(status: &ModelStatusResult, surface: &mut dyn Surface) {
+    surface.line(LineKind::Info, &current_model_line(status));
+}
+
+/// The text of the [`render_current_model_line`] line. Pure, so every state is
+/// unit-tested as a string rather than through a surface.
+fn current_model_line(status: &ModelStatusResult) -> String {
+    let Some(selection) = &status.selection else {
+        return "model: none recorded yet — the daemon proposes one on first run.".to_owned();
+    };
+    let source = firstrun::source_label(selection.source);
+    if selection.declined_local {
+        return format!("model: local tier declined ({source}) — sessions run remote-only.");
+    }
+    let Some(name) = &selection.model_name else {
+        // `model_name` is `None` exactly when declined, so a daemon that sent
+        // neither gets said plainly rather than having a model invented for it.
+        return format!("model: recorded with no model ({source}) — sessions run remote-only.");
+    };
+    format!(
+        "model: {name} ({source}) — {}",
+        install_words(status.install.as_ref(), name)
+    )
+}
+
+/// The install state of the *selected* model, in the words [`install_label`]
+/// already uses.
+///
+/// The name check is the point: `install` describes whichever weights the daemon
+/// has on disk, which after a fresh `model set` is not yet the selected model.
+/// Attributing those weights to the new selection would report a model as
+/// `verified` when nothing of it has been downloaded — the misattribution shape
+/// of BUG-146, in one line the user has no way to cross-check.
+fn install_words(install: Option<&InstallStateView>, selected: &str) -> &'static str {
+    match install {
+        Some(install) if install.model_name == selected => install_label(install.status),
+        _ => "not installed yet",
+    }
+}
+
 /// The numbered catalog rows, marking the current selection and each entry's
 /// fit. The fits are the daemon's (`model/list` computes them against the probe)
 /// so every client renders the same verdict rather than re-deriving it.
@@ -626,7 +690,6 @@ mod tests {
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
     use teton_protocol::events::SelectionSource;
-    use teton_protocol::methods::InstallStateView;
 
     /// Run `resolve_proposal` with scripted answers, returning the reply (if any)
     /// alongside the surface and prompter for assertions.
@@ -1091,6 +1154,201 @@ mod tests {
         assert!(notice.contains("qwen2.5-coder-7b"), "{notice}");
         assert!(notice.contains("4.4 GiB download"), "{notice}");
         assert!(notice.contains("needs 8.0 GiB RAM"), "{notice}");
+    }
+
+    /// A `model/status` with a live selection and, optionally, weights on disk.
+    fn status_with(
+        selection: Option<ModelSelectionView>,
+        install: Option<InstallStateView>,
+    ) -> ModelStatusResult {
+        ModelStatusResult {
+            selection,
+            install,
+            pending_proposal: None,
+        }
+    }
+
+    /// A decision naming `name`, reached the given way.
+    fn selected(name: &str, source: SelectionSource) -> ModelSelectionView {
+        ModelSelectionView {
+            model_name: Some(name.to_owned()),
+            source,
+            declined_local: false,
+            decided_at_ms: 1,
+        }
+    }
+
+    /// Render the `/model` one-liner and return it, asserting on the way out
+    /// that it really was the surface's only output (REQ-555 D-6).
+    fn one_line(status: &ModelStatusResult) -> String {
+        let mut surface = RecordingSurface::new();
+        render_current_model_line(status, &mut surface);
+        assert_eq!(
+            surface.calls.len(),
+            1,
+            "/model renders exactly one line: {:?}",
+            surface.calls
+        );
+        let lines = surface.lines_of(LineKind::Info);
+        assert_eq!(lines.len(), 1, "the one line is an Info line");
+        lines[0].to_owned()
+    }
+
+    // AC-3: the ordinary case names the model, how it was chosen, and what state
+    // its weights are in — all in one line.
+    #[test]
+    fn current_model_line_names_the_model_its_source_and_its_install_state() {
+        let status = status_with(
+            Some(selected("qwen2.5-coder-7b", SelectionSource::UserOverride)),
+            Some(InstallStateView {
+                model_name: "qwen2.5-coder-7b".to_owned(),
+                status: InstallStatus::Verified,
+            }),
+        );
+        assert_eq!(
+            one_line(&status),
+            "model: qwen2.5-coder-7b (user override) — verified"
+        );
+    }
+
+    // BR-4: the source suffix is `firstrun::source_label`'s, not a second
+    // spelling of the same enum that could drift from the full report's.
+    #[test]
+    fn current_model_line_borrows_the_reports_source_vocabulary() {
+        for source in [
+            SelectionSource::Probe,
+            SelectionSource::UserOverride,
+            SelectionSource::ConfigPin,
+            SelectionSource::AutoAccept,
+        ] {
+            let status = status_with(Some(selected("m", source)), None);
+            let line = one_line(&status);
+            assert!(
+                line.contains(&format!("({})", firstrun::source_label(source))),
+                "{line}"
+            );
+        }
+    }
+
+    // BR-4: and the install words are `install_label`'s, for every state the
+    // protocol can report — so `teton model status` and `/model` cannot describe
+    // the same weights differently.
+    #[test]
+    fn current_model_line_borrows_the_reports_install_vocabulary_for_every_state() {
+        for status_kind in [
+            InstallStatus::Absent,
+            InstallStatus::Partial,
+            InstallStatus::Verified,
+            InstallStatus::Corrupt,
+        ] {
+            let status = status_with(
+                Some(selected("qwen2.5-coder-3b", SelectionSource::Probe)),
+                Some(InstallStateView {
+                    model_name: "qwen2.5-coder-3b".to_owned(),
+                    status: status_kind,
+                }),
+            );
+            assert_eq!(
+                one_line(&status),
+                format!(
+                    "model: qwen2.5-coder-3b (accepted the proposal) — {}",
+                    install_label(status_kind)
+                )
+            );
+        }
+    }
+
+    // AC-3: a declined local tier says so rather than printing nothing — the one
+    // state where there is no model to name is exactly the state a user most
+    // needs named.
+    #[test]
+    fn current_model_line_says_the_local_tier_was_declined() {
+        let status = status_with(
+            Some(ModelSelectionView {
+                model_name: None,
+                source: SelectionSource::UserOverride,
+                declined_local: true,
+                decided_at_ms: 1,
+            }),
+            None,
+        );
+        let line = one_line(&status);
+        assert!(line.contains("local tier declined"), "{line}");
+        assert!(line.contains("user override"), "{line}");
+        assert!(line.contains("remote-only"), "{line}");
+    }
+
+    // AC-3: no decision yet is still a line, and one that says what happens next.
+    #[test]
+    fn current_model_line_says_when_no_decision_has_been_recorded() {
+        let line = one_line(&status_with(None, None));
+        assert!(line.contains("none recorded yet"), "{line}");
+        assert!(line.contains("first run"), "{line}");
+    }
+
+    // A daemon that recorded a decision with neither a model nor a decline gets
+    // said plainly, rather than having a model invented for it.
+    #[test]
+    fn current_model_line_reports_a_decision_that_named_no_model() {
+        let status = status_with(
+            Some(ModelSelectionView {
+                model_name: None,
+                source: SelectionSource::ConfigPin,
+                declined_local: false,
+                decided_at_ms: 1,
+            }),
+            None,
+        );
+        let line = one_line(&status);
+        assert!(line.contains("recorded with no model"), "{line}");
+        assert!(line.contains("config pin"), "{line}");
+    }
+
+    // A selection whose weights are not on disk at all.
+    #[test]
+    fn current_model_line_reports_a_selection_with_no_weights_yet() {
+        let status = status_with(
+            Some(selected("qwen3-coder-30b", SelectionSource::UserOverride)),
+            None,
+        );
+        assert_eq!(
+            one_line(&status),
+            "model: qwen3-coder-30b (user override) — not installed yet"
+        );
+    }
+
+    // The install record describes whichever weights are on disk, which right
+    // after a `model set` is the PREVIOUS model. Reporting the new selection as
+    // `verified` on the strength of the old model's weights would be a one-line
+    // lie the user cannot cross-check.
+    #[test]
+    fn current_model_line_never_attributes_another_models_install_state() {
+        let status = status_with(
+            Some(selected("qwen3-coder-30b", SelectionSource::UserOverride)),
+            Some(InstallStateView {
+                model_name: "qwen2.5-coder-7b".to_owned(),
+                status: InstallStatus::Verified,
+            }),
+        );
+        let line = one_line(&status);
+        assert_eq!(
+            line,
+            "model: qwen3-coder-30b (user override) — not installed yet"
+        );
+        assert!(!line.contains("qwen2.5-coder-7b"), "{line}");
+    }
+
+    // D-6: still exactly one line when the payload also carries an outstanding
+    // proposal — the full report is where a proposal gets its own notice.
+    #[test]
+    fn current_model_line_stays_one_line_with_a_proposal_outstanding() {
+        let status = ModelStatusResult {
+            selection: None,
+            install: None,
+            pending_proposal: Some(proposal()),
+        };
+        // `one_line` asserts the single-line invariant itself.
+        assert!(one_line(&status).contains("none recorded yet"));
     }
 
     #[test]
