@@ -59,6 +59,12 @@ struct Cli {
     #[arg(long, short = 'y', global = true)]
     yes: bool,
 
+    /// Show routing and turn-end notices in the interactive session. By default
+    /// the transcript is just the conversation — model responses and tool
+    /// activity; privacy and degradation warnings always show.
+    #[arg(long, short = 'v', global = true)]
+    verbose: bool,
+
     /// The subcommand to run; omit to open an interactive session.
     #[command(subcommand)]
     command: Option<Command>,
@@ -249,7 +255,7 @@ fn main() -> ExitCode {
     let paths = socket_path::daemon_paths();
 
     let result = match cli.command {
-        None => run_session(&paths, cli.yes),
+        None => run_session(&paths, cli.yes, cli.verbose),
         Some(Command::Doctor) => run_doctor(&paths),
         Some(Command::Cost) => run_cost(&paths),
         Some(Command::Model { action }) => match action {
@@ -292,9 +298,10 @@ fn main() -> ExitCode {
 /// This is the client that owns the first-run model prompt: it answers permission
 /// requests and model proposals, and `auto_accept` (`--yes`) makes the latter
 /// unattended (BR-5).
-fn run_session(paths: &DaemonPaths, auto_accept: bool) -> anyhow::Result<()> {
+fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut state = SessionState::new();
+    state.verbose = verbose;
     let mut prompter = StdinPrompter::new();
 
     // The banner is for humans at a terminal. Piped stdout (the e2e suites,
@@ -383,10 +390,18 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool) -> anyhow::Result<()> {
                 }],
             };
             match conn.call(params, &mut ctx)? {
-                Ok(res) => ctx.surface.line(
-                    LineKind::Info,
-                    &format!("turn ended ({:?}).", res.stop_reason),
-                ),
+                Ok(res) => {
+                    if verbose {
+                        ctx.surface.line(
+                            LineKind::Info,
+                            &format!("turn ended ({:?}).", res.stop_reason),
+                        );
+                    } else {
+                        // The streamed response may not end in a newline; a blank
+                        // line closes it so the next entry frame starts clean.
+                        ctx.surface.line(LineKind::Info, "");
+                    }
+                }
                 Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
                     ctx.surface.line(
                         LineKind::Notice,
