@@ -386,6 +386,13 @@ impl ContextManager {
 
     /// Render the full prompt string for a text engine, invoking `hook` for the
     /// system block and every conversation block (egress seam).
+    ///
+    /// Block text is neutralized before it is interpolated between the role
+    /// labels ([`neutralize_frame_labels`](super::render::neutralize_frame_labels),
+    /// BUG-148): the labels are line-anchored frame, so unescaped content could
+    /// otherwise write a byte-perfect forged turn pair into the transcript. Only
+    /// the harness writes frame. The system prompt is harness-authored and rides
+    /// through untouched.
     #[must_use]
     pub fn assemble(&self, hook: &mut dyn ProvenanceHook) -> String {
         hook.on_block(&ContextBlock {
@@ -395,7 +402,14 @@ impl ContextManager {
         });
 
         let mut out = String::new();
-        out.push_str(&self.system);
+        // The system prompt is *mostly* harness-authored, but not entirely: it
+        // ends with `ToolRegistry::docs()`, and an MCP tool's description comes
+        // from the server that advertises it (BUG-148, second entry point). A
+        // hostile server can therefore plant a forged turn pair above all frame,
+        // in the highest-trust region of the prompt. Neutralizing is a no-op on
+        // every harness-authored line — none of them starts flush-left with a
+        // role label.
+        out.push_str(&super::render::neutralize_frame_labels(&self.system));
         out.push_str("\n\n");
         if self.truncated {
             out.push_str("[earlier conversation truncated to fit the context window]\n\n");
@@ -407,7 +421,7 @@ impl ContextManager {
                 out.push_str(&format!(" ({tool})"));
             }
             out.push_str(":\n");
-            out.push_str(&block.text);
+            out.push_str(&super::render::neutralize_frame_labels(&block.text));
             out.push_str("\n\n");
         }
         out.push_str("Assistant:\n");
@@ -433,7 +447,9 @@ impl ContextManager {
         // egress seam sees exactly the same blocks it always has.
         let flat = self.assemble(hook);
 
-        let mut system = self.system.clone();
+        // Neutralized for the same reason as the flat path: server-supplied MCP
+        // tool descriptions ride in the tool docs at the tail of this string.
+        let mut system = super::render::neutralize_frame_labels(&self.system).into_owned();
         if self.truncated {
             system.push_str("\n\n[earlier conversation was truncated to fit the context window]");
         }
@@ -450,11 +466,20 @@ impl ContextManager {
             // GENERATED copy of it as a fabricated tool result (REQ-554 BR-4 —
             // the ChatML counterpart of flat's `Tool (` marker); deriving both
             // from one constant keeps label and marker from drifting apart.
+            // Neutralized on this path too (BUG-148). The label below is
+            // line-anchored frame inside the user turn exactly as flat's
+            // `Tool (` is, and `<tool-result` rides in the content — so content
+            // that forges either one forges a tool result here as well. Weaker
+            // than the flat case (a remote provider separates roles
+            // structurally, in JSON), but the same class, and putting the choke
+            // point below the format branch is what keeps the raw arm from
+            // becoming the exploit (LESSON-474).
+            let content = super::render::neutralize_frame_labels(&block.text);
             let text = match &block.provenance {
                 Provenance::Tool { tool, .. } => {
-                    format!("{TOOL_RESULT_LABEL_PREFIX}{tool}):\n{}", block.text)
+                    format!("{TOOL_RESULT_LABEL_PREFIX}{tool}):\n{content}")
                 }
-                _ => block.text.clone(),
+                _ => content.into_owned(),
             };
             // Merge into the previous message when the role repeats, guaranteeing
             // strict user/assistant alternation regardless of block order.
