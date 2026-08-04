@@ -70,7 +70,27 @@ struct TestDaemon {
 }
 
 impl TestDaemon {
+    /// A daemon with no local engine: the first-run consent gate is live, and a
+    /// proposal is outstanding when a client attaches.
     fn spawn(daemon: &Path) -> Self {
+        Self::spawn_with_script(daemon, None)
+    }
+
+    /// A daemon whose local tier is the `TETON_LOCAL_SCRIPT` scripted engine,
+    /// replaying `replies` one per turn in order.
+    ///
+    /// The scripted-session tests need both of the things this buys. A scripted
+    /// engine downloads nothing, so it is exempt from the first-run consent gate
+    /// (`tetond` E-5): no proposal is outstanding when the CLI attaches, and every
+    /// piped stdin line therefore reaches the *entry loop* instead of being eaten
+    /// as the answer to a consent question. And the tier can actually serve a
+    /// turn, so a prompt produces a real `route_decided` event and a real turn
+    /// end — which is what makes AC-4's `/verbose` toggle observable at all.
+    fn spawn_scripted(daemon: &Path, replies: &[&str]) -> Self {
+        Self::spawn_with_script(daemon, Some(replies))
+    }
+
+    fn spawn_with_script(daemon: &Path, replies: Option<&[&str]>) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let root =
@@ -99,6 +119,15 @@ impl TestDaemon {
         )
         .unwrap();
 
+        // The canned local-engine replies, when this daemon was asked for a
+        // scripted tier. Blocks are separated by a `---` line — the format
+        // `ScriptedFileEngine::from_script` parses.
+        let script = replies.map(|replies| {
+            let path = root.join("local_script.txt");
+            std::fs::write(&path, replies.join("\n---\n")).unwrap();
+            path
+        });
+
         let log = std::fs::File::create(root.join("tetond.log")).unwrap();
         let mut command = Command::new(daemon);
         command
@@ -124,6 +153,9 @@ impl TestDaemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
+        if let Some(script) = &script {
+            command.env("TETON_LOCAL_SCRIPT", script);
+        }
         let child = command.spawn().expect("spawn teton-code");
 
         let socket = runtime_dir.join("teton").join("tetond.sock");
@@ -164,6 +196,18 @@ impl TestDaemon {
     /// `stdin` is closed after the given input, which is what ends the session
     /// loop (the CLI treats EOF as "done", never as an answer).
     fn run_cli_with_stdin(&self, teton: &Path, args: &[&str], stdin: &str) -> String {
+        self.run_cli_capture(teton, args, stdin).0
+    }
+
+    /// As [`Self::run_cli_with_stdin`], but also returning the process's exit
+    /// status — AC-5 claims an exit code, not only an output, and a claim about
+    /// an exit code has to look at one.
+    fn run_cli_capture(
+        &self,
+        teton: &Path,
+        args: &[&str],
+        stdin: &str,
+    ) -> (String, std::process::ExitStatus) {
         let mut child = Command::new(teton)
             .args(args)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
@@ -183,7 +227,7 @@ impl TestDaemon {
             .unwrap_or_else(|e| panic!("run teton {args:?}: {e}"));
         let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
-        combined
+        (combined, output.status)
     }
 }
 
@@ -522,4 +566,486 @@ fn a_refused_config_is_reported_by_the_cli_that_autostarted_the_daemon() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// In-session slash commands, driven through a pipe against a live daemon
+// (REQ-555 AC-1 / AC-2 / AC-3b / AC-4 / AC-5 / AC-6 / AC-7 / AC-7b)
+// ---------------------------------------------------------------------------
+//
+// The unit tests in `slash.rs` pin the classifier and the dispatch table; what
+// they cannot show is the *shipped* loop intercepting a typed line before it
+// becomes a `prompt/turn`, rendering the command through the session's own
+// connection, and leaving through the same exit Ctrl-D leaves through. That is
+// this section's job, and it needs a daemon that can actually serve a turn —
+// hence [`TestDaemon::spawn_scripted`].
+//
+// Two properties of that fixture shape every test below:
+//
+//   * The scripted local tier is exempt from the first-run consent gate, so no
+//     proposal is outstanding and every stdin line reaches the entry loop. (With
+//     the unscripted daemon the first line would answer a consent question, as
+//     the REQ-547 tests above rely on.)
+//   * A turn is served locally only when the freeform heuristic classifies the
+//     prompt as an *auxiliary* duty — `tetond`'s `AUXILIARY_SIGNALS`. Every
+//     prompt line here therefore carries such a signal ("explain", "what does"),
+//     so the turn reaches the scripted engine rather than the configured remote
+//     default, which this suite deliberately cannot call.
+
+/// The scripted engine's replies, one per turn in order. Each is a distinct
+/// marker, so a test can say *which* turn produced a line — and so a slash
+/// command that leaked into the prompt path shows up as a reply that should not
+/// exist.
+const TURN_REPLIES: &[&str] = &[
+    "scripted-turn-one complete.",
+    "scripted-turn-two complete.",
+    "scripted-turn-three complete.",
+];
+
+/// Assert that no prompt turn was attempted at all (BR-1).
+///
+/// Observed from outside the process, "no `prompt/turn` was issued" is the
+/// absence of everything a turn produces: the scripted engine's reply (which a
+/// served turn always prints), a routing notice, the turn-end line, and every
+/// way a turn can fail. A command that reached the model would trip at least one
+/// of these — including on a daemon that refused to serve it.
+fn assert_no_turn_ran(output: &str, what: &str) {
+    for reply in TURN_REPLIES {
+        assert!(
+            !output.contains(reply),
+            "{what} reached the model — the scripted engine answered it; output:\n{output}"
+        );
+    }
+    for marker in [
+        "route [",
+        "turn ended",
+        "prompt failed",
+        "does not execute prompt turns yet",
+    ] {
+        assert!(
+            !output.contains(marker),
+            "{what} produced `{marker}`, so a turn was attempted; output:\n{output}"
+        );
+    }
+}
+
+/// AC-1 (with AC-6 alongside it): `/help` lists every command and its summary,
+/// the escape footer is there, and no turn is attempted for either the unknown
+/// command or the known one.
+///
+/// The unknown command comes first on purpose: the `/help` listing that follows
+/// it is the evidence that the entry loop kept accepting input after the hint
+/// (AC-6), which a test that only looked at the hint could not tell from a loop
+/// that had died.
+#[test]
+fn slash_help_lists_every_command_and_no_turn_is_attempted() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/frobnicate\n/help\n");
+
+    // AC-6: one actionable line naming `/help`, and no RPC behind it.
+    assert!(
+        session.contains("unknown command: /frobnicate"),
+        "an unknown command must name what was typed; output:\n{session}"
+    );
+    assert!(
+        session.contains("type /help for the commands this session knows."),
+        "the hint must point at /help; output:\n{session}"
+    );
+
+    // AC-1: all six commands, each with the summary `/help` generates from the
+    // dispatch table (BR-7) — asserted as the rendered `/name  summary` pair, so
+    // a row that lost its summary fails here.
+    for (name, summary) in [
+        ("/help", "List the commands this session knows."),
+        (
+            "/cost",
+            "Show the daemon's cost report, exactly as `teton cost` does.",
+        ),
+        ("/model", "Show the model the local tier is currently on."),
+        (
+            "/model set",
+            "Switch the local tier to a catalog model: /model set <name>.",
+        ),
+        (
+            "/verbose",
+            "Toggle the routing and turn-end notices for this session.",
+        ),
+        ("/quit", "End the session, exactly as Ctrl-D does."),
+    ] {
+        let rendered = session
+            .lines()
+            .find(|line| line.contains(name) && line.contains(summary));
+        assert!(
+            rendered.is_some(),
+            "`{name}` is missing from /help with its summary; output:\n{session}"
+        );
+    }
+
+    // AC-7b's documentation half: the escape hatch is one footer line.
+    assert!(
+        session.contains("//text sends text as a prompt with one leading slash"),
+        "/help must document the // escape; output:\n{session}"
+    );
+
+    // AC-1's load-bearing half: neither line spent a model call.
+    assert_no_turn_ran(&session, "`/frobnicate` and `/help`");
+}
+
+/// AC-2, e2e leg: a mid-session `/cost` renders the daemon's whole report.
+///
+/// The count is what makes this an assertion rather than a coincidence: the
+/// session-end summary renders the report once on its own, so a session where
+/// `/cost` did nothing still contains one. Two means the command rendered its
+/// own — through `query_and_render_cost`, the single function behind every cost
+/// surface (BR-4). Which figures appear is pinned against the renderer in
+/// `cost_ui`'s unit tests; what this proves is that the in-session command is a
+/// call site of it.
+#[test]
+fn slash_cost_renders_the_daemons_report_mid_session() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/cost\n");
+
+    assert_eq!(
+        session.matches("── cost summary ──").count(),
+        2,
+        "/cost must render the report on top of the session-end one; output:\n{session}"
+    );
+    assert_eq!(
+        session
+            .matches("estimated savings vs anthropic/claude-opus-4")
+            .count(),
+        2,
+        "/cost must render the daemon's savings baseline, not a stub; output:\n{session}"
+    );
+    assert_no_turn_ran(&session, "`/cost`");
+}
+
+/// AC-4: quiet by default, loud after `/verbose`, quiet again after the second
+/// toggle — three real turns in one scripted session.
+///
+/// The output is split on the toggle echoes rather than searched as a whole:
+/// "the notices render somewhere" would stay green if they rendered for the
+/// wrong turn, which is exactly the drift a session-scoped toggle can suffer.
+///
+/// What the segments are anchored on matters, because one thing here has no
+/// fixed position. The daemon's per-client writer drains two independent
+/// producers — request responses and the broadcast event stream — so a turn's
+/// trailing streamed text can be queued *after* that turn's own response and
+/// then render at the head of the next pump, one command later. The routing
+/// notice cannot move like that (`route_decided` is published before the turn
+/// runs, and the client's pump is FIFO up to the response it is waiting for) and
+/// neither can the turn-end line (the entry loop prints it on the response
+/// itself). So the per-segment assertions below are made on those two markers
+/// only; that the turns ran at all is asserted over the whole output, in order.
+#[test]
+fn slash_verbose_toggles_the_route_notice_around_real_turns() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "explain the first thing\n\
+         /verbose\n\
+         explain the second thing\n\
+         /verbose\n\
+         explain the third thing\n",
+    );
+
+    let (quiet, rest) = session
+        .split_once("verbose on")
+        .unwrap_or_else(|| panic!("/verbose never echoed `verbose on`; output:\n{session}"));
+    let (loud, quiet_again) = rest
+        .split_once("verbose off")
+        .unwrap_or_else(|| panic!("/verbose never echoed `verbose off`; output:\n{session}"));
+
+    // All three turns ran, in order — three replies from a script that hands
+    // them out one per turn.
+    let mut previous = 0;
+    for (turn, reply) in TURN_REPLIES.iter().enumerate() {
+        let at = session.find(reply).unwrap_or_else(|| {
+            panic!(
+                "turn {} never reached the model; output:\n{session}",
+                turn + 1
+            )
+        });
+        assert!(
+            at >= previous,
+            "the turns did not run in order; output:\n{session}"
+        );
+        previous = at;
+    }
+
+    // Turn one, quiet: answered with nothing said about routing.
+    assert!(
+        !quiet.contains("route [") && !quiet.contains("turn ended"),
+        "a default session must start quiet; segment:\n{quiet}"
+    );
+
+    // Turn two, after the toggle: the routing notice and the turn-end line.
+    assert!(
+        loud.contains("route [freeform] → local"),
+        "`/verbose` did not surface the routing notice; segment:\n{loud}"
+    );
+    assert!(
+        loud.contains("turn ended"),
+        "`/verbose` did not surface the turn-end line; segment:\n{loud}"
+    );
+
+    // Turn three, after the second toggle: quiet again — the toggle flips back,
+    // it does not latch.
+    assert!(
+        !quiet_again.contains("route [") && !quiet_again.contains("turn ended"),
+        "a second `/verbose` must hide the notices again; segment:\n{quiet_again}"
+    );
+
+    // And the counts, which is what makes the three segments an exclusive
+    // partition rather than three independent searches: exactly one of the three
+    // turns was ever narrated.
+    assert_eq!(
+        session.matches("route [").count(),
+        1,
+        "exactly the verbose turn should have been narrated; output:\n{session}"
+    );
+    assert_eq!(
+        session.matches("turn ended").count(),
+        1,
+        "exactly the verbose turn should have printed a turn-end line; output:\n{session}"
+    );
+}
+
+/// AC-5: `/quit` ends the session exactly as Ctrl-D does.
+///
+/// Two fresh daemons run the *same* history and then part ways only at the last
+/// line: one session types `/quit`, the other closes stdin. In piped mode the
+/// framed prompter degrades to a plain one and echoes nothing it read, so the two
+/// runs are comparable as whole byte streams rather than as extracted summaries —
+/// identical banner, identical session id (each daemon is fresh), identical
+/// history, identical session-end block. That whole-output equality is a strictly
+/// stronger claim than the AC's "identical session-end output", and it is the
+/// honest one here: a pipe has no input echo to subtract.
+///
+/// The shared history is two RPC-bearing commands rather than a model turn, and
+/// the reason is the ordering property documented on the `/verbose` test above:
+/// a turn's trailing streamed text is queued by a different producer than the
+/// turn's response, so its position in the byte stream is not reproducible across
+/// two processes. Comparing two runs bytewise requires a history whose output is
+/// deterministic; what AC-5 is about — that `/quit` leaves through the session-end
+/// path Ctrl-D leaves through, rather than a parallel shutdown — is unaffected by
+/// which commands preceded it, and the cost summary here is the daemon's real
+/// one, over the session's real (empty) ledger.
+///
+/// (On a TTY the prompter's EOF-vs-Enter cursor chrome legitimately differs;
+/// the AC puts that out of scope, and this suite never sees it.)
+#[test]
+fn slash_quit_ends_the_session_exactly_as_ctrl_d_does() {
+    let Some(daemon_bin) = daemon_or_skip() else {
+        return;
+    };
+    let teton = teton_bin();
+    let history = "/model\n/cost\n";
+
+    let quit_daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
+    let (quit, quit_status) =
+        quit_daemon.run_cli_capture(&teton, &[], &format!("{history}/quit\n"));
+    drop(quit_daemon);
+
+    let eof_daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
+    let (eof, eof_status) = eof_daemon.run_cli_capture(&teton, &[], history);
+    drop(eof_daemon);
+
+    // The session-end summary is there at all — a `/quit` that skipped it would
+    // otherwise be "identical" to a Ctrl-D that skipped it too.
+    assert!(
+        quit.contains("no model calls were recorded this session."),
+        "the session-end call summary is missing; output:\n{quit}"
+    );
+    assert_eq!(
+        quit.matches("── cost summary ──").count(),
+        2,
+        "the history's /cost and the session-end summary should both render; output:\n{quit}"
+    );
+
+    assert_eq!(
+        quit, eof,
+        "/quit and Ctrl-D must produce the same session output.\n\
+         --- /quit ---\n{quit}\n--- ctrl-d ---\n{eof}"
+    );
+    assert!(
+        quit_status.success() && eof_status.success(),
+        "both paths must exit 0; /quit: {quit_status:?}, ctrl-d: {eof_status:?}"
+    );
+}
+
+/// AC-7 and AC-7b, e2e legs: a `//`-escaped line and a plain line both reach the
+/// model; neither is dispatched as a command.
+///
+/// The escaped line is `//help …` on purpose — `/help` is a *real* row in the
+/// dispatch table, so a classifier that checked the table before the escape
+/// would print the command list here. It does not: the line is answered by the
+/// model, and the daemon's own routing reason names the signal it matched inside
+/// the escaped text ("what does"), which is the prompt text arriving at the
+/// daemon and being classified there rather than the CLI reporting on itself.
+///
+/// What this cannot see is the byte-level shape of that text: the CLI never
+/// echoes what it sent, and neither the scripted engine's reply nor any daemon
+/// surface quotes the prompt back. That exactly one leading slash survives the
+/// collapse is pinned in `slash.rs`
+/// (`the_double_slash_escape_collapses_only_the_leading_pair`), the classifier
+/// whose output this loop hands straight to `PromptTurnParams`; what is proved
+/// here is the half a unit test cannot reach — that the escaped line defeats the
+/// dispatch table in the shipped binary and becomes a turn.
+#[test]
+fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "/verbose\n\
+         //help me: what does this repo do?\n\
+         explain the plain path\n",
+    );
+
+    // Both lines became turns, in order: the escape first, the plain prompt
+    // second.
+    assert!(
+        session.contains(TURN_REPLIES[0]),
+        "the //-escaped line never reached the model; output:\n{session}"
+    );
+    assert!(
+        session.contains(TURN_REPLIES[1]),
+        "the plain prompt never reached the model; output:\n{session}"
+    );
+    assert_eq!(
+        session.matches("route [").count(),
+        2,
+        "exactly two turns should have been routed; output:\n{session}"
+    );
+
+    // And neither was treated as a command: no dispatch, no rejection.
+    assert!(
+        !session.contains("List the commands this session knows."),
+        "`//help …` dispatched /help instead of prompting the model; output:\n{session}"
+    );
+    assert!(
+        !session.contains("unknown command"),
+        "an escaped or plain line was run through the dispatch table; output:\n{session}"
+    );
+
+    // The daemon classified the escaped line's own text — the routing reason
+    // names the signal it found in it.
+    assert!(
+        session.contains("matched 'what does'"),
+        "the escaped line's text did not reach the daemon's router; output:\n{session}"
+    );
+    assert!(
+        session.contains("matched 'explain'"),
+        "the plain line's text did not reach the daemon's router; output:\n{session}"
+    );
+}
+
+/// AC-3b, e2e leg: `/model set` runs the shared validate → confirm → set flow
+/// against a live daemon.
+///
+/// TASK-036 pinned that flow's decision (`decide_model_set`) as a pure function,
+/// which is where the consent gate belongs. What is left to prove — and what
+/// only a live daemon can — is that the in-session command is wired to it: that
+/// the catalog it validates against is the daemon's own `model/list`, that an
+/// accepted name reaches `model/set` and changes what the *next* `/model` reads
+/// back, and that a declined above-floor pick leaves the daemon's selection
+/// where it was.
+///
+/// The `n` on its own line is the second confirmation's answer. If a regression
+/// stopped asking, that line would fall through to the entry loop as a prompt —
+/// which `assert_no_turn_ran` catches at the end.
+#[test]
+fn slash_model_set_runs_the_shared_flow_against_a_live_daemon() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "/model set definitely-not-a-model\n\
+         /model set qwen2.5-coder-1.5b\n\
+         /model\n\
+         /model set qwen3-coder-30b-a3b\n\
+         n\n\
+         /model\n",
+    );
+
+    // Leg one — an unknown name: nothing is sent, and the remedy is the catalog
+    // itself (which is why in-session `/model list` is out of scope).
+    assert!(
+        session.contains("no catalog entry named `definitely-not-a-model`"),
+        "an unknown name must be refused by name; output:\n{session}"
+    );
+    for name in [
+        "qwen2.5-coder-1.5b",
+        "qwen2.5-coder-3b",
+        "qwen2.5-coder-7b",
+        "qwen3-coder-30b-a3b",
+    ] {
+        assert!(
+            session.contains(name),
+            "the daemon's catalog entry {name} is missing from the hint; output:\n{session}"
+        );
+    }
+
+    // Leg two — a name that fits: sent without a question, and visible to the
+    // next `/model` because it is the daemon's state that changed, not a
+    // client-side note.
+    assert!(
+        session.contains("selection: qwen2.5-coder-1.5b (user override)"),
+        "a fitting name must be applied and confirmed; output:\n{session}"
+    );
+    assert!(
+        session.contains("model: qwen2.5-coder-1.5b (user override)"),
+        "/model must read the new selection back; output:\n{session}"
+    );
+
+    // Leg three — above this machine's RAM floor: the REQ-547 BR-3 warning, and
+    // a decline that changes nothing (LESSON-470's default-no dialogue).
+    assert!(
+        session.contains("warning: qwen3-coder-30b-a3b needs 20.0 GiB RAM"),
+        "an above-floor pick must warn before it is applied; output:\n{session}"
+    );
+    assert!(
+        session.contains("selection unchanged; `qwen3-coder-30b-a3b` was not sent."),
+        "declining must say the selection was left alone; output:\n{session}"
+    );
+    assert!(
+        !session.contains("selection: qwen3-coder-30b-a3b"),
+        "a declined pick reached model/set; output:\n{session}"
+    );
+    assert_eq!(
+        session.matches("model: qwen2.5-coder-1.5b").count(),
+        2,
+        "the selection must still be the fitting one after the decline; output:\n{session}"
+    );
+
+    // None of it was a prompt: `/model set` is the one command that writes
+    // daemon state, and it still never spends a model call (BR-1).
+    assert_no_turn_ran(&session, "the /model set session");
 }
