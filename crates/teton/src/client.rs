@@ -68,6 +68,21 @@ pub struct UiContext<'a> {
     /// Explicit opt-in auto-accept (BR-5 / AC-5): answer a proposal with `accept`
     /// and read no user input at all. Off unless `--yes` was passed.
     pub auto_accept_model: bool,
+    /// Whether this process's **stdin** is a terminal — the one world-fact the
+    /// `/model set` gate turns on (REQ-555 spec Permissions).
+    ///
+    /// It rides here rather than being read at handler depth because the slash
+    /// handlers touch the world only through this context and the [`Surface`]
+    /// seam — that is what lets a ratatui front-end inherit the commands by
+    /// implementing the same seams (REQ-555 BR-9). A handler calling
+    /// `std::io::stdin()` itself would be a second, invisible seam, and would
+    /// leave one session holding two notions of "interactive" — this one and
+    /// the stdout-derived flag that governs the banner and the entry frame.
+    ///
+    /// Stdin, not stdout, and read once at the edge: the stdout check asks
+    /// whether *output* is a terminal, which says nothing about who produced the
+    /// line that reached a handler.
+    pub typed_input: bool,
 }
 
 /// One message read off the socket.
@@ -842,6 +857,9 @@ mod tests {
             answer_permissions: false,
             answer_model_proposals: true,
             auto_accept_model: false,
+            // No command runs under this context; the honest value for a test
+            // process is the same check the real edge makes.
+            typed_input: std::io::IsTerminal::is_terminal(&std::io::stdin()),
         };
         conn.answer_outstanding_model_proposal(&mut ctx)
             .expect("the round-trip completes");

@@ -190,6 +190,18 @@ impl TestDaemon {
         self.run_cli_with_stdin(teton, args, "")
     }
 
+    /// Run `teton <args...>` and return its **stdout alone**.
+    ///
+    /// The suite's default capture concatenates stdout and stderr, which is the
+    /// right haystack for "did this run say X anywhere". It is the wrong
+    /// *needle*: AC-2 compares one surface's rendering against the other's own
+    /// bytes, and a needle carrying a diagnostic that only ever goes to stderr
+    /// would fail a comparison the rendering passed — or, worse, quietly widen
+    /// what counts as a match.
+    fn run_cli_stdout(&self, teton: &Path, args: &[&str]) -> String {
+        self.run_cli_streams(teton, args, "", CliSeams::Off).0
+    }
+
     /// Run `teton <args...>` with `stdin` piped in, so an *interactive* prompt
     /// can be answered by the test the way a user answers it.
     ///
@@ -232,6 +244,20 @@ impl TestDaemon {
         stdin: &str,
         seams: CliSeams,
     ) -> (String, std::process::ExitStatus) {
+        let (mut combined, stderr, status) = self.run_cli_streams(teton, args, stdin, seams);
+        combined.push_str(&stderr);
+        (combined, status)
+    }
+
+    /// The one place a CLI process is actually run: stdout, stderr and status,
+    /// kept apart. Every other runner here is a view over this.
+    fn run_cli_streams(
+        &self,
+        teton: &Path,
+        args: &[&str],
+        stdin: &str,
+        seams: CliSeams,
+    ) -> (String, String, std::process::ExitStatus) {
         let mut command = Command::new(teton);
         command
             .args(args)
@@ -257,9 +283,11 @@ impl TestDaemon {
         let output = child
             .wait_with_output()
             .unwrap_or_else(|e| panic!("run teton {args:?}: {e}"));
-        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
-        (combined, output.status)
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status,
+        )
     }
 }
 
@@ -757,13 +785,12 @@ const COST_MARKER: &str = "── cost summary ──";
 
 /// Everything a run printed from its **first** cost-summary marker onward.
 ///
-/// For `teton cost` that is exactly the report: `run_cost` renders it last and
-/// writes nothing to stderr on this path. For a session it is the `/cost`
-/// command's report followed by the rest of the session — which is why the
-/// comparison below is `starts_with` and not `contains`. A session always
-/// contains a correct report at its *end* (the session-end summary), so
-/// "somewhere in the output" would be satisfied by a `/cost` that rendered
-/// nothing of the kind.
+/// For `teton cost` — read from stdout alone below — that is exactly the report:
+/// `run_cost` renders it last. For a session it is the `/cost` command's report
+/// followed by the rest of the session, which is why the comparison below is
+/// `starts_with` and not `contains`. A session always contains a correct report
+/// at its *end* (the session-end summary), so "somewhere in the output" would be
+/// satisfied by a `/cost` that rendered nothing of the kind.
 fn cost_report_from_first_marker<'a>(output: &'a str, what: &str) -> &'a str {
     let at = output
         .find(COST_MARKER)
@@ -822,8 +849,10 @@ fn slash_cost_renders_the_daemons_report_mid_session() {
     );
 
     // The cross-process half: the same daemon, asked the same question by the
-    // subcommand.
-    let subcommand = daemon.run_cli(&teton, &["cost"]);
+    // subcommand. Its **stdout alone** is the needle — the rendering under test
+    // is what the subcommand prints, and appending its stderr would put bytes
+    // into the comparison that the session's `/cost` was never asked to produce.
+    let subcommand = daemon.run_cli_stdout(&teton, &["cost"]);
     let report = cost_report_from_first_marker(&subcommand, "`teton cost`");
     let in_session = cost_report_from_first_marker(&session, "the session");
     assert!(
@@ -1107,10 +1136,12 @@ fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
 /// stopped asking, that line would fall through to the entry loop as a prompt —
 /// which `assert_no_turn_ran` catches at the end.
 ///
-/// This is the one test in the file that runs the CLI *seamed*
-/// ([`TestDaemon::run_cli_seamed`]). `/model set` is typed-input-only and would
-/// otherwise refuse a piped session outright; the refusal itself is the next
-/// test's subject, and the gate's own decision is a unit test in `slash.rs`.
+/// This is one of the two tests in the file that run the CLI *seamed*
+/// ([`TestDaemon::run_cli_seamed`]) — the other is the `--yes` waiver below, and
+/// both are seamed for the same reason. `/model set` is refused on non-terminal
+/// stdin and would otherwise decline a piped session outright; the refusal
+/// itself is the next test's subject, and the gate's own decision is a unit test
+/// in `slash.rs`.
 #[test]
 fn slash_model_set_runs_the_shared_flow_against_a_live_daemon() {
     let Some(daemon) = daemon_or_skip() else {
@@ -1225,8 +1256,13 @@ fn a_piped_model_set_is_refused_and_changes_nothing() {
         "the refusal must point at the shell command that does it; output:\n{session}"
     );
 
-    // Nothing was sent: no `model/set` success line, and no validation output
-    // either — the gate refuses before `model/list` is even asked.
+    // Nothing changed: no `model/set` success line, and the `/model` that
+    // follows does not read the refused name back. What is *not* claimed here is
+    // where in the handler the refusal happened — nothing below distinguishes
+    // "refused before `model/list` was asked" from "asked, then refused", and
+    // for a valid catalog name neither ordering prints anything of its own. The
+    // gate's position is `slash.rs`'s to state; this test's evidence is that no
+    // state moved.
     assert!(
         !session.contains("selection: qwen2.5-coder-1.5b"),
         "a refused /model set reached model/set; output:\n{session}"
