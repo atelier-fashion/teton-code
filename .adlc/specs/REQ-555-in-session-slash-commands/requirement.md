@@ -1,7 +1,7 @@
 ---
 id: REQ-555
 title: "In-session slash commands for the teton interactive CLI"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-04
 updated: 2026-08-04
