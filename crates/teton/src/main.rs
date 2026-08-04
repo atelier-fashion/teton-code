@@ -528,20 +528,50 @@ fn run_model_list(paths: &DaemonPaths) -> anyhow::Result<()> {
 
 /// `teton model set <name>`: change the selection post-first-run (AC-9).
 ///
-/// The BR-3 second confirmation is applied here too, and for the same reason it
-/// exists in the first-run prompt: an above-RAM-floor pick is the user's call but
-/// must never happen by accident. The fit comes from `model/list` (the daemon
-/// computes it), and the daemon independently refuses the change unless
-/// `confirmed_above_ram_floor` is set — this is the legible half of that guard,
-/// not the guard itself.
+/// A connection-opening shell around [`apply_model_set`] and nothing else: the
+/// validation, the BR-3 confirmation, and the `model/set` call are the shared
+/// flow's, so this subcommand and the in-session `/model set` cannot diverge
+/// (REQ-555 BR-4b).
 fn run_model_set(paths: &DaemonPaths, name: &str, assume_yes: bool) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    apply_model_set(name, assume_yes, &mut conn, &mut ctx)
+}
 
-    let list = match conn.call(ModelListParams::default(), &mut ctx)? {
+/// Change the local-tier model selection: validate the name against
+/// `model/list`, apply the REQ-547 BR-3 above-RAM-floor confirmation, and send
+/// `model/set`.
+///
+/// This is the **one** implementation of that flow (REQ-555 BR-4b, D-3). Both
+/// `teton model set` and the in-session `/model set` are call sites of it — the
+/// caller supplies an already-open connection and its own context, so the
+/// subcommand keeps its passive ctx while `/model set` runs under the session's
+/// (D-4). A parallel copy of a confirmation flow is exactly how REQ-547's
+/// consent bypass shipped (LESSON-441): the branch that skipped the check was
+/// the one nobody was looking at.
+///
+/// The BR-3 second confirmation exists for the same reason it exists in the
+/// first-run prompt: an above-RAM-floor pick is the user's call but must never
+/// happen by accident. The fit comes from `model/list` (the daemon computes it),
+/// and the daemon independently refuses the change unless
+/// `confirmed_above_ram_floor` is set — this is the legible half of that guard,
+/// not the guard itself.
+///
+/// # Errors
+///
+/// Propagates a transport error from either RPC. A daemon that *answers* — with
+/// an error, or with "no such method" — is reported on the surface and returns
+/// `Ok`: a refused change ends the command, never the session.
+pub(crate) fn apply_model_set(
+    name: &str,
+    assume_yes: bool,
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+) -> anyhow::Result<()> {
+    let list = match conn.call(ModelListParams::default(), ctx)? {
         Ok(list) => list,
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
             ctx.surface.line(
@@ -560,50 +590,19 @@ fn run_model_set(paths: &DaemonPaths, name: &str, assume_yes: bool) -> anyhow::R
         }
     };
 
-    let Some(model) = list.models.iter().find(|m| m.entry.name == name) else {
-        let names: Vec<&str> = list.models.iter().map(|m| m.entry.name.as_str()).collect();
-        ctx.surface.line(
-            LineKind::Error,
-            &format!(
-                "no catalog entry named `{name}`. Available: {}",
-                names.join(", ")
-            ),
-        );
+    // Everything between the two RPCs is the pure decision below, so the
+    // consent gate is exercised by unit tests with no daemon and no socket.
+    let Some(params) = decide_model_set(
+        name,
+        assume_yes,
+        &list,
+        &mut *ctx.surface,
+        &mut *ctx.prompter,
+    ) else {
         return Ok(());
     };
 
-    // BR-3: above this machine's RAM floor needs an explicit second answer.
-    let above_floor = model.entry.ram_floor_bytes > list.probe.total_ram_bytes;
-    if above_floor && !assume_yes {
-        let confirmed = model_ui::confirm_above_ram_floor(
-            name,
-            model.entry.ram_floor_bytes,
-            list.probe.total_ram_bytes,
-            &mut *ctx.surface,
-            &mut *ctx.prompter,
-        );
-        if !confirmed {
-            ctx.surface.line(
-                LineKind::Notice,
-                &format!("selection unchanged; `{name}` was not sent."),
-            );
-            return Ok(());
-        }
-    } else if above_floor {
-        ctx.surface.line(
-            LineKind::Notice,
-            &format!(
-                "`{name}` needs more RAM than this machine has; --yes supplies the second \
-                 confirmation (BR-3)."
-            ),
-        );
-    }
-
-    let params = ModelSetParams {
-        name: name.to_owned(),
-        confirmed_above_ram_floor: above_floor,
-    };
-    match conn.call(params, &mut ctx)? {
+    match conn.call(params, ctx)? {
         Ok(result) => {
             let source = firstrun::source_label(result.selection.source);
             ctx.surface.line(
@@ -625,6 +624,66 @@ fn run_model_set(paths: &DaemonPaths, name: &str, assume_yes: bool) -> anyhow::R
         ),
     }
     Ok(())
+}
+
+/// Decide what — if anything — `model/set` should be asked to do about `name`.
+///
+/// Pure with respect to the daemon: it reads one `model/list` payload and, for
+/// an above-floor pick, asks one question. `None` means send nothing; the reason
+/// is already on the surface. Splitting this out of [`apply_model_set`] is what
+/// lets the BR-3 gate — including the leg where the user declines — be pinned
+/// without a `Connection` (LESSON-441/464: a consent gate needs its own
+/// known-bad).
+fn decide_model_set(
+    name: &str,
+    assume_yes: bool,
+    list: &teton_protocol::methods::ModelListResult,
+    surface: &mut dyn Surface,
+    prompter: &mut dyn Prompter,
+) -> Option<ModelSetParams> {
+    let Some(model) = list.models.iter().find(|m| m.entry.name == name) else {
+        let names: Vec<&str> = list.models.iter().map(|m| m.entry.name.as_str()).collect();
+        surface.line(
+            LineKind::Error,
+            &format!(
+                "no catalog entry named `{name}`. Available: {}",
+                names.join(", ")
+            ),
+        );
+        return None;
+    };
+
+    // BR-3: above this machine's RAM floor needs an explicit second answer.
+    let above_floor = model.entry.ram_floor_bytes > list.probe.total_ram_bytes;
+    if above_floor && !assume_yes {
+        let confirmed = model_ui::confirm_above_ram_floor(
+            name,
+            model.entry.ram_floor_bytes,
+            list.probe.total_ram_bytes,
+            surface,
+            prompter,
+        );
+        if !confirmed {
+            surface.line(
+                LineKind::Notice,
+                &format!("selection unchanged; `{name}` was not sent."),
+            );
+            return None;
+        }
+    } else if above_floor {
+        surface.line(
+            LineKind::Notice,
+            &format!(
+                "`{name}` needs more RAM than this machine has; --yes supplies the second \
+                 confirmation (BR-3)."
+            ),
+        );
+    }
+
+    Some(ModelSetParams {
+        name: name.to_owned(),
+        confirmed_above_ram_floor: above_floor,
+    })
 }
 
 /// `teton model status`: the decision, the install state, and where the weights
@@ -1068,6 +1127,8 @@ fn privacy_label(mode: PrivacyMode) -> &'static str {
 mod tests {
     use super::*;
     use crate::keychain::MockKeychain;
+    use crate::prompt::ScriptedPrompter;
+    use crate::render::RecordingSurface;
 
     /// Parse args as the CLI would, panicking with clap's message on error.
     fn parse(args: &[&str]) -> Cli {
@@ -1253,5 +1314,143 @@ mod tests {
             "openai-compatible"
         );
         assert_eq!(privacy_label(PrivacyMode::LocalOnly), "local-only");
+    }
+
+    // -----------------------------------------------------------------------
+    // The shared `model set` flow (REQ-555 BR-4b / AC-3b). Both `teton model
+    // set` and `/model set` run `apply_model_set`, whose whole decision — name
+    // validation, the REQ-547 BR-3 above-RAM-floor gate, and what ends up in
+    // `ModelSetParams` — is `decide_model_set`. Pinning it here pins both
+    // surfaces at once; that is the point of there being one function.
+    // -----------------------------------------------------------------------
+
+    /// Run the decision against the scripted catalog. Returns what would be
+    /// sent to `model/set` (`None` = send nothing), everything rendered, and how
+    /// many questions were asked.
+    fn decide(
+        name: &str,
+        assume_yes: bool,
+        answers: &[&str],
+    ) -> (Option<ModelSetParams>, RecordingSurface, usize) {
+        let list = model_ui::testing::list_result();
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(answers);
+        let params = decide_model_set(name, assume_yes, &list, &mut surface, &mut prompter);
+        (params, surface, prompter.asked)
+    }
+
+    // AC-3b, leg one: a name that fits this machine is sent as-is, with no
+    // question and no chatter — `confirmed_above_ram_floor` is false because
+    // there was nothing to confirm.
+    #[test]
+    fn a_fitting_catalog_name_is_sent_without_asking_anything() {
+        let name = model_ui::testing::small_entry().name;
+        let (params, surface, asked) = decide(&name, false, &[]);
+
+        let params = params.expect("a fitting catalog name should be sent");
+        assert_eq!(params.name, name);
+        assert!(!params.confirmed_above_ram_floor);
+        assert_eq!(asked, 0, "a fitting pick asks nothing");
+        assert!(
+            surface.calls.is_empty(),
+            "a fitting pick warns about nothing: {:?}",
+            surface.calls
+        );
+    }
+
+    // AC-3b, leg two: an unknown name sends nothing and names the alternatives,
+    // which is what makes `/model list` unnecessary in-session (spec Out of
+    // Scope). Listing them is the whole remedy, so the test asserts every one.
+    #[test]
+    fn an_unknown_name_sends_nothing_and_lists_the_catalog() {
+        let (params, surface, asked) = decide("qwen9-turbo-1t", false, &["y"]);
+
+        assert!(params.is_none(), "an unknown name must not reach model/set");
+        assert_eq!(asked, 0, "an unknown name is not a question");
+        let errors = surface.lines_of(LineKind::Error);
+        assert_eq!(errors.len(), 1, "one line, not a report: {errors:?}");
+        assert!(errors[0].contains("qwen9-turbo-1t"), "{}", errors[0]);
+        for model in &model_ui::testing::list_result().models {
+            assert!(
+                errors[0].contains(&model.entry.name),
+                "`{}` is in the catalog but not in the hint: {}",
+                model.entry.name,
+                errors[0]
+            );
+        }
+    }
+
+    // AC-3b, leg three: above the RAM floor the pick is warned about and only
+    // proceeds after an explicit second answer — and only then does
+    // `confirmed_above_ram_floor` ride the wire (REQ-547 BR-3).
+    #[test]
+    fn an_above_floor_name_is_sent_only_after_the_second_confirmation() {
+        let name = model_ui::testing::oversized_entry().name;
+        let (params, surface, asked) = decide(&name, false, &["y"]);
+
+        let params = params.expect("an explicit yes should send the change");
+        assert_eq!(params.name, name);
+        assert!(
+            params.confirmed_above_ram_floor,
+            "the daemon refuses the change without this flag"
+        );
+        assert_eq!(asked, 1, "exactly one second confirmation");
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "warning:"),
+            "the pick was sent with no warning shown: {:?}",
+            surface.calls
+        );
+        assert!(surface.any_line_contains(LineKind::Notice, &name));
+    }
+
+    // AC-3b, leg three's other half — the one that matters. Declining leaves the
+    // selection alone, says so, and sends NOTHING: `None` here is the whole
+    // guard, since `apply_model_set` issues `model/set` only for `Some`.
+    // (LESSON-470: the dialogue defaults to no, so silence declines too.)
+    #[test]
+    fn declining_the_ram_floor_warning_sends_nothing_and_says_so() {
+        let name = model_ui::testing::oversized_entry().name;
+
+        for answer in ["n", "no", ""] {
+            let (params, surface, asked) = decide(&name, false, &[answer]);
+            assert!(
+                params.is_none(),
+                "`{answer}` was read as consent and the change was sent"
+            );
+            assert_eq!(asked, 1, "the decline consumed one dialogue prompt");
+            assert!(
+                surface.any_line_contains(LineKind::Notice, "selection unchanged"),
+                "declining said nothing: {:?}",
+                surface.calls
+            );
+            assert!(surface.any_line_contains(LineKind::Notice, &name));
+        }
+
+        // EOF (Ctrl-D at the question) is not consent either.
+        let (params, _, asked) = decide(&name, false, &[]);
+        assert!(params.is_none(), "EOF was read as consent");
+        assert_eq!(asked, 1);
+    }
+
+    // The Permissions-table stand-in: `--yes` supplies the second confirmation
+    // for an unattended run, and reads no input at all (REQ-547 BR-5's posture).
+    // In-session this is the session's own `--yes`, carried on
+    // `UiContext::auto_accept_model`.
+    #[test]
+    fn yes_supplies_the_second_confirmation_and_reads_no_input() {
+        let name = model_ui::testing::oversized_entry().name;
+        let (params, surface, asked) = decide(&name, true, &["n"]);
+
+        let params = params.expect("--yes should supply the confirmation");
+        assert!(params.confirmed_above_ram_floor);
+        assert_eq!(
+            asked, 0,
+            "--yes reads no input, so the scripted `n` is unused"
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "--yes"),
+            "an unattended above-floor install happened silently: {:?}",
+            surface.calls
+        );
     }
 }

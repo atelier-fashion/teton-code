@@ -24,8 +24,11 @@
 //! matching subcommands already render through (BR-4) — `/cost` through
 //! [`crate::query_and_render_cost`], `/model` through
 //! [`model_ui::render_current_model_line`] over the same `model/status`
-//! response `teton model status` renders in full. Two surfaces describing one
-//! piece of daemon state must not be able to disagree.
+//! response `teton model status` renders in full, and `/model set` through
+//! [`crate::apply_model_set`], the one implementation of the validate → confirm
+//! → set flow `teton model set` also runs (BR-4b). Two surfaces describing one
+//! piece of daemon state must not be able to disagree, and one consent gate must
+//! not have two implementations (LESSON-441).
 //!
 //! [`classify`] and [`resolve`] are pure and total, and are pinned in both
 //! directions (BR-8): every table row is reachable from parsed input, and every
@@ -82,6 +85,23 @@ pub enum CommandOutcome {
 /// the client-local commands ignore the connection but share the signature.
 type Handler = fn(&mut Connection, &mut UiContext<'_>, &str) -> anyhow::Result<CommandOutcome>;
 
+/// What a row does with the text after its name.
+///
+/// Both variants are rejections at [`resolve`] time, before any handler runs:
+/// an argument a command has no use for is a typo, and a missing one is a
+/// half-typed command. Either way exactly one line renders and no RPC is issued
+/// (BR-2).
+#[derive(Debug, Clone, Copy)]
+enum Args {
+    /// No argument is meaningful; one supplied is rejected rather than silently
+    /// ignored.
+    None,
+    /// An argument is required. The string is the usage clause a bare command
+    /// line gets back, so the hint says what to type rather than only that
+    /// something is missing.
+    Required(&'static str),
+}
+
 /// One row of the dispatch table.
 #[derive(Debug)]
 struct CommandSpec {
@@ -91,52 +111,55 @@ struct CommandSpec {
     name: &'static str,
     /// The one line `/help` prints for this command.
     summary: &'static str,
-    /// Whether a trailing argument is meaningful. A row that takes none rejects
-    /// one with the [`HELP_HINT`] rather than silently ignoring it.
-    takes_args: bool,
+    /// What the row does with a trailing argument.
+    args: Args,
     /// The code that runs the command.
     handler: Handler,
 }
 
 /// Every slash command, in `/help` order. The dispatcher matches against this
 /// array and `/help` renders from it, so the two cannot drift (BR-7).
-///
-/// TASK-036 adds the `model set` row; the two-word name resolves through
-/// [`split_name`]'s longest-match rule and needs no classifier change.
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "help",
         summary: "List the commands this session knows.",
-        takes_args: false,
+        args: Args::None,
         handler: handle_help,
     },
     CommandSpec {
         name: "cost",
         summary: "Show the daemon's cost report, exactly as `teton cost` does.",
-        takes_args: false,
+        args: Args::None,
         handler: handle_cost,
     },
     CommandSpec {
-        // Stays argument-less: TASK-036's `model set` is its own row, and
-        // [`split_name`]'s longest match routes `/model set <name>` there
-        // without this row ever seeing the argument. Anything else trailing
-        // `/model` is a typo and is rejected here rather than being read as a
-        // model name.
+        // Argument-less: `model set` is its own row below, and [`split_name`]'s
+        // longest match routes `/model set <name>` there without this row ever
+        // seeing the argument. Anything else trailing `/model` is a typo and is
+        // rejected here rather than being read as a model name.
         name: "model",
         summary: "Show the model the local tier is currently on.",
-        takes_args: false,
+        args: Args::None,
         handler: handle_model,
+    },
+    CommandSpec {
+        name: "model set",
+        summary: "Switch the local tier to a catalog model: /model set <name>.",
+        args: Args::Required(
+            "a catalog name — `/model set <name>`, and `teton model list` names them",
+        ),
+        handler: handle_model_set,
     },
     CommandSpec {
         name: "verbose",
         summary: "Toggle the routing and turn-end notices for this session.",
-        takes_args: false,
+        args: Args::None,
         handler: handle_verbose,
     },
     CommandSpec {
         name: "quit",
         summary: "End the session, exactly as Ctrl-D does.",
-        takes_args: false,
+        args: Args::None,
         handler: handle_quit,
     },
 ];
@@ -228,10 +251,17 @@ fn resolve<'a>(name: &str, args: &'a str) -> Resolution<'a> {
     let Some(spec) = COMMANDS.iter().find(|spec| spec.name == name) else {
         return Resolution::Rejected(format!("unknown command: /{name} — {HELP_HINT}"));
     };
-    if !spec.takes_args && !args.is_empty() {
-        return Resolution::Rejected(format!("/{} takes no arguments — {HELP_HINT}", spec.name));
+    match spec.args {
+        Args::None if !args.is_empty() => {
+            Resolution::Rejected(format!("/{} takes no arguments — {HELP_HINT}", spec.name))
+        }
+        // Rejected here rather than inside the handler, so a half-typed
+        // `/model set` renders its usage without opening a `model/list` first.
+        Args::Required(usage) if args.is_empty() => {
+            Resolution::Rejected(format!("/{} needs {usage} — {HELP_HINT}", spec.name))
+        }
+        _ => Resolution::Run(spec, args),
     }
-    Resolution::Run(spec, args)
 }
 
 /// Render a command line that never reaches a handler: exactly one line, and
@@ -338,6 +368,35 @@ fn handle_model(
     Ok(CommandOutcome::Continue)
 }
 
+/// The `/model set <name>` handler: the write path, and the only command here
+/// that changes daemon state.
+///
+/// It contains no validation and no confirmation of its own — every line of that
+/// belongs to [`crate::apply_model_set`], the same function `teton model set`
+/// runs (BR-4b, D-3). A second copy of the REQ-547 BR-3 above-RAM-floor gate is
+/// precisely the shape that shipped REQ-547's consent bypass (LESSON-441), so
+/// this handler's job is to supply the session's connection, the session's
+/// context, and the session's `--yes`, and nothing else.
+///
+/// `assume_yes` is `ctx.auto_accept_model` — the session's own `--yes` flag,
+/// which `run_session` puts there and which the Permissions table names as the
+/// explicit unattended stand-in for the second confirmation. Without it the
+/// question is asked on `ctx.prompter`, the session's **plain** dialogue
+/// prompter: the framed prompter belongs to the entry area, and a consent
+/// question is dialogue, not entry (REQ-549 BR-5). Declining renders "selection
+/// unchanged" and the loop carries on (LESSON-470 — a default-no dialogue).
+fn handle_model_set(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    // A bare `/model set` never reaches here: `Args::Required` rejects it at
+    // resolve time with the usage line.
+    let assume_yes = ctx.auto_accept_model;
+    crate::apply_model_set(args, assume_yes, conn, ctx)?;
+    Ok(CommandOutcome::Continue)
+}
+
 /// The `/quit` handler: it renders nothing and ends no session itself — the
 /// entry loop breaks on [`CommandOutcome::Quit`] and the existing post-loop
 /// path prints the session-end cost summary (BR-6).
@@ -380,17 +439,24 @@ mod tests {
     #[test]
     fn every_table_row_is_reachable_from_a_typed_command_line() {
         for spec in COMMANDS {
-            let typed = format!("/{}", spec.name);
-            let Input::Command { name, args } = classify(&typed) else {
+            // A row that requires an argument is only reachable *with* one, so
+            // the loop types what the row asks for rather than skipping it.
+            let expected_args = match spec.args {
+                Args::None => "",
+                Args::Required(_) => "qwen2.5-coder-3b",
+            };
+            let typed = format!("/{} {expected_args}", spec.name);
+            let typed = typed.trim_end();
+            let Input::Command { name, args } = classify(typed) else {
                 panic!("`{typed}` did not classify as a command");
             };
             assert_eq!(name, spec.name);
-            assert_eq!(args, "");
+            assert_eq!(args, expected_args);
             let Resolution::Run(resolved, run_args) = resolve(name, args) else {
                 panic!("`{typed}` classified as a command but did not dispatch");
             };
             assert_eq!(resolved.name, spec.name);
-            assert_eq!(run_args, "");
+            assert_eq!(run_args, expected_args);
             assert!(
                 !resolved.summary.is_empty(),
                 "/{} would appear in /help with no summary",
@@ -402,11 +468,10 @@ mod tests {
     // The loop above proves every row in the table is reachable — and stays
     // green if a row is *deleted*. This is the other half of that invariant
     // (LESSON-479): the commands this REQ promises are in the table at all.
-    // TASK-036 adds `model set` to this list.
     #[test]
     fn the_table_carries_every_command_this_req_promises() {
         let names: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
-        for expected in ["help", "cost", "model", "verbose", "quit"] {
+        for expected in ["help", "cost", "model", "model set", "verbose", "quit"] {
             assert!(
                 names.contains(&expected),
                 "/{expected} is missing from the dispatch table: {names:?}"
@@ -442,21 +507,21 @@ mod tests {
         assert_eq!(classify("//help"), Input::EscapedPrompt("/help"));
     }
 
-    // The longest matching name wins on a word boundary, so TASK-036 adds a
-    // `model set` row beside `model` without touching the classifier.
+    // The longest matching name wins on a word boundary, which is what lets the
+    // `model set` row sit beside `model` without touching the classifier.
     #[test]
     fn a_two_word_row_wins_over_its_one_word_prefix() {
         const FIXTURE: &[CommandSpec] = &[
             CommandSpec {
                 name: "model",
                 summary: "show the current model",
-                takes_args: false,
+                args: Args::None,
                 handler: handle_help,
             },
             CommandSpec {
                 name: "model set",
                 summary: "change the current model",
-                takes_args: true,
+                args: Args::Required("a catalog name"),
                 handler: handle_help,
             },
         ];
@@ -577,17 +642,44 @@ mod tests {
         }
     }
 
-    // The `/model set` seam (TASK-036). Until that row exists, `set <name>` is a
-    // stray argument to `/model` and is rejected — never read as a model name,
-    // and never silently ignored. TASK-036 adds the `model set` row, at which
-    // point [`split_name`]'s longest match routes this line there instead and
-    // this assertion is the one that says so.
+    // The `/model set` seam, post-TASK-036. `set <name>` is no longer a stray
+    // argument to `/model`: [`split_name`]'s longest match routes the line to
+    // the two-word row, carrying the catalog name as the argument. The two
+    // neighbouring lines stay rejections — a bare `/model set` is a half-typed
+    // command, and `/model <anything-else>` is a typo that must never be read as
+    // a model name.
     #[test]
-    fn model_set_is_rejected_until_task_036_adds_its_row() {
+    fn model_set_routes_to_its_own_row_and_a_bare_one_asks_for_a_name() {
         let Input::Command { name, args } = classify("/model set qwen2.5-coder-3b") else {
             panic!("`/model set …` did not classify as a command");
         };
-        assert_eq!((name, args), ("model", "set qwen2.5-coder-3b"));
+        assert_eq!((name, args), ("model set", "qwen2.5-coder-3b"));
+        let Resolution::Run(spec, run_args) = resolve(name, args) else {
+            panic!("`/model set qwen2.5-coder-3b` did not reach the model-set row");
+        };
+        assert_eq!(spec.name, "model set");
+        // The catalog name reaches the handler verbatim — the flow validates it
+        // against `model/list`, so nothing here second-guesses it.
+        assert_eq!(run_args, "qwen2.5-coder-3b");
+
+        // No name: the usage line, not a `model/list` with an empty name.
+        let Input::Command { name, args } = classify("/model set") else {
+            panic!("`/model set` did not classify as a command");
+        };
+        assert_eq!((name, args), ("model set", ""));
+        let Resolution::Rejected(hint) = resolve(name, args) else {
+            panic!("a bare `/model set` reached the handler");
+        };
+        assert!(hint.contains("/model set"), "{hint}");
+        assert!(hint.contains("<name>"), "{hint}");
+        assert!(hint.contains("/help"), "{hint}");
+
+        // And the one-word row still refuses a stray word rather than treating
+        // it as a model name.
+        let Input::Command { name, args } = classify("/model extra") else {
+            panic!("`/model extra` did not classify as a command");
+        };
+        assert_eq!((name, args), ("model", "extra"));
         assert!(matches!(resolve(name, args), Resolution::Rejected(_)));
     }
 }
