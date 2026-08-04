@@ -1,7 +1,7 @@
 ---
 id: BUG-151
 title: "The frame-marker coverage invariant only holds in one direction"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-04
 updated: 2026-08-04
@@ -94,8 +94,47 @@ which is what makes it a real guard rather than a restatement.
 
 ## Resolution
 
-(filled after fix)
+Added `every_opening_envelope_tag_is_also_an_output_marker`: the reverse containment for the
+envelope layer. Every **opening** tag in `UNTRUSTED_ENVELOPE_TAGS` must appear in both
+`FLAT_ANCHORED_MARKERS` and `CHATML_ANCHORED_MARKERS`.
+
+Two exemptions, encoded as explicit skips with their reasons rather than left implicit:
+
+- **Closing tags** (`</tool-result`, `</mcp-tool-result`) are input-only by construction — a
+  model that emits `</tool-result>` has closed nothing it opened, so it has forged nothing.
+- **Transcript labels** need no reverse check: `starts_with_frame_label` derives its alphabet
+  *from* the output sets, so containment there is structural rather than asserted.
+
+The forward guard's comment now names its direction (`output ⊆ input`) so the pair reads as
+the equality it is.
+
+### Verification
+
+A passing test proves nothing until it has been seen to fail. Reverting `<mcp-tool-result`
+from both marker sets — reproducing `main` at `39ff1f8`, after BUG-148 and before BUG-149 —
+makes the new test go red with exactly the intended message:
+
+```
+"<mcp-tool-result" is defused on input but is not in FLAT_ANCHORED_MARKERS — a model can
+still emit a fabricated envelope the input side already treats as frame (the BUG-149 shape)
+```
+
+Green on `main` today. So the guard would have caught BUG-149 mechanically.
+
+All four CI commands green locally and on PR #36: `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+(32 test binaries), `cargo test -p tetond --test e2e` (28 passed).
+
+## Deployment
+
+PR #36, squash-merged to `main` as `c3c39b0` (2026-08-04). No runtime deploy applies — plain
+OSS PR-gated CI, and this change is test-and-docs only, so it alters no shipped daemon
+behavior.
 
 ## Files Changed
 
-(filled after fix)
+- `crates/tetond/src/harness/render.rs` — `every_opening_envelope_tag_is_also_an_output_marker`;
+  forward guard's comment names its direction
+- `.adlc/context/architecture.md` — ADR-009's rule-3 caveat replaced with the now-symmetric
+  invariant and its two documented asymmetries
+- `.adlc/bugs/BUG-151-frame-marker-coverage-is-one-directional.md` — this report
