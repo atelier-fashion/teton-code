@@ -18,13 +18,26 @@
 //! `/quit` leaves the entry loop through the same post-loop path Ctrl-D takes
 //! instead of a parallel shutdown that can drift from it (BR-6).
 //!
+//! The data-bearing commands add no protocol surface (BR-3): they are new call
+//! sites of RPCs the daemon already serves, issued on the session's *own*
+//! connection and context (D-4), and they render through the functions the
+//! matching subcommands already render through (BR-4) — `/cost` through
+//! [`crate::query_and_render_cost`], `/model` through
+//! [`model_ui::render_current_model_line`] over the same `model/status`
+//! response `teton model status` renders in full. Two surfaces describing one
+//! piece of daemon state must not be able to disagree.
+//!
 //! [`classify`] and [`resolve`] are pure and total, and are pinned in both
 //! directions (BR-8): every table row is reachable from parsed input, and every
 //! non-command line reaches the prompt path unchanged. A one-directional test
 //! here would be the BUG-151 shape — a guard that stays green while half the
 //! invariant drifts (LESSON-479).
 
+use teton_protocol::jsonrpc::error_code;
+use teton_protocol::methods::ModelStatusParams;
+
 use crate::client::{Connection, UiContext};
+use crate::model_ui;
 use crate::render::{LineKind, Surface};
 
 /// The one line `/help` prints about the `//` escape hatch (BR-1b).
@@ -88,15 +101,31 @@ struct CommandSpec {
 /// Every slash command, in `/help` order. The dispatcher matches against this
 /// array and `/help` renders from it, so the two cannot drift (BR-7).
 ///
-/// TASK-035 adds the `cost` and `model` rows and TASK-036 the `model set` row;
-/// the two-word name resolves through [`split_name`]'s longest-match rule and
-/// needs no classifier change.
+/// TASK-036 adds the `model set` row; the two-word name resolves through
+/// [`split_name`]'s longest-match rule and needs no classifier change.
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "help",
         summary: "List the commands this session knows.",
         takes_args: false,
         handler: handle_help,
+    },
+    CommandSpec {
+        name: "cost",
+        summary: "Show the daemon's cost report, exactly as `teton cost` does.",
+        takes_args: false,
+        handler: handle_cost,
+    },
+    CommandSpec {
+        // Stays argument-less: TASK-036's `model set` is its own row, and
+        // [`split_name`]'s longest match routes `/model set <name>` there
+        // without this row ever seeing the argument. Anything else trailing
+        // `/model` is a typo and is rejected here rather than being read as a
+        // model name.
+        name: "model",
+        summary: "Show the model the local tier is currently on.",
+        takes_args: false,
+        handler: handle_model,
     },
     CommandSpec {
         name: "verbose",
@@ -263,6 +292,52 @@ fn handle_verbose(
     Ok(CommandOutcome::Continue)
 }
 
+/// The `/cost` handler: the daemon's authoritative cost report, rendered by the
+/// same function `teton cost` calls (BR-4 / AC-2).
+///
+/// There is nothing else here on purpose. Every figure, the daemon-too-old
+/// notice, and the RPC-error line all come from
+/// [`crate::query_and_render_cost`], so the in-session meter cannot drift from
+/// the subcommand's — a second rendering would be two answers to one question
+/// about the user's money.
+fn handle_cost(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    _args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    // The session's own connection and context (D-4): no second connection, and
+    // an event arriving while this RPC pumps behaves exactly as it would
+    // between turns.
+    crate::query_and_render_cost(conn, ctx)?;
+    Ok(CommandOutcome::Continue)
+}
+
+/// The `/model` handler: one line naming the model the local tier is on (AC-3),
+/// derived from the same `model/status` response `teton model status` renders in
+/// full (BR-4, D-6).
+///
+/// The daemon-too-old and RPC-error arms mirror `run_model_status`'s wording and
+/// return [`CommandOutcome::Continue`] either way: a failed status query ends a
+/// command, never the session.
+fn handle_model(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    _args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    match conn.call(ModelStatusParams::default(), ctx)? {
+        Ok(status) => model_ui::render_current_model_line(&status, ctx.surface),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
+            LineKind::Notice,
+            "this daemon build does not expose model/status yet.",
+        ),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("could not read the model status: {}", err.message),
+        ),
+    }
+    Ok(CommandOutcome::Continue)
+}
+
 /// The `/quit` handler: it renders nothing and ends no session itself — the
 /// entry loop breaks on [`CommandOutcome::Quit`] and the existing post-loop
 /// path prints the session-end cost summary (BR-6).
@@ -320,6 +395,21 @@ mod tests {
                 !resolved.summary.is_empty(),
                 "/{} would appear in /help with no summary",
                 spec.name
+            );
+        }
+    }
+
+    // The loop above proves every row in the table is reachable — and stays
+    // green if a row is *deleted*. This is the other half of that invariant
+    // (LESSON-479): the commands this REQ promises are in the table at all.
+    // TASK-036 adds `model set` to this list.
+    #[test]
+    fn the_table_carries_every_command_this_req_promises() {
+        let names: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
+        for expected in ["help", "cost", "model", "verbose", "quit"] {
+            assert!(
+                names.contains(&expected),
+                "/{expected} is missing from the dispatch table: {names:?}"
             );
         }
     }
@@ -465,5 +555,39 @@ mod tests {
         };
         assert!(hint.contains("takes no arguments"), "{hint}");
         assert!(hint.contains("/help"), "{hint}");
+    }
+
+    // The data-bearing commands follow the same convention: a trailing word is
+    // rejected with the hint rather than quietly dropped, so a typo never runs
+    // an RPC the user did not ask for (BR-2). `/cost` is unparameterized by
+    // OQ-3's resolution, and `/model` takes no argument of its own.
+    #[test]
+    fn a_trailing_argument_to_cost_or_model_is_rejected() {
+        for typed in ["/cost extra-arg", "/model extra"] {
+            let Input::Command { name, args } = classify(typed) else {
+                panic!("`{typed}` did not classify as a command");
+            };
+            assert!(!args.is_empty(), "`{typed}` parsed no argument");
+            let Resolution::Rejected(hint) = resolve(name, args) else {
+                panic!("`{typed}` ran the handler with a stray argument");
+            };
+            assert!(hint.contains("takes no arguments"), "{hint}");
+            assert!(hint.contains(&format!("/{name}")), "{hint}");
+            assert!(hint.contains("/help"), "{hint}");
+        }
+    }
+
+    // The `/model set` seam (TASK-036). Until that row exists, `set <name>` is a
+    // stray argument to `/model` and is rejected — never read as a model name,
+    // and never silently ignored. TASK-036 adds the `model set` row, at which
+    // point [`split_name`]'s longest match routes this line there instead and
+    // this assertion is the one that says so.
+    #[test]
+    fn model_set_is_rejected_until_task_036_adds_its_row() {
+        let Input::Command { name, args } = classify("/model set qwen2.5-coder-3b") else {
+            panic!("`/model set …` did not classify as a command");
+        };
+        assert_eq!((name, args), ("model", "set qwen2.5-coder-3b"));
+        assert!(matches!(resolve(name, args), Resolution::Rejected(_)));
     }
 }

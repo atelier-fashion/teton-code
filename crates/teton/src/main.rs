@@ -446,7 +446,12 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
         format!("recorded {} model call(s) this session.", state.cost.len())
     };
     surface.line(LineKind::Info, &session_line);
-    query_and_render_cost(&mut conn, &mut surface, &mut state, &mut prompter)?;
+    {
+        // The session is over by the time this runs, so the summary asks with a
+        // passive context exactly as it always has.
+        let mut end_ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+        query_and_render_cost(&mut conn, &mut end_ctx)?;
+    }
     let _ = surface.flush();
     Ok(())
 }
@@ -455,24 +460,25 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
 /// render it, or print a graceful notice when the daemon does not expose the
 /// method or cannot answer. Every figure — totals, baseline, savings — comes from
 /// the daemon; the CLI computes none of it (REQ-544 M-7).
-fn query_and_render_cost(
+///
+/// This is the **one** implementation behind every cost surface: `teton cost`,
+/// the session-end summary, and the in-session `/cost` command (REQ-555 BR-4 /
+/// AC-2) are call sites of it, never re-implementations — two surfaces
+/// describing the same daemon state must not be able to drift apart. The caller
+/// supplies the context, so the subcommand keeps its passive one while `/cost`
+/// runs under the session's own (REQ-555 D-4).
+pub(crate) fn query_and_render_cost(
     conn: &mut Connection,
-    surface: &mut dyn Surface,
-    state: &mut SessionState,
-    prompter: &mut dyn Prompter,
+    ctx: &mut UiContext<'_>,
 ) -> anyhow::Result<()> {
-    let result = {
-        let mut ctx = passive_ctx(&mut *surface, &mut *state, &mut *prompter);
-        conn.call(CostQueryParams::default(), &mut ctx)?
-    };
-    match result {
-        Ok(res) => cost_ui::render_report_view(&res.report, surface),
-        Err(err) if err.code == error_code::METHOD_NOT_FOUND => surface.line(
+    match conn.call(CostQueryParams::default(), ctx)? {
+        Ok(res) => cost_ui::render_report_view(&res.report, ctx.surface),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
             LineKind::Notice,
             "this daemon build does not expose the cost/query method yet; no authoritative \
              cost report is available.",
         ),
-        Err(err) => surface.line(
+        Err(err) => ctx.surface.line(
             LineKind::Error,
             &format!("cost query failed: {}", err.message),
         ),
@@ -736,7 +742,10 @@ fn run_cost(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
-    query_and_render_cost(&mut conn, &mut surface, &mut state, &mut prompter)?;
+    {
+        let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+        query_and_render_cost(&mut conn, &mut ctx)?;
+    }
     let _ = surface.flush();
     Ok(())
 }
