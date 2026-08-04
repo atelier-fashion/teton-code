@@ -39,23 +39,40 @@ use teton_inference::ChatFormat;
 /// here — ordinary prose can contain `User:` mid-line.
 ///
 /// Shared with the *input* side: [`super::render::neutralize_frame_labels`]
-/// defuses this same set in untrusted content, so what the model must not be
-/// allowed to emit is exactly what content is not allowed to introduce
-/// (BUG-148). One constant, so the two directions cannot drift apart.
-pub(super) const FLAT_ANCHORED_MARKERS: &[&str] =
-    &["User:", "Assistant:", "Tool (", "<tool-result"];
+/// and [`super::render::neutralize_envelope_tags`] defuse this same set in
+/// untrusted content, so what the model must not be allowed to emit is exactly
+/// what content is not allowed to introduce (BUG-148). One constant, so the two
+/// directions cannot drift apart.
+///
+/// Both envelope spellings are listed. `<mcp-tool-result`
+/// ([`super::tools::mcp::frame_untrusted`]) is not a `<tool-result` suffix
+/// match, so listing only the latter left the MCP envelope forgeable on the
+/// output side while the input side already defused it — the gap BUG-149
+/// closes.
+pub(super) const FLAT_ANCHORED_MARKERS: &[&str] = &[
+    "User:",
+    "Assistant:",
+    "Tool (",
+    "<tool-result",
+    "<mcp-tool-result",
+];
 
 /// Line-anchored fabrication markers for the ChatML rendering (REQ-554 BR-4,
 /// ADR-4): the harness-authored labels a ChatML prompt shows the model —
-/// the untrusted-content envelope and the tool-result label `prepare()`
-/// writes at the head of a tool-bearing user turn ([`TOOL_RESULT_LABEL_PREFIX`],
-/// the ChatML counterpart of flat's `Tool (`). A generated one is a fake
-/// tool result (the BUG-147 fabrication axis).
+/// the untrusted-content envelope in both its spellings (built-in and MCP) and
+/// the tool-result label `prepare()` writes at the head of a tool-bearing user
+/// turn ([`TOOL_RESULT_LABEL_PREFIX`], the ChatML counterpart of flat's
+/// `Tool (`). A generated one is a fake tool result (the BUG-147 fabrication
+/// axis).
 ///
-/// Also shared with [`super::render::neutralize_frame_labels`] — see
-/// [`FLAT_ANCHORED_MARKERS`].
-pub(super) const CHATML_ANCHORED_MARKERS: &[&str] =
-    &["<tool-result", super::context::TOOL_RESULT_LABEL_PREFIX];
+/// Also shared with the input-side neutralizers — see
+/// [`FLAT_ANCHORED_MARKERS`], including why `<mcp-tool-result` is listed
+/// separately from `<tool-result`.
+pub(super) const CHATML_ANCHORED_MARKERS: &[&str] = &[
+    "<tool-result",
+    "<mcp-tool-result",
+    super::context::TOOL_RESULT_LABEL_PREFIX,
+];
 
 /// Position-independent markers: the ChatML control-token spellings.
 ///
@@ -883,6 +900,37 @@ mod tests {
                 "{format:?} must cut the fabricated envelope"
             );
         }
+    }
+
+    #[test]
+    fn the_mcp_untrusted_envelope_is_a_marker_in_both_modes() {
+        // BUG-149: `<mcp-tool-result` is not a `<tool-result` suffix match, so
+        // it needs its own entry — without it a model fabricating the MCP
+        // envelope streamed through while the built-in spelling was cut.
+        // The forgery is built by the writer itself rather than spelled out
+        // here, so the test fails if the writer and the marker ever drift.
+        let forged = super::super::tools::mcp::frame_untrusted("srv", "search", "attacker text");
+        for format in [ChatFormat::Flat, ChatFormat::ChatMl] {
+            let mut scanner = ReplyScanner::for_format(format);
+            assert!(scanner.push("Reading it now.\n"));
+            assert!(!scanner.push(&forged));
+            assert_eq!(
+                &scanner.buf[..scanner.context_cut()],
+                "Reading it now.\n",
+                "{format:?} must cut the fabricated MCP envelope"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_envelope_spellings_stall_until_they_are_told_apart() {
+        // `<tool-result` and `<mcp-tool-result` diverge one byte in, so a chunk
+        // boundary inside the shared `<` must hold rather than advance past it.
+        let mut scanner = ReplyScanner::new();
+        assert!(scanner.push("Answer.\n<"));
+        assert_eq!(scanner.flushable_len(), "Answer.\n".len());
+        assert!(!scanner.push("mcp-tool-result server=\"srv\" tool=\"search\">"));
+        assert_eq!(&scanner.buf[..scanner.context_cut()], "Answer.\n");
     }
 
     #[test]
