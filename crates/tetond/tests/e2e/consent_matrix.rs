@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use teton_inference::catalog::{Catalog, HfSource};
+use teton_protocol::jsonrpc::error_code;
 
 use crate::harness::{
     assert_no_boundary_bytes, file_map, fixture_catalog_toml, fixture_models, local_model_block,
@@ -699,6 +700,14 @@ fn ac2_with_a_loader_accept_benchmarks_reaches_ready_and_serves_a_local_turn() {
     assert!(
         !starved_msg.contains("local engine could not serve"),
         "a withheld tier must not be reported as a broken engine; got: {starved_msg}"
+    );
+    // BUG-152, on the wire: an unanswered proposal is NOT the transient state.
+    // Waiting does not answer it — the user does — so it must not arrive with
+    // the code a client renders as "still loading, sit tight".
+    assert_eq!(
+        starved["error"]["code"].as_i64(),
+        Some(error_code::UNKNOWN_PROVIDER),
+        "a tier withheld pending an answer is settled, not warming: {starved}"
     );
 
     let id = client.await_pending_proposal(PROPOSAL_WINDOW);

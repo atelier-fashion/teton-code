@@ -677,13 +677,9 @@ impl DaemonRuntime {
         &self.consent
     }
 
-    /// Whether the local tier may serve a turn right now.
-    ///
-    /// Two independent conditions: the tier must be *capable* (`local_available`,
-    /// BR-8's latency duty) and it must be *consented to* (REQ-547 BR-1). A
-    /// machine awaiting an answer routes remote-only rather than blocking — the
     /// Why no tier could serve a turn, said so the user can act on it
-    /// (BUG-146).
+    /// (BUG-146) — and coded so a client can tell "wait" from "fix something"
+    /// (BUG-152).
     ///
     /// Reached only from the [`HarnessError::NoTierAvailable`] arm — the route
     /// named a provider this daemon does not have and the local slot was empty.
@@ -694,11 +690,23 @@ impl DaemonRuntime {
     /// lifecycle replay describing the same machine at the same moment must
     /// not tell the user two different stories.
     ///
+    /// Two of those six causes — an install in flight, and verified weights
+    /// mid-load — resolve **without the user doing anything**, so they carry
+    /// [`error_code::TIER_WARMING`] and a client renders them as a waiting
+    /// notice rather than a failure. The other four need an answer, a command,
+    /// or different hardware, and keep [`error_code::UNKNOWN_PROVIDER`]. The
+    /// split is made here, next to the classification it depends on, rather
+    /// than by a client re-reading the sentence for keywords — that would be a
+    /// second classifier for one state, which is what LESSON-456 is about.
+    ///
     /// Every branch names the model but never a path (BR-11): the two reason
     /// builders it borrows, [`loading_local_engine_reason`] and
     /// [`no_local_engine_reason`], are the same ones the lifecycle stream
     /// already publishes.
-    fn unserved_turn_reason(&self, config: &Config) -> String {
+    fn unserved_turn_error(&self, config: &Config) -> RpcError {
+        // Every settled cause codes the same way; only the two transient ones
+        // below override it, and each says so at the `return`.
+        let settled = |reason: String| RpcError::new(error_code::UNKNOWN_PROVIDER, reason);
         let has_remote = config.providers.iter().any(|p| p.kind.is_remote());
         // The one clause that is the same in every branch: with a remote
         // provider registered, the turn would have had somewhere to go.
@@ -720,7 +728,7 @@ impl DaemonRuntime {
                     .disabled_reason
                     .clone()
                     .unwrap_or_else(|| "the local tier is unavailable on this machine".to_owned());
-                return format!("{reason}{add_provider}");
+                return settled(format!("{reason}{add_provider}"));
             }
         }
 
@@ -733,48 +741,69 @@ impl DaemonRuntime {
 
         // BR-4: a settled, deliberate absence — not something to wait for.
         if selection.as_ref().is_some_and(|s| s.declined_local) {
-            return format!(
+            return settled(format!(
                 "the local tier was declined, so it will not serve turns; \
                  `teton model set <name>` changes that.{add_provider}"
-            );
+            ));
         }
 
         // Accepted, and the install is in flight right now (M-2's claim is
         // held). Read BEFORE `consent_required()`, which stays true until the
         // weights verify — so during the whole download the fall-through
         // branch would tell the user their accept did nothing.
+        //
+        // Transient (BUG-152): the download finishing is the only thing this
+        // turn was waiting for.
         if selection
             .as_ref()
             .and_then(|s| s.model_name.as_deref())
             .is_some_and(|name| self.consent.install_in_flight(name))
         {
-            return format!("{}{add_provider}", installing_local_model_reason(&model_id));
+            return RpcError::new(
+                error_code::TIER_WARMING,
+                format!("{}{add_provider}", installing_local_model_reason(&model_id)),
+            );
         }
 
         // BR-1: proposed and unanswered. The session runs, the tier does not.
         if self.consent.consent_required() {
-            return format!(
+            return settled(format!(
                 "{model_id} is proposed for this machine but has not been \
                  answered yet, so the local tier is withheld — answer the \
                  prompt (or `teton model list`) to open it.{add_provider}"
-            );
+            ));
         }
 
         // Decided and installed. Either the load is in flight — the window this
         // bug was reported from — or it already failed and left its reason.
         if self.weights_loader_present {
             return match self.engine.load_failure() {
-                Some(reason) => format!("{reason}{add_provider}"),
-                None => format!(
-                    "{}  Retry in a moment.{add_provider}",
-                    loading_local_engine_reason(&model_id)
+                // A load that already failed is settled: retrying the turn
+                // meets the same dead engine, so this is not a "wait" state.
+                Some(reason) => settled(format!("{reason}{add_provider}")),
+                // Transient (BUG-152): the load completing is the only thing
+                // this turn was waiting for.
+                None => RpcError::new(
+                    error_code::TIER_WARMING,
+                    format!(
+                        "{} Retry in a moment.{add_provider}",
+                        loading_local_engine_reason(&model_id)
+                    ),
                 ),
             };
         }
 
-        format!("{}{add_provider}", no_local_engine_reason(&model_id))
+        settled(format!(
+            "{}{add_provider}",
+            no_local_engine_reason(&model_id)
+        ))
     }
 
+    /// Whether the local tier may serve a turn right now.
+    ///
+    /// Two independent conditions: the tier must be *capable* (`local_available`,
+    /// BR-8's latency duty) and it must be *consented to* (REQ-547 BR-1). A
+    /// machine awaiting an answer routes remote-only rather than blocking — the
     /// gate withholds the tier, never the session (D-3).
     #[must_use]
     pub fn local_tier_available(&self) -> bool {
@@ -1319,11 +1348,10 @@ impl DaemonRuntime {
                 // BUG-146: nothing could serve the turn. The daemon knows
                 // exactly why — it published the same fact on the lifecycle
                 // stream moments earlier — so it says so, with the action.
+                // BUG-152: and with the code that says whether there is an
+                // action at all, or only a wait.
                 Err(HarnessError::NoTierAvailable) => {
-                    return Err(RpcError::new(
-                        error_code::UNKNOWN_PROVIDER,
-                        self.unserved_turn_reason(&config),
-                    ));
+                    return Err(self.unserved_turn_error(&config));
                 }
                 // REQ-544 M-3: a credential that will not resolve is a config
                 // problem, not a transient fault — surface it clearly (the
@@ -3238,8 +3266,12 @@ mod tests {
     /// Each case asserts the distinguishing phrase AND refutes the phrase of
     /// the state it is most easily confused with, so collapsing two branches
     /// back into one sentence fails here rather than in a user's terminal.
+    ///
+    /// BUG-152 adds the code to each case: the sentence is what the user
+    /// reads, the code is what the client renders it *as*, and a branch that
+    /// gets one right and the other wrong is exactly the drift this pins.
     #[test]
-    fn unserved_turn_reason_names_the_state_that_actually_applies() {
+    fn unserved_turn_error_names_the_state_that_actually_applies() {
         use crate::model_consent::WeightsInstaller;
         use teton_core::entities::{ModelSelection, SelectionSource};
         use teton_inference::catalog::ModelEntry;
@@ -3315,7 +3347,8 @@ mod tests {
             above_floor: true,
             forced_bench: None,
         });
-        let msg = loading.unserved_turn_reason(&empty_config);
+        let err = loading.unserved_turn_error(&empty_config);
+        let msg = err.message.clone();
         assert!(
             msg.contains("loading and benchmarking"),
             "a loading tier must say so; got: {msg}"
@@ -3328,20 +3361,37 @@ mod tests {
             !msg.contains("could not be loaded") && !msg.contains("no local inference engine"),
             "a tier that is still loading must not be reported as failed or absent; got: {msg}"
         );
+        // BUG-152: waiting is the whole remedy, so this is the code that tells
+        // a client to render a notice rather than a failure.
+        assert_eq!(
+            err.code,
+            error_code::TIER_WARMING,
+            "a tier mid-load is the transient state; got: {msg}"
+        );
 
         // 2. Same machine, but the load already failed: its recorded reason
         //    wins over the loading sentence.
         loading
             .engine
             .record_load_failure(format!("{model}'s weights could not be loaded"));
-        let failed = loading.unserved_turn_reason(&empty_config);
+        let failed = loading.unserved_turn_error(&empty_config);
         assert!(
-            failed.contains("could not be loaded"),
-            "a failed load must surface its own reason; got: {failed}"
+            failed.message.contains("could not be loaded"),
+            "a failed load must surface its own reason; got: {}",
+            failed.message
         );
         assert!(
-            !failed.contains("Retry in a moment"),
-            "a terminal load failure must not tell the user to wait; got: {failed}"
+            !failed.message.contains("Retry in a moment"),
+            "a terminal load failure must not tell the user to wait; got: {}",
+            failed.message
+        );
+        // BUG-152: a dead engine is not a warming one — retrying meets the
+        // same failure, so it must not render as "still loading".
+        assert_eq!(
+            failed.code,
+            error_code::UNKNOWN_PROVIDER,
+            "a failed load is settled, not transient; got: {}",
+            failed.message
         );
 
         // 3. Below the hardware floor: nothing to wait for at all.
@@ -3355,7 +3405,8 @@ mod tests {
             above_floor: false,
             forced_bench: None,
         });
-        let msg = below.unserved_turn_reason(&empty_config);
+        let below_err = below.unserved_turn_error(&empty_config);
+        let msg = below_err.message.clone();
         assert!(
             msg.contains("below the local-tier floor"),
             "the probe's own sentence must survive; got: {msg}"
@@ -3364,11 +3415,17 @@ mod tests {
             !msg.contains("loading"),
             "a disabled tier is never 'loading'; got: {msg}"
         );
+        // BUG-152: no amount of waiting adds RAM to this machine.
+        assert_eq!(
+            below_err.code,
+            error_code::UNKNOWN_PROVIDER,
+            "a machine below the floor has nothing to wait for; got: {msg}"
+        );
 
         // 4. Every branch tells a provider-less machine how to get unstuck.
         for msg in [
-            loading.unserved_turn_reason(&empty_config),
-            below.unserved_turn_reason(&empty_config),
+            loading.unserved_turn_error(&empty_config).message,
+            below.unserved_turn_error(&empty_config).message,
         ] {
             assert!(
                 msg.contains("teton provider add"),
@@ -3380,8 +3437,8 @@ mod tests {
         let selection = ModelSelection::accepted("m", SelectionSource::Probe, 1);
         assert!(!selection.model_name.unwrap_or_default().contains('/'));
         for msg in [
-            loading.unserved_turn_reason(&empty_config),
-            below.unserved_turn_reason(&empty_config),
+            loading.unserved_turn_error(&empty_config).message,
+            below.unserved_turn_error(&empty_config).message,
         ] {
             assert!(
                 !msg.contains('/') || msg.contains("teton provider add"),
@@ -3396,7 +3453,7 @@ mod tests {
     /// the in-flight branch the refusal told exactly this user their proposal
     /// "has not been answered yet" — their accept, apparently lost.
     #[test]
-    fn unserved_turn_reason_during_an_in_flight_install_says_so() {
+    fn unserved_turn_error_during_an_in_flight_install_says_so() {
         use crate::model_consent::{InstallError, WeightsInstaller};
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
@@ -3475,7 +3532,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        let msg = runtime.unserved_turn_reason(&Config::default());
+        let err = runtime.unserved_turn_error(&Config::default());
+        let msg = err.message.clone();
         assert!(
             msg.contains("download/install is running"),
             "a turn refused mid-install must say the install is in flight; got: {msg}"
@@ -3487,6 +3545,12 @@ mod tests {
         assert!(
             msg.contains("teton provider add"),
             "with no remote provider, the message must name the way out; got: {msg}"
+        );
+        // BUG-152: a running download is the other state that ends by itself.
+        assert_eq!(
+            err.code,
+            error_code::TIER_WARMING,
+            "an install in flight is transient; got: {msg}"
         );
 
         drop(release);
