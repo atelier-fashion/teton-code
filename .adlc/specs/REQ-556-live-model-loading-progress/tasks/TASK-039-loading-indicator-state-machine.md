@@ -31,15 +31,21 @@ separated precisely so the logic is testable without the terminal plumbing.
       happening; a tier waiting on the user is not working).
 - [ ] `frame` returns `None` whenever nothing should be drawn, so "hidden" is
       representable and is the default.
-- [ ] `frame` returns a fraction **only** when the observed stage carried byte
-      counts; with `total_bytes: None` it returns motion and no fraction (BR-5).
-- [ ] `frame` contains no elapsed-time or ETA arithmetic. It has no clock input
-      other than `tick`, and `tick` must not be converted to a remaining-time
-      estimate anywhere (BR-5). Assert the rendered string never matches an
-      ETA-shaped pattern for any tick in a long sweep.
-- [ ] Bounded termination: past a tick cap the indicator stops advancing and
-      `frame` yields one static line naming the last stage actually observed
-      (BR-7, ADR-556-3). Test drives a sequence that never reaches `Ready`.
+- [ ] **AC-3 (a)**: `frame` returns a fraction **only** when the observed stage
+      carried byte counts; with `total_bytes: None` it returns motion and no
+      fraction (BR-5).
+- [ ] **AC-3 (b)**: `frame` contains no elapsed-time or ETA arithmetic. It has
+      no clock input other than `tick`, and `tick` must not be converted to a
+      remaining-time estimate anywhere (BR-5). Assert the rendered string never
+      matches an ETA-shaped pattern for any tick in a long sweep.
+- [ ] **AC-3 (c)**: `firstrun::render_lifecycle`'s and `progress_bar`'s existing
+      unit tests pass **unmodified** — this task reuses them and adds no second
+      rendering of any stage (BR-10). A test edited to accommodate this module
+      is a BR-10 violation, not an accommodation.
+- [ ] **AC-6**: bounded termination — past a tick cap the indicator stops
+      advancing and `frame` yields one static line naming the last stage
+      actually observed (BR-7, ADR-556-3). Test drives a sequence that never
+      reaches `Ready`.
 - [ ] The frame sequence advances with `tick` — two different ticks in the
       working state produce different strings (this is what TASK-042's mutation
       check breaks).

@@ -27,6 +27,11 @@ dropped criterion.
 
 ## Acceptance Criteria
 
+- [ ] **AC-1 (pty leg)**: with the daemon in the load window, the indicator is
+      observed *advancing* in the pty transcript — at least two distinct frames,
+      with no line written to the pty's input. TASK-040 covers AC-1 only at unit
+      level against `RecordingSurface`; this is the half that proves it reaches
+      a real terminal.
 - [ ] AC-2: with the tier opening mid-session, `>> local model <id> ready`
       appears in the pty transcript **with no line written to the pty's input**.
       The test must fail against a binary without TASK-038 — verify that
