@@ -1,0 +1,56 @@
+{
+  "req": "REQ-557",
+  "branch": "feat/REQ-557-provider-model-identity-and-default",
+  "startedAt": "2026-08-05T19:19:39Z",
+  "completed": false,
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Create Worktree + Preflight",
+      "completedAt": "2026-08-05T19:19:39Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate the Requirement Spec",
+      "completedAt": "2026-08-05T19:20:53Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-05T19:25:38Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-05T19:29:48Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-557",
+      "branch": "feat/REQ-557-provider-model-identity-and-default",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}

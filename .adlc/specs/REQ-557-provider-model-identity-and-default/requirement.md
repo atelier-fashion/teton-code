@@ -1,7 +1,7 @@
 ---
 id: REQ-557
 title: "Provider model identity and an explicit default provider"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-05
 updated: 2026-08-05
@@ -64,7 +64,7 @@ and adds no new request parameters (REQ-559).
 | ModelProvider | id | string | required, unique — unchanged |
 | ModelProvider | kind | enum(local, openai-compatible, anthropic, custom) | required — unchanged |
 | ModelProvider | endpoint | string (URL) | required for remote kinds — unchanged |
-| ModelProvider | **model** | string | **new**; required for remote kinds — enforced at *validation*, not at deserialization (BR-7). The exact model identifier sent on the wire (e.g. `claude-opus-5`, `deepseek-chat`). Never inferred, never defaulted to the provider id |
+| ModelProvider | **model** | string | **new**; required for remote kinds — enforced by a *non-fatal usability pass*, not by the deserializer and not by `validate()` (BR-7). The exact model identifier sent on the wire (e.g. `claude-opus-5`, `deepseek-chat`). Never inferred, never defaulted to the provider id |
 | ModelProvider | auth_ref | string | unchanged; two providers sharing a vendor MAY share one `auth_ref` |
 | ModelProvider | capabilities | object | unchanged |
 | Config | **default_provider** | Option\<string\> | **new**; FK → ModelProvider.id. `None` is a real state meaning "no default configured", never a literal placeholder |
@@ -139,14 +139,25 @@ No new events and no new RPCs. `config/get`'s `ProviderConfig` projection gains
       a provider-id-shaped model string. Migration never runs twice and never
       guesses.
 
-      **The field must be reachable by the migration.** `ModelProvider` is a
-      serde struct; a `model` declared as a bare required `String` makes every
-      pre-REQ config fail to *deserialize*, and a config that cannot be opened
-      cannot be migrated — the requirement would defeat its own migration and
-      AC-6 would be unimplementable. The field lands deserializable-as-absent
-      (`Option`/`#[serde(default)]`) and BR-1's required-ness is enforced in the
-      **validation** pass that already rejects raw-key-shaped `auth_ref` values
-      (`config.rs:269`), which runs after load and can report by provider id.
+      **The field must be reachable by the migration — at two layers.** First,
+      `ModelProvider` is a serde struct; a `model` declared as a bare required
+      `String` makes every pre-REQ config fail to *deserialize*, and a config
+      that cannot be opened cannot be migrated. The field therefore lands
+      deserializable-as-absent (`Option`/`#[serde(default)]`).
+
+      Second — and this is the layer an earlier draft of this rule got wrong —
+      required-ness must **not** live in `Config::validate()` either.
+      `Config::load` validates internally and the daemon converts a load error
+      into a refusal to start, so a validation-level requirement would still
+      block a pre-REQ config from starting long enough to migrate, and would
+      make a *single* unresolvable provider prevent startup entirely — the
+      opposite of this rule's own "the daemon starts with that provider
+      unusable". Required-ness is therefore enforced by a **non-fatal usability
+      pass** that reports offending providers by id and marks them unroutable,
+      leaving `validate()`'s fail-closed startup posture for genuinely
+      structural errors (duplicate ids, raw keys, a **dangling**
+      `default_provider` — which is invalid rather than merely incomplete,
+      because it names something that does not exist).
 - [ ] BR-8: `default_provider` is **not** a permission to bypass BR-1 of
       REQ-544. Boundary enforcement, session taint pinning, and egress recording
       are unchanged by this REQ; a default provider is a routing convenience,
