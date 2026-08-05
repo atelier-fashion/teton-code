@@ -110,6 +110,41 @@ pub struct ModelProvider {
     pub capabilities: ProviderCapabilities,
 }
 
+impl ModelProvider {
+    /// The model this provider declares it calls, or `None` when it declares
+    /// none — treating a blank or whitespace-only value as no declaration.
+    ///
+    /// **This is the one place that decides what "declared" means** (BUG-155).
+    /// Before it existed, three call sites answered the question separately and
+    /// two of them disagreed: `Config::unusable_providers` and
+    /// `Config::migrate_models` trimmed and treated `""` / `"   "` as absent,
+    /// while `build_router` matched on `Some(_)` alone. A provider with
+    /// `model = " "` was therefore reported unusable at startup, named in the
+    /// turn-failure message, and rendered `UNUSABLE` by `teton provider list`,
+    /// while simultaneously being registered in the router and sending a blank
+    /// model string to a real vendor API.
+    ///
+    /// That is the drift LESSON-456 is about — a state classified by one
+    /// component and acted on by another, with nothing observing the
+    /// disagreement — so the predicate lives on the entity and every caller
+    /// reads it from here.
+    #[must_use]
+    pub fn declared_model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+    }
+
+    /// Whether this provider cannot serve turns because it declares no model
+    /// (REQ-557 ADR-E). Always `false` for the local kind, whose model is owned
+    /// by the REQ-547 consent flow rather than by this field.
+    #[must_use]
+    pub fn is_unusable_for_lacking_a_model(&self) -> bool {
+        self.kind.is_remote() && self.declared_model().is_none()
+    }
+}
+
 /// One row of the phase → provider routing table (System Model:
 /// `RoutingPolicy`). In structured mode this table, not per-prompt heuristics,
 /// determines routing (BR-5).

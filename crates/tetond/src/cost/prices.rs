@@ -215,12 +215,53 @@ mod tests {
         assert_eq!(table.entry("llama-3-70b"), None);
     }
 
+    /// A zero-priced row means "priced, and it costs nothing" — a different
+    /// claim from "we have no price for this" (`None`). The table keeps them
+    /// apart.
+    ///
+    /// BUG-155: this used to assert the property against the bundled table's
+    /// local-tier rows. Those rows are gone — local turns are never metered, so
+    /// they served no purpose, and once lookup keyed on the model alone they
+    /// matched any REMOTE provider declaring the same model name, billing a paid
+    /// gateway call at $0 and crediting it as savings. The property is real, so
+    /// it is now tested against a table built for it.
     #[test]
-    fn local_tier_is_priced_at_zero_not_unpriced() {
-        let table = PriceTable::bundled();
-        // Local is *priced* (present in the table) at 0 — distinct from an
-        // unknown model, which is unpriced (None).
-        assert_eq!(table.price("qwen2.5-coder-3b", 9999, 9999), Some(0));
+    fn a_zero_price_is_priced_not_unpriced() {
+        let table = PriceTable {
+            version: 1,
+            baseline: Baseline {
+                provider_id: "anthropic".to_owned(),
+                model: "claude-opus-4".to_owned(),
+            },
+            models: vec![ModelPrice {
+                provider_id: "promo".to_owned(),
+                model: "free-tier-model".to_owned(),
+                input_usd_micros_per_mtok: 0,
+                output_usd_micros_per_mtok: 0,
+            }],
+        };
+        assert_eq!(table.price("free-tier-model", 9999, 9999), Some(0));
+        assert_eq!(table.price("some-other-model", 9999, 9999), None);
+    }
+
+    /// BUG-155 regression guard: no row in the SHIPPED table may price a model
+    /// at zero.
+    ///
+    /// Lookup is keyed on the model alone, so a zero row applies to every
+    /// provider declaring that model — including a paid remote gateway, which
+    /// would then be reported as free *and* credited with the full baseline as
+    /// savings. If on-device models are ever re-added here, this is the test
+    /// that should stop it.
+    #[test]
+    fn the_bundled_table_prices_nothing_at_zero() {
+        for entry in &PriceTable::bundled().models {
+            assert!(
+                entry.input_usd_micros_per_mtok > 0 || entry.output_usd_micros_per_mtok > 0,
+                "model {:?} is priced at zero; keyed on the model alone that silently \
+                 makes any paid provider declaring it appear free",
+                entry.model
+            );
+        }
     }
 
     #[test]
@@ -256,22 +297,25 @@ mod tests {
     /// a duplicate row per provider — and the second provider silently went
     /// unpriced until somebody noticed and added one.
     #[test]
-    fn two_providers_calling_one_model_price_from_a_single_entry() {
+    fn one_row_backs_every_provider_that_declares_the_model() {
         let table = PriceTable::bundled();
-        // `deepseek-chat` is authored once, under provider id "deepseek". Two
-        // providers — say a direct account and a proxy — both declare it.
-        let direct = table.price("deepseek-chat", 1000, 200);
-        let proxy = table.price("deepseek-chat", 1000, 200);
-        assert_eq!(direct, proxy);
-        assert_eq!(direct, Some(270 + 220));
-        // And exactly one row backs both.
+        // This test used to call `price("deepseek-chat", …)` twice and assert the
+        // results matched — which is true of any pure function and proved
+        // nothing (BUG-155). Lookup takes no provider argument at all any more,
+        // so "two providers price identically" is not expressible here; what IS
+        // checkable, and what the multi-provider story actually rests on, is
+        // that a single row serves the model. The cross-provider claim is tested
+        // where provider ids exist: `report.rs`'s
+        // `two_providers_calling_one_model_are_priced_identically`.
+        assert_eq!(table.price("deepseek-chat", 1000, 200), Some(270 + 220));
         assert_eq!(
             table
                 .models
                 .iter()
                 .filter(|m| m.model == "deepseek-chat")
                 .count(),
-            1
+            1,
+            "one row, so no provider needs a duplicate of it"
         );
     }
 

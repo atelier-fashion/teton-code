@@ -713,7 +713,7 @@ impl DaemonRuntime {
     /// builders it borrows, [`loading_local_engine_reason`] and
     /// [`no_local_engine_reason`], are the same ones the lifecycle stream
     /// already publishes.
-    fn unserved_turn_error(&self, config: &Config) -> RpcError {
+    fn unserved_turn_error(&self, config: &Config, phase: Option<CorePhase>) -> RpcError {
         // Every settled cause codes the same way; only the two transient ones
         // below override it, and each says so at the `return`.
         let settled = |reason: String| RpcError::new(error_code::UNKNOWN_PROVIDER, reason);
@@ -731,7 +731,34 @@ impl DaemonRuntime {
             .filter(|p| p.kind.is_remote() && !unusable.contains(&p.id))
             .map(|p| p.id.as_str())
             .collect();
-        let add_provider = if !unusable.is_empty() {
+        // BUG-155: arm 1 fires only when the unusable set is actually IMPLICATED
+        // — either it is all we have, or the configured default is one of them.
+        // It used to fire whenever any unusable provider existed anywhere, so a
+        // leftover unmigrated provider hijacked the message for unrelated
+        // causes: a turn that failed for want of a `[[routing]]` rule told the
+        // user to re-register a provider that had nothing to do with it, and
+        // doing so changed nothing.
+        let default_is_unusable = config
+            .default_provider
+            .as_ref()
+            .is_some_and(|d| unusable.contains(d));
+        // The turn's own policy is the strongest signal: if THIS phase routes to
+        // a provider that declares no model, that provider is the cause even
+        // when other providers are perfectly healthy. Without this the message
+        // would tell the user their config is fine and point them at
+        // `teton policy show`, while the policy is exactly what is broken.
+        let policy_names_unusable = phase.is_some_and(|ph| {
+            config.routing.iter().any(|r| {
+                r.phase == ph
+                    && (unusable.contains(&r.provider_id)
+                        || r.fallback_id
+                            .as_ref()
+                            .is_some_and(|fb| unusable.contains(fb)))
+            })
+        });
+        let unusable_is_implicated = !unusable.is_empty()
+            && (usable_remote.is_empty() || default_is_unusable || policy_names_unusable);
+        let add_provider = if unusable_is_implicated {
             // REQ-557 ADR-E, router half. A remote provider with no declared
             // model is a *usability* condition, so the daemon started — that is
             // the whole point of keeping the rule out of `validate()`. The
@@ -1112,10 +1139,42 @@ impl DaemonRuntime {
 
     /// Apply a `config/set` mutation, validate, and persist it.
     ///
+    /// ## Registration is stricter than loading, deliberately (BUG-155)
+    ///
+    /// REQ-557 AC-2 requires that a remote provider cannot be registered without
+    /// a model, and that rule originally lived only in `teton provider add`. But
+    /// `config/set` is a first-class protocol surface — the acceptance suite's
+    /// own helper drives it — so every non-`teton` ACP client bypassed the check,
+    /// persisted a modelless provider, got no warning, and put the provider's id
+    /// on the wire as a model on the very next turn.
+    ///
+    /// The check belongs *here* rather than in `Config::validate` and the
+    /// distinction is ADR-E's: **loading** a config that already contains a
+    /// modelless provider must stay permissive, or a pre-REQ config cannot boot
+    /// far enough to be migrated. **Registering a new one** is a fresh user
+    /// action with no legacy to honour, so it fails closed.
+    ///
     /// # Errors
-    /// Returns a [`RpcError`] (code `CONFIG_REJECTED`) if the resulting config
-    /// fails validation (e.g. a raw key in `auth_ref`, BR-7).
+    /// Returns a [`RpcError`] (code `CONFIG_REJECTED`) if the update would
+    /// register a remote provider with no declared model, or if the resulting
+    /// config fails validation (e.g. a raw key in `auth_ref`, BR-7).
     pub fn apply_config_update(&self, update: ConfigUpdate) -> Result<(), RpcError> {
+        if let ConfigUpdate::RegisterProvider(pc) = &update {
+            let kind = to_core_kind(pc.kind);
+            let declared = pc.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+            if kind.is_remote() && declared.is_none() {
+                return Err(RpcError::new(
+                    error_code::CONFIG_REJECTED,
+                    format!(
+                        "provider '{}' is a remote provider and must declare the model it \
+                         calls: send `model` with the registration (e.g. \
+                         `teton provider add {} --model <name>`). The model is never inferred \
+                         from the provider id.",
+                        pc.id.0, pc.id.0
+                    ),
+                ));
+            }
+        }
         let mut config = self.config.lock().expect("config mutex poisoned");
         let mut candidate = config.clone();
         apply_update(&mut candidate, update);
@@ -1123,8 +1182,14 @@ impl DaemonRuntime {
             .validate()
             .map_err(|e| RpcError::new(error_code::CONFIG_REJECTED, e.to_string()))?;
         if let Some(path) = &self.config_path {
-            if let Ok(toml) = candidate.to_toml() {
-                let _ = std::fs::write(path, toml);
+            // BUG-155: atomic, like every other durable write in this daemon.
+            if let Err(err) = write_config_atomically(path, &candidate) {
+                return Err(RpcError::new(
+                    error_code::CONFIG_REJECTED,
+                    format!(
+                        "the configuration change could not be saved ({err}); nothing was applied."
+                    ),
+                ));
             }
         }
         *config = candidate;
@@ -1400,7 +1465,7 @@ impl DaemonRuntime {
                 // BUG-152: and with the code that says whether there is an
                 // action at all, or only a wait.
                 Err(HarnessError::NoTierAvailable) => {
-                    return Err(self.unserved_turn_error(&config));
+                    return Err(self.unserved_turn_error(&config, core_phase));
                 }
                 // REQ-544 M-3: a credential that will not resolve is a config
                 // problem, not a transient fault — surface it clearly (the
@@ -1507,10 +1572,22 @@ impl DaemonRuntime {
         // when no providers are registered — so this is "nothing is configured
         // and the tier is not live", never an engine fault (BUG-146).
         let provider_cfg = provider_cfg.ok_or(HarnessError::NoTierAvailable)?;
-        let model = route
-            .model
-            .clone()
-            .unwrap_or_else(|| provider_cfg.id.clone());
+        // BUG-155 / REQ-557 BR-1: a remote route with no model does NOT fall back
+        // to the provider id. That fallback was `billing_model`'s, it was
+        // supposed to be deleted rather than relocated, and it was live: a
+        // provider the router deliberately refused to register could still be
+        // reached through `default_provider`, through a policy `fallback_id`, or
+        // through `config/set register_provider` — and this line then put the
+        // provider's own id on the wire as the model, billed it, and named it in
+        // `teton cost` as a model needing a price.
+        //
+        // The route not carrying a model means no usable provider was selected,
+        // which is exactly `NoTierAvailable`'s meaning — so this reuses
+        // `unserved_turn_error`'s existing classifier (BR-5) and the user gets
+        // the sentence naming the unusable provider and the `--model` remedy.
+        let Some(model) = route.model.clone() else {
+            return Err(HarnessError::NoTierAvailable);
+        };
         let caps = CapabilityProfile::from_core(provider_cfg.capabilities);
         let provider: Box<dyn Provider> = build_provider(provider_cfg, caps);
 
@@ -1598,6 +1675,50 @@ fn load_config(path: Option<&Path>) -> anyhow::Result<Config> {
     }
 }
 
+/// Serialize `config` and replace `path` with it **atomically** — a sibling temp
+/// file, flushed to disk, then renamed over the target.
+///
+/// BUG-155. The previous `std::fs::write` truncated the user's config in place.
+/// That is not merely untidy, it is fail-OPEN: every `Config` field is
+/// `#[serde(default)]`, so a zero-length or truncated file still *loads*, and
+/// because `providers` serializes before `boundaries`, a partial write is very
+/// likely to be valid TOML carrying the user's remote providers and none of
+/// their `local-only` privacy boundaries. The daemon would then start, report
+/// nothing, and route turns remotely with boundary enforcement silently gone —
+/// which is precisely the outcome `load_config`'s refusal-to-start exists to
+/// prevent, reached through a different door.
+///
+/// REQ-557 is what made this urgent: the migration turned this from a write
+/// behind an explicit user action into an unattended write on the first start
+/// after upgrade, for every existing install. Same shape as
+/// [`crate::selection_store`]'s `write_atomically`.
+///
+/// # Errors
+/// Returns the underlying I/O or serialization error. The caller decides
+/// whether that is fatal; the on-disk file is left untouched either way.
+fn write_config_atomically(path: &Path, config: &Config) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let text = config.to_toml()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("toml.tmp");
+    {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        // Durability before visibility: without the sync, the rename can land
+        // while the contents are still only in the page cache, so a power loss
+        // yields an empty file under the real name — the exact fail-open state
+        // this function exists to prevent.
+        file.sync_all()?;
+    }
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })?;
+    Ok(())
+}
+
 /// Run the one-shot REQ-557 model migration on a freshly loaded config, persist
 /// the result, and report at startup every provider that is still unusable.
 ///
@@ -1645,26 +1766,73 @@ fn migrate_and_report_provider_models(
             .filter(|id| !unresolved.contains(id))
             .map(String::as_str)
             .collect();
+
+        // BUG-155: `default_provider` needs migrating too, and nothing did it.
+        //
+        // REQ-557 deleted `build_router`'s positional `.find(is_remote)` default
+        // and added an explicit key — but shipped no migration for it, so every
+        // pre-REQ config arrived with `default_provider` unset. On a machine with
+        // a local tier that is silent, not loud: `resolve_freeform` hands the
+        // coding turn to the local model and the session completes, so a user
+        // whose freeform turns went to DeepSeek yesterday gets a 3B local answer
+        // today with no error to explain it. REQ-557's own value — "must not
+        // silently route somewhere the user never chose" — pointing the other way.
+        //
+        // So the same one-shot pass writes down the default the pre-REQ binary
+        // would have computed: the first remote provider in array order. That is
+        // deliberately the deleted derivation — reproducing it ONCE, visibly, as
+        // an explicit key the user can see and change is the whole point (it is
+        // ADR-C's argument for models, applied to the default). It is not a
+        // runtime fallback: nothing re-derives it after this.
+        //
+        // Gated on `!pending.is_empty()`, i.e. only for a config that was
+        // demonstrably pre-REQ. A post-REQ config with no default keeps none —
+        // OQ-3's "no implicit default" holds for everyone who was never migrated.
+        let migrated_default = if config.default_provider.is_none() {
+            let first_remote = config
+                .providers
+                .iter()
+                .find(|p| p.kind.is_remote() && p.declared_model().is_some())
+                .map(|p| p.id.clone());
+            if let Some(id) = first_remote {
+                config.default_provider = Some(id.clone());
+                Some(id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Only a migration that actually changed something rewrites the file.
         // A config where nothing resolved is left byte-for-byte alone.
-        if !migrated.is_empty() {
-            eprintln!(
-                "tetond: migrated {} provider(s) to a declared model (REQ-557): {}. \
-                 The model each provider calls is now recorded in the config rather than \
-                 inferred from the price table.",
-                migrated.len(),
-                migrated.join(", ")
-            );
+        if !migrated.is_empty() || migrated_default.is_some() {
+            if !migrated.is_empty() {
+                eprintln!(
+                    "tetond: migrated {} provider(s) to a declared model (REQ-557): {}. \
+                     The model each provider calls is now recorded in the config rather than \
+                     inferred from the price table.",
+                    migrated.len(),
+                    migrated.join(", ")
+                );
+            }
+            if let Some(id) = &migrated_default {
+                eprintln!(
+                    "tetond: set `default_provider = \"{id}\"` — the provider this config was \
+                     already defaulting to by position. It is now an explicit choice you can \
+                     change; freeform turns with no matching policy route to it."
+                );
+            }
             // A missing config path (a defaulted config) or a config that will
             // not serialize falls through silently: the in-memory migration
             // still stands for this session, and the absence guard makes a
             // re-run on the next start harmless.
-            if let (Some(path), Ok(toml)) = (path, config.to_toml()) {
-                if let Err(err) = std::fs::write(path, toml) {
+            if let Some(path) = path {
+                if let Err(err) = write_config_atomically(path, config) {
                     eprintln!(
-                        "tetond: WARNING — the model migration could not be saved ({}), so it \
-                         will run again on the next start. Routing this session is unaffected.",
-                        err.kind()
+                        "tetond: WARNING — the model migration could not be saved ({err}), so it \
+                         will run again on the next start. Your existing config file is \
+                         unchanged and routing this session is unaffected."
                     );
                 }
             }
@@ -2869,8 +3037,19 @@ fn build_router(
         // unbilled, so the id doubles as the attribution label — this is not the
         // price-table derivation ADR-A deletes, and REQ-557 OQ-4 governs whether
         // the consent selection is eventually mirrored here.
-        let model = match (p.model.clone(), p.kind) {
+        // BUG-155: ask the ENTITY what "declared" means rather than re-deriving
+        // it from `Option`. This arm used to match `Some(_)`, which disagreed
+        // with `unusable_providers()`/`migrate_models()` on a blank model — so a
+        // provider reported unusable at startup was registered here anyway and
+        // sent `"model": ""` to a real vendor API.
+        let model = match (p.declared_model().map(str::to_owned), p.kind) {
             (Some(model), _) => model,
+            // A LOCAL provider is different and must NOT be skipped: its model is
+            // owned by the REQ-547 consent flow, so `None` there is the normal
+            // state rather than an unmigrated one. Dropping it would remove a
+            // config-declared local tier from the router entirely, and a
+            // `[[routing]]` policy naming it could no longer select it. Local
+            // calls are unbilled, so the id doubles as the attribution label.
             (None, ProviderKind::Local) => p.id.clone(),
             (None, _) => continue,
         };
@@ -2988,13 +3167,27 @@ fn snapshot_from_config(config: &Config) -> ConfigSnapshot {
 fn apply_update(config: &mut Config, update: ConfigUpdate) {
     match update {
         ConfigUpdate::RegisterProvider(pc) => {
+            let id = pc.id.0;
+            // BUG-155: re-registering an existing id keeps the capability
+            // profile that entry already carried. `ProviderCapabilities` is not
+            // settable over this RPC at all, so replacing wholesale silently
+            // reset a hand-authored `[providers.capabilities]` table to the
+            // default — and REQ-557's own remedy message ("re-register with
+            // `--model`") is what sends users down this path. A provider pinned
+            // to the degraded tool-calling tier (BR-6) would come back Native
+            // and get the full tool loop it was explicitly excluded from.
+            let capabilities = config
+                .providers
+                .iter()
+                .find(|p| p.id == id)
+                .map_or_else(ProviderCapabilities::default, |p| p.capabilities);
             let provider = ModelProvider {
-                id: pc.id.0,
+                id,
                 kind: to_core_kind(pc.kind),
                 endpoint: pc.endpoint,
                 model: pc.model,
                 auth_ref: pc.auth_ref,
-                capabilities: ProviderCapabilities::default(),
+                capabilities,
             };
             if let Some(existing) = config.providers.iter_mut().find(|p| p.id == provider.id) {
                 *existing = provider;
@@ -3523,7 +3716,7 @@ mod tests {
             above_floor: true,
             forced_bench: None,
         });
-        let err = loading.unserved_turn_error(&empty_config);
+        let err = loading.unserved_turn_error(&empty_config, None);
         let msg = err.message.clone();
         assert!(
             msg.contains("loading and benchmarking"),
@@ -3550,7 +3743,7 @@ mod tests {
         loading
             .engine
             .record_load_failure(format!("{model}'s weights could not be loaded"));
-        let failed = loading.unserved_turn_error(&empty_config);
+        let failed = loading.unserved_turn_error(&empty_config, None);
         assert!(
             failed.message.contains("could not be loaded"),
             "a failed load must surface its own reason; got: {}",
@@ -3581,7 +3774,7 @@ mod tests {
             above_floor: false,
             forced_bench: None,
         });
-        let below_err = below.unserved_turn_error(&empty_config);
+        let below_err = below.unserved_turn_error(&empty_config, None);
         let msg = below_err.message.clone();
         assert!(
             msg.contains("below the local-tier floor"),
@@ -3600,8 +3793,8 @@ mod tests {
 
         // 4. Every branch tells a provider-less machine how to get unstuck.
         for msg in [
-            loading.unserved_turn_error(&empty_config).message,
-            below.unserved_turn_error(&empty_config).message,
+            loading.unserved_turn_error(&empty_config, None).message,
+            below.unserved_turn_error(&empty_config, None).message,
         ] {
             assert!(
                 msg.contains("teton provider add"),
@@ -3613,8 +3806,8 @@ mod tests {
         let selection = ModelSelection::accepted("m", SelectionSource::Probe, 1);
         assert!(!selection.model_name.unwrap_or_default().contains('/'));
         for msg in [
-            loading.unserved_turn_error(&empty_config).message,
-            below.unserved_turn_error(&empty_config).message,
+            loading.unserved_turn_error(&empty_config, None).message,
+            below.unserved_turn_error(&empty_config, None).message,
         ] {
             assert!(
                 !msg.contains('/') || msg.contains("teton provider add"),
@@ -3708,7 +3901,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        let err = runtime.unserved_turn_error(&Config::default());
+        let err = runtime.unserved_turn_error(&Config::default(), None);
         let msg = err.message.clone();
         assert!(
             msg.contains("download/install is running"),
@@ -4151,6 +4344,185 @@ mod tests {
             route.reason.contains("default"),
             "the reason must name the missing default (BR-5): {route:?}"
         );
+    }
+
+    /// BUG-155 (mutation check): changing `build_router`'s
+    /// `(None, ProviderKind::Local) => p.id.clone()` arm to `continue` left the
+    /// whole suite green, despite the nine-line comment defending that arm.
+    ///
+    /// Nothing tested it because every e2e fixture gets its local tier from
+    /// `TETON_LOCAL_SCRIPT` rather than from a `[[providers]]` entry, so the arm
+    /// never fired. A config that *does* declare the local tier and routes a
+    /// phase to it must still be able to select it — otherwise the local tier
+    /// silently stops being routable by policy.
+    #[test]
+    fn a_config_declared_local_provider_stays_routable() {
+        let config = Config {
+            providers: vec![ModelProvider {
+                id: "on-device".to_owned(),
+                kind: ProviderKind::Local,
+                endpoint: None,
+                // Normal for the local kind: REQ-547's consent flow owns it.
+                model: None,
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            }],
+            routing: vec![RoutingPolicy {
+                phase: CorePhase::Io,
+                provider_id: "on-device".to_owned(),
+                fallback_id: None,
+            }],
+            ..Config::default()
+        };
+
+        let route = build_router(&config, true, &BTreeMap::new()).resolve_structured(CorePhase::Io);
+        assert_eq!(
+            route.provider_id.as_ref().map(|p| p.0.as_str()),
+            Some("on-device"),
+            "a declared local provider must remain selectable by policy: {route:?}"
+        );
+        // Local calls are unbilled, so the id doubles as the attribution label.
+        assert_eq!(route.model.as_deref(), Some("on-device"));
+    }
+
+    /// BUG-155: a REMOTE provider whose model is blank never enters the router.
+    ///
+    /// `unusable_providers()` already called this unusable — it trims — while
+    /// `build_router` matched on `Some(_)` and registered it anyway. The daemon
+    /// therefore told the user the provider could not serve turns while it was
+    /// serving them, with `"model": ""` on the wire.
+    #[test]
+    fn a_blank_model_keeps_a_remote_provider_out_of_the_router() {
+        let config = Config {
+            providers: vec![ModelProvider {
+                id: "blank".to_owned(),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
+                model: Some("   ".to_owned()),
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            }],
+            routing: vec![RoutingPolicy {
+                phase: CorePhase::Implement,
+                provider_id: "blank".to_owned(),
+                fallback_id: None,
+            }],
+            ..Config::default()
+        };
+        // The classifier and the router must agree that this provider is unusable.
+        assert_eq!(config.unusable_providers(), vec!["blank"]);
+        let route =
+            build_router(&config, false, &BTreeMap::new()).resolve_structured(CorePhase::Implement);
+        assert_eq!(
+            route.provider_id, None,
+            "a provider reported unusable must not be routable: {route:?}"
+        );
+    }
+
+    /// BUG-155: a `default_provider` naming a registered-but-unusable provider is
+    /// treated as no default at all, rather than yielding a route whose model is
+    /// `None` (which downstream turned into the provider id on the wire).
+    #[test]
+    fn a_default_provider_that_is_unusable_is_not_routable() {
+        let config = Config {
+            default_provider: Some("broken".to_owned()),
+            providers: vec![ModelProvider {
+                id: "broken".to_owned(),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
+                model: None,
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            }],
+            ..Config::default()
+        };
+        // Validation accepts it on purpose: BR-6 checks the id is REGISTERED, and
+        // ADR-E keeps usability out of validation so a pre-REQ config can boot.
+        assert!(config.validate().is_ok());
+
+        let router = build_router(&config, false, &BTreeMap::new());
+        assert_eq!(router.default_provider(), Some("broken"));
+        let route = router.resolve_freeform("implement the parser");
+        assert_eq!(
+            route.provider_id, None,
+            "an unusable default must not be selected: {route:?}"
+        );
+        assert_eq!(
+            route.model, None,
+            "and it must carry no model for anything downstream to fall back from"
+        );
+    }
+
+    /// BUG-155: the unusable-provider arm of `unserved_turn_error` fires only
+    /// when the unusable set is actually implicated.
+    ///
+    /// It used to fire whenever any unusable provider existed anywhere, so a
+    /// leftover unmigrated provider hijacked the message for causes that had
+    /// nothing to do with it — telling the user to re-register a provider whose
+    /// re-registration would change nothing.
+    #[test]
+    fn the_unusable_arm_fires_only_when_the_unusable_provider_is_implicated() {
+        let runtime = DaemonRuntime::minimal();
+        let with_stale_and_good = Config {
+            default_provider: Some("good".to_owned()),
+            providers: vec![
+                ModelProvider {
+                    id: "good".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some("https://api.example.com/v1".to_owned()),
+                    model: Some("deepseek-chat".to_owned()),
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                },
+                ModelProvider {
+                    id: "stale".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some("https://api.other.com/v1".to_owned()),
+                    model: None,
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                },
+            ],
+            ..Config::default()
+        };
+
+        // No policy for this phase: the cause is the missing routing rule, not
+        // `stale`. The message must not send the user after `stale`.
+        let unrelated = runtime.unserved_turn_error(&with_stale_and_good, Some(CorePhase::Review));
+        assert!(
+            !unrelated.message.contains("stale"),
+            "an unrelated failure must not blame an unusable provider: {}",
+            unrelated.message
+        );
+
+        // Now the phase's policy names `stale` — it IS the cause, and is named.
+        let mut policy_names_stale = with_stale_and_good.clone();
+        policy_names_stale.routing.push(RoutingPolicy {
+            phase: CorePhase::Review,
+            provider_id: "stale".to_owned(),
+            fallback_id: None,
+        });
+        let implicated = runtime.unserved_turn_error(&policy_names_stale, Some(CorePhase::Review));
+        assert!(
+            implicated.message.contains("stale") && implicated.message.contains("--model"),
+            "a turn routed to an unusable provider must name it and the remedy: {}",
+            implicated.message
+        );
+    }
+
+    /// The empty-machine arm still fires for a config with no providers at all —
+    /// pinned because BUG-155 added branches ahead of it in the chain.
+    #[test]
+    fn an_empty_config_still_reports_that_no_remote_provider_is_configured() {
+        let runtime = DaemonRuntime::minimal();
+        let message = runtime
+            .unserved_turn_error(&Config::default(), None)
+            .message;
+        assert!(
+            message.contains("No remote provider is configured either"),
+            "{message}"
+        );
+        assert!(!message.contains("default_provider"), "{message}");
     }
 
     fn two_provider_spec_config() -> Config {

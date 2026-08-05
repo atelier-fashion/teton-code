@@ -338,12 +338,47 @@ mod tests {
         assert!(!report.unpriced.models.contains("claude-opus-4"));
     }
 
+    /// A minimal table: one frontier row (so the baseline resolves) and one
+    /// genuinely zero-priced row. For tests that need the priced-at-zero vs.
+    /// unpriced distinction without depending on the shipped table's contents.
+    fn zero_priced_table() -> PriceTable {
+        use crate::cost::prices::{Baseline, ModelPrice};
+        PriceTable {
+            version: 1,
+            baseline: Baseline {
+                provider_id: "anthropic".to_owned(),
+                model: "claude-opus-4".to_owned(),
+            },
+            models: vec![
+                ModelPrice {
+                    provider_id: "anthropic".to_owned(),
+                    model: "claude-opus-4".to_owned(),
+                    input_usd_micros_per_mtok: 15_000_000,
+                    output_usd_micros_per_mtok: 75_000_000,
+                },
+                ModelPrice {
+                    provider_id: "promo".to_owned(),
+                    model: "free-tier-model".to_owned(),
+                    input_usd_micros_per_mtok: 0,
+                    output_usd_micros_per_mtok: 0,
+                },
+            ],
+        }
+    }
+
     /// REQ-557 AC-7: an unpriced call is recorded as unpriced, never as a
     /// zero-cost one. The distinction is the whole of BR-9 — a `$0` record reads
     /// as "this was free", which is a claim the meter has no basis for.
     #[test]
     fn an_unpriced_call_is_never_folded_in_as_zero_cost() {
-        let prices = PriceTable::bundled();
+        // The zero-priced entry is built here rather than borrowed from the
+        // bundled table: the distinction under test is "priced at zero" vs "no
+        // price at all", and it must hold for ANY table, not only for whichever
+        // rows happen to ship today. BUG-155 removed the local rows this test
+        // used to lean on — they were never used for local traffic (which is
+        // unmetered) and, keyed on the model alone, they silently priced remote
+        // gateways at zero.
+        let prices = zero_priced_table();
         let rows = vec![
             row(
                 "s1",
@@ -354,15 +389,15 @@ mod tests {
                 1_000_000,
                 None,
             ),
-            // A genuinely free call: local IS in the table, priced at zero.
+            // A genuinely free call: the model IS in the table, priced at zero.
             row(
                 "s1",
                 None,
-                "local",
-                "qwen2.5-coder-3b",
+                "promo",
+                "free-tier-model",
                 1000,
                 500,
-                prices.price("qwen2.5-coder-3b", 1000, 500),
+                prices.price("free-tier-model", 1000, 500),
             ),
         ];
         let report = aggregate(&rows, &prices);
@@ -370,12 +405,15 @@ mod tests {
         // Both contribute zero dollars, but for opposite reasons, and the report
         // keeps them apart: one is priced-at-zero, the other has no price at all.
         assert_eq!(report.total.usd_micros, 0);
-        assert_eq!(report.total.priced_calls, 1, "the local call IS priced");
+        assert_eq!(
+            report.total.priced_calls, 1,
+            "the zero-priced call IS priced"
+        );
         assert_eq!(report.total.unpriced_calls, 1);
         assert_eq!(report.unpriced.calls, 1);
         assert!(report.unpriced.models.contains("llama-3-70b"));
         assert!(
-            !report.unpriced.models.contains("qwen2.5-coder-3b"),
+            !report.unpriced.models.contains("free-tier-model"),
             "a model priced at zero is priced, not unpriced"
         );
         // The unpriced call's huge token volume never reaches the savings
@@ -445,7 +483,7 @@ mod tests {
     #[test]
     fn aggregates_by_session_phase_and_provider() {
         let prices = PriceTable::bundled();
-        // Two priced calls (opus review + local implement) and one unpriced.
+        // Two priced calls (opus review + cheap-remote implement) and one unpriced.
         let rows = vec![
             row(
                 "s1",
@@ -459,11 +497,11 @@ mod tests {
             row(
                 "s1",
                 Some(Phase::Implement),
-                "local",
-                "qwen2.5-coder-3b",
+                "deepseek",
+                "deepseek-chat",
                 4000,
                 2000,
-                prices.price("qwen2.5-coder-3b", 4000, 2000),
+                prices.price("deepseek-chat", 4000, 2000),
             ),
             row(
                 "s2",
@@ -502,31 +540,36 @@ mod tests {
 
         // Per-provider grouping.
         let providers: Vec<&str> = report.per_provider.iter().map(|g| g.key.as_str()).collect();
-        assert_eq!(providers, vec!["anthropic", "local", "some-vllm"]); // sorted
+        assert_eq!(providers, vec!["anthropic", "deepseek", "some-vllm"]); // sorted
     }
 
     #[test]
     fn savings_reprices_priced_volume_at_the_frontier() {
         let prices = PriceTable::bundled();
-        // One local (free) implement call — the routing-savings story.
-        let local_cost = prices.price("qwen2.5-coder-3b", 10_000, 5000);
+        // One CHEAP REMOTE implement call — the routing-savings story. This was a
+        // local call priced from a $0 row until BUG-155 removed those rows (local
+        // turns are never metered, and keyed on the model alone the rows priced
+        // any remote provider declaring that model at zero). A genuinely cheap
+        // remote call tests the same claim and is the case the estimate exists for.
+        let cheap_cost = prices.price("deepseek-chat", 10_000, 5000);
         let rows = vec![row(
             "s1",
             Some(Phase::Implement),
-            "local",
-            "qwen2.5-coder-3b",
+            "deepseek",
+            "deepseek-chat",
             10_000,
             5000,
-            local_cost,
+            cheap_cost,
         )];
         let report = aggregate(&rows, &prices);
 
-        // Actual: local is priced at 0.
-        assert_eq!(report.savings.actual_usd_micros, 0);
-        // Baseline: 10k in + 5k out at Opus ($15/$75 per Mtok).
+        // Actual: deepseek-chat at $0.27/$1.10 per Mtok.
+        //   10_000 * 0.27 + 5_000 * 1.10 = 2_700 + 5_500 = 8_200 micro-USD
+        assert_eq!(report.savings.actual_usd_micros, 8_200);
+        // Baseline: the same volume at Opus ($15/$75 per Mtok).
         //   10_000 * 15 + 5_000 * 75 = 150_000 + 375_000 = 525_000 micro-USD
         assert_eq!(report.savings.baseline_usd_micros, 525_000);
-        assert_eq!(report.savings.savings_usd_micros, 525_000);
+        assert_eq!(report.savings.savings_usd_micros, 525_000 - 8_200);
         assert_eq!(report.savings.priced_calls, 1);
         assert_eq!(report.savings.baseline_model, "anthropic/claude-opus-4");
     }

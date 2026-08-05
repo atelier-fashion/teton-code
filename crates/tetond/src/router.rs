@@ -268,7 +268,19 @@ impl Router {
         // and, failing that, minted the literal id "local" — the doubled fallback
         // that produced BUG-146. A freeform turn with no default and no usable
         // local tier now says so instead of naming a provider registered nowhere.
-        let Some(default_provider_id) = self.default_provider.clone() else {
+        // BUG-155: a `default_provider` naming a provider the router refused to
+        // register (remote, no declared model — ADR-E) is treated exactly like an
+        // absent one, and falls into the branch below. `Config::validate` accepts
+        // such a config on purpose (BR-6 checks the id is REGISTERED, and ADR-E
+        // keeps usability out of validation so a pre-REQ config can still boot),
+        // so this is the layer that has to notice. Reusing the no-default branch
+        // rather than adding a second one keeps one classifier for one state
+        // (BR-5, LESSON-456).
+        let usable_default = self
+            .default_provider
+            .clone()
+            .filter(|id| self.is_routable(id));
+        let Some(default_provider_id) = usable_default else {
             // The local tier can still serve an auxiliary duty on its own; only a
             // coding turn genuinely needs the default. Rather than re-implement
             // the duty split here, fall back to local when it is available and
@@ -292,8 +304,9 @@ impl Router {
                         provider_id: Some(ProviderId::from(local.as_str())),
                         phase: None,
                         reason: format!(
-                            "{} No default provider is configured, so a coding turn stays local \
-                             too; set `default_provider` to route one remotely.",
+                            "{} No usable default provider is configured, so a coding turn stays \
+                             local too; set `default_provider` to a provider that declares a \
+                             `model` to route one remotely.",
                             decision.reason
                         ),
                         outcome: RouteOutcome::Fallback,
@@ -304,9 +317,9 @@ impl Router {
                     harness: HarnessConfig::default(),
                     provider_id: None,
                     phase: None,
-                    reason: "No default provider is configured and the local tier cannot serve \
-                             this turn. Register a provider with `teton provider add` and set \
-                             `default_provider` to its id."
+                    reason: "No usable default provider is configured and the local tier \
+                             cannot serve this turn. Register a provider with `teton provider add \
+                             <id> --model <name>` and set `default_provider` to its id."
                         .to_owned(),
                     outcome: RouteOutcome::NoPolicy,
                 },
@@ -545,14 +558,32 @@ impl Router {
             .map_or(ProviderHealth::Unavailable, |p| p.health)
     }
 
+    /// Whether `provider_id` is actually routable — i.e. it entered the provider
+    /// map at construction.
+    ///
+    /// `build_router` deliberately skips a remote provider that declares no
+    /// model (REQ-557 ADR-E), so map membership IS the usability check. Policy
+    /// evaluation gets this for free because `health_of` reports an unmapped id
+    /// as `Unavailable`; the two paths below read a provider id straight out of
+    /// config and so have to ask explicitly (BUG-155).
+    fn is_routable(&self, provider_id: &str) -> bool {
+        self.providers.contains_key(provider_id)
+    }
+
     /// The configured fallback provider for `phase`'s policy, when the primary
     /// (`failed`) is the one that failed. Freeform (no phase) has no policy
     /// fallback.
+    ///
+    /// BUG-155: the fallback id is read straight from the policy, so — unlike the
+    /// primary, which `evaluate` screens through `health_of` — it has to be
+    /// screened here. Without this, a mid-turn failure could fail over to a
+    /// provider the router refused to register, and the turn would egress to it
+    /// with the provider id as its model.
     fn fallback_for(&self, phase: Option<CorePhase>, failed: &str) -> Option<String> {
         let phase = phase?;
         let policy = self.policies.iter().find(|p| p.phase == phase)?;
         if policy.provider_id == failed {
-            policy.fallback_id.clone()
+            policy.fallback_id.clone().filter(|fb| self.is_routable(fb))
         } else {
             None
         }
@@ -611,6 +642,54 @@ fn to_protocol_failure_class(class: FailureClass) -> ProtoFailureClass {
 mod tests {
     use super::*;
     use teton_core::ToolCallTier;
+
+    /// BUG-155: a policy `fallback_id` naming a provider the router never
+    /// registered is not failed over to.
+    ///
+    /// Pinned HERE, at the router, rather than only through an end-to-end
+    /// "no bytes reached the provider" assertion. Those two guards — screening
+    /// the fallback, and refusing a remote route that carries no model — mask
+    /// each other: with either one in place the traffic assertion still passes,
+    /// so mutating either alone looked safe. Defence in depth is fine; two
+    /// guards with no independent coverage is not (LESSON-483's shape, one layer
+    /// over). This test fails if the screen is removed, whatever the backstop does.
+    #[test]
+    fn a_fallback_to_an_unregistered_provider_is_not_taken() {
+        use teton_providers::FailureClass;
+
+        let router = Router::new(
+            vec![RoutingPolicy {
+                phase: CorePhase::Implement,
+                provider_id: "primary".to_owned(),
+                fallback_id: Some("unusable".to_owned()),
+            }],
+            None,
+            None,
+        )
+        // Only the primary is registered. `build_router` skips a remote provider
+        // that declares no model (ADR-E), so "unusable" being absent from the
+        // map is exactly what that looks like from here.
+        .with_provider(
+            "primary",
+            "deepseek-chat",
+            native(),
+            ProviderHealth::Healthy,
+        );
+
+        let outcome = router.on_provider_failure(
+            Some(CorePhase::Implement),
+            "primary",
+            FailureClass::MalformedResponse,
+        );
+
+        assert!(
+            outcome.route.is_none(),
+            "a turn must not fail over to a provider the router considers \
+             unusable — its context would egress to an endpoint the daemon told \
+             the user could not serve turns: {:?}",
+            outcome.route
+        );
+    }
 
     fn native() -> CapabilityProfile {
         CapabilityProfile {
