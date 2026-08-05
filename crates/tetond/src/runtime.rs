@@ -4321,6 +4321,9 @@ mod tests {
                 capabilities: ProviderCapabilities::default(),
             }],
             routing: Vec::new(),
+            tiers: Vec::new(),
+            categories: Vec::new(),
+            judgment_default: teton_core::JudgmentCategory::default(),
             boundaries: Vec::new(),
             mcp_server: Vec::new(),
         };
@@ -4553,6 +4556,9 @@ mod tests {
                 provider_id: "anthropic".to_owned(),
                 fallback_id: Some("deepseek".to_owned()),
             }],
+            tiers: Vec::new(),
+            categories: Vec::new(),
+            judgment_default: teton_core::JudgmentCategory::default(),
             boundaries: Vec::new(),
             mcp_server: Vec::new(),
         }

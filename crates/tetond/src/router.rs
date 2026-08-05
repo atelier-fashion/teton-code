@@ -31,6 +31,7 @@
 
 use std::collections::BTreeMap;
 
+use teton_core::category::{Category as CoreCategory, CategoryResolution, Tier as CoreTier};
 use teton_core::entities::RoutingPolicy;
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::{evaluate, ProviderHealth, RouteOutcome};
@@ -38,7 +39,9 @@ use teton_core::policy::{evaluate, ProviderHealth, RouteOutcome};
 use teton_protocol::events::{
     Event, FailureClass as ProtoFailureClass, ProviderDegraded, RouteDecided,
 };
-use teton_protocol::{Phase as ProtoPhase, ProviderId, SessionId};
+use teton_protocol::{
+    Category as ProtoCategory, Phase as ProtoPhase, ProviderId, SessionId, Tier as ProtoTier,
+};
 
 use teton_providers::{
     classify, degradation_signal, CapabilityProfile, FailureAction, FailureClass,
@@ -62,6 +65,44 @@ pub fn to_protocol_phase(phase: CorePhase) -> ProtoPhase {
         CorePhase::Review => ProtoPhase::Review,
         CorePhase::Io => ProtoPhase::Io,
         CorePhase::Freeform => ProtoPhase::Freeform,
+    }
+}
+
+/// Map a `teton_core::category::Category` (the dispatch key) to the
+/// `teton_protocol::Category` carried on the `route_decided` / `cost_recorded`
+/// wire. Total, and the same boundary bridge [`to_protocol_phase`] is.
+///
+/// Deliberately **one-way**. `teton_core::category::Category` carries no
+/// `FromStr` and no `Deserialize` because that absence is REQ-558 AC-3's
+/// guarantee that prompt text cannot name a harness-known category; the wire
+/// twin is deserializable so a client can read the event, and that stays safe
+/// only while no conversion runs wire → core.
+#[must_use]
+pub fn to_protocol_category(category: CoreCategory) -> ProtoCategory {
+    match category {
+        CoreCategory::Route => ProtoCategory::Route,
+        CoreCategory::Redact => ProtoCategory::Redact,
+        CoreCategory::Title => ProtoCategory::Title,
+        CoreCategory::Digest => ProtoCategory::Digest,
+        CoreCategory::Compact => ProtoCategory::Compact,
+        CoreCategory::Triage => ProtoCategory::Triage,
+        CoreCategory::Edit => ProtoCategory::Edit,
+        CoreCategory::Shell => ProtoCategory::Shell,
+        CoreCategory::Design => ProtoCategory::Design,
+        CoreCategory::Debug => ProtoCategory::Debug,
+        CoreCategory::Review => ProtoCategory::Review,
+    }
+}
+
+/// Map a `teton_core::category::Tier` to its wire twin. Total; see
+/// [`to_protocol_category`] for why the conversion runs only in this direction.
+#[must_use]
+pub fn to_protocol_tier(tier: CoreTier) -> ProtoTier {
+    match tier {
+        CoreTier::Reflex => ProtoTier::Reflex,
+        CoreTier::Scan => ProtoTier::Scan,
+        CoreTier::Build => ProtoTier::Build,
+        CoreTier::Think => ProtoTier::Think,
     }
 }
 
@@ -105,6 +146,19 @@ pub struct Route {
     /// *selected* provider. Meaningful only when a provider was selected; for the
     /// no-provider case it is the strict [`HarnessConfig::default`].
     pub harness: HarnessConfig,
+    /// The [`CategoryResolution`] this route was built from, when the decision
+    /// came through the category chain (`teton_core::category::resolve`).
+    ///
+    /// [`Route::route_decided`] reads its `category` and `tier` **off this
+    /// value** and recomputes neither (REQ-558 ADR-D, BR-6, AC-11): two surfaces
+    /// describing one routing state must not be able to drift apart. This is the
+    /// defect BUG-155 shipped four times in this subsystem one REQ ago.
+    ///
+    /// `None` for a decision reached by the pre-category paths — phase policy
+    /// and the freeform heuristic — that TASK-050 replaces. Those paths have no
+    /// resolution to read, and inventing one for them would be the second
+    /// computation this field exists to prevent.
+    pub resolution: Option<CategoryResolution>,
 }
 
 impl Route {
@@ -116,9 +170,19 @@ impl Route {
 
     /// The `route_decided` event payload for this decision, or `None` when no
     /// provider was selected (the event's `provider_id` is required).
+    ///
+    /// The category and the tier are **projected from [`Route::resolution`]**,
+    /// never recomputed — not even the tier, which `Category::tier()` could
+    /// supply. A resolution that reports a tier is the one authority on which
+    /// tier this decision went through (ADR-D, AC-11).
     #[must_use]
     pub fn route_decided(&self) -> Option<RouteDecided> {
         self.provider_id.as_ref().map(|provider_id| RouteDecided {
+            category: self
+                .resolution
+                .as_ref()
+                .map(|r| to_protocol_category(r.category)),
+            tier: self.resolution.as_ref().map(|r| to_protocol_tier(r.tier)),
             phase: self.phase,
             provider_id: provider_id.clone(),
             model: self.model.clone(),
@@ -255,6 +319,9 @@ impl Router {
             reason: decision.reason,
             outcome: decision.outcome,
             harness,
+            // Phase policy, not the category chain — TASK-050 repoints this at
+            // `teton_core::category::resolve` and the resolution lands here.
+            resolution: None,
         }
     }
 
@@ -310,6 +377,7 @@ impl Router {
                             decision.reason
                         ),
                         outcome: RouteOutcome::Fallback,
+                        resolution: None,
                     }
                 }
                 _ => Route {
@@ -322,6 +390,7 @@ impl Router {
                              <id> --model <name>` and set `default_provider` to its id."
                         .to_owned(),
                     outcome: RouteOutcome::NoPolicy,
+                    resolution: None,
                 },
             };
         };
@@ -337,6 +406,7 @@ impl Router {
                      configured default provider '{default_provider_id}'."
                 ),
                 outcome: RouteOutcome::Primary,
+                resolution: None,
             };
         };
         let config = FreeformConfig {
@@ -361,6 +431,9 @@ impl Router {
             phase: None,
             reason: decision.reason,
             outcome,
+            // The freeform heuristic, not the category chain — TASK-050 deletes
+            // this path and resolves the classified category instead.
+            resolution: None,
         }
     }
 
@@ -386,6 +459,7 @@ impl Router {
                          provider is registered, so the turn cannot be served."
                     .to_owned(),
                 outcome: RouteOutcome::NoPolicy,
+                resolution: None,
             };
         };
         Route {
@@ -395,6 +469,10 @@ impl Router {
             phase: None,
             reason: reason.into(),
             outcome: RouteOutcome::Fallback,
+            // BR-7: the taint pin overrides every category binding, so this route
+            // is deliberately *not* a category resolution — it is the privacy
+            // backstop refusing to consult one.
+            resolution: None,
         }
     }
 
@@ -604,6 +682,9 @@ impl Router {
             reason,
             outcome,
             harness,
+            // A failure re-route names the provider it continues on, not a fresh
+            // category resolution; TASK-050 carries the original one through.
+            resolution: None,
         }
     }
 }
@@ -642,6 +723,112 @@ fn to_protocol_failure_class(class: FailureClass) -> ProtoFailureClass {
 mod tests {
     use super::*;
     use teton_core::ToolCallTier;
+
+    /// A `Route` carrying `resolution`, with everything else fixed. The point of
+    /// each test below is the resolution, not the wiring around it.
+    fn route_from(resolution: CategoryResolution) -> Route {
+        Route {
+            provider_id: resolution.provider_id.clone().map(ProviderId::from),
+            model: Some("some-model".to_owned()),
+            phase: None,
+            reason: resolution.reason.clone(),
+            outcome: resolution.outcome,
+            harness: HarnessConfig::default(),
+            resolution: Some(resolution),
+        }
+    }
+
+    /// REQ-558 AC-8: a decision that resolved a category names it, names the
+    /// tier, names the provider, and carries a non-empty reason. Swept across
+    /// **every** category, resolved for real, so a category that stops appearing
+    /// on the wire fails here rather than in a client.
+    #[test]
+    fn route_decided_names_the_category_tier_provider_and_reason() {
+        use teton_core::category::{resolve, CategoryTable, TierBinding};
+        use teton_core::Tier;
+
+        let table = Tier::ALL.into_iter().fold(
+            CategoryTable::new().with_local_provider("on-device"),
+            |t, tier| {
+                t.with_tier(TierBinding {
+                    tier,
+                    provider_id: "remote".to_owned(),
+                    fallback_id: None,
+                })
+            },
+        );
+
+        for category in CoreCategory::ALL {
+            let resolution = resolve(category, &table, |_| ProviderHealth::Healthy, |_| true);
+            let decided = route_from(resolution.clone())
+                .route_decided()
+                .unwrap_or_else(|| panic!("{category} selected no provider"));
+
+            assert_eq!(decided.category, Some(to_protocol_category(category)));
+            assert_eq!(decided.tier, Some(to_protocol_tier(resolution.tier)));
+            assert_eq!(decided.provider_id.0, resolution.provider_id.unwrap());
+            assert!(!decided.reason.is_empty(), "{category}");
+        }
+    }
+
+    /// AC-11 / ADR-D, as a provenance check rather than a value check: the event
+    /// reports the tier **the resolution reported**, and does not recompute one
+    /// from the category.
+    ///
+    /// The resolution here is deliberately self-inconsistent — `edit` with the
+    /// `think` tier — which `resolve` would never produce. That is the only way
+    /// to tell "read off the resolution" apart from "recomputed via
+    /// `Category::tier()`", because the two agree on every real input. Replacing
+    /// the projection with `r.category.tier()` turns this red.
+    #[test]
+    fn the_tier_on_the_wire_comes_from_the_resolution_not_from_the_category() {
+        let resolution = CategoryResolution {
+            category: CoreCategory::Edit,
+            tier: CoreTier::Think,
+            provider_id: Some("remote".to_owned()),
+            fallback_id: None,
+            reason: "a resolution nobody would compute".to_owned(),
+            outcome: RouteOutcome::Primary,
+        };
+        assert_ne!(
+            CoreCategory::Edit.tier(),
+            CoreTier::Think,
+            "this test is only meaningful while the two disagree"
+        );
+
+        let decided = route_from(resolution).route_decided().expect("decided");
+        assert_eq!(decided.tier, Some(ProtoTier::Think));
+        assert_eq!(decided.category, Some(ProtoCategory::Edit));
+    }
+
+    /// The reason travels verbatim. BR-6/AC-11's "two surfaces must not drift"
+    /// is not satisfied by a paraphrase, so the event carries the resolution's
+    /// own sentence, byte for byte.
+    #[test]
+    fn an_unresolvable_category_puts_its_own_sentence_on_the_route() {
+        use teton_core::category::{resolve, CategoryTable};
+
+        let empty = CategoryTable::new();
+        let resolution = resolve(
+            CoreCategory::Design,
+            &empty,
+            |_| ProviderHealth::Healthy,
+            |_| true,
+        );
+        assert!(resolution.provider_id.is_none());
+        assert!(
+            resolution.reason.contains("'design'"),
+            "{}",
+            resolution.reason
+        );
+
+        // No provider was selected, so there is no `route_decided` to emit — the
+        // event's `provider_id` is required. The sentence is still the
+        // resolution's, and the route that carries it is the same object.
+        let route = route_from(resolution.clone());
+        assert!(route.route_decided().is_none());
+        assert_eq!(route.reason, resolution.reason);
+    }
 
     /// BUG-155: a policy `fallback_id` naming a provider the router never
     /// registered is not failed over to.
@@ -764,6 +951,37 @@ mod tests {
         ] {
             assert_eq!(to_protocol_phase(core), proto);
         }
+    }
+
+    /// The wire twins mirror the core enums variant-for-variant, spelling
+    /// included: the daemon's decision and what a client reads are one fact, and
+    /// the shared spelling is what lets a ledger column, a config key, and an
+    /// event all say `digest`.
+    ///
+    /// Driven off `Category::ALL` / `Tier::ALL`, so a variant added to core is
+    /// covered here the moment `to_protocol_category`'s exhaustive match forces
+    /// it to be handled at all.
+    #[test]
+    fn the_wire_category_and_tier_mirror_the_core_ones() {
+        use teton_core::Tier;
+
+        for core in CoreCategory::ALL {
+            assert_eq!(
+                to_protocol_category(core).as_str(),
+                core.as_str(),
+                "{core} is spelled differently on the wire"
+            );
+        }
+        for core in Tier::ALL {
+            assert_eq!(to_protocol_tier(core).as_str(), core.as_str(), "{core}");
+            // A category's tier survives the crossing intact.
+            for category in CoreCategory::ALL.into_iter().filter(|c| c.tier() == core) {
+                assert_eq!(to_protocol_tier(category.tier()), to_protocol_tier(core));
+            }
+        }
+        // All eleven, pinned-local ones included: the event reports what
+        // happened, not what a config file could have asked for.
+        assert_eq!(CoreCategory::ALL.len(), 11);
     }
 
     #[test]

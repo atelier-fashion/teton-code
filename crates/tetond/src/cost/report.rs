@@ -297,6 +297,9 @@ mod tests {
         LedgerRow {
             session_id: session.to_owned(),
             phase,
+            // The rollups group by session, phase, and provider (REQ-544 AC-4);
+            // the category rides on the row without changing that shape.
+            category: None,
             provider_id: provider.to_owned(),
             model: model.to_owned(),
             input_tokens: input,

@@ -414,12 +414,17 @@ fn phase_name(phase: Phase) -> &'static str {
 }
 
 fn format_route(rd: &RouteDecided) -> String {
-    let phase = rd.phase.map_or("freeform", phase_name);
+    // REQ-558: the category is what drove the decision, so it leads when the
+    // decision came through the category chain. The phase is the fallback label
+    // for a decision made before that chain existed (BR-11 keeps `phase` for
+    // cost attribution, not for explaining a route).
+    let key = match (rd.category, rd.tier) {
+        (Some(category), Some(tier)) => format!("{category}/{tier}"),
+        (Some(category), None) => category.to_string(),
+        _ => rd.phase.map_or("freeform", phase_name).to_owned(),
+    };
     let model = rd.model.as_deref().unwrap_or("(model tbd)");
-    format!(
-        "route [{phase}] → {} {model} — {}",
-        rd.provider_id, rd.reason
-    )
+    format!("route [{key}] → {} {model} — {}", rd.provider_id, rd.reason)
 }
 
 fn format_privacy(pb: &PrivacyBlock) -> String {
@@ -503,6 +508,34 @@ mod tests {
         assert_eq!(surface.fragments(), "Hello, world");
     }
 
+    /// REQ-558: a decision that came through the category chain is labelled by
+    /// the thing that drove it. The phase is not what explains a route any more,
+    /// so it does not appear in the label when a category does.
+    #[test]
+    fn a_route_notice_is_labelled_by_its_category_and_tier() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+
+        render_event(
+            &envelope(Event::RouteDecided(RouteDecided {
+                category: Some(teton_protocol::Category::Design),
+                tier: Some(teton_protocol::Tier::Think),
+                phase: None,
+                provider_id: ProviderId::from("anthropic"),
+                model: Some("claude-opus-4".to_owned()),
+                reason: "Routing the 'design' category to 'anthropic' through its 'think' tier \
+                         binding."
+                    .to_owned(),
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        assert!(surface.any_line_contains(LineKind::Notice, "route [design/think]"));
+        assert!(!surface.any_line_contains(LineKind::Notice, "route [freeform]"));
+    }
+
     #[test]
     fn control_events_render_as_one_line_notices() {
         let mut surface = RecordingSurface::new();
@@ -511,6 +544,8 @@ mod tests {
 
         let events = [
             Event::RouteDecided(RouteDecided {
+                category: None,
+                tier: None,
                 phase: Some(Phase::Architect),
                 provider_id: ProviderId::from("anthropic"),
                 model: Some("claude-opus-4".to_owned()),
@@ -546,6 +581,8 @@ mod tests {
 
         let events = [
             Event::RouteDecided(RouteDecided {
+                category: None,
+                tier: None,
                 phase: None,
                 provider_id: ProviderId::from("local"),
                 model: None,
@@ -655,6 +692,7 @@ mod tests {
                 record: CostRecord {
                     session_id: SessionId::from("s1"),
                     phase: Some(Phase::Review),
+                    category: None,
                     provider_id: ProviderId::from("anthropic"),
                     model: "claude-opus-4".to_owned(),
                     input_tokens: 1000,

@@ -153,6 +153,115 @@ pub enum Phase {
     Freeform,
 }
 
+/// The routing tier a category inherits its provider binding from (REQ-558).
+///
+/// Mirrors `teton_core::category::Tier` variant-for-variant, so the daemon's
+/// resolution and this wire form cannot drift apart — the precedent
+/// [`ProviderKind`] and [`crate::events::SelectionSource`] set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// Sub-second, every turn, never leaves the machine — latency and privacy
+    /// dominate.
+    Reflex,
+    /// Read a lot, emit a little — context window and $/input-token dominate.
+    Scan,
+    /// The agentic loop (read → edit → run → verify) — tool-call fidelity
+    /// dominates.
+    Build,
+    /// Design, debug, critique — reasoning depth dominates.
+    Think,
+}
+
+impl Tier {
+    /// The lowercase wire/display name — identical to the serde form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Tier::Reflex => "reflex",
+            Tier::Scan => "scan",
+            Tier::Build => "build",
+            Tier::Think => "think",
+        }
+    }
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The routing category a model call was made for — the dispatch key in both
+/// session modes (REQ-558 BR-1).
+///
+/// Mirrors **all eleven** variants of `teton_core::category::Category`,
+/// including the two `route` and `redact` that are pinned to the local tier and
+/// have no configurable counterpart: this type reports what *happened*, not what
+/// a config file may bind, and a pinned category still routes a call.
+///
+/// # The conversion is one-way on purpose
+///
+/// `teton_core::category::Category` deliberately carries no `FromStr` and no
+/// `Deserialize` — that absence is AC-3's type-level guarantee that no
+/// prompt-text path can name a harness-known category. This wire twin *is*
+/// deserializable, because a client has to read the event it appears in, and
+/// that stays safe only while the conversion runs core → wire and never back.
+/// Adding a `teton_protocol::Category -> teton_core::Category` conversion (or a
+/// `FromStr` on either side) reopens the hole the core type closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Category {
+    /// Classifies the four judgment categories; pinned local (BR-5).
+    Route,
+    /// Secret/PII scan before egress; pinned local (BR-4).
+    Redact,
+    /// Session and branch naming.
+    Title,
+    /// File and diff summarization into context.
+    Digest,
+    /// Conversation compaction.
+    Compact,
+    /// Ranking grep/glob hits.
+    Triage,
+    /// Write code from a task artifact.
+    Edit,
+    /// Command construction and output interpretation.
+    Shell,
+    /// Architecture, decomposition, spec authoring.
+    Design,
+    /// Root-cause on a failure.
+    Debug,
+    /// Adversarial critique.
+    Review,
+}
+
+impl Category {
+    /// The lowercase wire/display name — identical to the serde form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Category::Route => "route",
+            Category::Redact => "redact",
+            Category::Title => "title",
+            Category::Digest => "digest",
+            Category::Compact => "compact",
+            Category::Triage => "triage",
+            Category::Edit => "edit",
+            Category::Shell => "shell",
+            Category::Design => "design",
+            Category::Debug => "debug",
+            Category::Review => "review",
+        }
+    }
+}
+
+impl fmt::Display for Category {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Session interaction mode (spec entity `Session.mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -239,6 +348,47 @@ mod tests {
             serde_json::to_string(&Phase::Architect).unwrap(),
             "\"architect\""
         );
+    }
+
+    /// The display name and the serde form are two renderings of one wire
+    /// spelling, so they are asserted to be the same string rather than
+    /// maintained in parallel. A variant whose `as_str` drifts from its serde
+    /// rename fails here.
+    #[test]
+    fn category_and_tier_display_names_are_their_wire_form() {
+        let categories = [
+            Category::Route,
+            Category::Redact,
+            Category::Title,
+            Category::Digest,
+            Category::Compact,
+            Category::Triage,
+            Category::Edit,
+            Category::Shell,
+            Category::Design,
+            Category::Debug,
+            Category::Review,
+        ];
+        for category in categories {
+            let json = serde_json::to_string(&category).unwrap();
+            assert_eq!(json, format!("\"{}\"", category.as_str()));
+            assert_eq!(category.to_string(), category.as_str());
+            assert_eq!(
+                serde_json::from_str::<Category>(&json).unwrap(),
+                category,
+                "{category} must round-trip"
+            );
+        }
+        // All eleven, including the two pinned-local ones: the event reports
+        // what happened, and a pinned category still routes a call.
+        assert_eq!(categories.len(), 11);
+
+        for tier in [Tier::Reflex, Tier::Scan, Tier::Build, Tier::Think] {
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(json, format!("\"{}\"", tier.as_str()));
+            assert_eq!(tier.to_string(), tier.as_str());
+            assert_eq!(serde_json::from_str::<Tier>(&json).unwrap(), tier);
+        }
     }
 
     #[test]

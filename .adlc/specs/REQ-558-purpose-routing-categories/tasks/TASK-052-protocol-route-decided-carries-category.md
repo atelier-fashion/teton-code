@@ -1,7 +1,7 @@
 ---
 id: TASK-052
 title: "route_decided and CostRecord carry the category and tier"
-status: draft
+status: complete
 parent: REQ-558
 created: 2026-08-05
 updated: 2026-08-05
