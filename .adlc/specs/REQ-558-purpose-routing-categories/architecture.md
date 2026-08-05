@@ -268,7 +268,7 @@ Recorded here rather than silently worked around:
 | `Config.tiers`, `Config.categories` | `teton-core/src/config.rs` | replace `Config.routing` |
 | `Phase` | `teton-core/src/phase.rs` | `Freeform` removed; `ALL` becomes `[Phase; 5]` |
 | `RouteDecided` | `teton-protocol/src/events.rs` | `+ category`, `+ tier`; `phase` stays `Option` |
-| `CostRecord` / `LedgerRow` | unchanged | `phase` retained — BR-11 |
+| `CostRecord` / `LedgerRow` | `teton-protocol/src/events.rs`, `tetond/src/cost/ledger.rs` | `+ category: Option<Category>` (additive ledger column; historical rows are genuinely NULL). `phase` **retained** — BR-11. *(Corrected: this row previously read "unchanged", which contradicted TASK-052's own ACs.)* |
 
 ## Risks
 
