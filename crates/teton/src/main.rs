@@ -1061,6 +1061,35 @@ fn run_provider_add(
              inferred from the provider id."
         );
     }
+    // BUG-155 / REQ-557 AC-1: "registering a third with id `opus` fails."
+    //
+    // It did not. The daemon's `RegisterProvider` is replace-or-insert, so a
+    // second `provider add opus --model claude-sonnet-5` silently OVERWROTE the
+    // Opus entry and every route the user believed went to Opus went to Sonnet —
+    // with no error, and `provider list` showing one provider where they expected
+    // two. That is the exact command BR-3's headline ("Opus for design, Sonnet
+    // for build") invites people to run twice.
+    //
+    // The upsert stays: `config/set` is also how a provider is legitimately
+    // *updated*, and there is no remove op to sequence around. So the refusal
+    // lives here, at the `add` verb, which is what the AC is written about — and
+    // it runs before `read_secret` for the same reason the `--model` check does.
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    {
+        let mut state = SessionState::new();
+        let mut prompter = StdinPrompter::new();
+        let mut probe_ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+        if let Ok(cfg) = conn.call(ConfigGetParams::default(), &mut probe_ctx)? {
+            if cfg.snapshot.providers.iter().any(|p| p.id.0 == id) {
+                anyhow::bail!(
+                    "provider `{id}` is already registered. Ids are unique — pick a different \
+                     one (e.g. `{id}-2`) if you want a second provider, which is how one vendor \
+                     serves two models. Nothing was changed and no credential was read."
+                );
+            }
+        }
+    }
+
     let keychain = keychain::default_keychain();
     // Local providers have no credential; every remote kind requires a key.
     let secret = if matches!(kind, ProviderKind::Local) {
@@ -1078,7 +1107,6 @@ fn run_provider_add(
     )?;
     let auth = config.auth_ref.clone().unwrap_or_else(|| "—".to_owned());
 
-    let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);

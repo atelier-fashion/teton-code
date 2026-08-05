@@ -1476,3 +1476,61 @@ fn provider_list_renders_the_declared_model() {
          output:\n{listed}"
     );
 }
+
+/// BUG-155 / REQ-557 AC-1: "registering a third with id `opus` fails."
+///
+/// It did not. The daemon's `RegisterProvider` is replace-or-insert, so a second
+/// `provider add` on an existing id silently OVERWROTE the entry — the exact
+/// command BR-3's headline ("Opus for design, Sonnet for build") invites people
+/// to run twice, quietly collapsing two providers into one and re-pointing every
+/// route the user believed went to the first.
+///
+/// The refusal must also come before the credential prompt, for the same reason
+/// the `--model` check does.
+#[test]
+fn provider_add_refuses_an_id_that_is_already_registered() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn(&daemon);
+    let teton = teton_bin();
+
+    // The fixture config already registers `deepseek`.
+    let (output, status) = daemon.run_cli_capture(
+        &teton,
+        &[
+            "provider",
+            "add",
+            "deepseek",
+            "--kind",
+            "openai-compatible",
+            "--model",
+            "deepseek-reasoner",
+        ],
+        "",
+    );
+
+    assert!(
+        !status.success(),
+        "re-adding an existing id must fail rather than overwrite; output:\n{output}"
+    );
+    assert!(
+        output.contains("already registered"),
+        "the failure must say why; output:\n{output}"
+    );
+    assert!(
+        !output.contains("API key for"),
+        "and must refuse before asking for a credential; output:\n{output}"
+    );
+
+    // The original registration is intact — not replaced by the refused one.
+    let listed = daemon.run_cli(&teton, &["provider", "list"]);
+    assert!(
+        listed.contains("deepseek-chat"),
+        "the existing provider must keep its model; output:\n{listed}"
+    );
+    assert!(
+        !listed.contains("deepseek-reasoner"),
+        "the refused registration must not have landed; output:\n{listed}"
+    );
+}

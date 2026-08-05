@@ -414,7 +414,7 @@ impl Config {
         let mut out: Vec<String> = self
             .providers
             .iter()
-            .filter(|p| p.kind.is_remote() && p.model.as_deref().unwrap_or("").trim().is_empty())
+            .filter(|p| p.is_unusable_for_lacking_a_model())
             .map(|p| p.id.clone())
             .collect();
         out.sort_unstable();
@@ -449,7 +449,7 @@ impl Config {
             if !p.kind.is_remote() {
                 continue;
             }
-            if p.model.as_deref().unwrap_or("").trim().is_empty() {
+            if p.declared_model().is_none() {
                 match resolve(&p.id).filter(|m| !m.trim().is_empty()) {
                     Some(model) => p.model = Some(model),
                     None => unresolved.push(p.id.clone()),
@@ -667,6 +667,84 @@ kind = "local"
         // BR-7: the daemon still starts; only the unresolved provider is unusable.
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.unusable_providers(), vec!["mystery"]);
+    }
+
+    /// BUG-155 (mutation check): deleting `migrate_models`' `!p.kind.is_remote()`
+    /// guard left the entire workspace suite green, because no migration fixture
+    /// contained a local provider.
+    ///
+    /// What the guard prevents: `teton provider add on-device --kind local`
+    /// produces a `[[providers]] kind = "local"` entry with no model, which is
+    /// its normal state — REQ-547's consent flow owns the local model selection.
+    /// Without the guard the migration resolves that entry against the price
+    /// table by id and writes the answer into the config **permanently**,
+    /// creating a second source of truth for a fact the consent flow owns. That
+    /// is the drift OQ-4 deferred precisely to avoid.
+    #[test]
+    fn migration_leaves_a_local_provider_alone() {
+        let mut cfg = Config {
+            providers: vec![
+                ModelProvider {
+                    id: "local".to_owned(),
+                    kind: ProviderKind::Local,
+                    endpoint: None,
+                    model: None,
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                },
+                ModelProvider {
+                    id: "anthropic".to_owned(),
+                    kind: ProviderKind::Anthropic,
+                    endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
+                    model: None,
+                    auth_ref: Some("keychain:anthropic".to_owned()),
+                    capabilities: ProviderCapabilities::default(),
+                },
+            ],
+            ..Config::default()
+        };
+
+        // A resolver that would happily answer for ANY id, including "local" —
+        // the guard, not the resolver, is what protects the local entry.
+        let unresolved = cfg.migrate_models(|id| Some(format!("model-for-{id}")));
+
+        assert!(unresolved.is_empty());
+        assert_eq!(
+            cfg.providers[0].model, None,
+            "a local provider's model is owned by the REQ-547 consent flow; the \
+             migration must never write one (OQ-4)"
+        );
+        assert_eq!(
+            cfg.providers[1].model.as_deref(),
+            Some("model-for-anthropic"),
+            "the remote provider alongside it still migrates"
+        );
+    }
+
+    /// BUG-155: `declared_model()` is the single definition of "declares a
+    /// model", and blank counts as absent everywhere. Before it, this predicate
+    /// was written out three times and `build_router`'s copy disagreed.
+    #[test]
+    fn a_blank_model_counts_as_no_model_everywhere() {
+        for blank in ["", "   ", "\t"] {
+            let cfg = Config {
+                providers: vec![ModelProvider {
+                    id: "p".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some("https://api.example.com/v1".to_owned()),
+                    model: Some(blank.to_owned()),
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                }],
+                ..Config::default()
+            };
+            assert_eq!(cfg.providers[0].declared_model(), None, "{blank:?}");
+            assert!(
+                cfg.providers[0].is_unusable_for_lacking_a_model(),
+                "{blank:?}"
+            );
+            assert_eq!(cfg.unusable_providers(), vec!["p"], "{blank:?}");
+        }
     }
 
     #[test]

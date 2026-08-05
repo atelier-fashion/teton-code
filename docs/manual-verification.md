@@ -341,13 +341,23 @@ was actually verified — which is **not at all**.
 `teton provider add sonnet --kind anthropic --model claude-sonnet-5`, then
 `teton provider list` showing two providers, same kind, distinct models.
 
-**Why there is no harness.** `run_provider_add` stores the API key through
-`keychain::default_keychain()`, which on macOS is the real Security-framework
-generic-password store. There is no test seam on that path — deliberately, since
-a seam on a credential store is a liability — so an automated success leg would
-write real entries into the developer's login keychain (and can prompt for
-keychain access mid-suite). `TETON_PROVIDER_KEY` supplies the *secret* without a
-prompt but does not redirect where it is stored.
+**Why there is no harness — corrected (BUG-155).** The original wording here
+claimed there was "no test seam on that path — deliberately, since a seam on a
+credential store is a liability." That overstated the case, and the review panel
+was right to call it out: a `Keychain` trait and a `MockKeychain` already exist
+(`crates/teton/src/keychain.rs`) and are already used by `build_provider_registration`'s
+own unit tests one frame down.
+
+The real gap is narrower and closeable: `run_provider_add` hardcodes
+`keychain::default_keychain()` rather than accepting an injectable backend, so
+the *subprocess* CLI e2e harness cannot substitute the mock. On macOS that means
+an automated success leg would write real entries into the developer's login
+keychain (and can prompt for keychain access mid-suite). `TETON_PROVIDER_KEY`
+supplies the *secret* without a prompt but does not redirect where it is stored.
+
+This is a legitimate near-term exemption — an env-gated backend override is a
+security-sensitive seam and deserves its own design — but it is plumbing, not a
+structural impossibility, and it should be described that way.
 
 **What IS covered automatically, and how far it goes:**
 
@@ -355,6 +365,8 @@ prompt but does not redirect where it is stored.
 |---|---|---|
 | Two providers, one kind, distinct models, registered and read back with their models | `tetond/tests/e2e/ac_matrix.rs::ac2_two_remote_providers_complete_sessions` | Full — over the same `config/set` RPC the CLI drives, including the `config/get` round-trip |
 | Missing `--model` exits non-zero, names the flag, registers nothing, and never prompts for a credential | `teton/tests/cli_e2e.rs::provider_add_without_a_model_refuses_before_asking_for_a_credential` | Full — through the real CLI binary against a live daemon |
+| The same requirement over the `config/set` RPC (the surface every non-`teton` ACP client uses) | `tetond/tests/e2e/model_identity.rs::registering_a_remote_provider_over_rpc_requires_a_model` | Full — BUG-155; the CLI-only guard was bypassable |
+| Re-adding an already-registered id fails, changes nothing, and prompts for no credential | `teton/tests/cli_e2e.rs::provider_add_refuses_an_id_that_is_already_registered` | Full — BUG-155; AC-1's third clause had no implementation at all |
 | A local-kind add still succeeds with no `--model` and no credential | `teton/tests/cli_e2e.rs::a_local_provider_still_registers_without_a_model` | Full — the local path reaches no keychain |
 | `provider list` renders the model, and flags a remote provider that has none | `teton/src/main.rs::provider_list_names_the_model_or_says_the_provider_is_unusable` (unit) + `cli_e2e.rs::provider_list_renders_the_declared_model` (e2e) | Full for the rendering; the e2e leg reaches it via the load-time migration rather than via `provider add` |
 | Argument parsing for two same-kind providers with distinct models | `teton/src/main.rs::two_providers_of_one_kind_parse_to_distinct_models` | Full at the parser |

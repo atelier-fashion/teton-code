@@ -537,3 +537,332 @@ fn remote_routes(client: &Client, provider: &str) -> usize {
         .filter(|e| e["provider_id"].as_str() == Some(provider))
         .count()
 }
+
+/// REGRESSION (BUG-155): a `default_provider` naming a registered-but-UNUSABLE
+/// provider must not send that provider's **id** as the model.
+///
+/// `Config::validate` accepts this config — BR-6 only rejects a default naming an
+/// *unregistered* id — so the daemon starts, correctly, with the provider
+/// unusable (ADR-E). But `resolve_freeform`'s coding branch trusts
+/// `default_provider` unconditionally, unlike `resolve_structured`, which routes
+/// through `health_of` and so cannot select a provider missing from the router
+/// map. The resulting `Route` carries `provider_id: Some("mystery")` with
+/// `model: None`, and `run_one_attempt` then resolves the model as
+/// `route.model.unwrap_or_else(|| provider_cfg.id.clone())` — the provider id
+/// standing in for a model, on a real outbound call.
+///
+/// That is precisely the fallback BR-1 says is "deleted, not relocated".
+#[test]
+fn an_unusable_default_provider_never_sends_its_id_as_the_model() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 10, 5));
+
+    let mut config = String::new();
+    config.push_str("default_provider = \"mystery\"\n\n");
+    // Registered (so `validate` passes) but declares no model, and the legacy
+    // price lookup cannot resolve it either — so it stays unusable.
+    config.push_str(&legacy_provider_block(
+        "mystery",
+        "openai-compatible",
+        &provider.openai_endpoint(),
+    ));
+
+    let ws = Workspace::new("bug155");
+    ws.write_config(&config);
+    let daemon = Daemon::spawn(&ws, probe_16gb());
+    let mut client = daemon.connect();
+
+    let session = client.create_session("freeform", None);
+    // A coding turn, so it resolves through the default rather than local.
+    let turn = client.prompt(&session, "implement the greeting");
+
+    // Whatever the turn does, the one thing it must NOT do is call out
+    // announcing the provider id as a model.
+    for body in provider.requests() {
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("\"model\":\"mystery\""),
+            "BR-1 VIOLATION: the provider id was sent as the model on the wire. \
+             A fallback identifier is not an answer (LESSON-456). Payload:\n{text}"
+        );
+    }
+    // And the turn must not silently succeed against an unusable provider.
+    assert!(
+        turn.get("error").is_some(),
+        "a turn routed to an unusable provider must fail, naming it: {turn}"
+    );
+}
+
+/// BUG-155: `config/set register_provider` must refuse a remote provider with no
+/// model, exactly as `teton provider add` does.
+///
+/// AC-2's guard lived only in the CLI, but `config/set` is a first-class protocol
+/// surface — this suite's own `register_provider` helper drives it — so every
+/// non-`teton` ACP client bypassed the check: the registration was persisted,
+/// nothing was logged, and the next turn put the provider's id on the wire as its
+/// model.
+///
+/// The rule belongs at *registration* rather than in `Config::validate`, and the
+/// distinction is ADR-E's: loading a config that already contains a modelless
+/// provider stays permissive so a pre-REQ config can boot far enough to migrate,
+/// while registering a new one has no legacy to honour and fails closed.
+#[test]
+fn registering_a_remote_provider_over_rpc_requires_a_model() {
+    let ws = Workspace::new("rpcreq");
+    ws.write_config("# nothing registered yet\n");
+    let daemon = Daemon::spawn(&ws, probe_16gb());
+    let mut client = daemon.connect();
+
+    let refused = client.call(
+        "config/set",
+        serde_json::json!({ "update": {
+            "op": "register_provider",
+            "id": "gpu-box",
+            "kind": "openai-compatible",
+            "endpoint": "http://127.0.0.1:1/v1/chat/completions",
+        }}),
+    );
+    assert!(
+        refused.get("error").is_some(),
+        "a modelless remote registration must be refused over RPC too: {refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("model"),
+        "the refusal must name what is missing: {refused}"
+    );
+
+    // And nothing was persisted.
+    let snapshot = client.config_get();
+    let ids: Vec<&str> = snapshot["providers"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| p["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !ids.contains(&"gpu-box"),
+        "a refused registration must not be persisted: {snapshot}"
+    );
+
+    // The same registration WITH a model is accepted.
+    let accepted = client.call(
+        "config/set",
+        serde_json::json!({ "update": {
+            "op": "register_provider",
+            "id": "gpu-box",
+            "kind": "openai-compatible",
+            "endpoint": "http://127.0.0.1:1/v1/chat/completions",
+            "model": "qwen2.5-coder-7b",
+        }}),
+    );
+    assert_eq!(
+        accepted["result"]["applied"].as_bool(),
+        Some(true),
+        "{accepted}"
+    );
+}
+
+/// BUG-155: a policy `fallback_id` naming an unusable provider is not failed over
+/// to.
+///
+/// The primary is screened by `evaluate` through `health_of`, which reports an
+/// unregistered id as `Unavailable`. The fallback was read straight off the
+/// policy with no such screen, so a mid-turn failure of a healthy primary could
+/// egress the turn's whole accumulated context to a provider the daemon had
+/// announced at startup as unable to serve turns.
+#[test]
+fn a_failure_does_not_fall_back_to_an_unusable_provider() {
+    let flaky = MockProvider::always_bad();
+    let unusable = MockProvider::always(openai_turn("Should never be reached.", None, 10, 5));
+
+    let mut config = String::new();
+    config.push_str(&format!(
+        "[[providers]]\nid = \"flaky\"\nkind = \"openai-compatible\"\nendpoint = \"{}\"\n\
+         model = \"deepseek-chat\"\n\n",
+        flaky.openai_endpoint()
+    ));
+    // Registered, remote, no model, and unresolvable by the legacy lookup.
+    config.push_str(&legacy_provider_block(
+        "unusable",
+        "openai-compatible",
+        &unusable.openai_endpoint(),
+    ));
+    config.push_str(
+        "[[routing]]\nphase = \"implement\"\nprovider_id = \"flaky\"\n\
+         fallback_id = \"unusable\"\n\n",
+    );
+
+    let ws = Workspace::new("fbunus");
+    ws.write_config(&config);
+    let daemon = Daemon::spawn(&ws, probe_16gb());
+    let mut client = daemon.connect();
+
+    let session = client.create_session("structured", Some("implement"));
+    let _ = client.prompt(&session, "implement the feature");
+
+    assert_eq!(
+        unusable.request_count(),
+        0,
+        "not one byte may reach a provider the router considers unusable — not on \
+         the primary path, and not by failing over to it"
+    );
+    for body in unusable.requests() {
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("\"model\":\"unusable\""), "{text}");
+    }
+}
+
+/// BUG-155: the migration writes down the default the pre-REQ binary computed by
+/// position, so an upgrade does not silently change where freeform turns go.
+///
+/// REQ-557 deleted the positional default but shipped no migration for it, so
+/// every pre-REQ config arrived with `default_provider` unset. With a local tier
+/// present that is silent rather than loud — the coding turn goes to the local
+/// model and the session completes, so a user whose freeform turns went to a
+/// remote provider yesterday gets a local answer today with nothing to explain it.
+#[test]
+fn migration_writes_down_the_default_the_config_was_already_using() {
+    let first = MockProvider::always(openai_turn("Done.", None, 10, 5));
+    let second = MockProvider::always(openai_turn("Done.", None, 10, 5));
+
+    let mut config = String::new();
+    config.push_str(&legacy_provider_block(
+        "deepseek",
+        "openai-compatible",
+        &first.openai_endpoint(),
+    ));
+    config.push_str(&legacy_provider_block(
+        "moonshot",
+        "openai-compatible",
+        &second.openai_endpoint(),
+    ));
+
+    let ws = Workspace::new("defmig");
+    ws.write_config(&config);
+    let daemon = Daemon::spawn(&ws, probe_16gb());
+
+    let written = std::fs::read_to_string(&ws.config_path).expect("config file");
+    assert!(
+        written.contains("default_provider = \"deepseek\""),
+        "the pre-REQ positional default (the FIRST remote provider) must be \
+         written down explicitly, not silently dropped:\n{written}"
+    );
+    assert!(
+        daemon.log().contains("default_provider"),
+        "and the user must be told it happened. log:\n{}",
+        daemon.log()
+    );
+
+    // It is now an explicit key, so a freeform coding turn routes to it.
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+    let turn = client.prompt(&session, "implement the greeting");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{turn}"
+    );
+    assert!(
+        first.request_count() >= 1,
+        "the turn went to the migrated default"
+    );
+    assert_eq!(second.request_count(), 0, "and not to the other provider");
+}
+
+/// BUG-155: a config that is already post-REQ never has a `default_provider`
+/// invented for it. The migration is a one-shot bridge for configs that predate
+/// the key, not a standing rule — OQ-3's "no implicit default" holds for anyone
+/// who was never migrated.
+#[test]
+fn a_post_req_config_is_never_given_a_default_it_did_not_ask_for() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 10, 5));
+    let mut config = String::new();
+    // Every provider already declares a model: nothing to migrate.
+    config.push_str(&format!(
+        "[[providers]]\nid = \"deepseek\"\nkind = \"openai-compatible\"\nendpoint = \"{}\"\n\
+         model = \"deepseek-chat\"\n\n",
+        provider.openai_endpoint()
+    ));
+
+    let ws = Workspace::new("nodefmig");
+    ws.write_config(&config);
+    // Bound (not dropped) so the daemon stays up while the file is inspected.
+    let _daemon = Daemon::spawn(&ws, probe_16gb());
+
+    let written = std::fs::read_to_string(&ws.config_path).expect("config file");
+    assert!(
+        !written.contains("default_provider"),
+        "a fully-migrated config must keep its deliberate absence of a default:\n{written}"
+    );
+}
+
+/// BUG-155: a migration that cannot be saved leaves the user's existing config
+/// **byte-for-byte intact**, and the daemon still starts.
+///
+/// This is the property the atomic write exists for. The old code called
+/// `std::fs::write` straight at the target, which truncates on open — so a
+/// failure part-way through left a truncated file. That is not fail-closed:
+/// every `Config` field is `#[serde(default)]`, and `providers` serializes
+/// before `boundaries`, so a truncated config is very likely to be valid TOML
+/// carrying the user's remote providers and NONE of their `local-only`
+/// boundaries. The daemon would start, report nothing, and route remotely with
+/// boundary enforcement silently gone.
+///
+/// A read-only config *directory* is the cleanest way to make the save fail
+/// while leaving the file itself readable: the atomic path cannot create its
+/// sibling temp file and gives up without touching the original, whereas
+/// writing directly to the target would have truncated a file it then could not
+/// refill.
+#[test]
+fn a_migration_that_cannot_be_saved_leaves_the_config_untouched() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 10, 5));
+    let ws = Workspace::new("roconf");
+
+    // A pre-REQ config (migratable) that also declares a privacy boundary — the
+    // thing a truncating write would drop.
+    let dir = ws.root.join("cfgdir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.toml");
+    let original = format!(
+        "{}[[boundaries]]\npath_glob = \"secrets/**\"\nmode = \"local-only\"\n",
+        legacy_provider_block("deepseek", "openai-compatible", &provider.openai_endpoint())
+    );
+    std::fs::write(&config_path, &original).unwrap();
+
+    // Read-only directory: no new file can be created inside it.
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&dir, perms).unwrap();
+
+    let daemon = Daemon::spawn(
+        &ws,
+        probe_16gb().env("TETON_CONFIG", config_path.to_string_lossy().to_string()),
+    );
+
+    // The daemon came up (reaching this line is the assertion) and said it could
+    // not save.
+    let log = daemon.log();
+    assert!(
+        log.contains("could not be saved"),
+        "a failed migration save must be reported, not swallowed. log:\n{log}"
+    );
+
+    // The point: the config on disk is exactly what the user wrote.
+    let after = std::fs::read_to_string(&config_path).expect("config still readable");
+    assert_eq!(
+        after, original,
+        "a migration that could not be saved must leave the config byte-for-byte \
+         intact — a truncating write would drop the privacy boundary below the \
+         providers and the daemon would start with it silently gone"
+    );
+    assert!(
+        after.contains("[[boundaries]]"),
+        "the boundary in particular must survive:\n{after}"
+    );
+
+    // Restore permissions so the temp workspace can be cleaned up.
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&dir, perms).unwrap();
+}

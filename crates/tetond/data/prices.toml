@@ -2,8 +2,23 @@
 #
 # Versioned *data*, not code (mirrors `teton-inference/data/models.toml`): the
 # daemon can drop in a newer table — bumping `version` — without a `tetond`
-# release. Each entry maps a (provider_id, model) pair to its per-million-token
-# price, expressed in integer micro-USD so money never rounds through a float.
+# release. Each entry gives one MODEL its per-million-token price, expressed in
+# integer micro-USD so money never rounds through a float.
+#
+# LOOKUP IS KEYED ON `model` ALONE (REQ-557 ADR-A). `provider_id` is a label —
+# it names the vendor an entry was authored against and renders the baseline as
+# `provider/model` — but it is NOT part of the key. Two providers calling the
+# same model share one row, which is the point: it is what lets one vendor serve
+# two models and one model be served by two endpoints.
+#
+# Consequences when editing this file:
+#   - Do NOT add a second row for a model that already has one to give a
+#     particular provider a different rate. Lookup takes the first match, so the
+#     new row would be dead and its calls billed at the existing rate.
+#   - Do NOT price anything at zero. A zero row applies to every provider
+#     declaring that model, including a paid gateway, which would then be
+#     reported as free AND credited with the full baseline as savings (BUG-155).
+#     Both rules are enforced by tests in `src/cost/prices.rs`.
 #
 #   input_usd_micros_per_mtok  = micro-USD charged per 1,000,000 input tokens
 #   output_usd_micros_per_mtok = micro-USD charged per 1,000,000 output tokens
@@ -12,9 +27,10 @@
 #   input_tokens  * input_rate  / 1_000_000
 # + output_tokens * output_rate / 1_000_000   (integer micro-USD).
 #
-# BR-2: a (provider, model) pair ABSENT from this table is *unpriced* — the
-# ledger records its token counts with a NULL cost and the report surfaces them
-# as "unpriced tokens". A price is NEVER guessed for an unknown model.
+# BR-2: a model ABSENT from this table is *unpriced* — the ledger records its
+# token counts with a NULL cost and the report surfaces them as "unpriced
+# tokens", naming the model so a user can see what needs a price. A price is
+# NEVER guessed for an unknown model.
 #
 # `[baseline]` names the all-frontier comparator used for the AC-4 savings
 # estimate (OQ-6): the report reprices every priced call's token volume at this
@@ -72,24 +88,23 @@ input_usd_micros_per_mtok = 600_000
 output_usd_micros_per_mtok = 2_500_000
 
 # --- Local tier --------------------------------------------------------------
-# On-device inference has no marginal API cost, so it is priced at zero. This is
-# what makes the routing-savings story honest: a local or cheap call genuinely
-# costs ~nothing, and the baseline reprices its token volume at the frontier.
-
-[[models]]
-provider_id = "local"
-model = "qwen2.5-coder-1.5b"
-input_usd_micros_per_mtok = 0
-output_usd_micros_per_mtok = 0
-
-[[models]]
-provider_id = "local"
-model = "qwen2.5-coder-3b"
-input_usd_micros_per_mtok = 0
-output_usd_micros_per_mtok = 0
-
-[[models]]
-provider_id = "local"
-model = "qwen2.5-coder-7b"
-input_usd_micros_per_mtok = 0
-output_usd_micros_per_mtok = 0
+# DELIBERATELY EMPTY (BUG-155).
+#
+# On-device inference has no marginal API cost, and this table used to carry
+# zero-priced rows for the local models to say so. Two facts made those rows
+# actively harmful once REQ-557 re-keyed lookup on the model alone:
+#
+#   1. They were never used for their stated purpose. Local turns are not
+#      metered at all — the cost meter is attached to the egress transport
+#      (`Egress::with_cost_meter`), which only the REMOTE path constructs, so a
+#      local call never reaches a price lookup.
+#   2. Keyed on model alone, they matched ANY provider. A self-hosted or rented
+#      GPU endpoint declaring `model = "qwen2.5-coder-7b"` — exactly the
+#      one-model-many-providers shape BR-3 exists to enable — was billed from
+#      the local row: reported as costing $0 AND credited with the full Opus
+#      baseline as savings. A metered API call reported as free, with a
+#      fabricated saving on top.
+#
+# With no row, such a call is correctly *unpriced* and named in `teton cost`,
+# which is the honest answer: we do not know what that gateway charges. This is
+# BR-9 ("never a $0 record for a model we cannot price") holding.
