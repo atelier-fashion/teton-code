@@ -318,3 +318,27 @@ Two notes on how this list was produced, so a later reader can reproduce it:
   its publish-then-apply finding is directly load-bearing for BR-7 — the `ready`
   event this feature would naturally stop on is broadcast *before* the runtime
   flips the tier open. It was read directly and is cited above.
+
+## Wrapup (2026-08-04)
+
+Shipped in PR #49 (squash `3260284`). All 11 BRs implemented; 6 of 8 ACs fully
+automated, 2 partially — recorded below rather than closed by assertion.
+
+**Deferred, and why.** AC-1's pty leg (the dots observed advancing at a real
+terminal) and AC-5's "typed while animating" half both need the local tier held
+in its load window, which no test seam can do from the `teton` crate:
+`TETON_LOCAL_SCRIPT` opens the tier from construction, and
+`TETON_FAKE_ENGINE_LOADER` reaches the window only through the consent flow plus
+a weights host whose fixture (`MockHf`) lives in `tetond`'s e2e harness. Adding
+a seam whose only purpose was to hold the tier still would have been production
+code shipped to satisfy a test. Both behaviours are on
+`docs/manual-verification.md` §6, which is now their only coverage.
+
+**Follow-up REQ worth cutting:** lift `MockHf` and the consent fixture into a
+shared test-support crate so both e2e suites can reach the load window. That
+closes these two ACs and would make any future first-run/loading work testable
+without duplicating a mock HTTP host.
+
+**Lesson captured:** `LESSON-481` — a gate that hides a feature from users also
+hides it from the suite; split the logic out from under the gate, and make a
+fixture assert its own isolation.
