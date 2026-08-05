@@ -105,14 +105,19 @@ impl FramedStdinPrompter {
     /// the input row and shred it. The caller erases, renders, and draws again
     /// — so the frame appears to stay put while lines scroll above it.
     ///
-    /// The cursor sits in the input row, one row below the top rule: step to
-    /// column 0, up one row, and clear from there to the end of the screen.
-    pub(crate) fn erase(&mut self) {
+    /// The cursor sits in the input row, one row below the top rule, so the
+    /// frame alone is one row up. `status_rows` is how many extra rows a caller
+    /// drew *above* the frame (REQ-556's indicator draws one, or none when it
+    /// has nothing to say) — they are erased together, because they were drawn
+    /// together and a partial erase would leave a stale indicator stranded
+    /// above the redrawn frame.
+    pub(crate) fn erase(&mut self, status_rows: usize) {
         if !self.framed {
             return;
         }
+        let up = 1 + status_rows;
         let mut out = io::stdout();
-        let _ = write!(out, "\r\x1b[1A\x1b[J");
+        let _ = write!(out, "\r\x1b[{up}A\x1b[J");
         let _ = out.flush();
     }
 

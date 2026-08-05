@@ -96,13 +96,16 @@ enum Incoming {
 }
 
 /// What one non-blocking drain of the event channel produced (REQ-556 BR-1).
+///
+/// Deliberately just a count. Lifecycle stages are folded into
+/// [`SessionState::loading`] by `render_event`, which every event passes
+/// through — returning them here as well would be a second path to the same
+/// fact, and the two would drift the first time one of them was updated.
 #[derive(Debug, Default)]
 pub struct Drained {
     /// How many things actually rendered. Zero means the caller's screen is
     /// untouched, so an open entry frame is still intact.
     pub rendered: usize,
-    /// The `model_lifecycle` payloads seen, in arrival order.
-    pub lifecycle: Vec<teton_protocol::events::ModelLifecycle>,
 }
 
 /// A live connection to the daemon.
@@ -261,9 +264,6 @@ impl Connection {
                         on_first();
                     }
                     drained.rendered += 1;
-                    if let teton_protocol::events::Event::ModelLifecycle(ml) = &env.event {
-                        drained.lifecycle.push(ml.clone());
-                    }
                     self.dispatch_event(&env, ctx)?;
                 }
                 Incoming::Lagged(err) => {
@@ -776,12 +776,6 @@ mod tests {
             .expect("drain");
 
         assert_eq!(drained.rendered, 2, "both queued events rendered");
-        assert_eq!(drained.lifecycle.len(), 2, "both were lifecycle payloads");
-        assert!(
-            matches!(drained.lifecycle[1].stage, ModelLifecycleStage::Ready),
-            "arrival order is preserved: {:?}",
-            drained.lifecycle
-        );
         // The caller's frame is torn down once, not once per event — otherwise
         // a burst would erase and redraw for every line in it.
         assert_eq!(teardowns, 1, "on_first runs exactly once per drain");
@@ -789,6 +783,47 @@ mod tests {
             surface.any_line_contains(LineKind::Notice, "ready"),
             "the ready line reached the surface: {:?}",
             surface.calls
+        );
+        // The indicator was folded on the way through, in arrival order, so the
+        // terminal `Ready` wins and the session stops animating (REQ-556 BR-6).
+        // Asserting through session state rather than a returned vector is the
+        // point: this is the path a real session takes.
+        assert!(
+            state.loading.frame(0).is_none(),
+            "a drained Ready must leave the indicator hidden"
+        );
+    }
+
+    /// The fold happens in `render_event`, so an event drained while idle and
+    /// an event drained by a turn's pump reach the indicator identically. This
+    /// pins the idle half; the mid-turn half rides the same `dispatch_event`.
+    #[test]
+    fn draining_a_mid_load_stage_leaves_the_indicator_visible() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(lifecycle_envelope(
+            "qwen3-coder-30b-a3b",
+            ModelLifecycleStage::Verifying {
+                total_bytes: 18_600_000_000,
+            },
+        ))
+        .expect("queue");
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut ctx = UiContext {
+            surface: &mut surface,
+            state: &mut state,
+            prompter: &mut prompter,
+            answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+            typed_input: true,
+        };
+        conn.drain_events(&mut ctx, || {}).expect("drain");
+        assert!(
+            state.loading.frame(0).is_some(),
+            "a verifying tier is work in progress and must draw"
         );
     }
 

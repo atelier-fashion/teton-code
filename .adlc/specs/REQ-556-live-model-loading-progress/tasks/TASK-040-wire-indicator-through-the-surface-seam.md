@@ -1,7 +1,7 @@
 ---
 id: TASK-040
 title: "Wire the indicator into the entry loop through the Surface seam, TTY-gated"
-status: draft
+status: complete
 parent: REQ-556
 created: 2026-08-04
 updated: 2026-08-04
@@ -18,8 +18,25 @@ behind BR-2.
 
 ## Files to Create/Modify
 
-- `crates/teton/src/render.rs` — add an in-place repaint capability to the `Surface` trait; ANSI implementation in `PlainSurface` (save cursor → move → `\r\x1b[K` → redraw → restore), no-op default so non-TTY surfaces inherit silence; `RecordingSurface` records the calls
-- `crates/teton/src/main.rs` — on tick, advance the indicator and repaint; on a rendered lifecycle event, repaint; clear the indicator when `frame` yields `None`
+- `crates/teton/src/session_ui.rs` — `SessionState::loading`; `render_event`'s `ModelLifecycle` arm folds the stage into it beside rendering the line
+- `crates/teton/src/main.rs` — `paint_indicator`; `next_interactive_line` ticks, repaints, and tracks the row count
+- `crates/teton/src/prompt.rs` — `erase(status_rows)` takes back the indicator's row along with the frame
+- `crates/teton/src/client.rs` — `Drained` reduced to a count
+
+**No new `Surface` method was needed.** The indicator draws with the existing
+`Surface::line`, so BR-3 holds without widening the trait — and BR-2's TTY
+gating is *structural* rather than a no-op implementation: `next_interactive_line`
+is only reached when the session is interactive, so a piped run never
+constructs an indicator or paints a row. The task's original plan (a repaint
+capability with a no-op default) would have added trait surface for a guarantee
+the call graph already gives.
+
+**The fold moved into `SessionState`.** The first plan fed the indicator from
+the idle drain's return value, which goes stale: a `Ready` arriving *during* a
+turn is drained by `call`'s own pump, so the indicator would have kept animating
+"model starting" after the tier opened. Folding in `render_event` — the one
+place every event passes through, exactly where `cost` is folded — closes that
+by construction.
 
 ## Acceptance Criteria
 

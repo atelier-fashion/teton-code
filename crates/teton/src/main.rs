@@ -326,7 +326,13 @@ fn next_interactive_line(
     entry: &mut FramedStdinPrompter,
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
+    tick: &mut u64,
 ) -> anyhow::Result<Option<String>> {
+    // The indicator's row is emitted through the `Surface` seam (BR-3) and the
+    // frame through the `Prompter` seam, in that order, so the indicator sits
+    // immediately above the frame's top rule (ADR-556-4). `status_rows` is how
+    // many rows that added, which is what `erase` needs to take back.
+    let mut status_rows = paint_indicator(ctx, *tick);
     entry.draw(entry_prompt);
     loop {
         if prompt::stdin_ready(FRAME_INTERVAL) {
@@ -334,11 +340,40 @@ fn next_interactive_line(
             // EOF"; `read_line` distinguishes them by yielding zero bytes.
             return Ok(entry.read_line());
         }
-        // Nothing typed within the interval. Anything from the daemon?
-        let drained = conn.drain_events(ctx, || entry.erase())?;
+        // Nothing typed within the interval. Anything from the daemon? The
+        // teardown only runs if something is actually going to render, so an
+        // idle session does not flicker once per interval.
+        let rows = status_rows;
+        let drained = conn.drain_events(ctx, || entry.erase(rows))?;
         if drained.rendered > 0 {
+            status_rows = paint_indicator(ctx, *tick);
+            entry.draw(entry_prompt);
+            continue;
+        }
+        // Nothing typed and nothing said: advance the animation, if there is
+        // one running. A hidden or stalled indicator asks for no repaint, so a
+        // settled session costs one `poll` per interval and nothing else.
+        if ctx.state.loading.tick() {
+            *tick = tick.wrapping_add(1);
+            entry.erase(status_rows);
+            status_rows = paint_indicator(ctx, *tick);
             entry.draw(entry_prompt);
         }
+    }
+}
+
+/// Draw the indicator's row, if it has anything to say. Returns how many rows
+/// it occupies, which is `0` when nothing was drawn.
+///
+/// Goes through [`Surface::line`] rather than writing to stdout, so a ratatui
+/// front-end inherits the indicator by implementing the same seam (BR-3).
+fn paint_indicator(ctx: &mut UiContext<'_>, tick: u64) -> usize {
+    match ctx.state.loading.frame(tick) {
+        Some(line) => {
+            ctx.surface.line(LineKind::Notice, &line);
+            1
+        }
+        None => 0,
     }
 }
 
@@ -470,6 +505,9 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             "› "
         };
         let mut entry = FramedStdinPrompter::new(interactive, color);
+        // The indicator's animation clock, persisted across turns so the dots do
+        // not restart every time a turn ends (REQ-556).
+        let mut frame_tick: u64 = 0;
         loop {
             // REQ-556 BR-1. An interactive session waits on stdin *and* the
             // daemon's event stream, so a lifecycle line reaches the user when
@@ -478,7 +516,13 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             // byte-identity holding by construction rather than by care, since
             // the new code is simply not on that path.
             let input = if interactive {
-                match next_interactive_line(entry_prompt, &mut entry, &mut conn, &mut ctx)? {
+                match next_interactive_line(
+                    entry_prompt,
+                    &mut entry,
+                    &mut conn,
+                    &mut ctx,
+                    &mut frame_tick,
+                )? {
                     Some(line) => line,
                     None => break,
                 }
@@ -1526,6 +1570,67 @@ mod tests {
         assert!(
             surface.calls.is_empty(),
             "a successful status renders nothing of its own here: {:?}",
+            surface.calls
+        );
+    }
+
+    // REQ-556 BR-3 / AC-1 (unit leg). The indicator's row goes through the
+    // `Surface` seam like every other line the session prints, so a ratatui
+    // front-end inherits it by implementing the same seam rather than by
+    // reimplementing the animation. The returned row count is what the frame's
+    // `erase` takes back — get it wrong and the redraw strands a stale row.
+    #[test]
+    fn the_indicator_paints_through_the_surface_and_reports_its_row_count() {
+        use teton_protocol::events::ModelLifecycleStage;
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+            };
+
+            // Nothing observed yet: nothing drawn, no rows to take back.
+            assert_eq!(paint_indicator(&mut ctx, 0), 0);
+
+            // Mid-load: one row, through the seam, as a Notice like the
+            // lifecycle lines it sits above.
+            ctx.state.loading.observe(
+                "qwen3-coder-30b-a3b",
+                &ModelLifecycleStage::Benchmark {
+                    first_token_ms: 368,
+                    tokens_per_sec: 73.0,
+                },
+            );
+            assert_eq!(paint_indicator(&mut ctx, 0), 1);
+
+            // Tier open: back to nothing, so `erase` is told to take back zero
+            // rows and the next frame sits flush where the ready line left off
+            // (BR-6).
+            ctx.state
+                .loading
+                .observe("qwen3-coder-30b-a3b", &ModelLifecycleStage::Ready);
+            assert_eq!(paint_indicator(&mut ctx, 0), 0);
+        }
+
+        // Exactly one row across three paints — so the two hidden paints drew
+        // nothing at all, which is what keeps an idle session quiet.
+        assert_eq!(
+            surface.lines_of(LineKind::Notice).len(),
+            1,
+            "exactly one indicator row was drawn across the three paints: {:?}",
+            surface.calls
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "model starting"),
+            "the drawn row is the loading motion: {:?}",
             surface.calls
         );
     }

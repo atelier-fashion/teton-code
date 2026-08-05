@@ -219,13 +219,6 @@ impl LoadingIndicator {
         }
     }
 
-    /// Whether anything is currently drawn — the caller uses this to decide
-    /// between repainting and clearing the indicator's row.
-    #[must_use]
-    pub fn is_visible(&self) -> bool {
-        self.phase != Phase::Hidden
-    }
-
     /// The animation suffix for a tick. The only use of `tick` in this module.
     fn dots(tick: u64) -> &'static str {
         DOTS[(tick % DOTS.len() as u64) as usize]
@@ -269,7 +262,7 @@ mod tests {
             },
         ] {
             ind.observe("m", &stage);
-            assert!(ind.is_visible(), "{stage:?} should draw");
+            assert!(ind.frame(0).is_some(), "{stage:?} should draw");
             assert!(ind.frame(0).is_some(), "{stage:?} should have a frame");
         }
         for stage in [
@@ -291,7 +284,7 @@ mod tests {
             },
         ] {
             ind.observe("m", &stage);
-            assert!(!ind.is_visible(), "{stage:?} must not draw");
+            assert!(ind.frame(0).is_none(), "{stage:?} must not draw");
             assert_eq!(ind.frame(0), None, "{stage:?} must have no frame");
         }
     }
