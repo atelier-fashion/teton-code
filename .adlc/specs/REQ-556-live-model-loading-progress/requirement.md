@@ -1,7 +1,7 @@
 ---
 id: REQ-556
 title: "Live model-loading progress in the interactive session"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-04
 updated: 2026-08-04
