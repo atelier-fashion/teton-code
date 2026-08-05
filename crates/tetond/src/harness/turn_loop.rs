@@ -643,7 +643,11 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     let mut s = String::from(
         "You are Teton Code, a coding agent that reads, edits, and verifies files \
          using tools.\n\
-         Work in short steps and use exactly one tool per reply.\n\
+         If the question can be answered from what you already know or from the \
+         conversation so far, answer it directly in plain text and call no tool. \
+         Use tools to find out what only the files can tell you.\n\
+         When you do use tools, work in short steps and use exactly one tool per \
+         reply.\n\
          To call a tool, reply with ONLY a JSON object on its own:\n\
          {\"tool\": \"<name>\", \"arguments\": { ... }}\n\
          When the task is complete, reply with a short plain-text summary and NO JSON.\n",
@@ -960,5 +964,41 @@ mod tests {
         assert!(config.require_verification);
         assert!(config.max_turns <= 12);
         assert_eq!(config.max_tools, Some(5));
+    }
+
+    #[test]
+    fn the_system_prompt_offers_a_no_tool_ending_for_a_question_it_already_knows() {
+        // BUG-154. The prompt used to describe only two endings — a tool call
+        // now, or a plain-text summary once "the task is complete" — and a
+        // question that needs no files matched neither, so the model reached for
+        // a tool because that was the only shape it had been given.
+        //
+        // Observed on qwen3-coder-30b-a3b before the fix: "what is the
+        // difference between a Mutex and an RwLock" opened with *"I'll explain
+        // the difference by examining their implementations in the repository"*
+        // and spent grep, grep, glob without ever answering; "what does HTTP
+        // status code 429 mean" answered correctly and *then* went looking
+        // through the repo's Python files, because stopping there was not a
+        // shape the prompt described.
+        //
+        // Checked on both profiles: the local tier runs the strict default, and
+        // this is not a weak-model crutch — a strong model that searches a repo
+        // to define a Mutex is just as wrong.
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                system.contains("answer it directly in plain text and call no tool"),
+                "the no-tool ending is gone from the system prompt — a question \
+                 answerable from knowledge will go searching the repo again. If \
+                 this clause was reworded deliberately, update this test to the \
+                 new wording; do not just delete the assertion.\n{system}"
+            );
+            // A second legal ending, not a replacement for the first: the
+            // tool-calling contract must still be spelled out beside it.
+            assert!(
+                system.contains("{\"tool\": \"<name>\", \"arguments\""),
+                "the tool-call format is missing:\n{system}"
+            );
+        }
     }
 }
