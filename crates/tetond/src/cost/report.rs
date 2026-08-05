@@ -21,6 +21,8 @@
 //! [`SavingsEstimate::methodology`] string travels with the number so the CLI
 //! can never present it as measured fact.
 
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 
 use teton_protocol::Phase;
@@ -47,7 +49,7 @@ pub struct GroupTotals {
 
 /// Token volume for calls whose model has no price (BR-2: surfaced, never
 /// costed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UnpricedTotals {
     /// Number of unpriced calls.
     pub calls: u64,
@@ -55,6 +57,14 @@ pub struct UnpricedTotals {
     pub input_tokens: u64,
     /// Output tokens spent on unpriced calls.
     pub output_tokens: u64,
+    /// Every model in this bucket, by name, deduplicated and ordered (REQ-557
+    /// BR-9 / AC-7b).
+    ///
+    /// The counts above say *how much* went unpriced; without this a user could
+    /// not tell *what* to price, and had to go read config or logs to find out.
+    /// A `BTreeSet` rather than a `Vec` so the rendering and the tests are
+    /// deterministic without sorting at the call site.
+    pub models: BTreeSet<String>,
 }
 
 /// Whole-ledger totals.
@@ -173,6 +183,7 @@ pub fn aggregate(rows: &[LedgerRow], prices: &PriceTable) -> CostReport {
         calls: 0,
         input_tokens: 0,
         output_tokens: 0,
+        models: BTreeSet::new(),
     };
     let mut by_session: BTreeMap<String, Accum> = BTreeMap::new();
     let mut by_phase: BTreeMap<String, Accum> = BTreeMap::new();
@@ -210,6 +221,11 @@ pub fn aggregate(rows: &[LedgerRow], prices: &PriceTable) -> CostReport {
                 unpriced.calls = unpriced.calls.saturating_add(1);
                 unpriced.input_tokens = unpriced.input_tokens.saturating_add(row.input_tokens);
                 unpriced.output_tokens = unpriced.output_tokens.saturating_add(row.output_tokens);
+                // BR-9 / AC-7b: name what could not be priced. The row carries
+                // the model the provider declared, so the bucket can say which
+                // ones need a price entry instead of only how many tokens went
+                // uncosted.
+                unpriced.models.insert(row.model.clone());
             }
         }
     }
@@ -289,6 +305,132 @@ mod tests {
         }
     }
 
+    /// REQ-557 AC-7b: the bucket names every model it could not price, so a user
+    /// can read off what needs a price entry. Two distinct unpriced models, one
+    /// of them called twice, list once each in sorted order.
+    #[test]
+    fn the_unpriced_bucket_names_every_model_it_could_not_price() {
+        let prices = PriceTable::bundled();
+        let rows = vec![
+            row("s1", None, "vllm", "llama-3-70b", 800, 200, None),
+            row("s1", None, "vllm", "llama-3-70b", 100, 50, None),
+            row("s1", None, "gateway", "mistral-large", 400, 100, None),
+            row(
+                "s1",
+                Some(Phase::Review),
+                "anthropic",
+                "claude-opus-4",
+                1000,
+                500,
+                prices.price("claude-opus-4", 1000, 500),
+            ),
+        ];
+        let report = aggregate(&rows, &prices);
+
+        assert_eq!(report.unpriced.calls, 3);
+        assert_eq!(
+            report.unpriced.models.iter().cloned().collect::<Vec<_>>(),
+            vec!["llama-3-70b".to_owned(), "mistral-large".to_owned()],
+            "each unpriced model is named exactly once, in a deterministic order"
+        );
+        // The priced model is NOT in the bucket — this names what needs a price,
+        // not what was called.
+        assert!(!report.unpriced.models.contains("claude-opus-4"));
+    }
+
+    /// REQ-557 AC-7: an unpriced call is recorded as unpriced, never as a
+    /// zero-cost one. The distinction is the whole of BR-9 — a `$0` record reads
+    /// as "this was free", which is a claim the meter has no basis for.
+    #[test]
+    fn an_unpriced_call_is_never_folded_in_as_zero_cost() {
+        let prices = PriceTable::bundled();
+        let rows = vec![
+            row(
+                "s1",
+                None,
+                "vllm",
+                "llama-3-70b",
+                1_000_000,
+                1_000_000,
+                None,
+            ),
+            // A genuinely free call: local IS in the table, priced at zero.
+            row(
+                "s1",
+                None,
+                "local",
+                "qwen2.5-coder-3b",
+                1000,
+                500,
+                prices.price("qwen2.5-coder-3b", 1000, 500),
+            ),
+        ];
+        let report = aggregate(&rows, &prices);
+
+        // Both contribute zero dollars, but for opposite reasons, and the report
+        // keeps them apart: one is priced-at-zero, the other has no price at all.
+        assert_eq!(report.total.usd_micros, 0);
+        assert_eq!(report.total.priced_calls, 1, "the local call IS priced");
+        assert_eq!(report.total.unpriced_calls, 1);
+        assert_eq!(report.unpriced.calls, 1);
+        assert!(report.unpriced.models.contains("llama-3-70b"));
+        assert!(
+            !report.unpriced.models.contains("qwen2.5-coder-3b"),
+            "a model priced at zero is priced, not unpriced"
+        );
+        // The unpriced call's huge token volume never reaches the savings
+        // estimate on either side.
+        assert_eq!(report.savings.priced_calls, 1);
+    }
+
+    /// REQ-557 AC-7: two providers declaring the same model are priced
+    /// identically, from one price entry, and roll up under their own provider
+    /// ids. Pre-REQ the second provider went unpriced unless the table carried a
+    /// duplicate row keyed to its id.
+    #[test]
+    fn two_providers_calling_one_model_are_priced_identically() {
+        let prices = PriceTable::bundled();
+        let cost = prices.price("claude-opus-4", 1000, 500);
+        assert!(cost.is_some());
+        let rows = vec![
+            row(
+                "s1",
+                None,
+                "anthropic-direct",
+                "claude-opus-4",
+                1000,
+                500,
+                cost,
+            ),
+            row(
+                "s1",
+                None,
+                "anthropic-gateway",
+                "claude-opus-4",
+                1000,
+                500,
+                cost,
+            ),
+        ];
+        let report = aggregate(&rows, &prices);
+
+        assert_eq!(report.total.priced_calls, 2);
+        assert!(report.unpriced.models.is_empty());
+        let by_provider: Vec<(&str, i64)> = report
+            .per_provider
+            .iter()
+            .map(|g| (g.key.as_str(), g.usd_micros))
+            .collect();
+        assert_eq!(
+            by_provider,
+            vec![
+                ("anthropic-direct", cost.unwrap()),
+                ("anthropic-gateway", cost.unwrap()),
+            ],
+            "the same model costs the same whoever served it"
+        );
+    }
+
     #[test]
     fn empty_ledger_reports_zeros_and_no_savings_signal() {
         let report = aggregate(&[], &PriceTable::bundled());
@@ -312,7 +454,7 @@ mod tests {
                 "claude-opus-4",
                 1000,
                 500,
-                prices.price("anthropic", "claude-opus-4", 1000, 500),
+                prices.price("claude-opus-4", 1000, 500),
             ),
             row(
                 "s1",
@@ -321,7 +463,7 @@ mod tests {
                 "qwen2.5-coder-3b",
                 4000,
                 2000,
-                prices.price("local", "qwen2.5-coder-3b", 4000, 2000),
+                prices.price("qwen2.5-coder-3b", 4000, 2000),
             ),
             row(
                 "s2",
@@ -367,7 +509,7 @@ mod tests {
     fn savings_reprices_priced_volume_at_the_frontier() {
         let prices = PriceTable::bundled();
         // One local (free) implement call — the routing-savings story.
-        let local_cost = prices.price("local", "qwen2.5-coder-3b", 10_000, 5000);
+        let local_cost = prices.price("qwen2.5-coder-3b", 10_000, 5000);
         let rows = vec![row(
             "s1",
             Some(Phase::Implement),
@@ -392,7 +534,7 @@ mod tests {
     #[test]
     fn using_the_baseline_model_itself_yields_zero_savings() {
         let prices = PriceTable::bundled();
-        let cost = prices.price("anthropic", "claude-opus-4", 2000, 1000);
+        let cost = prices.price("claude-opus-4", 2000, 1000);
         let rows = vec![row(
             "s1",
             Some(Phase::Spec),

@@ -49,9 +49,11 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-044 (in progress: e2e fixtures need `model`)",
+    "currentTask": "TASK-045 (price lookup by model; UnpricedTotals model identity)",
     "completedTasks": [
-      "TASK-043"
+      "TASK-043",
+      "TASK-044",
+      "TASK-046"
     ],
     "failedTasks": []
   }

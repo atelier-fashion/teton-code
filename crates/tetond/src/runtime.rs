@@ -3046,6 +3046,9 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
         total_calls: report.total.calls,
         priced_calls: report.total.priced_calls,
         unpriced_calls: report.total.unpriced_calls,
+        // REQ-557 AC-7b: the models the meter could not price travel to the
+        // client by name, so `teton cost` can say what to add a price for.
+        unpriced_models: report.unpriced.models.iter().cloned().collect(),
         savings_usd_micros: report.savings.savings_usd_micros,
         baseline_usd_micros: report.savings.baseline_usd_micros,
         baseline_model: report.savings.baseline_model.clone(),

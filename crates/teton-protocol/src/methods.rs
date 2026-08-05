@@ -618,6 +618,13 @@ pub struct CostReportView {
     pub priced_calls: u64,
     /// Calls with no price-table entry (never guessed a cost).
     pub unpriced_calls: u64,
+    /// The models behind [`Self::unpriced_calls`], by name, deduplicated and
+    /// ordered (REQ-557 BR-9 / AC-7b).
+    ///
+    /// A client can name what needs a price entry instead of only reporting that
+    /// something went uncosted. Empty whenever `unpriced_calls` is 0.
+    #[serde(default)]
+    pub unpriced_models: Vec<String>,
     /// `baseline − actual`; the estimated saving vs. an all-frontier baseline.
     pub savings_usd_micros: i64,
     /// What the same token volume would cost at the baseline, in micro-USD.
@@ -1084,6 +1091,7 @@ mod tests {
                 total_calls: 3,
                 priced_calls: 2,
                 unpriced_calls: 1,
+                unpriced_models: vec!["llama-3-70b".to_owned()],
                 savings_usd_micros: 500_000,
                 baseline_usd_micros: 548_100,
                 baseline_model: "anthropic/claude-opus-4".to_owned(),
