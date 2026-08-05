@@ -563,7 +563,10 @@ async fn an_undecided_tier_is_withheld_while_the_session_still_routes_remote_onl
 
     // ...and a turn resolved against that state still finds a provider: the
     // session runs remote-only rather than blocking on the answer (BR-1).
-    let router = Router::new(Vec::new(), "remote", "local")
+    let router = Router::new(Vec::new(),
+        Some("remote".to_owned()),
+        Some("local".to_owned()),
+    )
         .with_provider("remote", "remote-model", native(), ProviderHealth::Healthy)
         .with_local_available(runtime.local_tier_available());
     let route = router.resolve_freeform("write a function that parses this config file");

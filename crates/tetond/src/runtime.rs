@@ -2664,24 +2664,43 @@ fn build_provider(provider: &ModelProvider, caps: CapabilityProfile) -> Box<dyn 
 /// Build the phase-policy [`Router`] from a config snapshot.
 ///
 /// Each provider's billed model name is resolved from the price table
-/// ([`billing_model`]) so cost attribution (BR-2) hits a real price entry rather
+/// (its declared `model`, REQ-557 ADR-A) so cost attribution (BR-2) hits a real price entry rather
 /// than the bare provider id.
+/// The local tier's canonical provider id when the config declares no explicit
+/// `[[providers]]` entry for it (REQ-557 ADR-D).
+const LOCAL_PROVIDER_ID: &str = "local";
+
 fn build_router(
     config: &Config,
     local_available: bool,
     prices: &PriceTable,
     health: &BTreeMap<String, ProviderHealth>,
 ) -> Router {
+    // REQ-557 BR-4 / ADR-D: both halves of the old fallback chain are gone.
+    // Previously `default_provider` fell back to `local_provider`, which itself
+    // fell back to the literal id "local" — so an unconfigured install routed
+    // every turn to a provider registered nowhere and announced it in a
+    // `route_decided` event. That doubled fallback-identifier-standing-for-
+    // absence is BUG-146's root cause #1 (LESSON-456: "a fallback identifier is
+    // not 'none' — keep the Option").
+    // The local tier's own id. When the config declares no `[[providers]]` entry
+    // of kind `local` the tier still exists — it comes from the engine, not the
+    // config — so it keeps its canonical id.
+    //
+    // This is deliberately NOT the fallback BUG-146 was about, and the
+    // distinction is the whole of ADR-D. The defect was `default_provider`
+    // resolving to `local_provider` resolving to the literal `"local"`: a
+    // *remote-routing* decision answered with a fabricated id, so an
+    // unconfigured install announced a route to a provider registered nowhere.
+    // That chain is gone. What remains here is the local tier naming itself,
+    // which is a constant rather than a stand-in for an absent choice.
     let local_provider = config
         .providers
         .iter()
         .find(|p| matches!(p.kind, ProviderKind::Local))
-        .map_or_else(|| "local".to_owned(), |p| p.id.clone());
-    let default_provider = config
-        .providers
-        .iter()
-        .find(|p| p.kind.is_remote())
-        .map_or_else(|| local_provider.clone(), |p| p.id.clone());
+        .map(|p| p.id.clone())
+        .or_else(|| Some(LOCAL_PROVIDER_ID.to_owned()));
+    let default_provider = config.default_provider.clone();
 
     let mut router = Router::new(config.routing.clone(), default_provider, local_provider)
         .with_local_available(local_available);
@@ -2694,9 +2713,31 @@ fn build_router(
             .get(&p.id)
             .copied()
             .unwrap_or(ProviderHealth::Healthy);
+        // REQ-557 ADR-A: the model is the provider's own declaration. Nothing
+        // derives it from the price table any more — pricing is a *consumer* of
+        // this string, never its source. A provider that has not been migrated
+        // yet (model: None) is unusable rather than silently billed under its own
+        // id; `unusable_providers()` reports it and the router refuses to route
+        // to it because it never enters the provider map.
+        // A REMOTE provider with no declared model is unusable (REQ-557 ADR-E):
+        // it never enters the provider map, so the router cannot route to it and
+        // `unusable_providers()` reports it by id.
+        //
+        // A LOCAL provider is different and must NOT be skipped: its model is
+        // owned by the REQ-547 consent flow, not by this field, so `None` there
+        // is the normal state rather than an unmigrated one. Dropping it would
+        // remove the local tier from the router entirely. Local calls are
+        // unbilled, so the id doubles as the attribution label — this is not the
+        // price-table derivation ADR-A deletes, and REQ-557 OQ-4 governs whether
+        // the consent selection is eventually mirrored here.
+        let model = match (p.model.clone(), p.kind) {
+            (Some(model), _) => model,
+            (None, ProviderKind::Local) => p.id.clone(),
+            (None, _) => continue,
+        };
         router = router.with_provider(
             p.id.clone(),
-            billing_model(prices, &p.id),
+            model,
             CapabilityProfile::from_core(p.capabilities),
             seed,
         );
@@ -2769,13 +2810,6 @@ fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBoundary]) ->
 /// The model name a provider is billed under: the first price-table entry for
 /// that provider id, or the provider id itself when the table knows no model for
 /// it (an unpriced provider, recorded but never guessed a cost, BR-2).
-fn billing_model(prices: &PriceTable, provider_id: &str) -> String {
-    prices
-        .models
-        .iter()
-        .find(|m| m.provider_id == provider_id)
-        .map_or_else(|| provider_id.to_owned(), |m| m.model.clone())
-}
 
 // ---------------------------------------------------------------------------
 // Config <-> protocol conversions

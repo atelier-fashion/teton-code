@@ -84,8 +84,8 @@ fn structured_router() -> Router {
             policy(CorePhase::Review, "anthropic", Some("deepseek")),
             policy(CorePhase::Io, "local", None),
         ],
-        "deepseek",
-        "local",
+        Some("deepseek".to_owned()),
+        Some("local".to_owned()),
     )
     .with_provider(
         "anthropic",
@@ -305,8 +305,8 @@ async fn simulated_provider_failure_falls_back_and_completes_emitting_provider_d
     // Implement primary = a flaky provider whose fallback is anthropic.
     let router = Router::new(
         vec![policy(CorePhase::Implement, "flaky", Some("anthropic"))],
-        "anthropic",
-        "local",
+        Some("anthropic".to_owned()),
+        Some("local".to_owned()),
     )
     .with_provider("flaky", "flaky-model", native(), ProviderHealth::Healthy)
     .with_provider(
@@ -437,8 +437,8 @@ async fn weak_capability_provider_gets_degraded_harness_profile() {
     // Implement routes to a weak-tool-calling provider.
     let router = Router::new(
         vec![policy(CorePhase::Implement, "kimi", None)],
-        "kimi",
-        "local",
+        Some("kimi".to_owned()),
+        Some("local".to_owned()),
     )
     .with_provider("kimi", "kimi-k2", degraded(), ProviderHealth::Degraded);
 
