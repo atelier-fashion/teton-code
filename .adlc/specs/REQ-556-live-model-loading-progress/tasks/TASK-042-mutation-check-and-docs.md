@@ -1,7 +1,7 @@
 ---
 id: TASK-042
 title: "Mutation-check the feature and document the loading window"
-status: draft
+status: complete
 parent: REQ-556
 created: 2026-08-04
 updated: 2026-08-04
@@ -36,6 +36,28 @@ whole of LESSON-441 and LESSON-464.
 - [ ] Every AC in the requirement is traceable to a test or a manual-verification
       line — produce the mapping and record any AC that ends up with neither
       (there should be none; if there is, that is a finding, not a footnote).
+
+## AC traceability (produced 2026-08-04)
+
+| AC | Route | Where |
+|---|---|---|
+| AC-1 | unit | `main::the_indicator_paints_through_the_surface_and_reports_its_row_count` |
+| AC-1 | **pty — NOT COVERED** | recorded in TASK-041; manual-verification §6 is the coverage |
+| AC-2 | pty | `pty_e2e::an_idle_session_renders_an_event_with_nothing_typed` (mutation-verified) |
+| AC-3 (a) | unit | `loading::a_fraction_appears_only_when_the_daemon_supplied_a_total` |
+| AC-3 (b) | unit | `loading::no_frame_ever_renders_an_eta` (500-tick sweep × 4 phases) |
+| AC-3 (c) | existing | `firstrun::render_lifecycle_covers_every_stage`, `firstrun::progress_bar_tracks_percent_and_clamps` — both unmodified |
+| AC-4 | piped | `cli_e2e::slash_quit_ends_the_session_exactly_as_ctrl_d_does`, `an_escaped_line_and_a_plain_line_both_reach_the_model` — both unmodified |
+| AC-5 | pty | **partial** — the pty session accepts input and the frame survives, but no line is typed *while the indicator animates* (needs the load window, as AC-1's pty leg does) |
+| AC-6 | unit | `loading::an_indicator_that_never_hears_ready_stops_and_says_what_it_saw` |
+| AC-7 | CI | both `fmt · clippy · test` legs (macos-latest, ubuntu-latest) |
+| AC-8 | mutation | both mutations applied and observed failing; recorded in `loading.rs`'s module docs |
+
+**Two ACs are not fully closed** — AC-1's pty leg and AC-5's
+"while-animating" half — and both fail for the *same* reason: no test seam can
+hold the tier in its load window from this crate. Neither is quietly dropped;
+both are on the manual-verification checklist and the way to close them (lift
+`MockHf` into shared test support) is recorded in TASK-041.
 
 ## Technical Notes
 

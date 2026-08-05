@@ -229,9 +229,23 @@ kill %1 && ./target/release/tetond &
       re-benchmarks before `ready` — expect the tier to open some tens of
       seconds after start for a multi-GB model, with the honest
       "loading and benchmarking" reason replayed in the window before it does
-- [ ] a prompt typed *inside* that window comes back as a `>> model still
-      loading — …` notice, not as an `error:` line (BUG-152), and the session
-      keeps accepting input; the same prompt retyped after `ready` is served
+- [ ] **during that window the session says so without being asked** (REQ-556):
+      an indicator animates above the entry frame — `model starting`, dots
+      growing — with nothing typed. This is the one REQ-556 behaviour with no
+      automated proof at a real terminal (its fixture needs the load window,
+      which no test seam can hold open), so this checkbox *is* the coverage.
+- [ ] **the tier opening announces itself.** `>> local model <id> ready`
+      appears on its own, with no prompt typed and no key pressed. Before
+      REQ-556 that line sat queued until the next turn, so a session could be
+      ready for minutes and look idle.
+- [ ] no ETA, countdown, or "time remaining" appears anywhere in that window —
+      the daemon publishes nothing to compute one from, so a number would be
+      invented (REQ-556 BR-5)
+- [ ] a prompt typed *inside* the window still comes back as a `>> model still
+      loading — …` notice, not an `error:` line (BUG-152), and the session keeps
+      accepting input; the same prompt retyped after `ready` is served. With
+      REQ-556 this is the **fallback** rather than the primary experience — the
+      indicator above should already have told you.
 
 ---
 

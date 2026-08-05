@@ -26,6 +26,21 @@
 //! lifecycle stage already has a one-line rendering in
 //! [`crate::firstrun::render_lifecycle`], and it keeps it — a second renderer
 //! for a stage that already has one is exactly the drift BR-10 forbids.
+//!
+//! # What breaks which test
+//!
+//! Both mutations below were **applied and observed failing** (REQ-556 AC-8),
+//! not reasoned about — a suite that stays green with the feature disabled has
+//! not tested the feature (LESSON-441, LESSON-464):
+//!
+//! | Mutation | Fails |
+//! |---|---|
+//! | `dots()` ignores its `tick` (animation frozen) | `the_frame_advances_with_the_tick` |
+//! | the entry loop reverts to blocking `read_line` (no idle drain) | `pty_e2e::an_idle_session_renders_an_event_with_nothing_typed`, after the full 20 s window |
+//!
+//! The pair is deliberate: they correspond to the REQ's two halves — this
+//! module's motion, and the loop's timeliness. A mutation that only breaks a
+//! compile would be no evidence at all.
 
 use teton_protocol::events::ModelLifecycleStage;
 
