@@ -37,7 +37,7 @@
 
 use crate::phase::Phase;
 use crate::policy::{ProviderHealth, RouteOutcome};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
@@ -296,14 +296,16 @@ impl fmt::Display for Category {
 // ConfigurableCategory
 // ---------------------------------------------------------------------------
 
-/// The ten categories a configuration file may bind to a provider.
+/// The nine categories a configuration file may bind to a provider.
 ///
-/// `redact` is **absent by design** (BR-4, ADR-B): resolution has no branch for
-/// it and cannot be made to have one, because config cannot express the
-/// binding. This is also what makes a `[[categories]] name = "redact"` entry
-/// fail to deserialize — the rejection is a property of the type, not a
-/// hand-written check that could be forgotten.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `redact` and `route` are **absent by design** (BR-4, BR-5, ADR-B):
+/// resolution has no branch for either and cannot be made to have one, because
+/// config cannot express the binding. This is also what makes a
+/// `[[categories]] name = "redact"` entry fail to deserialize — the rejection is
+/// a property of the type, not a hand-written check that could be forgotten.
+/// The hand-written [`Deserialize`] impl below changes only the *message*, never
+/// the set of representable states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigurableCategory {
     /// See [`Category::Title`].
@@ -384,9 +386,15 @@ impl From<ConfigurableCategory> for Category {
 
 /// A string that does not name a [`ConfigurableCategory`].
 ///
-/// The `redact` case is called out separately because the message quality *is*
-/// the acceptance criterion (AC-4): a user who writes `categories.redact` must
-/// learn the key is **forbidden**, not that it is misspelled.
+/// The two pinned categories are called out separately because the message
+/// quality *is* the acceptance criterion (AC-4): a user who writes
+/// `categories.redact` must learn the key is **forbidden**, not that it is
+/// misspelled.
+///
+/// They get one variant each rather than a shared "that category is pinned"
+/// sentence for the reason the resolver's `resolve_pinned_local` spells out:
+/// each is pinned for its **own** reason, and REQ-544 BR-5's legibility promise
+/// is that a decision names the signal that fired, not that it names *a* signal.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseCategoryError {
     /// The caller named `redact`, which has no configuration path (BR-4).
@@ -395,6 +403,13 @@ pub enum ParseCategoryError {
          it inspects content before that content is allowed to leave the machine. Remove the entry."
     )]
     RedactIsPinned,
+    /// The caller named `route`, which has no configuration path (BR-5).
+    #[error(
+        "'route' is pinned to the local tier by construction and cannot be bound to a provider: \
+         a classifier that calls a remote model has spent what the routing decision saves, so no \
+         binding for it could name a valid state. Remove the entry."
+    )]
+    RouteIsPinned,
     /// The caller named something that is not a category at all.
     #[error("unknown category '{name}'; expected one of: {expected}")]
     Unknown {
@@ -403,6 +418,20 @@ pub enum ParseCategoryError {
         /// The accepted names, comma-separated.
         expected: String,
     },
+}
+
+impl ParseCategoryError {
+    /// The `Unknown` case — the accepted names never advertise a pinned one.
+    fn unknown(name: &str) -> Self {
+        ParseCategoryError::Unknown {
+            name: name.to_owned(),
+            expected: ConfigurableCategory::ALL
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
 }
 
 impl FromStr for ConfigurableCategory {
@@ -415,17 +444,48 @@ impl FromStr for ConfigurableCategory {
         {
             return Ok(c);
         }
-        if s == Category::Redact.as_str() {
-            return Err(ParseCategoryError::RedactIsPinned);
+        // A name that IS a category but has no configurable counterpart is
+        // *pinned*, not misspelled. The pinned set is derived from
+        // `configurable()` rather than listed here, so the two facts cannot
+        // disagree — but the sentence is still chosen per category, because a
+        // borrowed justification is the defect this module already corrected
+        // once (see `resolve_pinned_local`).
+        if let Some(pinned) = Category::ALL
+            .into_iter()
+            .find(|c| c.as_str() == s && c.configurable().is_none())
+        {
+            return Err(match pinned {
+                Category::Redact => ParseCategoryError::RedactIsPinned,
+                Category::Route => ParseCategoryError::RouteIsPinned,
+                // Unreachable while those two are the only pinned categories. A
+                // third one needs its own sentence rather than a borrowed one,
+                // and falling through to the typo message here is what makes
+                // `every_pinned_category_names_its_own_pin` fail until it has
+                // one.
+                other => ParseCategoryError::unknown(other.as_str()),
+            });
         }
-        Err(ParseCategoryError::Unknown {
-            name: s.to_owned(),
-            expected: ConfigurableCategory::ALL
-                .iter()
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        })
+        Err(ParseCategoryError::unknown(s))
+    }
+}
+
+/// Deserialized through [`FromStr`] rather than derived, so a config naming a
+/// pinned category reads [`ParseCategoryError`]'s sentence instead of serde's
+/// bare `unknown variant`, which reads like a typo (AC-4).
+///
+/// The **rejection** is still structural: there is no `Redact` or `Route`
+/// variant to deserialize into, so those states stay unrepresentable however
+/// this impl is written (ADR-B). What the hand-written impl buys is only the
+/// message — and it buys it for every format at once, config TOML and the
+/// JSON-RPC payload that binds a category at runtime alike, rather than at
+/// whichever call site remembered to check.
+impl<'de> Deserialize<'de> for ConfigurableCategory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -1289,8 +1349,56 @@ mod tests {
         let unknown = "nonsense".parse::<ConfigurableCategory>().unwrap_err();
         let text = unknown.to_string();
         assert!(text.contains("nonsense") && text.contains("edit"), "{text}");
-        // The list of accepted names never advertises the pinned category.
+        // The list of accepted names never advertises a pinned category.
         assert!(!text.contains("redact"), "{text}");
+        assert!(!text.contains("route"), "{text}");
+    }
+
+    #[test]
+    fn every_pinned_category_names_its_own_pin() {
+        // AC-4 asserted per pinned category rather than for `redact` alone
+        // (LESSON-479: a subset invariant only holds where you iterate). TWO
+        // categories are unrepresentable in config, and a user who writes
+        // either must learn the key is forbidden, not misspelled.
+        let pinned: Vec<Category> = Category::ALL
+            .into_iter()
+            .filter(|c| c.configurable().is_none())
+            .collect();
+        assert_eq!(
+            pinned,
+            vec![Category::Route, Category::Redact],
+            "the pinned set changed; each pinned category needs its own \
+             ParseCategoryError sentence"
+        );
+
+        for category in pinned {
+            let err = category
+                .as_str()
+                .parse::<ConfigurableCategory>()
+                .unwrap_err();
+            assert!(
+                !matches!(err, ParseCategoryError::Unknown { .. }),
+                "{category} is pinned but reads as a typo: {err}"
+            );
+            let text = err.to_string();
+            assert!(text.contains(category.as_str()), "{category}: {text}");
+            assert!(text.contains("pinned"), "{category}: {text}");
+        }
+
+        // And each names its OWN reason — `route` must not inherit `redact`'s.
+        assert_eq!(
+            "route".parse::<ConfigurableCategory>().unwrap_err(),
+            ParseCategoryError::RouteIsPinned
+        );
+        let route = ParseCategoryError::RouteIsPinned.to_string();
+        assert!(
+            route.contains("classifier"),
+            "route's pin must cite BR-5's reason, not redact's: {route}"
+        );
+        assert!(
+            !route.contains("leave the machine"),
+            "route inherited redact's explanation: {route}"
+        );
     }
 
     #[test]
@@ -1325,12 +1433,20 @@ mod tests {
         assert!(text.contains("think") && text.contains("design"), "{text}");
         assert_eq!(toml::from_str::<Wrap>(&text).unwrap(), wrap);
 
-        // A config naming `redact` cannot deserialize — the pin, as a type.
-        let err = toml::from_str::<Wrap>(
-            "tier = \"think\"\nname = \"redact\"\njudgment_default = \"edit\"\n",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("redact"), "{err}");
+        // A config naming a pinned category cannot deserialize — the pin, as a
+        // type — and the message says *pinned*, not "unknown variant" (AC-4).
+        for pinned in ["redact", "route"] {
+            let err = toml::from_str::<Wrap>(&format!(
+                "tier = \"think\"\nname = \"{pinned}\"\njudgment_default = \"edit\"\n"
+            ))
+            .unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains(pinned), "{text}");
+            assert!(
+                text.contains("pinned"),
+                "a TOML rejection that reads as a typo: {text}"
+            );
+        }
     }
 
     // -- resolution: the AC-2 table ----------------------------------------

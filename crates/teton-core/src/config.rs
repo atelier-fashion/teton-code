@@ -1,7 +1,11 @@
 //! The on-disk TOML configuration schema and its validation.
 //!
-//! The config file declares providers, the phase → provider routing table, and
-//! privacy boundaries. It never holds a raw credential (BR-7): providers carry
+//! The config file declares providers, the tier → provider table with its
+//! per-category overrides (REQ-558), and privacy boundaries. The pre-REQ-558
+//! phase → provider table (`[[routing]]`) is still *read* here so TASK-055's
+//! migration has something to migrate; nothing dispatches on it.
+//!
+//! It never holds a raw credential (BR-7): providers carry
 //! an `auth_ref` — a reference into the OS keychain (or an `env:`/`op://`
 //! reference) — and [`Config::validate`] accepts an `auth_ref` only if it matches
 //! a recognized reference form (a positive scheme allowlist), rejecting anything
@@ -13,6 +17,13 @@
 //! without leaking a secret (BR-7 again).
 
 use crate::boundary::BoundaryMatcher;
+// REQ-558: `TierBinding`/`CategoryOverride` live in `category` beside the
+// resolver that reads them, so the type that makes a `redact` binding
+// unrepresentable (ADR-B) sits next to the match arm that relies on it. They are
+// imported here rather than redeclared — one shape, one definition.
+use crate::category::{
+    CategoryOverride, ConfigurableCategory, JudgmentCategory, Tier, TierBinding,
+};
 use crate::entities::{ModelProvider, PrivacyBoundary, RoutingPolicy};
 use crate::mcp::{McpServerConfig, McpTransport};
 use crate::phase::Phase;
@@ -105,9 +116,47 @@ pub struct Config {
     /// rather than omitting something that does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<String>,
-    /// The phase → provider routing table.
+    /// The category a freeform judgment turn is assigned when classification is
+    /// bypassed or fails (REQ-558 BR-9).
+    ///
+    /// Defaults to `edit`, the coding-turn category — today's behavior is that a
+    /// non-auxiliary freeform prompt is a coding turn, and the default is chosen
+    /// to preserve it rather than to be neutral.
+    ///
+    /// Serialized **unconditionally** (no `skip_serializing_if`), for the same
+    /// reason as [`LocalModelConfig::auto_accept`]: AC-12 requires the declared
+    /// default be *configuration-visible* rather than a hidden constant, and a
+    /// key that disappears from a written-out config whenever it holds its
+    /// default is precisely the hidden constant that rules out.
+    #[serde(default)]
+    pub judgment_default: JudgmentCategory,
+    /// **Deprecated (REQ-558):** the pre-REQ-558 phase → provider routing table.
+    ///
+    /// Retained only so TASK-055's migration can *read* it — a table that cannot
+    /// be opened cannot be migrated, which is why REQ-557's `model` field is an
+    /// `Option` too. Nothing dispatches on it: [`Config::tiers`] and
+    /// [`Config::categories`] are the routing table now, and a category is the
+    /// dispatch key in both session modes (BR-1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routing: Vec<RoutingPolicy>,
+    /// The tier → provider table — the primary routing surface (REQ-558).
+    ///
+    /// Four rows cover all eleven categories, because every category inherits
+    /// its tier's binding ([`crate::Category::tier`]). An **empty** table is a
+    /// perfectly loadable config: unbound is incomplete, not corrupt (REQ-557
+    /// ADR-E), and every config authored before this REQ is in exactly that
+    /// state. What such a config cannot do is route — [`crate::resolve`] answers
+    /// with a sentence naming the category and its unset tier (BR-8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<TierBinding>,
+    /// Per-category overrides of the tier binding (REQ-558).
+    ///
+    /// `redact` and `route` are not nameable here: [`ConfigurableCategory`] has
+    /// no variant for either, so the binding is unrepresentable rather than
+    /// merely rejected (ADR-B). An entry naming one fails to deserialize with a
+    /// message that says *pinned* (AC-4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<CategoryOverride>,
     /// Privacy boundaries (repo-relative globs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boundaries: Vec<PrivacyBoundary>,
@@ -158,6 +207,93 @@ pub enum ConfigError {
         /// Comma-separated registered ids, so the fix is readable from the error.
         registered: String,
     },
+
+    /// A `[[tiers]]` row binds a tier to an unregistered provider id.
+    ///
+    /// Same posture, and the same message shape, as
+    /// [`ConfigError::UnknownDefaultProvider`] (REQ-557 BR-6): it names
+    /// something that does not exist, so it is a **validity** error rather than
+    /// a route that fails later, further from the cause, with the wrong name
+    /// attached (LESSON-456). A tier with *no* row is not this error — that is
+    /// an incomplete config, which loads.
+    #[error(
+        "the '{tier}' tier is bound to provider '{provider_id}', which is not registered. \
+         Registered providers: {registered}. Bind the tier to one of them with \
+         `teton policy set-tier {tier} <provider>`, or register it with `teton provider add`."
+    )]
+    UnknownTierProvider {
+        /// The tier whose binding dangles.
+        tier: Tier,
+        /// The missing provider id.
+        provider_id: String,
+        /// Comma-separated registered ids, so the fix is readable from the error.
+        registered: String,
+    },
+
+    /// A `[[tiers]]` row names an unregistered fallback provider id.
+    #[error(
+        "the '{tier}' tier names fallback provider '{fallback_id}', which is not registered. \
+         Registered providers: {registered}. Name one of them as the fallback, or register it \
+         with `teton provider add`."
+    )]
+    UnknownTierFallback {
+        /// The tier whose fallback dangles.
+        tier: Tier,
+        /// The missing fallback provider id.
+        fallback_id: String,
+        /// Comma-separated registered ids.
+        registered: String,
+    },
+
+    /// A `[[categories]]` override binds a category to an unregistered provider.
+    #[error(
+        "the '{category}' category override names provider '{provider_id}', which is not \
+         registered. Registered providers: {registered}. Bind the category to one of them with \
+         `teton policy set-category {category} <provider>`, or register it with \
+         `teton provider add`."
+    )]
+    UnknownCategoryProvider {
+        /// The category whose override dangles.
+        category: ConfigurableCategory,
+        /// The missing provider id.
+        provider_id: String,
+        /// Comma-separated registered ids.
+        registered: String,
+    },
+
+    /// A `[[categories]]` override names an unregistered fallback provider.
+    #[error(
+        "the '{category}' category override names fallback provider '{fallback_id}', which is \
+         not registered. Registered providers: {registered}. Name one of them as the fallback, \
+         or register it with `teton provider add`."
+    )]
+    UnknownCategoryFallback {
+        /// The category whose fallback dangles.
+        category: ConfigurableCategory,
+        /// The missing fallback provider id.
+        fallback_id: String,
+        /// Comma-separated registered ids.
+        registered: String,
+    },
+
+    /// Two `[[tiers]]` rows bind the same tier.
+    ///
+    /// Rejected rather than resolved first-row-wins: the second row is a user's
+    /// explicit instruction, and silently honouring the first is the "the knob
+    /// did nothing" defect this REQ exists to remove (BR-1). Same posture as
+    /// [`ConfigError::DuplicateProvider`].
+    #[error(
+        "the '{0}' tier is bound more than once; a tier names exactly one provider. \
+         Remove the duplicate `[[tiers]]` entry — the extra one would be silently ignored."
+    )]
+    DuplicateTierBinding(Tier),
+
+    /// Two `[[categories]]` rows override the same category.
+    #[error(
+        "the '{0}' category is overridden more than once; a category names exactly one provider. \
+         Remove the duplicate `[[categories]]` entry — the extra one would be silently ignored."
+    )]
+    DuplicateCategoryOverride(ConfigurableCategory),
 
     /// A routing rule targets the `freeform` phase. Freeform prompts are routed
     /// by heuristics (BR-5), not the phase→provider table, so such a rule can
@@ -317,18 +453,14 @@ impl Config {
         // with that provider unusable".
         if let Some(default_provider) = &self.default_provider {
             if !ids.contains(default_provider.as_str()) {
-                let mut registered: Vec<&str> = ids.iter().copied().collect();
-                registered.sort_unstable();
                 return Err(ConfigError::UnknownDefaultProvider {
                     default_provider: default_provider.clone(),
-                    registered: if registered.is_empty() {
-                        "(none)".to_owned()
-                    } else {
-                        registered.join(", ")
-                    },
+                    registered: registered_ids(&ids),
                 });
             }
         }
+
+        self.validate_category_table(&ids)?;
 
         for rule in &self.routing {
             // M-6: a freeform routing entry is inert — freeform prompts route by
@@ -376,6 +508,73 @@ impl Config {
                     if endpoint.trim().is_empty() {
                         return Err(ConfigError::McpMissingEndpoint(server.id.clone()));
                     }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates the REQ-558 tier/category table against the registered
+    /// provider ids.
+    ///
+    /// Two things it deliberately does **not** do:
+    ///
+    /// - **It does not require any binding.** A config with no `[[tiers]]` rows
+    ///   loads. Unbound is incomplete, not corrupt (REQ-557 ADR-E) — and since
+    ///   `Config::load` failing is the daemon refusing to start, requiring a
+    ///   binding here would make every pre-REQ-558 config unopenable, including
+    ///   by the migration written to fix it.
+    /// - **It does not screen a tier's provider for being remote.** A user may
+    ///   bind `reflex` to a remote provider and get a remote `title`; what they
+    ///   cannot get is a remote `redact` or `route`, and that is enforced where
+    ///   the decision is made — in [`crate::resolve`], by a type with no variant
+    ///   for either (BR-4, BR-5, ADR-B) — not by a check here that a second
+    ///   config path could bypass.
+    fn validate_category_table(&self, ids: &HashSet<&str>) -> Result<(), ConfigError> {
+        let mut bound: HashSet<Tier> = HashSet::with_capacity(self.tiers.len());
+        for binding in &self.tiers {
+            if !bound.insert(binding.tier) {
+                return Err(ConfigError::DuplicateTierBinding(binding.tier));
+            }
+            if !ids.contains(binding.provider_id.as_str()) {
+                return Err(ConfigError::UnknownTierProvider {
+                    tier: binding.tier,
+                    provider_id: binding.provider_id.clone(),
+                    registered: registered_ids(ids),
+                });
+            }
+            if let Some(fallback) = &binding.fallback_id {
+                if !ids.contains(fallback.as_str()) {
+                    return Err(ConfigError::UnknownTierFallback {
+                        tier: binding.tier,
+                        fallback_id: fallback.clone(),
+                        registered: registered_ids(ids),
+                    });
+                }
+            }
+        }
+
+        let mut overridden: HashSet<ConfigurableCategory> =
+            HashSet::with_capacity(self.categories.len());
+        for over in &self.categories {
+            if !overridden.insert(over.name) {
+                return Err(ConfigError::DuplicateCategoryOverride(over.name));
+            }
+            if !ids.contains(over.provider_id.as_str()) {
+                return Err(ConfigError::UnknownCategoryProvider {
+                    category: over.name,
+                    provider_id: over.provider_id.clone(),
+                    registered: registered_ids(ids),
+                });
+            }
+            if let Some(fallback) = &over.fallback_id {
+                if !ids.contains(fallback.as_str()) {
+                    return Err(ConfigError::UnknownCategoryFallback {
+                        category: over.name,
+                        fallback_id: fallback.clone(),
+                        registered: registered_ids(ids),
+                    });
                 }
             }
         }
@@ -504,6 +703,23 @@ impl Config {
     #[must_use]
     pub fn effective_pinned_local_model(&self) -> Option<&str> {
         self.local_model.pinned.as_deref()
+    }
+}
+
+/// The registered provider ids, sorted and comma-separated — the "and here is
+/// what you could have named instead" half of a dangling-reference message
+/// (REQ-557 BR-6).
+///
+/// `(none)` rather than an empty string when nothing is registered: a message
+/// that trails off after "Registered providers:" reads like a formatting bug,
+/// and "nothing is registered" is the most useful thing the error could say.
+fn registered_ids(ids: &HashSet<&str>) -> String {
+    let mut registered: Vec<&str> = ids.iter().copied().collect();
+    registered.sort_unstable();
+    if registered.is_empty() {
+        "(none)".to_owned()
+    } else {
+        registered.join(", ")
     }
 }
 
@@ -878,6 +1094,36 @@ auth_ref = "keychain:anthropic"
                     capabilities: ProviderCapabilities::default(),
                 },
             ],
+            judgment_default: JudgmentCategory::Edit,
+            tiers: vec![
+                TierBinding {
+                    tier: Tier::Reflex,
+                    provider_id: "local".to_owned(),
+                    fallback_id: None,
+                },
+                TierBinding {
+                    tier: Tier::Scan,
+                    provider_id: "local".to_owned(),
+                    fallback_id: Some("deepseek".to_owned()),
+                },
+                TierBinding {
+                    tier: Tier::Build,
+                    provider_id: "deepseek".to_owned(),
+                    fallback_id: Some("anthropic-prod".to_owned()),
+                },
+                TierBinding {
+                    tier: Tier::Think,
+                    provider_id: "anthropic-prod".to_owned(),
+                    fallback_id: Some("deepseek".to_owned()),
+                },
+            ],
+            // The case the per-category override exists for: a different vendor
+            // reviews the code than the one that wrote it.
+            categories: vec![CategoryOverride {
+                name: ConfigurableCategory::Review,
+                provider_id: "deepseek".to_owned(),
+                fallback_id: None,
+            }],
             routing: vec![
                 RoutingPolicy {
                     phase: Phase::Architect,
@@ -1419,6 +1665,337 @@ base_url = "https://hf-mirror.example.com"
             cfg.local_model.base_url = Some(good.to_owned());
             cfg.validate()
                 .unwrap_or_else(|e| panic!("`{good}` should be accepted, got {e}"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // [[tiers]] / [[categories]] / judgment_default (REQ-558)
+    // -----------------------------------------------------------------------
+
+    /// The shape a user authors: four tiers, one override, one declared default.
+    const TIER_TABLE_TOML: &str = r#"
+judgment_default = "design"
+
+[[providers]]
+id = "on-device"
+kind = "local"
+
+[[providers]]
+id = "opus"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-opus-5"
+auth_ref = "keychain:anthropic"
+
+[[tiers]]
+tier = "reflex"
+provider_id = "on-device"
+
+[[tiers]]
+tier = "think"
+provider_id = "opus"
+fallback_id = "on-device"
+
+[[categories]]
+name = "review"
+provider_id = "opus"
+"#;
+
+    #[test]
+    fn load_reads_a_tier_and_category_table() {
+        let cfg = Config::load(TIER_TABLE_TOML).expect("should load and validate");
+        assert_eq!(cfg.tiers.len(), 2);
+        assert_eq!(cfg.tiers[0].tier, Tier::Reflex);
+        assert_eq!(cfg.tiers[0].provider_id, "on-device");
+        assert_eq!(cfg.tiers[0].fallback_id, None);
+        assert_eq!(cfg.tiers[1].tier, Tier::Think);
+        assert_eq!(cfg.tiers[1].fallback_id.as_deref(), Some("on-device"));
+        assert_eq!(cfg.categories.len(), 1);
+        assert_eq!(cfg.categories[0].name, ConfigurableCategory::Review);
+        assert_eq!(cfg.categories[0].provider_id, "opus");
+        assert_eq!(cfg.judgment_default, JudgmentCategory::Design);
+    }
+
+    #[test]
+    fn the_tier_and_category_tables_round_trip_through_toml() {
+        // The REQ-557 round-trip precedent, extended to the new tables: what the
+        // daemon writes back must be what a user could have authored.
+        let cfg = Config::load(TIER_TABLE_TOML).expect("must load");
+        let toml_text = cfg.to_toml().expect("serialize");
+        assert!(toml_text.contains("[[tiers]]"), "toml: {toml_text}");
+        assert!(toml_text.contains("[[categories]]"), "toml: {toml_text}");
+        assert!(toml_text.contains("tier = \"think\""), "toml: {toml_text}");
+        assert!(toml_text.contains("name = \"review\""), "toml: {toml_text}");
+        let back = Config::from_toml(&toml_text).expect("deserialize");
+        assert_eq!(cfg, back, "round-trip mismatch; toml was:\n{toml_text}");
+        Config::load(&toml_text).expect("a re-serialized config must still validate");
+    }
+
+    #[test]
+    fn a_categories_entry_naming_a_pinned_category_says_pinned_not_misspelled() {
+        // AC-4. The *rejection* is free — `ConfigurableCategory` has no variant
+        // for either, so the binding is unrepresentable (ADR-B). What this test
+        // guards is the **message**: serde's bare "unknown variant `redact`"
+        // names the key but reads like a typo, and a user who deletes and
+        // retypes it learns nothing.
+        for pinned in ["redact", "route"] {
+            let toml_text = format!(
+                r#"
+[[providers]]
+id = "on-device"
+kind = "local"
+
+[[categories]]
+name = "{pinned}"
+provider_id = "on-device"
+"#
+            );
+            let err = Config::load(&toml_text)
+                .expect_err("a binding for a pinned category must be rejected at load");
+            assert!(
+                matches!(err, LoadError::Parse(_)),
+                "{pinned}: expected a parse rejection, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(pinned), "{pinned}: {msg}");
+            assert!(
+                msg.contains("pinned"),
+                "{pinned}: the message must say the key is forbidden, not \
+                 misspelled: {msg}"
+            );
+            assert!(
+                !msg.contains("unknown variant"),
+                "{pinned}: serde's typo-shaped message leaked through: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_categories_entry_naming_nothing_at_all_still_reads_as_a_typo() {
+        // The other half of the same message: a real misspelling must NOT be
+        // reported as a pin, and the accepted list must not advertise a
+        // category that cannot be bound.
+        let err = Config::load(
+            r#"
+[[categories]]
+name = "redct"
+provider_id = "on-device"
+"#,
+        )
+        .expect_err("an unknown category must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("redct"), "{msg}");
+        assert!(
+            msg.contains("edit"),
+            "the message lists what is accepted: {msg}"
+        );
+        assert!(!msg.contains("redact"), "{msg}");
+        assert!(!msg.contains("'route'"), "{msg}");
+    }
+
+    #[test]
+    fn a_binding_naming_an_unregistered_provider_is_rejected_with_the_alternatives() {
+        // REQ-557 BR-6's shape, applied to all four dangling-reference slots the
+        // new table has. Asserted per slot rather than once: three of the four
+        // are copies of the same six lines, which is exactly where a missing
+        // check hides.
+        fn assert_rejected(slot: &str, cfg: &Config) {
+            let err = cfg
+                .validate()
+                .expect_err(&format!("{slot}: a dangling id must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("ghost"), "{slot} must name the id: {msg}");
+            assert!(
+                msg.contains("anthropic-prod") && msg.contains("deepseek"),
+                "{slot} must list the registered ids: {msg}"
+            );
+        }
+
+        let mut cfg = sample_config();
+        cfg.tiers[3].provider_id = "ghost".to_owned();
+        assert_rejected("tier provider", &cfg);
+
+        let mut cfg = sample_config();
+        cfg.tiers[3].fallback_id = Some("ghost".to_owned());
+        assert_rejected("tier fallback", &cfg);
+
+        let mut cfg = sample_config();
+        cfg.categories[0].provider_id = "ghost".to_owned();
+        assert_rejected("category provider", &cfg);
+
+        let mut cfg = sample_config();
+        cfg.categories[0].fallback_id = Some("ghost".to_owned());
+        assert_rejected("category fallback", &cfg);
+    }
+
+    #[test]
+    fn the_dangling_binding_error_names_the_tier_or_category_it_came_from() {
+        let mut cfg = sample_config();
+        cfg.tiers[3].provider_id = "ghost".to_owned();
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::UnknownTierProvider {
+                tier: Tier::Think,
+                provider_id: "ghost".to_owned(),
+                registered: "anthropic-prod, deepseek, local".to_owned(),
+            }
+        );
+
+        let mut cfg = sample_config();
+        cfg.categories[0].fallback_id = Some("ghost".to_owned());
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::UnknownCategoryFallback {
+                category: ConfigurableCategory::Review,
+                fallback_id: "ghost".to_owned(),
+                registered: "anthropic-prod, deepseek, local".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn binding_the_same_tier_or_category_twice_is_rejected() {
+        // My call, not the task's: `CategoryTable::tier_binding` resolves
+        // first-row-wins, so a second row would be silently ignored — a knob
+        // that does nothing, which is the defect this REQ exists to remove
+        // (BR-1). Same posture as `DuplicateProvider`.
+        let mut cfg = sample_config();
+        cfg.tiers.push(TierBinding {
+            tier: Tier::Think,
+            provider_id: "deepseek".to_owned(),
+            fallback_id: None,
+        });
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::DuplicateTierBinding(Tier::Think)
+        );
+
+        let mut cfg = sample_config();
+        cfg.categories.push(CategoryOverride {
+            name: ConfigurableCategory::Review,
+            provider_id: "local".to_owned(),
+            fallback_id: None,
+        });
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::DuplicateCategoryOverride(ConfigurableCategory::Review)
+        );
+    }
+
+    #[test]
+    fn a_config_with_no_tier_bindings_still_loads() {
+        // REQ-557 ADR-E's posture: an empty table is incomplete, not corrupt.
+        // `Config::load` failing is the daemon refusing to start, so requiring a
+        // binding here would make every config authored before this REQ
+        // unopenable — including by the migration written to fix it.
+        let cfg = Config::load(
+            r#"
+[[providers]]
+id = "on-device"
+kind = "local"
+"#,
+        )
+        .expect("a config that binds no tier must still load");
+        assert!(cfg.tiers.is_empty() && cfg.categories.is_empty());
+        assert!(Config::load("")
+            .expect("an empty document loads")
+            .tiers
+            .is_empty());
+    }
+
+    #[test]
+    fn a_pre_req_558_config_carrying_the_phase_routing_table_still_loads() {
+        // The `[[routing]]` table survives until TASK-055's migration has read
+        // it: a table that cannot be opened cannot be migrated.
+        let cfg = Config::load(
+            r#"
+[[providers]]
+id = "opus"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-opus-5"
+auth_ref = "keychain:anthropic"
+
+[[routing]]
+phase = "architect"
+provider_id = "opus"
+"#,
+        )
+        .expect("a pre-REQ-558 config must still load");
+        assert_eq!(cfg.routing.len(), 1);
+        assert_eq!(cfg.routing[0].phase, Phase::Architect);
+        assert!(cfg.tiers.is_empty(), "and it binds no tier yet");
+    }
+
+    #[test]
+    fn a_freeform_routing_entry_is_still_rejected_after_the_schema_change() {
+        // The architecture's "Corrections to the Requirement": BR-10's "drop the
+        // freeform entry" describes a config that has never loaded, so the
+        // migration has nothing to drop. This rejection is TASK-051's to revisit
+        // when `Phase::Freeform` goes, not this task's to relax.
+        let err = Config::load(
+            r#"
+[[providers]]
+id = "opus"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+auth_ref = "keychain:anthropic"
+
+[[routing]]
+phase = "freeform"
+provider_id = "opus"
+
+[[tiers]]
+tier = "think"
+provider_id = "opus"
+"#,
+        )
+        .expect_err("a freeform routing entry must still be rejected");
+        assert!(matches!(
+            err,
+            LoadError::Validate(ConfigError::FreeformRoutingPolicy)
+        ));
+    }
+
+    #[test]
+    fn judgment_default_is_a_real_key_that_defaults_to_edit_and_is_written_out() {
+        // BR-9 / AC-12: the declared default is configuration-visible, not a
+        // hidden constant. A key that vanishes from a written-out config
+        // whenever it holds its default IS a hidden constant, so it serializes
+        // unconditionally.
+        assert_eq!(Config::default().judgment_default, JudgmentCategory::Edit);
+        assert_eq!(
+            Config::load("").expect("loads").judgment_default,
+            JudgmentCategory::Edit,
+            "a config that says nothing means today's behavior: a non-auxiliary \
+             freeform prompt is a coding turn"
+        );
+
+        let toml_text = Config::default().to_toml().expect("serialize");
+        assert!(
+            toml_text.contains("judgment_default = \"edit\""),
+            "the declared default must be readable from the config file: {toml_text}"
+        );
+
+        // And changing it is a config edit, not a recompile.
+        let cfg = Config::load("judgment_default = \"debug\"\n").expect("loads");
+        assert_eq!(cfg.judgment_default, JudgmentCategory::Debug);
+        let back = Config::from_toml(&cfg.to_toml().expect("serialize")).expect("deserialize");
+        assert_eq!(back.judgment_default, JudgmentCategory::Debug);
+    }
+
+    #[test]
+    fn judgment_default_admits_only_the_four_judgment_categories() {
+        // BR-2/AC-3's guarantee reaching config: the key's type is
+        // `JudgmentCategory`, so `judgment_default = "digest"` is a load error
+        // rather than a harness-known category assigned from a config file.
+        for not_a_judgment in ["digest", "redact", "route", "title", "shell"] {
+            let err = Config::load(&format!("judgment_default = \"{not_a_judgment}\"\n"))
+                .expect_err("only the judgment four may be the declared default");
+            assert!(
+                err.to_string().contains(not_a_judgment),
+                "{not_a_judgment}: {err}"
+            );
         }
     }
 
