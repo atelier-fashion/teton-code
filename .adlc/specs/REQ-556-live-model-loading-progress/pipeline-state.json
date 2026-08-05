@@ -1,0 +1,77 @@
+{
+  "req": "REQ-556",
+  "branch": "feat/REQ-556-live-model-loading-progress",
+  "startedAt": "2026-08-04T23:43:59Z",
+  "completed": false,
+  "currentPhase": 6,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Create Worktrees + Preflight + Load Context",
+      "completedAt": "2026-08-04T23:44:14Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate the Requirement Spec",
+      "completedAt": "2026-08-04T23:50:01Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-04T23:55:08Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-04T23:56:41Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-05T01:36:50Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (reflect + review)",
+      "completedAt": "2026-08-05T01:41:49Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-556",
+      "branch": "feat/REQ-556-live-model-loading-progress",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/49",
+      "prNumber": 49,
+      "prCreatedAt": "2026-08-04T23:44:07Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-039",
+      "TASK-038",
+      "TASK-040",
+      "TASK-041",
+      "TASK-042"
+    ],
+    "failedTasks": []
+  }
+}

@@ -86,6 +86,15 @@ pub struct SessionState {
     /// in-session `/verbose` command toggles it mid-session (REQ-555 BR-5).
     /// Session-scoped either way — nothing here is persisted.
     pub verbose: bool,
+    /// The local tier's loading indicator (REQ-556).
+    ///
+    /// It lives in session state, beside `cost`, for the same reason `cost`
+    /// does: the fold happens in [`render_event`], which is the **one** place
+    /// every `model_lifecycle` event passes through — whether it arrives while
+    /// the session is idle at the prompt or is drained by a turn's own pump. An
+    /// indicator fed only from the idle path would keep animating "model
+    /// starting" after a `Ready` that landed mid-turn.
+    pub loading: crate::loading::LoadingIndicator,
 }
 
 impl SessionState {
@@ -152,6 +161,12 @@ pub fn render_event(
             EventOutcome::Rendered
         }
         Event::ModelLifecycle(ModelLifecycle { model_id, stage }) => {
+            // The line and the indicator are two presentations of one event,
+            // folded at one place so they cannot disagree (REQ-556 BR-10,
+            // LESSON-456). `render_lifecycle` keeps sole ownership of the
+            // per-stage line; the indicator only ever draws motion for the
+            // window that has no line at all.
+            state.loading.observe(model_id, stage);
             firstrun::render_lifecycle(model_id, stage, surface);
             EventOutcome::Rendered
         }

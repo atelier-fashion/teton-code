@@ -95,6 +95,19 @@ enum Incoming {
     Lagged(RpcError),
 }
 
+/// What one non-blocking drain of the event channel produced (REQ-556 BR-1).
+///
+/// Deliberately just a count. Lifecycle stages are folded into
+/// [`SessionState::loading`] by `render_event`, which every event passes
+/// through — returning them here as well would be a second path to the same
+/// fact, and the two would drift the first time one of them was updated.
+#[derive(Debug, Default)]
+pub struct Drained {
+    /// How many things actually rendered. Zero means the caller's screen is
+    /// untouched, so an open entry frame is still intact.
+    pub rendered: usize,
+}
+
 /// A live connection to the daemon.
 pub struct Connection {
     writer: UnixStream,
@@ -199,6 +212,71 @@ impl Connection {
                 }
                 Incoming::Event(env) => self.dispatch_event(&env, ctx)?,
                 Incoming::Lagged(err) => report_lag(&err, ctx.surface),
+            }
+        }
+    }
+
+    /// Render every event already queued, without blocking (REQ-556 BR-1).
+    ///
+    /// The interactive entry loop calls this between polls of stdin, which is
+    /// what makes a lifecycle event reach the user at the time it arrives
+    /// rather than at the next turn. Before this existed, the only thing that
+    /// drained the channel was [`Self::call`]'s pump, so events queued silently
+    /// while the loop sat in `read_line` — the daemon knew the tier was ready
+    /// and the session had no way to say so.
+    ///
+    /// Rendering goes through the same [`Self::dispatch_event`] the turn pump
+    /// uses, so there is exactly one renderer for any given event (REQ-556
+    /// BR-10) and permission/proposal answering behaves identically whether an
+    /// event arrives mid-turn or while idle.
+    ///
+    /// Returns the `model_lifecycle` payloads seen, in order, so an idle caller
+    /// can fold them into its indicator without re-inspecting the envelopes.
+    ///
+    /// `on_first` runs **once**, immediately before the first thing renders,
+    /// and only if something is going to render. An interactive caller uses it
+    /// to tear down its open entry frame, which would otherwise be overwritten
+    /// by the notice. Nothing queued ⇒ `on_first` never runs ⇒ no teardown and
+    /// no redraw, so an idle session does not flicker once per poll interval.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a send failure from answering a permission or proposal. A
+    /// disconnected channel is **not** an error here — it is reported as "no
+    /// more events", and the caller discovers the drop on its next `call`.
+    pub fn drain_events(
+        &mut self,
+        ctx: &mut UiContext,
+        mut on_first: impl FnMut(),
+    ) -> anyhow::Result<Drained> {
+        let mut drained = Drained::default();
+        loop {
+            let incoming = match self.incoming.try_recv() {
+                Ok(incoming) => incoming,
+                // Empty: nothing queued right now. Disconnected: the daemon is
+                // gone, which the next `call` reports properly — draining is not
+                // the place to fail a session.
+                Err(_) => return Ok(drained),
+            };
+            match incoming {
+                Incoming::Event(env) => {
+                    if drained.rendered == 0 {
+                        on_first();
+                    }
+                    drained.rendered += 1;
+                    self.dispatch_event(&env, ctx)?;
+                }
+                Incoming::Lagged(err) => {
+                    if drained.rendered == 0 {
+                        on_first();
+                    }
+                    drained.rendered += 1;
+                    report_lag(&err, ctx.surface);
+                }
+                // A stray ack for a permission or proposal reply we already
+                // sent fire-and-forget. `call` ignores these too. Renders
+                // nothing, so it must not trigger `on_first`.
+                Incoming::Response(_) => {}
             }
         }
     }
@@ -621,7 +699,188 @@ mod tests {
     use super::*;
     use std::io::BufWriter;
     use std::os::unix::net::UnixListener;
+    use teton_protocol::events::ModelLifecycleStage;
     use teton_protocol::jsonrpc::error_code;
+
+    use crate::render::RecordingSurface;
+
+    /// A `Connection` whose channel the test feeds directly. `UnixStream::pair`
+    /// gives the writer half a real, connected socket without a daemon, so
+    /// `drain_events` is exercised with no server, no terminal, and no thread.
+    fn test_connection() -> (Connection, mpsc::Sender<Incoming>, UnixStream) {
+        let (writer, peer) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = mpsc::channel();
+        (
+            Connection {
+                writer,
+                incoming: rx,
+                next_id: 1,
+            },
+            tx,
+            peer,
+        )
+    }
+
+    fn lifecycle_envelope(model: &str, stage: ModelLifecycleStage) -> Incoming {
+        use teton_protocol::events::{Event, EventEnvelope, ModelLifecycle};
+        Incoming::Event(Box::new(EventEnvelope {
+            session_id: None,
+            seq: 1,
+            event: Event::ModelLifecycle(ModelLifecycle {
+                model_id: model.to_owned(),
+                stage,
+            }),
+        }))
+    }
+
+    /// REQ-556 BR-1. Before `drain_events`, the only thing that emptied this
+    /// channel was `call`'s pump, so a lifecycle event that arrived while the
+    /// entry loop sat in `read_line` stayed queued until the next turn — the
+    /// daemon knew the tier was ready and the session had no way to say so.
+    ///
+    /// Exercised with no socket server and no terminal, which is the point:
+    /// BR-2 hides the interactive path from every piped e2e, so this behaviour
+    /// needs a route that does not involve a tty.
+    #[test]
+    fn draining_renders_queued_events_and_reports_their_lifecycle_stages() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(lifecycle_envelope(
+            "qwen3-coder-30b-a3b",
+            ModelLifecycleStage::Verifying {
+                total_bytes: 18_600_000_000,
+            },
+        ))
+        .expect("queue");
+        tx.send(lifecycle_envelope(
+            "qwen3-coder-30b-a3b",
+            ModelLifecycleStage::Ready,
+        ))
+        .expect("queue");
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut ctx = UiContext {
+            surface: &mut surface,
+            state: &mut state,
+            prompter: &mut prompter,
+            answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+            typed_input: true,
+        };
+
+        let mut teardowns = 0;
+        let drained = conn
+            .drain_events(&mut ctx, || teardowns += 1)
+            .expect("drain");
+
+        assert_eq!(drained.rendered, 2, "both queued events rendered");
+        // The caller's frame is torn down once, not once per event — otherwise
+        // a burst would erase and redraw for every line in it.
+        assert_eq!(teardowns, 1, "on_first runs exactly once per drain");
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "ready"),
+            "the ready line reached the surface: {:?}",
+            surface.calls
+        );
+        // The indicator was folded on the way through, in arrival order, so the
+        // terminal `Ready` wins and the session stops animating (REQ-556 BR-6).
+        // Asserting through session state rather than a returned vector is the
+        // point: this is the path a real session takes.
+        assert!(
+            state.loading.frame(0).is_none(),
+            "a drained Ready must leave the indicator hidden"
+        );
+    }
+
+    /// The fold happens in `render_event`, so an event drained while idle and
+    /// an event drained by a turn's pump reach the indicator identically. This
+    /// pins the idle half; the mid-turn half rides the same `dispatch_event`.
+    #[test]
+    fn draining_a_mid_load_stage_leaves_the_indicator_visible() {
+        let (mut conn, tx, _peer) = test_connection();
+        tx.send(lifecycle_envelope(
+            "qwen3-coder-30b-a3b",
+            ModelLifecycleStage::Verifying {
+                total_bytes: 18_600_000_000,
+            },
+        ))
+        .expect("queue");
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut ctx = UiContext {
+            surface: &mut surface,
+            state: &mut state,
+            prompter: &mut prompter,
+            answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+            typed_input: true,
+        };
+        conn.drain_events(&mut ctx, || {}).expect("drain");
+        assert!(
+            state.loading.frame(0).is_some(),
+            "a verifying tier is work in progress and must draw"
+        );
+    }
+
+    /// An idle session must not flicker: with nothing queued, the caller's
+    /// entry frame is never torn down, so there is nothing to redraw.
+    #[test]
+    fn draining_an_empty_channel_touches_nothing() {
+        let (mut conn, _tx, _peer) = test_connection();
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut ctx = UiContext {
+            surface: &mut surface,
+            state: &mut state,
+            prompter: &mut prompter,
+            answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+            typed_input: true,
+        };
+
+        let mut teardowns = 0;
+        let drained = conn
+            .drain_events(&mut ctx, || teardowns += 1)
+            .expect("drain");
+
+        assert_eq!(drained.rendered, 0);
+        assert_eq!(teardowns, 0, "no teardown when nothing renders");
+        assert!(
+            surface.calls.is_empty(),
+            "nothing rendered: {:?}",
+            surface.calls
+        );
+    }
+
+    /// A dropped daemon is reported by the next `call`, not by a drain — a
+    /// disconnected channel here must read as "nothing more queued" rather than
+    /// failing a session that is otherwise fine.
+    #[test]
+    fn draining_a_disconnected_channel_is_not_an_error() {
+        let (mut conn, tx, _peer) = test_connection();
+        drop(tx);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+        let mut ctx = UiContext {
+            surface: &mut surface,
+            state: &mut state,
+            prompter: &mut prompter,
+            answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+            typed_input: true,
+        };
+        let drained = conn.drain_events(&mut ctx, || {}).expect("not an error");
+        assert_eq!(drained.rendered, 0);
+    }
 
     #[test]
     fn classify_reads_a_success_response() {

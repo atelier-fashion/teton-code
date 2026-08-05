@@ -28,6 +28,7 @@ mod client;
 mod cost_ui;
 mod firstrun;
 mod keychain;
+mod loading;
 mod model_ui;
 mod prompt;
 mod render;
@@ -296,6 +297,106 @@ fn main() -> ExitCode {
     }
 }
 
+/// How long the interactive entry loop waits on stdin before checking the
+/// daemon's event stream and advancing the loading indicator (REQ-556).
+///
+/// Short enough that a lifecycle line lands promptly and an animation reads as
+/// motion; long enough that an idle session is not spinning. This is the
+/// indicator's frame interval as well as the poll timeout — one clock, so there
+/// is no timer thread and no `sleep` anywhere in the loop.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// How many rows above the cursor the indicator's row sits while the entry
+/// frame is open: `[status][top rule][input row ← cursor][bottom rule]`.
+///
+/// Lives beside the frame interval because both are facts about the interactive
+/// layout that `next_interactive_line` depends on; the geometry itself is
+/// `FramedStdinPrompter::draw`'s, and this must move if that does.
+const STATUS_ROWS_ABOVE_CURSOR: usize = 2;
+
+/// Wait for the next line an interactive user types, rendering anything the
+/// daemon says in the meantime (REQ-556 BR-1).
+///
+/// The entry frame stays **open** across the wait, so the place to type is
+/// visible the whole time. When something does arrive, the frame is torn down
+/// before it renders and redrawn afterwards — otherwise the notice would land
+/// in the input row and shred it. Nothing queued means no teardown at all, so
+/// an idle session does not flicker once per interval.
+///
+/// `None` on EOF (Ctrl-D), which the caller turns into the same post-loop
+/// session-end path `/quit` takes (REQ-555 BR-6).
+///
+/// # Errors
+///
+/// Propagates a failure from answering a permission or model proposal.
+fn next_interactive_line(
+    entry_prompt: &str,
+    entry: &mut FramedStdinPrompter,
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    tick: &mut u64,
+) -> anyhow::Result<Option<String>> {
+    // The indicator's row is emitted through the `Surface` seam (BR-3) and the
+    // frame through the `Prompter` seam, in that order, so the indicator sits
+    // immediately above the frame's top rule (ADR-556-4). `status_rows` is how
+    // many rows that added, which is what `erase` needs to take back.
+    let mut status_rows = paint_indicator(ctx, *tick);
+    entry.draw(entry_prompt);
+    loop {
+        if prompt::stdin_ready(FRAME_INTERVAL) {
+            // Readable covers "a line is waiting" and "the descriptor is at
+            // EOF"; `read_line` distinguishes them by yielding zero bytes.
+            return Ok(entry.read_line());
+        }
+        // Nothing typed within the interval. Anything from the daemon? The
+        // teardown only runs if something is actually going to render, so an
+        // idle session does not flicker once per interval.
+        let rows = status_rows;
+        let drained = conn.drain_events(ctx, || entry.erase(rows))?;
+        if drained.rendered > 0 {
+            status_rows = paint_indicator(ctx, *tick);
+            entry.draw(entry_prompt);
+            continue;
+        }
+        // Nothing typed and nothing said: advance the animation, if there is
+        // one running. A hidden or stalled indicator asks for no repaint, so a
+        // settled session costs one `poll` per interval and nothing else.
+        //
+        // This repaints the status row **in place** rather than tearing the
+        // frame down. The frame teardown above is correct for an event, which
+        // has to scroll a new line into the log; using it for the animation
+        // would blank whatever the user had typed into the input row eight
+        // times a second (ADR-556-4). The text would survive — the kernel holds
+        // the line until Enter — but watching it flicker away while typing is
+        // not a thing to ship.
+        if ctx.state.loading.tick() {
+            *tick = tick.wrapping_add(1);
+            if let Some(line) = ctx.state.loading.frame(*tick) {
+                // Two rows up: the layout is [status][top rule][input row ←
+                // cursor][bottom rule].
+                ctx.surface
+                    .repaint_row_above(STATUS_ROWS_ABOVE_CURSOR, LineKind::Notice, &line);
+                status_rows = 1;
+            }
+        }
+    }
+}
+
+/// Draw the indicator's row, if it has anything to say. Returns how many rows
+/// it occupies, which is `0` when nothing was drawn.
+///
+/// Goes through [`Surface::line`] rather than writing to stdout, so a ratatui
+/// front-end inherits the indicator by implementing the same seam (BR-3).
+fn paint_indicator(ctx: &mut UiContext<'_>, tick: u64) -> usize {
+    match ctx.state.loading.frame(tick) {
+        Some(line) => {
+            ctx.surface.line(LineKind::Notice, &line);
+            1
+        }
+        None => 0,
+    }
+}
+
 /// The headline a turn that arrived while the local tier was still coming up
 /// renders under (BUG-152).
 ///
@@ -424,7 +525,33 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             "› "
         };
         let mut entry = FramedStdinPrompter::new(interactive, color);
-        while let Some(input) = entry.ask(entry_prompt) {
+        // The indicator's animation clock, persisted across turns so the dots do
+        // not restart every time a turn ends (REQ-556).
+        let mut frame_tick: u64 = 0;
+        loop {
+            // REQ-556 BR-1. An interactive session waits on stdin *and* the
+            // daemon's event stream, so a lifecycle line reaches the user when
+            // it happens rather than at the next turn. A piped session takes
+            // the original blocking path untouched — that is BR-2's
+            // byte-identity holding by construction rather than by care, since
+            // the new code is simply not on that path.
+            let input = if interactive {
+                match next_interactive_line(
+                    entry_prompt,
+                    &mut entry,
+                    &mut conn,
+                    &mut ctx,
+                    &mut frame_tick,
+                )? {
+                    Some(line) => line,
+                    None => break,
+                }
+            } else {
+                match entry.ask(entry_prompt) {
+                    Some(line) => line,
+                    None => break,
+                }
+            };
             let text = input.trim();
             if text.is_empty() {
                 continue;
@@ -1463,6 +1590,67 @@ mod tests {
         assert!(
             surface.calls.is_empty(),
             "a successful status renders nothing of its own here: {:?}",
+            surface.calls
+        );
+    }
+
+    // REQ-556 BR-3 / AC-1 (unit leg). The indicator's row goes through the
+    // `Surface` seam like every other line the session prints, so a ratatui
+    // front-end inherits it by implementing the same seam rather than by
+    // reimplementing the animation. The returned row count is what the frame's
+    // `erase` takes back — get it wrong and the redraw strands a stale row.
+    #[test]
+    fn the_indicator_paints_through_the_surface_and_reports_its_row_count() {
+        use teton_protocol::events::ModelLifecycleStage;
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+            };
+
+            // Nothing observed yet: nothing drawn, no rows to take back.
+            assert_eq!(paint_indicator(&mut ctx, 0), 0);
+
+            // Mid-load: one row, through the seam, as a Notice like the
+            // lifecycle lines it sits above.
+            ctx.state.loading.observe(
+                "qwen3-coder-30b-a3b",
+                &ModelLifecycleStage::Benchmark {
+                    first_token_ms: 368,
+                    tokens_per_sec: 73.0,
+                },
+            );
+            assert_eq!(paint_indicator(&mut ctx, 0), 1);
+
+            // Tier open: back to nothing, so `erase` is told to take back zero
+            // rows and the next frame sits flush where the ready line left off
+            // (BR-6).
+            ctx.state
+                .loading
+                .observe("qwen3-coder-30b-a3b", &ModelLifecycleStage::Ready);
+            assert_eq!(paint_indicator(&mut ctx, 0), 0);
+        }
+
+        // Exactly one row across three paints — so the two hidden paints drew
+        // nothing at all, which is what keeps an idle session quiet.
+        assert_eq!(
+            surface.lines_of(LineKind::Notice).len(),
+            1,
+            "exactly one indicator row was drawn across the three paints: {:?}",
+            surface.calls
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "model starting"),
+            "the drawn row is the loading motion: {:?}",
             surface.calls
         );
     }

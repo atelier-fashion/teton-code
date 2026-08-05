@@ -34,3 +34,12 @@ security-framework = "2"
 
 [lints]
 workspace = true
+
+# Test-only. REQ-556's BR-2 makes the loading indicator emit nothing unless
+# stdout is a terminal, so the piped `cli_e2e` harness is structurally blind to
+# it — and BR-1's claim ("an event renders while the session is idle at the
+# prompt") is *about* timing at a terminal. Neither can be reached over a pipe,
+# which is why a pty enters the dev-dependency set. Nothing in the shipped
+# binary links it: `cargo tree --edges normal` shows it absent.
+[dev-dependencies]
+portable-pty = "0.9"

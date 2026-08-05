@@ -1,7 +1,7 @@
 ---
 id: REQ-556
 title: "Live model-loading progress in the interactive session"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-04
 updated: 2026-08-04
@@ -147,6 +147,11 @@ one.
       rendered honestly without a new daemon event, that is an explicit scope
       decision recorded at architecture time, not an implementation detail.
       (informed by REQ-555)
+- [ ] BR-9: A failure to render the indicator is never fatal and never silent.
+      If animation cannot be driven (terminal too narrow, cursor control
+      unavailable, write error), the session degrades to the existing static
+      notice and remains fully usable — the loading state stays discoverable by
+      the fallback, not lost with the decoration. (informed by LESSON-447)
 - [ ] BR-10: **No second renderer.** The per-stage lines stay
       `render_lifecycle`'s, byte for byte. This REQ changes when those lines
       reach the user and adds motion to the one window that has no line at all;
@@ -159,18 +164,16 @@ one.
       indicator invisible to every piped test, so without this rule the
       feature's core behaviour has no verification path at all — the TTY gate
       would double as a test blindfold. (informed by LESSON-441)
-- [ ] BR-9: A failure to render the indicator is never fatal and never silent.
-      If animation cannot be driven (terminal too narrow, cursor control
-      unavailable, write error), the session degrades to the existing static
-      notice and remains fully usable — the loading state stays discoverable by
-      the fallback, not lost with the decoration. (informed by LESSON-447)
 
 ## Acceptance Criteria
 
-Each criterion names how it is verified, because BR-2 puts the indicator
-outside the reach of the existing piped harness. Three routes are used: **unit**
-(the BR-11 state→frames function, no terminal), **pty** (a new PTY-driven e2e —
-see External Dependencies), and **piped** (the existing `cli_e2e` harness).
+AC-1 through AC-6 each name how they are verified, because BR-2 puts the
+indicator outside the reach of the existing piped harness. Three routes are
+used: **unit** (the BR-11 state→frames function, no terminal), **pty** (a new
+PTY-driven e2e — see External Dependencies), and **piped** (the existing
+`cli_e2e` harness). AC-7 and AC-8 carry no route tag because they are
+cross-cutting claims about the suite as a whole — which platforms it ran on,
+and whether it actually fails when the feature is disabled.
 
 - [ ] AC-1 *(unit + pty)*: With the daemon mid-load, opening `teton` shows a
       live indicator naming the model and its current phase, advancing at a
