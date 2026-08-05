@@ -158,8 +158,6 @@ impl Prompter for FramedStdinPrompter {
     }
 }
 
-/// The terminal's column count, or a conservative 80 when stdout is not a
-/// terminal or the query fails.
 /// Wait up to `timeout` for stdin to have something to read (REQ-556 BR-1).
 ///
 /// This is what lets the interactive entry loop stop *blocking* on stdin
@@ -191,6 +189,8 @@ pub(crate) fn stdin_ready(timeout: std::time::Duration) -> bool {
     rc > 0
 }
 
+/// The terminal's column count, or a conservative 80 when stdout is not a
+/// terminal or the query fails.
 fn terminal_width() -> usize {
     // SAFETY: TIOCGWINSZ writes a plain `winsize` struct through the pointer
     // and touches nothing else; a failure is reported through the return code

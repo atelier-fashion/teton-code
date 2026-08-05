@@ -46,6 +46,25 @@ pub trait Surface {
     /// assistant output, which arrives as a sequence of chunks.
     fn fragment(&mut self, text: &str);
 
+    /// Repaint one row `rows_up` above the cursor **in place**, leaving the
+    /// cursor exactly where it was (REQ-556 ADR-556-4).
+    ///
+    /// The loading indicator's animation uses this rather than redrawing the
+    /// entry frame. In canonical mode the terminal echoes keystrokes into the
+    /// input row while the kernel holds the line until Enter; a frame redraw
+    /// every animation interval would blank those echoed characters several
+    /// times a second. The text would still be delivered — but watching it
+    /// flicker away while typing is not a thing to ship.
+    ///
+    /// `rows_up` comes from the caller because frame geometry is the caller's
+    /// knowledge, not the surface's; the surface owns only how to move a cursor.
+    ///
+    /// **Defaults to a no-op**, which is BR-2's guarantee for every surface
+    /// that is not a terminal — including any future one. A surface with no
+    /// cursor has no row to repaint, so silence is the correct behaviour rather
+    /// than something each implementor must remember to add.
+    fn repaint_row_above(&mut self, _rows_up: usize, _kind: LineKind, _text: &str) {}
+
     /// Flush any buffered output. The default is a no-op.
     ///
     /// # Errors
@@ -111,6 +130,31 @@ impl<W: Write> Surface for PlainSurface<W> {
         self.at_line_start = text.ends_with('\n');
     }
 
+    /// Save the cursor, step up, clear that row, write, restore. `at_line_start`
+    /// is deliberately untouched: the cursor ends where it began, so the
+    /// bookkeeping that keeps a later `line()` from colliding with streamed
+    /// output is still accurate.
+    fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) {
+        let prefix = Self::prefix(kind);
+        // A repaint claims exactly one row, and the cursor restore assumes it.
+        // `line()` can afford to pass text through — a stray newline there just
+        // makes two log lines — but here it would scroll the frame out from
+        // under `\x1b[u` and leave the entry area shredded. The text is
+        // daemon-supplied (a model id lands in it), which is the same trust
+        // level `render_lifecycle` already prints, but the *consequence* of a
+        // control character differs, so the guard belongs at this writer rather
+        // than at the source (LESSON-474: sanitize where the parser is).
+        let single_row: String = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let _ = write!(
+            self.out,
+            "\x1b[s\x1b[{rows_up}A\r\x1b[K{prefix}{single_row}\x1b[u"
+        );
+        let _ = self.out.flush();
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         self.out.flush()
     }
@@ -124,6 +168,11 @@ pub(crate) enum Rendered {
     Line(LineKind, String),
     /// A `fragment(text)` call.
     Fragment(String),
+    /// A `repaint_row_above(rows_up, kind, text)` call — recorded distinctly
+    /// from `Line` so a test can tell "scrolled a new line into the log" from
+    /// "redrew a row in place", which is exactly the distinction ADR-556-4 is
+    /// about.
+    Repaint(usize, LineKind, String),
 }
 
 /// A [`Surface`] that records every call instead of writing bytes. Test-only.
@@ -147,7 +196,7 @@ impl RecordingSurface {
             .iter()
             .filter_map(|c| match c {
                 Rendered::Fragment(t) => Some(t.as_str()),
-                Rendered::Line(..) => None,
+                Rendered::Line(..) | Rendered::Repaint(..) => None,
             })
             .collect()
     }
@@ -178,11 +227,107 @@ impl Surface for RecordingSurface {
     fn fragment(&mut self, text: &str) {
         self.calls.push(Rendered::Fragment(text.to_owned()));
     }
+
+    fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) {
+        self.calls
+            .push(Rendered::Repaint(rows_up, kind, text.to_owned()));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-556 ADR-556-4 / AC-5. The animation must repaint its row **in
+    /// place** — save, move, clear, write, restore — and must not disturb the
+    /// cursor. The first implementation tore the entry frame down and redrew it
+    /// on every tick, which blanked whatever the user had typed into the input
+    /// row eight times a second; the text still arrived on Enter, but it
+    /// visibly flickered away as it was typed.
+    #[test]
+    fn a_repaint_restores_the_cursor_and_leaves_line_bookkeeping_alone() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            // Mid-stream, so the `at_line_start` bookkeeping is in its
+            // interesting state.
+            surface.fragment("partially typed");
+            surface.repaint_row_above(2, LineKind::Notice, "model starting..");
+            // A repaint must not have changed where the surface thinks it is —
+            // the cursor came back to exactly where it was, so a later `line()`
+            // still knows it must close the open fragment first.
+            surface.line(LineKind::Info, "after");
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("\x1b[s"), "saves the cursor: {out:?}");
+        assert!(
+            out.contains("\x1b[2A"),
+            "steps up to the status row: {out:?}"
+        );
+        assert!(out.contains("\x1b[K"), "clears only that row: {out:?}");
+        assert!(out.contains("\x1b[u"), "restores the cursor: {out:?}");
+        assert!(
+            !out.contains("\x1b[J"),
+            "must not clear to end of screen — that is the frame teardown this \
+             replaced, and it is what erased typed input: {out:?}"
+        );
+        // The repaint carries the same prefix the scrolled line would, so the
+        // row does not visibly jump when the indicator is finally replaced by
+        // `render_lifecycle`'s own notice.
+        assert!(out.contains(">> model starting.."), "{out:?}");
+        // `at_line_start` was left alone: the fragment is still open, so the
+        // following `line()` closed it with a newline first.
+        assert!(
+            out.contains("partially typed"),
+            "the streamed fragment survived: {out:?}"
+        );
+    }
+
+    /// A repaint owns exactly one row and its cursor restore depends on that,
+    /// so a control character in the text — which would scroll the frame out
+    /// from under the restore — is defused at the writer rather than trusted
+    /// from the source (LESSON-474).
+    #[test]
+    fn a_repaint_cannot_be_made_to_span_more_than_its_row() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            surface.repaint_row_above(2, LineKind::Notice, "model\nstarting\r\x1b[2J..");
+        }
+        let out = String::from_utf8(buf).unwrap();
+        let body = out
+            .split("\x1b[K")
+            .nth(1)
+            .expect("the cleared-row body")
+            .split("\x1b[u")
+            .next()
+            .expect("up to the cursor restore");
+        assert!(
+            !body.contains('\n') && !body.contains('\r') && !body.contains('\x1b'),
+            "control characters must not survive into the repainted row: {body:?}"
+        );
+    }
+
+    /// BR-2's guarantee for every non-terminal surface, including future ones:
+    /// the default is silence, so a new `Surface` implementor cannot forget to
+    /// suppress the indicator.
+    #[test]
+    fn a_surface_that_does_not_override_repaint_emits_nothing() {
+        struct Bare(Vec<String>);
+        impl Surface for Bare {
+            fn line(&mut self, _kind: LineKind, text: &str) {
+                self.0.push(text.to_owned());
+            }
+            fn fragment(&mut self, _text: &str) {}
+        }
+        let mut bare = Bare(Vec::new());
+        bare.repaint_row_above(2, LineKind::Notice, "model starting..");
+        assert!(
+            bare.0.is_empty(),
+            "the default repaint must be a no-op: {:?}",
+            bare.0
+        );
+    }
 
     #[test]
     fn plain_surface_closes_an_open_fragment_before_a_line() {

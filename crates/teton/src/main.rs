@@ -306,6 +306,14 @@ fn main() -> ExitCode {
 /// is no timer thread and no `sleep` anywhere in the loop.
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 
+/// How many rows above the cursor the indicator's row sits while the entry
+/// frame is open: `[status][top rule][input row ← cursor][bottom rule]`.
+///
+/// Lives beside the frame interval because both are facts about the interactive
+/// layout that `next_interactive_line` depends on; the geometry itself is
+/// `FramedStdinPrompter::draw`'s, and this must move if that does.
+const STATUS_ROWS_ABOVE_CURSOR: usize = 2;
+
 /// Wait for the next line an interactive user types, rendering anything the
 /// daemon says in the meantime (REQ-556 BR-1).
 ///
@@ -353,11 +361,23 @@ fn next_interactive_line(
         // Nothing typed and nothing said: advance the animation, if there is
         // one running. A hidden or stalled indicator asks for no repaint, so a
         // settled session costs one `poll` per interval and nothing else.
+        //
+        // This repaints the status row **in place** rather than tearing the
+        // frame down. The frame teardown above is correct for an event, which
+        // has to scroll a new line into the log; using it for the animation
+        // would blank whatever the user had typed into the input row eight
+        // times a second (ADR-556-4). The text would survive — the kernel holds
+        // the line until Enter — but watching it flicker away while typing is
+        // not a thing to ship.
         if ctx.state.loading.tick() {
             *tick = tick.wrapping_add(1);
-            entry.erase(status_rows);
-            status_rows = paint_indicator(ctx, *tick);
-            entry.draw(entry_prompt);
+            if let Some(line) = ctx.state.loading.frame(*tick) {
+                // Two rows up: the layout is [status][top rule][input row ←
+                // cursor][bottom rule].
+                ctx.surface
+                    .repaint_row_above(STATUS_ROWS_ABOVE_CURSOR, LineKind::Notice, &line);
+                status_rows = 1;
+            }
         }
     }
 }
