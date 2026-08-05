@@ -553,6 +553,16 @@ impl Daemon {
     pub fn connect(&self) -> Client {
         Client::connect(&self.socket)
     }
+
+    /// Everything this daemon has written to stderr so far.
+    ///
+    /// The daemon reports startup conditions the user must act on here — the
+    /// REQ-557 model migration and its unusable-provider report among them — and
+    /// "the report reaches the user" is an acceptance criterion (ADR-E), so the
+    /// suite has to be able to read it rather than take it on faith.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
 }
 
 impl Drop for Daemon {

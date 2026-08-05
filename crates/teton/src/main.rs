@@ -1531,6 +1531,53 @@ mod tests {
         );
     }
 
+    /// REQ-557: `provider list` shows the model each provider calls — the field
+    /// that distinguishes two providers of the same kind (BR-3) — and says
+    /// plainly when a remote provider has none.
+    ///
+    /// The unusable branch matters most: after upgrading across REQ-557 a
+    /// provider that was never migrated simply stops serving turns, and this
+    /// listing is the first place a user looks. A blank column there would leave
+    /// them to guess.
+    #[test]
+    fn provider_list_names_the_model_or_says_the_provider_is_unusable() {
+        use teton_protocol::methods::ProviderConfig;
+
+        let provider = |id: &str, kind: ProviderKind, model: Option<&str>| ProviderConfig {
+            id: ProviderId::from(id),
+            kind,
+            endpoint: Some("https://example.invalid".to_owned()),
+            model: model.map(str::to_owned),
+            auth_ref: None,
+        };
+
+        let mut surface = RecordingSurface::new();
+        render_config(
+            &[
+                provider("opus", ProviderKind::Anthropic, Some("claude-opus-5")),
+                provider("sonnet", ProviderKind::Anthropic, Some("claude-sonnet-5")),
+                provider("stale", ProviderKind::OpenaiCompatible, None),
+                provider("on-device", ProviderKind::Local, None),
+            ],
+            &mut surface,
+        );
+        let rendered = surface.lines_of(LineKind::Info).join("\n");
+
+        // Two providers, same kind, distinct models — the shape BR-3 exists for.
+        assert!(rendered.contains("claude-opus-5"), "{rendered}");
+        assert!(rendered.contains("claude-sonnet-5"), "{rendered}");
+        // A remote provider with no model is called out, with the remedy.
+        assert!(rendered.contains("UNUSABLE"), "{rendered}");
+        assert!(rendered.contains("--model"), "{rendered}");
+        // The local tier's model is owned by the consent flow, not this field —
+        // so it is pointed at, never reported as broken (OQ-4).
+        assert!(rendered.contains("teton model status"), "{rendered}");
+        assert!(
+            !rendered.contains("on-device [local]  UNUSABLE"),
+            "a local provider without a model is normal, not unusable: {rendered}"
+        );
+    }
+
     /// `--model` is optional *to the parser* (a local provider legitimately has
     /// none — REQ-547 owns that selection) and required for a remote kind by
     /// `run_provider_add`, which rejects it before reading any credential. The

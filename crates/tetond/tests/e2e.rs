@@ -13,6 +13,10 @@
 //! - [`consent_matrix`] — one test per REQ-547 acceptance criterion (the
 //!   first-run model-consent gate), against a mock model host and a fixture
 //!   catalog whose digests are genuinely computed from the bytes served.
+//! - [`model_identity`] — REQ-557: the one-shot model migration, the ADR-E
+//!   startup posture (a missing model is unusable, not invalid), the nameable
+//!   missing default, and the BR-8 egress-capture claim that none of it changed
+//!   the privacy boundary.
 
 // The suite lives under `tests/e2e/`; `#[path]` keeps that layout while this
 // top-level file remains the integration-test binary Cargo compiles.
@@ -22,5 +26,7 @@ mod ac_matrix;
 mod consent_matrix;
 #[path = "e2e/harness.rs"]
 mod harness;
+#[path = "e2e/model_identity.rs"]
+mod model_identity;
 #[path = "e2e/privacy_fixes.rs"]
 mod privacy_fixes;

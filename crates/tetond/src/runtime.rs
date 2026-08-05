@@ -4097,6 +4097,62 @@ mod tests {
 
     /// A two-remote-provider config: Spec routes to `anthropic` with `deepseek`
     /// as the fallback — the shape that exercises the health-driven failover.
+    /// REQ-557 BR-4 / AC-4: with no `default_provider` in the config, the
+    /// router's default is `None` — at the type level, not merely "behaves as if
+    /// absent".
+    ///
+    /// This pins **both halves** of the deleted fallback chain, and it has to,
+    /// because they fail differently and a test that catches one can miss the
+    /// other (TASK-047 mutation check B; the one-directional-guard shape of
+    /// BUG-151 / LESSON-479):
+    ///
+    /// - restoring the positional `.find(is_remote)` makes this `Some("remote")`
+    /// - restoring only the tail — `default_provider` falling back to
+    ///   `local_provider`, which falls back to the literal `"local"` — makes it
+    ///   `Some("local")`, an id that is registered nowhere. That second one is
+    ///   invisible to every test that asserts on `unserved_turn_error`, because
+    ///   that function classifies from the *config*, which still says no default.
+    #[test]
+    fn an_unconfigured_default_provider_is_none_not_a_synthesized_id() {
+        let config = Config {
+            pinned_local_model: None,
+            // The whole point: unset.
+            default_provider: None,
+            local_model: teton_core::LocalModelConfig::default(),
+            providers: vec![ModelProvider {
+                id: "remote".to_owned(),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: Some("keychain:remote".to_owned()),
+                capabilities: ProviderCapabilities::default(),
+            }],
+            routing: Vec::new(),
+            boundaries: Vec::new(),
+            mcp_server: Vec::new(),
+        };
+
+        let router = build_router(&config, false, &BTreeMap::new());
+        assert_eq!(
+            router.default_provider(),
+            None,
+            "an unset default is a real absence carried in the type — never the \
+             first remote provider, and never the literal \"local\""
+        );
+
+        // And the absence is legible rather than silently routed: a coding turn
+        // with no local tier available selects nobody and says why.
+        let route = router.resolve_freeform("implement the parser");
+        assert_eq!(
+            route.provider_id, None,
+            "no provider may be selected when none was configured: {route:?}"
+        );
+        assert!(
+            route.reason.contains("default"),
+            "the reason must name the missing default (BR-5): {route:?}"
+        );
+    }
+
     fn two_provider_spec_config() -> Config {
         Config {
             pinned_local_model: None,

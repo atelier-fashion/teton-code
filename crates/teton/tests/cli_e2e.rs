@@ -1367,3 +1367,112 @@ fn yes_waives_the_in_session_above_floor_confirmation_without_eating_a_line() {
 
     assert_no_turn_ran(&session, "the --yes /model set session");
 }
+
+// ---------------------------------------------------------------------------
+// REQ-557 — `provider add` requires the model it will call
+// ---------------------------------------------------------------------------
+
+/// AC-2: `teton provider add <id> --kind anthropic` with no `--model` exits
+/// non-zero naming the flag, registers nothing, **and never asks for a
+/// credential**.
+///
+/// The "never asks" half is the one worth a test. `run_provider_add` used to
+/// call `read_secret` before it built the registration, so a missing argument
+/// would have been discovered only *after* the user typed an API key into a
+/// command that was always going to fail. Ordering a validation before an input
+/// prompt is invisible to a test that only checks the exit code, which is why
+/// this asserts on the prompt text too.
+#[test]
+fn provider_add_without_a_model_refuses_before_asking_for_a_credential() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn(&daemon);
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(
+        &teton,
+        &["provider", "add", "unmodeled", "--kind", "anthropic"],
+        "",
+    );
+
+    assert!(
+        !status.success(),
+        "a remote provider with no --model must exit non-zero; output:\n{output}"
+    );
+    assert!(
+        output.contains("--model"),
+        "the failure must name the flag that is missing; output:\n{output}"
+    );
+    assert!(
+        !output.contains("API key for"),
+        "the argument check must precede the credential prompt — a user must \
+         never type a key into a command that cannot succeed; output:\n{output}"
+    );
+
+    // Registers nothing: the provider list is unchanged.
+    let listed = daemon.run_cli(&teton, &["provider", "list"]);
+    assert!(
+        !listed.contains("unmodeled"),
+        "a refused registration must not appear in `provider list`; output:\n{listed}"
+    );
+}
+
+/// A **local** provider still registers without `--model`: the local model is
+/// owned by the REQ-547 consent flow and is read there, never set here. The
+/// requirement is on remote kinds only, and a parser-level `required` would have
+/// broken this path.
+#[test]
+fn a_local_provider_still_registers_without_a_model() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn(&daemon);
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(
+        &teton,
+        &["provider", "add", "on-device", "--kind", "local"],
+        "",
+    );
+
+    assert!(
+        status.success(),
+        "a local provider needs no --model and no credential; output:\n{output}"
+    );
+    assert!(
+        !output.contains("API key for"),
+        "a local provider has no credential to read; output:\n{output}"
+    );
+
+    let listed = daemon.run_cli(&teton, &["provider", "list"]);
+    assert!(
+        listed.contains("on-device"),
+        "the local provider should be registered; output:\n{listed}"
+    );
+}
+
+/// `provider list` renders the model each provider calls, end to end against a
+/// live daemon — including a provider that reached this state through the
+/// load-time migration rather than through `provider add`.
+///
+/// (The rendering of a provider with *no* model is pinned as a unit test on
+/// `render_config`, where both branches can be exercised without a daemon whose
+/// fixture config would have been migrated already.)
+#[test]
+fn provider_list_renders_the_declared_model() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn(&daemon);
+    let teton = teton_bin();
+
+    // The daemon's fixture config declares `deepseek` in the pre-REQ shape, so
+    // the load-time migration resolves it through the legacy price lookup.
+    let listed = daemon.run_cli(&teton, &["provider", "list"]);
+    assert!(
+        listed.contains("deepseek-chat"),
+        "the listing must show the model the provider calls, not only its id; \
+         output:\n{listed}"
+    );
+}

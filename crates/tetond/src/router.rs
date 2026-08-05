@@ -208,6 +208,19 @@ impl Router {
         self
     }
 
+    /// The configured freeform default provider, or `None` when none is set.
+    ///
+    /// `None` is a real state (REQ-557 BR-4), not a placeholder to be filled in
+    /// later, and this accessor exists so that claim is assertable at the type
+    /// level rather than only through the behaviour it produces. Both halves of
+    /// the pre-REQ fallback chain — the positional `.find(is_remote)` and its
+    /// tail through `local_provider` to the literal `"local"` — would show up
+    /// here as a `Some` nobody configured.
+    #[must_use]
+    pub fn default_provider(&self) -> Option<&str> {
+        self.default_provider.as_deref()
+    }
+
     /// Set whether the local tier can meet its BR-8 latency duty (false when it is
     /// below the hardware floor, benchmark-disabled, or shed under pressure).
     #[must_use]

@@ -325,3 +325,56 @@ Notes / findings :
 
 _The macOS sign-off above closes gap 1/2 verification on that platform; the
 Linux leg has not been run._
+
+---
+
+## REQ-557 — provider model identity and an explicit default
+
+Everything REQ-557 claims is covered by automated tests except the one leg
+below. It is recorded here rather than closed by assertion, at the strength it
+was actually verified — which is **not at all**.
+
+### Not automated: `teton provider add --model` for a *remote* kind
+
+**What is uncovered.** AC-1's success path end-to-end through the CLI:
+`teton provider add opus --kind anthropic --model claude-opus-5` followed by
+`teton provider add sonnet --kind anthropic --model claude-sonnet-5`, then
+`teton provider list` showing two providers, same kind, distinct models.
+
+**Why there is no harness.** `run_provider_add` stores the API key through
+`keychain::default_keychain()`, which on macOS is the real Security-framework
+generic-password store. There is no test seam on that path — deliberately, since
+a seam on a credential store is a liability — so an automated success leg would
+write real entries into the developer's login keychain (and can prompt for
+keychain access mid-suite). `TETON_PROVIDER_KEY` supplies the *secret* without a
+prompt but does not redirect where it is stored.
+
+**What IS covered automatically, and how far it goes:**
+
+| Leg | Where | Strength |
+|---|---|---|
+| Two providers, one kind, distinct models, registered and read back with their models | `tetond/tests/e2e/ac_matrix.rs::ac2_two_remote_providers_complete_sessions` | Full — over the same `config/set` RPC the CLI drives, including the `config/get` round-trip |
+| Missing `--model` exits non-zero, names the flag, registers nothing, and never prompts for a credential | `teton/tests/cli_e2e.rs::provider_add_without_a_model_refuses_before_asking_for_a_credential` | Full — through the real CLI binary against a live daemon |
+| A local-kind add still succeeds with no `--model` and no credential | `teton/tests/cli_e2e.rs::a_local_provider_still_registers_without_a_model` | Full — the local path reaches no keychain |
+| `provider list` renders the model, and flags a remote provider that has none | `teton/src/main.rs::provider_list_names_the_model_or_says_the_provider_is_unusable` (unit) + `cli_e2e.rs::provider_list_renders_the_declared_model` (e2e) | Full for the rendering; the e2e leg reaches it via the load-time migration rather than via `provider add` |
+| Argument parsing for two same-kind providers with distinct models | `teton/src/main.rs::two_providers_of_one_kind_parse_to_distinct_models` | Full at the parser |
+
+So the gap is narrow and specific: **the keychain write and the CLI's own
+success rendering for a remote provider**. The registration payload it produces,
+the daemon's handling of it, and every refusal path are all covered.
+
+**To close it by hand** (macOS, ~2 min):
+
+```
+TETON_PROVIDER_KEY=dummy-not-a-real-key teton provider add opus   --kind anthropic --model claude-opus-5
+TETON_PROVIDER_KEY=dummy-not-a-real-key teton provider add sonnet --kind anthropic --model claude-sonnet-5
+teton provider list
+TETON_PROVIDER_KEY=dummy-not-a-real-key teton provider add opus   --kind anthropic --model claude-opus-5   # must fail: duplicate id
+```
+
+Expected: the first two succeed and report the keychain ref; `provider list`
+shows `opus` and `sonnet`, both `[anthropic]`, with `claude-opus-5` and
+`claude-sonnet-5` respectively; the fourth fails on the duplicate id. Afterwards
+delete the two `teton` generic-password entries from Keychain Access.
+
+**Status: NOT RUN.** No sign-off block below, because nobody has executed it.
