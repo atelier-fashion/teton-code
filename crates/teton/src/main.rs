@@ -144,6 +144,10 @@ enum ProviderAction {
         /// Endpoint URL (required for remote kinds).
         #[arg(long)]
         endpoint: Option<String>,
+        /// The model this provider calls, e.g. `claude-opus-5` (REQ-557 BR-1).
+        /// Required for remote kinds; never inferred from the provider id.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// List configured providers.
     List,
@@ -268,9 +272,12 @@ fn main() -> ExitCode {
             ModelAction::Status => run_model_status(&paths),
         },
         Some(Command::Provider { action }) => match action {
-            ProviderAction::Add { id, kind, endpoint } => {
-                run_provider_add(&paths, &id, kind.into(), endpoint)
-            }
+            ProviderAction::Add {
+                id,
+                kind,
+                endpoint,
+                model,
+            } => run_provider_add(&paths, &id, kind.into(), endpoint, model),
             ProviderAction::List => run_provider_list(&paths),
         },
         Some(Command::Boundary { action }) => match action {
@@ -1041,8 +1048,19 @@ fn run_provider_add(
     id: &str,
     kind: ProviderKind,
     endpoint: Option<String>,
+    model: Option<String>,
 ) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
+    // REQ-557 BR-1 / TASK-046: a remote provider MUST declare its model, and the
+    // check runs BEFORE `read_secret` — otherwise the user types a credential
+    // into a command that was always going to fail.
+    if !matches!(kind, ProviderKind::Local) && model.as_deref().unwrap_or("").trim().is_empty() {
+        anyhow::bail!(
+            "provider `{id}` is a remote provider and must declare the model it calls: \
+             pass `--model <name>` (e.g. `--model claude-opus-5`). The model is never \
+             inferred from the provider id."
+        );
+    }
     let keychain = keychain::default_keychain();
     // Local providers have no credential; every remote kind requires a key.
     let secret = if matches!(kind, ProviderKind::Local) {
@@ -1050,8 +1068,14 @@ fn run_provider_add(
     } else {
         Some(read_secret(id)?)
     };
-    let config =
-        build_provider_registration(id, kind, endpoint, keychain.as_ref(), secret.as_deref())?;
+    let config = build_provider_registration(
+        id,
+        kind,
+        endpoint,
+        model,
+        keychain.as_ref(),
+        secret.as_deref(),
+    )?;
     let auth = config.auth_ref.clone().unwrap_or_else(|| "—".to_owned());
 
     let mut conn = client::ensure_connected(paths, &mut surface)?;
@@ -1270,6 +1294,7 @@ fn build_provider_registration(
     id: &str,
     kind: ProviderKind,
     endpoint: Option<String>,
+    model: Option<String>,
     keychain: &dyn Keychain,
     secret: Option<&str>,
 ) -> anyhow::Result<ProviderConfig> {
@@ -1281,6 +1306,7 @@ fn build_provider_registration(
         id: ProviderId::from(id),
         kind,
         endpoint,
+        model,
         auth_ref,
     })
 }
@@ -1434,7 +1460,13 @@ mod tests {
         ]);
         match cli.command {
             Some(Command::Provider {
-                action: ProviderAction::Add { id, kind, endpoint },
+                action:
+                    ProviderAction::Add {
+                        id,
+                        kind,
+                        endpoint,
+                        model,
+                    },
             }) => {
                 assert_eq!(id, "deepseek");
                 assert!(matches!(kind, CliProviderKind::OpenaiCompatible));
@@ -1506,6 +1538,7 @@ mod tests {
             "anthropic",
             ProviderKind::Anthropic,
             Some("https://api.anthropic.com".to_owned()),
+            Some("claude-opus-5".to_owned()),
             &keychain,
             Some("sk-super-secret"),
         )
@@ -1527,7 +1560,7 @@ mod tests {
     fn local_provider_registration_needs_no_secret() {
         let keychain = MockKeychain::new();
         let config =
-            build_provider_registration("local", ProviderKind::Local, None, &keychain, None)
+            build_provider_registration("local", ProviderKind::Local, None, None, &keychain, None)
                 .unwrap();
         assert!(config.auth_ref.is_none());
         assert!(keychain.stored_secret("local").is_none());

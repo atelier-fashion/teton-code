@@ -478,6 +478,14 @@ pub struct ProviderConfig {
     /// Endpoint URL; required for remote kinds.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub endpoint: Option<String>,
+    /// The model this provider calls (REQ-557 BR-1) — the declared routing
+    /// identity, never derived from the price table or the provider id.
+    ///
+    /// `Option` because a client attached to a daemon mid-migration may
+    /// legitimately see a provider whose model is not resolved yet (REQ-557
+    /// ADR-C/ADR-E), and because local providers carry none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
     /// Reference to an OS-keychain entry. NEVER a raw key or token (BR-7); the
     /// wire and config only carry the reference, the daemon resolves it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1026,6 +1034,7 @@ mod tests {
                     id: ProviderId::from("anthropic"),
                     kind: ProviderKind::Anthropic,
                     endpoint: Some("https://api.anthropic.com".to_owned()),
+                    model: Some("claude-opus-5".to_owned()),
                     auth_ref: Some("keychain://teton/anthropic".to_owned()),
                 }],
                 routing: vec![RoutingRule {
@@ -1048,6 +1057,7 @@ mod tests {
                 id: ProviderId::from("deepseek"),
                 kind: ProviderKind::OpenaiCompatible,
                 endpoint: Some("https://api.deepseek.com".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain://teton/deepseek".to_owned()),
             }),
             ConfigUpdate::SetRoutingRule(RoutingRule {

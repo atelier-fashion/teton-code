@@ -2791,6 +2791,7 @@ fn snapshot_from_config(config: &Config) -> ConfigSnapshot {
                 id: ProviderId::from(p.id.as_str()),
                 kind: to_proto_kind(p.kind),
                 endpoint: p.endpoint.clone(),
+                model: p.model.clone(),
                 auth_ref: p.auth_ref.clone(),
             })
             .collect(),
@@ -2822,6 +2823,7 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
                 id: pc.id.0,
                 kind: to_core_kind(pc.kind),
                 endpoint: pc.endpoint,
+                model: pc.model,
                 auth_ref: pc.auth_ref,
                 capabilities: ProviderCapabilities::default(),
             };
@@ -3185,6 +3187,7 @@ mod tests {
                 id: ProviderId::from("deepseek"),
                 kind: ProtoProviderKind::OpenaiCompatible,
                 endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain:deepseek".to_owned()),
             }),
         );
@@ -3220,6 +3223,7 @@ mod tests {
                 id: ProviderId::from("p"),
                 kind: ProtoProviderKind::OpenaiCompatible,
                 endpoint: Some(endpoint.to_owned()),
+                model: Some("test-model".to_owned()),
                 auth_ref: None,
             })
         };
@@ -3779,6 +3783,7 @@ mod tests {
             id: "p".to_owned(),
             kind,
             endpoint: Some(endpoint.to_owned()),
+            model: Some("test-model".to_owned()),
             auth_ref: auth_ref.map(str::to_owned),
             capabilities: ProviderCapabilities::default(),
         }
@@ -3923,12 +3928,14 @@ mod tests {
     fn two_provider_spec_config() -> Config {
         Config {
             pinned_local_model: None,
+            default_provider: Some("anthropic".to_owned()),
             local_model: teton_core::LocalModelConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),
                     kind: ProviderKind::Anthropic,
                     endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
+                    model: Some("claude-opus-5".to_owned()),
                     auth_ref: Some("keychain:anthropic".to_owned()),
                     capabilities: ProviderCapabilities::default(),
                 },
@@ -3936,6 +3943,7 @@ mod tests {
                     id: "deepseek".to_owned(),
                     kind: ProviderKind::OpenaiCompatible,
                     endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
+                    model: Some("deepseek-chat".to_owned()),
                     auth_ref: Some("keychain:deepseek".to_owned()),
                     capabilities: ProviderCapabilities::default(),
                 },
