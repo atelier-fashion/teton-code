@@ -174,6 +174,87 @@ fn migration_resolves_what_it_can_reports_what_it_cannot_and_does_not_re_run() {
 }
 
 // ===========================================================================
+// AC-3 — the model on the wire is the one the provider DECLARED.
+// ===========================================================================
+
+/// A turn's `route_decided` carries the provider's **declared** model, asserted
+/// against a provider whose id appears **nowhere** in the price table.
+///
+/// This is the criterion that proves the value is declared rather than looked
+/// up, and the provider id is chosen to make that the only possible explanation:
+/// pre-REQ, `billing_model` searched the price table by provider id and fell
+/// back to the id itself when it found nothing, so this same config would have
+/// announced `model: "no-such-vendor"` — the provider's own id standing in for a
+/// model it never called. It now announces `custom-model-v9`, which only the
+/// config could have supplied.
+///
+/// The cost half rides along: the model is genuinely unpriced (it is in no
+/// table), so the meter records the call unpriced and the report NAMES it
+/// (AC-7b) — rather than pricing it at zero or attributing it to the id.
+#[test]
+fn route_decided_carries_the_declared_model_not_a_price_table_lookup() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 1000, 200));
+
+    let mut config = String::new();
+    config.push_str(&format!(
+        "[[providers]]\nid = \"no-such-vendor\"\nkind = \"openai-compatible\"\n\
+         endpoint = \"{}\"\nmodel = \"custom-model-v9\"\n\n",
+        provider.openai_endpoint()
+    ));
+    config.push_str(&routing_block("implement", "no-such-vendor"));
+
+    let ws = Workspace::new("declared");
+    ws.write_config(&config);
+    let daemon = Daemon::spawn(&ws, probe_16gb());
+    let mut client = daemon.connect();
+
+    let session = client.create_session("structured", Some("implement"));
+    let turn = client.prompt(&session, "implement the feature");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "the turn should complete: {turn}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    let decided = client
+        .events_named("route_decided")
+        .into_iter()
+        .find(|e| e["provider_id"].as_str() == Some("no-such-vendor"))
+        .expect("a route_decided naming the provider");
+    assert_eq!(
+        decided["model"].as_str(),
+        Some("custom-model-v9"),
+        "route_decided must carry the DECLARED model. Pre-REQ this said \
+         \"no-such-vendor\" — the provider id standing in for a model, which is \
+         the fallback-identifier defect BR-1 deletes: {decided}"
+    );
+
+    // The cost side agrees, and names what it could not price (AC-7 / AC-7b).
+    let report = client.cost_query();
+    assert_eq!(report["unpriced_calls"].as_u64(), Some(1), "{report}");
+    let unpriced: Vec<&str> = report["unpriced_models"]
+        .as_array()
+        .expect("unpriced_models")
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    assert_eq!(
+        unpriced,
+        vec!["custom-model-v9"],
+        "the report must name the unpriced MODEL, not the provider id: {report}"
+    );
+    assert_eq!(
+        report["total_usd_micros"].as_i64(),
+        Some(0),
+        "an unpriced call contributes no dollars — and is counted as unpriced \
+         rather than as a $0 call (BR-9): {report}"
+    );
+
+    assert_no_boundary_bytes();
+}
+
+// ===========================================================================
 // ADR-E — the startup posture a missing model must NOT have.
 // ===========================================================================
 
