@@ -91,6 +91,19 @@ pub fn render_report_view(report: &CostReportView, surface: &mut dyn Surface) {
                 report.priced_calls, report.unpriced_calls
             ),
         );
+        // REQ-557 AC-7b: name the models, and say what to do about them. A count
+        // alone tells a user something went uncosted but not what to price, which
+        // left them reading config or logs to find out.
+        if !report.unpriced_models.is_empty() {
+            surface.line(
+                LineKind::Cost,
+                &format!(
+                    "  no price on file for: {} — add an entry for each to the price table to \
+                     see its spend",
+                    report.unpriced_models.join(", ")
+                ),
+            );
+        }
     }
 
     render_group(surface, "per phase", &report.per_phase);
@@ -187,6 +200,7 @@ mod tests {
             total_calls: 2,
             priced_calls: 1,
             unpriced_calls: 1,
+            unpriced_models: vec!["llama-3-70b".to_owned()],
             savings_usd_micros: 522_000,
             baseline_usd_micros: 525_000,
             baseline_model: "anthropic/claude-opus-4".to_owned(),
@@ -220,5 +234,67 @@ mod tests {
         // The baseline model and savings come from the daemon's report, verbatim.
         assert!(surface.any_line_contains(LineKind::Cost, "anthropic/claude-opus-4"));
         assert!(surface.any_line_contains(LineKind::Cost, "$0.522000"));
+    }
+
+    /// REQ-557 AC-7b: `teton cost` names every unpriced model and says what to do
+    /// about it. A count alone ("1 unpriced") tells the user something went
+    /// uncosted but not what to price.
+    #[test]
+    fn unpriced_models_are_named_with_the_remedy() {
+        let report = CostReportView {
+            total_usd_micros: 3_000,
+            total_calls: 3,
+            priced_calls: 1,
+            unpriced_calls: 2,
+            unpriced_models: vec!["llama-3-70b".to_owned(), "mistral-large".to_owned()],
+            savings_usd_micros: 0,
+            baseline_usd_micros: 3_000,
+            baseline_model: "anthropic/claude-opus-4".to_owned(),
+            methodology: "Estimate, not a measurement.".to_owned(),
+            per_phase: Vec::new(),
+            per_provider: Vec::new(),
+        };
+
+        let mut surface = RecordingSurface::new();
+        render_report_view(&report, &mut surface);
+
+        assert!(
+            surface.any_line_contains(LineKind::Cost, "llama-3-70b"),
+            "every unpriced model must be named"
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Cost, "mistral-large"),
+            "every unpriced model must be named, not just the first"
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Cost, "price table"),
+            "the rendering must state the remedy, not merely that something was \
+             unpriced"
+        );
+    }
+
+    /// The unpriced line is absent when there is nothing to report — an empty
+    /// "no price on file for:" would be noise on a fully-priced session.
+    #[test]
+    fn a_fully_priced_report_says_nothing_about_unpriced_models() {
+        let report = CostReportView {
+            total_usd_micros: 3_000,
+            total_calls: 1,
+            priced_calls: 1,
+            unpriced_calls: 0,
+            unpriced_models: Vec::new(),
+            savings_usd_micros: 0,
+            baseline_usd_micros: 3_000,
+            baseline_model: "anthropic/claude-opus-4".to_owned(),
+            methodology: "Estimate, not a measurement.".to_owned(),
+            per_phase: Vec::new(),
+            per_provider: Vec::new(),
+        };
+
+        let mut surface = RecordingSurface::new();
+        render_report_view(&report, &mut surface);
+
+        assert!(!surface.any_line_contains(LineKind::Cost, "no price on file"));
+        assert!(!surface.any_line_contains(LineKind::Cost, "unpriced"));
     }
 }

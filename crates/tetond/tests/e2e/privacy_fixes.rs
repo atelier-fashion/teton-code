@@ -28,8 +28,15 @@ fn probe_16gb_with_local(script: std::path::PathBuf) -> DaemonOptions {
         .script(script)
 }
 
-fn provider_block(id: &str, kind: &str, endpoint: &str) -> String {
-    format!("[[providers]]\nid = \"{id}\"\nkind = \"{kind}\"\nendpoint = \"{endpoint}\"\n\n")
+/// A `[[providers]]` entry. `model` is the model the provider *calls* — REQ-557
+/// BR-1/BR-2 make it a required declaration for every remote kind, and a remote
+/// provider without one is unusable (ADR-E), so a fixture that omits it has no
+/// routable remote provider at all.
+fn provider_block(id: &str, kind: &str, endpoint: &str, model: &str) -> String {
+    format!(
+        "[[providers]]\nid = \"{id}\"\nkind = \"{kind}\"\nendpoint = \"{endpoint}\"\n\
+         model = \"{model}\"\n\n"
+    )
 }
 
 fn routing_block(phase: &str, provider: &str) -> String {
@@ -78,6 +85,7 @@ fn taint_and_reroute(tag: &str, tool_call: (&str, &str, &str)) {
         "deepseek",
         "openai-compatible",
         &provider.openai_endpoint(),
+        "deepseek-chat",
     ));
     config.push_str(&routing_block("implement", "deepseek"));
     config.push_str(&boundary_block("secrets/**", "local-only"));

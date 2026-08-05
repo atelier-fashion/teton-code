@@ -79,6 +79,27 @@ pub struct ModelProvider {
     /// Endpoint URL; required for remote kinds, absent for `local`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// The exact model identifier sent on the wire (REQ-557 BR-1) — e.g.
+    /// `claude-opus-5`, `deepseek-chat`. This is the **declared** routing
+    /// identity; nothing derives it from the price table, the provider id, or
+    /// the endpoint (REQ-557 ADR-A).
+    ///
+    /// `Option` is load-bearing at two layers, and neither is a style choice
+    /// (REQ-557 ADR-B / ADR-E):
+    ///
+    /// 1. A bare `String` makes every pre-REQ config fail to **deserialize**,
+    ///    and a config that cannot be opened cannot be migrated.
+    /// 2. The requirement is likewise **not** enforced in
+    ///    [`crate::config::Config::validate`]. `Config::load` validates
+    ///    internally and the daemon turns a load error into a refusal to start,
+    ///    so a validation-level rule would block a pre-REQ config from starting
+    ///    long enough to migrate — and would make one unresolvable provider
+    ///    prevent startup entirely. It is enforced by the non-fatal usability
+    ///    pass ([`crate::config::Config::unusable_providers`]) instead.
+    ///
+    /// Absent for `local`, whose model is owned by the REQ-547 consent flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Reference to an OS-keychain entry holding the credential. Never the raw
     /// credential itself (BR-7); config validation rejects raw-key-shaped
     /// values.

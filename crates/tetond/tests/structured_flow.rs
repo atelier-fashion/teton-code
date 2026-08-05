@@ -162,8 +162,8 @@ fn structured_router() -> Router {
             policy(CorePhase::Implement, "deepseek", Some("anthropic")),
             policy(CorePhase::Review, "anthropic", Some("deepseek")),
         ],
-        "deepseek",
-        "local",
+        Some("deepseek".to_owned()),
+        Some("local".to_owned()),
     )
     .with_provider(
         "anthropic",

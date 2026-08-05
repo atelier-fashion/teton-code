@@ -144,6 +144,10 @@ enum ProviderAction {
         /// Endpoint URL (required for remote kinds).
         #[arg(long)]
         endpoint: Option<String>,
+        /// The model this provider calls, e.g. `claude-opus-5` (REQ-557 BR-1).
+        /// Required for remote kinds; never inferred from the provider id.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// List configured providers.
     List,
@@ -268,9 +272,12 @@ fn main() -> ExitCode {
             ModelAction::Status => run_model_status(&paths),
         },
         Some(Command::Provider { action }) => match action {
-            ProviderAction::Add { id, kind, endpoint } => {
-                run_provider_add(&paths, &id, kind.into(), endpoint)
-            }
+            ProviderAction::Add {
+                id,
+                kind,
+                endpoint,
+                model,
+            } => run_provider_add(&paths, &id, kind.into(), endpoint, model),
             ProviderAction::List => run_provider_list(&paths),
         },
         Some(Command::Boundary { action }) => match action {
@@ -1041,8 +1048,19 @@ fn run_provider_add(
     id: &str,
     kind: ProviderKind,
     endpoint: Option<String>,
+    model: Option<String>,
 ) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
+    // REQ-557 BR-1 / TASK-046: a remote provider MUST declare its model, and the
+    // check runs BEFORE `read_secret` — otherwise the user types a credential
+    // into a command that was always going to fail.
+    if !matches!(kind, ProviderKind::Local) && model.as_deref().unwrap_or("").trim().is_empty() {
+        anyhow::bail!(
+            "provider `{id}` is a remote provider and must declare the model it calls: \
+             pass `--model <name>` (e.g. `--model claude-opus-5`). The model is never \
+             inferred from the provider id."
+        );
+    }
     let keychain = keychain::default_keychain();
     // Local providers have no credential; every remote kind requires a key.
     let secret = if matches!(kind, ProviderKind::Local) {
@@ -1050,8 +1068,14 @@ fn run_provider_add(
     } else {
         Some(read_secret(id)?)
     };
-    let config =
-        build_provider_registration(id, kind, endpoint, keychain.as_ref(), secret.as_deref())?;
+    let config = build_provider_registration(
+        id,
+        kind,
+        endpoint,
+        model,
+        keychain.as_ref(),
+        secret.as_deref(),
+    )?;
     let auth = config.auth_ref.clone().unwrap_or_else(|| "—".to_owned());
 
     let mut conn = client::ensure_connected(paths, &mut surface)?;
@@ -1270,6 +1294,7 @@ fn build_provider_registration(
     id: &str,
     kind: ProviderKind,
     endpoint: Option<String>,
+    model: Option<String>,
     keychain: &dyn Keychain,
     secret: Option<&str>,
 ) -> anyhow::Result<ProviderConfig> {
@@ -1281,6 +1306,7 @@ fn build_provider_registration(
         id: ProviderId::from(id),
         kind,
         endpoint,
+        model,
         auth_ref,
     })
 }
@@ -1320,10 +1346,23 @@ fn render_config(providers: &[ProviderConfig], surface: &mut dyn Surface) {
         } else {
             "none"
         };
+        // REQ-557 BR-1/BR-3: the model a provider calls is what distinguishes two
+        // otherwise-identical providers ("Opus for design, Sonnet for build"), so
+        // it is the field this listing exists to show. A remote provider with no
+        // model cannot serve turns (ADR-E) — say so here rather than printing a
+        // blank column, because this listing is where a user goes to find out why
+        // a provider stopped working after an upgrade.
+        let model = match (provider.model.as_deref(), provider.kind) {
+            (Some(model), _) if !model.trim().is_empty() => model.to_owned(),
+            // The local tier's model is owned by the REQ-547 consent flow, not by
+            // this field; `teton model status` is where it is read (OQ-4).
+            (_, ProviderKind::Local) => "(see `teton model status`)".to_owned(),
+            _ => "UNUSABLE — no model; re-add with `--model <name>`".to_owned(),
+        };
         surface.line(
             LineKind::Info,
             &format!(
-                "  {} [{}]  {endpoint}  auth: {auth}",
+                "  {} [{}]  {model}  {endpoint}  auth: {auth}",
                 provider.id,
                 kind_label(provider.kind)
             ),
@@ -1421,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_add_parses_kind_and_endpoint() {
+    fn provider_add_parses_kind_endpoint_and_model() {
         let cli = parse(&[
             "teton",
             "provider",
@@ -1431,16 +1470,126 @@ mod tests {
             "openai-compatible",
             "--endpoint",
             "https://api.deepseek.com",
+            "--model",
+            "deepseek-chat",
         ]);
         match cli.command {
             Some(Command::Provider {
-                action: ProviderAction::Add { id, kind, endpoint },
+                action:
+                    ProviderAction::Add {
+                        id,
+                        kind,
+                        endpoint,
+                        model,
+                    },
             }) => {
                 assert_eq!(id, "deepseek");
                 assert!(matches!(kind, CliProviderKind::OpenaiCompatible));
                 assert_eq!(endpoint.as_deref(), Some("https://api.deepseek.com"));
                 assert_eq!(ProviderKind::from(kind), ProviderKind::OpenaiCompatible);
+                assert_eq!(model.as_deref(), Some("deepseek-chat"));
             }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    /// REQ-557 BR-3: two providers may share a kind and differ only in id and
+    /// model — the "Opus for design, Sonnet for build" shape the REQ exists to
+    /// make expressible. The parser must carry both models through distinctly.
+    #[test]
+    fn two_providers_of_one_kind_parse_to_distinct_models() {
+        let model_of = |id: &str, model: &str| {
+            let cli = parse(&[
+                "teton",
+                "provider",
+                "add",
+                id,
+                "--kind",
+                "anthropic",
+                "--model",
+                model,
+            ]);
+            match cli.command {
+                Some(Command::Provider {
+                    action:
+                        ProviderAction::Add {
+                            id, kind, model, ..
+                        },
+                }) => {
+                    assert_eq!(ProviderKind::from(kind), ProviderKind::Anthropic);
+                    (id, model)
+                }
+                other => panic!("unexpected parse: {other:?}"),
+            }
+        };
+        let opus = model_of("opus", "claude-opus-5");
+        let sonnet = model_of("sonnet", "claude-sonnet-5");
+        assert_eq!(opus, ("opus".to_owned(), Some("claude-opus-5".to_owned())));
+        assert_eq!(
+            sonnet,
+            ("sonnet".to_owned(), Some("claude-sonnet-5".to_owned()))
+        );
+    }
+
+    /// REQ-557: `provider list` shows the model each provider calls — the field
+    /// that distinguishes two providers of the same kind (BR-3) — and says
+    /// plainly when a remote provider has none.
+    ///
+    /// The unusable branch matters most: after upgrading across REQ-557 a
+    /// provider that was never migrated simply stops serving turns, and this
+    /// listing is the first place a user looks. A blank column there would leave
+    /// them to guess.
+    #[test]
+    fn provider_list_names_the_model_or_says_the_provider_is_unusable() {
+        use teton_protocol::methods::ProviderConfig;
+
+        let provider = |id: &str, kind: ProviderKind, model: Option<&str>| ProviderConfig {
+            id: ProviderId::from(id),
+            kind,
+            endpoint: Some("https://example.invalid".to_owned()),
+            model: model.map(str::to_owned),
+            auth_ref: None,
+        };
+
+        let mut surface = RecordingSurface::new();
+        render_config(
+            &[
+                provider("opus", ProviderKind::Anthropic, Some("claude-opus-5")),
+                provider("sonnet", ProviderKind::Anthropic, Some("claude-sonnet-5")),
+                provider("stale", ProviderKind::OpenaiCompatible, None),
+                provider("on-device", ProviderKind::Local, None),
+            ],
+            &mut surface,
+        );
+        let rendered = surface.lines_of(LineKind::Info).join("\n");
+
+        // Two providers, same kind, distinct models — the shape BR-3 exists for.
+        assert!(rendered.contains("claude-opus-5"), "{rendered}");
+        assert!(rendered.contains("claude-sonnet-5"), "{rendered}");
+        // A remote provider with no model is called out, with the remedy.
+        assert!(rendered.contains("UNUSABLE"), "{rendered}");
+        assert!(rendered.contains("--model"), "{rendered}");
+        // The local tier's model is owned by the consent flow, not this field —
+        // so it is pointed at, never reported as broken (OQ-4).
+        assert!(rendered.contains("teton model status"), "{rendered}");
+        assert!(
+            !rendered.contains("on-device [local]  UNUSABLE"),
+            "a local provider without a model is normal, not unusable: {rendered}"
+        );
+    }
+
+    /// `--model` is optional *to the parser* (a local provider legitimately has
+    /// none — REQ-547 owns that selection) and required for a remote kind by
+    /// `run_provider_add`, which rejects it before reading any credential. The
+    /// split is deliberate: a parser-level `required` would break `provider add
+    /// <id> --kind local`.
+    #[test]
+    fn provider_add_leaves_a_missing_model_to_the_runtime_check() {
+        let cli = parse(&["teton", "provider", "add", "x", "--kind", "anthropic"]);
+        match cli.command {
+            Some(Command::Provider {
+                action: ProviderAction::Add { model, .. },
+            }) => assert_eq!(model, None),
             other => panic!("unexpected parse: {other:?}"),
         }
     }
@@ -1506,6 +1655,7 @@ mod tests {
             "anthropic",
             ProviderKind::Anthropic,
             Some("https://api.anthropic.com".to_owned()),
+            Some("claude-opus-5".to_owned()),
             &keychain,
             Some("sk-super-secret"),
         )
@@ -1527,7 +1677,7 @@ mod tests {
     fn local_provider_registration_needs_no_secret() {
         let keychain = MockKeychain::new();
         let config =
-            build_provider_registration("local", ProviderKind::Local, None, &keychain, None)
+            build_provider_registration("local", ProviderKind::Local, None, None, &keychain, None)
                 .unwrap();
         assert!(config.auth_ref.is_none());
         assert!(keychain.stored_secret("local").is_none());

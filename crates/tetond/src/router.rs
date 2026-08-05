@@ -162,9 +162,9 @@ pub struct Router {
     policies: Vec<RoutingPolicy>,
     providers: BTreeMap<String, ProviderRuntime>,
     /// Freeform default provider (coding turns, and the BR-8 bypass target).
-    default_provider: String,
+    default_provider: Option<String>,
     /// Local tier provider id (freeform auxiliary duties).
-    local_provider: String,
+    local_provider: Option<String>,
     /// Whether the local tier can serve its BR-8 latency duty right now.
     local_available: bool,
 }
@@ -176,14 +176,14 @@ impl Router {
     #[must_use]
     pub fn new(
         policies: Vec<RoutingPolicy>,
-        default_provider: impl Into<String>,
-        local_provider: impl Into<String>,
+        default_provider: Option<String>,
+        local_provider: Option<String>,
     ) -> Self {
         Self {
             policies,
             providers: BTreeMap::new(),
-            default_provider: default_provider.into(),
-            local_provider: local_provider.into(),
+            default_provider,
+            local_provider,
             local_available: true,
         }
     }
@@ -206,6 +206,19 @@ impl Router {
             },
         );
         self
+    }
+
+    /// The configured freeform default provider, or `None` when none is set.
+    ///
+    /// `None` is a real state (REQ-557 BR-4), not a placeholder to be filled in
+    /// later, and this accessor exists so that claim is assertable at the type
+    /// level rather than only through the behaviour it produces. Both halves of
+    /// the pre-REQ fallback chain — the positional `.find(is_remote)` and its
+    /// tail through `local_provider` to the literal `"local"` — would show up
+    /// here as a `Some` nobody configured.
+    #[must_use]
+    pub fn default_provider(&self) -> Option<&str> {
+        self.default_provider.as_deref()
     }
 
     /// Set whether the local tier can meet its BR-8 latency duty (false when it is
@@ -250,9 +263,72 @@ impl Router {
     /// unavailable, BR-8); coding turns go to the configured default.
     #[must_use]
     pub fn resolve_freeform(&self, prompt: &str) -> Route {
+        // REQ-557 BR-4 / ADR-D: an unset default is a real absence. Before this
+        // REQ the router picked whichever remote provider was first in the config
+        // and, failing that, minted the literal id "local" — the doubled fallback
+        // that produced BUG-146. A freeform turn with no default and no usable
+        // local tier now says so instead of naming a provider registered nowhere.
+        let Some(default_provider_id) = self.default_provider.clone() else {
+            // The local tier can still serve an auxiliary duty on its own; only a
+            // coding turn genuinely needs the default. Rather than re-implement
+            // the duty split here, fall back to local when it is available and
+            // otherwise report the missing default.
+            return match (&self.local_provider, self.local_available) {
+                // The local tier can still serve. Route through the SAME
+                // heuristic rather than short-circuiting it: REQ-544 BR-5 makes
+                // every decision's reason name the signal that fired, and a fixed
+                // sentence would drop the duty classification that legibility
+                // depends on. The missing default is appended, not substituted.
+                (Some(local), true) => {
+                    let config = FreeformConfig {
+                        local_provider_id: local.clone(),
+                        default_provider_id: local.clone(),
+                        local_available: true,
+                    };
+                    let decision = route_freeform(prompt, &config);
+                    Route {
+                        model: self.model_of(local),
+                        harness: self.harness_config_for(local),
+                        provider_id: Some(ProviderId::from(local.as_str())),
+                        phase: None,
+                        reason: format!(
+                            "{} No default provider is configured, so a coding turn stays local \
+                             too; set `default_provider` to route one remotely.",
+                            decision.reason
+                        ),
+                        outcome: RouteOutcome::Fallback,
+                    }
+                }
+                _ => Route {
+                    model: None,
+                    harness: HarnessConfig::default(),
+                    provider_id: None,
+                    phase: None,
+                    reason: "No default provider is configured and the local tier cannot serve \
+                             this turn. Register a provider with `teton provider add` and set \
+                             `default_provider` to its id."
+                        .to_owned(),
+                    outcome: RouteOutcome::NoPolicy,
+                },
+            };
+        };
+        let Some(local_provider_id) = self.local_provider.clone() else {
+            // No local tier at all: every freeform turn goes to the default.
+            return Route {
+                model: self.model_of(&default_provider_id),
+                harness: self.harness_config_for(&default_provider_id),
+                provider_id: Some(ProviderId::from(default_provider_id.as_str())),
+                phase: None,
+                reason: format!(
+                    "Freeform routing: no local tier is registered, so this turn goes to the \
+                     configured default provider '{default_provider_id}'."
+                ),
+                outcome: RouteOutcome::Primary,
+            };
+        };
         let config = FreeformConfig {
-            local_provider_id: self.local_provider.clone(),
-            default_provider_id: self.default_provider.clone(),
+            local_provider_id,
+            default_provider_id,
             local_available: self.local_available,
         };
         let decision = route_freeform(prompt, &config);
@@ -287,7 +363,18 @@ impl Router {
     /// session and fails closed instead).
     #[must_use]
     pub fn resolve_local_pin(&self, reason: impl Into<String>) -> Route {
-        let provider = self.local_provider.clone();
+        let Some(provider) = self.local_provider.clone() else {
+            return Route {
+                model: None,
+                harness: HarnessConfig::default(),
+                provider_id: None,
+                phase: None,
+                reason: "This session is pinned to the local tier for privacy, but no local \
+                         provider is registered, so the turn cannot be served."
+                    .to_owned(),
+                outcome: RouteOutcome::NoPolicy,
+            };
+        };
         Route {
             model: self.model_of(&provider),
             harness: self.harness_config_for(&provider),
@@ -555,8 +642,8 @@ mod tests {
                 policy(CorePhase::Spec, "anthropic", Some("deepseek")),
                 policy(CorePhase::Implement, "deepseek", Some("anthropic")),
             ],
-            "deepseek",
-            "local",
+            Some("deepseek".to_owned()),
+            Some("local".to_owned()),
         )
         .with_provider(
             "anthropic",

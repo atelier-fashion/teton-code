@@ -138,11 +138,24 @@ fn temp_socket(tag: &str) -> PathBuf {
 /// Every event a `session/prompt` publishes reaches the client before the
 /// turn's own response frame.
 ///
-/// The minimal daemon has no engine and no providers, so each turn publishes
-/// its `route_decided` (emitted inside `run_prompt_turn`, before the attempt)
-/// and then fails with "no tier available" — which exercises exactly the
-/// racing seam: an event published on the turn task versus the response that
-/// same task enqueues moments later. The event must win, every time.
+/// Each turn publishes its `route_decided` (emitted inside `run_prompt_turn`,
+/// before the attempt) and then fails — which exercises exactly the racing
+/// seam: an event published on the turn task versus the response that same task
+/// enqueues moments later. The event must win, every time.
+///
+/// **The turn needs a real route to decide.** Before REQ-557 this test ran
+/// against a bare `Daemon::new()` with no providers at all, and still saw a
+/// `route_decided` — because `build_router` synthesized a default from array
+/// position and, failing that, from the literal id `"local"`. That fabricated
+/// route is BUG-146's root cause #1 and REQ-557 BR-4 deletes it, so a daemon
+/// with no providers now correctly emits nothing to order against. The fixture
+/// therefore registers a genuine provider over the same `config/set` path the
+/// CLI drives; the ordering claim is unchanged.
+///
+/// The turn is made to fail on an **unresolvable credential** rather than a dead
+/// endpoint: `auth_ref` resolution happens before any socket is opened and is
+/// classified as settled (never retried), so each of the 150 iterations fails
+/// immediately and deterministically — no network, no keychain, no backoff.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_turns_events_precede_the_turns_response_on_the_wire() {
     let path = temp_socket("ord-turn");
@@ -153,12 +166,58 @@ async fn a_turns_events_precede_the_turns_response_on_the_wire() {
     let mut client = TestClient::connect(&path).await;
     client.handshake().await;
 
+    // A provider the router can actually select: a declared `model` (REQ-557
+    // BR-1 — without one it is unusable and never enters the provider map) and
+    // an `auth_ref` naming an env var that is not set.
+    let (_, registered) = client
+        .call_collecting_events(
+            1000,
+            "config/set",
+            json!({ "update": {
+                "op": "register_provider",
+                "id": "ordering",
+                "kind": "openai-compatible",
+                "endpoint": "http://127.0.0.1:1/v1/chat/completions",
+                "model": "deepseek-chat",
+                "auth_ref": "env:TETON_ORDERING_TEST_CREDENTIAL_ABSENT",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        registered["result"]["applied"].as_bool(),
+        Some(true),
+        "provider registration failed: {registered}"
+    );
+    // A phase policy, so a structured turn resolves through the routing table
+    // rather than through `default_provider` (which no RPC can set — REQ-557
+    // adds none, by design).
+    let (_, routed) = client
+        .call_collecting_events(
+            1001,
+            "config/set",
+            json!({ "update": {
+                "op": "set_routing_rule",
+                "phase": "implement",
+                "provider_id": "ordering",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        routed["result"]["applied"].as_bool(),
+        Some(true),
+        "routing rule failed: {routed}"
+    );
+
     for turn in 0..TURNS {
         // A fresh session per turn makes the `route_decided` attributable: its
         // `session_id` ties it to this iteration and no other.
         let id = 2 + 2 * turn as i64;
         let (_, created) = client
-            .call_collecting_events(id, "session/create", json!({"mode": "freeform"}))
+            .call_collecting_events(
+                id,
+                "session/create",
+                json!({"mode": "structured", "phase": "implement"}),
+            )
             .await;
         let sid = created["result"]["session_id"]
             .as_str()
@@ -176,11 +235,11 @@ async fn a_turns_events_precede_the_turns_response_on_the_wire() {
             )
             .await;
 
-        // The turn fails (no tier is configured) — the ordering claim is
-        // about the error response exactly as much as a success.
+        // The turn fails (the credential does not resolve) — the ordering claim
+        // is about the error response exactly as much as a success.
         assert!(
             response.get("error").is_some(),
-            "expected the no-tier error response, got: {response}"
+            "expected the unresolvable-credential error response, got: {response}"
         );
         assert!(
             events.iter().any(|e| {

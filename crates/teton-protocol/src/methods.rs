@@ -478,6 +478,14 @@ pub struct ProviderConfig {
     /// Endpoint URL; required for remote kinds.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub endpoint: Option<String>,
+    /// The model this provider calls (REQ-557 BR-1) — the declared routing
+    /// identity, never derived from the price table or the provider id.
+    ///
+    /// `Option` because a client attached to a daemon mid-migration may
+    /// legitimately see a provider whose model is not resolved yet (REQ-557
+    /// ADR-C/ADR-E), and because local providers carry none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
     /// Reference to an OS-keychain entry. NEVER a raw key or token (BR-7); the
     /// wire and config only carry the reference, the daemon resolves it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -610,6 +618,13 @@ pub struct CostReportView {
     pub priced_calls: u64,
     /// Calls with no price-table entry (never guessed a cost).
     pub unpriced_calls: u64,
+    /// The models behind [`Self::unpriced_calls`], by name, deduplicated and
+    /// ordered (REQ-557 BR-9 / AC-7b).
+    ///
+    /// A client can name what needs a price entry instead of only reporting that
+    /// something went uncosted. Empty whenever `unpriced_calls` is 0.
+    #[serde(default)]
+    pub unpriced_models: Vec<String>,
     /// `baseline − actual`; the estimated saving vs. an all-frontier baseline.
     pub savings_usd_micros: i64,
     /// What the same token volume would cost at the baseline, in micro-USD.
@@ -1026,6 +1041,7 @@ mod tests {
                     id: ProviderId::from("anthropic"),
                     kind: ProviderKind::Anthropic,
                     endpoint: Some("https://api.anthropic.com".to_owned()),
+                    model: Some("claude-opus-5".to_owned()),
                     auth_ref: Some("keychain://teton/anthropic".to_owned()),
                 }],
                 routing: vec![RoutingRule {
@@ -1048,6 +1064,7 @@ mod tests {
                 id: ProviderId::from("deepseek"),
                 kind: ProviderKind::OpenaiCompatible,
                 endpoint: Some("https://api.deepseek.com".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain://teton/deepseek".to_owned()),
             }),
             ConfigUpdate::SetRoutingRule(RoutingRule {
@@ -1074,6 +1091,7 @@ mod tests {
                 total_calls: 3,
                 priced_calls: 2,
                 unpriced_calls: 1,
+                unpriced_models: vec!["llama-3-70b".to_owned()],
                 savings_usd_micros: 500_000,
                 baseline_usd_micros: 548_100,
                 baseline_model: "anthropic/claude-opus-4".to_owned(),

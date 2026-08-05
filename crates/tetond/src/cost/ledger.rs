@@ -203,12 +203,12 @@ impl CostLedger {
         output_tokens: u64,
     ) -> Result<(), LedgerError> {
         let provider_id = provider_id.into();
-        let usd_micros = self.prices.price(
-            &provider_id,
-            &attribution.model,
-            input_tokens,
-            output_tokens,
-        );
+        // REQ-557 ADR-A: priced by the model the provider DECLARED it calls, not
+        // by the provider id. The provider is who served it; the model is what
+        // costs money.
+        let usd_micros = self
+            .prices
+            .price(&attribution.model, input_tokens, output_tokens);
         self.record(LedgerRow {
             session_id: session_id.into(),
             phase: attribution.phase,
@@ -309,12 +309,10 @@ struct MeteredBody {
 impl MeteredBody {
     fn finalize(&self) {
         let usage = self.scan.usage();
-        let usd_micros = self.prices.price(
-            &self.provider_id.0,
-            &self.attribution.model,
-            usage.input,
-            usage.output,
-        );
+        // REQ-557 ADR-A: priced by declared model (see `record_call`).
+        let usd_micros = self
+            .prices
+            .price(&self.attribution.model, usage.input, usage.output);
         let row = LedgerRow {
             session_id: self.session_id.0.clone(),
             phase: self.attribution.phase,

@@ -51,6 +51,11 @@
 - **Workflow-aware routing** — phase (spec/architect/implement/review/io)
   determines model tier via a user-visible policy table; never per-prompt
   heuristics in structured mode (BR-5).
+- **Declared identity over derived identity** — a provider states the model it
+  calls; pricing, routing, and attribution all consume that declaration. No
+  subsystem re-derives an identifier from another subsystem's table, and an
+  absent identifier stays `None` rather than becoming a plausible literal
+  (REQ-557 ADR-A/ADR-D).
 - **Adapter degradation** — providers with weak tool-calling get a reduced
   harness profile (smaller tool set, shorter loops, mandatory verification)
   rather than the full loop (BR-6).
