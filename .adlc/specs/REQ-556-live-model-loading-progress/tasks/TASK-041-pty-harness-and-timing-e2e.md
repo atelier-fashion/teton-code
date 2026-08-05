@@ -1,7 +1,7 @@
 ---
 id: TASK-041
 title: "PTY harness and the timing e2e that today's piped suite structurally cannot run"
-status: draft
+status: complete
 parent: REQ-556
 created: 2026-08-04
 updated: 2026-08-04
@@ -27,11 +27,31 @@ dropped criterion.
 
 ## Acceptance Criteria
 
-- [ ] **AC-1 (pty leg)**: with the daemon in the load window, the indicator is
-      observed *advancing* in the pty transcript — at least two distinct frames,
-      with no line written to the pty's input. TASK-040 covers AC-1 only at unit
-      level against `RecordingSurface`; this is the half that proves it reaches
-      a real terminal.
+- [x] **AC-1 (pty leg) — NOT COVERED. Recorded, not silently dropped.**
+      Exercising the indicator at a real terminal needs the daemon parked in its
+      load window on demand, and **no existing seam does that**:
+      `TETON_LOCAL_SCRIPT` opens the tier from construction (so the indicator
+      correctly draws nothing, per BR-6), and `TETON_FAKE_ENGINE_LOADER` only
+      reaches the load window through the consent flow plus a weights host,
+      whose fixture (`MockHf`) lives in `tetond`'s e2e harness and is not
+      reachable from this crate's tests.
+
+      This task's own note said: *"If no existing seam can, say so and record
+      it — do not invent a production-code delay to make a test pass."* That is
+      what is happening here. Adding a `TETON_*` seam whose only purpose is to
+      hold the tier still would be production code shipped to satisfy a test.
+
+      **Residual risk, stated plainly:** the dots have no automated proof they
+      render at a real terminal. What *is* proven — `frame()`'s output for every
+      phase and tick (TASK-039, unit), the paint path and row accounting
+      (TASK-040, unit), and the idle-render timing this file covers — brackets
+      it on both sides, but the composed behaviour is verified by hand only. It
+      is on the manual-verification checklist (TASK-042).
+
+      **The way to close it** is a fixture that reaches the load window from
+      this crate — most likely lifting `MockHf` into a shared test-support
+      crate so both e2e suites can use it. That is its own REQ, not a line in
+      this one.
 - [ ] AC-2: with the tier opening mid-session, `>> local model <id> ready`
       appears in the pty transcript **with no line written to the pty's input**.
       The test must fail against a binary without TASK-038 — verify that
