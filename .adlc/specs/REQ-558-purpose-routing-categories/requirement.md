@@ -1,7 +1,7 @@
 ---
 id: REQ-558
 title: "Purpose-oriented routing categories as the runtime dispatch key"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-05
 updated: 2026-08-05
