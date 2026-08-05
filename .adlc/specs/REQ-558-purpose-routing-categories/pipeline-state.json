@@ -1,0 +1,38 @@
+{
+  "req": "REQ-558",
+  "branch": "feat/REQ-558-purpose-routing-categories",
+  "startedAt": "2026-08-05T22:10:55Z",
+  "completed": false,
+  "currentPhase": 1,
+  "completedPhases": [
+    0
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Create Worktree + Preflight",
+      "completedAt": "2026-08-05T22:10:55Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-558",
+      "branch": "feat/REQ-558-purpose-routing-categories",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
