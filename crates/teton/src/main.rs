@@ -241,8 +241,6 @@ enum CliPhase {
     Review,
     /// Mechanical I/O.
     Io,
-    /// No structured phase.
-    Freeform,
 }
 
 impl From<CliPhase> for Phase {
@@ -253,7 +251,6 @@ impl From<CliPhase> for Phase {
             CliPhase::Implement => Phase::Implement,
             CliPhase::Review => Phase::Review,
             CliPhase::Io => Phase::Io,
-            CliPhase::Freeform => Phase::Freeform,
         }
     }
 }

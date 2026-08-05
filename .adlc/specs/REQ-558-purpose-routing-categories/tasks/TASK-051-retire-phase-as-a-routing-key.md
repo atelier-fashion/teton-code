@@ -1,7 +1,7 @@
 ---
 id: TASK-051
 title: "Retire Phase from routing signatures and remove Phase::Freeform"
-status: draft
+status: complete
 parent: REQ-558
 created: 2026-08-05
 updated: 2026-08-05
@@ -28,13 +28,13 @@ distinction already lives in `Session.mode`.
 - [ ] `Phase` appears in **no** routing signature — not `resolve_*`, not the
       configured table, not `route_decided`'s dispatch input (AC-9). Enforced by
       compilation plus a test that the router's public API mentions no `Phase`.
-- [ ] `Phase` still appears in `CostRecord` and `LedgerRow`, and a cost-attribution
+- [x] `Phase` still appears in `CostRecord` and `LedgerRow`, and a cost-attribution
       test proves per-phase rollups still work for a structured session (BR-11).
-- [ ] `phase_from_wire("freeform")` returns `None` via an **explicit arm above the
+- [x] `phase_from_wire("freeform")` returns `None` via an **explicit arm above the
       catch-all**, with a comment naming it as the retired variant, and a test
       asserts it (ADR-G).
-- [ ] `Phase::ALL.len() == 5` and its test is updated rather than deleted.
-- [ ] The structured machine's initial state is a deliberate choice, documented in
+- [x] `Phase::ALL.len() == 5` and its test is updated rather than deleted.
+- [x] The structured machine's initial state is a deliberate choice, documented in
       the code, not the first variant that compiles.
 
 ## Technical Notes
@@ -52,3 +52,36 @@ six months later.
 place where this task changes behavior rather than types. Decide what a structured
 session's initial phase should be and say why in a comment; do not pick whatever
 compiles.
+
+## Implementation Notes
+
+**The first AC is left unticked on purpose — it is not wholly this task's to
+close.** `Router::resolve_structured(&self, phase: CorePhase)` and the
+`RoutingPolicy` table it reads are removed by TASK-050 and TASK-055
+respectively; TASK-051 owns the enum and every non-router call site. The half of
+AC-9 that *is* closed here: `Phase` no longer reaches routing through
+`category_for_phase`'s freeform arm, and `route_decided`'s dispatch input
+(`Route::resolution`) never mentioned it. The "router's public API mentions no
+`Phase`" test belongs with TASK-050, which is the change that makes it pass.
+
+**The freeform-routing rejection moved outward rather than disappearing.**
+`ConfigError::FreeformRoutingPolicy` and its `Config::validate` check became
+unreachable the moment `Phase` lost the variant — serde rejects
+`phase = "freeform"` at deserialization, before validation runs — so the check,
+the error variant, and the test that constructed `RoutingPolicy { phase:
+Phase::Freeform }` are deleted. The behaviour is pinned by
+`a_freeform_routing_entry_is_still_rejected_after_the_schema_change`, which drives
+the config through `Config::load` as text and now asserts `LoadError::Parse` with
+a message naming the offending value.
+
+**The freeform machine holds `None`, not a nominated phase.**
+`PhaseMachine.phase` became `Option<Phase>`: `Some(Phase::Spec)` for a structured
+session (unchanged), `None` for a freeform one. Naming a substitute lifecycle
+phase would have made `PhaseMachine` the only type in the workspace claiming a
+freeform session sits somewhere in the ADLC flow — `Session.phase`,
+`Route.phase`, `RouteDecided.phase`, and the ledger's `phase` column are all
+`Option` and have always held `None` for freeform work — and it would silently
+bill freeform turns to a lifecycle bucket the moment the machine gains a
+cost-attributing caller. `next_phase()` now derives from `self.phase` alone so
+`Mode` cannot disagree with it. Rationale is recorded on
+`PhaseMachine::freeform`.

@@ -187,7 +187,6 @@ fn core_of(phase: Phase) -> CorePhase {
         Phase::Implement => CorePhase::Implement,
         Phase::Review => CorePhase::Review,
         Phase::Io => CorePhase::Io,
-        Phase::Freeform => CorePhase::Freeform,
     }
 }
 
@@ -286,7 +285,11 @@ async fn demo_requirement_flows_all_four_phases_with_per_phase_routing_and_real_
         Phase::Implement,
         Phase::Review,
     ] {
-        assert_eq!(machine.phase(), phase, "machine tracks the flow position");
+        assert_eq!(
+            machine.phase(),
+            Some(phase),
+            "machine tracks the flow position"
+        );
 
         // (1) Route this phase and broadcast the decision (BR-5, AC-3).
         let route = router.resolve_structured(core_of(phase));
@@ -481,11 +484,13 @@ async fn freeform_mode_requires_no_artifacts() {
     let store = ArtifactStore::new(&repo);
     let machine = PhaseMachine::freeform();
 
-    assert_eq!(machine.phase(), Phase::Freeform);
+    // REQ-558 ADR-G: a freeform session has no lifecycle phase at all, rather
+    // than sitting in a `Phase::Freeform` pseudo-phase.
+    assert_eq!(machine.phase(), None);
     // A freeform session has no `.teton/` and needs none — no artifacts, no gates.
     assert!(machine.context_artifacts(&store).is_empty());
     assert!(!store.teton_dir().exists());
-    assert!(machine.is_terminal(), "freeform is a single-phase flow");
+    assert!(machine.is_terminal(), "freeform has no flow to walk");
 
     std::fs::remove_dir_all(&repo).ok();
 }

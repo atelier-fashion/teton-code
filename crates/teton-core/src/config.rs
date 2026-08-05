@@ -295,17 +295,6 @@ pub enum ConfigError {
     )]
     DuplicateCategoryOverride(ConfigurableCategory),
 
-    /// A routing rule targets the `freeform` phase. Freeform prompts are routed
-    /// by heuristics (BR-5), not the phase→provider table, so such a rule can
-    /// never take effect — it is rejected rather than silently ignored (M-6).
-    #[error(
-        "routing policy for the freeform phase can never take effect: freeform prompts are \
-         routed by heuristics, not the phase→provider routing table. Remove the \
-         `phase = \"freeform\"` routing entry, or run the session in structured mode to route \
-         it by policy (BR-5)."
-    )]
-    FreeformRoutingPolicy,
-
     /// A routing rule references a provider id that no provider declares.
     #[error("routing policy for the {phase} phase references unknown provider '{provider_id}'")]
     UnknownProvider {
@@ -363,9 +352,8 @@ pub enum ConfigError {
     /// Decision 2). The pin moved into the `[local_model]` table; the old key is
     /// no longer honoured — a config that still sets it is rejected with a
     /// migration instruction rather than silently promoted (which, post-REQ-547,
-    /// would mean an unprompted download the probe never proposed). Same posture
-    /// as [`ConfigError::FreeformRoutingPolicy`]: reject the inert key loudly
-    /// instead of ignoring it.
+    /// would mean an unprompted download the probe never proposed): reject the
+    /// inert key loudly instead of ignoring it.
     #[error(
         "the top-level `pinned_local_model` key is no longer supported (it was REQ-544's \
          spelling). Move it into the local-model table: replace `pinned_local_model = \"{name}\"` \
@@ -462,13 +450,13 @@ impl Config {
 
         self.validate_category_table(&ids)?;
 
+        // REQ-544 M-6 rejected a `phase = "freeform"` routing rule here, loudly.
+        // ADR-G retires the variant, which moves that rejection outward to
+        // deserialization: serde's unknown-variant error fires before `validate`
+        // ever runs, so the check could not be reached and its error variant
+        // could not be constructed. The *behaviour* is unchanged and pinned by
+        // `a_freeform_routing_entry_is_still_rejected_after_the_schema_change`.
         for rule in &self.routing {
-            // M-6: a freeform routing entry is inert — freeform prompts route by
-            // heuristics, never the policy table — so reject it with an actionable
-            // message rather than accepting a rule that can never fire.
-            if rule.phase == Phase::Freeform {
-                return Err(ConfigError::FreeformRoutingPolicy);
-            }
             if !ids.contains(rule.provider_id.as_str()) {
                 return Err(ConfigError::UnknownProvider {
                     phase: rule.phase,
@@ -1325,26 +1313,12 @@ auth_ref = "keychain:anthropic"
         );
     }
 
-    #[test]
-    fn routing_rule_for_the_freeform_phase_is_rejected() {
-        // REQ-544 M-6: a freeform routing entry can never fire (heuristics, not the
-        // policy table, route freeform prompts), so validation must reject it with a
-        // clear, actionable message instead of silently accepting an inert rule.
-        let mut cfg = sample_config();
-        cfg.routing.push(RoutingPolicy {
-            phase: Phase::Freeform,
-            provider_id: "deepseek".to_owned(),
-            fallback_id: None,
-        });
-        let err = cfg.validate().unwrap_err();
-        assert_eq!(err, ConfigError::FreeformRoutingPolicy);
-        let msg = err.to_string();
-        assert!(msg.contains("freeform"), "message: {msg}");
-        assert!(
-            msg.contains("heuristics") && msg.contains("structured"),
-            "message should explain why and how to fix: {msg}"
-        );
-    }
+    // NOTE: REQ-544 M-6's `routing_rule_for_the_freeform_phase_is_rejected` is
+    // gone with `ConfigError::FreeformRoutingPolicy` (ADR-G) — it built its
+    // input by constructing `RoutingPolicy { phase: Phase::Freeform }`, which no
+    // longer exists. The behaviour it pinned did not go with it: see
+    // `a_freeform_routing_entry_is_still_rejected_after_the_schema_change`,
+    // which drives the same config through `Config::load` as text.
 
     #[test]
     fn invalid_boundary_glob_is_rejected() {
@@ -1931,8 +1905,14 @@ provider_id = "opus"
     fn a_freeform_routing_entry_is_still_rejected_after_the_schema_change() {
         // The architecture's "Corrections to the Requirement": BR-10's "drop the
         // freeform entry" describes a config that has never loaded, so the
-        // migration has nothing to drop. This rejection is TASK-051's to revisit
-        // when `Phase::Freeform` goes, not this task's to relax.
+        // migration has nothing to drop.
+        //
+        // ADR-G moved the *mechanism* of that rejection without changing the
+        // *behaviour*: it used to be `ConfigError::FreeformRoutingPolicy` raised
+        // by `Config::validate`; now `Phase` has no `Freeform` variant, so serde
+        // refuses the value one layer earlier and validation never runs. This
+        // test exists to keep that promise pinned to the observable outcome —
+        // this config does not load — rather than to whichever layer says no.
         let err = Config::load(
             r#"
 [[providers]]
@@ -1951,10 +1931,15 @@ provider_id = "opus"
 "#,
         )
         .expect_err("a freeform routing entry must still be rejected");
-        assert!(matches!(
-            err,
-            LoadError::Validate(ConfigError::FreeformRoutingPolicy)
-        ));
+        assert!(
+            matches!(err, LoadError::Parse(_)),
+            "the rejection is now a parse error, not a validation error: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("freeform"),
+            "the message must still name the offending value: {msg}"
+        );
     }
 
     #[test]

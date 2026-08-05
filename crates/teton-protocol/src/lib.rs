@@ -133,24 +133,26 @@ id_newtype!(
     TurnId
 );
 
-/// Lifecycle phase that drives workflow-aware routing (spec `RoutingPolicy.phase`).
+/// Lifecycle phase of a structured (ADLC) session.
 ///
-/// Structured mode pins a session to a phase; freeform mode leaves it `None`.
+/// **Not a routing key** (REQ-558 BR-1/AC-9) — [`Category`] is. Phase travels on
+/// the wire for cost attribution (`cost_recorded`, BR-11) and to report which
+/// gate a structured session sits behind. Structured mode pins a session to a
+/// phase; freeform mode leaves every `phase` field `None`, which is why there is
+/// no `Freeform` variant (ADR-G).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// Requirement authoring — routes to a frontier model.
+    /// Requirement authoring.
     Spec,
-    /// Architecture / task decomposition — routes to a frontier model.
+    /// Architecture / task decomposition.
     Architect,
-    /// Implementation from task artifacts — routes to a cheap/mid model.
+    /// Implementation from task artifacts.
     Implement,
-    /// Code review — routes to a frontier model.
+    /// Code review.
     Review,
-    /// Mechanical I/O (summaries, commit messages) — routes to the local tier.
+    /// Mechanical I/O (summaries, commit messages).
     Io,
-    /// No structured phase; heuristic routing applies.
-    Freeform,
 }
 
 /// The routing tier a category inherits its provider binding from (REQ-558).

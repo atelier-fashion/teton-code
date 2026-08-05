@@ -1079,12 +1079,6 @@ pub const fn category_for_phase(phase: Phase) -> Category {
         Phase::Implement => Category::Edit,
         Phase::Review => Category::Review,
         Phase::Io => Category::Digest,
-        // ADR-G retires `Phase::Freeform` (TASK-051); until the variant is gone
-        // this arm keeps the function total. Freeform is a session *mode*, and a
-        // mode has no category of its own, so it maps to the BR-9 declared
-        // default. Deleting the variant deletes this arm — which is the intended
-        // prompt, not a mapping to preserve.
-        Phase::Freeform => Category::Edit,
     }
 }
 
@@ -1095,9 +1089,10 @@ pub const fn category_for_phase(phase: Phase) -> Category {
 /// because one old knob becomes several — the migration reports each expansion
 /// by name so a user who wanted them to differ knows to split them.
 ///
-/// `freeform` expands to **nothing**: `Config::validate` has always rejected a
-/// `[[routing]]` rule targeting it, so no such row can exist to migrate (see the
-/// architecture's "Corrections to the Requirement").
+/// There is no `freeform` leg: a `[[routing]]` rule targeting it has never
+/// loaded (rejected by `Config::validate` before ADR-G, by serde after it), so
+/// no such row can exist to migrate — see the architecture's "Corrections to the
+/// Requirement". The migration handles the five phases that can appear.
 #[must_use]
 pub const fn categories_for_phase(phase: Phase) -> &'static [Category] {
     match phase {
@@ -1110,7 +1105,6 @@ pub const fn categories_for_phase(phase: Phase) -> &'static [Category] {
             Category::Title,
             Category::Compact,
         ],
-        Phase::Freeform => &[],
     }
 }
 
@@ -1918,21 +1912,19 @@ mod tests {
                 Category::Compact
             ]
         );
-        // A `[[routing]]` rule naming `freeform` has never loaded, so there is
-        // nothing to migrate (architecture: Corrections to the Requirement).
-        assert!(categories_for_phase(Phase::Freeform).is_empty());
+        // Five legs, not six: a `[[routing]]` rule naming `freeform` has never
+        // loaded, so there is nothing to migrate, and ADR-G removed the variant
+        // that would have named it (architecture: Corrections to the
+        // Requirement).
+        assert_eq!(Phase::ALL.len(), 5);
     }
 
     #[test]
     fn dispatch_and_migration_agree_on_every_live_phase() {
         // ADR-F: one knowledge, two uses. The dispatch category is the head of
-        // the migration expansion, so the two cannot drift.
+        // the migration expansion, so the two cannot drift. Every phase is a
+        // live phase now that `Freeform` is retired — there is no arm to skip.
         for phase in Phase::ALL {
-            // `Phase::Freeform` is retired by ADR-G/TASK-051 and has no
-            // expansion; every other phase must agree.
-            if phase == Phase::Freeform {
-                continue;
-            }
             assert_eq!(
                 categories_for_phase(phase).first(),
                 Some(&category_for_phase(phase)),

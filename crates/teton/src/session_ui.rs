@@ -401,7 +401,11 @@ fn status_label(status: ToolCallStatus) -> &'static str {
     }
 }
 
-/// Human name for a routing phase.
+/// Human name for a lifecycle phase.
+///
+/// There is no `freeform` arm: ADR-G retired the variant, and a freeform turn
+/// reaches the display path as `phase: None` — the `map_or` fallback in
+/// [`format_route`] is what renders it.
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
         Phase::Spec => "spec",
@@ -409,7 +413,6 @@ fn phase_name(phase: Phase) -> &'static str {
         Phase::Implement => "implement",
         Phase::Review => "review",
         Phase::Io => "io",
-        Phase::Freeform => "freeform",
     }
 }
 

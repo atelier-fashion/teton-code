@@ -562,11 +562,13 @@ fn phase_to_wire(phase: Phase) -> &'static str {
         Phase::Implement => "implement",
         Phase::Review => "review",
         Phase::Io => "io",
-        Phase::Freeform => "freeform",
     }
 }
 
 /// Parse a phase back from its wire form; unknown strings become `None`.
+///
+/// A ledger written by an older build can still hold `"freeform"`, and that row
+/// now reads back as "no phase" — see the explicit arm below.
 fn phase_from_wire(s: &str) -> Option<Phase> {
     Some(match s {
         "spec" => Phase::Spec,
@@ -574,7 +576,15 @@ fn phase_from_wire(s: &str) -> Option<Phase> {
         "implement" => Phase::Implement,
         "review" => Phase::Review,
         "io" => Phase::Io,
-        "freeform" => Phase::Freeform,
+        // `"freeform"` is the phase variant REQ-558 ADR-G retired. Its rows are
+        // reattributed to the no-phase bucket, and that is a decision, not the
+        // catch-all below happening to swallow it: freeform was never a
+        // lifecycle position, `resolve_freeform` has always recorded `phase:
+        // NULL`, and the only rows carrying the literal string came from a
+        // structured session explicitly created at `Phase::Freeform`. Keep this
+        // arm above the catch-all so a reader six months from now can tell a
+        // human chose this rather than a `_ => None` swallowing a live value.
+        "freeform" => return None,
         _ => return None,
     })
 }
@@ -845,6 +855,53 @@ CREATE TRIGGER cost_records_no_delete
         assert_eq!(reopened.all_records().expect("read").len(), 2);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// REQ-558 ADR-G: `Phase::Freeform` is retired, so a historical row storing
+    /// the literal `"freeform"` reads back as **no phase** and rolls up into the
+    /// `none` bucket. That reattribution is a decision, so it is pinned by a
+    /// test and by an explicit arm in [`phase_from_wire`] — not left to the
+    /// catch-all, where it would read as an oversight.
+    #[test]
+    fn a_stored_freeform_phase_reattributes_to_the_no_phase_bucket() {
+        assert_eq!(
+            phase_from_wire("freeform"),
+            None,
+            "the retired variant must not resolve to any live phase"
+        );
+        // Every phase that still exists is unaffected — the reattribution is
+        // scoped to the one retired value, not a general loosening. Swept from
+        // `teton_core::Phase::ALL` so a phase added later lands here without
+        // anyone remembering to extend the list.
+        for core in teton_core::phase::Phase::ALL {
+            let phase = crate::router::to_protocol_phase(core);
+            assert_eq!(
+                phase_from_wire(phase_to_wire(phase)),
+                Some(phase),
+                "{core} does not survive the ledger round trip"
+            );
+        }
+
+        // And end to end, against a row an older build could really have
+        // written: it survives (the ledger is append-only), it is simply
+        // unattributed.
+        let (ledger, _sink) = ledger();
+        {
+            let guard = ledger.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO cost_records
+                       (recorded_at_ms, session_id, phase, category, provider_id, model,
+                        input_tokens, output_tokens, usd_micros)
+                     VALUES (1, 'old', 'freeform', NULL, 'deepseek', 'deepseek-chat', 10, 5, 7)",
+                    [],
+                )
+                .expect("a pre-ADR-G row");
+        }
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 1, "the row is kept, not dropped");
+        assert_eq!(rows[0].phase, None);
+        assert_eq!(rows[0].usd_micros, Some(7), "its cost is still attributed");
     }
 
     #[test]

@@ -64,7 +64,6 @@ pub fn to_protocol_phase(phase: CorePhase) -> ProtoPhase {
         CorePhase::Implement => ProtoPhase::Implement,
         CorePhase::Review => ProtoPhase::Review,
         CorePhase::Io => ProtoPhase::Io,
-        CorePhase::Freeform => ProtoPhase::Freeform,
     }
 }
 
@@ -947,10 +946,12 @@ mod tests {
             (CorePhase::Implement, ProtoPhase::Implement),
             (CorePhase::Review, ProtoPhase::Review),
             (CorePhase::Io, ProtoPhase::Io),
-            (CorePhase::Freeform, ProtoPhase::Freeform),
         ] {
             assert_eq!(to_protocol_phase(core), proto);
         }
+        // And the two enums are the same size, so a variant added on one side
+        // cannot quietly go unmapped on the other.
+        assert_eq!(CorePhase::ALL.len(), 5);
     }
 
     /// The wire twins mirror the core enums variant-for-variant, spelling

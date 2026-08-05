@@ -3276,7 +3276,6 @@ fn to_proto_phase(phase: CorePhase) -> ProtoPhase {
         CorePhase::Implement => ProtoPhase::Implement,
         CorePhase::Review => ProtoPhase::Review,
         CorePhase::Io => ProtoPhase::Io,
-        CorePhase::Freeform => ProtoPhase::Freeform,
     }
 }
 
@@ -3287,7 +3286,6 @@ fn to_core_phase(phase: ProtoPhase) -> CorePhase {
         ProtoPhase::Implement => CorePhase::Implement,
         ProtoPhase::Review => CorePhase::Review,
         ProtoPhase::Io => CorePhase::Io,
-        ProtoPhase::Freeform => CorePhase::Freeform,
     }
 }
 
