@@ -1346,10 +1346,23 @@ fn render_config(providers: &[ProviderConfig], surface: &mut dyn Surface) {
         } else {
             "none"
         };
+        // REQ-557 BR-1/BR-3: the model a provider calls is what distinguishes two
+        // otherwise-identical providers ("Opus for design, Sonnet for build"), so
+        // it is the field this listing exists to show. A remote provider with no
+        // model cannot serve turns (ADR-E) — say so here rather than printing a
+        // blank column, because this listing is where a user goes to find out why
+        // a provider stopped working after an upgrade.
+        let model = match (provider.model.as_deref(), provider.kind) {
+            (Some(model), _) if !model.trim().is_empty() => model.to_owned(),
+            // The local tier's model is owned by the REQ-547 consent flow, not by
+            // this field; `teton model status` is where it is read (OQ-4).
+            (_, ProviderKind::Local) => "(see `teton model status`)".to_owned(),
+            _ => "UNUSABLE — no model; re-add with `--model <name>`".to_owned(),
+        };
         surface.line(
             LineKind::Info,
             &format!(
-                "  {} [{}]  {endpoint}  auth: {auth}",
+                "  {} [{}]  {model}  {endpoint}  auth: {auth}",
                 provider.id,
                 kind_label(provider.kind)
             ),
@@ -1447,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_add_parses_kind_and_endpoint() {
+    fn provider_add_parses_kind_endpoint_and_model() {
         let cli = parse(&[
             "teton",
             "provider",
@@ -1457,6 +1470,8 @@ mod tests {
             "openai-compatible",
             "--endpoint",
             "https://api.deepseek.com",
+            "--model",
+            "deepseek-chat",
         ]);
         match cli.command {
             Some(Command::Provider {
@@ -1472,7 +1487,62 @@ mod tests {
                 assert!(matches!(kind, CliProviderKind::OpenaiCompatible));
                 assert_eq!(endpoint.as_deref(), Some("https://api.deepseek.com"));
                 assert_eq!(ProviderKind::from(kind), ProviderKind::OpenaiCompatible);
+                assert_eq!(model.as_deref(), Some("deepseek-chat"));
             }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    /// REQ-557 BR-3: two providers may share a kind and differ only in id and
+    /// model — the "Opus for design, Sonnet for build" shape the REQ exists to
+    /// make expressible. The parser must carry both models through distinctly.
+    #[test]
+    fn two_providers_of_one_kind_parse_to_distinct_models() {
+        let model_of = |id: &str, model: &str| {
+            let cli = parse(&[
+                "teton",
+                "provider",
+                "add",
+                id,
+                "--kind",
+                "anthropic",
+                "--model",
+                model,
+            ]);
+            match cli.command {
+                Some(Command::Provider {
+                    action:
+                        ProviderAction::Add {
+                            id, kind, model, ..
+                        },
+                }) => {
+                    assert_eq!(ProviderKind::from(kind), ProviderKind::Anthropic);
+                    (id, model)
+                }
+                other => panic!("unexpected parse: {other:?}"),
+            }
+        };
+        let opus = model_of("opus", "claude-opus-5");
+        let sonnet = model_of("sonnet", "claude-sonnet-5");
+        assert_eq!(opus, ("opus".to_owned(), Some("claude-opus-5".to_owned())));
+        assert_eq!(
+            sonnet,
+            ("sonnet".to_owned(), Some("claude-sonnet-5".to_owned()))
+        );
+    }
+
+    /// `--model` is optional *to the parser* (a local provider legitimately has
+    /// none — REQ-547 owns that selection) and required for a remote kind by
+    /// `run_provider_add`, which rejects it before reading any credential. The
+    /// split is deliberate: a parser-level `required` would break `provider add
+    /// <id> --kind local`.
+    #[test]
+    fn provider_add_leaves_a_missing_model_to_the_runtime_check() {
+        let cli = parse(&["teton", "provider", "add", "x", "--kind", "anthropic"]);
+        match cli.command {
+            Some(Command::Provider {
+                action: ProviderAction::Add { model, .. },
+            }) => assert_eq!(model, None),
             other => panic!("unexpected parse: {other:?}"),
         }
     }

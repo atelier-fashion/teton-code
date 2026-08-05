@@ -35,8 +35,25 @@ fn probe_4gb() -> DaemonOptions {
         .env("TETON_PROBE_GPU", "apple-silicon")
 }
 
-fn provider_block(id: &str, kind: &str, endpoint: &str) -> String {
-    format!("[[providers]]\nid = \"{id}\"\nkind = \"{kind}\"\nendpoint = \"{endpoint}\"\n\n")
+/// A `[[providers]]` entry. `model` is the model the provider *calls* — REQ-557
+/// BR-1/BR-2 make it a required declaration for every remote kind, and a remote
+/// provider without one is unusable (ADR-E), so a fixture that omits it has no
+/// routable remote provider at all.
+fn provider_block(id: &str, kind: &str, endpoint: &str, model: &str) -> String {
+    format!(
+        "[[providers]]\nid = \"{id}\"\nkind = \"{kind}\"\nendpoint = \"{endpoint}\"\n\
+         model = \"{model}\"\n\n"
+    )
+}
+
+/// The explicit `default_provider` key (REQ-557 BR-4). It is a top-level key, so
+/// it must precede every table/array header in the document.
+///
+/// There is no implicit default any more — REQ-557 deletes `build_router`'s
+/// positional `.find` and its literal-`"local"` tail — so a fixture whose turn
+/// resolves through the default rather than a `[[routing]]` policy has to say so.
+fn default_provider_key(id: &str) -> String {
+    format!("default_provider = \"{id}\"\n\n")
 }
 
 fn routing_block(phase: &str, provider: &str, fallback: Option<&str>) -> String {
@@ -129,12 +146,14 @@ fn ac2_two_remote_providers_complete_sessions() {
         "deepseek",
         "openai-compatible",
         &deepseek.openai_endpoint(),
+        "deepseek-chat",
     );
     register_provider(
         &mut client,
         "anthropic",
         "anthropic",
         &anthropic.anthropic_endpoint(),
+        "claude-opus-4",
     );
     set_routing(&mut client, "implement", "deepseek", None);
     set_routing(&mut client, "spec", "anthropic", None);
@@ -152,6 +171,29 @@ fn ac2_two_remote_providers_complete_sessions() {
         "{ids:?}"
     );
 
+    // REQ-557 TASK-046: the declared model survives daemon persistence and
+    // reappears in the `config/get` projection — the round-trip that proves the
+    // model is a stored property of the provider, not something re-derived on
+    // read.
+    let model_of = |id: &str| -> Option<String> {
+        snapshot["providers"]
+            .as_array()?
+            .iter()
+            .find(|p| p["id"].as_str() == Some(id))?["model"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        model_of("deepseek").as_deref(),
+        Some("deepseek-chat"),
+        "{snapshot}"
+    );
+    assert_eq!(
+        model_of("anthropic").as_deref(),
+        Some("claude-opus-4"),
+        "{snapshot}"
+    );
+
     // The OpenAI-compatible provider completes an (implement) session.
     let s1 = client.create_session("structured", Some("implement"));
     let r1 = client.prompt(&s1, "say hello");
@@ -162,10 +204,30 @@ fn ac2_two_remote_providers_complete_sessions() {
     let r2 = client.prompt(&s2, "say hello");
     assert_eq!(result_stop_reason(&r2), Some("end_turn"), "{r2}");
 
-    // And a freeform session completes routed to a remote (the default remote).
+    // A freeform coding turn resolves through the DEFAULT provider, and REQ-557
+    // BR-4 removes the implicit one: `build_router`'s positional
+    // `.find(is_remote)` — which silently made "whichever provider was
+    // registered first" the default — is deleted, and the REQ adds no RPC to set
+    // `default_provider` (config-file only; OQ-2/OQ-3 lean "no implicit
+    // default"). So with two providers registered over the wire and no default
+    // set, this turn has nowhere to go and must SAY so rather than route to a
+    // provider nobody chose. Pre-REQ it completed against `deepseek` purely
+    // because that call came first — the routing-by-array-position defect
+    // (BUG-146 root cause #1) this asserts is gone.
     let s3 = client.create_session("freeform", None);
     let r3 = client.prompt(&s3, "implement the greeting");
-    assert_eq!(result_stop_reason(&r3), Some("end_turn"), "{r3}");
+    assert_eq!(
+        result_stop_reason(&r3),
+        None,
+        "a freeform coding turn with no `default_provider` must not silently \
+         route to a provider the user never chose: {r3}"
+    );
+    let msg = r3["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("default_provider"),
+        "the failure must name the missing default (AC-4), not just say the turn \
+         did not route: {r3}"
+    );
 
     client.drain_events(Duration::from_millis(200));
     let routed: Vec<&str> = client
@@ -194,11 +256,13 @@ fn ac3_phase_routing_is_observable() {
         "anthropic",
         "anthropic",
         &frontier.anthropic_endpoint(),
+        "claude-opus-4",
     ));
     config.push_str(&provider_block(
         "deepseek",
         "openai-compatible",
         &cheap.openai_endpoint(),
+        "deepseek-chat",
     ));
     config.push_str(&routing_block("spec", "anthropic", None));
     config.push_str(&routing_block("architect", "anthropic", None));
@@ -263,11 +327,15 @@ fn ac4_cost_meter_reports_totals_phases_and_savings() {
         "anthropic",
         "anthropic",
         &frontier.anthropic_endpoint(),
+        // The model the arithmetic below prices against; pre-REQ this was
+        // derived from the price table by provider id, now it is declared.
+        "claude-opus-4",
     ));
     config.push_str(&provider_block(
         "deepseek",
         "openai-compatible",
         &cheap.openai_endpoint(),
+        "deepseek-chat",
     ));
     config.push_str(&routing_block("spec", "anthropic", None));
     config.push_str(&routing_block("implement", "deepseek", None));
@@ -387,6 +455,7 @@ fn ac5_privacy_boundary_blocks_and_never_leaks() {
         "deepseek",
         "openai-compatible",
         &provider.openai_endpoint(),
+        "deepseek-chat",
     ));
     config.push_str(&routing_block("implement", "deepseek", None));
     config.push_str(&boundary_block("secrets/**", "local-only"));
@@ -472,15 +541,20 @@ fn ac7_degraded_provider_falls_back_and_completes() {
     let healthy = MockProvider::always(openai_turn("Recovered and done.", None, 120, 20));
 
     let mut config = String::new();
+    // Two providers declaring the SAME model behind different endpoints — the
+    // BR-3 shape this REQ exists to make expressible. Neither id appears in the
+    // price table, so both are unpriced; AC-7 is about health fallback, not cost.
     config.push_str(&provider_block(
         "flaky",
         "openai-compatible",
         &flaky.openai_endpoint(),
+        "deepseek-chat",
     ));
     config.push_str(&provider_block(
         "healthy",
         "openai-compatible",
         &healthy.openai_endpoint(),
+        "deepseek-chat",
     ));
     config.push_str(&routing_block("implement", "flaky", Some("healthy")));
 
@@ -563,10 +637,15 @@ fn ac8_probe_selects_benchmarks_and_steps_down() {
     {
         let provider = MockProvider::always(openai_turn("Remote-only done.", None, 100, 10));
         let mut config = String::new();
+        // The freeform session below has no phase policy to match, so it resolves
+        // through the default. REQ-557 BR-4 removed the implicit positional
+        // default, so this fixture states it.
+        config.push_str(&default_provider_key("deepseek"));
         config.push_str(&provider_block(
             "deepseek",
             "openai-compatible",
             &provider.openai_endpoint(),
+            "deepseek-chat",
         ));
         let ws = Workspace::new("ac8b");
         ws.write_config(&config);
@@ -668,7 +747,12 @@ fn live_smoke_real_provider_completes_a_session() {
 
     let ws = Workspace::new("live");
     let mut config = String::new();
-    config.push_str(&provider_block("deepseek", "openai-compatible", &endpoint));
+    config.push_str(&provider_block(
+        "deepseek",
+        "openai-compatible",
+        &endpoint,
+        "deepseek-chat",
+    ));
     config.push_str(&routing_block("implement", "deepseek", None));
     ws.write_config(&config);
     let daemon = Daemon::spawn(&ws, probe_16gb());
@@ -687,7 +771,7 @@ fn live_smoke_real_provider_completes_a_session() {
 // helpers
 // ---------------------------------------------------------------------------
 
-fn register_provider(client: &mut Client, id: &str, kind: &str, endpoint: &str) {
+fn register_provider(client: &mut Client, id: &str, kind: &str, endpoint: &str, model: &str) {
     let resp = client.call(
         "config/set",
         json!({ "update": {
@@ -695,6 +779,7 @@ fn register_provider(client: &mut Client, id: &str, kind: &str, endpoint: &str) 
             "id": id,
             "kind": kind,
             "endpoint": endpoint,
+            "model": model,
         }}),
     );
     assert_eq!(

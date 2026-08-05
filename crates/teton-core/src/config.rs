@@ -414,9 +414,7 @@ impl Config {
         let mut out: Vec<String> = self
             .providers
             .iter()
-            .filter(|p| {
-                p.kind.is_remote() && p.model.as_deref().unwrap_or("").trim().is_empty()
-            })
+            .filter(|p| p.kind.is_remote() && p.model.as_deref().unwrap_or("").trim().is_empty())
             .map(|p| p.id.clone())
             .collect();
         out.sort_unstable();
@@ -624,7 +622,10 @@ auth_ref = "keychain:mystery"
         // config and (b) make ONE unresolvable provider prevent startup —
         // contradicting BR-7's "the daemon starts with that provider unusable".
         let cfg = Config::load(PRE_REQ_557_TOML).expect("must load");
-        assert!(cfg.validate().is_ok(), "missing model must not be a validity error");
+        assert!(
+            cfg.validate().is_ok(),
+            "missing model must not be a validity error"
+        );
         assert_eq!(cfg.unusable_providers(), vec!["anthropic", "mystery"]);
     }
 
@@ -649,7 +650,11 @@ kind = "local"
             "anthropic" => Some("claude-opus-5".to_owned()),
             _ => None,
         });
-        assert_eq!(unresolved, vec!["mystery"], "must report by id, never guess");
+        assert_eq!(
+            unresolved,
+            vec!["mystery"],
+            "must report by id, never guess"
+        );
         assert_eq!(
             cfg.providers[0].model.as_deref(),
             Some("claude-opus-5"),
@@ -680,7 +685,10 @@ kind = "local"
         let mut cfg = Config::load(PRE_REQ_557_TOML).expect("must load");
         cfg.providers[0].model = Some("declared-by-the-user".to_owned());
         let _ = cfg.migrate_models(|_| Some("from-the-price-table".to_owned()));
-        assert_eq!(cfg.providers[0].model.as_deref(), Some("declared-by-the-user"));
+        assert_eq!(
+            cfg.providers[0].model.as_deref(),
+            Some("declared-by-the-user")
+        );
     }
 
     #[test]

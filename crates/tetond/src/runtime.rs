@@ -535,7 +535,17 @@ impl DaemonRuntime {
         // H-1: a present-but-invalid config refuses to start rather than failing
         // open to an empty default that would drop every declared privacy
         // boundary. A genuinely absent file still defaults.
-        let config = load_config(config_path.as_deref())?;
+        let mut config = load_config(config_path.as_deref())?;
+        // REQ-557 BR-7 / ADR-C: the one-shot model migration runs here, on the
+        // loaded config, before anything reads a provider. It has to be after
+        // `load_config` and not inside `Config::validate` — a validation-level
+        // model requirement would make a pre-REQ config refuse to start, and the
+        // migration that fixes it could never run (ADR-E).
+        migrate_and_report_provider_models(
+            &mut config,
+            config_path.as_deref(),
+            &PriceTable::bundled(),
+        );
 
         // --- repo root (the tool jail) ---
         let repo_root = std::env::var_os("TETON_REPO_ROOT")
@@ -707,18 +717,58 @@ impl DaemonRuntime {
         // Every settled cause codes the same way; only the two transient ones
         // below override it, and each says so at the `return`.
         let settled = |reason: String| RpcError::new(error_code::UNKNOWN_PROVIDER, reason);
+        // The remote half of the sentence, appended to whichever local-tier
+        // reason applies below. Four states of ONE classifier, most specific
+        // first — deliberately not a second classifier (REQ-557 BR-5,
+        // LESSON-456): the turn-failure sentence and the lifecycle stream have
+        // to keep agreeing, so the two causes REQ-557 introduces are branches
+        // *here* rather than a parallel machine somewhere else.
+        let unusable = config.unusable_providers();
         let has_remote = config.providers.iter().any(|p| p.kind.is_remote());
-        // The one clause that is the same in every branch: with a remote
-        // provider registered, the turn would have had somewhere to go.
-        let add_provider = if has_remote {
-            // A remote provider IS configured, so the route resolving to a
-            // missing one is a routing/config mismatch rather than an empty
-            // machine — say that instead of telling them to add what they have.
-            " A remote provider is configured but this turn did not route to it; \
-             check `teton policy show` and the provider id in `teton provider list`."
-        } else {
+        let usable_remote: Vec<&str> = config
+            .providers
+            .iter()
+            .filter(|p| p.kind.is_remote() && !unusable.contains(&p.id))
+            .map(|p| p.id.as_str())
+            .collect();
+        let add_provider = if !unusable.is_empty() {
+            // REQ-557 ADR-E, router half. A remote provider with no declared
+            // model is a *usability* condition, so the daemon started — that is
+            // the whole point of keeping the rule out of `validate()`. The
+            // refusal therefore has to happen at routing time, and it has to
+            // name the provider and the remedy rather than report a generic
+            // no-route the user cannot act on.
+            format!(
+                " Provider(s) {} are registered with no `model`, so they cannot serve \
+                 turns — re-register with `teton provider add <id> --model <name>`.",
+                unusable.join(", ")
+            )
+        } else if !has_remote {
             " No remote provider is configured either — `teton provider add` \
              registers one to serve turns while the local tier is unavailable."
+                .to_owned()
+        } else if config.default_provider.is_none() {
+            // REQ-557 BR-4 / AC-4: the absence IS the cause, and it is nameable.
+            // Pre-REQ this state could not arise, because the router synthesized
+            // a default from array position and, failing that, the literal
+            // "local" — which is exactly how an unconfigured install came to
+            // announce a route to a provider registered nowhere (BUG-146 root
+            // cause #1). Keeping the absence in the type is what makes this
+            // sentence possible.
+            format!(
+                " A remote provider is configured but no `default_provider` is set, so a \
+                 turn with no matching policy has no remote to route to; set \
+                 `default_provider` to one of: {}.",
+                usable_remote.join(", ")
+            )
+        } else {
+            // A remote provider IS configured and a default IS set, so the route
+            // resolving to a missing one is a routing/config mismatch rather
+            // than an empty machine — say that instead of telling them to add
+            // what they have.
+            " A remote provider is configured but this turn did not route to it; \
+             check `teton policy show` and the provider id in `teton provider list`."
+                .to_owned()
         };
 
         // A machine below the hardware floor has no local tier to wait for.
@@ -1152,7 +1202,6 @@ impl DaemonRuntime {
             // here, so this turn routes remote-only instead of blocking on the
             // answer.
             self.local_tier_available(),
-            self.ledger.prices(),
             &health_snapshot,
         );
 
@@ -1546,6 +1595,95 @@ fn load_config(path: Option<&Path>) -> anyhow::Result<Config> {
              refusing to start rather than silently ignore it.",
             err.kind()
         )),
+    }
+}
+
+/// Run the one-shot REQ-557 model migration on a freshly loaded config, persist
+/// the result, and report at startup every provider that is still unusable.
+///
+/// A config written by the pre-REQ binary declares no `model` on any provider,
+/// because the field did not exist: the model was re-derived on every turn by
+/// searching the price table for the provider's id. ADR-C performs that lookup
+/// **once**, writes the answer back, and stops.
+///
+/// A provider the lookup cannot resolve keeps `model: None`, is named on stderr,
+/// and stays unusable — the daemon still starts. BR-7's own vocabulary is the
+/// tell: it says *unusable*, not *invalid*. A config naming a provider we cannot
+/// yet price is not corrupt; it is incomplete in one entry, and refusing to start
+/// would strand the user with no way to fix it (ADR-E).
+///
+/// **The legacy resolver lives and dies here.** It is a closure over the price
+/// table rather than a named helper, deliberately: ADR-A forbids deriving a model
+/// identifier from a billing table, and this is the single bounded exception that
+/// exists only to carry old configs across the change. A named function would
+/// outlive the migration and become a live derivation path again — the shape
+/// LESSON-443 documents. Note it does **not** carry `billing_model`'s
+/// `map_or_else(|| provider_id.to_owned(), …)` tail: an unresolvable provider
+/// yields `None`, never its own id (BR-1, LESSON-456).
+///
+/// Idempotent by construction (ADR-C): the guard is the absence of a model, so a
+/// second start finds nothing to migrate, writes nothing, and reports nothing new.
+fn migrate_and_report_provider_models(
+    config: &mut Config,
+    path: Option<&Path>,
+    prices: &PriceTable,
+) {
+    // The providers a migration would act on — exactly the usability pass's
+    // answer before it runs. Reusing that classifier rather than re-deriving the
+    // condition keeps the two from drifting (LESSON-456).
+    let pending = config.unusable_providers();
+    if !pending.is_empty() {
+        let unresolved = config.migrate_models(|provider_id| {
+            prices
+                .models
+                .iter()
+                .find(|m| m.provider_id == provider_id)
+                .map(|m| m.model.clone())
+        });
+        let migrated: Vec<&str> = pending
+            .iter()
+            .filter(|id| !unresolved.contains(id))
+            .map(String::as_str)
+            .collect();
+        // Only a migration that actually changed something rewrites the file.
+        // A config where nothing resolved is left byte-for-byte alone.
+        if !migrated.is_empty() {
+            eprintln!(
+                "tetond: migrated {} provider(s) to a declared model (REQ-557): {}. \
+                 The model each provider calls is now recorded in the config rather than \
+                 inferred from the price table.",
+                migrated.len(),
+                migrated.join(", ")
+            );
+            // A missing config path (a defaulted config) or a config that will
+            // not serialize falls through silently: the in-memory migration
+            // still stands for this session, and the absence guard makes a
+            // re-run on the next start harmless.
+            if let (Some(path), Ok(toml)) = (path, config.to_toml()) {
+                if let Err(err) = std::fs::write(path, toml) {
+                    eprintln!(
+                        "tetond: WARNING — the model migration could not be saved ({}), so it \
+                         will run again on the next start. Routing this session is unaffected.",
+                        err.kind()
+                    );
+                }
+            }
+        }
+    }
+
+    // ADR-E consequence: the unusable report must reach the user at startup, or a
+    // provider silently stops working after upgrade. This covers both the
+    // migration's unresolvable leg and a hand-edited config that never had a
+    // model — one report for one condition, whatever produced it.
+    let unusable = config.unusable_providers();
+    if !unusable.is_empty() {
+        eprintln!(
+            "tetond: WARNING — provider(s) {} declare no `model`, so they cannot serve turns \
+             and any turn routed to one will fail naming them. Every other provider is \
+             unaffected and the daemon is running. Fix with: \
+             `teton provider add <id> --model <name>`.",
+            unusable.join(", ")
+        );
     }
 }
 
@@ -2661,19 +2799,24 @@ fn build_provider(provider: &ModelProvider, caps: CapabilityProfile) -> Box<dyn 
     }
 }
 
-/// Build the phase-policy [`Router`] from a config snapshot.
-///
-/// Each provider's billed model name is resolved from the price table
-/// (its declared `model`, REQ-557 ADR-A) so cost attribution (BR-2) hits a real price entry rather
-/// than the bare provider id.
 /// The local tier's canonical provider id when the config declares no explicit
 /// `[[providers]]` entry for it (REQ-557 ADR-D).
+///
+/// This is the local tier **naming itself**, not a stand-in for an absent
+/// choice: the tier comes from the engine rather than from a `[[providers]]`
+/// entry, so it has an id whether or not the config mentions one. The literal
+/// `"local"` was doing double duty before REQ-557 — this, and a fallback for a
+/// missing default. Only the second was a defect, and only the second is gone.
 const LOCAL_PROVIDER_ID: &str = "local";
 
+/// Build the phase-policy [`Router`] from a config snapshot.
+///
+/// Takes no price table: REQ-557 ADR-A reversed the dependency, so a provider
+/// **declares** the model it calls and pricing is a downstream consumer of that
+/// string. Nothing here derives an identifier from a billing table any more.
 fn build_router(
     config: &Config,
     local_available: bool,
-    prices: &PriceTable,
     health: &BTreeMap<String, ProviderHealth>,
 ) -> Router {
     // REQ-557 BR-4 / ADR-D: both halves of the old fallback chain are gone.
@@ -2683,17 +2826,12 @@ fn build_router(
     // `route_decided` event. That doubled fallback-identifier-standing-for-
     // absence is BUG-146's root cause #1 (LESSON-456: "a fallback identifier is
     // not 'none' — keep the Option").
-    // The local tier's own id. When the config declares no `[[providers]]` entry
-    // of kind `local` the tier still exists — it comes from the engine, not the
-    // config — so it keeps its canonical id.
     //
-    // This is deliberately NOT the fallback BUG-146 was about, and the
-    // distinction is the whole of ADR-D. The defect was `default_provider`
-    // resolving to `local_provider` resolving to the literal `"local"`: a
-    // *remote-routing* decision answered with a fabricated id, so an
-    // unconfigured install announced a route to a provider registered nowhere.
-    // That chain is gone. What remains here is the local tier naming itself,
-    // which is a constant rather than a stand-in for an absent choice.
+    // What survives is the local tier naming itself. When the config declares no
+    // `[[providers]]` entry of kind `local` the tier still exists — it comes from
+    // the engine, not the config — so it keeps its canonical id. That is a
+    // constant, not a stand-in for an absent choice, and the distinction is the
+    // whole of ADR-D.
     let local_provider = config
         .providers
         .iter()
@@ -2715,13 +2853,14 @@ fn build_router(
             .unwrap_or(ProviderHealth::Healthy);
         // REQ-557 ADR-A: the model is the provider's own declaration. Nothing
         // derives it from the price table any more — pricing is a *consumer* of
-        // this string, never its source. A provider that has not been migrated
-        // yet (model: None) is unusable rather than silently billed under its own
-        // id; `unusable_providers()` reports it and the router refuses to route
-        // to it because it never enters the provider map.
-        // A REMOTE provider with no declared model is unusable (REQ-557 ADR-E):
-        // it never enters the provider map, so the router cannot route to it and
-        // `unusable_providers()` reports it by id.
+        // this string, never its source.
+        //
+        // A REMOTE provider with no declared model is unusable (ADR-E): it never
+        // enters the provider map, so `health_of` reports it Unavailable, policy
+        // evaluation cannot select it, and `unusable_providers()` names it in the
+        // startup report and in `unserved_turn_error`. It is not silently billed
+        // under its own id — that fallback identifier is precisely what BR-1
+        // deletes.
         //
         // A LOCAL provider is different and must NOT be skipped: its model is
         // owned by the REQ-547 consent flow, not by this field, so `None` there
@@ -2806,10 +2945,6 @@ fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBoundary]) ->
         Err(_) => true,
     }
 }
-
-/// The model name a provider is billed under: the first price-table entry for
-/// that provider id, or the provider id itself when the table knows no model for
-/// it (an unpriced provider, recorded but never guessed a cost, BR-2).
 
 // ---------------------------------------------------------------------------
 // Config <-> protocol conversions
@@ -4000,12 +4135,10 @@ mod tests {
         // of the router blindly reseeding it Healthy every turn.
         use teton_core::policy::RouteOutcome;
         let config = two_provider_spec_config();
-        let prices = PriceTable::bundled();
 
         // Turn 1: no prior failures → the Spec primary (anthropic) is chosen.
         let fresh = BTreeMap::new();
-        let route1 =
-            build_router(&config, false, &prices, &fresh).resolve_structured(CorePhase::Spec);
+        let route1 = build_router(&config, false, &fresh).resolve_structured(CorePhase::Spec);
         assert_eq!(route1.provider_id.as_ref().unwrap().0, "anthropic");
         assert_eq!(route1.outcome, RouteOutcome::Primary);
 
@@ -4020,8 +4153,7 @@ mod tests {
         // Turn 2: build_router seeds anthropic Unavailable from the map → policy
         // fails over to the fallback deepseek. This is the cross-turn fallback that
         // was previously dead because every turn reseeded Healthy.
-        let route2 =
-            build_router(&config, false, &prices, &persisted).resolve_structured(CorePhase::Spec);
+        let route2 = build_router(&config, false, &persisted).resolve_structured(CorePhase::Spec);
         assert_eq!(
             route2.provider_id.as_ref().unwrap().0,
             "deepseek",

@@ -293,8 +293,15 @@ fn ac1_nothing_downloads_before_the_answer_and_the_machine_is_legible() {
 
     let ws = Workspace::new("c-ac1");
     let catalog = ws.write_catalog(&fixture_catalog_toml(&models));
+    // D-3's remote-only turn is freeform with no phase policy, so it resolves
+    // through the default. REQ-557 BR-4 removed the implicit positional default
+    // and BR-1 makes `model` a required declaration for a remote kind, so both
+    // are stated here — a remote provider without a model is unusable (ADR-E)
+    // and the turn would have no tier at all. `default_provider` is a top-level
+    // key, so it precedes every table header in the document.
     ws.write_config(&format!(
-        "{}[[providers]]\nid = \"remote\"\nkind = \"openai-compatible\"\nendpoint = \"{}\"\n",
+        "default_provider = \"remote\"\n\n{}[[providers]]\nid = \"remote\"\n\
+         kind = \"openai-compatible\"\nendpoint = \"{}\"\nmodel = \"deepseek-chat\"\n",
         local_model_block(&hf.base_url(), false),
         provider.openai_endpoint(),
     ));
