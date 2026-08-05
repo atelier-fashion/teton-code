@@ -28,17 +28,24 @@ pub enum ProviderHealth {
 
 /// Which branch of the policy produced the decision. Lets callers react
 /// (e.g. emit `provider_degraded`) without re-parsing the reason string.
+///
+/// **Shared by both dispatch paths** — phase-policy [`evaluate`] and
+/// [`crate::category::resolve`] (REQ-558 ADR-J). Two vocabularies for one
+/// concept is how surfaces drift, so the category resolver imports this rather
+/// than forking a parallel enum. The variant docs are worded for both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteOutcome {
     /// Primary provider selected, healthy.
     Primary,
     /// Primary provider selected but degraded (reduced harness profile).
     PrimaryDegraded,
-    /// Primary unavailable; fell back to the configured fallback.
+    /// Primary unavailable or unroutable; fell back to the configured fallback.
     Fallback,
-    /// No routing policy is configured for this phase.
+    /// Nothing is configured for this dispatch key — no policy for the phase,
+    /// or no tier binding and no override for the category.
     NoPolicy,
-    /// A policy exists but no provider in it is currently usable.
+    /// A binding exists but no provider in it is currently usable — unavailable,
+    /// or not routable at all (REQ-557 ADR-E).
     NoHealthyProvider,
 }
 

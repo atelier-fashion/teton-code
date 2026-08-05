@@ -1,7 +1,7 @@
 ---
 id: TASK-048
 title: "Category, Tier, and the pure resolution function in teton-core"
-status: draft
+status: complete
 parent: REQ-558
 created: 2026-08-05
 updated: 2026-08-05

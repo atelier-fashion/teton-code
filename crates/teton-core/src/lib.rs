@@ -8,6 +8,9 @@
 //!
 //! Module map:
 //! - [`phase`] — the ADLC [`Phase`] enum (decision D-4).
+//! - [`category`] — the purpose-oriented routing [`Category`], its [`Tier`],
+//!   and the pure [`resolve`] function that is the runtime dispatch key
+//!   (REQ-558).
 //! - [`entities`] — the System Model data types (providers, policies,
 //!   boundaries). Session, cost-record, and task-artifact state live in the
 //!   daemon (`teton_protocol` wire types + `tetond` structured artifacts), so
@@ -16,10 +19,12 @@
 //!   BR-7 no-raw-credentials rule.
 //! - [`mcp`] — user-declared MCP servers (the `[[mcp_server]]` config table,
 //!   ADR-003 / AC-9).
-//! - [`policy`] — pure routing-policy evaluation ([`policy::evaluate`]).
+//! - [`policy`] — pure routing-policy evaluation ([`policy::evaluate`]) and the
+//!   shared [`RouteOutcome`] vocabulary both dispatch paths report in.
 //! - [`boundary`] — pure privacy-boundary glob matching.
 
 pub mod boundary;
+pub mod category;
 pub mod config;
 pub mod entities;
 pub mod mcp;
@@ -27,6 +32,15 @@ pub mod phase;
 pub mod policy;
 
 pub use boundary::{match_boundary, BoundaryError, BoundaryMatcher};
+// REQ-558: `TierBinding`/`CategoryOverride` live beside the resolver that reads
+// them rather than in `entities`, so the type that makes a `redact` binding
+// unrepresentable (ADR-B) sits next to the match arm that relies on it. They are
+// re-exported here, so `teton_core::TierBinding` is the stable path either way.
+pub use category::{
+    categories_for_phase, category_for_phase, resolve, Category, CategoryOrigin, CategoryOverride,
+    CategoryResolution, CategoryTable, ConfigurableCategory, JudgmentCategory, ParseCategoryError,
+    ParseJudgmentCategoryError, ParseTierError, Tier, TierBinding,
+};
 pub use config::{Config, ConfigError, LoadError, LocalModelConfig};
 pub use entities::{
     BoundaryMode, ModelProvider, ModelSelection, PrivacyBoundary, ProviderCapabilities,
