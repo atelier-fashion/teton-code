@@ -589,6 +589,165 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    // ---- REQ-557: model identity, default provider, usability, migration ----
+
+    /// The pre-REQ-557 config shape. Deliberately written as raw TOML rather
+    /// than built from the struct: the point is that bytes authored before this
+    /// REQ still parse (ADR-B).
+    const PRE_REQ_557_TOML: &str = r#"
+[[providers]]
+id = "anthropic"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+auth_ref = "keychain:anthropic"
+
+[[providers]]
+id = "mystery"
+kind = "openai-compatible"
+endpoint = "https://api.mystery.example"
+auth_ref = "keychain:mystery"
+"#;
+
+    #[test]
+    fn a_pre_req_557_config_still_loads() {
+        // ADR-B: if `model` were a required String this fails to DESERIALIZE,
+        // and a config that cannot be opened can never be migrated.
+        let cfg = Config::load(PRE_REQ_557_TOML).expect("pre-REQ-557 config must still load");
+        assert_eq!(cfg.providers.len(), 2);
+        assert!(cfg.providers.iter().all(|p| p.model.is_none()));
+    }
+
+    #[test]
+    fn a_remote_provider_without_a_model_is_unusable_not_invalid() {
+        // ADR-E: the load path refuses daemon startup on a validation error, so
+        // making this a validation error would (a) block migration of a pre-REQ
+        // config and (b) make ONE unresolvable provider prevent startup —
+        // contradicting BR-7's "the daemon starts with that provider unusable".
+        let cfg = Config::load(PRE_REQ_557_TOML).expect("must load");
+        assert!(cfg.validate().is_ok(), "missing model must not be a validity error");
+        assert_eq!(cfg.unusable_providers(), vec!["anthropic", "mystery"]);
+    }
+
+    #[test]
+    fn a_local_provider_is_never_unusable_for_lacking_a_model() {
+        // The local tier's model is owned by the REQ-547 consent flow.
+        let cfg = Config::load(
+            r#"
+[[providers]]
+id = "local"
+kind = "local"
+"#,
+        )
+        .expect("must load");
+        assert!(cfg.unusable_providers().is_empty());
+    }
+
+    #[test]
+    fn migration_fills_what_it_can_and_reports_what_it_cannot() {
+        let mut cfg = Config::load(PRE_REQ_557_TOML).expect("must load");
+        let unresolved = cfg.migrate_models(|id| match id {
+            "anthropic" => Some("claude-opus-5".to_owned()),
+            _ => None,
+        });
+        assert_eq!(unresolved, vec!["mystery"], "must report by id, never guess");
+        assert_eq!(
+            cfg.providers[0].model.as_deref(),
+            Some("claude-opus-5"),
+            "resolvable provider is migrated"
+        );
+        assert!(
+            cfg.providers[1].model.is_none(),
+            "unresolvable provider keeps None rather than falling back to its id"
+        );
+        // BR-7: the daemon still starts; only the unresolved provider is unusable.
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.unusable_providers(), vec!["mystery"]);
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let mut cfg = Config::load(PRE_REQ_557_TOML).expect("must load");
+        let resolve = |id: &str| Some(format!("model-for-{id}"));
+        let first = cfg.migrate_models(resolve);
+        let snapshot = cfg.providers.clone();
+        let second = cfg.migrate_models(resolve);
+        assert!(first.is_empty() && second.is_empty());
+        assert_eq!(cfg.providers, snapshot, "a second run must be a no-op");
+    }
+
+    #[test]
+    fn migration_never_overwrites_a_declared_model() {
+        let mut cfg = Config::load(PRE_REQ_557_TOML).expect("must load");
+        cfg.providers[0].model = Some("declared-by-the-user".to_owned());
+        let _ = cfg.migrate_models(|_| Some("from-the-price-table".to_owned()));
+        assert_eq!(cfg.providers[0].model.as_deref(), Some("declared-by-the-user"));
+    }
+
+    #[test]
+    fn two_providers_may_share_a_vendor_and_differ_only_in_model() {
+        // BR-3 — the case the whole REQ exists to make expressible. Viable
+        // because `auth_ref` binds to the endpoint origin, not the provider id.
+        let cfg = Config::load(
+            r#"
+[[providers]]
+id = "opus"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-opus-5"
+auth_ref = "keychain:anthropic"
+
+[[providers]]
+id = "sonnet"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-sonnet-5"
+auth_ref = "keychain:anthropic"
+"#,
+        )
+        .expect("two providers on one vendor must validate");
+        assert!(cfg.unusable_providers().is_empty());
+    }
+
+    #[test]
+    fn a_dangling_default_provider_is_rejected_and_names_the_alternatives() {
+        // BR-6 / AC-5: unlike a missing model, this names something that does
+        // not exist, so it IS a validity error.
+        let err = Config::load(
+            r#"
+default_provider = "ghost"
+
+[[providers]]
+id = "opus"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-opus-5"
+auth_ref = "keychain:anthropic"
+"#,
+        )
+        .expect_err("a dangling default_provider must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("ghost"), "names the dangling id: {msg}");
+        assert!(msg.contains("opus"), "lists the registered ids: {msg}");
+    }
+
+    #[test]
+    fn a_resolvable_default_provider_validates() {
+        let cfg = Config::load(
+            r#"
+default_provider = "opus"
+
+[[providers]]
+id = "opus"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-opus-5"
+auth_ref = "keychain:anthropic"
+"#,
+        )
+        .expect("must load");
+        assert_eq!(cfg.default_provider.as_deref(), Some("opus"));
+    }
+
     fn sample_config() -> Config {
         Config {
             pinned_local_model: None,
