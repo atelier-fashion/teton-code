@@ -80,37 +80,112 @@ impl FramedStdinPrompter {
     }
 }
 
-impl Prompter for FramedStdinPrompter {
-    fn ask(&mut self, question: &str) -> Option<String> {
+impl FramedStdinPrompter {
+    /// Draw the entry frame and park the cursor in its input row.
+    ///
+    /// Split out of [`Prompter::ask`] so an interactive caller can keep the
+    /// frame *open* while it waits on both stdin and the daemon's event stream
+    /// (REQ-556 BR-1). `ask` remains draw-then-read, so every existing caller
+    /// and the whole non-interactive path are byte-identical.
+    pub(crate) fn draw(&mut self, question: &str) {
         if !self.framed {
-            return StdinPrompter::new().ask(question);
+            return;
         }
         let mut out = io::stdout();
         let rule = self.rule();
         // Rule, blank input row, rule — then cursor up two, into the input row.
         let _ = write!(out, "{rule}\n\n{rule}\n\x1b[2A{question}");
         let _ = out.flush();
+    }
+
+    /// Erase a frame drawn by [`Self::draw`], leaving the cursor where ordinary
+    /// output should resume.
+    ///
+    /// Needed because a notice rendered while the frame is open would land in
+    /// the input row and shred it. The caller erases, renders, and draws again
+    /// — so the frame appears to stay put while lines scroll above it.
+    ///
+    /// The cursor sits in the input row, one row below the top rule: step to
+    /// column 0, up one row, and clear from there to the end of the screen.
+    pub(crate) fn erase(&mut self) {
+        if !self.framed {
+            return;
+        }
+        let mut out = io::stdout();
+        let _ = write!(out, "\r\x1b[1A\x1b[J");
+        let _ = out.flush();
+    }
+
+    /// Read one line from the open frame, doing the cursor bookkeeping the
+    /// frame's geometry needs. `None` on EOF.
+    pub(crate) fn read_line(&mut self) -> Option<String> {
+        let mut out = io::stdout();
         let mut line = String::new();
         match io::stdin().read_line(&mut line) {
             Ok(0) | Err(_) => {
-                // EOF echoes no newline: the cursor is still on the input row,
-                // two steps above where output should resume.
-                let _ = writeln!(out, "\n");
-                let _ = out.flush();
+                if self.framed {
+                    // EOF echoes no newline: the cursor is still on the input
+                    // row, two steps above where output should resume.
+                    let _ = writeln!(out, "\n");
+                    let _ = out.flush();
+                }
                 None
             }
             Ok(_) => {
-                // Enter's echo landed the cursor on the bottom rule; step past.
-                let _ = writeln!(out);
-                let _ = out.flush();
+                if self.framed {
+                    // Enter's echo landed the cursor on the bottom rule; step past.
+                    let _ = writeln!(out);
+                    let _ = out.flush();
+                }
                 Some(line.trim_end_matches(['\n', '\r']).to_owned())
             }
         }
     }
 }
 
+impl Prompter for FramedStdinPrompter {
+    fn ask(&mut self, question: &str) -> Option<String> {
+        if !self.framed {
+            return StdinPrompter::new().ask(question);
+        }
+        self.draw(question);
+        self.read_line()
+    }
+}
+
 /// The terminal's column count, or a conservative 80 when stdout is not a
 /// terminal or the query fails.
+/// Wait up to `timeout` for stdin to have something to read (REQ-556 BR-1).
+///
+/// This is what lets the interactive entry loop stop *blocking* on stdin
+/// without stopping being the only thing that *reads* it. A stdin reader thread
+/// would have been a second reader of the same descriptor, and
+/// `Connection::dispatch_event` answers permission and model-proposal prompts
+/// with their own `read_line` — so a line typed while a consent prompt was open
+/// would have gone to whichever reader the kernel woke (ADR-556-1). One reader,
+/// interruptible wait, no race.
+///
+/// Returns `true` when a subsequent read will not meaningfully block: either
+/// bytes are available or the descriptor is at EOF (`POLLIN` reports both, and
+/// the caller distinguishes them by reading zero bytes). An error — `EINTR`
+/// most often — reports `false`, which costs one tick and re-polls. It must
+/// never be reported as EOF, or a stray signal would end the session.
+#[must_use]
+pub(crate) fn stdin_ready(timeout: std::time::Duration) -> bool {
+    let mut fds = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: `poll` reads `events` and writes `revents` through the pointer to
+    // a single owned `pollfd` and touches nothing else; failure is reported
+    // through the return code, which is checked here. Same shape as the
+    // `TIOCGWINSZ` call below.
+    let rc = unsafe { libc::poll(&raw mut fds, 1, ms) };
+    rc > 0
+}
+
 fn terminal_width() -> usize {
     // SAFETY: TIOCGWINSZ writes a plain `winsize` struct through the pointer
     // and touches nothing else; a failure is reported through the return code

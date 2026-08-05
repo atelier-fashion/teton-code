@@ -297,6 +297,51 @@ fn main() -> ExitCode {
     }
 }
 
+/// How long the interactive entry loop waits on stdin before checking the
+/// daemon's event stream and advancing the loading indicator (REQ-556).
+///
+/// Short enough that a lifecycle line lands promptly and an animation reads as
+/// motion; long enough that an idle session is not spinning. This is the
+/// indicator's frame interval as well as the poll timeout — one clock, so there
+/// is no timer thread and no `sleep` anywhere in the loop.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Wait for the next line an interactive user types, rendering anything the
+/// daemon says in the meantime (REQ-556 BR-1).
+///
+/// The entry frame stays **open** across the wait, so the place to type is
+/// visible the whole time. When something does arrive, the frame is torn down
+/// before it renders and redrawn afterwards — otherwise the notice would land
+/// in the input row and shred it. Nothing queued means no teardown at all, so
+/// an idle session does not flicker once per interval.
+///
+/// `None` on EOF (Ctrl-D), which the caller turns into the same post-loop
+/// session-end path `/quit` takes (REQ-555 BR-6).
+///
+/// # Errors
+///
+/// Propagates a failure from answering a permission or model proposal.
+fn next_interactive_line(
+    entry_prompt: &str,
+    entry: &mut FramedStdinPrompter,
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+) -> anyhow::Result<Option<String>> {
+    entry.draw(entry_prompt);
+    loop {
+        if prompt::stdin_ready(FRAME_INTERVAL) {
+            // Readable covers "a line is waiting" and "the descriptor is at
+            // EOF"; `read_line` distinguishes them by yielding zero bytes.
+            return Ok(entry.read_line());
+        }
+        // Nothing typed within the interval. Anything from the daemon?
+        let drained = conn.drain_events(ctx, || entry.erase())?;
+        if drained.rendered > 0 {
+            entry.draw(entry_prompt);
+        }
+    }
+}
+
 /// The headline a turn that arrived while the local tier was still coming up
 /// renders under (BUG-152).
 ///
@@ -425,7 +470,24 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             "› "
         };
         let mut entry = FramedStdinPrompter::new(interactive, color);
-        while let Some(input) = entry.ask(entry_prompt) {
+        loop {
+            // REQ-556 BR-1. An interactive session waits on stdin *and* the
+            // daemon's event stream, so a lifecycle line reaches the user when
+            // it happens rather than at the next turn. A piped session takes
+            // the original blocking path untouched — that is BR-2's
+            // byte-identity holding by construction rather than by care, since
+            // the new code is simply not on that path.
+            let input = if interactive {
+                match next_interactive_line(entry_prompt, &mut entry, &mut conn, &mut ctx)? {
+                    Some(line) => line,
+                    None => break,
+                }
+            } else {
+                match entry.ask(entry_prompt) {
+                    Some(line) => line,
+                    None => break,
+                }
+            };
             let text = input.trim();
             if text.is_empty() {
                 continue;

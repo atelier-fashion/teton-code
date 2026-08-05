@@ -22,38 +22,56 @@ receive — which is what lets a single thread own the terminal.
 
 ## Key decisions
 
-### ADR-556-1: One channel, two producers — the loop selects by receiving
+### ADR-556-1: One reader of stdin; the *wait* is interruptible, not the read
 
-**Decision.** Extend `Incoming` with a stdin variant (`Line(String)` / `Eof`).
-In **interactive TTY sessions only**, spawn a stdin reader thread that performs
-the blocking `read_line` and sends each line into the *same* `mpsc::Sender` the
-socket reader already uses. The entry loop's blocking point becomes
-`recv_timeout(FRAME_INTERVAL)` on the unified channel:
+**Superseded draft (recorded, not deleted).** The first version of this ADR put
+the blocking `read_line` on a **stdin reader thread** feeding the existing
+`mpsc::Sender`, so the loop could block once on a unified channel. Writing
+TASK-038 showed that plan has a defect that would have shipped as intermittent
+data loss, so it is recorded here rather than quietly replaced.
 
-| Received | Loop does |
+**Why it fails.** `Connection::dispatch_event` (`client.rs:206`) answers
+permission requests and model proposals by calling `ctx.prompter.ask()`, which
+does its own blocking `read_line` on stdin. A stdin reader thread is a *second*
+reader of the same descriptor, so a line typed while a consent prompt is open
+goes to whichever reader the kernel wakes — the prompt or the entry loop, at
+random. That is REQ-547's entire surface, and the failure would be rare,
+timing-dependent, and invisible in a piped test.
+
+**Decision.** Keep exactly **one** reader of stdin — the main thread — and make
+the *wait* interruptible instead of the read. In interactive TTY sessions the
+entry loop becomes:
+
+| Condition | Loop does |
 |---|---|
-| `Incoming::Event(_)` | render it (existing `dispatch_event` path) and repaint the indicator |
-| `Incoming::Stdin(Line)` | run the existing classify → dispatch → `prompt/turn` path |
-| `Incoming::Stdin(Eof)` | break to the existing post-loop cost summary (BR-6 of REQ-555) |
-| `Err(RecvTimeoutError::Timeout)` | advance the tick and repaint the indicator |
+| queued events (`try_recv`) | render each through the existing `dispatch_event`, fold lifecycle stages into the indicator, repaint |
+| `poll(STDIN_FILENO, FRAME_INTERVAL)` reports readable | `read_line`, then the existing classify → dispatch → `prompt/turn` path |
+| readable and `read_line` yields 0 bytes | EOF — break to the existing post-loop cost summary (REQ-555 BR-6) |
+| poll times out | advance the tick and repaint the indicator |
 
-**Rationale.** `std::sync::mpsc` has no `select`; merging producers into one
-channel is the idiomatic std answer and avoids adding an async runtime or a
-libc `poll` on fd 0 to a synchronous CLI. It answers OQ-1 in favour of a
-non-blocking entry loop *without* a second thread writing to the terminal: the
-stdin thread only **reads**, the main thread remains the sole writer, so the
-framed entry area cannot be corrupted by interleaved writes. That was the
-failure mode that made the render-thread alternative unattractive.
+**Rationale.** `libc` is already a direct dependency of the `teton` crate, used
+exactly this way for `TIOCGWINSZ` in `prompt.rs:114`, so `poll` on fd 0 adds no
+dependency and follows an established local pattern. In canonical mode the
+terminal delivers whole lines, so a `read_line` issued *after* poll reports
+readable does not meaningfully block. Crucially the `Prompter` seam is
+untouched: permission and proposal prompts keep reading stdin exactly as they
+do today, because nothing else ever is.
+
+This is strictly smaller than the superseded plan — no new thread, no new
+`Incoming` variant, no change to the channel — which is the second reason to
+prefer it.
 
 **Consequences.**
 - The **piped path is not touched at all.** Non-TTY sessions keep calling
   `FramedStdinPrompter::ask` exactly as today, so AC-4's byte-identity holds
   *by construction* rather than by careful matching — the new code is not on
   that path. This is the mechanical expression of BR-1's TTY scoping and BR-2.
-- A thread blocked in `read_line` cannot be cancelled. It is detached; the
-  process exits and takes it with it. Nothing joins it.
-- `recv_timeout` is the animation clock, so there is no separate timer thread
-  and no `sleep` anywhere in the loop.
+- The poll timeout is the animation clock: no timer thread and no `sleep`
+  anywhere in the loop.
+- `poll` returning an error (notably `EINTR`) is treated as "not readable",
+  which costs one extra tick and re-polls. It must never be treated as EOF.
+- Unix-only, which matches the project's platform scope (Windows is out of
+  scope in the requirement and in the charter).
 
 ### ADR-556-2: The indicator is a pure state machine; the loop only ticks it
 
