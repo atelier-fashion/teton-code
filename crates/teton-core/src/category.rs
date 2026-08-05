@@ -249,7 +249,7 @@ impl Category {
     /// This category's configurable counterpart, or `None` for the one category
     /// a config file cannot name.
     ///
-    /// `None` for [`Category::Redact`] and for nothing else — this is the
+    /// `None` for [`Category::Redact`] and [`Category::Route`] — this is the
     /// fallible direction of ADR-B's asymmetry
     /// ([`From<ConfigurableCategory>`](Category) is total; this is not).
     #[must_use]
@@ -260,7 +260,19 @@ impl Category {
             // send the content it exists to guard, so there is no such binding
             // to express.
             Category::Redact => None,
-            Category::Route => Some(ConfigurableCategory::Route),
+            // BR-5: `route` MUST resolve to the local tier, and when the local
+            // tier cannot serve, classification is *bypassed* rather than routed
+            // remotely — "a router that calls a remote model to decide has spent
+            // what it was saving" (REQ-544 BR-8).
+            //
+            // No configuration of `route` can therefore express a valid state:
+            // the only provider it may resolve to is the local one, which is not
+            // a choice. Left configurable, a user could write a config that
+            // violated BR-5 — a remote classifier on every freeform turn — and a
+            // test proved they could. Pinning it here rather than screening at
+            // the call site is LESSON-484: enforce the rule where the decision is
+            // made, not where it is convenient.
+            Category::Route => None,
             Category::Title => Some(ConfigurableCategory::Title),
             Category::Digest => Some(ConfigurableCategory::Digest),
             Category::Compact => Some(ConfigurableCategory::Compact),
@@ -294,8 +306,6 @@ impl fmt::Display for Category {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigurableCategory {
-    /// See [`Category::Route`].
-    Route,
     /// See [`Category::Title`].
     Title,
     /// See [`Category::Digest`].
@@ -317,9 +327,9 @@ pub enum ConfigurableCategory {
 }
 
 impl ConfigurableCategory {
-    /// Every configurable category — ten, one per [`Category`] except `redact`.
-    pub const ALL: [ConfigurableCategory; 10] = [
-        ConfigurableCategory::Route,
+    /// Every configurable category — nine, one per [`Category`] except the two
+    /// pinned-local ones (`redact`, `route`).
+    pub const ALL: [ConfigurableCategory; 9] = [
         ConfigurableCategory::Title,
         ConfigurableCategory::Digest,
         ConfigurableCategory::Compact,
@@ -353,7 +363,6 @@ impl Category {
     #[must_use]
     pub const fn from_configurable(c: ConfigurableCategory) -> Category {
         match c {
-            ConfigurableCategory::Route => Category::Route,
             ConfigurableCategory::Title => Category::Title,
             ConfigurableCategory::Digest => Category::Digest,
             ConfigurableCategory::Compact => Category::Compact,
@@ -733,15 +742,23 @@ where
 {
     let tier = category.tier();
 
-    // BR-4 / ADR-B / AC-4: `redact` is pinned to the local tier **by
-    // construction**. `Category::Redact` is the one variant with no
-    // `ConfigurableCategory` counterpart, so this branch is taken for `redact`
-    // and only ever for `redact`, and it returns without consulting a single
-    // binding. It is not `if binding.is_none() { local }` — config cannot
+    // BR-4 / BR-5 / ADR-B / AC-4: `redact` and `route` are pinned to the local
+    // tier **by construction**. They are the two variants with no
+    // `ConfigurableCategory` counterpart, so this branch is taken for them and
+    // only for them, and it returns without consulting a single binding.
+    //
+    // `redact` because it inspects content before that content is allowed to
+    // leave the machine; `route` because a classifier that calls a remote model
+    // has spent what the routing decision was meant to save. It is not `if binding.is_none() { local }` — config cannot
     // express a redact binding, so there is no condition here to get wrong the
     // day someone adds a key (LESSON-443).
     let Some(configurable) = category.configurable() else {
-        return resolve_pinned_local(table.local_provider_id.as_deref(), &health, &usable);
+        return resolve_pinned_local(
+            category,
+            table.local_provider_id.as_deref(),
+            &health,
+            &usable,
+        );
     };
 
     let binding = table
@@ -894,6 +911,7 @@ where
 /// the whole point of the category is to inspect content before it is allowed
 /// to leave the machine.
 fn resolve_pinned_local<H, U>(
+    category: Category,
     local_provider_id: Option<&str>,
     health: &H,
     usable: &U,
@@ -902,8 +920,27 @@ where
     H: Fn(&str) -> ProviderHealth,
     U: Fn(&str) -> bool,
 {
-    let category = Category::Redact;
+    debug_assert!(
+        category.configurable().is_none(),
+        "resolve_pinned_local is only for categories config cannot name"
+    );
     let tier = category.tier();
+    // Each pinned category is pinned for its OWN reason, and the sentence has to
+    // say which — REQ-544 BR-5's legibility promise is that a decision names the
+    // signal that fired, not that it names *a* signal. This function was written
+    // when `redact` was the only pinned category and hardcoded its justification;
+    // when `route` joined it, `route` inherited redact's explanation.
+    let why_pinned = match category {
+        Category::Redact => {
+            "it inspects content before that content is allowed to leave the machine"
+        }
+        Category::Route => {
+            "a classifier that calls a remote model has spent what the routing decision saves"
+        }
+        // Unreachable while `configurable()` returns None for exactly these two;
+        // the debug_assert above catches a future third.
+        _ => "it is pinned to the local tier by construction",
+    };
 
     let Some(local) = local_provider_id else {
         return CategoryResolution {
@@ -951,8 +988,8 @@ where
             fallback_id: None,
             reason: format!(
                 "The '{category}' category is pinned to the local tier and '{local}' {why}. It is \
-                 never routed to a remote provider — it inspects content before that content is \
-                 allowed to leave the machine — so '{category}' cannot be routed.{note}",
+                 never routed to a remote provider — {why_pinned} — so '{category}' cannot be \
+                 routed.{note}",
                 why = rejected.why(),
                 note = rejected.note(),
             ),
@@ -1047,6 +1084,27 @@ mod tests {
         )
     }
 
+    /// BR-5: `route` MUST resolve to the local tier. A user who binds the
+    /// `reflex` tier to a remote provider must NOT get a remote classifier — "a
+    /// router that calls a remote model to decide has spent what it was saving".
+    #[test]
+    fn route_never_resolves_to_a_remote_provider() {
+        let table = tiers_bound_to("frontier-remote");
+        let r = resolve(
+            Category::Route,
+            &table,
+            |_| ProviderHealth::Healthy,
+            |_| true,
+        );
+        assert_eq!(
+            r.provider_id.as_deref(),
+            Some(LOCAL),
+            "route resolved to {:?}, but BR-5 forbids classification ever going \
+             remote — the decision costs more than it saves",
+            r.provider_id
+        );
+    }
+
     /// The category as it appears inside a reason sentence. Quoted, so that
     /// asserting `route` names itself is not satisfied by the word "Routing".
     fn named(category: Category) -> String {
@@ -1068,7 +1126,7 @@ mod tests {
     #[test]
     fn every_enum_lists_each_variant_exactly_once() {
         assert_eq!(Category::ALL.len(), 11);
-        assert_eq!(ConfigurableCategory::ALL.len(), 10);
+        assert_eq!(ConfigurableCategory::ALL.len(), 9);
         assert_eq!(JudgmentCategory::ALL.len(), 4);
         assert_eq!(Tier::ALL.len(), 4);
 
@@ -1086,15 +1144,20 @@ mod tests {
     }
 
     #[test]
-    fn redact_is_the_one_category_config_cannot_name() {
+    fn redact_and_route_are_the_categories_config_cannot_name() {
         // ADR-B: the pin is a type, not a check. `ConfigurableCategory` has no
-        // `Redact` variant, so a binding for it is unrepresentable.
+        // `Redact` and no `Route` variant, so a binding for either is
+        // unrepresentable — `redact` because it inspects content before egress,
+        // `route` because BR-5 forbids classification ever going remote, which
+        // leaves no valid state a binding could express.
         for c in ConfigurableCategory::ALL {
             assert_ne!(Category::from(c), Category::Redact, "{c} maps to redact");
+            assert_ne!(Category::from(c), Category::Route, "{c} maps to route");
         }
         assert!(Category::Redact.configurable().is_none());
+        assert!(Category::Route.configurable().is_none());
         for category in Category::ALL {
-            if category == Category::Redact {
+            if matches!(category, Category::Redact | Category::Route) {
                 continue;
             }
             let configurable = category
@@ -1336,9 +1399,10 @@ mod tests {
             assert_eq!(r.tier, category.tier(), "{category}");
             assert_eq!(
                 r.outcome,
-                // Nothing is bound for the ten; for the pinned one there is
-                // nothing to bind, only a local tier that is not there.
-                if category == Category::Redact {
+                // Nothing is bound for the nine configurable ones; for the two
+                // pinned ones there is nothing to bind, only a local tier that
+                // is not there.
+                if matches!(category, Category::Redact | Category::Route) {
                     RouteOutcome::NoHealthyProvider
                 } else {
                     RouteOutcome::NoPolicy
@@ -1367,9 +1431,9 @@ mod tests {
                 r.reason
             );
             assert!(r.provider_id.is_none(), "{category}");
-            // The unset binding is named too: the tier for the ten, the local
-            // tier for the pinned one.
-            if category == Category::Redact {
+            // The unset binding is named too: the tier for the nine
+            // configurable ones, the local tier for the two pinned ones.
+            if matches!(category, Category::Redact | Category::Route) {
                 assert!(
                     r.reason.contains("local"),
                     "{category} must name the local tier: {}",
@@ -1693,7 +1757,10 @@ mod tests {
         for category in Category::ALL {
             let r = resolve(category, &table, healthy, all_usable);
             match (category.tier(), category) {
-                (_, Category::Redact) => assert_eq!(r.provider_id.as_deref(), Some(LOCAL)),
+                // Both pinned-local categories ignore the table entirely.
+                (_, Category::Redact | Category::Route) => {
+                    assert_eq!(r.provider_id.as_deref(), Some(LOCAL))
+                }
                 (Tier::Think, _) => assert_eq!(r.provider_id.as_deref(), Some("frontier")),
                 _ => assert_eq!(r.provider_id, None, "{category} borrowed a binding"),
             }
