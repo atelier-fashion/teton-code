@@ -49,7 +49,7 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-044",
+    "currentTask": "TASK-044 (in progress: e2e fixtures need `model`)",
     "completedTasks": [
       "TASK-043"
     ],
