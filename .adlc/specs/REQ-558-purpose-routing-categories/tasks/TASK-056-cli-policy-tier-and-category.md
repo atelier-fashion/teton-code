@@ -17,7 +17,9 @@ mapping — including which categories have no call site yet (ADR-A, ADR-H, OQ-4
 
 - `crates/teton/src/main.rs` — `PolicyAction::SetTier`, `PolicyAction::SetCategory`;
   `CliCategory` / `CliTier` value enums; `run_policy_show` rendering
-- `crates/teton-protocol/src/methods.rs` — the `ConfigUpdate` variants
+- `crates/teton-protocol/src/methods.rs` — replace `ConfigUpdate::SetRoutingRule`
+  and the `RoutingRule` type (it carries a `phase` field, which AC-9 reaches) with
+  the tier/category equivalents
 - `crates/tetond/src/runtime.rs` — the handlers
 
 ## Acceptance Criteria
@@ -39,6 +41,8 @@ mapping — including which categories have no call site yet (ADR-A, ADR-H, OQ-4
       rejected before anything is written, naming the provider (REQ-557 BR-6,
       BUG-155 M4's shape).
 - [ ] Arg-parsing tests cover both new subcommands.
+- [ ] `RoutingRule` and `ConfigUpdate::SetRoutingRule` no longer exist — the
+      protocol carries no phase-keyed routing type (AC-9).
 
 ## Technical Notes
 

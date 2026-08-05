@@ -95,6 +95,16 @@ than reading as a typo.
 Category` conversion is total and the reverse is fallible, which is the correct
 asymmetry.
 
+**And one consequence worth stating out loud**: because the rejection is a
+deserialization failure, a config carrying `categories.redact` makes the daemon
+**refuse to start** (serde error → `Config::load` error → `load_config`'s
+"Refusing to start"). That is the intended severity and it is consistent with
+REQ-557 treating a dangling `default_provider` as a validity error — both name
+something that does not exist, and both are fixed by deleting one line. It is
+called out because REQ-557's ADR-E exists precisely to remind us that
+refuse-to-start is a big hammer: the test for whether it is the right one is
+whether the user can act on it without the daemon running, and here they can.
+
 ### ADR-C: Structured mode maps phase→category deterministically; only freeform calls the classifier
 
 **Decision**: the classifier (`route`) runs **only** for a freeform turn's judgment
@@ -183,6 +193,30 @@ that a human decided this, which is the difference between a decision and a bug.
 **Consequences**: `Phase::ALL` becomes `[Phase; 5]` and its `len() == 6` test
 updates. `CliPhase::Freeform` goes. The structured machine's initial state must
 move off `Phase::Freeform` — see the risk note below.
+
+### ADR-J: `policy::evaluate` and its tests are deleted with their last caller; `RouteOutcome` stays put
+
+**Decision**: when TASK-050 repoints `resolve_structured` at `category::resolve`,
+the same change deletes `policy::evaluate` **and its table-driven test module**
+(`policy.rs:129–279`). `policy.rs` survives as the home of `RouteOutcome` alone —
+the shared outcome vocabulary — and nothing else.
+
+**Rationale**: `evaluate` has exactly one production caller (`router.rs:246`), and
+TASK-049 retires `RoutingPolicy`, its input type. After both, it is dead code —
+but *implied* dead code, which is how REQ-557 shipped `billing_model`'s orphaned
+doc comment: a deletion that every task assumed another task would do. The
+~150-line test module is the more dangerous half, because a dead test suite still
+counts as coverage to anyone reading a test-count.
+
+`RouteOutcome` does **not** move. It is consumed by `router.rs` and `runtime.rs`
+today and by `category::resolve` after this REQ; relocating it would touch three
+crates to no purpose, and a module that exists to hold one shared enum is a
+legitimate module. Two vocabularies for one concept is the drift LESSON-456 is
+about — one enum, one home, both dispatch paths reading it.
+
+**Consequences**: `policy.rs` shrinks to a type definition. If a future REQ finds
+it has nothing else to say, merging it into `category.rs` is a one-line change —
+but not in this REQ, where it would inflate the diff for tidiness.
 
 ### ADR-H: `teton policy` keeps its noun; `set` gains tier and category forms
 

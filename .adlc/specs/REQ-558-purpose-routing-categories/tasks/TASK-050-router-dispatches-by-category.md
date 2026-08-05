@@ -22,6 +22,9 @@ experience is deleted.
 - `crates/tetond/src/heuristics.rs` — **delete** `AUXILIARY_SIGNALS`,
   `route_freeform`, `FreeformDuty`, `classify_duty`, and their tests
 - `crates/tetond/src/runtime.rs` — `build_router` builds the tier/category table
+- `crates/teton-core/src/policy.rs` — **delete** `evaluate` and its table-driven
+  test module once this task removes its last caller; the file survives as the
+  home of `RouteOutcome` alone (ADR-J)
 
 ## Acceptance Criteria
 
@@ -37,6 +40,12 @@ experience is deleted.
       so an unusable provider is never selected (ADR-E, BUG-155).
 - [ ] Existing router tests that assert phase dispatch are migrated to category
       dispatch; the `AUXILIARY_SIGNALS` tests are deleted rather than adapted.
+- [ ] `policy::evaluate` no longer exists anywhere in the workspace, **and neither
+      does its test module** (`policy.rs:129-279`). `RouteOutcome` stays in
+      `policy.rs` and is imported by the category resolver (ADR-J).
+- [ ] `grep -r "evaluate(" crates/*/src` returns no routing-policy caller — only
+      the unrelated `DutySpec::evaluate` (`runtime.rs:2714`, `:2845`), which is a
+      hardware-benchmark duty check and must be left alone.
 - [ ] `resolve_local_pin`'s behavior is unchanged.
 
 ## Technical Notes
@@ -52,6 +61,13 @@ containing "summarize"/"explain"/"describe"/"grep" to the local tier — which m
 boundary tests vacuous whenever the fixture prompt happened to contain one. After
 this task that trap is gone; TASK-057 adds the assertion that replaces vigilance
 with a check.
+
+**Delete the dead test module, not just the dead function** (ADR-J). `evaluate`'s
+~150-line table-driven suite iterates `Phase::ALL` and will keep compiling and
+passing after its subject has no production caller — a dead test suite that still
+counts as coverage to anyone reading a test-count. REQ-557 shipped the smaller
+version of this miss: `billing_model`'s doc comment outlived its function because
+every task assumed another task owned the deletion.
 
 **Do not reintroduce a two-way split.** The temptation is a "cheap vs expensive"
 fast path. That is `AUXILIARY_SIGNALS` with new names — the category chain is the
