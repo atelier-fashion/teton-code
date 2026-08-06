@@ -2007,19 +2007,45 @@ fn load_config(path: Option<&Path>) -> anyhow::Result<Config> {
 /// after upgrade, for every existing install. Same shape as
 /// [`crate::selection_store`]'s `write_atomically`.
 ///
+/// # The replacement carries the original's permissions
+///
+/// `File::create` yields a umask-derived mode, normally `0644`. Rewriting a
+/// user's config through a temp file would therefore *widen* it: a config
+/// deliberately set to `0600` comes back world-readable, silently, on the first
+/// upgraded start — and this file can hold real secrets, because
+/// `McpTransport::Stdio { env }` stores arbitrary environment values with no
+/// validation, which is exactly where an API key ends up.
+///
+/// So the original's mode is read and applied to the temp file **before** the
+/// rename, which is the only ordering that leaves no window: set it after and
+/// the file is briefly readable under its real name. With no original to read
+/// (a first write), the fallback is `0600` rather than the umask default —
+/// the same choice [`crate::auth`] makes for the socket and its directory, and
+/// for the same reason: a file that may hold a credential does not get its
+/// permissions from an inherited umask.
+///
 /// # Errors
 /// Returns the underlying I/O or serialization error. The caller decides
 /// whether that is fatal; the on-disk file is left untouched either way.
 fn write_config_atomically(path: &Path, config: &Config) -> anyhow::Result<()> {
     use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
     let text = config.to_toml()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Read before writing: once the temp file exists there is nothing left to
+    // learn from, and after the rename it is too late.
+    let mode = std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o600);
     let temp = path.with_extension("toml.tmp");
     {
         let mut file = std::fs::File::create(&temp)?;
+        // Before any content is written, so the bytes are never on disk under
+        // a wider mode than the file they are replacing.
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         file.write_all(text.as_bytes())?;
         // Durability before visibility: without the sync, the rename can land
         // while the contents are still only in the page cache, so a power loss
@@ -4291,6 +4317,71 @@ provider_id = "on-device"
         // so a failed write costs a warning rather than a session's routing.
         assert!(config.legacy_routing.is_empty());
         assert!(!config.categories.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A rewrite never widens the config's permissions.**
+    ///
+    /// The migration turned the config write from something behind an explicit
+    /// user action into an unattended write on the first start after upgrade,
+    /// for every existing install. `File::create` takes its mode from the
+    /// umask — normally `0644` — so a user who ran `chmod 600` on a config
+    /// holding an API key would have had it silently made world-readable, once,
+    /// with nothing said.
+    ///
+    /// It can hold a key: `McpTransport::Stdio { env }` stores arbitrary
+    /// environment values with no validation, which is precisely where one
+    /// goes. And the codebase already sets `0600` deliberately for the socket
+    /// (`auth::secure_socket_permissions`), so the umask default here was an
+    /// inconsistency rather than a considered choice.
+    #[test]
+    fn rewriting_the_config_preserves_its_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode_of = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o7777;
+
+        let dir = scratch_dir("config-mode");
+
+        // 1. A tightened config stays tightened.
+        let tight = dir.join("tight.toml");
+        std::fs::write(&tight, PRE_REQ_558_CONFIG).unwrap();
+        std::fs::set_permissions(&tight, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = load_config(Some(&tight)).expect("loads");
+        migrate_and_report_routing_table(&mut config, Some(&tight));
+        assert_ne!(
+            std::fs::read_to_string(&tight).unwrap(),
+            PRE_REQ_558_CONFIG,
+            "the migration must actually have rewritten the file, or this test \
+             is asserting about a write that never happened"
+        );
+        assert_eq!(
+            mode_of(&tight),
+            0o600,
+            "a config the user restricted must not come back world-readable — \
+             it can hold an API key in `[mcp_server.transport] env`"
+        );
+
+        // 2. A deliberately group-readable config keeps that too: the rule is
+        //    "preserve", not "clamp to 0600". Clamping would be a different
+        //    silent change, in the other direction.
+        let group = dir.join("group.toml");
+        std::fs::write(&group, PRE_REQ_558_CONFIG).unwrap();
+        std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let mut config = load_config(Some(&group)).expect("loads");
+        migrate_and_report_routing_table(&mut config, Some(&group));
+        assert_eq!(mode_of(&group), 0o640);
+
+        // 3. With no original to read from, the fallback is owner-only rather
+        //    than whatever the umask happens to be — the same choice
+        //    `auth::secure_socket_permissions` makes.
+        let fresh = dir.join("fresh.toml");
+        write_config_atomically(&fresh, &Config::default()).expect("writes");
+        assert_eq!(
+            mode_of(&fresh),
+            0o600,
+            "a config this daemon created gets owner-only, not the umask default"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

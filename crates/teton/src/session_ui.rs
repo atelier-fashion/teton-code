@@ -403,9 +403,10 @@ fn status_label(status: ToolCallStatus) -> &'static str {
 
 /// Human name for a lifecycle phase.
 ///
-/// There is no `freeform` arm: ADR-G retired the variant, and a freeform turn
-/// reaches the display path as `phase: None` — the `map_or` fallback in
-/// [`format_route`] is what renders it.
+/// There is no `freeform` arm: ADR-G retired the variant. A freeform turn now
+/// reaches the display path with a *category*, which is what
+/// [`format_route`] renders; only [`format_phase_transition`] still needs a
+/// phase name, and a transition always has one.
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
         Phase::Spec => "spec",
@@ -417,14 +418,22 @@ fn phase_name(phase: Phase) -> &'static str {
 }
 
 fn format_route(rd: &RouteDecided) -> String {
-    // REQ-558: the category is what drove the decision, so it leads when the
-    // decision came through the category chain. The phase is the fallback label
-    // for a decision made before that chain existed (BR-11 keeps `phase` for
-    // cost attribution, not for explaining a route).
+    // REQ-558: the category is what drove the decision, so it is the label.
+    //
+    // A decision with **no** category consulted no binding, and there is
+    // exactly one of those: the BR-7 taint pin, which overrides every binding
+    // because the session has touched `local-only` content. So the label is
+    // `pinned` — not the phase, which did not drive this route (BR-11 keeps
+    // `phase` for cost attribution, not for explaining one), and certainly not
+    // `freeform`, which is the value ADR-G retired and which was being printed
+    // for *structured* sessions: the taint arm returns before the phase is
+    // stamped, so a pinned `implement` turn rendered `route [freeform] → local`
+    // — wrong about the mode, and silent about the only thing worth saying,
+    // which is why the turn is on the local tier at all.
     let key = match (rd.category, rd.tier) {
         (Some(category), Some(tier)) => format!("{category}/{tier}"),
         (Some(category), None) => category.to_string(),
-        _ => rd.phase.map_or("freeform", phase_name).to_owned(),
+        _ => "pinned".to_owned(),
     };
     let model = rd.model.as_deref().unwrap_or("(model tbd)");
     format!("route [{key}] → {} {model} — {}", rd.provider_id, rd.reason)
@@ -539,6 +548,53 @@ mod tests {
         assert!(!surface.any_line_contains(LineKind::Notice, "route [freeform]"));
     }
 
+    /// **A taint-pinned route is labelled `pinned`, in either session mode.**
+    ///
+    /// The pin consults no binding — that is what makes it a privacy guarantee
+    /// rather than a routing decision — so it arrives with no category and no
+    /// tier. The label used to fall through to the phase, defaulting to
+    /// `freeform`; and because `dispatch_route`'s taint arm returns *before* the
+    /// phase is stamped, a pinned `implement` turn rendered
+    /// `route [freeform] → local`. Wrong about the mode, naming the value ADR-G
+    /// retired, and silent about the only thing worth saying: why this turn is
+    /// on the local tier.
+    #[test]
+    fn a_taint_pinned_route_is_labelled_pinned_not_freeform() {
+        // Both shapes the pin can arrive in: a freeform session (no phase) and
+        // a structured one (the phase never stamped, because the taint arm
+        // returns first). Neither may say `freeform`.
+        for phase in [None, Some(Phase::Implement)] {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.verbose = true;
+
+            render_event(
+                &envelope(Event::RouteDecided(RouteDecided {
+                    category: None,
+                    tier: None,
+                    phase,
+                    provider_id: ProviderId::from("local"),
+                    model: Some("qwen2.5-coder-7b".to_owned()),
+                    reason: "session previously touched local-only content; pinned to the \
+                             local tier (BR-1 backstop)"
+                        .to_owned(),
+                })),
+                &mut surface,
+                &mut state,
+            );
+
+            assert!(
+                surface.any_line_contains(LineKind::Notice, "route [pinned]"),
+                "a route that consulted no binding must say so ({phase:?})"
+            );
+            assert!(
+                !surface.any_line_contains(LineKind::Notice, "freeform"),
+                "`freeform` is the value ADR-G retired, and this session may not \
+                 even be one ({phase:?})"
+            );
+        }
+    }
+
     #[test]
     fn control_events_render_as_one_line_notices() {
         let mut surface = RecordingSurface::new();
@@ -547,8 +603,8 @@ mod tests {
 
         let events = [
             Event::RouteDecided(RouteDecided {
-                category: None,
-                tier: None,
+                category: Some(teton_protocol::Category::Design),
+                tier: Some(teton_protocol::Tier::Think),
                 phase: Some(Phase::Architect),
                 provider_id: ProviderId::from("anthropic"),
                 model: Some("claude-opus-4".to_owned()),
@@ -569,7 +625,7 @@ mod tests {
             render_event(&envelope(event), &mut surface, &mut state);
         }
 
-        assert!(surface.any_line_contains(LineKind::Notice, "route [architect]"));
+        assert!(surface.any_line_contains(LineKind::Notice, "route [design/think]"));
         assert!(surface.any_line_contains(LineKind::Notice, "claude-opus-4"));
         assert!(surface.any_line_contains(LineKind::Notice, "privacy: secrets/prod.env"));
         assert!(surface.any_line_contains(LineKind::Notice, "re-routed to the local tier"));
