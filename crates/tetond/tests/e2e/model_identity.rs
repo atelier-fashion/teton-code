@@ -21,7 +21,7 @@
 use std::time::Duration;
 
 use crate::harness::{
-    assert_no_boundary_bytes, openai_turn, Client, Daemon, DaemonOptions, MockProvider,
+    assert_no_boundary_bytes, openai_turn, tier_block, Client, Daemon, DaemonOptions, MockProvider,
     MockResponse, Workspace,
 };
 
@@ -41,14 +41,6 @@ fn probe_16gb() -> DaemonOptions {
 /// migration has to accept.
 fn legacy_provider_block(id: &str, kind: &str, endpoint: &str) -> String {
     format!("[[providers]]\nid = \"{id}\"\nkind = \"{kind}\"\nendpoint = \"{endpoint}\"\n\n")
-}
-
-/// A `[[tiers]]` row (REQ-558). The tier — not the lifecycle phase — is the
-/// configured routing surface: `build` serves `edit`/`shell`, `think` serves
-/// `design`/`debug`/`review`, and a structured turn maps its phase to a category
-/// which inherits one of them.
-fn tier_block(tier: &str, provider: &str) -> String {
-    format!("[[tiers]]\ntier = \"{tier}\"\nprovider_id = \"{provider}\"\n\n")
 }
 
 /// The `model` the config file declares for `id`, or `None` when it declares

@@ -2,7 +2,7 @@
 id: BUG-156
 title: "A session pinned local by the privacy taint backstop can fail over to a remote provider"
 status: fixed-by-REQ-558
-severity: high
+severity: medium
 created: 2026-08-06
 updated: 2026-08-06
 component: "daemon/router"
@@ -90,17 +90,57 @@ tainted, locally-pinned session.
 **Confirmed by code reading**: the daemon reaches that call after a failed
 attempt, and passes the session's phase rather than the route's.
 
-**Not yet executed end to end**: whether bytes reach the wire depends on the
-egress choke point, which still runs. For a session tainted by **boundary-file
-content**, egress would likely block the payload — provenance matches a glob.
+### The wire leg, closed by TASK-057 — and it corrects this record twice
 
-For a session tainted by **unknown provenance** (a `shell` result), it would not:
-that content matches no boundary glob, so the egress check has nothing to catch.
-**That case is the reason the taint backstop exists at all** — REQ-544 C-2 calls
-it "the backstop for the model-paraphrase residual BR-1 provenance alone cannot
-catch." A backstop that a fallback can route around is not a backstop.
+TASK-057 drove the failover end to end against a capturing mock provider. Two
+of the claims above did not survive that, and are corrected here rather than
+quietly left standing.
 
-Closing that leg is REQ-558 TASK-057's egress-capture work.
+**1. The severity was overstated: the ordinary local tier cannot reach this at
+all.** `run_prompt_turn` calls `on_provider_failure` only for
+`HarnessError::Remote`. A taint-pinned route names `local_provider_id`, and
+when that is the daemon's own engine the turn runs through `LocalEngineSource`,
+whose failures are `HarnessError::Engine` — returned to the caller immediately,
+with the failover path never consulted. So for the configuration this record
+describes (a real local tier as the policy's primary), **a local failure never
+reaches the defect.** The router-level hole was real; the path from a user's
+config to it was not the one written above.
+
+**2. "Egress has nothing to catch" is wrong for unknown provenance.**
+`egress/inspector.rs::inspect` blocks on `provenance.is_unknown()` *before* it
+looks at any glob — REQ-544 C-1's fail-closed rule — so unknown-provenance
+content is stopped at the choke point precisely because it matches no boundary.
+And the backstop does not arm at all with no boundary configured
+(`context_is_sensitive` returns `false` on an empty boundary list). There is
+therefore **no state in which a session is tainted by unknown provenance and
+egress would have let that same content through** — which is the opposite of
+what this section originally claimed, and it is the main reason the severity
+drops.
+
+**3. It IS reachable end to end, in one configuration, and that one is
+demonstrated by captured bytes.** `local_provider_id` falls back to the literal
+id `local` when the config declares no `kind = "local"` provider. A user who
+registers their own llama.cpp server as `openai-compatible` under that id — a
+natural thing to do — makes the taint pin dispatch over HTTP, so a 4xx from it
+becomes `HarnessError::Remote` and the failover path runs. On `main`'s logic the
+tainted turn is then handed to the tier's remote `fallback_id`.
+
+That is what
+`tetond/tests/e2e/routing_categories.rs::a_tainted_session_does_not_fail_over_to_the_tiers_remote_fallback`
+drives, with a control session on the same daemon and the same binding that
+*does* reach the fallback — so the tainted session's zero bytes are the pin
+holding rather than an unreachable fallback.
+
+### The router-level test did not actually pin this
+
+Worth recording, because it is this REQ's own lesson turned on itself:
+`a_tainted_session_cannot_fail_over_to_a_remote_provider` was written to pin the
+fix and **stayed green** under a faithful restoration of `main`'s logic. Its
+fixture bound no tier to `local`, and the defect only fires when the failed
+provider is some row's primary — so the mutation changed nothing it could see.
+TASK-057 rebuilt that fixture in this bug's own shape (`provider_id = "local"`,
+`fallback_id = <remote>`) with a non-vacuity leg, and both it and the e2e test
+now fail on the mutation.
 
 ## Root Cause
 
@@ -126,7 +166,12 @@ now takes `&Route` and reads the fallback off **the route's own
 it consults no binding — so it has no fallback to hand out, and the failover path
 cannot manufacture one from the session's phase.
 
-Pinned by `a_tainted_session_cannot_fail_over_to_a_remote_provider`.
+Pinned at two layers, each of which fails on the mutation alone:
+
+- `tetond/src/router.rs::a_tainted_session_cannot_fail_over_to_a_remote_provider`
+  — the router, against this record's own config shape;
+- `tetond/tests/e2e/routing_categories.rs::a_tainted_session_does_not_fail_over_to_the_tiers_remote_fallback`
+  — the wire, by captured bytes, with a live control.
 
 ## Why this has its own record
 

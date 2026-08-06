@@ -1568,7 +1568,10 @@ impl DaemonRuntime {
                     // resolution rather than recomputed, and `None` for the taint
                     // pin, which resolved no category at all (BR-7).
                     let category = route.resolution.as_ref().map(|r| r.category);
-                    return Err(self.unserved_turn_error(&config, category));
+                    return Err(unserved_turn_sentence(
+                        &route,
+                        self.unserved_turn_error(&config, category),
+                    ));
                 }
                 // REQ-544 M-3: a credential that will not resolve is a config
                 // problem, not a transient fault — surface it clearly (the
@@ -3369,6 +3372,44 @@ fn build_provider(provider: &ModelProvider, caps: CapabilityProfile) -> Box<dyn 
         _ => Box::new(OpenAiCompatAdapter::new(
             OpenAiCompatConfig::new(provider.id.clone(), endpoint).with_capabilities(caps),
         )),
+    }
+}
+
+/// The turn-failure sentence, with the **resolver's own answer in front of it**
+/// when the resolver is what declined (REQ-558 AC-11, BR-6).
+///
+/// Two different failures share one arm in the turn loop, and they have
+/// different authors:
+///
+/// - **The resolution selected nothing.** `category::resolve` already decided
+///   and already explained — it names the category, the binding it read, why
+///   the provider it found was passed over, and the `teton policy set-*` remedy.
+///   That sentence is the answer, carried verbatim. Recomputing one here would
+///   be a second call site answering a settled question, which is the defect
+///   AC-11 exists to make red and which BUG-155 shipped four times in this
+///   subsystem one REQ earlier (LESSON-484).
+/// - **The resolution selected a provider and the harness still could not
+///   serve.** The route is fine; what is missing is a tier — loading, declined,
+///   awaiting consent, below the floor. Nothing in the resolution knows that, so
+///   [`DaemonRuntime::unserved_turn_error`]'s classifier is the only thing that
+///   can say it, and it stands alone.
+///
+/// The two compose rather than compete: on the first path the resolver says
+/// *which binding failed* and the classifier says *what state the machine is
+/// in*, and a user needs both. The code travels untouched — a tier that is
+/// merely warming is still a wait, not an error (BUG-152).
+///
+/// This mirrors what the `digest` duty already does with the same value
+/// (`DigestRoute::unresolved(route.reason)`); before this, the duty path carried
+/// the resolver's sentence and the *turn* path — the one a user actually reads —
+/// discarded it.
+fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) -> RpcError {
+    if route.selected() {
+        return classified;
+    }
+    RpcError {
+        message: format!("{} {}", route.reason, classified.message),
+        ..classified
     }
 }
 

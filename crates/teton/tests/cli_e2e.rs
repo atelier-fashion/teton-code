@@ -1562,3 +1562,105 @@ fn provider_add_refuses_an_id_that_is_already_registered() {
         "the refused registration must not have landed; output:\n{listed}"
     );
 }
+
+/// REQ-558 AC-11 / ADR-A / ADR-H: `teton policy show` renders the **daemon's**
+/// resolved table through the real CLI binary.
+///
+/// The daemon-side half of AC-11 — that the projection `policy show` renders is
+/// the resolver's own answer, byte for byte, and agrees with `route_decided`
+/// and with the turn-failure sentence — is pinned in
+/// `tetond/tests/e2e/routing_categories.rs`. What that cannot show is that the
+/// shipped CLI reaches `config/get` at all and renders what comes back: a
+/// `render_policy` unit test formats a struct nobody proved the binary fetched.
+/// This closes that last mile, which is the same seam TASK-007 deferred here
+/// for the consent flow.
+///
+/// A **scripted** tier, because a resolved row and an unresolved one take
+/// different branches of the renderer and only the resolved one carries ADR-A's
+/// call-site marker — a daemon with no engine renders eleven `unresolved` rows
+/// and would leave the marker untested.
+#[test]
+fn policy_show_renders_the_daemons_resolved_table() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, &["Done."]);
+    let teton = teton_bin();
+
+    let shown = daemon.run_cli(&teton, &["policy", "show"]);
+
+    // Both halves of ADR-H's table are rendered.
+    assert!(
+        shown.contains("tiers —"),
+        "the tier table is the primary surface and must be rendered; output:\n{shown}"
+    );
+    assert!(
+        shown.contains("categories:"),
+        "and the per-category rows below it; output:\n{shown}"
+    );
+
+    /// The rendered row whose first word is `name`, or `None`.
+    fn row<'a>(shown: &'a str, name: &str) -> Option<&'a str> {
+        shown.lines().find(|l| {
+            l.trim_start_matches(['>', ' '])
+                .starts_with(&format!("{name} "))
+        })
+    }
+
+    // All four tiers, each showing this fixture's binding to the local tier.
+    for tier in ["reflex", "scan", "build", "think"] {
+        let line =
+            row(&shown, tier).unwrap_or_else(|| panic!("no `{tier}` tier row; output:\n{shown}"));
+        assert!(
+            line.contains("→ local"),
+            "tier `{tier}` must render its binding; row:\n{line}"
+        );
+    }
+
+    // All eleven categories have a row, each naming its tier and its provider.
+    // Matched on the row prefix rather than by bare substring, so `route` is
+    // not satisfied by the word "Routing" inside somebody else's reason.
+    for (category, tier) in [
+        ("route", "reflex"),
+        ("redact", "reflex"),
+        ("title", "reflex"),
+        ("digest", "scan"),
+        ("compact", "scan"),
+        ("triage", "scan"),
+        ("edit", "build"),
+        ("shell", "build"),
+        ("design", "think"),
+        ("debug", "think"),
+        ("review", "think"),
+    ] {
+        let line = row(&shown, category)
+            .unwrap_or_else(|| panic!("no `{category}` category row; output:\n{shown}"));
+        assert!(
+            line.contains(tier) && line.contains("→ local"),
+            "category `{category}` must render its `{tier}` tier and its \
+             provider; row:\n{line}"
+        );
+    }
+
+    // ADR-A: a category with no call site says so every time it is printed, and
+    // one that has a call site does not. The marker is derived from the
+    // daemon's own call sites, so this also shows the CLI is rendering the
+    // daemon's answer rather than a table of its own.
+    let unreached = row(&shown, "triage").expect("a `triage` row");
+    assert!(
+        unreached.contains("declared, no call site yet"),
+        "an unreached category must be marked; row:\n{unreached}"
+    );
+    let reached = row(&shown, "edit").expect("an `edit` row");
+    assert!(
+        !reached.contains("no call site"),
+        "`edit` has a call site and must not carry the marker; row:\n{reached}"
+    );
+
+    // AC-12: the BR-9 declared default is configuration-visible, and the CLI
+    // says so rather than leaving it compiled in silently.
+    assert!(
+        shown.contains("judgment_default"),
+        "the declared default must be reported; output:\n{shown}"
+    );
+}

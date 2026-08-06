@@ -17,6 +17,10 @@
 //!   startup posture (a missing model is unusable, not invalid), the nameable
 //!   missing default, and the BR-8 egress-capture claim that none of it changed
 //!   the privacy boundary.
+//! - [`routing_categories`] — REQ-558: the taint backstop overriding every
+//!   category binding (AC-6, egress capture), what every `route_decided`
+//!   carries (AC-8), and the one-resolver rule across the surfaces that
+//!   describe a routing state (AC-11).
 
 // The suite lives under `tests/e2e/`; `#[path]` keeps that layout while this
 // top-level file remains the integration-test binary Cargo compiles.
@@ -30,3 +34,5 @@ mod harness;
 mod model_identity;
 #[path = "e2e/privacy_fixes.rs"]
 mod privacy_fixes;
+#[path = "e2e/routing_categories.rs"]
+mod routing_categories;

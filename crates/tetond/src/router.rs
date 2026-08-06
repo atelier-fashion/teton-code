@@ -1653,15 +1653,60 @@ mod tests {
     /// policy, so a tainted *structured* session could fail over to that phase's
     /// remote fallback — the privacy pin surviving the decision but not the first
     /// provider error.
+    ///
+    /// The table is built here rather than taken from [`router`] because the
+    /// shared fixture binds no tier to `local`, and the defect only fires when
+    /// **the failed provider is some row's primary**: against that fixture,
+    /// restoring the old "look the failed provider up in the table" logic
+    /// changes nothing and the test stays green. BUG-156's own reproduction is
+    /// this shape — `provider_id = "local"`, `fallback_id = <remote>` — which is
+    /// what the local-first pitch invites a user to write, so it is the shape
+    /// this test has to hold.
     #[test]
     fn a_tainted_session_cannot_fail_over_to_a_remote_provider() {
-        let router = router();
+        let router = Router::new(
+            CategoryTable::new()
+                .with_local_provider("local")
+                // The local tier as PRIMARY, with a remote fallback.
+                .with_tier(tier(CoreTier::Think, "local", Some("anthropic"))),
+            None,
+        )
+        .with_provider(
+            "anthropic",
+            "claude-opus-4",
+            native(),
+            ProviderHealth::Healthy,
+        );
+
+        // Non-vacuity: on this very table an ordinary category failure DOES
+        // reach the remote fallback, so the pinned assertion below is the pin
+        // holding rather than an unreachable fallback.
+        let bound = router.resolve(CoreCategory::Design);
+        assert_eq!(bound.provider_id.as_ref().unwrap().0, "local");
+        let reachable =
+            router.on_provider_failure(&bound, "local", FailureClass::MalformedResponse);
+        assert_eq!(
+            reachable
+                .route
+                .as_ref()
+                .and_then(|r| r.provider_id.as_ref())
+                .map(|p| p.0.as_str()),
+            Some("anthropic"),
+            "an untainted turn on this binding fails over to the remote fallback"
+        );
+
         let pinned = router.resolve_local_pin("session touched local-only content");
+        assert_eq!(pinned.provider_id.as_ref().unwrap().0, "local");
         let outcome = router.on_provider_failure(&pinned, "local", FailureClass::MalformedResponse);
         assert!(
             outcome.route.is_none(),
             "a pinned session must not continue on a provider a binding named: {:?}",
             outcome.route
+        );
+        assert_eq!(
+            outcome.degraded.and_then(|d| d.fallback_id),
+            None,
+            "and the degradation event must not announce a fallback it will not take"
         );
     }
 

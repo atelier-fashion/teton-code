@@ -390,3 +390,118 @@ shows `opus` and `sonnet`, both `[anthropic]`, with `claude-opus-5` and
 delete the two `teton` generic-password entries from Keychain Access.
 
 **Status: NOT RUN.** No sign-off block below, because nobody has executed it.
+
+---
+
+## REQ-558 — purpose-oriented routing categories
+
+Everything REQ-558 claims is covered by automated tests except the legs below.
+They are recorded here at the strength they were **actually** verified, which
+for the first one is *not at all*.
+
+### Not automated: the `route` classifier's latency on a real local model
+
+**What is uncovered.** REQ-558 adds a model call to a path that had none: every
+freeform judgment turn now waits on a local classification before its real call
+starts. The architecture names this as a risk in as many words — *"the latency
+cost on the available case is new and unmeasured"* — and the spec's own
+assumption is *"the risk is latency, not accuracy."*
+
+**Why there is no harness.** Measuring it needs weights and an engine. CI ships
+neither: `tetond` is built without `--features tetond/llama`, and the local tier
+in every automated test is `ScriptedFileEngine`, which answers a classification
+in microseconds from a string table. A stand-in engine can prove the *call
+count* (which it does — see below) but not the wall clock, and a wall-clock
+number measured against a string table would be a fabricated one.
+
+**What the estimate is, and where it came from.** TASK-053 sized the prompt and
+the output budget for 0.2–0.5 s on a 3B model over Metal
+(`CLASSIFIER_INPUT_MAX_BYTES = 2_048`, `CLASSIFIER_MAX_TOKENS = 8`, greedy, a
+one-word answer contract). **That figure is a design target, not a measurement.
+Nobody has run it.** It is stated here so a later reader does not mistake it for
+an observation.
+
+**What IS covered automatically, and how far it goes:**
+
+| Leg | Where | Strength |
+|---|---|---|
+| The bypass issues **no call at all** when the local tier cannot serve | `tetond/src/classify.rs::a_bypassed_turn_issues_no_call_at_all`, `runtime.rs::an_unavailable_local_tier_bypasses_classification_with_no_call` | Full — asserted by call count on a counting engine, not by output text |
+| A structured turn issues **zero** classifier calls | `runtime.rs::dispatch` tests | Full — call count |
+| Classification never reaches a remote provider | `teton-core/src/category.rs::route_never_resolves_to_a_remote_provider` | Full — every tier bound remote, `route` still resolves local |
+| The prompt and output budgets are what the design says | `classify.rs` constants + their tests | Full at the constants; says nothing about elapsed time |
+| A classifier failure degrades to the declared default and says so | `classify.rs` + `routing.rs` | Full |
+
+**To close it by hand** (macOS/Apple Silicon, ~5 min, after a
+`docs/manual-verification.md` REQ-547 AC-13 install has already put weights on
+disk):
+
+```sh
+cargo build --workspace --release --features tetond/llama
+./target/release/tetond &
+./target/release/teton
+# in the session, with /verbose on, submit a FREEFORM judgment prompt:
+#   Explain the tradeoffs between these two architectures, then apply one.
+```
+
+Record: the wall-clock gap between submitting the prompt and the first token of
+the *answer*, and the same gap for a **structured** turn (which runs no
+classifier) as the control. The classifier's cost is the difference. REQ-544
+BR-8's duty for a local-tier call is ≤ 1000 ms to first token; a classifier that
+eats a large share of that on top of the real call is a finding to record, not a
+number to re-run until it looks acceptable.
+
+**Status: NOT RUN.** No sign-off block, because nobody has executed it.
+
+### Recorded exception: a taint-pinned `route_decided` carries no category
+
+AC-8 says every `route_decided` carries a category, a tier, a provider, and a
+non-empty reason. **One route is a deliberate exception**: the session-taint
+backstop (`Router::resolve_local_pin`, BR-7).
+
+That path consults no binding on purpose — it is a privacy guarantee overriding
+every category binding, not a category decision — so it carries
+`resolution: None`, and `route_decided` therefore omits `category` and `tier`
+entirely (both are `skip_serializing_if = "Option::is_none"`). The provider and
+the reason are still present and still non-empty.
+
+This is ADR-D's rule applied to itself: `route_decided` projects the category
+and the tier **off the resolution** and recomputes neither, so a route that
+resolved no category has none to report. Minting one — "well, it *would* have
+been `design`" — would be exactly the second computation ADR-D exists to
+prevent, and it would be a lie about which decision was made.
+
+It is asserted rather than dodged, in
+`tetond/tests/e2e/routing_categories.rs::a_tainted_session_stays_local_and_the_pre_taint_turn_proves_it_would_not_have`
+and in `router.rs::every_route_but_the_taint_pin_carries_its_resolution`. Any
+client rendering `route_decided` must handle the absence; `teton`'s own
+`/verbose` route line already does.
+
+### Not automated: `teton policy set-tier` / `set-category` through the CLI binary
+
+**What is uncovered.** The two *write* commands end to end through the shipped
+binary: `teton policy set-tier think anthropic`, then `teton policy show`
+reporting the new binding.
+
+**Why.** The same shape as REQ-557's `provider add` gap above — nothing about
+the keychain here, just that no CLI e2e test drives the write path yet.
+`teton policy show` **is** now covered end to end
+(`teton/tests/cli_e2e.rs::policy_show_renders_the_daemons_resolved_table`), and
+the write path's daemon half — including the refusal of a binding naming a
+provider that cannot serve a turn — is covered at the RPC and unit layers
+(`runtime.rs::reject_unusable_binding` and its tests, `main.rs`'s parser tests).
+What is untested is the CLI's argument plumbing into `config/set` for these two
+subcommands.
+
+**To close it by hand** (~1 min, against any running daemon):
+
+```sh
+teton policy show                                   # note `think`'s current binding
+teton policy set-tier think deepseek
+teton policy show                                   # `think → deepseek [configured]`
+teton policy set-category design deepseek
+teton policy show                                   # `design … [override]`
+teton policy set-tier think no-such-provider        # must fail, naming the registered ids
+teton policy set-category redact deepseek           # must fail, naming the pin (BR-4)
+```
+
+**Status: NOT RUN.**
