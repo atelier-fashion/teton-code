@@ -2165,6 +2165,18 @@ fn migrate_and_report_provider_models(
 /// something for the user to *do*: their single knob is now several, and if they
 /// wanted `edit` and `shell` — or the four `io` categories — to differ, this is
 /// the moment they learn they can say so.
+///
+/// # The `digest` sentence
+///
+/// Wherever a migrated binding reaches `digest` — the `io` phase's expansion, or
+/// the `scan` tier written from `default_provider` — the user is told plainly
+/// what that duty *is*. The earlier wording said the write recorded "where your
+/// unbound tiers were already sending turns", which is true of turns and false
+/// of this duty: `digest` was hardcoded to the local engine and sent nothing
+/// anywhere. It summarizes tool output — file bodies, build logs, command
+/// output — and that content has never left the machine before. Whether that is
+/// the right default is REQ-558's question and not this function's; announcing
+/// it as merely making the existing behaviour visible is not.
 fn routing_migration_report(report: &RoutingMigration) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -2194,6 +2206,25 @@ fn routing_migration_report(report: &RoutingMigration) -> Vec<String> {
             }
         }
 
+        // What `digest` actually is, said once per migrated rule that reaches it.
+        if migrated.categories.contains(&ConfigurableCategory::Digest) {
+            lines.push(digest_egress_notice(provider));
+        }
+
+        // A dead fallback the migration refused to copy forward. Reported
+        // because the id is disappearing from the user's file, and a config key
+        // that vanishes without a sentence is indistinguishable from a bug.
+        if let Some(fallback) = &migrated.dropped_fallback {
+            lines.push(format!(
+                "tetond: the retired `{phase}` routing rule named `{fallback}` as its fallback, \
+                 which declares no `model` and so cannot serve a turn (REQ-558). It was not \
+                 carried onto the new category rows — the daemon would never have failed over to \
+                 it. Give it a model with `teton provider add {fallback} --model <name>`, then \
+                 re-add it with `teton policy set-category <category> {provider} --fallback \
+                 {fallback}`."
+            ));
+        }
+
         // The lossy half. Five phases map onto four category groups, so `spec`
         // and `architect` collapse onto `design` — a user who routed them
         // differently has lost a distinction and must be told which side
@@ -2211,6 +2242,29 @@ fn routing_migration_report(report: &RoutingMigration) -> Vec<String> {
         }
     }
 
+    // A rule the migration refused to write. This is the loudest line it can
+    // emit, because the alternative — writing the dead binding — takes the
+    // category out of routing entirely, and `edit` is where every ordinary
+    // freeform coding turn lands.
+    for skipped in &report.skipped {
+        let phase = skipped.phase;
+        let provider = &skipped.provider_id;
+        let names: Vec<String> = skipped
+            .categories
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect();
+        lines.push(format!(
+            "tetond: the retired `{phase}` routing rule pointed at `{provider}`, which declares \
+             no `model` and so cannot serve a turn (REQ-558). It was NOT migrated: writing it \
+             would have left {} unroutable, because a per-category binding never falls back to \
+             its tier. Those categories keep routing through their tier instead. To restore the \
+             rule: `teton provider add {provider} --model <name>`, then `teton policy \
+             set-category <category> {provider}`.",
+            names.join(", ")
+        ));
+    }
+
     if let Some(provider) = &report.default_provider {
         let tiers: Vec<String> = report
             .default_tiers
@@ -2219,15 +2273,50 @@ fn routing_migration_report(report: &RoutingMigration) -> Vec<String> {
             .collect();
         lines.push(format!(
             "tetond: wrote `default_provider = \"{provider}\"` into the {} tier bindings \
-             (REQ-558) — where your unbound tiers were already sending turns, now visible and \
-             editable with `teton policy set-tier <tier> <provider>`. `reflex` is left unbound \
-             on purpose: it is the sub-second, every-turn tier that never leaves the machine, so \
-             it inherits your local model rather than a remote default.",
+             (REQ-558), now visible and editable with `teton policy set-tier <tier> <provider>`. \
+             `reflex` is left unbound on purpose: it is the sub-second, every-turn tier that \
+             never leaves the machine, so it inherits your local model rather than a remote \
+             default.",
             tiers.join(", ")
+        ));
+        // `scan` carries the `digest` duty, which is not a turn and was not
+        // already going anywhere. Say so rather than folding it into "where
+        // your turns were already going".
+        if report.default_tiers.contains(&Tier::Scan) {
+            lines.push(digest_egress_notice(provider));
+        }
+    }
+
+    if let Some(provider) = &report.skipped_default {
+        lines.push(format!(
+            "tetond: `default_provider = \"{provider}\"` declares no `model`, so no tier bindings \
+             were written from it (REQ-558). Nothing is broken — your unbound tiers still fall \
+             back to your local model, which is what they were already doing. Give it a model \
+             with `teton provider add {provider} --model <name>` and the tiers are written on \
+             the next start."
         ));
     }
 
     lines
+}
+
+/// The one sentence the migration owes about `digest`, wherever a migrated
+/// binding reaches it.
+///
+/// Kept as one function with one caller-supplied provider so the `io` expansion
+/// and the `scan` tier write cannot say different things about the same duty.
+/// It states the change and stops: what `digest` reads, where that content went
+/// before, and where it goes now. Whether the user wants that is theirs to
+/// decide, and the last sentence is how they decide it.
+fn digest_egress_notice(provider: &str) -> String {
+    format!(
+        "tetond: NOTE — that includes the `digest` duty, which summarizes tool output (file \
+         contents, build logs, command output) to keep a long session inside its context window. \
+         Until now `digest` ran on your local model unconditionally and that content never left \
+         this machine; it will now be sent to `{provider}`. Privacy boundaries still apply, and a \
+         session that touched `local-only` content still digests locally. To keep all of it \
+         local: `teton policy set-category digest local`."
+    )
 }
 
 /// Run the one-shot REQ-558 routing migration on a freshly loaded config,
@@ -4186,6 +4275,162 @@ provider_id = "on-device"
         assert!(
             text.contains("reflex") && text.contains("never leaves the machine"),
             "and must say why `reflex` was left unbound:\n{text}"
+        );
+    }
+
+    /// **The `digest` sentence, wherever a migrated binding reaches it.**
+    ///
+    /// The tiers line used to say the write recorded "where your unbound tiers
+    /// were already sending turns, now visible and editable". That is true of
+    /// turns and false of the `digest` duty, which was hardcoded to the local
+    /// engine and sent nothing anywhere. `digest` summarizes tool output — file
+    /// bodies, build logs — so a user is owed the plain fact that this content
+    /// has not left the machine before and now will, and the one command that
+    /// keeps it here. The semantic question is theirs; the sentence is ours.
+    ///
+    /// Asserted on **both** paths that reach `digest` — the `io` expansion and
+    /// the `scan` tier written from `default_provider` — because they are two
+    /// call sites for one fact.
+    #[test]
+    fn a_migration_that_sends_digest_remote_says_what_digest_reads() {
+        fn assert_says_it(text: &str, provider: &str) {
+            for phrase in [
+                "summarizes tool output",
+                "never left this machine",
+                "set-category digest local",
+            ] {
+                assert!(
+                    text.contains(phrase),
+                    "the report must say {phrase:?}:\n{text}"
+                );
+            }
+            assert!(
+                text.contains(&format!("`{provider}`")),
+                "and must name where it now goes:\n{text}"
+            );
+            assert!(
+                !text.contains("already sending turns"),
+                "and must not claim this was already happening:\n{text}"
+            );
+        }
+
+        let provider = ModelProvider {
+            id: "cheap".to_owned(),
+            kind: ProviderKind::OpenaiCompatible,
+            endpoint: Some("https://api.deepseek.com".to_owned()),
+            model: Some("deepseek-chat".to_owned()),
+            auth_ref: Some("keychain:cheap".to_owned()),
+            capabilities: ProviderCapabilities::default(),
+        };
+
+        // 1. The `io` rule expanding onto `digest`.
+        let mut via_phase = Config {
+            providers: vec![provider.clone()],
+            legacy_routing: vec![LegacyRoutingRule {
+                phase: CorePhase::Io,
+                provider_id: "cheap".to_owned(),
+                fallback_id: None,
+            }],
+            ..Config::default()
+        };
+        let report = via_phase.migrate_routing_to_categories();
+        assert_says_it(&routing_migration_report(&report).join("\n"), "cheap");
+
+        // 2. The `scan` tier written from `default_provider`, which `digest`
+        //    inherits. Same duty, same sentence.
+        let mut via_tier = Config {
+            providers: vec![provider],
+            default_provider: Some("cheap".to_owned()),
+            ..Config::default()
+        };
+        let report = via_tier.migrate_routing_to_categories();
+        assert!(report.default_tiers.contains(&Tier::Scan));
+        assert_says_it(&routing_migration_report(&report).join("\n"), "cheap");
+
+        // 3. And a migration that reaches `digest` on neither path does not
+        //    say it — otherwise the notice is noise rather than news.
+        let mut neither = Config {
+            providers: vec![ModelProvider {
+                id: "cheap".to_owned(),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: Some("keychain:cheap".to_owned()),
+                capabilities: ProviderCapabilities::default(),
+            }],
+            tiers: vec![TierBinding {
+                tier: Tier::Think,
+                provider_id: "cheap".to_owned(),
+                fallback_id: None,
+            }],
+            legacy_routing: vec![LegacyRoutingRule {
+                phase: CorePhase::Review,
+                provider_id: "cheap".to_owned(),
+                fallback_id: None,
+            }],
+            ..Config::default()
+        };
+        let report = neither.migrate_routing_to_categories();
+        assert!(!routing_migration_report(&report)
+            .join("\n")
+            .contains("summarizes tool output"));
+    }
+
+    /// A rule the migration refused to write is reported **by name**, with the
+    /// categories the user is losing and what to do about it.
+    ///
+    /// This is the loudest line the migration emits, and it has to be: the
+    /// alternative — persisting the dead binding — takes `edit` out of routing
+    /// entirely, and `edit` is where every ordinary freeform coding turn lands.
+    #[test]
+    fn a_skipped_rule_and_a_skipped_default_are_both_reported_by_name() {
+        let unusable = ModelProvider {
+            id: "my-llama".to_owned(),
+            kind: ProviderKind::OpenaiCompatible,
+            endpoint: Some("http://127.0.0.1:8080".to_owned()),
+            model: None,
+            auth_ref: None,
+            capabilities: ProviderCapabilities::default(),
+        };
+
+        let mut config = Config {
+            providers: vec![unusable.clone()],
+            legacy_routing: vec![LegacyRoutingRule {
+                phase: CorePhase::Implement,
+                provider_id: "my-llama".to_owned(),
+                fallback_id: None,
+            }],
+            ..Config::default()
+        };
+        let report = config.migrate_routing_to_categories();
+        let text = routing_migration_report(&report).join("\n");
+
+        assert!(text.contains("`my-llama`"), "{text}");
+        assert!(
+            text.contains("`edit`") && text.contains("`shell`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("declares no `model`"),
+            "the report must name the cause:\n{text}"
+        );
+        assert!(
+            text.contains("teton provider add my-llama --model"),
+            "and the remedy:\n{text}"
+        );
+
+        // The `default_provider` leg, same screen and same obligation.
+        let mut config = Config {
+            providers: vec![unusable],
+            default_provider: Some("my-llama".to_owned()),
+            ..Config::default()
+        };
+        let report = config.migrate_routing_to_categories();
+        let text = routing_migration_report(&report).join("\n");
+        assert!(text.contains("no tier bindings"), "{text}");
+        assert!(
+            text.contains("local model"),
+            "and must say the machine still routes:\n{text}"
         );
     }
 

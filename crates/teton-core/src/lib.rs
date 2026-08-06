@@ -44,7 +44,7 @@ pub use category::{
 };
 pub use config::{
     Config, ConfigError, LegacyRoutingRule, LoadError, LocalModelConfig, MigratedPhase,
-    RoutingMigration,
+    RoutingMigration, SkippedRule,
 };
 pub use entities::{
     BoundaryMode, ModelProvider, ModelSelection, PrivacyBoundary, ProviderCapabilities,

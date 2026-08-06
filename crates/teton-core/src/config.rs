@@ -220,6 +220,13 @@ pub struct MigratedPhase {
     pub provider_id: String,
     /// The categories this rule was written out as, in expansion order.
     pub categories: Vec<ConfigurableCategory>,
+    /// The rule's fallback, dropped because that provider cannot serve a turn.
+    ///
+    /// `reject_unusable_binding` refuses exactly this id from a user setting a
+    /// binding over the wire, so the migration must not write it either — a
+    /// migration is not a privileged author. Reported rather than dropped
+    /// silently: the id is disappearing from the user's file.
+    pub dropped_fallback: Option<String>,
     /// The categories this rule mapped to but did **not** write, because
     /// something already held them.
     ///
@@ -245,6 +252,28 @@ pub struct DroppedBinding {
     pub kept_provider_id: String,
 }
 
+/// A retired rule the migration **refused to write**, because the provider it
+/// names cannot serve a turn (REQ-557 ADR-E: a remote provider declaring no
+/// `model`).
+///
+/// The rule is still consumed — it is inert either way — but nothing is written
+/// in its place, and that is the point. A `[[categories]]` override never falls
+/// through to its tier, so persisting a dead override does not degrade the
+/// category, it *removes* it: `edit` is the BR-9 default, where every ordinary
+/// freeform coding turn lands, so a dead `edit` row is every coding turn
+/// failing. Writing nothing leaves the category on its tier, which is where a
+/// config that never had the rule would have put it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRule {
+    /// The phase the retired rule named.
+    pub phase: Phase,
+    /// The provider it named, which cannot serve a turn.
+    pub provider_id: String,
+    /// The categories it would have bound, had the provider been usable — the
+    /// bindings the user is losing, by name.
+    pub categories: Vec<ConfigurableCategory>,
+}
+
 /// What one run of [`Config::migrate_routing_to_categories`] changed.
 ///
 /// Returned rather than logged so the caller owns the wording and the tests can
@@ -252,21 +281,37 @@ pub struct DroppedBinding {
 /// and a criterion whose only witness is an `eprintln!` cannot be tested.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RoutingMigration {
-    /// Every retired rule the run consumed, in table order.
+    /// Every retired rule the run consumed **and wrote**, in table order.
     pub phases: Vec<MigratedPhase>,
+    /// Every retired rule the run consumed and deliberately did not write,
+    /// because its provider cannot serve a turn.
+    pub skipped: Vec<SkippedRule>,
     /// The tiers materialized from [`Config::default_provider`], in tier order.
     /// Never contains [`Tier::Reflex`].
     pub default_tiers: Vec<Tier>,
     /// The provider [`Self::default_tiers`] were bound to, when any were.
     pub default_provider: Option<String>,
+    /// [`Config::default_provider`], when it was screened out and therefore
+    /// wrote no tiers at all.
+    ///
+    /// Not counted by [`Self::is_empty`]: nothing was consumed and nothing
+    /// written, so there is no reason to rewrite the file — and the migration
+    /// self-heals, writing the tiers on the first start after the provider
+    /// declares a model.
+    pub skipped_default: Option<String>,
 }
 
 impl RoutingMigration {
     /// Whether the run changed nothing — the second-start case, and the guard
     /// on whether the config file is rewritten at all.
+    ///
+    /// A **skipped** rule counts as a change. It wrote no binding, but it was
+    /// consumed out of `legacy_routing`, so the file must be rewritten to drop
+    /// the retired table — otherwise the next start finds the same rule, skips
+    /// it again, and reports it again forever.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.phases.is_empty() && self.default_tiers.is_empty()
+        self.phases.is_empty() && self.skipped.is_empty() && self.default_tiers.is_empty()
     }
 }
 
@@ -819,17 +864,49 @@ impl Config {
         // or not it wrote anything, so the caller's write drops the retired
         // table from disk and the next start has nothing to find.
         for rule in std::mem::take(&mut self.legacy_routing) {
-            let mut written = Vec::new();
-            let mut dropped = Vec::new();
-            for category in categories_for_phase(rule.phase) {
+            // The rule's categories, computed once: they are what gets written
+            // when the provider can serve, and what gets *reported as lost* when
+            // it cannot.
+            let names: Vec<ConfigurableCategory> = categories_for_phase(rule.phase)
+                .iter()
                 // Total by construction: no phase maps to `route` or `redact`,
-                // the two categories config cannot name (ADR-B). Skipping
+                // the two categories config cannot name (ADR-B). Filtering
                 // rather than asserting keeps the migration total if that ever
                 // changes — a config it cannot express is not one it should
                 // refuse to open.
-                let Some(name) = category.configurable() else {
-                    continue;
-                };
+                .filter_map(|c| c.configurable())
+                .collect();
+
+            // A binding naming a provider that cannot serve is not a weaker
+            // binding, it is a *hole*: an override never falls through to its
+            // tier, so writing one removes the category from routing entirely.
+            // `edit` is the BR-9 freeform default, so a dead `edit` row is every
+            // ordinary coding turn failing — on a config that worked yesterday.
+            // The rule is consumed either way; nothing is written in its place,
+            // which leaves each category on its tier exactly as if the rule had
+            // never existed.
+            if !self.provider_can_serve(&rule.provider_id) {
+                report.skipped.push(SkippedRule {
+                    phase: rule.phase,
+                    provider_id: rule.provider_id,
+                    categories: names,
+                });
+                continue;
+            }
+
+            // `reject_unusable_binding` refuses a fallback the same way it
+            // refuses a primary, and a migration is not a privileged author. An
+            // unusable fallback is inert at resolution anyway (`resolve`
+            // screens it), so dropping it costs nothing and keeps a dead id out
+            // of the user's file.
+            let (fallback_id, dropped_fallback) = match rule.fallback_id {
+                Some(id) if !self.provider_can_serve(&id) => (None, Some(id)),
+                other => (other, None),
+            };
+
+            let mut written = Vec::new();
+            let mut dropped = Vec::new();
+            for name in names {
                 // First claim wins, and "first" is the user's own table order.
                 // The claimant may be an explicit `[[categories]]` row (which
                 // must never lose to a retired one) or an earlier rule in this
@@ -844,7 +921,7 @@ impl Config {
                 self.categories.push(CategoryOverride {
                     name,
                     provider_id: rule.provider_id.clone(),
-                    fallback_id: rule.fallback_id.clone(),
+                    fallback_id: fallback_id.clone(),
                 });
                 written.push(name);
             }
@@ -852,30 +929,59 @@ impl Config {
                 phase: rule.phase,
                 provider_id: rule.provider_id,
                 categories: written,
+                dropped_fallback,
                 dropped,
             });
         }
 
         if self.tiers.is_empty() {
             if let Some(default_provider) = self.default_provider.clone() {
-                for tier in Tier::ALL
-                    .into_iter()
-                    .filter(|t| t.inherits_default_provider())
-                {
-                    self.tiers.push(TierBinding {
-                        tier,
-                        provider_id: default_provider.clone(),
-                        fallback_id: None,
-                    });
-                    report.default_tiers.push(tier);
-                }
-                if !report.default_tiers.is_empty() {
-                    report.default_provider = Some(default_provider);
+                // The same screen, for the same reason. A tier bound to a
+                // provider that cannot serve is worse than an unbound one:
+                // `Router::effective_table` fills an *unbound* tier from the
+                // local model and keeps the machine routing, and writing the
+                // dead id down replaces that fill with a hole. Leaving the
+                // tiers unwritten costs nothing — the fill still applies — and
+                // the migration self-heals, writing them on the first start
+                // after the provider declares a model.
+                if self.provider_can_serve(&default_provider) {
+                    for tier in Tier::ALL
+                        .into_iter()
+                        .filter(|t| t.inherits_default_provider())
+                    {
+                        self.tiers.push(TierBinding {
+                            tier,
+                            provider_id: default_provider.clone(),
+                            fallback_id: None,
+                        });
+                        report.default_tiers.push(tier);
+                    }
+                    if !report.default_tiers.is_empty() {
+                        report.default_provider = Some(default_provider);
+                    }
+                } else {
+                    report.skipped_default = Some(default_provider);
                 }
             }
         }
 
         report
+    }
+
+    /// Whether a binding naming `provider_id` could actually serve a turn — the
+    /// migration's copy of the screen [`crate::ModelProvider`] owns and
+    /// `reject_unusable_binding` applies to a user's own `config/set`.
+    ///
+    /// An **unregistered** id answers `true` here, deliberately. That is not the
+    /// migration's condition to report: [`Self::validate`] already rejects a
+    /// retired rule or a `default_provider` naming an unknown provider, names
+    /// it, and lists what is registered — and it runs before this does. Two
+    /// sentences for one condition is how they drift.
+    fn provider_can_serve(&self, provider_id: &str) -> bool {
+        self.providers
+            .iter()
+            .find(|p| p.id == provider_id)
+            .is_none_or(|p| !p.is_unusable_for_lacking_a_model())
     }
 
     fn validate_local_model(&self) -> Result<(), ConfigError> {
@@ -2363,6 +2469,153 @@ provider_id = "on-device"
                 .unwrap_or_else(|| panic!("no `{name}` row"));
             assert_eq!(row.fallback_id.as_deref(), fallback, "`{name}` fallback");
         }
+    }
+
+    /// A pre-REQ config where the routed provider declares no `model` — the
+    /// state [`Config::validate`] permits **on purpose**, so that a pre-REQ
+    /// config boots at all and [`Config::migrate_models`] gets a chance to run.
+    ///
+    /// `implement → my-llama` is the ordinary shape of it: a provider added
+    /// before REQ-557 existed, whose model the price table could not resolve.
+    const UNUSABLE_ROUTED_PROVIDER_TOML: &str = r#"
+[[providers]]
+id = "on-device"
+kind = "local"
+
+[[providers]]
+id = "my-llama"
+kind = "openai-compatible"
+endpoint = "http://127.0.0.1:8080"
+
+[[routing]]
+phase = "implement"
+provider_id = "my-llama"
+"#;
+
+    /// **The migration must not write a binding that cannot serve.**
+    ///
+    /// An override never falls through to its tier, so a dead `[[categories]]`
+    /// row does not degrade the category — it removes it. `edit` is the BR-9
+    /// freeform default, where every ordinary coding turn lands, so persisting
+    /// `edit → my-llama` turns "one provider is unusable" into "every freeform
+    /// turn hard-fails", on the first start after upgrade, on a config that
+    /// worked the day before.
+    ///
+    /// `reject_unusable_binding` refuses this exact binding from a user over
+    /// `config/set`. The migration is not a privileged author.
+    #[test]
+    fn a_rule_naming_an_unusable_provider_is_skipped_and_named() {
+        let mut cfg = Config::load(UNUSABLE_ROUTED_PROVIDER_TOML).expect("the fixture must load");
+        // The premise: this config is valid, and the provider is unusable.
+        assert_eq!(cfg.unusable_providers(), vec!["my-llama".to_owned()]);
+
+        let report = cfg.migrate_routing_to_categories();
+
+        assert!(
+            cfg.categories.is_empty(),
+            "a dead binding must not be persisted: {:?}",
+            cfg.categories
+        );
+        assert!(
+            report.phases.is_empty(),
+            "and it must not be reported as migrated"
+        );
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].provider_id, "my-llama");
+        assert_eq!(report.skipped[0].phase, Phase::Implement);
+        assert_eq!(
+            report.skipped[0].categories,
+            vec![ConfigurableCategory::Edit, ConfigurableCategory::Shell],
+            "the bindings the user is losing are reported by name"
+        );
+
+        // Consumed, so the retired table leaves the file and this is reported
+        // once rather than on every start.
+        assert!(cfg.legacy_routing.is_empty());
+        assert!(!report.is_empty(), "the file must still be rewritten");
+
+        // And it is genuinely idempotent: a second run finds nothing.
+        let mut again = cfg.clone();
+        assert!(again.migrate_routing_to_categories().is_empty());
+
+        // Non-vacuity: give the same provider a model and the rule migrates.
+        let mut usable = Config::load(UNUSABLE_ROUTED_PROVIDER_TOML).expect("loads");
+        usable.providers[1].model = Some("llama-3".to_owned());
+        let report = usable.migrate_routing_to_categories();
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            usable.categories.iter().map(|o| o.name).collect::<Vec<_>>(),
+            vec![ConfigurableCategory::Edit, ConfigurableCategory::Shell]
+        );
+    }
+
+    /// The same screen on the fallback, because `reject_unusable_binding`
+    /// applies it to both ids. The rule still migrates — its primary is fine —
+    /// but the dead id is not copied onto the new rows, and its disappearance
+    /// from the user's file is reported rather than silent.
+    #[test]
+    fn an_unusable_fallback_is_dropped_from_the_rows_it_would_have_been_copied_onto() {
+        let mut cfg = Config::load(UNUSABLE_ROUTED_PROVIDER_TOML).expect("loads");
+        cfg.providers.push(ModelProvider {
+            id: "good".to_owned(),
+            kind: ProviderKind::Anthropic,
+            endpoint: Some("https://api.anthropic.com".to_owned()),
+            model: Some("claude-opus-5".to_owned()),
+            auth_ref: Some("keychain:anthropic".to_owned()),
+            capabilities: ProviderCapabilities::default(),
+        });
+        cfg.legacy_routing = vec![LegacyRoutingRule {
+            phase: Phase::Implement,
+            provider_id: "good".to_owned(),
+            fallback_id: Some("my-llama".to_owned()),
+        }];
+
+        let report = cfg.migrate_routing_to_categories();
+
+        assert_eq!(report.phases.len(), 1);
+        assert_eq!(
+            report.phases[0].dropped_fallback.as_deref(),
+            Some("my-llama")
+        );
+        for row in &cfg.categories {
+            assert_eq!(row.provider_id, "good", "the usable primary still migrates");
+            assert_eq!(
+                row.fallback_id, None,
+                "a fallback that cannot serve is not written down: {row:?}"
+            );
+        }
+    }
+
+    /// **The `default_provider` → tiers leg gets the same screen.** A tier bound
+    /// to a provider that cannot serve is worse than an unbound one: an unbound
+    /// tier inherits the local model and the machine keeps routing, and writing
+    /// the dead id down replaces that with a hole.
+    #[test]
+    fn an_unusable_default_provider_writes_no_tiers() {
+        let mut cfg = Config::load(UNUSABLE_ROUTED_PROVIDER_TOML).expect("loads");
+        cfg.legacy_routing.clear();
+        cfg.default_provider = Some("my-llama".to_owned());
+
+        let report = cfg.migrate_routing_to_categories();
+
+        assert!(cfg.tiers.is_empty(), "no dead tier rows: {:?}", cfg.tiers);
+        assert!(report.default_tiers.is_empty());
+        assert_eq!(report.skipped_default.as_deref(), Some("my-llama"));
+        assert!(
+            report.is_empty(),
+            "nothing was consumed and nothing written, so there is no reason \
+             to rewrite the file"
+        );
+
+        // Non-vacuity, and the self-healing property: once it declares a model,
+        // the next start writes the tiers.
+        cfg.providers[1].model = Some("llama-3".to_owned());
+        let report = cfg.migrate_routing_to_categories();
+        assert_eq!(
+            report.default_tiers,
+            vec![Tier::Scan, Tier::Build, Tier::Think]
+        );
+        assert!(report.skipped_default.is_none());
     }
 
     #[test]
