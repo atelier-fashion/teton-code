@@ -5245,6 +5245,133 @@ provider_id = "on-device"
         );
     }
 
+    /// **A route that DID select a provider keeps the classifier's sentence,
+    /// byte for byte.**
+    ///
+    /// `unserved_turn_sentence` composes two authors, and its guard decides
+    /// which one speaks. When the resolution selected nothing, the resolver
+    /// already explained — it named the category, the binding, and the remedy —
+    /// so its sentence is prepended. When the resolution selected a provider
+    /// and the harness *still* could not serve, the route is fine and its
+    /// reason is a true statement about a decision that succeeded: prepending
+    /// "Routing the 'edit' category to 'cheap' through its 'build' tier
+    /// binding." to "the local tier is loading" produces a sentence that
+    /// contradicts itself and blames the wrong subsystem.
+    ///
+    /// Nothing tested that arm: deleting the guard outright left the whole
+    /// suite green, because no fixture built a *selected* route that could not
+    /// be served. That is BUG-152's own state — loading, below the floor,
+    /// awaiting consent — reached with a perfectly good binding.
+    #[test]
+    fn a_selected_route_keeps_the_classifiers_sentence_unchanged() {
+        use crate::router::Route;
+        use teton_core::category::{CategoryResolution, CategoryTable, TierBinding};
+        use teton_core::{BindingSource, Category as CoreCategory, RouteOutcome, Tier as CoreTier};
+
+        let classified = RpcError::new(
+            error_code::TIER_WARMING,
+            "The local tier is loading and benchmarking. Retry in a moment.",
+        );
+
+        // A route that genuinely resolved: a category, a tier, a provider, and
+        // a reason of its own that must NOT reach the user here.
+        let resolution = CategoryResolution {
+            category: CoreCategory::Edit,
+            tier: CoreTier::Build,
+            provider_id: Some("on-device".to_owned()),
+            fallback_id: None,
+            source: BindingSource::TierInheritance,
+            reason: "Routing the 'edit' category to 'on-device' through its 'build' tier \
+                     binding."
+                .to_owned(),
+            outcome: RouteOutcome::Primary,
+        };
+        let selected = Route {
+            provider_id: Some(ProviderId::from("on-device")),
+            model: Some("qwen".to_owned()),
+            phase: None,
+            reason: resolution.reason.clone(),
+            outcome: resolution.outcome,
+            harness: Default::default(),
+            resolution: Some(resolution),
+        };
+        assert!(selected.selected(), "the premise of this test");
+
+        let out = unserved_turn_sentence(&selected, classified.clone());
+        assert_eq!(
+            out.message, classified.message,
+            "a route that selected a provider adds nothing: the binding worked, \
+             and what failed is the tier's state, which only the classifier can \
+             describe"
+        );
+        assert_eq!(out.code, classified.code);
+
+        // The other arm, so this test measures the guard rather than the
+        // absence of composition: an UNRESOLVED route does prepend its reason.
+        let unresolved = Route {
+            provider_id: None,
+            model: None,
+            phase: None,
+            reason: "No provider is bound to the 'build' tier.".to_owned(),
+            outcome: RouteOutcome::NoPolicy,
+            harness: Default::default(),
+            resolution: None,
+        };
+        let out = unserved_turn_sentence(&unresolved, classified.clone());
+        assert_eq!(
+            out.message,
+            format!("{} {}", unresolved.reason, classified.message),
+            "an unresolved route's own sentence is the answer, carried verbatim"
+        );
+
+        // And through the real pair, on a route the real resolver produced: a
+        // tier bound to a declared local provider whose engine is not loaded.
+        // The binding is perfect; the tier cannot serve. This is the shape the
+        // guard exists for, and it reaches it through `build_router` rather
+        // than through a hand-built `Route`.
+        let config = Config {
+            providers: vec![ModelProvider {
+                id: "on-device".to_owned(),
+                kind: ProviderKind::Local,
+                endpoint: None,
+                model: None,
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            }],
+            tiers: vec![TierBinding {
+                tier: CoreTier::Build,
+                provider_id: "on-device".to_owned(),
+                fallback_id: None,
+            }],
+            ..Config::default()
+        };
+        let route = build_router(&config, true, &BTreeMap::new()).resolve(CoreCategory::Edit);
+        assert_eq!(
+            route.provider_id.as_ref().map(|p| p.0.as_str()),
+            Some("on-device"),
+            "the resolver must genuinely select, or this leg proves nothing: {}",
+            route.reason
+        );
+        // What `run_prompt_turn` does on `HarnessError::NoTierAvailable`.
+        let runtime = DaemonRuntime::minimal();
+        let category = route.resolution.as_ref().map(|r| r.category);
+        let classified = runtime.unserved_turn_error(&config, category);
+        let out = unserved_turn_sentence(&route, classified.clone());
+        assert_eq!(
+            out.message, classified.message,
+            "a bound, selectable local tier that is not loaded must be reported \
+             as a tier state — not as a routing failure the binding did not have"
+        );
+        assert!(
+            !out.message.contains("Routing the 'edit' category"),
+            "the resolver's success sentence must not be read out as an error: {}",
+            out.message
+        );
+
+        // Unused-import guard: `CategoryTable` is what `build_router` builds.
+        let _ = CategoryTable::new();
+    }
+
     /// BUG-146: "nothing could serve this turn" has six very different
     /// causes, and the message must name the one that actually applies —
     /// the reported bug was a loading tier being blamed as a broken engine.
@@ -6671,6 +6798,81 @@ provider_id = "on-device"
             assert_eq!(
                 route.resolution.as_ref().map(|r| r.category),
                 Some(Category::Review)
+            );
+        }
+
+        /// **The unserved-turn guard, driven through `dispatch_route` itself.**
+        ///
+        /// A tier bound to a declared local provider that is above the floor and
+        /// decided, but whose weights are still loading — BUG-152's own state.
+        /// `dispatch_route` genuinely **selects** it (the binding is perfect),
+        /// and the harness then returns `NoTierAvailable` because the slot is
+        /// empty. What the user must read is the tier's state, not the
+        /// resolver's success sentence read out as an error.
+        ///
+        /// The sibling of `a_selected_route_keeps_the_classifiers_sentence_
+        /// unchanged`, at the layer the daemon actually calls: that one pins the
+        /// composition, this one proves the daemon's own dispatch reaches the
+        /// arm at all.
+        #[tokio::test]
+        async fn a_selected_but_unloaded_local_tier_reports_a_tier_state_not_a_routing_failure() {
+            let mut config = config();
+            config.providers.push(ModelProvider {
+                id: "on-device".to_owned(),
+                kind: ProviderKind::Local,
+                endpoint: None,
+                model: None,
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            });
+            // `edit` inherits `build`; bind it to the local tier explicitly.
+            config.tiers.retain(|t| t.tier != Tier::Build);
+            config.tiers.push(TierBinding {
+                tier: Tier::Build,
+                provider_id: "on-device".to_owned(),
+                fallback_id: None,
+            });
+
+            let engine = CountingEngine::answering("edit");
+            // `local_available` is true — the tier is above the floor and
+            // decided — which is what lets the resolver select it.
+            let runtime = runtime(config.clone(), &engine, true);
+            let router = router_for(&runtime);
+
+            let route = runtime
+                .dispatch_route(
+                    &router,
+                    &SessionId::from("sess"),
+                    SessionMode::Freeform,
+                    None,
+                    "add a retry to the upload helper",
+                )
+                .await;
+            assert!(
+                route.selected(),
+                "the premise: a binding that resolves cleanly — {}",
+                route.reason
+            );
+            assert_eq!(
+                route.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some("on-device")
+            );
+
+            // What `run_prompt_turn` does with `HarnessError::NoTierAvailable`.
+            let category = route.resolution.as_ref().map(|r| r.category);
+            let classified = runtime.unserved_turn_error(&config, category);
+            let shown = unserved_turn_sentence(&route, classified.clone());
+
+            assert_eq!(
+                shown.message, classified.message,
+                "the binding worked; only the tier's state failed, and only the \
+                 classifier can describe that"
+            );
+            assert!(
+                !shown.message.contains("Routing the"),
+                "the resolver's SUCCESS sentence must not be prefixed onto an \
+                 error — it contradicts it and blames the wrong subsystem: {}",
+                shown.message
             );
         }
 
