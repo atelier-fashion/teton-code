@@ -546,6 +546,12 @@ impl Router {
     /// - **Retry** — transient; no event, the caller retries the same route.
     /// - **Fail** — unrecoverable (e.g. auth); no route, the caller aborts.
     ///
+    /// Only the **Fallback** arm spends the fallback. `Degrade` and `Retry` hand
+    /// the turn back to the *same* provider, so the alternative the resolution
+    /// chose is still unspent and is still there for the next failure — a
+    /// timeout followed by a malformed response falls over, rather than
+    /// reporting that no fallback is configured.
+    ///
     /// It takes the failed [`Route`] rather than a phase (AC-9). That is not only
     /// a signature change: the fallback now comes from the resolution the turn
     /// was routed by, already screened for usability and health when it was
@@ -568,13 +574,15 @@ impl Router {
                         || format!("Falling back to '{fb}' after a provider failure."),
                         |s| format!("{} Continuing on the fallback '{fb}'.", s.reason),
                     );
-                    self.continue_on(
+                    // The one arm that actually switches providers, and so the
+                    // one arm that spends the fallback.
+                    Self::consume_fallback(self.continue_on(
                         route,
                         fb,
                         RouteOutcome::Fallback,
                         reason,
                         self.harness_config_for(fb),
-                    )
+                    ))
                 });
                 FailureOutcome {
                     degraded: Some(ProviderDegraded {
@@ -750,9 +758,30 @@ impl Router {
     /// computing the origin by comparing ids against `default_provider` would be
     /// a restatement of that rule, and would go wrong the first time someone
     /// sets `default_provider` to the local tier's own id.
+    /// An **unusable** `default_provider` inherits nothing, and falls through to
+    /// the local tier exactly as an absent one does.
+    ///
+    /// This is [`Router::is_usable`] — BUG-155's screen — applied to the one
+    /// candidate that was reaching a tier binding without it. `default_provider`
+    /// is a plain config key: it can name a provider that was deleted, or a
+    /// remote provider that declares no `model` and therefore never entered the
+    /// map (REQ-557 ADR-E). Returning it unscreened bound every unbound tier to
+    /// an id that cannot serve, and because the arm returned early it never
+    /// reached the local one — so a machine with a healthy local tier failed
+    /// every turn rather than serving them locally, which is the state
+    /// [`Router::inherited_provider`]'s own contract says must route.
+    ///
+    /// Health is deliberately *not* screened here. A binding is what the table
+    /// says; whether the provider is up is `category::resolve`'s question, and
+    /// it has a fallback to try and a sentence to write. Usability is different:
+    /// an id that can never serve is not a binding at all.
     fn inherited_binding(&self, tier: CoreTier) -> Option<(TierOrigin, String)> {
         if tier.inherits_default_provider() {
-            if let Some(default) = self.default_provider.clone() {
+            if let Some(default) = self
+                .default_provider
+                .clone()
+                .filter(|id| self.is_usable(id))
+            {
                 return Some((TierOrigin::DefaultProvider, default));
             }
         }
@@ -929,10 +958,20 @@ impl Router {
     /// The route to continue a failed turn on: a new provider, a new reason, the
     /// same turn.
     ///
-    /// It carries the failed route's phase and resolution forward, because the
-    /// turn's *category* has not changed — only which provider is serving it. The
-    /// resolution's own `fallback_id` is cleared: it has now been used, and a
-    /// route that could fail over to itself would loop.
+    /// It carries the failed route's phase and resolution forward **verbatim**,
+    /// because the turn's *category* has not changed — only which provider is
+    /// serving it.
+    ///
+    /// The fallback is deliberately **not** cleared here. Two of the three arms
+    /// that call this keep serving on the *same* provider — `Retry` re-attempts
+    /// it, `Degrade` re-attempts it under a reduced harness profile — so the
+    /// fallback has not been used and must still be there when the retry itself
+    /// fails. Clearing it unconditionally meant one transient timeout removed the
+    /// configured fallback for the rest of the turn, and the daemon then told the
+    /// user "provider failed and no fallback is configured" about a config that
+    /// configures one. Reachable inside the 2-attempt budget on the plain
+    /// `timeout → malformed` sequence. Consumption belongs to the arm that
+    /// consumes ([`Router::consume_fallback`]), not to the arm that retries.
     fn continue_on(
         &self,
         failed: &Route,
@@ -948,11 +987,22 @@ impl Router {
             reason,
             outcome,
             harness,
-            resolution: failed.resolution.clone().map(|mut r| {
-                r.fallback_id = None;
-                r
-            }),
+            resolution: failed.resolution.clone(),
         }
+    }
+
+    /// Spend the resolution's fallback: the route is now *running on* it, so a
+    /// further failure has nowhere left to go and must say so rather than fail
+    /// over to itself and loop.
+    ///
+    /// Called from exactly one place — the [`FailureAction::Fallback`] arm — and
+    /// that is the whole point. "The fallback has been used" is a fact about
+    /// having switched providers, so only the switch may assert it.
+    fn consume_fallback(mut route: Route) -> Route {
+        if let Some(resolution) = route.resolution.as_mut() {
+            resolution.fallback_id = None;
+        }
+        route
     }
 }
 
@@ -1535,6 +1585,64 @@ mod tests {
         assert!(route.reason.contains("'build'"), "{}", route.reason);
     }
 
+    /// **An unusable `default_provider` inherits nothing.** It falls through to
+    /// the local tier exactly as an absent one does, which is what
+    /// [`Router::inherited_provider`]'s own contract promises ("fall back to the
+    /// local tier, so an offline install still routes").
+    ///
+    /// Not contrived: `default_provider` is a plain config key naming a provider
+    /// by id, and REQ-557 ADR-E keeps a remote provider that declares no `model`
+    /// out of the router entirely. So the ordinary "I deleted that provider" and
+    /// "that provider never got migrated" configs both land here. Returning the
+    /// id unscreened bound every unbound tier to something that cannot serve —
+    /// and the arm returned early, so it never reached the local tier: a machine
+    /// with a perfectly healthy local model failed every turn.
+    #[test]
+    fn an_unusable_default_provider_falls_through_to_the_local_tier() {
+        let router = Router::new(
+            CategoryTable::new().with_local_provider("on-device"),
+            // Named by config, registered nowhere — REQ-557 ADR-E's shape.
+            Some("deleted-vendor".to_owned()),
+        )
+        .with_provider("on-device", "qwen", native(), ProviderHealth::Healthy);
+
+        // Non-vacuity: a *usable* default is still inherited, so this test is
+        // measuring the screen rather than the absence of inheritance.
+        let usable = Router::new(
+            CategoryTable::new().with_local_provider("on-device"),
+            Some("frontier".to_owned()),
+        )
+        .with_provider("on-device", "qwen", native(), ProviderHealth::Healthy)
+        .with_provider(
+            "frontier",
+            "claude-opus-4",
+            native(),
+            ProviderHealth::Healthy,
+        );
+        assert_eq!(
+            usable.resolve(CoreCategory::Edit).provider_id.unwrap().0,
+            "frontier"
+        );
+
+        let route = router.resolve(CoreCategory::Edit);
+        assert_eq!(
+            route.provider_id.as_ref().map(|p| p.0.as_str()),
+            Some("on-device"),
+            "an unusable default must not cost a healthy machine every turn: {}",
+            route.reason
+        );
+
+        // And `policy show` reports the tier the way it actually resolves —
+        // otherwise the table the user reads is not the table resolution reads.
+        let report = router.tier_report(CoreTier::Build);
+        assert_eq!(report.provider_id.as_deref(), Some("on-device"));
+        assert_eq!(report.origin, TierOrigin::LocalTier);
+        assert_eq!(
+            usable.tier_report(CoreTier::Build).origin,
+            TierOrigin::DefaultProvider
+        );
+    }
+
     /// The `reflex` tier is defined as "sub-second, every turn, **never leaves
     /// the machine**" (REQ-558's tier table). So an UNBOUND reflex tier must
     /// fall to the local provider, never to `default_provider`.
@@ -1765,6 +1873,86 @@ mod tests {
         // go rather than failing over to itself.
         let again = router.on_provider_failure(&next, "deepseek", FailureClass::MalformedResponse);
         assert!(again.route.is_none(), "{:?}", again.route);
+    }
+
+    /// **The fallback survives a retry.** A transient failure re-attempts the
+    /// *same* provider, so it has not spent the alternative the resolution
+    /// chose — and when the retry itself fails hard, the turn must still fall
+    /// over to it.
+    ///
+    /// `timeout → malformed` is not a contrived pair: it is the ordinary shape
+    /// of a provider going bad, and it fits inside the daemon's 2-attempt
+    /// budget. Clearing the fallback on the retry arm meant the second failure
+    /// reported "provider failed and no fallback is configured" — about a config
+    /// that configures one, and after never having tried it.
+    ///
+    /// Non-vacuous by construction: the same second failure applied to the
+    /// *original* route is asserted to fall over too, so this cannot pass by the
+    /// retry route having lost its identity rather than its fallback.
+    #[test]
+    fn a_retry_does_not_spend_the_fallback() {
+        let router = router();
+        let route = router.resolve(CoreCategory::Design);
+        assert_eq!(route.provider_id.as_ref().unwrap().0, "anthropic");
+
+        // 1. A transient timeout: same provider, no event, nothing spent.
+        let retried = router.on_provider_failure(&route, "anthropic", FailureClass::Timeout);
+        assert!(retried.degraded.is_none(), "a retry reports nothing yet");
+        let next = retried.route.expect("a retry continues");
+        assert_eq!(
+            next.provider_id.as_ref().unwrap().0,
+            "anthropic",
+            "a retry re-attempts the same provider"
+        );
+        assert_eq!(
+            next.resolution.as_ref().unwrap().fallback_id.as_deref(),
+            Some("deepseek"),
+            "the retry never reached the fallback, so it must not have spent it"
+        );
+
+        // 2. The retry fails hard. This is the assertion the bug broke.
+        let after = router.on_provider_failure(&next, "anthropic", FailureClass::MalformedResponse);
+        let continued = after
+            .route
+            .expect("a timeout must not cost the turn its configured fallback");
+        assert_eq!(continued.provider_id.as_ref().unwrap().0, "deepseek");
+        assert_eq!(
+            after.degraded.and_then(|d| d.fallback_id).map(|f| f.0),
+            Some("deepseek".to_owned()),
+            "and the degradation event names the fallback it actually took"
+        );
+
+        // 3. Which is spent now — a third failure has nowhere left to go.
+        assert!(router
+            .on_provider_failure(&continued, "deepseek", FailureClass::MalformedResponse)
+            .route
+            .is_none());
+    }
+
+    /// The `Degrade` arm keeps the same provider under a reduced harness
+    /// profile, so it has not spent the fallback either. The sibling of
+    /// [`a_retry_does_not_spend_the_fallback`], for the other non-switching arm.
+    #[test]
+    fn a_degrade_does_not_spend_the_fallback() {
+        let router = router();
+        let route = router.resolve(CoreCategory::Design);
+
+        let degraded =
+            router.on_provider_failure(&route, "anthropic", FailureClass::MalformedToolCall);
+        let next = degraded.route.expect("a degrade continues");
+        assert_eq!(next.provider_id.as_ref().unwrap().0, "anthropic");
+        assert!(next.harness.require_verification);
+        assert_eq!(
+            next.resolution.as_ref().unwrap().fallback_id.as_deref(),
+            Some("deepseek"),
+            "degrading the harness is not failing over; the fallback is unspent"
+        );
+
+        let after = router.on_provider_failure(&next, "anthropic", FailureClass::MalformedResponse);
+        assert_eq!(
+            after.route.expect("falls over").provider_id.unwrap().0,
+            "deepseek"
+        );
     }
 
     #[test]
