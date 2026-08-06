@@ -731,6 +731,86 @@ impl CategoryTable {
     pub fn category_override(&self, category: ConfigurableCategory) -> Option<&CategoryOverride> {
         self.categories.iter().find(|c| c.name == category)
     }
+
+    /// **Which row a category's binding comes from, and the ids it names** —
+    /// override first, then the category's tier, or `None` when neither is
+    /// bound.
+    ///
+    /// This is `override → tier` precedence, and it lives here so it is written
+    /// **once**. [`resolve`] reads it to decide where a turn goes; the daemon's
+    /// turn-failure classifier reads it to answer "does this turn's own binding
+    /// name a provider that cannot serve?". The second is a lookup rather than a
+    /// decision — it selects nothing and screens nothing — but it still has to
+    /// agree with the first about *which binding is under discussion*, and a
+    /// re-spelled `find(...).or_else(find(...))` beside the resolver is exactly
+    /// the second config-reading path BUG-155 found three of.
+    ///
+    /// A **pinned** category ([`Category::Redact`], [`Category::Route`]) has no
+    /// binding at all and answers `None`: config cannot express one, so there is
+    /// nothing here to read. That is not an omission the caller should paper
+    /// over — [`resolve`] takes its unconditional local arm for those two before
+    /// it ever asks.
+    #[must_use]
+    pub fn binding_for(&self, category: Category) -> Option<BoundRow<'_>> {
+        binding_for(&self.tiers, &self.categories, category)
+    }
+}
+
+/// [`CategoryTable::binding_for`] over the two row lists directly.
+///
+/// The daemon holds its rows on `Config` rather than in a `CategoryTable` on
+/// the turn-failure path, and cloning a table per failed turn to ask one
+/// question would be a strange price for reuse. The precedence still has one
+/// implementation; this is just the door that does not require the struct.
+#[must_use]
+pub fn binding_for<'a>(
+    tiers: &'a [TierBinding],
+    categories: &'a [CategoryOverride],
+    category: Category,
+) -> Option<BoundRow<'a>> {
+    let configurable = category.configurable()?;
+    if let Some(over) = categories.iter().find(|c| c.name == configurable) {
+        return Some(BoundRow {
+            row: BindingSource::Override,
+            provider_id: over.provider_id.as_str(),
+            fallback_id: over.fallback_id.as_deref(),
+        });
+    }
+    let tier = category.tier();
+    tiers.iter().find(|t| t.tier == tier).map(|t| BoundRow {
+        row: BindingSource::TierInheritance,
+        provider_id: t.provider_id.as_str(),
+        fallback_id: t.fallback_id.as_deref(),
+    })
+}
+
+/// The row [`CategoryTable::binding_for`] found, and the provider ids it names.
+///
+/// Borrowed rather than owned: every caller is asking a question about the
+/// table, not taking a copy of it away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundRow<'a> {
+    /// Which row this came from — an override, or the category's tier.
+    ///
+    /// Only ever [`BindingSource::Override`] or
+    /// [`BindingSource::TierInheritance`]: the other two variants describe
+    /// outcomes of *resolution*, which this is not.
+    pub row: BindingSource,
+    /// The primary provider the row names. Unscreened — whether it can serve is
+    /// [`resolve`]'s question.
+    pub provider_id: &'a str,
+    /// The fallback the row names, if any. Likewise unscreened.
+    pub fallback_id: Option<&'a str>,
+}
+
+impl BoundRow<'_> {
+    /// Whether either id this row names satisfies `predicate` — the shape every
+    /// caller asking "does this binding involve provider X" wants, without
+    /// having to remember that a row names two.
+    #[must_use]
+    pub fn names(&self, predicate: impl Fn(&str) -> bool) -> bool {
+        predicate(self.provider_id) || self.fallback_id.is_some_and(predicate)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -867,27 +947,11 @@ impl fmt::Display for BindingSource {
     }
 }
 
-/// The two configured rows a *bindable* category can take its provider from.
-///
-/// [`BindingSource`] is this widened by the two legs that return before the row
-/// lookup — the pinned one and the unbound one. Kept as its own private type so
-/// the `via` sentence below matches exhaustively over exactly the cases that can
-/// reach it: with a four-variant match there, two arms would be dead and would
-/// have to invent a sentence for a state that cannot occur.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Row {
-    Override,
-    Tier,
-}
-
-impl Row {
-    const fn source(self) -> BindingSource {
-        match self {
-            Row::Override => BindingSource::Override,
-            Row::Tier => BindingSource::TierInheritance,
-        }
-    }
-}
+// A private `Row` enum used to sit here, narrowing `BindingSource` to the two
+// variants a bindable category can reach so the `via` sentence could match
+// exhaustively. It is gone: `CategoryTable::binding_for` now owns the
+// override → tier lookup and reports the row it found, so a second vocabulary
+// for the same two cases would be one more thing to keep in step.
 
 /// Resolve `category` to a provider through override → tier → declared error
 /// (BR-8, BR-12).
@@ -935,31 +999,24 @@ where
     // has spent what the routing decision was meant to save. It is not `if binding.is_none() { local }` — config cannot
     // express a redact binding, so there is no condition here to get wrong the
     // day someone adds a key (LESSON-443).
-    let Some(configurable) = category.configurable() else {
+    if category.configurable().is_none() {
         return resolve_pinned_local(
             category,
             table.local_provider_id.as_deref(),
             &health,
             &usable,
         );
-    };
+    }
 
-    let binding = table
-        .category_override(configurable)
-        .map(|o| {
-            (
-                Row::Override,
-                o.provider_id.as_str(),
-                o.fallback_id.as_deref(),
-            )
-        })
-        .or_else(|| {
-            table
-                .tier_binding(tier)
-                .map(|t| (Row::Tier, t.provider_id.as_str(), t.fallback_id.as_deref()))
-        });
-
-    let Some((row, primary, fallback)) = binding else {
+    // Override → tier, asked of the table rather than re-spelled here, so the
+    // daemon's turn-failure classifier can ask the same question and get the
+    // same answer (`CategoryTable::binding_for`).
+    let Some(BoundRow {
+        row: source,
+        provider_id: primary,
+        fallback_id: fallback,
+    }) = table.binding_for(category)
+    else {
         // BR-8: the category names itself and its unset binding. Nothing is
         // synthesized and no other tier is borrowed from.
         return CategoryResolution {
@@ -977,10 +1034,10 @@ where
         };
     };
 
-    let source = row.source();
-    let via = match row {
-        Row::Override => "per its per-category override".to_owned(),
-        Row::Tier => format!("through its '{tier}' tier binding"),
+    let via = match source {
+        BindingSource::Override => "per its per-category override".to_owned(),
+        // `binding_for` returns only these two, and says so.
+        _ => format!("through its '{tier}' tier binding"),
     };
 
     match screen(primary, &health, &usable) {
@@ -1205,25 +1262,52 @@ where
 /// classifier.
 ///
 /// This and [`categories_for_phase`] are the *same knowledge* as BR-10's
-/// migration table, written once (ADR-F). Written twice they would drift, and
-/// the drift would be invisible — one is exercised at config load, the other on
-/// every structured turn.
+/// migration table, and ADR-F says it is written **once**. So this is a **view**
+/// of that table — its first entry — rather than a second `match` that agrees
+/// with it today.
+///
+/// ADR-C's mapping and ADR-F's expansion cannot be two tables and still be one
+/// fact. Written separately they would drift, and the drift would be invisible
+/// in the worst way: one is exercised at config load and the other on every
+/// structured turn, so a disagreement means the migration binds a category the
+/// turn never dispatches on — the user's rule silently applied to nothing.
+///
+/// **The first entry is the primary category by construction**, which is what
+/// makes the projection meaningful rather than incidental:
+/// [`categories_for_phase`] lists each phase's categories in expansion order,
+/// primary first (`implement` → `edit`, then `shell`; `io` → `digest`, then the
+/// rest). That ordering is the table's contract, pinned by
+/// `the_primary_category_is_the_first_of_the_expansion`.
 #[must_use]
 pub const fn category_for_phase(phase: Phase) -> Category {
-    match phase {
-        Phase::Spec | Phase::Architect => Category::Design,
-        Phase::Implement => Category::Edit,
-        Phase::Review => Category::Review,
-        Phase::Io => Category::Digest,
+    match categories_for_phase(phase) {
+        [primary, ..] => *primary,
+        // Unreachable: every arm of `categories_for_phase` is a non-empty
+        // literal. A `const fn` cannot panic usefully here, and inventing a
+        // category would be worse than naming the one a phase with no
+        // expansion would most plausibly want — so if this ever fires, the
+        // test above it fails first.
+        [] => Category::Edit,
     }
 }
 
 /// Every category an existing phase→provider binding expands to (BR-10).
 ///
-/// The one-to-many sibling of [`category_for_phase`], used by the migration.
+/// **The one table.** [`category_for_phase`] is a projection of this one —
+/// its first entry — rather than a second `match` beside it (ADR-C/ADR-F are
+/// one fact, not two).
+///
 /// `implement` expands to `edit` **and** `shell`, and `io` to four categories,
 /// because one old knob becomes several — the migration reports each expansion
 /// by name so a user who wanted them to differ knows to split them.
+///
+/// # Order is contract
+///
+/// Each arm lists its categories **primary first**: the one a structured turn in
+/// that phase actually dispatches on, then the rest of the expansion. Reordering
+/// an arm silently changes where every structured turn in that phase goes, which
+/// is why `the_primary_category_is_the_first_of_the_expansion` pins each one by
+/// name rather than merely checking the two functions agree with each other.
 ///
 /// There is no `freeform` leg: a `[[routing]]` rule targeting it has never
 /// loaded (rejected by `Config::validate` before ADR-G, by serde after it), so
@@ -2105,6 +2189,80 @@ mod tests {
         }
     }
 
+    /// **`binding_for` is the one implementation of override → tier**, and
+    /// `resolve` agrees with it by construction rather than by coincidence.
+    ///
+    /// The daemon's turn-failure classifier asks this accessor "does this
+    /// turn's own binding name a provider that cannot serve?", and it used to
+    /// re-spell the precedence as its own pair of `find`s. That is a second
+    /// config-reading path answering a question the resolver owns — BUG-155's
+    /// shape — and the failure is quiet: the two disagree about *which* binding
+    /// is under discussion, so the error names the wrong provider while the
+    /// turn goes somewhere else.
+    #[test]
+    fn the_binding_lookup_and_the_resolver_read_the_same_row() {
+        let table = tiers_bound_to("tier-provider").with_override(CategoryOverride {
+            name: ConfigurableCategory::Edit,
+            provider_id: "override-provider".to_owned(),
+            fallback_id: Some("override-fallback".to_owned()),
+        });
+
+        // The override wins for the category that has one...
+        let row = table.binding_for(Category::Edit).expect("edit is bound");
+        assert_eq!(row.provider_id, "override-provider");
+        assert_eq!(row.fallback_id, Some("override-fallback"));
+        assert_eq!(row.row, BindingSource::Override);
+        // ...and `names` covers both ids, which is the whole reason the caller
+        // does not get to see them separately.
+        assert!(row.names(|id| id == "override-fallback"));
+        assert!(!row.names(|id| id == "tier-provider"));
+
+        // ...and the tier serves every category that does not.
+        let row = table
+            .binding_for(Category::Design)
+            .expect("design is bound");
+        assert_eq!(row.provider_id, "tier-provider");
+        assert_eq!(row.row, BindingSource::TierInheritance);
+
+        // A pinned category has no binding to read at all: config cannot
+        // express one, so `None` here is a fact rather than an omission.
+        for pinned in [Category::Redact, Category::Route] {
+            assert_eq!(table.binding_for(pinned), None, "{pinned}");
+        }
+
+        // The agreement, across every category and both readers: whatever
+        // `resolve` selects is an id the lookup names.
+        for category in Category::ALL {
+            let r = resolve(category, &table, healthy, all_usable);
+            match table.binding_for(category) {
+                Some(row) => {
+                    assert_eq!(
+                        r.provider_id.as_deref(),
+                        Some(row.provider_id),
+                        "{category}: the resolver chose a provider the lookup \
+                         does not name"
+                    );
+                    assert_eq!(r.source, row.row, "{category}");
+                }
+                None => assert_eq!(
+                    r.provider_id.as_deref(),
+                    Some(LOCAL),
+                    "{category}: nothing bound, so only the pinned-local arm \
+                     may have produced a provider"
+                ),
+            }
+        }
+
+        // And the free-function door reads the same rows as the method.
+        for category in Category::ALL {
+            assert_eq!(
+                binding_for(&table.tiers, &table.categories, category),
+                table.binding_for(category),
+                "{category}"
+            );
+        }
+    }
+
     // -- phase → category (ADR-F) ------------------------------------------
 
     #[test]
@@ -2147,16 +2305,53 @@ mod tests {
         assert_eq!(Phase::ALL.len(), 5);
     }
 
+    /// **ADR-C and ADR-F are one fact, and the code says so structurally.**
+    ///
+    /// `category_for_phase` is now a *projection* of `categories_for_phase` —
+    /// its first entry — so the two cannot drift. That makes the agreement
+    /// check below a tautology, which is the point: the property is enforced by
+    /// construction rather than watched by a test.
+    ///
+    /// What still needs asserting is the thing the projection **assumes**: that
+    /// the first entry of each expansion really is the category a structured
+    /// turn in that phase should dispatch on. Nothing about the type enforces
+    /// the ordering, so it is pinned here per phase, by name. Reorder any arm of
+    /// `categories_for_phase` — putting `shell` before `edit`, say — and every
+    /// structured `implement` turn silently changes destination; this is what
+    /// turns red.
     #[test]
-    fn dispatch_and_migration_agree_on_every_live_phase() {
-        // ADR-F: one knowledge, two uses. The dispatch category is the head of
-        // the migration expansion, so the two cannot drift. Every phase is a
-        // live phase now that `Freeform` is retired — there is no arm to skip.
+    fn the_primary_category_is_the_first_of_the_expansion() {
+        // The ordering contract, per phase, by name. The migration's own
+        // expansion order is asserted in `phase_expansions_match_br_10`; this
+        // asserts what the HEAD of each expansion means.
+        for (phase, primary) in [
+            (Phase::Spec, Category::Design),
+            (Phase::Architect, Category::Design),
+            (Phase::Implement, Category::Edit),
+            (Phase::Review, Category::Review),
+            (Phase::Io, Category::Digest),
+        ] {
+            assert_eq!(
+                categories_for_phase(phase).first(),
+                Some(&primary),
+                "the `{phase}` expansion must lead with `{primary}` — a \
+                 structured turn in that phase dispatches on whatever is first"
+            );
+            assert_eq!(category_for_phase(phase), primary, "{phase}");
+        }
+
+        // And the projection holds for every phase, including any added later
+        // without a line above.
         for phase in Phase::ALL {
             assert_eq!(
                 categories_for_phase(phase).first(),
                 Some(&category_for_phase(phase)),
                 "{phase}"
+            );
+            assert!(
+                !categories_for_phase(phase).is_empty(),
+                "an empty expansion would make `category_for_phase` fall through \
+                 to its unreachable arm: {phase}"
             );
         }
     }

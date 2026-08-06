@@ -603,7 +603,7 @@ pub fn truncate_middle(text: &str, max_bytes: usize) -> String {
 }
 
 /// Largest index ≤ `i` that is a `char` boundary of `s`.
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+pub(super) fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     if i >= s.len() {
         return s.len();
     }

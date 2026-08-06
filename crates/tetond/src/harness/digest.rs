@@ -56,7 +56,7 @@ use teton_providers::{Message, Provider, Role, Transport, TurnEvent, TurnRequest
 use crate::cost::CostAttribution;
 use crate::egress::{Egress, EgressContext, Provenance};
 
-use super::context::ToolProvenance;
+use super::context::{floor_char_boundary, ToolProvenance, SUMMARIZER_INPUT_MAX_BYTES};
 use super::render::render_duty;
 
 /// The egress [`Provenance`] of one tool result.
@@ -222,6 +222,20 @@ impl Digester for LocalDigester {
     }
 }
 
+/// Byte ceiling on what a remote `digest` will accumulate from its stream.
+///
+/// `max_tokens` on the request is a *request*; a provider that ignores it, or a
+/// stream that does not terminate, would otherwise grow an unbounded buffer on
+/// the one path whose entire job is to make its input smaller. The local
+/// digester has no equivalent exposure — its engine returns a completed string
+/// under `GenParams` — so the bound lives here rather than at the call site.
+///
+/// Set to the summarizer's own **input** ceiling: a summary larger than the
+/// text it summarizes is not a summary, so nothing legitimate is lost, and
+/// reusing the constant means the two cannot drift into a state where the duty
+/// can return more than `summarize_if_large` would ever have sent.
+const DIGEST_OUTPUT_MAX_BYTES: usize = SUMMARIZER_INPUT_MAX_BYTES;
+
 /// A remote provider serving `digest`, through the single egress choke point.
 ///
 /// The provider is handed only the provenance-scoped `&dyn Transport` that
@@ -273,13 +287,30 @@ impl<T: Transport> Digester for RemoteDigester<T> {
         let mut text = String::new();
         while let Some(event) = stream.next().await {
             match event.map_err(|err| err.to_string())? {
-                TurnEvent::TextDelta(delta) => text.push_str(&delta),
+                // Bounded on the way in. `max_tokens` is a request, and a
+                // request is not a guarantee: a provider that ignores it — or a
+                // stream that simply does not stop — would otherwise grow this
+                // buffer without limit, on a path whose entire purpose is to
+                // SHRINK its input. The bound is the summarizer's own input
+                // ceiling, which a summary can never legitimately exceed; past
+                // it, stop accumulating and let the stream drain.
+                TurnEvent::TextDelta(delta) => {
+                    if text.len() < DIGEST_OUTPUT_MAX_BYTES {
+                        text.push_str(&delta);
+                    }
+                }
                 // A duty was offered no tools, so a tool call is a provider
                 // ignoring the request; drop it rather than fold it into a
                 // summary. `Completed` carries usage, which the meter reads off
                 // the stream at the choke point.
                 TurnEvent::ToolCall(_) | TurnEvent::Completed(_) => {}
             }
+        }
+        // The last delta may straddle the bound, so trim to it here rather than
+        // refusing a partial delta above — dropping a whole delta would cut the
+        // summary at an arbitrary earlier point for no gain.
+        if text.len() > DIGEST_OUTPUT_MAX_BYTES {
+            text.truncate(floor_char_boundary(&text, DIGEST_OUTPUT_MAX_BYTES));
         }
         Ok(text.trim().to_owned())
     }
@@ -339,6 +370,9 @@ mod tests {
     /// non-vacuous.
     struct WireProvider {
         reply: String,
+        /// How many times the reply delta is streamed. `1` is an ordinary
+        /// provider; anything larger is one ignoring its token budget.
+        repeat: usize,
     }
 
     #[async_trait]
@@ -368,13 +402,16 @@ mod tests {
                     TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
                     _ => ProviderError::Transport,
                 })?;
-            let events: Vec<Result<TurnEvent, ProviderError>> = vec![
-                Ok(TurnEvent::TextDelta(self.reply.clone())),
-                Ok(TurnEvent::Completed(TurnCompletion {
-                    usage: TokenUsage::default(),
-                    stop_reason: StopReason::EndTurn,
-                })),
-            ];
+            // `repeat` models a provider that ignores `max_tokens`: the same
+            // delta over and over, which is what an unbounded accumulator would
+            // happily grow on.
+            let mut events: Vec<Result<TurnEvent, ProviderError>> = (0..self.repeat)
+                .map(|_| Ok(TurnEvent::TextDelta(self.reply.clone())))
+                .collect();
+            events.push(Ok(TurnEvent::Completed(TurnCompletion {
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
+            })));
             Ok(Box::pin(stream::iter(events)))
         }
     }
@@ -399,6 +436,7 @@ mod tests {
             "frontier",
             Box::new(WireProvider {
                 reply: reply.to_owned(),
+                repeat: 1,
             }),
             egress,
             "claude-opus-4",
@@ -414,6 +452,67 @@ mod tests {
             .iter()
             .map(|body| String::from_utf8_lossy(body).into_owned())
             .collect()
+    }
+
+    /// **A provider that ignores `max_tokens` cannot grow the digest buffer
+    /// without limit.**
+    ///
+    /// `max_tokens` on the request is a request. The remote digester used to
+    /// accumulate every `TextDelta` into a `String` with no ceiling — on the one
+    /// path whose entire purpose is to make its input *smaller*, and driven by a
+    /// third party. A provider that streams forever, or simply ignores the
+    /// budget, would grow that buffer until the process died.
+    ///
+    /// Bounded harness-side, at the summarizer's own input ceiling: a summary
+    /// larger than the text it summarizes is not a summary, so the bound costs
+    /// nothing legitimate.
+    #[tokio::test]
+    async fn a_remote_digest_is_bounded_however_much_the_provider_streams() {
+        // 4 KiB per delta × 64 deltas = 256 KiB offered, 16 KiB accepted.
+        let chunk = "x".repeat(4096);
+        let transport = CaptureTransport::default();
+        let egress = Egress::new(transport, Vec::new(), Arc::new(NoopSink));
+        let route = DigestRoute::remote(
+            "frontier",
+            Box::new(WireProvider {
+                reply: chunk.clone(),
+                repeat: 64,
+            }),
+            egress,
+            "claude-opus-4",
+            "sess-1",
+        );
+
+        let out =
+            summarize_if_large(&route, "read", &oversized(), 50, &ToolProvenance::none()).await;
+
+        // `summarize_if_large` prefixes its own `[summarized … elided]` header,
+        // so the summary itself is what the bound governs. The header is short
+        // and fixed; measuring it in is what the allowance below is for.
+        let summary = out
+            .text
+            .split_once('\n')
+            .expect("the harness header is one line")
+            .1;
+        assert!(
+            summary.len() <= DIGEST_OUTPUT_MAX_BYTES,
+            "a digest accepted {} bytes from a provider ignoring its token \
+             budget; the ceiling is {DIGEST_OUTPUT_MAX_BYTES}",
+            summary.len()
+        );
+        // Non-vacuity, both directions: the provider really did offer far more
+        // than the bound (so the cap was exercised), and the digest really did
+        // accumulate up to it (so this is a cap and not a refusal).
+        assert!(
+            chunk.len() * 64 > DIGEST_OUTPUT_MAX_BYTES * 4,
+            "the fixture must offer well over the bound"
+        );
+        assert!(
+            summary.len() > DIGEST_OUTPUT_MAX_BYTES / 2,
+            "the cap must let a real summary through: {} bytes",
+            summary.len()
+        );
+        assert!(out.engine_error.is_none(), "{:?}", out.engine_error);
     }
 
     /// An oversized tool result: over both the token and the byte trigger.

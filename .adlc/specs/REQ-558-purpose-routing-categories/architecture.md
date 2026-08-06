@@ -130,7 +130,9 @@ that did not exist before, and running it on structured turns — which already 
 what they are doing — would add cost for no information.
 
 **Consequences**: the phase→category map is used in two places (this dispatch and
-BR-10's migration) and must be one function, not two. See ADR-F.
+BR-10's migration) and must be one table, not two. See ADR-F — which, as
+implemented, is stronger than "one function": the one-to-many expansion is the
+table, and this dispatch mapping is a *projection* of it.
 
 ### ADR-D: One resolver, one return value, three surfaces derived from it
 
@@ -176,15 +178,27 @@ by construction.
 **Consequences**: the mutation check for AC-10 gains a leg: un-screening the
 category resolver must turn a test red.
 
-### ADR-F: The phase→category map is one function, used by both dispatch and migration
+### ADR-F: The phase→category map is one table, and the dispatch mapping is a view of it
 
-**Decision**: a single `category_for_phase(Phase) -> Category` (plus its
-one-to-many sibling for migration) in `teton-core`. ADR-C's structured dispatch and
-BR-10's migration both call it.
+**Decision** *(as implemented; the original wording said "a single
+`category_for_phase` plus its one-to-many sibling", which is two `match`
+expressions and therefore two tables)*: `categories_for_phase(Phase) ->
+&'static [Category]` is **the** table. `category_for_phase(Phase) -> Category`
+is defined as its first entry. ADR-C's structured dispatch and BR-10's migration
+read the same data, not two copies that agree.
 
 **Rationale**: BR-10's mapping table and ADR-C's dispatch mapping are the same
 knowledge. Written twice, they drift — and the drift is invisible, because one is
-exercised at config-load and the other on every structured turn.
+exercised at config-load and the other on every structured turn. A test asserting
+the two agree only catches drift *after* someone writes it; a projection makes
+the disagreement unrepresentable.
+
+**Consequences**: the expansion's **order** becomes contract. Each arm lists its
+categories primary-first, because the head is what every structured turn in that
+phase dispatches on — reordering `implement` from `[edit, shell]` to
+`[shell, edit]` would silently redirect every structured implement turn. That is
+the property `the_primary_category_is_the_first_of_the_expansion` pins, per phase
+and by name; the old agreement check became a tautology and was folded into it.
 
 ### ADR-G: `Phase::Freeform` retires; the ledger's `"freeform"` string maps to `None` explicitly
 

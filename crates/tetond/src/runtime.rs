@@ -821,22 +821,17 @@ impl DaemonRuntime {
         //
         // What follows is a *lookup*, not a second resolution: it selects nothing
         // and screens nothing, it only asks which ids this turn's binding names.
-        // Ordering the override ahead of the tier mirrors `category::resolve`
-        // because it is reading the same table, not because it re-decides
-        // anything (ADR-D).
+        //
+        // The override → tier precedence is **asked of the table**
+        // (`CategoryTable::binding_for`), which is the same accessor
+        // `category::resolve` reads. It used to be re-spelled here as a pair of
+        // `find`s, which is a second config-reading path answering a question
+        // the resolver already owns — the shape BUG-155 found three of, and the
+        // failure mode is quiet: the two disagree about which binding is under
+        // discussion, so the message names the wrong provider.
         let binding_names_unusable = category.is_some_and(|category| {
-            let over = category
-                .configurable()
-                .and_then(|c| config.categories.iter().find(|o| o.name == c))
-                .map(|o| (&o.provider_id, o.fallback_id.as_ref()));
-            let inherited = config
-                .tiers
-                .iter()
-                .find(|t| t.tier == category.tier())
-                .map(|t| (&t.provider_id, t.fallback_id.as_ref()));
-            over.or(inherited).is_some_and(|(primary, fallback)| {
-                unusable.contains(primary) || fallback.is_some_and(|fb| unusable.contains(fb))
-            })
+            teton_core::category::binding_for(&config.tiers, &config.categories, category)
+                .is_some_and(|row| row.names(|id| unusable.iter().any(|u| u == id)))
         });
         let unusable_is_implicated = !unusable.is_empty()
             && (usable_remote.is_empty() || default_is_unusable || binding_names_unusable);
@@ -1620,10 +1615,7 @@ impl DaemonRuntime {
         prompt: &str,
     ) -> crate::router::Route {
         if self.session_taint.is_tainted(session_id) {
-            return router.resolve_local_pin(
-                "session previously touched local-only content; pinned to the local tier \
-                 (BR-1 backstop)",
-            );
+            return router.resolve_local_pin(taint_pin_reason("this turn"));
         }
 
         match mode {
@@ -1867,10 +1859,7 @@ impl DaemonRuntime {
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
     ) -> DigestRoute {
         let route = if self.session_taint.is_tainted(session_id) {
-            router.resolve_local_pin(
-                "session previously touched local-only content; the `digest` duty is pinned \
-                 to the local tier (BR-1 backstop)",
-            )
+            router.resolve_local_pin(taint_pin_reason("the `digest` duty"))
         } else {
             router.resolve(Category::Digest)
         };
@@ -3542,6 +3531,26 @@ fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) ->
         message: format!("{} {}", route.reason, classified.message),
         ..classified
     }
+}
+
+/// The BR-7 sentence a taint-pinned route carries, for whatever `what` names.
+///
+/// Two call sites reach the pin — a turn (`dispatch_route`) and the `digest`
+/// duty (`digest_route`) — and they had near-identical hand-written sentences
+/// with nothing observing the difference. That is the shape this codebase
+/// already refuses for the `ParseCategoryError` pair: two spellings of one fact
+/// drift, and here the drift is user-visible on the one surface that explains a
+/// privacy decision. So the cause and the remedy are written once and the
+/// subject is the parameter, which is the only part that legitimately differs.
+///
+/// `what` is a noun phrase naming the thing being pinned. It is prose, not an
+/// identifier: the sentence is read by a person deciding whether the daemon did
+/// something surprising.
+fn taint_pin_reason(what: &str) -> String {
+    format!(
+        "session previously touched local-only content; {what} is pinned to the local tier \
+         (BR-1 backstop)"
+    )
 }
 
 /// The local tier's canonical provider id when the config declares no explicit
@@ -5443,6 +5452,55 @@ provider_id = "on-device"
             local_tier_gated(false, true),
             "a real engine must not un-gate the tier before the user has decided"
         );
+    }
+
+    /// **Both taint-pin sentences come from one place, and each names what it
+    /// pinned.**
+    ///
+    /// A turn and the `digest` duty both reach `resolve_local_pin`, and both
+    /// used to hand it a hand-written sentence. Near-identical, with nothing
+    /// observing the difference — the shape this codebase already refuses for
+    /// the `ParseCategoryError` pair. The cause and the remedy now have one
+    /// home; only the subject differs, because only the subject legitimately
+    /// does.
+    ///
+    /// The drift this catches is user-visible on the one surface that explains
+    /// a privacy decision: a reader who sees two different accounts of why the
+    /// daemon stayed local has to work out whether they mean the same thing.
+    #[test]
+    fn both_taint_pin_sentences_share_one_cause_and_name_their_own_subject() {
+        let turn = taint_pin_reason("this turn");
+        let duty = taint_pin_reason("the `digest` duty");
+
+        // The shared half: the cause, and the rule it comes from.
+        for sentence in [&turn, &duty] {
+            assert!(
+                sentence.contains("previously touched local-only content"),
+                "the sentence must name the CAUSE: {sentence}"
+            );
+            assert!(
+                sentence.contains("pinned to the local tier"),
+                "and what was done about it: {sentence}"
+            );
+            assert!(sentence.contains("BR-1 backstop"), "{sentence}");
+        }
+
+        // The differing half: each names its own subject, so a user reading the
+        // duty's line is not left thinking their turn went local.
+        assert!(turn.contains("this turn"), "{turn}");
+        assert!(duty.contains("`digest` duty"), "{duty}");
+        assert_ne!(turn, duty);
+
+        // And both are what the daemon's two call sites actually produce. This
+        // is the leg that fails if someone re-inlines a literal at either site.
+        let router = build_router(&Config::default(), true, &BTreeMap::new());
+        for reason in [&turn, &duty] {
+            assert_eq!(
+                router.resolve_local_pin(reason.clone()).reason,
+                *reason,
+                "the router carries the sentence verbatim"
+            );
+        }
     }
 
     /// **A route that DID select a provider keeps the classifier's sentence,
