@@ -5491,16 +5491,54 @@ provider_id = "on-device"
         assert!(duty.contains("`digest` duty"), "{duty}");
         assert_ne!(turn, duty);
 
-        // And both are what the daemon's two call sites actually produce. This
-        // is the leg that fails if someone re-inlines a literal at either site.
-        let router = build_router(&Config::default(), true, &BTreeMap::new());
-        for reason in [&turn, &duty] {
-            assert_eq!(
-                router.resolve_local_pin(reason.clone()).reason,
-                *reason,
-                "the router carries the sentence verbatim"
-            );
-        }
+        // The TURN call site, through the real function. Asserting only that
+        // `taint_pin_reason` returns a good sentence says nothing about whether
+        // anyone calls it, so re-inlining a literal in `dispatch_route` would
+        // leave a helper-only test green.
+        let engine = crate::classify::test_support::CountingEngine::answering("edit");
+        let runtime = DaemonRuntime::minimal();
+        *runtime.config.lock().expect("config mutex") = Config {
+            providers: vec![ModelProvider {
+                id: "on-device".to_owned(),
+                kind: ProviderKind::Local,
+                endpoint: None,
+                model: None,
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            }],
+            ..Config::default()
+        };
+        runtime
+            .engine
+            .install("counting".to_owned(), engine.handle());
+        runtime.local_available.store(true, Ordering::SeqCst);
+        let config = runtime.config.lock().expect("config mutex").clone();
+        let router = build_router(&config, true, &BTreeMap::new());
+        let session = SessionId::from("tainted");
+        runtime.session_taint.mark(&session);
+
+        let turn_route = futures::executor::block_on(runtime.dispatch_route(
+            &router,
+            &session,
+            SessionMode::Freeform,
+            None,
+            "anything",
+        ));
+        assert_eq!(
+            turn_route.reason, turn,
+            "`dispatch_route` must carry the shared sentence, not a literal of \
+             its own"
+        );
+
+        // The DUTY call site is deliberately NOT asserted through
+        // `digest_route`, because its sentence cannot be observed there. Every
+        // path out of `digest_route` either returns `Serves` (which carries no
+        // reason) or replaces the route's reason with one of its own about the
+        // engine or the provider entry. The pin sentence it passes to
+        // `resolve_local_pin` therefore reaches no user today — worth knowing,
+        // and the reason this half is pinned at the helper only. Making it
+        // observable means carrying the reason onto `DigestRoute::Serves`,
+        // which is a change to the type rather than to this test.
     }
 
     /// **A route that DID select a provider keeps the classifier's sentence,
