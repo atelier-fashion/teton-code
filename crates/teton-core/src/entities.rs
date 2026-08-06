@@ -5,7 +5,6 @@
 //! into a live secret) is `tetond`'s job — this crate only ever sees the
 //! reference, never the secret itself (BR-7).
 
-use crate::phase::Phase;
 use serde::{Deserialize, Serialize};
 
 /// The transport/vendor family of a provider. Drives which adapter is used and
@@ -145,24 +144,17 @@ impl ModelProvider {
     }
 }
 
-/// One row of the **retired** phase → provider routing table (System Model:
-/// `RoutingPolicy`).
-///
-/// Nothing dispatches on it: REQ-558 made the category the runtime dispatch key
-/// in both session modes, and [`crate::TierBinding`] / [`crate::CategoryOverride`]
-/// are the configured table now. This type survives only so TASK-055's migration
-/// can *read* an existing `[[routing]]` table — a table that cannot be opened
-/// cannot be migrated — and goes when that migration lands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoutingPolicy {
-    /// The lifecycle phase this rule applies to.
-    pub phase: Phase,
-    /// Primary provider id (FK → [`ModelProvider::id`]).
-    pub provider_id: String,
-    /// Optional fallback provider id, used when the primary errors/times out.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_id: Option<String>,
-}
+// REQ-558 TASK-055: `RoutingPolicy` — the phase → provider routing table's row
+// type — is gone. It was the System Model's configured routing entity; the
+// configured table is now `TierBinding` + `CategoryOverride` in `category.rs`,
+// beside the resolver that reads them, and a category is the dispatch key in
+// both session modes (BR-1).
+//
+// What remains of the old table is `config::LegacyRoutingRule`: a row shape the
+// migration reads once from an existing `[[routing]]` block and never writes
+// back. It lives in `config.rs` rather than here on purpose — this module holds
+// the entities the system runs on, and that one is a file format we are
+// retiring, not an entity anything dispatches on.
 
 /// Whether boundary content may leave the machine, and how (System Model:
 /// `PrivacyBoundary.mode`). Default is the strict [`BoundaryMode::LocalOnly`].

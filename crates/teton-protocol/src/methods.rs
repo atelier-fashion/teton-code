@@ -492,7 +492,14 @@ pub struct ProviderConfig {
     pub auth_ref: Option<String>,
 }
 
-/// A single phase→provider routing rule (spec entity `RoutingPolicy`).
+/// A single phase→provider routing rule.
+///
+/// **Retired (REQ-558).** Its config-side entity `RoutingPolicy` is gone: a
+/// category is the dispatch key now, and `[[tiers]]` / `[[categories]]` are the
+/// configured table. This wire type outlives it for exactly one task —
+/// `ConfigUpdate::SetRoutingRule` still accepts a phase and writes the tier
+/// bindings that phase's categories inherit, so an older client is not silently
+/// ignored — and TASK-056 replaces it with tier and category forms.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingRule {
     /// The phase this rule governs.

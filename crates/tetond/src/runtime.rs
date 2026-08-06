@@ -93,7 +93,7 @@ use teton_core::boundary::BoundaryMatcher;
 use teton_core::category::{
     categories_for_phase, category_for_phase, Category, CategoryTable, Tier, TierBinding,
 };
-use teton_core::config::{Config, LocalModelConfig};
+use teton_core::config::{Config, LocalModelConfig, RoutingMigration};
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
 };
@@ -110,7 +110,7 @@ use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     ConfigSnapshot, ConfigUpdate, CostGroupView, CostQueryResult, CostReportView,
     ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult, ModelSetResult,
-    ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, RoutingRule,
+    ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
 };
 use teton_protocol::{
     Phase as ProtoPhase, PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId,
@@ -595,6 +595,12 @@ impl DaemonRuntime {
             config_path.as_deref(),
             &PriceTable::bundled(),
         );
+        // REQ-558 BR-10 / AC-7: the phase table becomes categories, and the
+        // `default_provider` fill becomes real `[[tiers]]` rows. Strictly AFTER
+        // the model migration, which is what may *set* `default_provider` on a
+        // pre-REQ-557 config (BUG-155) — run first, this leg would find nothing
+        // to materialize and the tiers would stay invisible for another release.
+        migrate_and_report_routing_table(&mut config, config_path.as_deref());
 
         // --- repo root (the tool jail) ---
         let repo_root = std::env::var_os("TETON_REPO_ROOT")
@@ -2103,6 +2109,114 @@ fn migrate_and_report_provider_models(
     }
 }
 
+/// The startup lines a [`RoutingMigration`] owes the user (BR-10, AC-7).
+///
+/// Split from the printing so it can be tested. "Each one-to-many expansion is
+/// **reported by name**" is an acceptance criterion, and a criterion whose only
+/// witness is an `eprintln!` is a criterion nothing checks.
+///
+/// The one-to-many case gets the extra sentence, because it is the one with
+/// something for the user to *do*: their single knob is now several, and if they
+/// wanted `edit` and `shell` — or the four `io` categories — to differ, this is
+/// the moment they learn they can say so.
+fn routing_migration_report(report: &RoutingMigration) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for migrated in &report.phases {
+        let phase = migrated.phase;
+        let provider = &migrated.provider_id;
+        match migrated.categories.len() {
+            0 => {}
+            1 => lines.push(format!(
+                "tetond: migrated the retired `{phase}` routing rule to the `{}` category, still \
+                 on provider `{provider}` (REQ-558). Phases no longer route; categories do.",
+                migrated.categories[0]
+            )),
+            n => {
+                let names: Vec<String> = migrated
+                    .categories
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect();
+                lines.push(format!(
+                    "tetond: migrated the retired `{phase}` routing rule to {n} categories, all \
+                     still on provider `{provider}` (REQ-558): {}. That was one setting and is \
+                     now {n} — if you want them to differ, split them with \
+                     `teton policy set-category <category> <provider>`.",
+                    names.join(", ")
+                ));
+            }
+        }
+
+        // The lossy half. Five phases map onto four category groups, so `spec`
+        // and `architect` collapse onto `design` — a user who routed them
+        // differently has lost a distinction and must be told which side
+        // survived, by name. Left unsaid, this is a routing rule disappearing
+        // from their config file with nothing to explain where their turns went.
+        for lost in &migrated.dropped {
+            lines.push(format!(
+                "tetond: the retired `{phase}` routing rule also mapped to the `{}` category, \
+                 which was already bound to `{}` (REQ-558) — that binding was kept and this \
+                 rule's `{provider}` was dropped for it. Phases that shared a category now \
+                 share one setting; rebind it with \
+                 `teton policy set-category {} <provider>`.",
+                lost.category, lost.kept_provider_id, lost.category
+            ));
+        }
+    }
+
+    if let Some(provider) = &report.default_provider {
+        let tiers: Vec<String> = report
+            .default_tiers
+            .iter()
+            .map(|t| format!("`{t}`"))
+            .collect();
+        lines.push(format!(
+            "tetond: wrote `default_provider = \"{provider}\"` into the {} tier bindings \
+             (REQ-558) — where your unbound tiers were already sending turns, now visible and \
+             editable with `teton policy set-tier <tier> <provider>`. `reflex` is left unbound \
+             on purpose: it is the sub-second, every-turn tier that never leaves the machine, so \
+             it inherits your local model rather than a remote default.",
+            tiers.join(", ")
+        ));
+    }
+
+    lines
+}
+
+/// Run the one-shot REQ-558 routing migration on a freshly loaded config,
+/// report every expansion by name, and persist the result.
+///
+/// Same shape as [`migrate_and_report_provider_models`], for the same reasons:
+/// key on the absence of the old state, report what changed, write **only** if
+/// something changed, and write atomically (BUG-155 C3). A migration that
+/// cannot be saved leaves the config byte-for-byte intact, says so, and runs
+/// again next start — the in-memory result still stands for this session, so a
+/// failed write costs a warning rather than a session.
+fn migrate_and_report_routing_table(config: &mut Config, path: Option<&Path>) {
+    let report = config.migrate_routing_to_categories();
+    if report.is_empty() {
+        return;
+    }
+
+    for line in routing_migration_report(&report) {
+        eprintln!("{line}");
+    }
+
+    // A missing config path (a defaulted config) falls through silently: the
+    // in-memory migration still stands for this session, and there is no file
+    // whose retired table could be found again.
+    if let Some(path) = path {
+        if let Err(err) = write_config_atomically(path, config) {
+            eprintln!(
+                "tetond: WARNING — the routing migration could not be saved ({err}), so it will \
+                 run again on the next start. Your existing config file is unchanged and routing \
+                 this session is unaffected."
+            );
+        }
+    }
+}
+
 /// Resolve the MCP servers this daemon serves (ADR-003 / AC-9).
 ///
 /// The main config document (`[[mcp_server]]`, already validated by
@@ -3257,10 +3371,10 @@ fn build_router(
     let default_provider = config.default_provider.clone();
 
     // REQ-558 BR-1: the configured tier/category table is what the runtime
-    // reads, on every turn and in both session modes. `config.routing` — the
-    // phase table — is deliberately NOT passed: nothing dispatches on it any
-    // more, and it survives in the schema only so TASK-055's migration can open
-    // it.
+    // reads, on every turn and in both session modes. `config.legacy_routing` —
+    // the retired phase table — is deliberately NOT passed: nothing dispatches
+    // on it, and by the time this runs `migrate_routing_to_categories` has
+    // already consumed it into the rows below.
     //
     // `local_provider_id` is the one entry that can be a constant rather than a
     // configured choice, and it is one because the tier comes from the engine
@@ -3407,15 +3521,20 @@ fn snapshot_from_config(config: &Config) -> ConfigSnapshot {
                 auth_ref: p.auth_ref.clone(),
             })
             .collect(),
-        routing: config
-            .routing
-            .iter()
-            .map(|r| RoutingRule {
-                phase: to_proto_phase(r.phase),
-                provider_id: ProviderId::from(r.provider_id.as_str()),
-                fallback_id: r.fallback_id.as_deref().map(ProviderId::from),
-            })
-            .collect(),
+        // REQ-558 TASK-055: the phase table is retired, and the daemon's own
+        // migration has consumed it by the time any client can call `config/get`
+        // — so there is no phase table left to project. Deliberately empty
+        // rather than reverse-mapping the category table into phase-shaped rows:
+        // that map is one-way (`design` came from either `spec` or `architect`,
+        // and nothing records which), so a reverse projection would have to
+        // invent the missing half.
+        //
+        // This leaves `teton policy show` reporting nothing for one task, which
+        // is TASK-056's to close — it adds the tier and category surface to
+        // `ConfigSnapshot` alongside `policy set-tier` / `set-category`. The
+        // alternative was shipping a `policy show` that shows a table nothing
+        // dispatches on, which is the defect this REQ exists to remove.
+        routing: Vec::new(),
         privacy: config
             .boundaries
             .iter()
@@ -3460,7 +3579,7 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
             }
         }
         ConfigUpdate::SetRoutingRule(rr) => {
-            // REQ-558 BR-1: `config.routing` is inert — nothing dispatches on it.
+            // REQ-558 BR-1: the phase table is inert — nothing dispatches on it.
             // This op is the wire form of the pre-REQ `teton policy set <phase>
             // <provider>`, and TASK-056 replaces it with tier and category forms.
             // Until then it must not become a configuration surface that silently
@@ -3556,15 +3675,11 @@ fn to_core_kind(kind: ProtoProviderKind) -> ProviderKind {
     }
 }
 
-fn to_proto_phase(phase: CorePhase) -> ProtoPhase {
-    match phase {
-        CorePhase::Spec => ProtoPhase::Spec,
-        CorePhase::Architect => ProtoPhase::Architect,
-        CorePhase::Implement => ProtoPhase::Implement,
-        CorePhase::Review => ProtoPhase::Review,
-        CorePhase::Io => ProtoPhase::Io,
-    }
-}
+// `to_proto_phase` went with the snapshot's phase-table projection: the phase
+// table is retired, and it had no other caller. Deleted rather than left behind
+// with an `#[allow(dead_code)]`, per ADR-J — implied dead code is how a deletion
+// ends up owned by nobody. Its inverse survives because `SetRoutingRule` still
+// takes a wire phase in.
 
 fn to_core_phase(phase: ProtoPhase) -> CorePhase {
     match phase {
@@ -3607,6 +3722,11 @@ fn env_flag(key: &str) -> bool {
 mod tests {
     use super::*;
     use teton_core::category::{CategoryOverride, ConfigurableCategory};
+    use teton_core::config::LegacyRoutingRule;
+    // The wire form of the retired phase rule. Test-only: `apply_update`'s
+    // `SetRoutingRule` arm still accepts it (TASK-056 replaces the op), but no
+    // production path in this module names the type any more.
+    use teton_protocol::methods::RoutingRule;
 
     /// A throwaway directory under the system temp dir, unique per test.
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -3681,6 +3801,207 @@ mod tests {
             "a valid config keeps its declared privacy boundaries"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- REQ-558 BR-10 / AC-7: the routing migration, on disk --------------
+
+    /// A config as the pre-REQ-558 binary wrote it: a phase table, a
+    /// `default_provider` (REQ-557's own migration sets one), and no tier table.
+    ///
+    /// Five routing rules, not six — a `phase = "freeform"` entry has never
+    /// loaded, so there is no such config to migrate. See
+    /// `a_freeform_routing_entry_is_still_rejected_after_the_schema_change` in
+    /// `teton-core`.
+    const PRE_REQ_558_CONFIG: &str = r#"default_provider = "cheap"
+
+[[providers]]
+id = "on-device"
+kind = "local"
+
+[[providers]]
+id = "cheap"
+kind = "openai-compatible"
+endpoint = "https://api.deepseek.com"
+model = "deepseek-chat"
+auth_ref = "keychain:cheap"
+
+[[routing]]
+phase = "implement"
+provider_id = "cheap"
+
+[[routing]]
+phase = "io"
+provider_id = "on-device"
+"#;
+
+    #[test]
+    fn the_routing_migration_persists_and_never_runs_twice() {
+        let dir = scratch_dir("routing-migration");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, PRE_REQ_558_CONFIG).unwrap();
+
+        let mut config = load_config(Some(&path)).expect("a pre-REQ config must load");
+        migrate_and_report_routing_table(&mut config, Some(&path));
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("[[categories]]"),
+            "the migration must WRITE — an in-memory-only migration re-runs \
+             forever. got:\n{after}"
+        );
+        assert!(
+            !after.contains("[[routing]]"),
+            "and must consume the retired table, which is what makes the next \
+             start find nothing. got:\n{after}"
+        );
+        assert!(
+            !after.contains("reflex"),
+            "and must bind NO reflex tier: `reflex` never leaves the machine, so \
+             persisting the remote `default_provider` into it would write a bug \
+             into the user's own file. got:\n{after}"
+        );
+
+        // A witness for "wrote nothing", which comparing bytes alone cannot
+        // give: a rewrite would drop this comment, an untouched file keeps it.
+        let marked = format!("{after}\n# left by the test, must survive a second start\n");
+        std::fs::write(&path, &marked).unwrap();
+
+        let mut second = load_config(Some(&path)).expect("the migrated config must load");
+        migrate_and_report_routing_table(&mut second, Some(&path));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            marked,
+            "a second start must not rewrite the config: the migration is keyed \
+             on the ABSENCE of the retired table and the PRESENCE of the tiers"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_migration_that_cannot_be_saved_leaves_the_config_byte_for_byte_intact() {
+        // BUG-155 C3. The write is atomic — a temp sibling, fsynced, renamed
+        // over the target — so a failure to persist cannot leave a truncated
+        // config behind. Every `Config` field is `#[serde(default)]`, which
+        // means a truncated file still LOADS, carrying the user's remote
+        // providers and none of their `local-only` boundaries: fail-open,
+        // reached through the config writer instead of the config loader.
+        //
+        // A read-only *directory* is what separates the two implementations. It
+        // stops the atomic write (which must create a sibling temp file) while
+        // leaving a plain `fs::write` to the still-writable file free to
+        // truncate it — so swapping `write_config_atomically` for `fs::write`
+        // turns this test red on the "byte-for-byte" assertion below.
+        let dir = scratch_dir("routing-migration-readonly");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, PRE_REQ_558_CONFIG).unwrap();
+
+        let mut config = load_config(Some(&path)).expect("a pre-REQ config must load");
+        set_dir_readonly(&dir, true);
+        migrate_and_report_routing_table(&mut config, Some(&path));
+        set_dir_readonly(&dir, false);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            PRE_REQ_558_CONFIG,
+            "a migration that cannot be saved must leave the config file exactly \
+             as it found it"
+        );
+        // And the session is unaffected: the in-memory migration still stands,
+        // so a failed write costs a warning rather than a session's routing.
+        assert!(config.legacy_routing.is_empty());
+        assert!(!config.categories.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Toggle a directory between `r-x` and `rwx` for the owner.
+    fn set_dir_readonly(dir: &Path, readonly: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if readonly { 0o555 } else { 0o755 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn every_one_to_many_expansion_is_reported_by_name() {
+        // AC-7, and the whole point of BR-10: a user with one `implement` rule
+        // is told it became `edit` AND `shell`, because a knob that silently
+        // splits is a knob whose second half they do not know they can set.
+        let mut config = Config {
+            providers: vec![ModelProvider {
+                id: "cheap".to_owned(),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: Some("keychain:cheap".to_owned()),
+                capabilities: ProviderCapabilities::default(),
+            }],
+            default_provider: Some("cheap".to_owned()),
+            legacy_routing: vec![
+                LegacyRoutingRule {
+                    phase: CorePhase::Implement,
+                    provider_id: "cheap".to_owned(),
+                    fallback_id: None,
+                },
+                LegacyRoutingRule {
+                    phase: CorePhase::Io,
+                    provider_id: "cheap".to_owned(),
+                    fallback_id: None,
+                },
+                LegacyRoutingRule {
+                    phase: CorePhase::Review,
+                    provider_id: "cheap".to_owned(),
+                    fallback_id: None,
+                },
+            ],
+            ..Config::default()
+        };
+        let report = config.migrate_routing_to_categories();
+        let text = routing_migration_report(&report).join("\n");
+
+        for expanded in ["edit", "shell", "digest", "triage", "title", "compact"] {
+            assert!(
+                text.contains(&format!("`{expanded}`")),
+                "the expansion `{expanded}` must be named in the report:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("`review`"),
+            "including the one-to-one case:\n{text}"
+        );
+        assert!(
+            text.contains("set-category"),
+            "and the report must say what to do about a split:\n{text}"
+        );
+
+        // The `default_provider` leg names the three tiers it wrote and says why
+        // `reflex` is not among them — a user reading "wrote your tiers" and
+        // finding one missing would otherwise reasonably think it a bug.
+        for tier in ["`scan`", "`build`", "`think`"] {
+            assert!(text.contains(tier), "the report must name {tier}:\n{text}");
+        }
+        assert!(
+            text.contains("reflex") && text.contains("never leaves the machine"),
+            "and must say why `reflex` was left unbound:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_config_with_no_path_migrates_in_memory_and_writes_nothing() {
+        // The defaulted-config case: there is no file to rewrite, and the
+        // absence guard makes a re-run on the next start harmless.
+        let mut config = Config {
+            default_provider: None,
+            legacy_routing: vec![LegacyRoutingRule {
+                phase: CorePhase::Review,
+                provider_id: "cheap".to_owned(),
+                fallback_id: None,
+            }],
+            ..Config::default()
+        };
+        migrate_and_report_routing_table(&mut config, None);
+        assert_eq!(config.categories.len(), 1);
+        assert!(config.legacy_routing.is_empty());
     }
 
     #[test]
@@ -3975,7 +4296,7 @@ mod tests {
         assert_eq!(config.tiers.len(), 1);
         assert_eq!(config.tiers[0].tier, Tier::Build);
         assert_eq!(config.tiers[0].provider_id, "deepseek");
-        assert!(config.routing.is_empty());
+        assert!(config.legacy_routing.is_empty());
 
         let snap = snapshot_from_config(&config);
         assert_eq!(snap.providers.len(), 1);
@@ -4755,7 +5076,7 @@ mod tests {
                 auth_ref: Some("keychain:remote".to_owned()),
                 capabilities: ProviderCapabilities::default(),
             }],
-            routing: Vec::new(),
+            legacy_routing: Vec::new(),
             tiers: Vec::new(),
             categories: Vec::new(),
             judgment_default: teton_core::JudgmentCategory::default(),
@@ -4992,7 +5313,7 @@ mod tests {
                     capabilities: ProviderCapabilities::default(),
                 },
             ],
-            routing: Vec::new(),
+            legacy_routing: Vec::new(),
             tiers: vec![TierBinding {
                 tier: Tier::Think,
                 provider_id: "anthropic".to_owned(),

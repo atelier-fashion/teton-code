@@ -640,12 +640,14 @@ impl Router {
     /// override → tier → declared error, and an id that got here by inheritance
     /// is screened by `is_usable` exactly like one the user typed.
     ///
-    /// This fill is **transitional**. TASK-055 migrates an existing `[[routing]]`
-    /// table into real `[[tiers]]` rows; a `default_provider`-only config has no
-    /// `[[routing]]` table to migrate, so without this a config REQ-557's own
-    /// migration produced would route nothing at all. See the report on TASK-050
-    /// — this is the seam where a `default_provider` → `[[tiers]]` migration
-    /// would let the fill be deleted.
+    /// TASK-055's migration now writes this fill down as real `[[tiers]]` rows
+    /// on the first start after upgrade, which is what makes it visible and
+    /// editable rather than an invisible runtime default. The fill stays anyway,
+    /// and is not merely belt-and-braces: it covers the states the migration by
+    /// construction cannot reach — a daemon with no config path at all, a config
+    /// whose migration write failed, a tier the user deleted by hand, and a
+    /// `default_provider` set after the migration already ran. What changed is
+    /// that the fill is no longer the *only* record of the answer.
     fn effective_table(&self) -> CategoryTable {
         CoreTier::ALL
             .into_iter()
@@ -674,13 +676,18 @@ impl Router {
     /// `scan`/`build`/`think` inherit `default_provider` and fall back to the
     /// local tier, so an offline install still routes. Nothing is synthesized at
     /// any step — every candidate is config- or engine-declared (BR-8).
+    ///
+    /// The `reflex` exclusion is asked of [`CoreTier::inherits_default_provider`]
+    /// rather than re-spelled here, because TASK-055's migration writes this
+    /// same fill down as real `[[tiers]]` rows and must exclude `reflex` for the
+    /// same reason. One fact, one home.
     fn inherited_provider(&self, tier: CoreTier) -> Option<String> {
-        match tier {
-            CoreTier::Reflex => self.table.local_provider_id.clone(),
-            _ => self
-                .default_provider
+        if tier.inherits_default_provider() {
+            self.default_provider
                 .clone()
-                .or_else(|| self.table.local_provider_id.clone()),
+                .or_else(|| self.table.local_provider_id.clone())
+        } else {
+            self.table.local_provider_id.clone()
         }
     }
 

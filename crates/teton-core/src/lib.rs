@@ -42,10 +42,13 @@ pub use category::{
     CategoryResolution, CategoryTable, ConfigurableCategory, JudgmentCategory, ParseCategoryError,
     ParseJudgmentCategoryError, ParseTierError, Tier, TierBinding,
 };
-pub use config::{Config, ConfigError, LoadError, LocalModelConfig};
+pub use config::{
+    Config, ConfigError, LegacyRoutingRule, LoadError, LocalModelConfig, MigratedPhase,
+    RoutingMigration,
+};
 pub use entities::{
     BoundaryMode, ModelProvider, ModelSelection, PrivacyBoundary, ProviderCapabilities,
-    ProviderKind, RoutingPolicy, SelectionSource, ToolCallTier,
+    ProviderKind, SelectionSource, ToolCallTier,
 };
 pub use mcp::{McpServerConfig, McpTransport};
 pub use phase::Phase;

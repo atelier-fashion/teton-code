@@ -22,9 +22,10 @@ use crate::boundary::BoundaryMatcher;
 // unrepresentable (ADR-B) sits next to the match arm that relies on it. They are
 // imported here rather than redeclared — one shape, one definition.
 use crate::category::{
-    CategoryOverride, ConfigurableCategory, JudgmentCategory, Tier, TierBinding,
+    categories_for_phase, CategoryOverride, ConfigurableCategory, JudgmentCategory, Tier,
+    TierBinding,
 };
-use crate::entities::{ModelProvider, PrivacyBoundary, RoutingPolicy};
+use crate::entities::{ModelProvider, PrivacyBoundary};
 use crate::mcp::{McpServerConfig, McpTransport};
 use crate::phase::Phase;
 use serde::{Deserialize, Serialize};
@@ -130,15 +131,29 @@ pub struct Config {
     /// default is precisely the hidden constant that rules out.
     #[serde(default)]
     pub judgment_default: JudgmentCategory,
-    /// **Deprecated (REQ-558):** the pre-REQ-558 phase → provider routing table.
+    /// **Retired (REQ-558):** the pre-REQ-558 `[[routing]]` phase → provider
+    /// table, read exactly once by [`Config::migrate_routing_to_categories`].
     ///
-    /// Retained only so TASK-055's migration can *read* it — a table that cannot
-    /// be opened cannot be migrated, which is why REQ-557's `model` field is an
-    /// `Option` too. Nothing dispatches on it: [`Config::tiers`] and
-    /// [`Config::categories`] are the routing table now, and a category is the
-    /// dispatch key in both session modes (BR-1).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub routing: Vec<RoutingPolicy>,
+    /// It is not a routing input and has no reader other than the migration —
+    /// the name says `legacy_` precisely so that a grep answers "does anything
+    /// dispatch on the phase table?" without anyone having to read for it.
+    /// [`Config::tiers`] and [`Config::categories`] are the routing table now,
+    /// and a category is the dispatch key in both session modes (BR-1).
+    ///
+    /// It stays *deserializable* for two reasons, both load-bearing:
+    ///
+    /// - a table that cannot be opened cannot be migrated, and
+    /// - `phase` is a [`Phase`], which has no `Freeform` variant (ADR-G), so a
+    ///   `[[routing]] phase = "freeform"` entry is still refused at load. Drop
+    ///   the field entirely and serde would *ignore* the unknown key instead —
+    ///   turning a rejection into silence, which AC-7 forbids.
+    ///
+    /// It stays *serializable-when-non-empty* for a third: the migration clears
+    /// it only after it has read it, so any config write that happens before
+    /// the migration ran preserves the user's table rather than deleting a
+    /// routing choice it never migrated.
+    #[serde(rename = "routing", default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_routing: Vec<LegacyRoutingRule>,
     /// The tier → provider table — the primary routing surface (REQ-558).
     ///
     /// Four rows cover all eleven categories, because every category inherits
@@ -165,6 +180,94 @@ pub struct Config {
     /// routing, and boundaries, rather than in a separate side file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_server: Vec<McpServerConfig>,
+}
+
+/// One row of the retired `[[routing]]` phase → provider table, as it appears
+/// on disk in a config authored before REQ-558.
+///
+/// This is a **file format**, not an entity: it exists so
+/// [`Config::migrate_routing_to_categories`] can open a pre-REQ config, and
+/// nothing dispatches on it. Its predecessor `RoutingPolicy` lived in
+/// `entities.rs` and was exported from the crate root; that type is gone, and
+/// the distinction is the point — an entity the system runs on versus a shape
+/// we read once on the way to deleting it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyRoutingRule {
+    /// The lifecycle phase this rule applied to. Typed as [`Phase`], which has
+    /// no `Freeform` variant (ADR-G) — that is what keeps a
+    /// `phase = "freeform"` entry refused at load.
+    pub phase: Phase,
+    /// Primary provider id (FK → [`ModelProvider::id`]).
+    pub provider_id: String,
+    /// Optional fallback provider id, used when the primary errored or timed
+    /// out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_id: Option<String>,
+}
+
+/// One migrated `[[routing]]` rule: the phase it bound, the provider it named,
+/// and **every category that binding became** (BR-10, AC-7).
+///
+/// `categories` is the reporting surface: a user with one `implement` rule has
+/// to be told it became `edit` *and* `shell`, because a knob that silently
+/// splits into two is a knob whose second half the user does not know they can
+/// now set differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigratedPhase {
+    /// The phase the retired rule named.
+    pub phase: Phase,
+    /// The provider it routed to, carried verbatim onto each category it wrote.
+    pub provider_id: String,
+    /// The categories this rule was written out as, in expansion order.
+    pub categories: Vec<ConfigurableCategory>,
+    /// The categories this rule mapped to but did **not** write, because
+    /// something already held them.
+    ///
+    /// This is the mirror of the one-to-many expansion and it loses information
+    /// rather than adding it, so it is if anything the more important half to
+    /// report. Five phases map onto four category groups: `spec` and
+    /// `architect` both become `design`, so a user who routed design work and
+    /// architecture work to different providers cannot any more, and has to be
+    /// told which of the two survived rather than discovering it by watching
+    /// where their turns go.
+    pub dropped: Vec<DroppedBinding>,
+}
+
+/// A category a retired rule mapped to but could not claim, and what holds it
+/// instead — either an earlier rule in the same migration (`spec` beating
+/// `architect` to `design`) or an explicit `[[categories]]` row the user wrote,
+/// which always wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedBinding {
+    /// The contested category.
+    pub category: ConfigurableCategory,
+    /// The provider the binding that won names.
+    pub kept_provider_id: String,
+}
+
+/// What one run of [`Config::migrate_routing_to_categories`] changed.
+///
+/// Returned rather than logged so the caller owns the wording and the tests can
+/// assert on the content: "reported by name" (AC-7) is an acceptance criterion,
+/// and a criterion whose only witness is an `eprintln!` cannot be tested.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoutingMigration {
+    /// Every retired rule the run consumed, in table order.
+    pub phases: Vec<MigratedPhase>,
+    /// The tiers materialized from [`Config::default_provider`], in tier order.
+    /// Never contains [`Tier::Reflex`].
+    pub default_tiers: Vec<Tier>,
+    /// The provider [`Self::default_tiers`] were bound to, when any were.
+    pub default_provider: Option<String>,
+}
+
+impl RoutingMigration {
+    /// Whether the run changed nothing — the second-start case, and the guard
+    /// on whether the config file is rewritten at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.phases.is_empty() && self.default_tiers.is_empty()
+    }
 }
 
 /// A configuration validation failure. No variant carries a credential value,
@@ -456,7 +559,16 @@ impl Config {
         // ever runs, so the check could not be reached and its error variant
         // could not be constructed. The *behaviour* is unchanged and pinned by
         // `a_freeform_routing_entry_is_still_rejected_after_the_schema_change`.
-        for rule in &self.routing {
+        //
+        // The FK checks below survive the retirement of the table they guard,
+        // and deliberately: `migrate_routing_to_categories` copies each rule's
+        // provider and fallback verbatim onto a `[[categories]]` row, which
+        // `validate_category_table` then checks on the NEXT load. Drop these and
+        // a dangling legacy rule stops being a refusal to start and becomes a
+        // migration that writes a config the daemon refuses to start on —
+        // the same error, one restart later, with the migration in between it
+        // and the cause.
+        for rule in &self.legacy_routing {
             if !ids.contains(rule.provider_id.as_str()) {
                 return Err(ConfigError::UnknownProvider {
                     phase: rule.phase,
@@ -645,6 +757,125 @@ impl Config {
         }
         unresolved.sort_unstable();
         unresolved
+    }
+
+    /// One-shot migration of a pre-REQ-558 config: turn the retired
+    /// `[[routing]]` phase table into `[[categories]]` overrides, and write the
+    /// `default_provider` fill down as real `[[tiers]]` rows (BR-10, AC-7).
+    ///
+    /// Returns what changed, so the caller can report each one-to-many
+    /// expansion **by name** and persist only when there is something to
+    /// persist.
+    ///
+    /// # The phase table becomes category overrides, not tier bindings
+    ///
+    /// A retired rule said "every turn in phase *p* goes to provider *x*". The
+    /// faithful translation is one `[[categories]]` row per category the phase
+    /// maps to, because that is the only form that preserves what the rule
+    /// said. Tier bindings cannot: `spec`/`architect` and `review` both land on
+    /// `think`, so a config that routed design to one vendor and critique to
+    /// another would lose one of them to whichever rule was written last —
+    /// silently, and in the user's favour exactly half the time.
+    ///
+    /// The expansion comes from [`categories_for_phase`], which is the *same*
+    /// function structured dispatch uses (ADR-F). BR-10's mapping table and
+    /// ADR-C's dispatch mapping are one piece of knowledge; written twice they
+    /// drift, and the drift is invisible because one runs at config load and the
+    /// other on every structured turn.
+    ///
+    /// # It never overwrites an explicit new-world binding
+    ///
+    /// A category that already has a `[[categories]]` row keeps it. The rule is
+    /// consumed either way — it is inert, and leaving it on disk would mean
+    /// re-reading it forever — but a legacy row never wins over something the
+    /// user wrote in the current vocabulary.
+    ///
+    /// # `default_provider` materializes into `scan`, `build` and `think`
+    ///
+    /// `Router::effective_table` already fills an unbound tier from
+    /// `default_provider`, so an upgraded config routes; that fill is invisible
+    /// and uneditable. Writing it down makes it both. **`reflex` is
+    /// deliberately excluded** — [`Tier::inherits_default_provider`] is asked
+    /// rather than the list being re-spelled here, because persisting
+    /// `reflex = <remote default>` would write the bug that predicate exists to
+    /// prevent into the user's file, where a later reader would take it for the
+    /// user's own choice.
+    ///
+    /// This leg is gated on the tier table being **entirely empty**, which is
+    /// what a config that predates the table looks like. A user who has bound
+    /// even one tier has engaged with the new schema, and the migration does not
+    /// argue with them.
+    ///
+    /// # Idempotence
+    ///
+    /// Keyed on the absence of the old state and the presence of the new: the
+    /// consumed rules are gone from `legacy_routing` (and therefore from the
+    /// file the caller writes), and the three tiers are bound. A second start
+    /// finds nothing, changes nothing, and reports nothing.
+    pub fn migrate_routing_to_categories(&mut self) -> RoutingMigration {
+        let mut report = RoutingMigration::default();
+
+        // `take` is the consumption: a rule that has been read is gone, whether
+        // or not it wrote anything, so the caller's write drops the retired
+        // table from disk and the next start has nothing to find.
+        for rule in std::mem::take(&mut self.legacy_routing) {
+            let mut written = Vec::new();
+            let mut dropped = Vec::new();
+            for category in categories_for_phase(rule.phase) {
+                // Total by construction: no phase maps to `route` or `redact`,
+                // the two categories config cannot name (ADR-B). Skipping
+                // rather than asserting keeps the migration total if that ever
+                // changes — a config it cannot express is not one it should
+                // refuse to open.
+                let Some(name) = category.configurable() else {
+                    continue;
+                };
+                // First claim wins, and "first" is the user's own table order.
+                // The claimant may be an explicit `[[categories]]` row (which
+                // must never lose to a retired one) or an earlier rule in this
+                // same run. Either way the loser is reported, not swallowed.
+                if let Some(held) = self.categories.iter().find(|over| over.name == name) {
+                    dropped.push(DroppedBinding {
+                        category: name,
+                        kept_provider_id: held.provider_id.clone(),
+                    });
+                    continue;
+                }
+                self.categories.push(CategoryOverride {
+                    name,
+                    provider_id: rule.provider_id.clone(),
+                    fallback_id: rule.fallback_id.clone(),
+                });
+                written.push(name);
+            }
+            report.phases.push(MigratedPhase {
+                phase: rule.phase,
+                provider_id: rule.provider_id,
+                categories: written,
+                dropped,
+            });
+        }
+
+        if self.tiers.is_empty() {
+            if let Some(default_provider) = self.default_provider.clone() {
+                for tier in Tier::ALL
+                    .into_iter()
+                    .filter(|t| t.inherits_default_provider())
+                {
+                    self.tiers.push(TierBinding {
+                        tier,
+                        provider_id: default_provider.clone(),
+                        fallback_id: None,
+                    });
+                    report.default_tiers.push(tier);
+                }
+                if !report.default_tiers.is_empty() {
+                    report.default_provider = Some(default_provider);
+                }
+            }
+        }
+
+        report
     }
 
     fn validate_local_model(&self) -> Result<(), ConfigError> {
@@ -1112,18 +1343,18 @@ auth_ref = "keychain:anthropic"
                 provider_id: "deepseek".to_owned(),
                 fallback_id: None,
             }],
-            routing: vec![
-                RoutingPolicy {
+            legacy_routing: vec![
+                LegacyRoutingRule {
                     phase: Phase::Architect,
                     provider_id: "anthropic-prod".to_owned(),
                     fallback_id: Some("deepseek".to_owned()),
                 },
-                RoutingPolicy {
+                LegacyRoutingRule {
                     phase: Phase::Implement,
                     provider_id: "deepseek".to_owned(),
                     fallback_id: Some("anthropic-prod".to_owned()),
                 },
-                RoutingPolicy {
+                LegacyRoutingRule {
                     phase: Phase::Io,
                     provider_id: "local".to_owned(),
                     fallback_id: None,
@@ -1290,7 +1521,7 @@ auth_ref = "keychain:anthropic"
     #[test]
     fn routing_to_unknown_provider_is_rejected() {
         let mut cfg = sample_config();
-        cfg.routing[0].provider_id = "ghost".to_owned();
+        cfg.legacy_routing[0].provider_id = "ghost".to_owned();
         assert_eq!(
             cfg.validate().unwrap_err(),
             ConfigError::UnknownProvider {
@@ -1303,7 +1534,7 @@ auth_ref = "keychain:anthropic"
     #[test]
     fn routing_to_unknown_fallback_is_rejected() {
         let mut cfg = sample_config();
-        cfg.routing[0].fallback_id = Some("ghost".to_owned());
+        cfg.legacy_routing[0].fallback_id = Some("ghost".to_owned());
         assert_eq!(
             cfg.validate().unwrap_err(),
             ConfigError::UnknownFallback {
@@ -1879,8 +2110,8 @@ kind = "local"
 
     #[test]
     fn a_pre_req_558_config_carrying_the_phase_routing_table_still_loads() {
-        // The `[[routing]]` table survives until TASK-055's migration has read
-        // it: a table that cannot be opened cannot be migrated.
+        // The `[[routing]]` table stays *readable* so the migration can open it:
+        // a table that cannot be opened cannot be migrated.
         let cfg = Config::load(
             r#"
 [[providers]]
@@ -1896,8 +2127,8 @@ provider_id = "opus"
 "#,
         )
         .expect("a pre-REQ-558 config must still load");
-        assert_eq!(cfg.routing.len(), 1);
-        assert_eq!(cfg.routing[0].phase, Phase::Architect);
+        assert_eq!(cfg.legacy_routing.len(), 1);
+        assert_eq!(cfg.legacy_routing[0].phase, Phase::Architect);
         assert!(cfg.tiers.is_empty(), "and it binds no tier yet");
     }
 
@@ -1940,6 +2171,351 @@ provider_id = "opus"
             msg.contains("freeform"),
             "the message must still name the offending value: {msg}"
         );
+    }
+
+    // ---- REQ-558 BR-10 / AC-7: the phase table becomes categories ----------
+
+    /// AC-7's fixture: a config with a rule for every phase that can appear.
+    ///
+    /// **Five, not six.** The architecture's "Corrections to the Requirement":
+    /// a `[[routing]]` rule targeting `freeform` has never loaded, so the
+    /// migration has nothing to drop — see
+    /// `a_freeform_routing_entry_is_still_rejected_after_the_schema_change`,
+    /// which drives the sixth entry through `Config::load` and asserts it is
+    /// still refused.
+    const PRE_REQ_558_TOML: &str = r#"
+default_provider = "opus"
+
+[[providers]]
+id = "on-device"
+kind = "local"
+
+[[providers]]
+id = "opus"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-opus-5"
+auth_ref = "keychain:anthropic"
+
+[[providers]]
+id = "cheap"
+kind = "openai-compatible"
+endpoint = "https://api.deepseek.com"
+model = "deepseek-chat"
+auth_ref = "keychain:cheap"
+
+[[routing]]
+phase = "spec"
+provider_id = "opus"
+
+[[routing]]
+phase = "architect"
+provider_id = "opus"
+fallback_id = "cheap"
+
+[[routing]]
+phase = "implement"
+provider_id = "cheap"
+fallback_id = "opus"
+
+[[routing]]
+phase = "review"
+provider_id = "opus"
+
+[[routing]]
+phase = "io"
+provider_id = "on-device"
+"#;
+
+    /// The provider a category resolves to after migration, or `None` when the
+    /// migration wrote no override for it.
+    fn override_for(cfg: &Config, name: ConfigurableCategory) -> Option<&str> {
+        cfg.categories
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| o.provider_id.as_str())
+    }
+
+    #[test]
+    fn the_migration_applies_the_documented_mapping_for_all_five_phases() {
+        // BR-10's table, end to end: spec + architect → design, implement →
+        // {edit, shell}, review → review, io → {digest, triage, title, compact}.
+        let mut cfg = Config::load(PRE_REQ_558_TOML).expect("the fixture must load");
+        let report = cfg.migrate_routing_to_categories();
+
+        assert_eq!(report.phases.len(), 5, "one report entry per retired rule");
+        assert_eq!(
+            override_for(&cfg, ConfigurableCategory::Design),
+            Some("opus"),
+            "spec and architect both bind `design`"
+        );
+        assert_eq!(
+            override_for(&cfg, ConfigurableCategory::Edit),
+            Some("cheap")
+        );
+        assert_eq!(
+            override_for(&cfg, ConfigurableCategory::Shell),
+            Some("cheap"),
+            "`implement` is one knob that became two — `shell` must carry the \
+             same provider, or half the phase silently stops being routed"
+        );
+        assert_eq!(
+            override_for(&cfg, ConfigurableCategory::Review),
+            Some("opus")
+        );
+        for io in [
+            ConfigurableCategory::Digest,
+            ConfigurableCategory::Triage,
+            ConfigurableCategory::Title,
+            ConfigurableCategory::Compact,
+        ] {
+            assert_eq!(
+                override_for(&cfg, io),
+                Some("on-device"),
+                "the `io` rule must reach `{io}`"
+            );
+        }
+        // `debug` was reachable from no phase, so nothing claims to know where
+        // the user wanted it. It falls to its tier rather than being invented.
+        assert_eq!(override_for(&cfg, ConfigurableCategory::Debug), None);
+
+        // And the result is a config the daemon can start on next time — a
+        // migration that writes something `validate` rejects turns a refusal to
+        // start into a refusal to start one restart later.
+        cfg.validate()
+            .expect("a migrated config must still validate");
+    }
+
+    #[test]
+    fn the_migration_expands_through_the_same_map_structured_dispatch_uses() {
+        // ADR-F: BR-10's migration table and ADR-C's dispatch map are one piece
+        // of knowledge. This is the test that keeps them one — re-encode the
+        // expansion here (or in the migration) and it goes red, which is the
+        // only way the drift becomes visible: one is exercised at config load,
+        // the other on every structured turn.
+        for phase in Phase::ALL {
+            let mut cfg = Config {
+                providers: vec![ModelProvider {
+                    id: "opus".to_owned(),
+                    kind: ProviderKind::Anthropic,
+                    endpoint: Some("https://api.anthropic.com".to_owned()),
+                    model: Some("claude-opus-5".to_owned()),
+                    auth_ref: Some("keychain:anthropic".to_owned()),
+                    capabilities: ProviderCapabilities::default(),
+                }],
+                legacy_routing: vec![LegacyRoutingRule {
+                    phase,
+                    provider_id: "opus".to_owned(),
+                    fallback_id: None,
+                }],
+                ..Config::default()
+            };
+            let report = cfg.migrate_routing_to_categories();
+
+            let expected: Vec<ConfigurableCategory> = categories_for_phase(phase)
+                .iter()
+                .filter_map(|c| c.configurable())
+                .collect();
+            assert_eq!(
+                report.phases[0].categories, expected,
+                "the `{phase}` migration must expand through `categories_for_phase`"
+            );
+            assert_eq!(
+                cfg.categories.iter().map(|o| o.name).collect::<Vec<_>>(),
+                expected,
+                "and must write exactly those rows"
+            );
+
+            // The dispatch half of the same fact: whatever a structured turn in
+            // this phase dispatches on has to be one of the categories the
+            // migration bound, or an upgraded config stops routing the phase it
+            // was configured for.
+            let dispatched = crate::category::category_for_phase(phase)
+                .configurable()
+                .expect("no phase dispatches on a pinned category");
+            assert!(
+                expected.contains(&dispatched),
+                "a structured `{phase}` turn dispatches on `{dispatched}`, which the \
+                 migration did not bind: {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_rules_fallback_travels_with_it_onto_every_category() {
+        // The old rule's fallback was half of what it said. Dropping it on the
+        // expansion would leave the user's second choice behind without a word.
+        let mut cfg = Config::load(PRE_REQ_558_TOML).expect("the fixture must load");
+        cfg.migrate_routing_to_categories();
+
+        for (name, fallback) in [
+            (ConfigurableCategory::Edit, Some("opus")),
+            (ConfigurableCategory::Shell, Some("opus")),
+            // `design` came from `spec`, the first of the two rules that map to
+            // it — see `two_phases_that_collapse_onto_one_category_say_so`.
+            (ConfigurableCategory::Design, None),
+            (ConfigurableCategory::Review, None),
+        ] {
+            let row = cfg
+                .categories
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("no `{name}` row"));
+            assert_eq!(row.fallback_id.as_deref(), fallback, "`{name}` fallback");
+        }
+    }
+
+    #[test]
+    fn two_phases_that_collapse_onto_one_category_say_so() {
+        // The mirror of the one-to-many expansion, and the half that LOSES
+        // information: `spec` and `architect` both become `design`, so a user
+        // who routed them to different providers cannot any more. First claim
+        // wins — "first" being their own table order — and the loser is named
+        // rather than vanishing.
+        let mut cfg = Config::load(PRE_REQ_558_TOML).expect("the fixture must load");
+        let report = cfg.migrate_routing_to_categories();
+
+        let spec = report
+            .phases
+            .iter()
+            .find(|p| p.phase == Phase::Spec)
+            .expect("the `spec` rule is reported");
+        assert_eq!(spec.categories, vec![ConfigurableCategory::Design]);
+        assert!(spec.dropped.is_empty(), "`spec` came first, so it won");
+
+        let architect = report
+            .phases
+            .iter()
+            .find(|p| p.phase == Phase::Architect)
+            .expect("the `architect` rule is reported");
+        assert!(
+            architect.categories.is_empty(),
+            "`architect` had nothing left to claim"
+        );
+        assert_eq!(architect.dropped.len(), 1);
+        assert_eq!(architect.dropped[0].category, ConfigurableCategory::Design);
+        assert_eq!(
+            architect.dropped[0].kept_provider_id, "opus",
+            "the report names the binding that survived, so the user can see \
+             what they now have instead of what they wrote"
+        );
+    }
+
+    #[test]
+    fn the_default_provider_becomes_scan_build_and_think_but_never_reflex() {
+        // `Router::effective_table` already sends an unbound tier to
+        // `default_provider`; writing it down makes that visible and editable.
+        // `reflex` is excluded because it is the tier that never leaves the
+        // machine — and `default_provider` is by construction a remote id
+        // (REQ-557's migration sets it to the first remote provider).
+        let mut cfg = Config::load(PRE_REQ_558_TOML).expect("the fixture must load");
+        let report = cfg.migrate_routing_to_categories();
+
+        assert_eq!(
+            report.default_tiers,
+            vec![Tier::Scan, Tier::Build, Tier::Think]
+        );
+        assert_eq!(report.default_provider.as_deref(), Some("opus"));
+        assert_eq!(
+            cfg.tiers.iter().map(|b| b.tier).collect::<Vec<_>>(),
+            vec![Tier::Scan, Tier::Build, Tier::Think]
+        );
+        assert!(
+            cfg.tiers.iter().all(|b| b.tier != Tier::Reflex),
+            "a migrated config must carry NO written `reflex` binding: persisting \
+             `reflex = <remote default>` is the bug `Tier::inherits_default_provider` \
+             exists to prevent, written into the user's own file where a later \
+             reader would take it for their choice"
+        );
+    }
+
+    #[test]
+    fn the_default_provider_leg_leaves_a_partly_bound_table_alone() {
+        // A user who has bound even one tier has engaged with the new schema.
+        // The migration materializes the *absence* of a table, not the absence
+        // of a row — it does not argue with a table someone is already editing.
+        let mut cfg = Config::load(PRE_REQ_558_TOML).expect("the fixture must load");
+        cfg.tiers.push(TierBinding {
+            tier: Tier::Think,
+            provider_id: "cheap".to_owned(),
+            fallback_id: None,
+        });
+        let report = cfg.migrate_routing_to_categories();
+
+        assert!(report.default_tiers.is_empty());
+        assert_eq!(cfg.tiers.len(), 1, "the user's own row, untouched");
+        assert_eq!(cfg.tiers[0].provider_id, "cheap");
+    }
+
+    #[test]
+    fn the_migration_runs_once() {
+        // Keyed on the absence of the old state and the presence of the new: the
+        // retired rules are consumed, the tiers are bound. A second start finds
+        // nothing, changes nothing, and reports nothing.
+        let mut cfg = Config::load(PRE_REQ_558_TOML).expect("the fixture must load");
+        let first = cfg.migrate_routing_to_categories();
+        assert!(!first.is_empty());
+
+        let after_first = cfg.clone();
+        let second = cfg.migrate_routing_to_categories();
+
+        assert!(
+            second.is_empty(),
+            "a second run must report nothing new: {second:?}"
+        );
+        assert_eq!(cfg, after_first, "and must change nothing");
+        assert!(
+            cfg.legacy_routing.is_empty(),
+            "the retired table is consumed, so the written-out config no longer \
+             carries it — which is what makes the next start find nothing"
+        );
+        assert!(
+            !cfg.to_toml().expect("serializes").contains("[[routing]]"),
+            "and the retired table must not be written back"
+        );
+    }
+
+    #[test]
+    fn the_migration_never_overwrites_an_explicit_category_override() {
+        // A legacy row never beats something the user wrote in the current
+        // vocabulary. The rule is still consumed — it is inert, and leaving it
+        // on disk means re-reading it forever — but it is reported as dropped
+        // rather than vanishing without a word.
+        let mut cfg = Config::load(PRE_REQ_558_TOML).expect("the fixture must load");
+        cfg.categories.push(CategoryOverride {
+            name: ConfigurableCategory::Edit,
+            provider_id: "opus".to_owned(),
+            fallback_id: None,
+        });
+        let report = cfg.migrate_routing_to_categories();
+
+        assert_eq!(
+            override_for(&cfg, ConfigurableCategory::Edit),
+            Some("opus"),
+            "the explicit override wins"
+        );
+        assert_eq!(
+            override_for(&cfg, ConfigurableCategory::Shell),
+            Some("cheap"),
+            "and the half of the expansion that was NOT already bound still lands"
+        );
+        let implement = report
+            .phases
+            .iter()
+            .find(|p| p.phase == Phase::Implement)
+            .expect("the rule is still reported");
+        assert_eq!(implement.categories, vec![ConfigurableCategory::Shell]);
+        assert_eq!(implement.dropped.len(), 1);
+        assert_eq!(implement.dropped[0].category, ConfigurableCategory::Edit);
+        assert_eq!(implement.dropped[0].kept_provider_id, "opus");
+    }
+
+    #[test]
+    fn a_config_with_nothing_to_migrate_reports_nothing() {
+        // The post-REQ config: no retired table, a tier table already bound.
+        let mut cfg = sample_config();
+        cfg.legacy_routing.clear();
+        assert!(cfg.migrate_routing_to_categories().is_empty());
     }
 
     #[test]
@@ -2007,6 +2583,6 @@ mode = "local-only"
         let cfg = Config::load(toml_text).expect("should load and validate");
         assert_eq!(cfg.local_model.pinned.as_deref(), Some("qwen2.5-coder-3b"));
         assert_eq!(cfg.providers.len(), 1);
-        assert_eq!(cfg.routing[0].phase, Phase::Architect);
+        assert_eq!(cfg.legacy_routing[0].phase, Phase::Architect);
     }
 }

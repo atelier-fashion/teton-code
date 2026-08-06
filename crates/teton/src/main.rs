@@ -1283,9 +1283,20 @@ fn run_policy_show(paths: &DaemonPaths) -> anyhow::Result<()> {
     match conn.call(ConfigGetParams::default(), &mut ctx)? {
         Ok(cfg) => {
             if cfg.snapshot.routing.is_empty() {
+                // REQ-558 TASK-055 retired the phase table, so this branch is
+                // now the only one taken: `ConfigSnapshot` carries no phase
+                // rules and does not yet carry the tier/category table that
+                // replaced them (TASK-056 adds both, with `set-tier` and
+                // `set-category`). Saying "no routing rules configured" here
+                // would be a lie to a user whose rules were migrated an instant
+                // earlier, and pointing them at `teton policy set` would be a
+                // second one. It says what is true instead.
                 ctx.surface.line(
-                    LineKind::Info,
-                    "no routing rules configured. Set one with `teton policy set`.",
+                    LineKind::Notice,
+                    "routing moved from phases to tiers and categories (REQ-558), and this \
+                     build cannot render the new table yet. Your config file's `[[tiers]]` \
+                     and `[[categories]]` sections are the routing table — the daemon \
+                     reports what it migrated on startup.",
                 );
             } else {
                 ctx.surface.line(LineKind::Info, "routing policy:");
