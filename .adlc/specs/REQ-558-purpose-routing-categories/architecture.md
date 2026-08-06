@@ -73,12 +73,17 @@ TASK-056's first run. The unreached set is **five**: `redact`, `title`, `compact
 `triage`, `shell`. A hand-maintained list would have shipped the wrong number, in
 the user-facing surface, silently. That is the entire argument for deriving it.
 
-### ADR-B: `redact` is absent from the *configurable* enum, so the pin needs no guard
+### ADR-B: the pinned categories are absent from the *configurable* enum, so the pin needs no guard
 
 **Decision**: two enums.
 
 - `Category` — all eleven. Used at call sites, by the resolver, and on the wire.
-- `ConfigurableCategory` — ten. `redact` is **not a variant**.
+- `ConfigurableCategory` — **nine**. `redact` and `route` are **not variants**.
+
+*(As implemented. This ADR was written with `redact` as the only pinned
+category and `ConfigurableCategory` at ten variants; `route` joined it during
+implementation, by the same mechanism and for the same reason — see the
+correction recorded below.)*
 
 Config deserializes into `ConfigurableCategory`. `resolve(Category::Redact, …)`
 returns the local tier by an unconditional match arm that never consults config,
@@ -262,13 +267,31 @@ Recorded here rather than silently worked around:
   the **five** valid phases, and a freeform routing entry remains rejected at load.
 - **AC-7's "all six phase entries" fixture** follows from the same fact and becomes
   five.
+- **`route` is pinned local too, so `ConfigurableCategory` has nine variants, not
+  ten.** ADR-B above was written pinning only `redact`. BR-5 says the classifier
+  runs on the local tier — "a router that calls a remote model to decide has spent
+  what the routing decision was meant to save" — and while `route` stayed
+  configurable a user could write a config that violated it, which a test proved
+  they could. So `route` is pinned by exactly ADR-B's mechanism rather than by a
+  screen at the call site (LESSON-484: enforce the rule where the decision is
+  made). Consequences: `ConfigurableCategory::ALL` is `[_; 9]`, `Category::ALL`
+  is unchanged at eleven, and `resolve` takes its unconditional local arm for two
+  categories rather than one.
+- **The hand-written `Deserialize` on `ConfigurableCategory` improves the message
+  for config TOML only.** Its doc comment claimed it bought the pin sentence "for
+  every format at once… and the JSON-RPC payload alike". It does not: `config/set`
+  deserializes `teton_protocol::ConfigurableCategory`, a separate type that
+  mirrors the same absences but derives `Deserialize`. The *rejection* is
+  structural on both surfaces; only the wording differs, and over the wire it is
+  serde's bare `unknown variant`. Recorded rather than fixed — the pin holds
+  either way, and the claim was the defect.
 
 ## Data Model Changes
 
 | Type | Location | Change |
 |---|---|---|
 | `Category` | `teton-core/src/category.rs` (new) | 11-variant enum + `origin` (`harness_known` / `intent_classified`) as a const fn |
-| `ConfigurableCategory` | same | 10 variants; `redact` unrepresentable (ADR-B) |
+| `ConfigurableCategory` | same | **9** variants; `redact` **and `route`** unrepresentable (ADR-B, as corrected below) |
 | `Tier` | same | 4-variant enum, `reflex`/`scan`/`build`/`think` |
 | `JudgmentCategory` | same | 4 variants; the classifier's **return type** (AC-3's type-level guarantee) |
 | `TierBinding`, `CategoryOverride` | `teton-core/src/entities.rs` | replace `RoutingPolicy` as the configured table |

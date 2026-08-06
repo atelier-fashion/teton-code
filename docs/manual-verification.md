@@ -427,7 +427,7 @@ an observation.
 |---|---|---|
 | The bypass issues **no call at all** when the local tier cannot serve | `tetond/src/classify.rs::a_bypassed_turn_issues_no_call_at_all`, `runtime.rs::an_unavailable_local_tier_bypasses_classification_with_no_call` | Full — asserted by call count on a counting engine, not by output text |
 | A structured turn issues **zero** classifier calls | `runtime.rs::dispatch` tests | Full — call count |
-| Classification never reaches a remote provider | `teton-core/src/category.rs::route_never_resolves_to_a_remote_provider` | Full — every tier bound remote, `route` still resolves local |
+| Classification never reaches a remote provider | `teton-core/src/category.rs::route_never_resolves_to_a_bound_provider` **plus** `runtime.rs::the_local_tier_id_is_never_a_registered_remote_providers_id` | Full, but **only as a pair**. The resolver is pure: it can assert `route` resolves to `local_provider_id` and consults no binding, and nothing more — it has no notion of a transport. That the id in that field is engine-backed is `local_tier_id`'s guarantee, pinned separately. Read either test alone and the claim is "it resolved to the expected *name*", which is what let a config registering a remote provider under the id `local` keep both sides green while dispatching over HTTP. |
 | The prompt and output budgets are what the design says | `classify.rs` constants + their tests | Full at the constants; says nothing about elapsed time |
 | A classifier failure degrades to the declared default and says so | `classify.rs` + `routing.rs` | Full |
 
@@ -476,6 +476,48 @@ and in `router.rs::every_route_but_the_taint_pin_carries_its_resolution`. Any
 client rendering `route_decided` must handle the absence; `teton`'s own
 `/verbose` route line already does.
 
+### Not automated: the `digest` duty running on a real remote provider, end to end
+
+**What is uncovered.** `digest_route`'s remote construction driven by a live
+daemon: a `scan` tier (or a `digest` override) bound to a remote provider, an
+oversized tool result, and the summarizer's prompt reaching that provider's
+endpoint through the real egress choke point.
+
+**Why the existing tests do not close it.** The capture tests in
+`harness/digest.rs` build a `DigestRoute::remote` **directly** and drive
+`summarize_if_large` over it. That covers everything downstream of the route —
+the duty prompt, the provenance scoping, the boundary refusal, the bounded
+failure paths — and nothing upstream: the daemon's own `digest_route` decides
+locality from `ProviderKind`, resolves the model, and builds the transport, and
+no test exercises that construction against a real remote endpoint. The
+daemon-level tests that *do* call `digest_route`
+(`runtime.rs::dispatch::digest`) assert which provider it chose, not that a
+remote choice actually sends.
+
+The **local** direction is closed end to end
+(`routing_categories.rs::an_upgraded_config_digests_on_the_local_tier_and_the_file_never_egresses`,
+which asserts on captured bytes that a file's contents do not reach the
+provider), so the gap is one-directional: nothing shows the remote path
+*working*, and the fixture above is what shows it not firing when it should not.
+
+**To close it by hand** (~2 min, against a mock or a real provider):
+
+```sh
+teton policy set-tier scan <remote-provider>
+teton policy show                       # `digest → <remote-provider> [tier]`
+# then, in a session, read a large file and watch the provider's request log:
+#   Read <a file over ~2 kB> and summarize it.
+```
+
+Record: that the summarizer's prompt (it ends with the
+`SUMMARIZER_OUTPUT_CONTRACT` line) appears in a request to
+`<remote-provider>`, and that the summary comes back in the follow-up turn's
+context. Then repeat in a session that has touched `local-only` content and
+record that it does **not** — the BR-7 pin, which is covered at the unit layer
+but not through a live remote binding either.
+
+**Status: NOT RUN.**
+
 ### Not automated: `teton policy set-tier` / `set-category` through the CLI binary
 
 **What is uncovered.** The two *write* commands end to end through the shipped
@@ -486,11 +528,17 @@ reporting the new binding.
 the keychain here, just that no CLI e2e test drives the write path yet.
 `teton policy show` **is** now covered end to end
 (`teton/tests/cli_e2e.rs::policy_show_renders_the_daemons_resolved_table`), and
-the write path's daemon half — including the refusal of a binding naming a
-provider that cannot serve a turn — is covered at the RPC and unit layers
+the write path's daemon half is covered at the RPC and unit layers
 (`runtime.rs::reject_unusable_binding` and its tests, `main.rs`'s parser tests).
 What is untested is the CLI's argument plumbing into `config/set` for these two
 subcommands.
+
+**Precisely what `reject_unusable_binding` covers**, because it is easy to
+overstate: the **usability** leg only — a binding naming a *registered* remote
+provider that declares no `model`. It deliberately does **not** answer for an
+**unregistered** id; that is `Config::validate`'s, which already names the
+provider and lists what is registered, and duplicating the sentence would give
+one condition two authors. Both legs are covered, by different code.
 
 **To close it by hand** (~1 min, against any running daemon):
 

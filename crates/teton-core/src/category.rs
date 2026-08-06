@@ -10,8 +10,10 @@
 //!
 //! - [`Tier`] — the four bindings most users configure.
 //! - [`Category`] — all eleven categories. The runtime dispatch key.
-//! - [`ConfigurableCategory`] — the ten a config file may bind. `redact` is
-//!   **not** a variant (ADR-B).
+//! - [`ConfigurableCategory`] — the **nine** a config file may bind. `redact`
+//!   and `route` are **not** variants (ADR-B, as corrected: the requirement's
+//!   ADR-B listed ten and pinned only `redact`; `route` was pinned during
+//!   implementation for the same reason and by the same mechanism).
 //! - [`JudgmentCategory`] — the four the classifier may return. This is the
 //!   type-level guarantee behind AC-3: there is no path from text into
 //!   [`Category`], so a keyword matcher cannot assign `digest`.
@@ -410,7 +412,7 @@ impl fmt::Display for ConfigurableCategory {
 }
 
 impl Category {
-    /// Total conversion from the configurable ten (ADR-B).
+    /// Total conversion from the configurable nine (ADR-B).
     ///
     /// A `const fn` twin of [`From<ConfigurableCategory> for Category`] so
     /// [`ConfigurableCategory::as_str`] can stay `const`.
@@ -528,9 +530,16 @@ impl FromStr for ConfigurableCategory {
 /// The **rejection** is still structural: there is no `Redact` or `Route`
 /// variant to deserialize into, so those states stay unrepresentable however
 /// this impl is written (ADR-B). What the hand-written impl buys is only the
-/// message — and it buys it for every format at once, config TOML and the
-/// JSON-RPC payload that binds a category at runtime alike, rather than at
-/// whichever call site remembered to check.
+/// message, and only here.
+///
+/// It does **not** reach the JSON-RPC payload. `config/set` deserializes
+/// `teton_protocol::ConfigurableCategory`, a separate type that mirrors this
+/// one's absences and derives `Deserialize` — so a client sending
+/// `name = "redact"` is still refused, structurally, but reads serde's bare
+/// `unknown variant` rather than the sentence above. That is a legibility gap
+/// on one surface, not a hole in the pin; it is recorded here rather than
+/// papered over, because a doc comment claiming coverage it does not have is
+/// how the next reader stops looking.
 impl<'de> Deserialize<'de> for ConfigurableCategory {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1319,7 +1328,7 @@ mod tests {
     }
 
     /// The provider a category resolves to in `tiers_bound_to(p)` — `p` for the
-    /// ten configurable ones, the local tier for the pinned one.
+    /// nine configurable ones, the local tier for the two pinned ones.
     fn expected_provider(category: Category, bound: &str) -> &str {
         if category.configurable().is_some() {
             bound
@@ -1843,7 +1852,7 @@ mod tests {
 
     #[test]
     fn redact_ignores_every_representable_override() {
-        // Nothing a config can say moves `redact`: bind all ten categories and
+        // Nothing a config can say moves `redact`: bind all nine categories and
         // all four tiers to a remote provider and it still resolves local.
         let mut table = tiers_bound_to("frontier-remote");
         for name in ConfigurableCategory::ALL {
