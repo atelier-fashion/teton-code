@@ -311,6 +311,17 @@ fn route_decided_names_a_category_a_tier_a_provider_and_a_reason_for_both_origin
         reason.contains("'edit'"),
         "the reason names the category that fired (BR-5): {edit}"
     );
+    // And that a classification actually **happened**. Without this the leg is
+    // satisfied by a bypass: the scripted engine answers classifications with
+    // `edit`, which is also the BR-9 declared default, and the bypass sentence
+    // names `'edit'` too — so every assertion above stays green on a daemon
+    // that never issued a classification call at all. This is the one line that
+    // tells the two apart.
+    assert!(
+        reason.contains("classifier read this turn's prompt"),
+        "this leg must show the `route` classifier ran, not the declared default \
+         standing in — the two produce the same category here: {edit}"
+    );
 
     // And the general claim, over every event either turn produced: no route
     // announces a provider without also saying what it was routing.
@@ -328,6 +339,120 @@ fn route_decided_names_a_category_a_tier_a_provider_and_a_reason_for_both_origin
             event.get("tier").is_some(),
             "category and tier are both projected off one resolution, so they \
              are present together or not at all (ADR-D): {event}"
+        );
+    }
+
+    assert_no_boundary_bytes();
+}
+
+/// **BR-11: the ledger row carries the category the turn was routed by, beside
+/// the phase it was attributed to.**
+///
+/// TASK-052's own technical note asked for this test — a structured turn whose
+/// row has phase `implement` **and** category `edit`, together, on one row —
+/// and it was the missing half of the feature: nothing on the turn path called
+/// `with_category`, so the new column and the `cost_recorded` field were NULL
+/// for `edit`, `design`, `debug` and `review`. That is every ordinary turn.
+///
+/// Both dimensions have to be on the *same* row for the column to be worth
+/// having. They answer different questions and neither derives the other:
+/// "what did the implement phase cost me" is the phase's, "what did `edit` cost
+/// me across every session, freeform ones included" is the category's — and a
+/// freeform session has no phase at all, which is exactly when the category
+/// column is the only thing that can answer.
+///
+/// Asserted on the `cost_recorded` event rather than by reading the ledger,
+/// because the event is the surface a client bills from.
+#[test]
+fn a_structured_turns_cost_row_carries_both_its_phase_and_its_category() {
+    let provider = MockProvider::always(openai_turn("Done.", None, 1200, 300));
+
+    let mut config = String::new();
+    config.push_str(&remote_provider_block(
+        "frontier",
+        &provider.openai_endpoint(),
+        "claude-opus-4",
+    ));
+    // `implement` maps to `edit`, which inherits `build`.
+    config.push_str(&tier_block("build", "frontier"));
+
+    let ws = Workspace::new("cost-category");
+    ws.write_config(&config);
+    let daemon = Daemon::spawn(&ws, probe_16gb());
+    let mut client = daemon.connect();
+
+    let session = client.create_session("structured", Some("implement"));
+    let turn = client.prompt(&session, "Add a retry to the upload helper.");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{turn}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    let records: Vec<&serde_json::Value> = client
+        .events_named("cost_recorded")
+        .into_iter()
+        .filter(|e| e["record"]["session_id"].as_str() == Some(session.as_str()))
+        .collect();
+    assert!(
+        !records.is_empty(),
+        "the remote turn must have billed something, or this test asserts \
+         nothing: {:?}",
+        client.events_named("cost_recorded")
+    );
+
+    for record in &records {
+        let row = &record["record"];
+        assert_eq!(
+            row["phase"].as_str(),
+            Some("implement"),
+            "the phase the spend is attributed to: {row}"
+        );
+        assert_eq!(
+            row["category"].as_str(),
+            Some("edit"),
+            "and the category it was FOR, on the same row — read off the \
+             resolution the turn was routed by, never re-derived from the \
+             phase (ADR-D): {row}"
+        );
+        assert_eq!(row["provider_id"].as_str(), Some("frontier"), "{row}");
+    }
+
+    // Non-vacuity for the "not derived from the phase" half: `implement` maps
+    // to two categories (`edit` and `shell`), so a row reading the phase and
+    // calling `category_for_phase` would also produce `edit` here. The
+    // freeform leg is what separates them — no phase at all, and still a
+    // category.
+    let freeform = client.create_session("freeform", None);
+    let turn = client.prompt(&freeform, "Add a retry to the download helper.");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{turn}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    let freeform_rows: Vec<&serde_json::Value> = client
+        .events_named("cost_recorded")
+        .into_iter()
+        .filter(|e| e["record"]["session_id"].as_str() == Some(freeform.as_str()))
+        .collect();
+    assert!(
+        !freeform_rows.is_empty(),
+        "the freeform turn billed nothing"
+    );
+    for record in &freeform_rows {
+        let row = &record["record"];
+        assert!(
+            row.get("phase").is_none() || row["phase"].is_null(),
+            "a freeform session has no phase: {row}"
+        );
+        assert_eq!(
+            row["category"].as_str(),
+            Some("edit"),
+            "which is precisely when the category column is the only thing \
+             that can say what the spend bought: {row}"
         );
     }
 

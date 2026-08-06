@@ -1802,6 +1802,16 @@ impl DaemonRuntime {
         if let Some(ph) = phase {
             source = source.with_phase(ph);
         }
+        // REQ-558 BR-11: the category the routing decision **resolved**, read
+        // off the route rather than re-derived from the phase (ADR-D). Threaded
+        // exactly the way the phase is, and for the same reason: without it the
+        // ledger's category column is NULL for every ordinary turn — `edit`,
+        // `design`, `debug`, `review` — and "what did `edit` cost me" is a
+        // question a phase column cannot answer, in freeform mode most of all,
+        // where there is no phase at all.
+        if let Some(category) = route.resolution.as_ref().map(|r| r.category) {
+            source = source.with_category(to_protocol_category(category));
+        }
 
         run_session_turn_with_source(
             &mut source,

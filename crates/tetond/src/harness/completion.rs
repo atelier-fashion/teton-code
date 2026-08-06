@@ -33,7 +33,7 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use teton_inference::{ChatFormat, Engine, EngineError};
-use teton_protocol::{Phase, ProviderId, SessionId};
+use teton_protocol::{Category, Phase, ProviderId, SessionId};
 use teton_providers::{
     Message, Provider, Role, TokenUsage, ToolSpec, Transport, TurnEvent, TurnRequest,
 };
@@ -275,6 +275,7 @@ pub struct RemoteProviderSource<'a, T: Transport> {
     model: String,
     session_id: SessionId,
     phase: Option<Phase>,
+    category: Option<Category>,
 }
 
 impl<'a, T: Transport> RemoteProviderSource<'a, T> {
@@ -294,6 +295,7 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
             model: model.into(),
             session_id: session_id.into(),
             phase: None,
+            category: None,
         }
     }
 
@@ -302,6 +304,24 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
     #[must_use]
     pub fn with_phase(mut self, phase: Phase) -> Self {
         self.phase = Some(phase);
+        self
+    }
+
+    /// Pin the routing `category` this source's calls were made **for**
+    /// (REQ-558 BR-11).
+    ///
+    /// The other half of `with_phase`, and independent of it: the phase is what
+    /// the spend is *attributed* to, the category is what it was *for*. A
+    /// freeform session has the second without the first, and a structured one
+    /// has both on the same row — which is the point, because "what did `edit`
+    /// cost me across every session" is a question the phase column cannot
+    /// answer.
+    ///
+    /// The caller passes the category the routing decision **resolved**, read
+    /// off `Route::resolution`, never one re-derived from the phase (ADR-D).
+    #[must_use]
+    pub fn with_category(mut self, category: Category) -> Self {
+        self.category = Some(category);
         self
     }
 }
@@ -345,13 +365,18 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             max_tokens: config.gen_params.max_tokens,
         };
 
-        // BR-2: attribute the call to (session, phase, model). BR-1: the scoped
-        // transport bakes in this turn's provenance so the provider cannot bypass
-        // the boundary check.
-        let attribution = match self.phase {
-            Some(phase) => CostAttribution::new(self.model.clone()).with_phase(phase),
-            None => CostAttribution::new(self.model.clone()),
-        };
+        // BR-2 / REQ-558 BR-11: attribute the call to (session, phase, category,
+        // model). Both dimensions travel, and neither is derived from the other:
+        // the phase says what the spend belongs to, the category says what it
+        // bought. BR-1: the scoped transport bakes in this turn's provenance so
+        // the provider cannot bypass the boundary check.
+        let mut attribution = CostAttribution::new(self.model.clone());
+        if let Some(phase) = self.phase {
+            attribution = attribution.with_phase(phase);
+        }
+        if let Some(category) = self.category {
+            attribution = attribution.with_category(category);
+        }
         let egress_ctx = EgressContext::new(self.provider_id.clone())
             .with_session(self.session_id.clone())
             .with_cost(attribution);

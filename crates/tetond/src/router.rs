@@ -666,10 +666,18 @@ impl Router {
     ) -> Option<EgressContext> {
         let provider_id = route.provider_id.clone()?;
         let model = route.model.clone()?;
-        let attribution = match route.phase {
-            Some(phase) => CostAttribution::new(model).with_phase(phase),
-            None => CostAttribution::new(model),
-        };
+        // Both attribution dimensions, and neither derived from the other: the
+        // phase is what the spend belongs to (stamped on by the caller after
+        // the decision), the category is what it was *for* (read off the
+        // resolution the turn was routed by — ADR-D, never recomputed from the
+        // phase). A freeform turn has the second without the first.
+        let mut attribution = CostAttribution::new(model);
+        if let Some(phase) = route.phase {
+            attribution = attribution.with_phase(phase);
+        }
+        if let Some(category) = route.resolution.as_ref().map(|r| r.category) {
+            attribution = attribution.with_category(to_protocol_category(category));
+        }
         Some(
             EgressContext::new(provider_id)
                 .with_session(session_id)
