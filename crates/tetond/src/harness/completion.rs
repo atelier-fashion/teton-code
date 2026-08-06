@@ -41,9 +41,8 @@ use teton_providers::{
 use crate::cost::CostAttribution;
 use crate::egress::{Egress, EgressContext, Provenance};
 
-use super::context::{
-    ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance, ToolProvenance,
-};
+use super::context::{ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance};
+use super::digest::tool_result_provenance;
 use super::render;
 use super::reply::{parse_reply, ParsedTurn, ReplyScanner};
 use super::tools::ToolRegistry;
@@ -416,14 +415,11 @@ pub fn context_provenance(ctx: &ContextManager) -> Provenance {
     let mut prov = Provenance::empty();
     for block in ctx.blocks() {
         if let CtxProvenance::Tool { provenance, .. } = &block.provenance {
-            match provenance {
-                ToolProvenance::Sources(paths) => {
-                    for path in paths {
-                        prov.merge(&Provenance::tainted_by(path.clone()));
-                    }
-                }
-                ToolProvenance::Unknown => prov.mark_unknown(),
-            }
+            // One per-result mapping, shared with the `digest` duty (which scopes
+            // a *single* result rather than the whole context). Two spellings of
+            // "what does this tool result mean to egress" is how one of them ends
+            // up laxer than the other.
+            prov.merge(&tool_result_provenance(provenance));
         }
     }
     prov
@@ -449,6 +445,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::harness::context::ToolProvenance;
     use async_trait::async_trait;
     use serde_json::json;
     use teton_inference::{Completion, GenParams, MockEngine};

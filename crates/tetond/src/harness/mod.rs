@@ -17,8 +17,11 @@
 //!   repo root; `edit` is exact-match and refuses ambiguous replacements.
 //! - [`permissions`] — per-tool allow/ask/deny policy, the `permission_request`
 //!   client round-trip over TASK-004's bus, and session-scoped grants.
-//! - [`context`] — small-model context management: truncation, local
+//! - [`context`] — small-model context management: truncation, tool-result
 //!   summarization, and the provenance-tagging seam for egress.
+//! - [`digest`] — the resolved `digest` route the summarization duty runs on
+//!   (REQ-558): the local engine or a remote provider behind the egress choke
+//!   point, or an explained refusal to resolve.
 //! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
@@ -36,6 +39,7 @@
 
 pub mod completion;
 pub mod context;
+pub mod digest;
 pub mod permissions;
 pub(crate) mod render;
 pub(crate) mod reply;
@@ -50,6 +54,7 @@ pub use context::{
     ContextBlock, ContextManager, NoopProvenanceHook, Provenance, ProvenanceHook,
     RecordingProvenanceHook, ToolProvenance,
 };
+pub use digest::{DigestRoute, Digester};
 pub use permissions::{
     PendingPermissions, PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,
 };

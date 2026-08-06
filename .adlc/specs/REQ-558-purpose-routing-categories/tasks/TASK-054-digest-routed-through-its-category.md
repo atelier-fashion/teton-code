@@ -1,10 +1,10 @@
 ---
 id: TASK-054
 title: "Route the digest call site through its category instead of hardcoding local"
-status: draft
+status: complete
 parent: REQ-558
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-06
 dependencies: [TASK-050]
 ---
 
@@ -23,17 +23,17 @@ route at all. Tag it `digest` and resolve it through the category chain.
 
 ## Acceptance Criteria
 
-- [ ] `summarize_if_large` resolves through `Category::Digest` and honours a
+- [x] `summarize_if_large` resolves through `Category::Digest` and honours a
       per-category override or its `scan` tier binding.
-- [ ] The category is tagged **at the call site** — no prompt text is consulted to
+- [x] The category is tagged **at the call site** — no prompt text is consulted to
       decide that a summarization is a summarization (BR-2).
-- [ ] **The mechanical-truncation fallback survives routing failure.** If the
+- [x] **The mechanical-truncation fallback survives routing failure.** If the
       resolved provider is unavailable or resolution fails, the function still
       bounds its input by truncation and reports the failure on its outcome — it
       does not return the input unchanged (LESSON-447).
-- [ ] A test asserts the invariant holds on the failure path: an oversized input
+- [x] A test asserts the invariant holds on the failure path: an oversized input
       with an unresolvable `digest` binding still comes back bounded.
-- [ ] Session taint still forces local for this call as for any other (BR-7).
+- [x] Session taint still forces local for this call as for any other (BR-7).
 
 ## Technical Notes
 

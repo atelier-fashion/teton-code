@@ -131,8 +131,8 @@ use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
-    build_system_prompt, ContextManager, LocalEngineSource, PendingPermissions, PermissionConfig,
-    PermissionGate, SessionEvents, ToolContext, ToolRegistry,
+    build_system_prompt, ContextManager, DigestRoute, LocalEngineSource, PendingPermissions,
+    PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolRegistry,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -187,6 +187,16 @@ fn scripted_classification() -> &'static str {
     teton_core::category::JudgmentCategory::Edit.as_str()
 }
 
+/// The stand-in engine's answer to a `digest` duty.
+///
+/// Deliberately a fixed marker rather than an echo of the input. `digest` exists
+/// to *shrink* what enters context, so a stand-in that handed the text back would
+/// make a fixture pass while proving the opposite of the duty; and a fixture that
+/// crosses the summarization threshold should be able to see that it did, in one
+/// legible string, rather than discover it as a mysterious assertion failure two
+/// turns later.
+const SCRIPTED_DIGEST: &str = "[scripted digest of the tool output]";
+
 /// A local [`Engine`] that replays a fixed script of replies, one per turn.
 ///
 /// This is the CI/offline stand-in for a real llama.cpp engine: the daemon ships
@@ -196,13 +206,22 @@ fn scripted_classification() -> &'static str {
 /// plain-text end-of-turn so no runaway loop can outrun it.
 ///
 /// **A duty is not a turn** (REQ-558). The script is a sequence of *turns*, and
-/// the daemon also issues local *duty* calls on its own behalf — since TASK-053,
-/// a `route` classification before every freeform judgment turn. Serving those
-/// from the script would silently shift every block by one and make a fixture's
-/// meaning depend on how many duties the daemon happens to run, so a
-/// classification is recognized by its output contract
-/// ([`crate::classify::CLASSIFIER_OUTPUT_CONTRACT`]) and answered off-script with
-/// the declared default, consuming nothing.
+/// the daemon also issues local *duty* calls on its own behalf: a `route`
+/// classification before every freeform judgment turn (TASK-053), and a `digest`
+/// whenever a tool result crosses the summarization threshold (TASK-054). Serving
+/// those from the script would silently shift every block by one and make a
+/// fixture's meaning depend on how many duties the daemon happens to run — so
+/// each duty is recognized by its own **output contract**
+/// ([`crate::classify::CLASSIFIER_OUTPUT_CONTRACT`],
+/// [`crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT`]) and answered
+/// off-script, consuming nothing.
+///
+/// The `digest` half was latent before this task and is not: `summarize_if_large`
+/// has always called this engine, and it *did* consume a block. It has never
+/// bitten only because every fixture's tool output stays under the threshold —
+/// which is a property of the fixtures, not of the seam. The contract is a shared
+/// constant on both sides precisely so the recognizer cannot drift away from the
+/// prompt it recognizes.
 pub struct ScriptedFileEngine {
     model_id: String,
     replies: Vec<String>,
@@ -250,6 +269,8 @@ impl Engine for ScriptedFileEngine {
         // meaning what the fixture author wrote (see the type's docs).
         let text = if prompt.contains(crate::classify::CLASSIFIER_OUTPUT_CONTRACT) {
             scripted_classification().to_owned()
+        } else if prompt.contains(crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
+            SCRIPTED_DIGEST.to_owned()
         } else {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
             self.replies
@@ -1366,6 +1387,7 @@ impl DaemonRuntime {
                 .run_one_attempt(
                     events,
                     &config,
+                    &router,
                     &route,
                     &session_id,
                     phase,
@@ -1621,6 +1643,7 @@ impl DaemonRuntime {
         &self,
         events: &Arc<EventBus>,
         config: &Config,
+        router: &Router,
         route: &crate::router::Route,
         session_id: &SessionId,
         phase: Option<ProtoPhase>,
@@ -1649,6 +1672,13 @@ impl DaemonRuntime {
             None => local_engine.is_some(),
         };
 
+        // REQ-558 TASK-054: the `digest` duty resolves through its **own**
+        // category, independently of the turn's. A turn on a frontier `think`
+        // provider still summarizes through whatever `scan` is bound to, and a
+        // turn on the local tier can digest remotely — the two decisions are not
+        // the same decision, which is the whole premise of dispatching on purpose.
+        let digest = self.digest_route(router, config, events, session_id, local_engine.as_ref());
+
         if is_local {
             let Some((engine, format)) = local_engine.as_ref() else {
                 // The route named a Local-kind provider but the slot is empty —
@@ -1666,7 +1696,7 @@ impl DaemonRuntime {
                 ctx,
                 &route.harness,
                 &mut hook,
-                Some(Arc::clone(engine)),
+                &digest,
             )
             .await;
         }
@@ -1717,7 +1747,6 @@ impl DaemonRuntime {
             source = source.with_phase(ph);
         }
 
-        let summarizer = local_engine.map(|(engine, _)| engine);
         run_session_turn_with_source(
             &mut source,
             tools,
@@ -1727,9 +1756,123 @@ impl DaemonRuntime {
             ctx,
             &route.harness,
             &mut hook,
-            summarizer,
+            &digest,
         )
         .await
+    }
+
+    /// Resolve the `digest` category for this turn (REQ-558 BR-1, BR-2, BR-7).
+    ///
+    /// Same two layers `dispatch_route` uses, in the same order, for the same
+    /// reasons.
+    ///
+    /// 1. **Session taint** (BR-7). A session pinned to the local tier by boundary
+    ///    exposure stays pinned for *every* model call it makes, and a duty is a
+    ///    model call. `digest` is not exempt: the pin is a privacy guarantee and
+    ///    the category table is a cost decision, and the two deliberately do not
+    ///    compose (LESSON-432). Checked before a category is resolved, so nothing
+    ///    here reads a binding on a tainted turn.
+    /// 2. **The resolver**, through [`Router::resolve`] — one table, one
+    ///    precedence, the same one the turn itself went through (BR-6).
+    ///
+    /// Every unresolvable outcome carries a **reason**, never a bare `None`: the
+    /// duty guards an invariant, so its caller must be able to say why it fell
+    /// back to mechanical truncation (LESSON-447). Where the sentence exists
+    /// already — the resolver's — it is carried verbatim rather than re-authored
+    /// (BR-6). Note what is *not* here: a credential that will not resolve fails
+    /// the **turn** on the turn path (a config error the user must fix), but only
+    /// the **duty** here — a duty is never fatal, and the failure is reported on
+    /// the summarize outcome instead.
+    ///
+    /// A remotely-bound `digest` builds its provider and transport eagerly, once
+    /// per attempt, whether or not any tool result ends up crossing the
+    /// threshold. That costs a keychain read and an HTTP client per turn against
+    /// a turn whose floor is one model inference, so it is not worth the
+    /// machinery to defer — but it is worth knowing that after REQ-557's
+    /// migration (`default_provider` set to the first remote provider, no
+    /// `[[tiers]]` rows) the unbound `scan` tier inherits that provider, so this
+    /// is the *ordinary* upgraded config and not an exotic one.
+    fn digest_route(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DigestRoute {
+        let route = if self.session_taint.is_tainted(session_id) {
+            router.resolve_local_pin(
+                "session previously touched local-only content; the `digest` duty is pinned \
+                 to the local tier (BR-1 backstop)",
+            )
+        } else {
+            router.resolve(Category::Digest)
+        };
+
+        let Some(provider_id) = route.provider_id.as_ref().map(|p| p.0.clone()) else {
+            return DigestRoute::unresolved(route.reason);
+        };
+
+        // Locality is decided exactly as the turn path decides it, from the same
+        // two facts: the provider's declared kind, or — for the local tier naming
+        // itself with no `[[providers]]` entry (REQ-557 ADR-D) — the presence of
+        // an engine.
+        let provider_cfg = config.providers.iter().find(|p| p.id == provider_id);
+        let is_local = match provider_cfg {
+            Some(p) => matches!(p.kind, ProviderKind::Local),
+            None => local_engine.is_some(),
+        };
+
+        if is_local {
+            return match local_engine {
+                Some((engine, _format)) => DigestRoute::local(provider_id, Arc::clone(engine)),
+                None => DigestRoute::unresolved(format!(
+                    "The 'digest' category resolves to '{provider_id}', but no local engine is \
+                     loaded to serve it yet."
+                )),
+            };
+        }
+
+        // Remote. Each way this can fail names what is missing rather than
+        // returning a bare "unavailable" — an unresolvable duty is a
+        // configuration fact the user can act on.
+        let Some(provider_cfg) = provider_cfg else {
+            return DigestRoute::unresolved(format!(
+                "The 'digest' category resolves to '{provider_id}', which this daemon has no \
+                 provider entry for, and no local engine is loaded to serve it instead."
+            ));
+        };
+        // REQ-557 BR-1 / BUG-155: no model, no call. A provider id is not a model
+        // name and must never stand in for one.
+        let Some(model) = route.model.clone() else {
+            return DigestRoute::unresolved(format!(
+                "The 'digest' category resolves to '{provider_id}', which declares no model, so \
+                 there is nothing to call."
+            ));
+        };
+        let transport = match build_remote_transport(provider_cfg, &self.secret_resolver) {
+            Ok(transport) => transport,
+            Err(err) => {
+                return DigestRoute::unresolved(format!(
+                    "The 'digest' category resolves to '{provider_id}', whose transport could \
+                     not be built: {err}"
+                ))
+            }
+        };
+        let caps = CapabilityProfile::from_core(provider_cfg.capabilities);
+        // BR-1: the duty reaches the network only through the choke point, with
+        // this daemon's boundaries and this session's cost meter — the same
+        // construction the turn path uses, because a duty that egresses through a
+        // second, laxer path is the hole BR-1 exists to close.
+        let egress = Egress::new(transport, config.boundaries.clone(), events.clone())
+            .with_cost_meter(Arc::new(self.ledger.clone()));
+        DigestRoute::remote(
+            provider_id,
+            build_provider(provider_cfg, caps),
+            egress,
+            model,
+            session_id.clone(),
+        )
     }
 }
 
@@ -3653,6 +3796,49 @@ mod tests {
         );
     }
 
+    /// **The same seam, for the `digest` duty** (REQ-558 TASK-054).
+    ///
+    /// This exposure is not new — `summarize_if_large` has always called this
+    /// engine and an oversized tool result has always consumed a scripted
+    /// *turn*. It has never bitten because no fixture's tool output crosses the
+    /// summarization threshold, which is a property of the fixtures rather than
+    /// of the seam, and routing `digest` makes the threshold reachable from more
+    /// configurations.
+    ///
+    /// Driven through `summarize_if_large` rather than against the bare
+    /// constant, because what needs asserting is that the **real duty prompt**
+    /// is recognized after rendering. A prompt edit that left the recognizer
+    /// matching nothing would pass a test written against the constant alone.
+    #[tokio::test]
+    async fn a_digest_duty_is_answered_off_script_and_consumes_no_block() {
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(ScriptedFileEngine::from_script(
+            "m",
+            "first reply\n---\nsecond reply",
+        )));
+
+        let out = crate::harness::context::summarize_if_large(
+            &DigestRoute::local("local", Arc::clone(&engine)),
+            "read",
+            &"word ".repeat(500),
+            50,
+            &crate::harness::ToolProvenance::none(),
+        )
+        .await;
+
+        assert_eq!(out.engine_error, None, "the stand-in served the duty");
+        assert!(out.text.contains(SCRIPTED_DIGEST), "{}", out.text);
+
+        // And the turn sequence is untouched: turn 1 still gets block 1.
+        let params = GenParams::default();
+        let mut sink = |_: &str| true;
+        let guard = engine.lock().expect("engine mutex");
+        assert_eq!(
+            guard.complete("p", &params, &mut sink).unwrap().text,
+            "first reply",
+            "the digest consumed a scripted turn"
+        );
+    }
+
     /// And the answer it gives is one the classifier can actually parse — a
     /// stand-in whose reply failed the parse would leave every scripted freeform
     /// turn reporting a classifier failure in `route_decided`.
@@ -5253,6 +5439,165 @@ mod tests {
                 route.resolution.is_none(),
                 "the taint pin resolves no category at all (BR-7)"
             );
+        }
+
+        // -------------------------------------------------------------------
+        // The `digest` duty's own dispatch (REQ-558 TASK-054): `digest_route`.
+        //
+        // `digest` is the one harness-known category with a real call site, and
+        // before this it was hardcoded to the local engine — a configuration
+        // surface the runtime never read, which is BR-1's defect in miniature.
+        // These drive the exact function `run_one_attempt` calls.
+        // -------------------------------------------------------------------
+        mod digest {
+            use super::*;
+            use teton_core::category::{CategoryOverride, ConfigurableCategory};
+
+            /// `config()` plus a `scan` binding — the tier `digest` inherits.
+            fn scan_bound_to(provider_id: &str) -> Config {
+                let mut config = config();
+                config.tiers.push(TierBinding {
+                    tier: Tier::Scan,
+                    provider_id: provider_id.to_owned(),
+                    fallback_id: None,
+                });
+                config
+            }
+
+            /// The `digest` route the turn path builds, from the same runtime
+            /// state and through the same router.
+            fn digest_for(runtime: &DaemonRuntime, session: &SessionId) -> DigestRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.digest_route(
+                    &router,
+                    &config,
+                    &Arc::new(EventBus::new()),
+                    session,
+                    slot.as_ref(),
+                )
+            }
+
+            /// **BR-1 for a harness-known category.** `digest` is a `scan` duty,
+            /// so binding `scan` sends the summarizer there — the configured
+            /// table is read for this call as for any other. Before TASK-054
+            /// this binding was inert and the duty ran on the local engine no
+            /// matter what the config said.
+            #[test]
+            fn digest_inherits_the_scan_tier_binding() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(scan_bound_to("cheap"), &engine, true);
+                assert_eq!(
+                    digest_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some("cheap")
+                );
+            }
+
+            /// A per-category override beats the tier, here as everywhere —
+            /// override → tier → error is one precedence, not one per call site.
+            #[test]
+            fn a_digest_override_beats_the_scan_binding() {
+                let engine = CountingEngine::answering("design");
+                let mut config = scan_bound_to("cheap");
+                config.categories.push(CategoryOverride {
+                    name: ConfigurableCategory::Digest,
+                    provider_id: "frontier".to_owned(),
+                    fallback_id: None,
+                });
+                let runtime = runtime(config, &engine, true);
+                assert_eq!(
+                    digest_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some("frontier")
+                );
+            }
+
+            /// With nothing bound to `scan`, `digest` inherits the local tier —
+            /// the pre-REQ behaviour, preserved for every user who configures
+            /// nothing.
+            #[test]
+            fn an_unbound_scan_tier_digests_locally() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(config(), &engine, true);
+                assert_eq!(
+                    digest_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some(LOCAL_PROVIDER_ID)
+                );
+            }
+
+            /// **BR-7 / LESSON-432.** Session taint overrides the category
+            /// binding for a *duty* as for a turn. A tainted session with `scan`
+            /// bound to a remote provider still digests locally — otherwise the
+            /// boundary backstop would hold for the conversation and leak
+            /// through the summarizer, which reads the same files.
+            ///
+            /// This is the mutation-sensitive one: deleting the taint check in
+            /// `digest_route` turns this red on its own, at its own layer.
+            #[test]
+            fn a_tainted_session_digests_on_the_local_tier() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(scan_bound_to("frontier"), &engine, true);
+                let session = SessionId::from("tainted");
+
+                // Non-vacuity: the same config, untainted, genuinely goes remote.
+                assert_eq!(
+                    digest_for(&runtime, &SessionId::from("clean")).provider(),
+                    Some("frontier")
+                );
+
+                runtime.session_taint.mark(&session);
+                assert_eq!(
+                    digest_for(&runtime, &session).provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "a tainted session must digest locally (BR-7)"
+                );
+            }
+
+            /// An unresolvable binding is a *reason*, not a silent `None`: the
+            /// resolver's own sentence rides onto the route so the caller can
+            /// say why it fell back to mechanical truncation (BR-6, BR-8,
+            /// LESSON-447). `ghost` is bound but registered nowhere, so nothing
+            /// can serve `digest` and no id is synthesized to pretend otherwise.
+            #[test]
+            fn an_unroutable_scan_binding_leaves_digest_unresolved_with_a_reason() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(scan_bound_to("ghost"), &engine, true);
+
+                let route = digest_for(&runtime, &SessionId::from("sess"));
+
+                assert_eq!(route.provider(), None);
+                let DigestRoute::Unresolved { reason } = route else {
+                    panic!("an unroutable binding must not resolve to a provider");
+                };
+                assert!(reason.contains("digest"), "{reason}");
+                assert!(reason.contains("ghost"), "{reason}");
+            }
+
+            /// A remote-only machine with nothing bound to `scan`: `digest`
+            /// inherits the local tier, which cannot serve. Unresolved — and the
+            /// sentence is the **resolver's**, carried verbatim rather than
+            /// re-authored here (BR-6, AC-11). The old code's answer to this
+            /// state was to fold the oversized result raw.
+            #[test]
+            fn a_machine_with_no_engine_and_no_scan_binding_cannot_digest() {
+                let runtime = DaemonRuntime::minimal();
+                *runtime.config.lock().expect("config mutex") = config();
+
+                let route = digest_for(&runtime, &SessionId::from("sess"));
+
+                assert_eq!(route.provider(), None);
+                let DigestRoute::Unresolved { reason } = route else {
+                    panic!("there is nothing to serve the duty");
+                };
+                // Byte-for-byte the resolver's own sentence for this state.
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let resolved =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+                        .resolve(Category::Digest);
+                assert_eq!(reason, resolved.reason);
+                assert!(reason.contains("'digest' cannot be routed"), "{reason}");
+            }
         }
     }
 }
