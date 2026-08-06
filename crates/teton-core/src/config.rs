@@ -996,6 +996,13 @@ impl Config {
             .is_none_or(|p| !p.is_unusable_for_lacking_a_model())
     }
 
+    /// Validates the `[local_model]` inputs (REQ-547).
+    ///
+    /// The pin's *shape* is what a config-time check can honestly assert: this
+    /// crate holds no catalog (that is `teton-inference`), so it rejects values
+    /// that could never name a catalog entry — a path, a URL, a blank string —
+    /// and leaves "is there such a model?" to the daemon, which has the catalog
+    /// and can list the alternatives.
     fn validate_local_model(&self) -> Result<(), ConfigError> {
         // Decision 2 (REQ-547 review): the legacy top-level `pinned_local_model`
         // is hard-deprecated. Reject it before anything else touches a pin, so no
