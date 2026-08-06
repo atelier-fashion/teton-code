@@ -460,6 +460,147 @@ fn a_structured_turns_cost_row_carries_both_its_phase_and_its_category() {
 }
 
 // ===========================================================================
+// The upgrade path: `scan` stays local until the user binds it.
+// ===========================================================================
+
+/// **A pre-REQ config upgraded in place summarizes tool output on the local
+/// tier, and the file's contents never reach the remote provider.**
+///
+/// This is the exact fixture the security audit's finding is about. The config
+/// is what an existing install looks like on the first start after upgrade: one
+/// remote provider, `default_provider` pointing at it, and no `[[tiers]]` at
+/// all. The user set that key so their *turns* would go somewhere. They never
+/// said anything about `digest`, which before this REQ ran on the local engine
+/// unconditionally and sent nothing anywhere.
+///
+/// So the turn does go remote — `edit` inherits `build`, which inherits
+/// `default_provider` — and the `read` result it comes back with is oversized
+/// and gets summarized. That summarization must happen here, on this machine.
+/// The file is seeded with a sentinel that appears nowhere else, and the
+/// assertion is on the bytes the provider actually received: a code-inspection
+/// claim about a privacy boundary is not a test (LESSON-432).
+///
+/// ## The non-vacuity legs
+///
+/// Both directions, because the claim is a negative and a negative is
+/// satisfied by a turn that never happened:
+///
+/// - the provider genuinely received the turn, so the wire was live;
+/// - the summary the local engine produced genuinely reached the provider's
+///   next request, so the digest ran and its output travelled — the sentinel's
+///   absence is the raw file being held back, not the whole mechanism being
+///   inert.
+#[test]
+fn an_upgraded_config_digests_on_the_local_tier_and_the_file_never_egresses() {
+    // A sentinel that exists only inside the oversized file.
+    const SENTINEL: &str = "ZZQQ-ONLY-IN-THE-FILE-XYZZY";
+    /// The stand-in local engine's fixed answer to a `digest` duty
+    /// (`runtime::SCRIPTED_DIGEST`). Its presence on the wire is proof the
+    /// summarizer ran **and** that the engine which served it was this
+    /// machine's — a remote `digest` would have put the mock provider's own
+    /// text there instead.
+    const LOCAL_DIGEST_MARKER: &str = "[scripted digest of the tool output]";
+
+    let frontier = MockProvider::start(
+        vec![
+            MockResponse::ok(openai_turn(
+                "Let me read that file.",
+                Some(("c1", "read", r#"{"path":"big.txt"}"#)),
+                120,
+                20,
+            )),
+            MockResponse::ok(openai_turn("Done.", None, 200, 30)),
+        ],
+        MockResponse::ok(openai_turn("Done.", None, 10, 5)),
+    );
+
+    // The upgraded shape, and the whole point of the fixture: a remote default
+    // and NO `[[tiers]]`. Nothing here mentions `scan`. The top-level key comes
+    // FIRST — written after an array-of-tables, TOML would make it a field of
+    // the last `[[providers]]` entry instead.
+    let mut config = String::from("default_provider = \"frontier\"\n\n");
+    config.push_str(&remote_provider_block(
+        "frontier",
+        &frontier.openai_endpoint(),
+        "claude-opus-4",
+    ));
+
+    let ws = Workspace::new("scan-local");
+    ws.write_config(&config);
+    // An oversized file — comfortably over both the token and the byte trigger
+    // — every line of which carries the sentinel.
+    let big: String = std::iter::repeat_n(format!("{SENTINEL} padding padding padding\n"), 400)
+        .collect::<Vec<_>>()
+        .concat();
+    std::fs::write(ws.repo.join("big.txt"), &big).expect("seed the oversized file");
+
+    // The local engine's only job in this test is the `digest` duty, which it
+    // answers off-script from its own output contract — so the script content
+    // is irrelevant and only its presence (a live local tier) matters.
+    let script = ws.write_script("unused: every turn here runs remotely");
+    let daemon = Daemon::spawn(&ws, probe_16gb().script(script));
+    let mut client = daemon.connect();
+
+    let session = client.create_session("structured", Some("implement"));
+    let turn = client.prompt(&session, "Read big.txt and tell me what is in it.");
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "{turn}"
+    );
+    client.drain_events(Duration::from_millis(300));
+
+    // NON-VACUITY 1: the turn really did go to the remote provider, so there
+    // was a wire for the file to leak onto.
+    assert!(
+        frontier.request_count() >= 2,
+        "the turn must have reached the provider twice — the tool call and the \
+         follow-up carrying its result — or nothing below is being tested"
+    );
+    let wire: String = frontier
+        .requests()
+        .iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect();
+
+    // NON-VACUITY 2: the digest genuinely ran, on the local engine, and its
+    // output genuinely travelled — so the sentinel's absence is the raw file
+    // being held back rather than the summarizer never firing.
+    assert!(
+        wire.contains(LOCAL_DIGEST_MARKER),
+        "the LOCAL engine's digest must have reached the follow-up request, or \
+         the summarizer never ran and this test proves nothing about where it \
+         ran. The follow-up carried: {wire}"
+    );
+    assert!(
+        wire.contains("summarized read output"),
+        "and the tool result must genuinely have been summarized rather than \
+         passed through under the threshold: {wire}"
+    );
+
+    // THE CLAIM: the file's contents never left this machine.
+    assert!(
+        !wire.contains(SENTINEL),
+        "PRIVACY REGRESSION: an upgraded config sent the contents of a file the \
+         user never routed anywhere to `frontier`. `scan` must not inherit \
+         `default_provider`: that key is about turns, and `digest` was running \
+         on the local engine before this REQ and sending nothing anywhere."
+    );
+
+    // And `policy show` says so, so the user can see it rather than infer it.
+    let digest = policy_row(&mut client, "digest");
+    assert_eq!(digest["tier"].as_str(), Some("scan"), "{digest}");
+    assert_ne!(
+        digest["provider_id"].as_str(),
+        Some("frontier"),
+        "the row a user reads must agree with where the turn actually went: \
+         {digest}"
+    );
+
+    assert_no_boundary_bytes();
+}
+
+// ===========================================================================
 // AC-11 / BR-6 — one resolver, three surfaces, no drift.
 // ===========================================================================
 

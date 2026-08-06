@@ -85,13 +85,34 @@ impl Tier {
     /// Whether an **unbound** tier may take its provider from
     /// [`crate::Config::default_provider`] (REQ-557 BR-4).
     ///
-    /// `false` for [`Tier::Reflex`] alone, and that is a property of what
-    /// `reflex` *is* — "sub-second, every turn, **never leaves the machine**".
-    /// `default_provider` is by construction the provider a *remote* upgrade
-    /// path names (REQ-557's migration sets it to the first remote provider),
-    /// so letting `reflex` inherit it would send the one tier whose entire
-    /// purpose is locality to a remote model, on every turn, without the user
-    /// ever choosing that.
+    /// `false` for [`Tier::Reflex`] and [`Tier::Scan`]; `true` for `build` and
+    /// `think`. The rule is one fact stated once: **a tier whose work was
+    /// already local before this REQ stays local until the user says
+    /// otherwise.**
+    ///
+    /// - `reflex` by definition — "sub-second, every turn, **never leaves the
+    ///   machine**". `default_provider` is by construction the provider a
+    ///   *remote* upgrade path names (REQ-557's migration sets it to the first
+    ///   remote provider), so letting `reflex` inherit it would send the one
+    ///   tier whose entire purpose is locality to a remote model, on every
+    ///   turn, without the user ever choosing that.
+    /// - `scan` because of what its only reached category actually does.
+    ///   `digest` summarizes tool output — file contents, build logs, command
+    ///   output — and before REQ-558 it was hardcoded to the local engine and
+    ///   sent nothing anywhere. Inheriting `default_provider` would take a
+    ///   config that had never let that content off the machine and, on the
+    ///   first start after upgrade, begin shipping file bodies to a vendor API
+    ///   because of a key the user set for something else entirely. Making the
+    ///   *turn* configurable is REQ-558's point; silently relocating a duty
+    ///   that was never configurable is not.
+    ///
+    /// A user who wants a cheap big-context remote model doing scan work has a
+    /// one-line way to say so (`teton policy set-tier scan <provider>`). That
+    /// is an opt-in, and an opt-in is the whole difference.
+    ///
+    /// `build` and `think` are the turn tiers: their work was already going
+    /// wherever the retired phase table or `default_provider` pointed, so
+    /// inheriting is continuity rather than a change.
     ///
     /// This lives here rather than in either of its two callers because it has
     /// two: the daemon's transient fill for an unbound tier
@@ -99,12 +120,17 @@ impl Tier {
     /// ([`crate::Config::migrate_routing_to_categories`]), which writes the
     /// fill's answer down as real `[[tiers]]` rows. Written twice they would
     /// drift, and the drift would be invisible in the worst direction — the
-    /// migration *persists* its answer, so a `reflex` binding it got wrong
-    /// would outlive the run and read to a later reviewer as the user's own
-    /// choice. Same argument as ADR-F, applied to the other shared fact.
+    /// migration *persists* its answer, so a binding it got wrong would outlive
+    /// the run and read to a later reviewer as the user's own choice. Same
+    /// argument as ADR-F, applied to the other shared fact.
+    ///
+    /// Note what this does **not** touch: an explicit `[[routing]] phase = "io"`
+    /// rule still migrates to its provider. A user who wrote that expressed an
+    /// intent, and the migration honours it. Only the *unbound* case stays
+    /// local.
     #[must_use]
     pub const fn inherits_default_provider(self) -> bool {
-        !matches!(self, Tier::Reflex)
+        matches!(self, Tier::Build | Tier::Think)
     }
 }
 

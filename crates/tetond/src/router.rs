@@ -736,23 +736,27 @@ impl Router {
 
     /// What an **unbound** tier inherits, or `None` when it inherits nothing.
     ///
-    /// `reflex` is defined as "sub-second, every turn, **never leaves the
-    /// machine**" (REQ-558's tier table), so it inherits the local tier and
-    /// nothing else. Filling it from `default_provider` like the other three
-    /// would send a tier whose entire purpose is locality to whatever remote
-    /// provider happened to be first in the config — and this is the ordinary
+    /// `reflex` and `scan` inherit the local tier and nothing else — a tier
+    /// whose work was already local before this REQ stays local until the user
+    /// says otherwise. `reflex` by definition ("sub-second, every turn, **never
+    /// leaves the machine**"); `scan` because its only reached category,
+    /// `digest`, ran on the local engine unconditionally and sent nothing
+    /// anywhere. Filling either from `default_provider` would be the ordinary
     /// upgrade path, not a contrived one: REQ-557's migration sets
     /// `default_provider` to the first remote provider, and an upgraded config
-    /// has no `[[tiers]]` at all.
+    /// has no `[[tiers]]` at all — so a config that had never let a file body
+    /// off the machine would start shipping them because of a key the user set
+    /// for their turns.
     ///
-    /// `scan`/`build`/`think` inherit `default_provider` and fall back to the
-    /// local tier, so an offline install still routes. Nothing is synthesized at
-    /// any step — every candidate is config- or engine-declared (BR-8).
+    /// `build`/`think` — the turn tiers — inherit `default_provider` and fall
+    /// back to the local tier, so an offline install still routes. Nothing is
+    /// synthesized at any step; every candidate is config- or engine-declared
+    /// (BR-8).
     ///
-    /// The `reflex` exclusion is asked of [`CoreTier::inherits_default_provider`]
-    /// rather than re-spelled here, because TASK-055's migration writes this
-    /// same fill down as real `[[tiers]]` rows and must exclude `reflex` for the
-    /// same reason. One fact, one home.
+    /// The exclusion is asked of [`CoreTier::inherits_default_provider`] rather
+    /// than re-spelled here, because TASK-055's migration writes this same fill
+    /// down as real `[[tiers]]` rows and must make the same exclusions for the
+    /// same reasons. One fact, one home.
     fn inherited_provider(&self, tier: CoreTier) -> Option<String> {
         self.inherited_binding(tier).map(|(_, provider)| provider)
     }
@@ -1500,19 +1504,23 @@ mod tests {
             ProviderHealth::Healthy,
         );
 
-        // A scan/build/think tier inherits the remote default...
+        // A turn tier (build/think) inherits the remote default...
         assert_eq!(
             router.resolve(CoreCategory::Edit).provider_id.unwrap().0,
             "frontier-remote"
         );
-        // ...but reflex does not: the tier is defined as never leaving the
-        // machine, so it inherits the local tier even when a remote default is
-        // set. `title` is the reflex category the fill can actually reach —
-        // `route` and `redact` are pinned before inheritance is consulted.
-        assert_eq!(
-            router.resolve(CoreCategory::Title).provider_id.unwrap().0,
-            "local"
-        );
+        // ...but reflex and scan do not: their work was already happening on
+        // this machine, so they inherit the local tier even when a remote
+        // default is set. `title` is the reflex category the fill can actually
+        // reach — `route` and `redact` are pinned before inheritance is
+        // consulted — and `digest` is `scan`'s.
+        for category in [CoreCategory::Title, CoreCategory::Digest] {
+            assert_eq!(
+                router.resolve(category).provider_id.unwrap().0,
+                "local",
+                "{category} must inherit the local tier"
+            );
+        }
         // ...and the two pinned categories are unmoved by it.
         for pinned in [CoreCategory::Redact, CoreCategory::Route] {
             let route = router.resolve(pinned);
@@ -1564,18 +1572,48 @@ mod tests {
         );
     }
 
-    /// BR-8: an unbound tier inherits the **declared** default — `default_provider`
-    /// first (REQ-557 BR-4: "the provider an unrouted turn goes to"), then the
-    /// local tier, which is what makes an offline machine route at all.
+    /// BR-8: an unbound **turn** tier inherits the declared default —
+    /// `default_provider` first (REQ-557 BR-4: "the provider an unrouted turn
+    /// goes to"), then the local tier, which is what makes an offline machine
+    /// route at all.
     ///
     /// Both are ids someone declared; neither is synthesized. With neither
     /// declared, the category names itself and its unset tier rather than
     /// borrowing a binding from somewhere else.
+    ///
+    /// `reflex` and `scan` are not turn tiers and inherit only the local tier;
+    /// that is `an_unbound_reflex_or_scan_tier_falls_to_local_never_to_the_
+    /// remote_default`'s.
     #[test]
     fn an_unbound_tier_inherits_the_declared_default_then_the_local_tier() {
-        // `scan` is unbound in the fixture, so `digest` inherits the default.
-        let route = router().resolve(CoreCategory::Digest);
+        // `think` is bound in the fixture; `build` is not, so `edit` inherits
+        // the default — which here happens to be the same provider `build`
+        // would have named, so assert the *origin* too rather than the id
+        // alone.
+        let router = Router::new(
+            CategoryTable::new()
+                .with_local_provider("local")
+                .with_tier(tier(CoreTier::Think, "anthropic", None)),
+            Some("deepseek".to_owned()),
+        )
+        .with_provider(
+            "anthropic",
+            "claude-opus-4",
+            native(),
+            ProviderHealth::Healthy,
+        )
+        .with_provider(
+            "deepseek",
+            "deepseek-chat",
+            native(),
+            ProviderHealth::Healthy,
+        );
+        let route = router.resolve(CoreCategory::Edit);
         assert_eq!(route.provider_id.as_ref().unwrap().0, "deepseek");
+        assert_eq!(
+            router.tier_report(CoreTier::Build).origin,
+            TierOrigin::DefaultProvider
+        );
 
         // No default: the local tier serves instead — REQ-544's local-first
         // promise, and the reason a machine with no remote provider still routes.
@@ -1651,17 +1689,23 @@ mod tests {
         );
     }
 
-    /// The `reflex` tier is defined as "sub-second, every turn, **never leaves
-    /// the machine**" (REQ-558's tier table). So an UNBOUND reflex tier must
-    /// fall to the local provider, never to `default_provider`.
+    /// **An unbound `reflex` or `scan` tier falls to the local provider, never
+    /// to `default_provider`.**
+    ///
+    /// `reflex` is defined as "sub-second, every turn, **never leaves the
+    /// machine**" (REQ-558's tier table). `scan` joins it because of what its
+    /// only reached category does: `digest` summarizes tool output — file
+    /// contents, build logs — and before this REQ it ran on the local engine
+    /// unconditionally and sent nothing anywhere.
     ///
     /// This matters on the ordinary upgrade path, not a contrived one: REQ-557's
     /// migration sets `default_provider` to the first remote provider, and an
     /// upgraded config has no `[[tiers]]` at all. Filling every tier from that
     /// one value sends a tier whose whole purpose is locality to a frontier
-    /// model — and reports it that way in `policy show`.
+    /// model — and, for `scan`, starts shipping file bodies to a vendor API
+    /// because of a key the user set for their *turns*.
     #[test]
-    fn an_unbound_reflex_tier_falls_to_local_never_to_the_remote_default() {
+    fn an_unbound_reflex_or_scan_tier_falls_to_local_never_to_the_remote_default() {
         let router = Router::new(
             CategoryTable::new().with_local_provider("on-device"),
             Some("frontier-remote".to_owned()),
@@ -1674,24 +1718,33 @@ mod tests {
         )
         .with_provider("on-device", "qwen", native(), ProviderHealth::Healthy);
         // `title` is the reflex category that is neither pinned nor classified,
-        // so it is the one the fill can actually reach.
-        let route = router.resolve(CoreCategory::Title);
-        assert_eq!(
-            route.provider_id.as_ref().map(|p| p.0.as_str()),
-            Some("on-device"),
-            "reflex resolved to {:?}; the tier is defined as never leaving the \
-             machine, so an unbound reflex must inherit the local tier, not the \
-             remote default: {}",
-            route.provider_id,
-            route.reason
-        );
-
-        // The other three tiers legitimately inherit the remote default.
-        for category in [
-            CoreCategory::Digest,
-            CoreCategory::Edit,
-            CoreCategory::Design,
+        // so it is the one the fill can actually reach. `digest` is `scan`'s.
+        for (category, why) in [
+            (
+                CoreCategory::Title,
+                "the tier is defined as never leaving the machine",
+            ),
+            (
+                CoreCategory::Digest,
+                "this duty summarizes tool output and ran locally before this REQ, \
+                 so it stays local until the user binds `scan` deliberately",
+            ),
         ] {
+            let route = router.resolve(category);
+            assert_eq!(
+                route.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some("on-device"),
+                "{category} resolved to {:?}; {why}, so an unbound tier must \
+                 inherit the local tier, not the remote default: {}",
+                route.provider_id,
+                route.reason
+            );
+        }
+
+        // The two TURN tiers legitimately inherit the remote default: their
+        // work was already going wherever the retired table pointed, so
+        // inheriting is continuity rather than a change.
+        for category in [CoreCategory::Edit, CoreCategory::Design] {
             let route = router.resolve(category);
             assert_eq!(
                 route.provider_id.as_ref().map(|p| p.0.as_str()),

@@ -835,16 +835,28 @@ impl Config {
     /// re-reading it forever — but a legacy row never wins over something the
     /// user wrote in the current vocabulary.
     ///
-    /// # `default_provider` materializes into `scan`, `build` and `think`
+    /// # `default_provider` materializes into `build` and `think`
     ///
-    /// `Router::effective_table` already fills an unbound tier from
+    /// `Router::effective_table` already fills an unbound turn tier from
     /// `default_provider`, so an upgraded config routes; that fill is invisible
-    /// and uneditable. Writing it down makes it both. **`reflex` is
-    /// deliberately excluded** — [`Tier::inherits_default_provider`] is asked
-    /// rather than the list being re-spelled here, because persisting
-    /// `reflex = <remote default>` would write the bug that predicate exists to
-    /// prevent into the user's file, where a later reader would take it for the
-    /// user's own choice.
+    /// and uneditable. Writing it down makes it both.
+    ///
+    /// **`reflex` and `scan` are deliberately excluded** —
+    /// [`Tier::inherits_default_provider`] is asked rather than the list being
+    /// re-spelled here. Both were local before this REQ and stay local until
+    /// the user binds them: `reflex` by definition, `scan` because its only
+    /// reached category is `digest`, which summarizes tool output and ran on
+    /// the local engine unconditionally. Persisting either as
+    /// `<remote default>` would write the change that predicate exists to
+    /// prevent into the user's own file, where a later reader would take it for
+    /// their choice — and for `scan` it would begin sending file contents and
+    /// build logs to a vendor API on the first start after upgrade, off a key
+    /// the user set for their turns.
+    ///
+    /// An explicit `[[routing]] phase = "io"` rule is a different matter and
+    /// still migrates to its provider: that is an intent the user expressed,
+    /// and the migration honours it (loudly — see `digest_egress_notice`). Only
+    /// the *unbound* case stays local.
     ///
     /// This leg is gated on the tier table being **entirely empty**, which is
     /// what a config that predates the table looks like. A user who has bound
@@ -2611,10 +2623,7 @@ provider_id = "my-llama"
         // the next start writes the tiers.
         cfg.providers[1].model = Some("llama-3".to_owned());
         let report = cfg.migrate_routing_to_categories();
-        assert_eq!(
-            report.default_tiers,
-            vec![Tier::Scan, Tier::Build, Tier::Think]
-        );
+        assert_eq!(report.default_tiers, vec![Tier::Build, Tier::Think]);
         assert!(report.skipped_default.is_none());
     }
 
@@ -2654,32 +2663,39 @@ provider_id = "my-llama"
         );
     }
 
+    /// `default_provider` materializes into the **turn** tiers only.
+    ///
+    /// `Router::effective_table` already sends an unbound `build`/`think` to
+    /// `default_provider`; writing it down makes that visible and editable.
+    ///
+    /// `reflex` and `scan` are both excluded, and for one reason stated once in
+    /// [`Tier::inherits_default_provider`]: a tier whose work was already local
+    /// before this REQ stays local until the user says otherwise. `reflex` by
+    /// definition; `scan` because its only reached category, `digest`, was
+    /// hardcoded to the local engine and sent nothing anywhere — so inheriting
+    /// a key the user set for their *turns* would start shipping file contents
+    /// and build logs to a vendor API on the first start after upgrade.
     #[test]
-    fn the_default_provider_becomes_scan_build_and_think_but_never_reflex() {
-        // `Router::effective_table` already sends an unbound tier to
-        // `default_provider`; writing it down makes that visible and editable.
-        // `reflex` is excluded because it is the tier that never leaves the
-        // machine — and `default_provider` is by construction a remote id
-        // (REQ-557's migration sets it to the first remote provider).
+    fn the_default_provider_becomes_build_and_think_but_never_reflex_or_scan() {
         let mut cfg = Config::load(PRE_REQ_558_TOML).expect("the fixture must load");
         let report = cfg.migrate_routing_to_categories();
 
-        assert_eq!(
-            report.default_tiers,
-            vec![Tier::Scan, Tier::Build, Tier::Think]
-        );
+        assert_eq!(report.default_tiers, vec![Tier::Build, Tier::Think]);
         assert_eq!(report.default_provider.as_deref(), Some("opus"));
         assert_eq!(
             cfg.tiers.iter().map(|b| b.tier).collect::<Vec<_>>(),
-            vec![Tier::Scan, Tier::Build, Tier::Think]
+            vec![Tier::Build, Tier::Think]
         );
-        assert!(
-            cfg.tiers.iter().all(|b| b.tier != Tier::Reflex),
-            "a migrated config must carry NO written `reflex` binding: persisting \
-             `reflex = <remote default>` is the bug `Tier::inherits_default_provider` \
-             exists to prevent, written into the user's own file where a later \
-             reader would take it for their choice"
-        );
+        for excluded in [Tier::Reflex, Tier::Scan] {
+            assert!(
+                cfg.tiers.iter().all(|b| b.tier != excluded),
+                "a migrated config must carry NO written `{excluded}` binding: \
+                 persisting `{excluded} = <remote default>` is the change \
+                 `Tier::inherits_default_provider` exists to prevent, written \
+                 into the user's own file where a later reader would take it \
+                 for their choice"
+            );
+        }
     }
 
     #[test]

@@ -2287,18 +2287,14 @@ fn routing_migration_report(report: &RoutingMigration) -> Vec<String> {
             .collect();
         lines.push(format!(
             "tetond: wrote `default_provider = \"{provider}\"` into the {} tier bindings \
-             (REQ-558), now visible and editable with `teton policy set-tier <tier> <provider>`. \
-             `reflex` is left unbound on purpose: it is the sub-second, every-turn tier that \
-             never leaves the machine, so it inherits your local model rather than a remote \
-             default.",
+             (REQ-558) — where your turns were already going, now visible and editable with \
+             `teton policy set-tier <tier> <provider>`. `reflex` and `scan` are left unbound on \
+             purpose: their work was already happening on this machine, and it stays there. \
+             `scan` carries the `digest` duty, which summarizes tool output (file contents, \
+             build logs, command output) — send that to a remote provider only if you mean to, \
+             with `teton policy set-tier scan <provider>`.",
             tiers.join(", ")
         ));
-        // `scan` carries the `digest` duty, which is not a turn and was not
-        // already going anywhere. Say so rather than folding it into "where
-        // your turns were already going".
-        if report.default_tiers.contains(&Tier::Scan) {
-            lines.push(digest_egress_notice(provider));
-        }
     }
 
     if let Some(provider) = &report.skipped_default {
@@ -2314,22 +2310,28 @@ fn routing_migration_report(report: &RoutingMigration) -> Vec<String> {
     lines
 }
 
-/// The one sentence the migration owes about `digest`, wherever a migrated
-/// binding reaches it.
+/// The one sentence the migration owes when a migrated binding actually sends
+/// `digest` off the machine.
 ///
-/// Kept as one function with one caller-supplied provider so the `io` expansion
-/// and the `scan` tier write cannot say different things about the same duty.
-/// It states the change and stops: what `digest` reads, where that content went
-/// before, and where it goes now. Whether the user wants that is theirs to
-/// decide, and the last sentence is how they decide it.
+/// After the `scan` carve-out there is exactly one path that does: an explicit
+/// `[[routing]] phase = "io"` rule. That rule is an intent the user expressed
+/// in the old vocabulary, so the migration honours it rather than quietly
+/// dropping it — but honouring it moves a duty that has never egressed before,
+/// and the user is owed the plain fact rather than a claim that this was
+/// already happening.
+///
+/// The tiers leg says nothing here because it no longer does anything here:
+/// `scan` is not written from `default_provider`, so an unbound `scan` keeps
+/// digesting on the local model. That is the change, not the message.
 fn digest_egress_notice(provider: &str) -> String {
     format!(
         "tetond: NOTE — that includes the `digest` duty, which summarizes tool output (file \
          contents, build logs, command output) to keep a long session inside its context window. \
          Until now `digest` ran on your local model unconditionally and that content never left \
-         this machine; it will now be sent to `{provider}`. Privacy boundaries still apply, and a \
-         session that touched `local-only` content still digests locally. To keep all of it \
-         local: `teton policy set-category digest local`."
+         this machine; because you routed the `io` phase explicitly, it will now be sent to \
+         `{provider}`. Privacy boundaries still apply, and a session that touched `local-only` \
+         content still digests locally. To keep all of it local: \
+         `teton policy set-category digest local`."
     )
 }
 
@@ -4352,33 +4354,39 @@ provider_id = "on-device"
             "and the report must say what to do about a split:\n{text}"
         );
 
-        // The `default_provider` leg names the three tiers it wrote and says why
-        // `reflex` is not among them — a user reading "wrote your tiers" and
-        // finding one missing would otherwise reasonably think it a bug.
-        for tier in ["`scan`", "`build`", "`think`"] {
+        // The `default_provider` leg names the two tiers it wrote and says why
+        // the other two are not among them — a user reading "wrote your tiers"
+        // and finding two missing would otherwise reasonably think it a bug.
+        for tier in ["`build`", "`think`"] {
             assert!(text.contains(tier), "the report must name {tier}:\n{text}");
         }
         assert!(
-            text.contains("reflex") && text.contains("never leaves the machine"),
-            "and must say why `reflex` was left unbound:\n{text}"
+            text.contains("`reflex` and `scan` are left unbound"),
+            "and must say which tiers stayed local:\n{text}"
+        );
+        assert!(
+            text.contains("already happening on this machine"),
+            "and why — their work was local before this REQ:\n{text}"
         );
     }
 
-    /// **The `digest` sentence, wherever a migrated binding reaches it.**
+    /// **The `digest` duty leaves the machine only when the user asked for it,
+    /// and when it does the migration says so plainly.**
     ///
-    /// The tiers line used to say the write recorded "where your unbound tiers
-    /// were already sending turns, now visible and editable". That is true of
-    /// turns and false of the `digest` duty, which was hardcoded to the local
-    /// engine and sent nothing anywhere. `digest` summarizes tool output — file
-    /// bodies, build logs — so a user is owed the plain fact that this content
-    /// has not left the machine before and now will, and the one command that
-    /// keeps it here. The semantic question is theirs; the sentence is ours.
+    /// There is exactly one migration path that sends `digest` remote: an
+    /// explicit `[[routing]] phase = "io"` rule. That is an intent the user
+    /// expressed in the old vocabulary, so the migration honours it — and tells
+    /// them what the duty actually reads (file contents, build logs), that this
+    /// content has never left the machine before, and the one command that
+    /// keeps it here.
     ///
-    /// Asserted on **both** paths that reach `digest` — the `io` expansion and
-    /// the `scan` tier written from `default_provider` — because they are two
-    /// call sites for one fact.
+    /// The `default_provider` → tiers leg does **not** reach it, and that is
+    /// the substance rather than the wording: `scan` is no longer written from
+    /// `default_provider`, so an unbound `scan` keeps digesting locally. This
+    /// test asserts the silence as hard as it asserts the sentence, because the
+    /// silence is the guarantee.
     #[test]
-    fn a_migration_that_sends_digest_remote_says_what_digest_reads() {
+    fn a_migration_sends_digest_remote_only_when_the_user_routed_io() {
         fn assert_says_it(text: &str, provider: &str) {
             for phrase in [
                 "summarizes tool output",
@@ -4422,16 +4430,41 @@ provider_id = "on-device"
         let report = via_phase.migrate_routing_to_categories();
         assert_says_it(&routing_migration_report(&report).join("\n"), "cheap");
 
-        // 2. The `scan` tier written from `default_provider`, which `digest`
-        //    inherits. Same duty, same sentence.
+        // 2. `default_provider` with no tiers at all — the ordinary upgrade
+        //    path, and the one the security audit flagged. `scan` must NOT be
+        //    written, so `digest` keeps running on the local model and there is
+        //    no notice to give.
         let mut via_tier = Config {
             providers: vec![provider],
             default_provider: Some("cheap".to_owned()),
             ..Config::default()
         };
         let report = via_tier.migrate_routing_to_categories();
-        assert!(report.default_tiers.contains(&Tier::Scan));
-        assert_says_it(&routing_migration_report(&report).join("\n"), "cheap");
+        assert_eq!(
+            report.default_tiers,
+            vec![Tier::Build, Tier::Think],
+            "the upgrade path must not bind `scan` to a remote default: that \
+             would start shipping file contents and build logs to a vendor API \
+             because of a key the user set for their turns"
+        );
+        assert!(
+            via_tier.tiers.iter().all(|t| t.tier != Tier::Scan),
+            "and must not write the row either: {:?}",
+            via_tier.tiers
+        );
+        let text = routing_migration_report(&report).join("\n");
+        assert!(
+            !text.contains("never left this machine"),
+            "nothing egressed, so there is nothing to warn about:\n{text}"
+        );
+        assert!(
+            text.contains("`reflex` and `scan` are left unbound"),
+            "but the user is told which tiers stayed local and why:\n{text}"
+        );
+        assert!(
+            text.contains("set-tier scan"),
+            "and how to opt in deliberately:\n{text}"
+        );
 
         // 3. And a migration that reaches `digest` on neither path does not
         //    say it — otherwise the notice is noise rather than news.
@@ -5157,11 +5190,15 @@ provider_id = "on-device"
         }
     }
 
-    /// The tier rows report the fill an unbound tier takes, and `reflex` takes a
-    /// different one — `Tier::inherits_default_provider`'s fact, reported rather
-    /// than restated.
+    /// The tier rows report the fill an unbound tier takes, and the two
+    /// **local-by-default** tiers take a different one —
+    /// `Tier::inherits_default_provider`'s fact, reported rather than restated.
+    ///
+    /// `build` inherits `default_provider`; `reflex` and `scan` inherit the
+    /// local tier. This row is where a user sees that asymmetry rather than
+    /// discovering it by watching where their file contents go.
     #[test]
-    fn an_unbound_tier_reports_what_it_inherits_and_reflex_differs() {
+    fn an_unbound_tier_reports_what_it_inherits_and_the_local_tiers_differ() {
         let mut config = config_with_remote("cheap");
         config.default_provider = Some("cheap".to_owned());
         apply_update(
@@ -5182,18 +5219,90 @@ provider_id = "on-device"
         assert_eq!(snap.tiers.len(), 4);
         assert_eq!(row(ProtoTier::Think).source, TierBindingSource::Configured);
         assert_eq!(
-            row(ProtoTier::Scan).source,
-            TierBindingSource::DefaultProvider
+            row(ProtoTier::Build).source,
+            TierBindingSource::DefaultProvider,
+            "a turn tier inherits the declared default — the non-vacuity leg, \
+             without which the two below prove nothing"
+        );
+        for local_by_default in [ProtoTier::Reflex, ProtoTier::Scan] {
+            assert_eq!(
+                row(local_by_default).source,
+                TierBindingSource::LocalTier,
+                "`{local_by_default}` never inherits a remote default: its work \
+                 was already local before this REQ, and this row is where the \
+                 user sees that rather than discovering it by watching where \
+                 their file contents go"
+            );
+            assert_ne!(
+                row(local_by_default).provider_id,
+                row(ProtoTier::Build).provider_id
+            );
+        }
+    }
+
+    /// **A structured `io` turn on an upgraded config routes locally, and that
+    /// is strictly better than what it did before.**
+    ///
+    /// The interaction worth checking when `scan` stopped inheriting
+    /// `default_provider`: `category_for_phase(Io)` is `digest`, so an `io` turn
+    /// resolves through the `scan` tier. If leaving `scan` unbound had broken
+    /// that turn, the carve-out would be trading a privacy improvement for a
+    /// functional regression.
+    ///
+    /// It does not. Pre-REQ, `policy::evaluate(Io, …)` on a config with no
+    /// `[[routing]] phase = "io"` rule returned no provider and `NoPolicy` —
+    /// "No routing policy is configured for the io phase, so the harness cannot
+    /// select a provider by policy" — and the turn failed. It now selects the
+    /// local tier and serves. A turn that used to fail now works, on the model
+    /// that was already doing this duty.
+    ///
+    /// Asserted as `Primary` on the local tier rather than merely "not
+    /// `NoPolicy`", because the whole point is that the turn is served.
+    #[test]
+    fn a_structured_io_turn_routes_locally_when_scan_is_unbound() {
+        use teton_core::category::category_for_phase;
+        use teton_core::RouteOutcome;
+
+        let config = Config {
+            providers: vec![ModelProvider {
+                id: "cheap".to_owned(),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            }],
+            // The upgraded shape: a remote default, no `[[tiers]]` at all.
+            default_provider: Some("cheap".to_owned()),
+            ..Config::default()
+        };
+        let router = build_router(&config, true, &BTreeMap::new());
+
+        let route = router.resolve(category_for_phase(CorePhase::Io));
+        assert_eq!(
+            route.provider_id.as_ref().map(|p| p.0.as_str()),
+            Some(LOCAL_PROVIDER_ID),
+            "an `io` turn resolves through `scan`, which stays local: {}",
+            route.reason
         );
         assert_eq!(
-            row(ProtoTier::Reflex).source,
-            TierBindingSource::LocalTier,
-            "`reflex` never inherits a remote default (REQ-557 BR-4) — the one \
-             asymmetry this row exists to make visible"
+            route.outcome,
+            RouteOutcome::Primary,
+            "and it is SERVED, not merely unrouted — pre-REQ this same config \
+             returned NoPolicy and the turn failed: {}",
+            route.reason
         );
-        assert_ne!(
-            row(ProtoTier::Reflex).provider_id,
-            row(ProtoTier::Scan).provider_id
+
+        // Non-vacuity: the turn tiers on the very same router do inherit the
+        // remote default, so this is `scan`'s carve-out rather than a default
+        // that failed to apply at all.
+        assert_eq!(
+            router
+                .resolve(category_for_phase(CorePhase::Implement))
+                .provider_id
+                .as_ref()
+                .map(|p| p.0.as_str()),
+            Some("cheap")
         );
     }
 
