@@ -1239,25 +1239,51 @@ mod tests {
         )
     }
 
-    /// BR-5: `route` MUST resolve to the local tier. A user who binds the
-    /// `reflex` tier to a remote provider must NOT get a remote classifier — "a
-    /// router that calls a remote model to decide has spent what it was saving".
+    /// BR-5: `route` MUST resolve to the table's local tier and to nothing
+    /// else. A user who binds the `reflex` tier to a remote provider must NOT
+    /// get a remote classifier — "a router that calls a remote model to decide
+    /// has spent what it was saving".
+    ///
+    /// # What this can and cannot assert
+    ///
+    /// Worth being exact, because overstating it is how a guard ends up with no
+    /// coverage. This resolver is pure: it is handed a table of ids and knows
+    /// nothing about transports, so it cannot check that
+    /// `local_provider_id` is *actually* on the machine. What it owns, and what
+    /// is asserted here, is that the answer is that id and never a bound one —
+    /// the resolver consults no binding for a pinned category.
+    ///
+    /// The other half — that the id the daemon puts in that field is
+    /// engine-backed — is `local_tier_id`'s, and is pinned by
+    /// `the_local_tier_id_is_never_a_registered_remote_providers_id`. Asserting
+    /// an id here and calling it a locality guarantee is exactly what let a
+    /// config with a remote provider registered under `local` keep both sides
+    /// green while dispatching over HTTP.
     #[test]
-    fn route_never_resolves_to_a_remote_provider() {
-        let table = tiers_bound_to("frontier-remote");
-        let r = resolve(
-            Category::Route,
-            &table,
-            |_| ProviderHealth::Healthy,
-            |_| true,
-        );
-        assert_eq!(
-            r.provider_id.as_deref(),
-            Some(LOCAL),
-            "route resolved to {:?}, but BR-5 forbids classification ever going \
-             remote — the decision costs more than it saves",
-            r.provider_id
-        );
+    fn route_never_resolves_to_a_bound_provider() {
+        for pinned in [Category::Route, Category::Redact] {
+            let table = tiers_bound_to("frontier-remote");
+            let r = resolve(pinned, &table, |_| ProviderHealth::Healthy, |_| true);
+            assert_eq!(
+                r.provider_id.as_deref(),
+                Some(LOCAL),
+                "{pinned} resolved to {:?}, but BR-4/BR-5 pin it to the local \
+                 tier — for `route` the decision would cost more than it saves, \
+                 and for `redact` the content is being inspected precisely \
+                 because it may not leave the machine",
+                r.provider_id
+            );
+            assert_ne!(
+                r.provider_id.as_deref(),
+                Some("frontier-remote"),
+                "and it must not be the bound provider, whatever the tier says"
+            );
+            assert_eq!(
+                r.source,
+                BindingSource::PinnedLocal,
+                "the pin reports itself as a pin, not as an inherited binding"
+            );
+        }
     }
 
     /// The category as it appears inside a reason sentence. Quoted, so that

@@ -607,6 +607,10 @@ impl DaemonRuntime {
         // pre-REQ-557 config (BUG-155) — run first, this leg would find nothing
         // to materialize and the tiers would stay invisible for another release.
         migrate_and_report_routing_table(&mut config, config_path.as_deref());
+        // A remote provider holding the on-device tier's own id costs the
+        // machine its local tier, and everything pinned to it fails closed.
+        // Silent unless that is actually the case.
+        report_shadowed_local_tier(&config);
 
         // --- repo root (the tool jail) ---
         let repo_root = std::env::var_os("TETON_REPO_ROOT")
@@ -3512,6 +3516,83 @@ fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) ->
 /// missing default. Only the second was a defect, and only the second is gone.
 const LOCAL_PROVIDER_ID: &str = "local";
 
+/// The id of the tier that is **actually on this machine**, or `None` when there
+/// is no such tier.
+///
+/// # Why this is a function and not a `.or_else(|| Some("local"))`
+///
+/// Everything downstream that must not leave the machine — the BR-7 taint pin,
+/// the `redact` and `route` categories that are pinned local by construction —
+/// finds the local tier by comparing against `CategoryTable::local_provider_id`.
+/// That comparison asserts an **id**. If the id is one a remote provider holds,
+/// every one of those guarantees resolves to a remote endpoint while its own
+/// sentence says the turn is pinned local: `run_one_attempt` decides locality
+/// from `ProviderKind::Local` and dispatches over HTTP, `digest_route` builds a
+/// `RemoteDigester` for a tainted session, and `resolve(Category::Redact)`
+/// hands back a vendor API.
+///
+/// Two ways the tier can be real, and nothing else counts:
+///
+/// - a `[[providers]]` entry that **declares** `kind = "local"`; or
+/// - the canonical id [`LOCAL_PROVIDER_ID`], which the engine-backed tier claims
+///   for itself when the config declares no entry for it (REQ-557 ADR-D) — but
+///   only while no other provider has taken that name.
+///
+/// A config registering, say, an `openai-compatible` llama.cpp server under the
+/// id `local` is not a mistake to reject at load; it is a perfectly reasonable
+/// thing to write, and refusing to start over a name would strand the user. It
+/// simply is not an engine-backed tier, and nothing here can prove an HTTP
+/// endpoint is on this machine. So the answer is `None`, which puts the config
+/// into a state the system already models exactly: a **remote-only machine**.
+/// `resolve_local_pin` already has that path — "no local provider is
+/// registered, so the turn cannot be served" — and it fails closed. The turn
+/// stops; it does not quietly go out over the network under a local-sounding
+/// name.
+///
+/// [`report_shadowed_local_tier`] tells the user at startup, because a tier
+/// disappearing deserves a sentence.
+fn local_tier_id(config: &Config) -> Option<String> {
+    if let Some(declared) = config
+        .providers
+        .iter()
+        .find(|p| matches!(p.kind, ProviderKind::Local))
+    {
+        return Some(declared.id.clone());
+    }
+    // The canonical id is the tier naming itself, so it is only the tier's to
+    // claim while nothing else answers to it.
+    config
+        .providers
+        .iter()
+        .all(|p| p.id != LOCAL_PROVIDER_ID)
+        .then(|| LOCAL_PROVIDER_ID.to_owned())
+}
+
+/// Warn at startup when a non-local provider has taken the canonical local-tier
+/// id, so the machine has no engine-backed tier the pins can resolve to.
+///
+/// Silent otherwise. The condition is exact: a provider registered under
+/// [`LOCAL_PROVIDER_ID`] whose kind is not `local`, with no other provider
+/// declaring `kind = "local"` — which is precisely when [`local_tier_id`]
+/// returns `None` despite the config mentioning the name.
+fn report_shadowed_local_tier(config: &Config) {
+    let shadowed = config
+        .providers
+        .iter()
+        .any(|p| p.id == LOCAL_PROVIDER_ID && !matches!(p.kind, ProviderKind::Local));
+    if shadowed && local_tier_id(config).is_none() {
+        eprintln!(
+            "tetond: WARNING — a remote provider is registered under the id \
+             `{LOCAL_PROVIDER_ID}`, which is the name the on-device tier uses for itself. This \
+             daemon therefore has no local tier: turns pinned local for privacy (a session that \
+             read `local-only` content), and the `redact` and `route` duties, will fail rather \
+             than run — they must not be served by a provider the daemon cannot prove is on this \
+             machine. Rename that provider, or declare your on-device engine with \
+             `kind = \"local\"`."
+        );
+    }
+}
+
 /// Build the phase-policy [`Router`] from a config snapshot.
 ///
 /// Takes no price table: REQ-557 ADR-A reversed the dependency, so a provider
@@ -3535,12 +3616,7 @@ fn build_router(
     // the engine, not the config — so it keeps its canonical id. That is a
     // constant, not a stand-in for an absent choice, and the distinction is the
     // whole of ADR-D.
-    let local_provider = config
-        .providers
-        .iter()
-        .find(|p| matches!(p.kind, ProviderKind::Local))
-        .map(|p| p.id.clone())
-        .or_else(|| Some(LOCAL_PROVIDER_ID.to_owned()));
+    let local_provider = local_tier_id(config);
     let default_provider = config.default_provider.clone();
 
     // REQ-558 BR-1: the configured tier/category table is what the runtime
@@ -5923,6 +5999,90 @@ provider_id = "on-device"
         assert_eq!(route.model.as_deref(), Some("on-device"));
     }
 
+    /// **The local tier's id is only ever an id the daemon serves on device.**
+    ///
+    /// The direct unit of the guarantee everything privacy-pinned rests on.
+    /// `CategoryTable::local_provider_id` is what `is_local_tier`,
+    /// `resolve_local_pin`, and the pinned `redact`/`route` categories all
+    /// compare against — so if it can hold the id of a registered remote
+    /// provider, every one of those resolves to a vendor endpoint while saying
+    /// the opposite.
+    #[test]
+    fn the_local_tier_id_is_never_a_registered_remote_providers_id() {
+        fn remote(id: &str) -> ModelProvider {
+            ModelProvider {
+                id: id.to_owned(),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.example.com".to_owned()),
+                model: Some("some-model".to_owned()),
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            }
+        }
+        fn local(id: &str) -> ModelProvider {
+            ModelProvider {
+                id: id.to_owned(),
+                kind: ProviderKind::Local,
+                endpoint: None,
+                model: None,
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            }
+        }
+        fn config(providers: Vec<ModelProvider>) -> Config {
+            Config {
+                providers,
+                ..Config::default()
+            }
+        }
+
+        // Nothing registered: the engine-backed tier names itself (ADR-D).
+        assert_eq!(
+            local_tier_id(&config(vec![])).as_deref(),
+            Some(LOCAL_PROVIDER_ID)
+        );
+        // Remotes registered under other names: still the tier's own name.
+        assert_eq!(
+            local_tier_id(&config(vec![remote("frontier")])).as_deref(),
+            Some(LOCAL_PROVIDER_ID)
+        );
+        // A declared `kind = "local"` entry wins, under whatever id it chose.
+        assert_eq!(
+            local_tier_id(&config(vec![remote("frontier"), local("on-device")])).as_deref(),
+            Some("on-device")
+        );
+        // A declared local entry that *also* took the canonical name is fine —
+        // it is the tier.
+        assert_eq!(
+            local_tier_id(&config(vec![local(LOCAL_PROVIDER_ID)])).as_deref(),
+            Some(LOCAL_PROVIDER_ID)
+        );
+        // The hazard: a REMOTE provider under the canonical name, and no
+        // declared local tier. The name is taken, so the tier has no id — and
+        // the daemon has no local tier, which is a state it already models.
+        assert_eq!(
+            local_tier_id(&config(vec![remote(LOCAL_PROVIDER_ID)])),
+            None
+        );
+        // And it is genuinely the *kind* that decides, not the position: the
+        // same config with a real local engine declared elsewhere resolves to
+        // that engine rather than to the squatter.
+        assert_eq!(
+            local_tier_id(&config(vec![remote(LOCAL_PROVIDER_ID), local("on-device")])).as_deref(),
+            Some("on-device")
+        );
+
+        // The consequence, at the surface that matters: with the name squatted,
+        // the pin names nothing rather than naming the vendor endpoint.
+        let squatted = config(vec![remote(LOCAL_PROVIDER_ID)]);
+        let router = build_router(&squatted, true, &BTreeMap::new());
+        assert_eq!(router.resolve_local_pin("tainted").provider_id, None);
+        // Same for `redact`, which is pinned local by construction (BR-4) and
+        // would otherwise hand content to a remote provider for inspection
+        // *before* that content is allowed to leave the machine.
+        assert_eq!(router.resolve(Category::Redact).provider_id, None);
+    }
+
     /// BUG-155: a REMOTE provider whose model is blank never enters the router.
     ///
     /// `unusable_providers()` already called this unusable — it trims — while
@@ -6531,10 +6691,100 @@ provider_id = "on-device"
                 route.provider_id.as_ref().map(|p| p.0.as_str()),
                 Some(LOCAL_PROVIDER_ID)
             );
+            // And — the load-bearing half — that id is one this daemon serves
+            // **on the machine**. Asserting the name alone is what let a config
+            // with a remote provider registered under `local` keep this test
+            // green while dispatching the pinned turn over HTTP.
+            assert_engine_backed(&config(), &route);
             assert!(
                 route.resolution.is_none(),
                 "the taint pin resolves no category at all (BR-7)"
             );
+        }
+
+        /// The pin **asserts locality**: whatever provider it names, the daemon
+        /// must serve it on this machine, and where it can name none it must
+        /// name none rather than reach for a lookalike.
+        ///
+        /// Swept across the three shapes `local_tier_id` distinguishes, because
+        /// the whole defect was that the third one was indistinguishable from
+        /// the first by name.
+        #[tokio::test]
+        async fn the_taint_pin_never_names_a_provider_the_daemon_would_dial() {
+            /// A `[[providers]]` entry that is genuinely the on-device tier.
+            fn local(id: &str) -> ModelProvider {
+                ModelProvider {
+                    id: id.to_owned(),
+                    kind: ProviderKind::Local,
+                    endpoint: None,
+                    model: None,
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                }
+            }
+
+            // 1. The canonical case: no `[[providers]]` entry, the engine-backed
+            //    tier names itself.
+            let mut declared = config();
+            // 2. A declared `kind = "local"` entry under any id at all.
+            let mut named = config();
+            named.providers.push(local("on-device"));
+            // 3. The hazard: a REMOTE provider holding the canonical id, and no
+            //    `kind = "local"` entry anywhere. `local` here is a vendor API
+            //    that merely shares a name with the tier.
+            let mut squatted = config();
+            squatted
+                .providers
+                .push(remote(LOCAL_PROVIDER_ID, "some-hosted-model"));
+
+            for (label, config, expected) in [
+                ("canonical", &mut declared, Some(LOCAL_PROVIDER_ID)),
+                ("declared", &mut named, Some("on-device")),
+                ("squatted", &mut squatted, None),
+            ] {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(config.clone(), &engine, true);
+                let router = router_for(&runtime);
+                let session = SessionId::from("tainted");
+                runtime.session_taint.mark(&session);
+
+                let route = runtime
+                    .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
+                    .await;
+
+                assert_eq!(
+                    route.provider_id.as_ref().map(|p| p.0.as_str()),
+                    expected,
+                    "{label}: the pin named the wrong provider — {}",
+                    route.reason
+                );
+                assert_engine_backed(config, &route);
+            }
+        }
+
+        /// The provider a route names must be one the daemon serves **without a
+        /// network call**, read from the same two facts `run_one_attempt` and
+        /// `digest_route` read: a `[[providers]]` entry declaring
+        /// `kind = "local"`, or no entry at all — in which case there is nothing
+        /// to dial and only the engine can serve it.
+        ///
+        /// Naming no provider passes: the turn stops rather than going out.
+        fn assert_engine_backed(config: &Config, route: &crate::router::Route) {
+            let Some(id) = route.provider_id.as_ref().map(|p| p.0.as_str()) else {
+                return;
+            };
+            // No entry at all is fine: `run_one_attempt` finds no
+            // `provider_cfg`, so it either runs on the engine or fails closed
+            // with `NoTierAvailable`. Neither reaches a transport.
+            if let Some(p) = config.providers.iter().find(|p| p.id == id) {
+                assert!(
+                    matches!(p.kind, ProviderKind::Local),
+                    "a route pinned local named `{id}`, which this config registers as a \
+                     `{:?}` provider — dispatch reads that kind and sends the turn over \
+                     HTTP. The pin must assert locality, not a name.",
+                    p.kind
+                );
+            }
         }
 
         // -------------------------------------------------------------------

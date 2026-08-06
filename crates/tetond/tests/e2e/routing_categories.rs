@@ -473,37 +473,44 @@ fn one_resolver_answers_policy_show_and_the_turn_failure_alike() {
 // BUG-156 — a taint-pinned session cannot fail over to a remote provider.
 // ===========================================================================
 
-/// A session pinned local by the taint backstop does **not** hand its turn to
-/// the tier's configured `fallback_id` when the pinned route fails — asserted
-/// by captured bytes, against a fallback the very same daemon and the very same
-/// binding reach on an untainted session.
+/// A session pinned local by the taint backstop is served **on this machine**,
+/// and never reaches the tier's configured `fallback_id` — asserted by captured
+/// bytes, against a fallback the very same daemon and the very same binding
+/// reach on an untainted session.
 ///
 /// ## Why the fixture looks like this
 ///
-/// BUG-156's hole is in the mid-turn failover path, which the daemon reaches
-/// only for `HarnessError::Remote`. A taint-pinned route names
-/// `local_provider_id`, and when that is the daemon's own engine the turn runs
-/// through `LocalEngineSource`, whose failures are `HarnessError::Engine` and
-/// are returned without ever consulting the failover path. So the ordinary
-/// local tier cannot reach the defect end to end at all.
+/// This is the config that used to make the pin dispatch over HTTP, and it is a
+/// natural one to write: a user runs their own llama.cpp server, registers it
+/// `openai-compatible` under the id `local`, and binds `think` to it with a
+/// frontier fallback. Before the locality fix, `local_provider_id` fell back to
+/// the literal id `local` whenever no `kind = "local"` provider was declared, so
+/// the taint pin resolved to *that* id, `run_one_attempt` read
+/// `ProviderKind::OpenaiCompatible`, and a tainted session's turn went out over
+/// the network while its own route sentence said it was pinned local.
 ///
-/// The one config that can is this one: `local_provider_id` falls back to the
-/// literal id `local` when no `kind = "local"` provider is declared, so a user
-/// who registers their own llama.cpp server as `openai-compatible` under that
-/// id — a natural thing to do — makes the taint pin dispatch over HTTP. The pin
-/// still holds (that provider *is* what the user declared as their local tier);
-/// what must not happen is the turn being handed onward to the tier's
-/// `fallback_id`, which is a genuine frontier provider.
+/// The pin now asserts locality rather than naming it: the canonical id belongs
+/// to the engine-backed tier only while nothing else answers to it, so here it
+/// resolves to **no provider at all**. Dispatch then has no `[[providers]]`
+/// entry to dial and serves the turn on the real on-device engine — which is
+/// what "pinned local" was always supposed to mean. There is no remaining path
+/// by which a pinned route can be handed to an HTTP transport, which is why the
+/// mid-turn failover leg BUG-156 patched is now unreachable from a pin by
+/// construction rather than by assertion. `Router::fallback_for` still carries
+/// its own unit-level pin.
 ///
-/// ## The non-vacuity leg
+/// ## The non-vacuity legs
 ///
-/// A control session on the same daemon, the same tier binding and the same
-/// failing primary **does** fail over to `backup` and completes there. So the
-/// tainted session's zero bytes are the pin holding, not an unreachable
-/// fallback. Reverting `Router::fallback_for` to re-read the configured table
-/// when the route carries no resolution — main's logic — turns this red.
+/// Two, because the interesting claim is a *negative*:
+///
+/// - a control session on the same daemon, the same tier binding and the same
+///   failing primary **does** fail over to `backup` and completes there, so the
+///   tainted session's zero bytes are the pin holding rather than an
+///   unreachable fallback;
+/// - the tainted turn genuinely completes, on the local engine's own scripted
+///   answer, so the zero bytes are not simply a turn that died early.
 #[test]
-fn a_tainted_session_does_not_fail_over_to_the_tiers_remote_fallback() {
+fn a_tainted_session_is_served_on_device_and_never_reaches_the_tiers_fallback() {
     // The provider the taint pin names. Its one scripted reply issues a `shell`
     // call, whose result is unknown-provenance and taints the session; every
     // call after that fails with a fallback-class error.
@@ -543,12 +550,11 @@ fn a_tainted_session_does_not_fail_over_to_the_tiers_remote_fallback() {
 
     let ws = Workspace::new("bug156");
     ws.write_config(&config);
-    // A live local tier. Not because any turn here runs on it — the pinned id
-    // is a remote-kind provider, so every turn below dispatches over HTTP — but
-    // because `Router::health_of` reports the id named by `local_provider_id`
-    // as `Unavailable` whenever the tier is not live. Without it the primary is
-    // passed over at *resolution* time and the turn fails over to `backup`
-    // before it ever reaches the mid-turn path this test is about.
+    // A live local tier — and it is now load-bearing rather than incidental.
+    // The engine is what actually serves every pinned turn below: the pin
+    // resolves to no provider id (the canonical name is taken by a remote
+    // entry), so dispatch has nothing to dial and falls to the engine. Its
+    // scripted answer is what the tainted session gets back.
     let script = ws.write_script("Local, done.");
     let daemon = Daemon::spawn(&ws, probe_16gb().script(script));
     let mut client = daemon.connect();
@@ -559,9 +565,8 @@ fn a_tainted_session_does_not_fail_over_to_the_tiers_remote_fallback() {
     client.drain_events(Duration::from_millis(300));
     // The follow-up call carrying the `shell` result is fail-closed at egress
     // (REQ-544 C-1: unknown provenance is blocked exactly like a boundary hit),
-    // and the reroute lands back on the same remote-kind id, so the turn ends
-    // in a refusal. What matters here is the side effect: the session is now
-    // tainted.
+    // and the reroute lands on the pin. What matters here is the side effect:
+    // the session is now tainted.
     assert!(
         client.saw_event("privacy_block"),
         "the unknown-provenance follow-up must be blocked, which is what taints \
@@ -570,9 +575,11 @@ fn a_tainted_session_does_not_fail_over_to_the_tiers_remote_fallback() {
     let pre_taint = routes_to(&client, "local");
     assert_eq!(
         pre_taint.len(),
-        2,
-        "turn 1 routes through the `think` binding and then reroutes onto the \
-         pin — both name the same id here: {:?}",
+        1,
+        "exactly ONE route names the squatted id — the pre-taint one, through \
+         the `think` binding. The reroute onto the pin must NOT announce it: \
+         that id belongs to a remote provider, and a route that names it is a \
+         route that dispatches over HTTP: {:?}",
         client.events_named("route_decided")
     );
     assert_eq!(
@@ -580,11 +587,6 @@ fn a_tainted_session_does_not_fail_over_to_the_tiers_remote_fallback() {
         Some("design"),
         "the pre-taint route went through the category chain: {}",
         pre_taint[0]
-    );
-    assert!(
-        pre_taint[1].get("category").is_none(),
-        "and the pin that replaced it consulted no binding (ADR-D): {}",
-        pre_taint[1]
     );
 
     // --- Control: an UNTAINTED session on the same binding does fail over ----
@@ -605,14 +607,14 @@ fn a_tainted_session_does_not_fail_over_to_the_tiers_remote_fallback() {
     );
     client.drain_events(Duration::from_millis(300));
 
-    // --- Turn 2 of the tainted session: pinned, and nothing fails over -------
+    // --- Turn 2 of the tainted session: served on device, nothing egresses ---
     let before = backup.request_count();
+    let before_pinned = pinned.request_count();
     let second = client.prompt(&tainted, "Now decompose the neighbouring loader.");
-    assert!(
-        second.get("error").is_some(),
-        "with the pinned provider failing and a tainted session having no \
-         fallback to hand out, the turn must FAIL rather than reach the \
-         frontier: {second}"
+    assert_eq!(
+        second["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "the pinned turn is served by the on-device engine: {second}"
     );
     client.drain_events(Duration::from_millis(300));
 
@@ -625,25 +627,18 @@ fn a_tainted_session_does_not_fail_over_to_the_tiers_remote_fallback() {
          one from the configured table (BUG-156)."
     );
     assert_eq!(
+        pinned.request_count(),
+        before_pinned,
+        "BR-7 VIOLATION: a tainted session's turn went out over HTTP to the \
+         provider squatting the local tier's id. The pin asserts locality, not \
+         a name — an id a remote `[[providers]]` entry answers to is not the \
+         engine-backed tier, whatever it is called."
+    );
+    assert_eq!(
         routes_to(&client, "backup").len(),
         1,
         "only the control session ever announced a route to the fallback: {:?}",
         client.events_named("route_decided")
-    );
-
-    // The degradation event for the tainted failure names no fallback: the user
-    // is told the provider failed and that there is nowhere to go, rather than
-    // being told about a failover that must not happen.
-    let no_fallback_degradations = client
-        .events_named("provider_degraded")
-        .into_iter()
-        .filter(|e| e["session_id"].as_str() == Some(tainted.as_str()))
-        .filter(|e| e.get("fallback_id").is_none())
-        .count();
-    assert!(
-        no_fallback_degradations >= 1,
-        "the tainted failure must report a degradation naming no fallback: {:?}",
-        client.events_named("provider_degraded")
     );
 
     assert_no_boundary_bytes();
