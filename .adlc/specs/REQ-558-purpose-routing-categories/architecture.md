@@ -66,6 +66,13 @@ fact.
 adds the `triage` call site, the test fails until the marker is updated — which is
 the intended prompt.
 
+**It worked before the REQ even shipped.** This ADR was written saying *six*
+categories are unreached, counting `route` among them. TASK-053 then gave `route`
+a call site — the classifier — and the derived test caught the stale six on
+TASK-056's first run. The unreached set is **five**: `redact`, `title`, `compact`,
+`triage`, `shell`. A hand-maintained list would have shipped the wrong number, in
+the user-facing surface, silently. That is the entire argument for deriving it.
+
 ### ADR-B: `redact` is absent from the *configurable* enum, so the pin needs no guard
 
 **Decision**: two enums.
