@@ -1,19 +1,21 @@
 //! Router acceptance harness (BR-5, BR-6, BR-8, AC-3, AC-7, and the BR-1/BR-2
 //! by-construction proof).
 //!
-//! The router is the wiring layer over the pure policy evaluator: it turns a
-//! phase (or a freeform prompt) into a provider + a legible reason, applies the
-//! BR-6 degradation profile, and — for remote calls — builds the egress-choke
-//! context that makes privacy (BR-1) and cost recording (BR-2) hold by
-//! construction. These tests drive the router the way the daemon will and assert:
+//! The router is the wiring layer over the pure category resolver: it turns a
+//! **category** into a provider + a legible reason, applies the BR-6 degradation
+//! profile, and — for remote calls — builds the egress-choke context that makes
+//! privacy (BR-1) and cost recording (BR-2) hold by construction. These tests
+//! drive the router the way the daemon does and assert:
 //!
-//! 1. Structured-mode calls route per the policy table and each emits a
-//!    `route_decided` whose reason names the rule that fired (BR-5, AC-3 backend).
-//! 2. Freeform heuristic decisions also emit `route_decided` with reasons (BR-5).
+//! 1. Structured-mode calls route per the configured table and each emits a
+//!    `route_decided` whose reason names the binding that fired (BR-5, AC-3
+//!    backend).
+//! 2. **Freeform calls read the same table** (REQ-558 BR-1) and also emit
+//!    `route_decided` with reasons (BR-5).
 //! 3. A simulated mid-session provider failure falls back per its failure class,
 //!    emits `provider_degraded`, and the session completes on the fallback (AC-7).
-//! 4. When the local tier is unavailable the router bypasses it to a remote
-//!    provider rather than blocking the loop (BR-8).
+//! 4. When the local tier is unavailable a category bound to it fails over to its
+//!    configured fallback rather than blocking the loop (BR-8).
 //! 5. A weak-capability provider is routed under the reduced harness profile
 //!    (smaller tool set, shorter loop, mandatory verification) (BR-6).
 //! 6. A routed *remote* call produces a `CostRecord` **and** is subject to
@@ -26,7 +28,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use teton_core::entities::{BoundaryMode, PrivacyBoundary, RoutingPolicy};
+use teton_core::category::{category_for_phase, Category, CategoryTable, Tier, TierBinding};
+use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
 use teton_core::ToolCallTier;
@@ -42,7 +45,7 @@ use teton_providers::{CapabilityProfile, FailureClass};
 use tetond::broadcast::{EventBus, Subscription};
 use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::{Egress, EgressError, NoopSink, Provenance};
-use tetond::router::Router;
+use tetond::router::{to_protocol_phase, Route, Router};
 
 // --------------------------------------------------------------------------
 // Fixtures
@@ -64,28 +67,40 @@ fn degraded() -> CapabilityProfile {
     }
 }
 
-fn policy(phase: CorePhase, provider: &str, fallback: Option<&str>) -> RoutingPolicy {
-    RoutingPolicy {
-        phase,
+fn tier(tier: Tier, provider: &str, fallback: Option<&str>) -> TierBinding {
+    TierBinding {
+        tier,
         provider_id: provider.to_owned(),
         fallback_id: fallback.map(str::to_owned),
     }
 }
 
-/// A router with the AC-3 routing shape: frontier on spec/architect/review, the
-/// cheap provider on implement, the local tier on io — plus a freeform default
-/// (deepseek) and local tier, all healthy.
+/// How the daemon routes a **structured** turn (`runtime.rs`): map the phase to
+/// a category (ADR-C, no model call), resolve the category, then stamp the phase
+/// back on for cost attribution only (BR-11, AC-9).
+///
+/// Written out here rather than hidden behind a router method because the two
+/// halves are the point: the router never sees the phase, and the ledger still
+/// does.
+fn structured_route(router: &Router, phase: CorePhase) -> Route {
+    let mut route = router.resolve(category_for_phase(phase));
+    route.phase = Some(to_protocol_phase(phase));
+    route
+}
+
+/// A router with the AC-3 routing shape translated into tiers: frontier on
+/// `think` (design/debug/review), the cheap provider on `build` (edit/shell),
+/// the local tier on `scan` (digest/triage) with a remote fallback — plus a
+/// declared default (deepseek) and a local tier, all healthy.
 fn structured_router() -> Router {
     Router::new(
-        vec![
-            policy(CorePhase::Spec, "anthropic", Some("deepseek")),
-            policy(CorePhase::Architect, "anthropic", Some("deepseek")),
-            policy(CorePhase::Implement, "deepseek", Some("anthropic")),
-            policy(CorePhase::Review, "anthropic", Some("deepseek")),
-            policy(CorePhase::Io, "local", None),
-        ],
+        CategoryTable::new()
+            .with_local_provider("local")
+            .with_tier(tier(Tier::Think, "anthropic", Some("deepseek")))
+            .with_tier(tier(Tier::Build, "deepseek", Some("anthropic")))
+            .with_tier(tier(Tier::Scan, "local", Some("deepseek")))
+            .with_tier(tier(Tier::Reflex, "local", None)),
         Some("deepseek".to_owned()),
-        Some("local".to_owned()),
     )
     .with_provider(
         "anthropic",
@@ -188,11 +203,11 @@ async fn collect_events(sub: &mut Subscription) -> Vec<teton_protocol::events::E
 }
 
 // --------------------------------------------------------------------------
-// 1. Structured-mode policy routing + legible route_decided (BR-5, AC-3)
+// 1. Structured-mode table routing + legible route_decided (BR-5, AC-3)
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn structured_mode_routes_per_policy_and_route_decided_names_the_rule() {
+async fn structured_mode_routes_per_the_table_and_route_decided_names_the_binding() {
     let router = structured_router();
     let bus = Arc::new(EventBus::new());
     let mut sub = bus.subscribe(64);
@@ -208,17 +223,25 @@ async fn structured_mode_routes_per_policy_and_route_decided_names_the_rule() {
     ];
 
     for (phase, provider, _) in expected {
-        let route = router.resolve_structured(phase);
+        let route = structured_route(&router, phase);
         assert_eq!(
             route.provider_id.as_ref().unwrap().0,
             provider,
-            "phase {phase} routes to {provider} per policy"
+            "phase {phase} maps to {} and routes to {provider}",
+            category_for_phase(phase)
         );
-        // BR-5: the reason names the rule that fired (the routing policy).
+        // BR-5: the reason names the binding that fired, by category and tier.
+        let category = category_for_phase(phase);
         assert!(
-            route.reason.contains("routing policy"),
-            "reason names the rule: {}",
+            route.reason.contains(&format!("'{category}'")),
+            "reason names the category that fired: {}",
             route.reason
+        );
+        // AC-9: the phase reached the route as attribution, never as dispatch —
+        // the resolution the decision was made from carries no phase at all.
+        assert_eq!(
+            route.resolution.as_ref().map(|r| r.category),
+            Some(category)
         );
         router.emit_route_decided(&bus, Some(session.clone()), &route);
     }
@@ -238,6 +261,9 @@ async fn structured_mode_routes_per_policy_and_route_decided_names_the_rule() {
             Event::RouteDecided(rd) => {
                 assert_eq!(rd.provider_id, ProviderId::from(*provider));
                 assert_eq!(rd.phase, Some(*proto));
+                // REQ-558 AC-8: every decision names its category and its tier.
+                assert!(rd.category.is_some(), "route_decided carries a category");
+                assert!(rd.tier.is_some(), "route_decided carries a tier");
                 assert!(!rd.reason.is_empty(), "route_decided carries a reason");
             }
             other => panic!("expected route_decided, got {other:?}"),
@@ -247,25 +273,46 @@ async fn structured_mode_routes_per_policy_and_route_decided_names_the_rule() {
 }
 
 // --------------------------------------------------------------------------
-// 2. Freeform heuristic decisions also emit route_decided (BR-5)
+// 2. Freeform reads the SAME table (REQ-558 BR-1) and emits route_decided (BR-5)
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn freeform_heuristic_decisions_emit_route_decided_with_reasons() {
+async fn freeform_decisions_read_the_configured_table_and_emit_route_decided() {
     let router = structured_router();
     let bus = Arc::new(EventBus::new());
     let mut sub = bus.subscribe(64);
     let session = SessionId::from("sess-freeform");
 
-    // An auxiliary duty → local tier; a coding turn → configured default.
-    let aux = router.resolve_freeform("summarize this diff for the changelog");
-    assert_eq!(aux.provider_id.as_ref().unwrap().0, "local");
-    assert!(aux.phase.is_none(), "freeform carries no phase");
-    router.emit_route_decided(&bus, Some(session.clone()), &aux);
+    // **AC-1, the headline regression.** "explain the tradeoffs between these two
+    // architectures" is a `design` turn, and `design` inherits `think` — so it
+    // reaches the frontier provider bound there. The deleted `AUXILIARY_SIGNALS`
+    // list sent that prompt to the 3B local model for containing "explain", and
+    // never consulted the table at all.
+    //
+    // The prompt is not passed to anything here because it cannot be: `resolve`
+    // takes a category. That absence is the fix.
+    let judgment = router.resolve(Category::Design);
+    assert_eq!(
+        judgment.provider_id.as_ref().unwrap().0,
+        "anthropic",
+        "a freeform `design` turn must reach the `think` binding, not the local \
+         tier: {}",
+        judgment.reason
+    );
+    assert!(judgment.phase.is_none(), "freeform carries no phase");
+    router.emit_route_decided(&bus, Some(session.clone()), &judgment);
 
-    let coding = router.resolve_freeform("implement the retry backoff");
+    // And a freeform turn with no classifier yet takes the BR-9 declared default
+    // (`edit`), which inherits `build`.
+    let coding = router.resolve(router.freeform_category());
     assert_eq!(coding.provider_id.as_ref().unwrap().0, "deepseek");
     router.emit_route_decided(&bus, Some(session.clone()), &coding);
+
+    // BR-1 asserted directly: freeform and structured resolve the SAME category
+    // through the SAME table to the same answer, byte for byte.
+    let structured = structured_route(&router, CorePhase::Implement);
+    assert_eq!(structured.provider_id, coding.provider_id);
+    assert_eq!(structured.reason, coding.reason);
 
     let events = collect_events(&mut sub).await;
     let decided: Vec<_> = events
@@ -282,16 +329,18 @@ async fn freeform_heuristic_decisions_emit_route_decided_with_reasons() {
     );
     for rd in &decided {
         assert!(rd.phase.is_none(), "freeform route_decided has no phase");
-        assert!(!rd.reason.is_empty(), "heuristic decision carries a reason");
+        assert!(rd.category.is_some(), "but it does carry a category (AC-8)");
+        assert!(rd.tier.is_some());
+        assert!(!rd.reason.is_empty(), "the decision carries a reason");
     }
     assert!(
-        decided[0].reason.to_lowercase().contains("local"),
-        "auxiliary reason names the local tier: {}",
+        decided[0].reason.contains("'design'"),
+        "the reason names the category that fired: {}",
         decided[0].reason
     );
     assert!(
-        decided[1].reason.contains("default"),
-        "coding reason names the default: {}",
+        decided[1].reason.contains("'edit'"),
+        "the reason names the category that fired: {}",
         decided[1].reason
     );
 }
@@ -304,9 +353,10 @@ async fn freeform_heuristic_decisions_emit_route_decided_with_reasons() {
 async fn simulated_provider_failure_falls_back_and_completes_emitting_provider_degraded() {
     // Implement primary = a flaky provider whose fallback is anthropic.
     let router = Router::new(
-        vec![policy(CorePhase::Implement, "flaky", Some("anthropic"))],
+        CategoryTable::new()
+            .with_local_provider("local")
+            .with_tier(tier(Tier::Build, "flaky", Some("anthropic"))),
         Some("anthropic".to_owned()),
-        Some("local".to_owned()),
     )
     .with_provider("flaky", "flaky-model", native(), ProviderHealth::Healthy)
     .with_provider(
@@ -321,14 +371,10 @@ async fn simulated_provider_failure_falls_back_and_completes_emitting_provider_d
     let session = SessionId::from("sess-ac7");
 
     // The primary is selected, then fails mid-turn with a fallback-class error.
-    let primary = router.resolve_structured(CorePhase::Implement);
+    let primary = structured_route(&router, CorePhase::Implement);
     assert_eq!(primary.provider_id.as_ref().unwrap().0, "flaky");
 
-    let outcome = router.on_provider_failure(
-        Some(CorePhase::Implement),
-        "flaky",
-        FailureClass::MalformedResponse,
-    );
+    let outcome = router.on_provider_failure(&primary, "flaky", FailureClass::MalformedResponse);
     let degraded = outcome
         .degraded
         .clone()
@@ -381,11 +427,8 @@ async fn a_malformed_tool_call_degrades_in_place_rather_than_failing() {
     // failure keeps the provider but forces the reduced BR-6 profile, still
     // completing rather than aborting.
     let router = structured_router();
-    let outcome = router.on_provider_failure(
-        Some(CorePhase::Implement),
-        "deepseek",
-        FailureClass::MalformedToolCall,
-    );
+    let route = structured_route(&router, CorePhase::Implement);
+    let outcome = router.on_provider_failure(&route, "deepseek", FailureClass::MalformedToolCall);
     let degraded = outcome
         .degraded
         .expect("degrade surfaces provider_degraded");
@@ -400,16 +443,30 @@ async fn a_malformed_tool_call_degrades_in_place_rather_than_failing() {
 }
 
 // --------------------------------------------------------------------------
-// 4. Local tier unavailable → router bypasses without blocking (BR-8)
+// 4. Local tier unavailable → the category fails over rather than blocking (BR-8)
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn local_tier_unavailable_bypasses_without_blocking() {
-    let router = structured_router().with_local_available(false);
+async fn a_category_bound_to_an_unavailable_local_tier_fails_over_rather_than_blocking() {
+    // `digest` inherits `scan`, which this fixture binds to the local tier with a
+    // remote fallback. With the tier available the turn stays local.
+    let available = structured_router();
+    assert_eq!(
+        available
+            .resolve(Category::Digest)
+            .provider_id
+            .as_ref()
+            .unwrap()
+            .0,
+        "local"
+    );
 
-    // An auxiliary duty would normally go local; with the local tier unavailable
-    // the router must bypass it — selecting the default — rather than blocking.
-    let route = router.resolve_freeform("summarize the failing test output");
+    // Below the hardware floor / gated / shed, the local tier cannot serve. REQ-544
+    // BR-8's promise is that the loop does not block on it — and REQ-558 keeps that
+    // promise through the *configured* fallback rather than a hardcoded bypass, so
+    // the user can see and change where it goes.
+    let router = structured_router().with_local_available(false);
+    let route = router.resolve(Category::Digest);
     assert!(
         route.selected(),
         "BR-8: the router must not block on the local tier"
@@ -417,11 +474,11 @@ async fn local_tier_unavailable_bypasses_without_blocking() {
     assert_eq!(
         route.provider_id.as_ref().unwrap().0,
         "deepseek",
-        "bypassed to the configured default"
+        "failed over to the tier's configured fallback"
     );
     assert!(
-        route.reason.contains("unavailable") && route.reason.contains("bypass"),
-        "reason explains the BR-8 bypass: {}",
+        route.reason.contains("unavailable") && route.reason.contains("falling back"),
+        "reason explains the failover: {}",
         route.reason
     );
     // The per-turn harness input is still produced — the loop can proceed.
@@ -436,20 +493,21 @@ async fn local_tier_unavailable_bypasses_without_blocking() {
 async fn weak_capability_provider_gets_degraded_harness_profile() {
     // Implement routes to a weak-tool-calling provider.
     let router = Router::new(
-        vec![policy(CorePhase::Implement, "kimi", None)],
+        CategoryTable::new()
+            .with_local_provider("local")
+            .with_tier(tier(Tier::Build, "kimi", None)),
         Some("kimi".to_owned()),
-        Some("local".to_owned()),
     )
     .with_provider("kimi", "kimi-k2", degraded(), ProviderHealth::Degraded);
 
-    let route = router.resolve_structured(CorePhase::Implement);
+    let route = structured_route(&router, CorePhase::Implement);
     assert_eq!(route.provider_id.as_ref().unwrap().0, "kimi");
 
     // BR-6: reduced tool set, shorter loop, mandatory verification.
     assert!(route.harness.require_verification);
     assert_eq!(route.harness.max_tools, Some(5));
     assert!(route.harness.max_turns <= 5);
-    // The degraded primary is kept (not failed over); the policy reason says so.
+    // The degraded primary is kept (not failed over); the reason says so.
     assert!(
         route.reason.contains("reduced profile"),
         "reason: {}",
@@ -473,8 +531,9 @@ async fn routed_remote_call_produces_cost_record_and_passes_boundary_inspection(
     let mut sub = bus.subscribe(64);
     let session = SessionId::from("sess-integration");
 
-    // The spec phase routes to a remote (anthropic) provider, per policy.
-    let route = router.resolve_structured(CorePhase::Spec);
+    // The spec phase maps to `design`, which routes to a remote (anthropic)
+    // provider through its `think` binding.
+    let route = structured_route(&router, CorePhase::Spec);
     assert_eq!(route.provider_id.as_ref().unwrap().0, "anthropic");
     router.emit_route_decided(&bus, Some(session.clone()), &route);
 

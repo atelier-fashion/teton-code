@@ -7,9 +7,10 @@
 //! up into (BR-11). The variants mirror REQ-544's System Model enum minus the
 //! retired `Freeform` pseudo-phase (ADR-G).
 //!
-//! One router signature still takes a `Phase` — `Router::resolve_structured` —
-//! and TASK-050 is what repoints it at the category chain. Nothing in *this*
-//! module depends on that: the enum already says nothing about providers.
+//! No router signature takes a `Phase` any more. A structured turn maps its
+//! phase to a category with [`crate::category_for_phase`] and hands the router
+//! the *category*; the phase is stamped back onto the decision afterwards, for
+//! cost attribution only (AC-9).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

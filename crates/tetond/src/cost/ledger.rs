@@ -579,7 +579,7 @@ fn phase_from_wire(s: &str) -> Option<Phase> {
         // `"freeform"` is the phase variant REQ-558 ADR-G retired. Its rows are
         // reattributed to the no-phase bucket, and that is a decision, not the
         // catch-all below happening to swallow it: freeform was never a
-        // lifecycle position, `resolve_freeform` has always recorded `phase:
+        // lifecycle position, the freeform path has always recorded `phase:
         // NULL`, and the only rows carrying the literal string came from a
         // structured session explicitly created at `Phase::Freeform`. Keep this
         // arm above the catch-all so a reader six months from now can tell a

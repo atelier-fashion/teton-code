@@ -1,10 +1,18 @@
-//! The router: phase-policy routing, remote wiring, and BR-6 degradation.
+//! The router: category routing, remote wiring, and BR-6 degradation.
 //!
-//! This is the *wiring* layer over pure policy. It does **no** policy logic of
-//! its own: structured-mode decisions come straight from
-//! [`teton_core::policy::evaluate`] (phase × table × provider-health → provider +
-//! reason), and freeform decisions from [`crate::heuristics`]. The router's job
-//! is everything around that pure core:
+//! This is the *wiring* layer over a pure resolver. It does **no** routing logic
+//! of its own: every decision, in **both** session modes, comes straight from
+//! [`teton_core::category::resolve`] (category × table × provider health ×
+//! provider usability → provider + reason). There is one dispatch key and one
+//! resolver (REQ-558 BR-1, ADR-D).
+//!
+//! Before REQ-558 there were two: structured turns read a phase → provider
+//! policy table, and freeform turns — the default experience — ignored it
+//! entirely in favour of a ten-word substring list, so `teton policy set` had no
+//! effect on a normal session. Both the phase evaluator and the substring list
+//! are deleted rather than relocated (BR-2).
+//!
+//! The router's job is everything around the pure core:
 //!
 //! - **Legibility (BR-5)** — turn every decision, policy or heuristic, into a
 //!   `route_decided` event whose `reason` names the rule/heuristic that fired.
@@ -22,19 +30,25 @@
 //!   the fallback provider (or the same provider under a reduced profile) so the
 //!   session completes rather than failing.
 //!
-//! ## Two `Phase` types
+//! ## `Phase` is not here
 //!
-//! `teton_core::Phase` is the routing axis the pure policy consumes;
-//! `teton_protocol::Phase` is what travels on the `route_decided` /
-//! `cost_recorded` wire. They have identical variants; [`to_protocol_phase`]
-//! bridges them at the event/attribution boundary.
+//! No routing signature in this module takes a [`teton_core::phase::Phase`]
+//! (AC-9). A structured turn maps its phase to a category with
+//! `teton_core::category_for_phase` and hands the router the *category*; the
+//! phase is stamped onto [`Route::phase`] afterwards, where it feeds cost
+//! attribution and nothing else (BR-11). [`to_protocol_phase`] survives as that
+//! attribution boundary's bridge — `teton_core::Phase` in, the
+//! `teton_protocol::Phase` that travels on `route_decided` / `cost_recorded`
+//! out.
 
 use std::collections::BTreeMap;
 
-use teton_core::category::{Category as CoreCategory, CategoryResolution, Tier as CoreTier};
-use teton_core::entities::RoutingPolicy;
+use teton_core::category::{
+    resolve as resolve_category, Category as CoreCategory, CategoryResolution, CategoryTable,
+    JudgmentCategory, Tier as CoreTier, TierBinding,
+};
 use teton_core::phase::Phase as CorePhase;
-use teton_core::policy::{evaluate, ProviderHealth, RouteOutcome};
+use teton_core::policy::{ProviderHealth, RouteOutcome};
 
 use teton_protocol::events::{
     Event, FailureClass as ProtoFailureClass, ProviderDegraded, RouteDecided,
@@ -51,7 +65,6 @@ use crate::broadcast::EventBus;
 use crate::cost::CostAttribution;
 use crate::egress::EgressContext;
 use crate::harness::turn_loop::{HarnessConfig, TurnRoute};
-use crate::heuristics::{route_freeform, FreeformConfig};
 
 /// Map a `teton_core::Phase` (the routing axis) to the `teton_protocol::Phase`
 /// carried on the `route_decided` / `cost_recorded` wire. The variants are
@@ -121,25 +134,31 @@ struct ProviderRuntime {
 /// One resolved routing decision: the selected provider, a legible reason, and
 /// the harness profile the turn runs under (BR-6 degradation applied).
 ///
-/// A `Route` is produced by [`Router::resolve_structured`] /
-/// [`Router::resolve_freeform`] and by the fallback path
+/// A `Route` is produced by [`Router::resolve`], by the taint backstop
+/// ([`Router::resolve_local_pin`]), and by the fallback path
 /// ([`Router::on_provider_failure`]). It is the single object the daemon threads
 /// into a turn: [`Route::turn_route`] hands the harness the provider + profile,
 /// and [`Router::egress_context`] builds the choke-point context for a remote
 /// call.
 #[derive(Debug, Clone)]
 pub struct Route {
-    /// Provider selected, or `None` when no provider could be selected (no policy
-    /// for the phase, or every candidate unavailable).
+    /// Provider selected, or `None` when no provider could be selected (nothing
+    /// bound for the category, or every candidate unusable).
     pub provider_id: Option<ProviderId>,
     /// Concrete model chosen, when the provider is registered.
     pub model: Option<String>,
-    /// Phase (protocol form) driving the decision; `None` in freeform mode.
+    /// Lifecycle phase (protocol form) this turn is attributed to, or `None` for
+    /// a freeform turn, which has no lifecycle position.
+    ///
+    /// **Not a routing input** (BR-11, AC-9). It is stamped on by the caller
+    /// *after* the decision is made, and travels only as far as
+    /// [`Router::egress_context`]'s [`CostAttribution`] and the `route_decided`
+    /// payload. Nothing in this module reads it to choose a provider.
     pub phase: Option<ProtoPhase>,
     /// User-facing sentence explaining the decision (feeds `route_decided`, BR-5).
     pub reason: String,
-    /// Structured outcome for programmatic branching (reused from the policy
-    /// evaluator; freeform maps its heuristic onto the same vocabulary).
+    /// Structured outcome for programmatic branching — the shared vocabulary
+    /// [`teton_core::category::resolve`] reports in.
     pub outcome: RouteOutcome,
     /// Harness configuration this turn runs under — the BR-6 profile of the
     /// *selected* provider. Meaningful only when a provider was selected; for the
@@ -153,10 +172,13 @@ pub struct Route {
     /// describing one routing state must not be able to drift apart. This is the
     /// defect BUG-155 shipped four times in this subsystem one REQ ago.
     ///
-    /// `None` for a decision reached by the pre-category paths — phase policy
-    /// and the freeform heuristic — that TASK-050 replaces. Those paths have no
-    /// resolution to read, and inventing one for them would be the second
-    /// computation this field exists to prevent.
+    /// `None` for exactly one route: [`Router::resolve_local_pin`], the session
+    /// taint backstop. That path consults **no** resolution on purpose — it is a
+    /// privacy guarantee overriding every binding (BR-7), not a category
+    /// decision — so it has no category to report, and minting one would be the
+    /// second computation this field exists to prevent. Every other route the
+    /// router produces carries one, which
+    /// `every_route_but_the_taint_pin_carries_its_resolution` asserts.
     pub resolution: Option<CategoryResolution>,
 }
 
@@ -214,41 +236,54 @@ pub struct FailureOutcome {
     pub route: Option<Route>,
 }
 
-/// The phase-policy router (architecture: Session → Router → egress).
+/// The category router (architecture: Session → Router → egress).
 ///
-/// Holds the routing table, the registered providers (model + capabilities +
-/// health), the freeform default/local ids, and whether the local tier can meet
-/// its BR-8 latency duty. Construction is builder-style so a caller (or a test)
-/// wires exactly the providers it needs.
+/// Holds the configured tier/category table, the registered providers (model +
+/// capabilities + health), the declared default provider, the BR-9 judgment
+/// default, and whether the local tier can meet its BR-8 latency duty.
+/// Construction is builder-style so a caller (or a test) wires exactly the
+/// providers it needs.
 #[derive(Debug, Clone)]
 pub struct Router {
-    policies: Vec<RoutingPolicy>,
+    /// The table **as configured** — `[[tiers]]`, `[[categories]]`, and the local
+    /// tier's id. [`Router::effective_table`] is what resolution reads.
+    table: CategoryTable,
     providers: BTreeMap<String, ProviderRuntime>,
-    /// Freeform default provider (coding turns, and the BR-8 bypass target).
+    /// The declared default provider (REQ-557 BR-4): the binding a tier the user
+    /// has not bound inherits.
     default_provider: Option<String>,
-    /// Local tier provider id (freeform auxiliary duties).
-    local_provider: Option<String>,
+    /// The category a freeform judgment turn takes when classification is
+    /// bypassed or fails (BR-9).
+    judgment_default: JudgmentCategory,
     /// Whether the local tier can serve its BR-8 latency duty right now.
     local_available: bool,
 }
 
 impl Router {
-    /// A router with the given routing table, freeform `default_provider` (coding
-    /// turns), and `local_provider` (auxiliary duties). The local tier starts
-    /// available; register providers with [`Router::with_provider`].
+    /// A router reading `table`, with `default_provider` as the binding an
+    /// unbound tier inherits (REQ-557 BR-4).
+    ///
+    /// The local tier starts available and the judgment default starts at
+    /// [`JudgmentCategory::Edit`]; register providers with
+    /// [`Router::with_provider`].
     #[must_use]
-    pub fn new(
-        policies: Vec<RoutingPolicy>,
-        default_provider: Option<String>,
-        local_provider: Option<String>,
-    ) -> Self {
+    pub fn new(table: CategoryTable, default_provider: Option<String>) -> Self {
         Self {
-            policies,
+            table,
             providers: BTreeMap::new(),
             default_provider,
-            local_provider,
+            judgment_default: JudgmentCategory::default(),
             local_available: true,
         }
+    }
+
+    /// Set the category a freeform judgment turn falls back to (BR-9). Read from
+    /// `Config::judgment_default`, which is why it is configuration-visible
+    /// rather than a constant compiled in here (AC-12).
+    #[must_use]
+    pub fn with_judgment_default(mut self, category: JudgmentCategory) -> Self {
+        self.judgment_default = category;
+        self
     }
 
     /// Register a provider's model, capability profile, and current health.
@@ -300,144 +335,56 @@ impl Router {
         }
     }
 
-    /// Resolve the provider for a **structured-mode** `phase` from the policy
-    /// table (BR-5). Pure policy evaluation ([`teton_core::policy::evaluate`])
-    /// decides; the router only attaches the model, phase, and BR-6 harness
-    /// profile of whatever provider policy chose.
+    /// Resolve `category` to a provider — **the** dispatch entry point, used
+    /// identically in both session modes (BR-1).
+    ///
+    /// The decision itself is [`teton_core::category::resolve`]'s: override →
+    /// tier → declared error, with provider health and provider *usability*
+    /// injected as closures (ADR-D, ADR-E). The router only attaches the model
+    /// and the BR-6 harness profile of whatever the resolver chose, and carries
+    /// the resolution itself on the route, so every surface downstream reads one
+    /// answer rather than computing a second (AC-11).
+    ///
+    /// It takes no phase and no prompt. No phase, because lifecycle position
+    /// stopped being a routing input (AC-9); no prompt, because a routing
+    /// function that can see the text is a function a keyword list can be
+    /// dropped into — the defect this REQ exists to close (BR-2).
     #[must_use]
-    pub fn resolve_structured(&self, phase: CorePhase) -> Route {
-        let decision = evaluate(phase, &self.policies, |id| self.health_of(id));
-        let provider_id = decision.provider_id;
-        let harness = provider_id
-            .as_deref()
-            .map_or_else(HarnessConfig::default, |id| self.harness_config_for(id));
-        Route {
-            model: provider_id.as_deref().and_then(|id| self.model_of(id)),
-            provider_id: provider_id.map(ProviderId::from),
-            phase: Some(to_protocol_phase(phase)),
-            reason: decision.reason,
-            outcome: decision.outcome,
-            harness,
-            // Phase policy, not the category chain — TASK-050 repoints this at
-            // `teton_core::category::resolve` and the resolution lands here.
-            resolution: None,
-        }
+    pub fn resolve(&self, category: CoreCategory) -> Route {
+        let table = self.effective_table();
+        let resolution = resolve_category(
+            category,
+            &table,
+            |id| self.health_of(id),
+            // ADR-E / BUG-155: the resolver never emits a provider the daemon
+            // would refuse to route to. BUG-155's Critical finding was three
+            // config-reading paths that each bypassed this screen, and a new
+            // dispatch axis is a fourth unless it is screened where the decision
+            // is made (LESSON-484).
+            |id| self.is_usable(id),
+        );
+        self.route_from(resolution)
     }
 
-    /// Resolve the provider for a **freeform** prompt via the heuristics (BR-5).
-    /// Auxiliary duties go local (or bypass to the default when the local tier is
-    /// unavailable, BR-8); coding turns go to the configured default.
+    /// The category a **freeform** turn dispatches on (ADR-C, BR-3, BR-9).
+    ///
+    /// Only the four judgment categories require reading user intent, and the
+    /// `route` classifier that reads it does not exist yet — TASK-053 builds it.
+    /// Until then, and whenever it is bypassed or fails (BR-5), a freeform turn
+    /// takes the **declared default** read from `Config::judgment_default`.
+    ///
+    /// It deliberately takes no prompt, and that is the seam TASK-053 fills: the
+    /// classifier is a `route`-category model call whose return type is
+    /// [`JudgmentCategory`], so it *cannot* name a harness-known category (AC-3).
+    /// Giving this function the prompt text now would be precisely where a
+    /// substring list reappears — which BR-2 deletes rather than relocates.
     #[must_use]
-    pub fn resolve_freeform(&self, prompt: &str) -> Route {
-        // REQ-557 BR-4 / ADR-D: an unset default is a real absence. Before this
-        // REQ the router picked whichever remote provider was first in the config
-        // and, failing that, minted the literal id "local" — the doubled fallback
-        // that produced BUG-146. A freeform turn with no default and no usable
-        // local tier now says so instead of naming a provider registered nowhere.
-        // BUG-155: a `default_provider` naming a provider the router refused to
-        // register (remote, no declared model — ADR-E) is treated exactly like an
-        // absent one, and falls into the branch below. `Config::validate` accepts
-        // such a config on purpose (BR-6 checks the id is REGISTERED, and ADR-E
-        // keeps usability out of validation so a pre-REQ config can still boot),
-        // so this is the layer that has to notice. Reusing the no-default branch
-        // rather than adding a second one keeps one classifier for one state
-        // (BR-5, LESSON-456).
-        let usable_default = self
-            .default_provider
-            .clone()
-            .filter(|id| self.is_routable(id));
-        let Some(default_provider_id) = usable_default else {
-            // The local tier can still serve an auxiliary duty on its own; only a
-            // coding turn genuinely needs the default. Rather than re-implement
-            // the duty split here, fall back to local when it is available and
-            // otherwise report the missing default.
-            return match (&self.local_provider, self.local_available) {
-                // The local tier can still serve. Route through the SAME
-                // heuristic rather than short-circuiting it: REQ-544 BR-5 makes
-                // every decision's reason name the signal that fired, and a fixed
-                // sentence would drop the duty classification that legibility
-                // depends on. The missing default is appended, not substituted.
-                (Some(local), true) => {
-                    let config = FreeformConfig {
-                        local_provider_id: local.clone(),
-                        default_provider_id: local.clone(),
-                        local_available: true,
-                    };
-                    let decision = route_freeform(prompt, &config);
-                    Route {
-                        model: self.model_of(local),
-                        harness: self.harness_config_for(local),
-                        provider_id: Some(ProviderId::from(local.as_str())),
-                        phase: None,
-                        reason: format!(
-                            "{} No usable default provider is configured, so a coding turn stays \
-                             local too; set `default_provider` to a provider that declares a \
-                             `model` to route one remotely.",
-                            decision.reason
-                        ),
-                        outcome: RouteOutcome::Fallback,
-                        resolution: None,
-                    }
-                }
-                _ => Route {
-                    model: None,
-                    harness: HarnessConfig::default(),
-                    provider_id: None,
-                    phase: None,
-                    reason: "No usable default provider is configured and the local tier \
-                             cannot serve this turn. Register a provider with `teton provider add \
-                             <id> --model <name>` and set `default_provider` to its id."
-                        .to_owned(),
-                    outcome: RouteOutcome::NoPolicy,
-                    resolution: None,
-                },
-            };
-        };
-        let Some(local_provider_id) = self.local_provider.clone() else {
-            // No local tier at all: every freeform turn goes to the default.
-            return Route {
-                model: self.model_of(&default_provider_id),
-                harness: self.harness_config_for(&default_provider_id),
-                provider_id: Some(ProviderId::from(default_provider_id.as_str())),
-                phase: None,
-                reason: format!(
-                    "Freeform routing: no local tier is registered, so this turn goes to the \
-                     configured default provider '{default_provider_id}'."
-                ),
-                outcome: RouteOutcome::Primary,
-                resolution: None,
-            };
-        };
-        let config = FreeformConfig {
-            local_provider_id,
-            default_provider_id,
-            local_available: self.local_available,
-        };
-        let decision = route_freeform(prompt, &config);
-        let outcome = if decision.bypassed_local {
-            // The local tier was bypassed to a remote provider (BR-8) — the
-            // closest policy-vocabulary fit is a fallback off the local tier.
-            RouteOutcome::Fallback
-        } else if self.is_degraded(&decision.provider_id) {
-            RouteOutcome::PrimaryDegraded
-        } else {
-            RouteOutcome::Primary
-        };
-        Route {
-            model: self.model_of(&decision.provider_id),
-            harness: self.harness_config_for(&decision.provider_id),
-            provider_id: Some(ProviderId::from(decision.provider_id)),
-            phase: None,
-            reason: decision.reason,
-            outcome,
-            // The freeform heuristic, not the category chain — TASK-050 deletes
-            // this path and resolves the classified category instead.
-            resolution: None,
-        }
+    pub fn freeform_category(&self) -> CoreCategory {
+        CoreCategory::from(self.judgment_default)
     }
 
-    /// Force a route to the **local tier**, ignoring phase policy and heuristics
-    /// entirely (REQ-544 C-2 / M-1).
+    /// Force a route to the **local tier**, ignoring the category table
+    /// entirely (REQ-544 C-2 / M-1, REQ-558 BR-7).
     ///
     /// This is the taint backstop for BR-1: a session whose context has touched
     /// `local-only` content — or an unknown-provenance `shell` result — is pinned
@@ -446,9 +393,13 @@ impl Router {
     /// even when the local tier is latency-degraded; the caller checks whether a
     /// local engine actually exists (a remote-only machine cannot serve a tainted
     /// session and fails closed instead).
+    ///
+    /// Category routing is a cost decision and this is a privacy guarantee, so
+    /// the two do not compose: the caller checks taint *before* resolving a
+    /// category, and this function reads no binding at all (BR-7, LESSON-432).
     #[must_use]
     pub fn resolve_local_pin(&self, reason: impl Into<String>) -> Route {
-        let Some(provider) = self.local_provider.clone() else {
+        let Some(provider) = self.table.local_provider_id.clone() else {
             return Route {
                 model: None,
                 harness: HarnessConfig::default(),
@@ -475,19 +426,25 @@ impl Router {
         }
     }
 
-    /// Handle a mid-session provider failure (AC-7).
+    /// Handle a mid-session provider failure on `route` (AC-7).
     ///
     /// Classifies `class` ([`teton_providers::classify`]) and:
-    /// - **Fallback** — re-resolves to the phase's configured fallback provider
-    ///   and emits `provider_degraded` naming it. The session continues there.
+    /// - **Fallback** — continues on the fallback **the failed route's own
+    ///   resolution already chose**, and emits `provider_degraded` naming it.
     /// - **Degrade** — keeps the same provider but forces the reduced BR-6 harness
     ///   profile, and emits `provider_degraded` with no fallback.
     /// - **Retry** — transient; no event, the caller retries the same route.
     /// - **Fail** — unrecoverable (e.g. auth); no route, the caller aborts.
+    ///
+    /// It takes the failed [`Route`] rather than a phase (AC-9). That is not only
+    /// a signature change: the fallback now comes from the resolution the turn
+    /// was routed by, already screened for usability and health when it was
+    /// resolved (ADR-E), instead of being re-read out of the configured table on
+    /// the failure path — the second read that is exactly BUG-155's shape.
     #[must_use]
     pub fn on_provider_failure(
         &self,
-        phase: Option<CorePhase>,
+        route: &Route,
         failed_provider: &str,
         class: FailureClass,
     ) -> FailureOutcome {
@@ -495,14 +452,14 @@ impl Router {
         let signal = degradation_signal(failed_provider, decision);
         match decision.action {
             FailureAction::Fallback => {
-                let fallback = self.fallback_for(phase, failed_provider);
-                let route = fallback.as_deref().map(|fb| {
+                let fallback = self.fallback_for(route);
+                let next = fallback.as_deref().map(|fb| {
                     let reason = signal.as_ref().map_or_else(
                         || format!("Falling back to '{fb}' after a provider failure."),
                         |s| format!("{} Continuing on the fallback '{fb}'.", s.reason),
                     );
-                    self.route_to(
-                        phase,
+                    self.continue_on(
+                        route,
                         fb,
                         RouteOutcome::Fallback,
                         reason,
@@ -515,7 +472,7 @@ impl Router {
                         failure_class: to_protocol_failure_class(class),
                         fallback_id: fallback.map(ProviderId::from),
                     }),
-                    route,
+                    route: next,
                 }
             }
             FailureAction::Degrade => {
@@ -525,8 +482,8 @@ impl Router {
                     || format!("'{failed_provider}' dropped to a reduced harness profile."),
                     |s| s.reason.clone(),
                 );
-                let route = self.route_to(
-                    phase,
+                let next = self.continue_on(
+                    route,
                     failed_provider,
                     RouteOutcome::PrimaryDegraded,
                     reason,
@@ -538,13 +495,13 @@ impl Router {
                         failure_class: to_protocol_failure_class(class),
                         fallback_id: None,
                     }),
-                    route: Some(route),
+                    route: Some(next),
                 }
             }
             FailureAction::Retry => FailureOutcome {
                 degraded: None,
-                route: Some(self.route_to(
-                    phase,
+                route: Some(self.continue_on(
+                    route,
                     failed_provider,
                     RouteOutcome::Primary,
                     format!("Retrying '{failed_provider}' after a transient failure."),
@@ -612,63 +569,188 @@ impl Router {
 
     // ---- internal helpers ----
 
+    /// The table resolution actually reads: the configured rows, plus a
+    /// **declared default** for every tier the config leaves unbound.
+    ///
+    /// An unbound tier inherits, in order:
+    ///
+    /// 1. `default_provider` — REQ-557 BR-4's key, whose documented meaning is
+    ///    literally "the provider an unrouted turn goes to";
+    /// 2. the local tier, which exists on this machine whether or not the config
+    ///    mentions it, and is the whole of REQ-544's local-first promise: a
+    ///    machine with no remote provider at all still routes.
+    ///
+    /// Every id here is **declared** — one by a config key, one by the engine —
+    /// so nothing is synthesized (BR-8), and this is the only place a default is
+    /// applied. `resolve`'s precedence is untouched: it sees a table and walks
+    /// override → tier → declared error, and an id that got here by inheritance
+    /// is screened by `is_usable` exactly like one the user typed.
+    ///
+    /// This fill is **transitional**. TASK-055 migrates an existing `[[routing]]`
+    /// table into real `[[tiers]]` rows; a `default_provider`-only config has no
+    /// `[[routing]]` table to migrate, so without this a config REQ-557's own
+    /// migration produced would route nothing at all. See the report on TASK-050
+    /// — this is the seam where a `default_provider` → `[[tiers]]` migration
+    /// would let the fill be deleted.
+    fn effective_table(&self) -> CategoryTable {
+        let inherited = self
+            .default_provider
+            .clone()
+            .or_else(|| self.table.local_provider_id.clone());
+        let Some(inherited) = inherited else {
+            return self.table.clone();
+        };
+        CoreTier::ALL
+            .into_iter()
+            .filter(|tier| self.table.tier_binding(*tier).is_none())
+            .fold(self.table.clone(), |table, tier| {
+                table.with_tier(TierBinding {
+                    tier,
+                    provider_id: inherited.clone(),
+                    fallback_id: None,
+                })
+            })
+    }
+
+    /// Turn a [`CategoryResolution`] into the [`Route`] the daemon threads into a
+    /// turn: the resolver's provider, reason and outcome verbatim, plus the model
+    /// and BR-6 harness profile of whatever it chose.
+    ///
+    /// The resolution rides along on [`Route::resolution`] rather than being
+    /// consumed here, which is what lets `route_decided` report the category and
+    /// tier without recomputing either (ADR-D, AC-11).
+    fn route_from(&self, resolution: CategoryResolution) -> Route {
+        let provider_id = resolution.provider_id.clone();
+        let harness = provider_id
+            .as_deref()
+            .map_or_else(HarnessConfig::default, |id| self.harness_config_for(id));
+        Route {
+            model: provider_id.as_deref().and_then(|id| self.model_of(id)),
+            provider_id: provider_id.map(ProviderId::from),
+            // Attribution only, and stamped on by the caller after the fact
+            // (BR-11, AC-9). The resolver never saw a phase.
+            phase: None,
+            reason: resolution.reason.clone(),
+            outcome: resolution.outcome,
+            harness,
+            resolution: Some(resolution),
+        }
+    }
+
     fn capability_of(&self, provider_id: &str) -> CapabilityProfile {
         self.providers
             .get(provider_id)
             .map_or_else(CapabilityProfile::default, |p| p.capabilities)
     }
 
-    fn is_degraded(&self, provider_id: &str) -> bool {
-        use teton_core::ToolCallTier;
-        self.capability_of(provider_id).tool_call_tier == ToolCallTier::Degraded
-    }
-
     fn model_of(&self, provider_id: &str) -> Option<String> {
         self.providers.get(provider_id).map(|p| p.model.clone())
     }
 
-    /// Health of a provider; an unregistered id is treated as unavailable so a
-    /// policy that names a provider the daemon does not know cannot select it.
+    /// Whether `provider_id` names the local tier.
+    fn is_local_tier(&self, provider_id: &str) -> bool {
+        self.table.local_provider_id.as_deref() == Some(provider_id)
+    }
+
+    /// Health of a provider as resolution sees it.
+    ///
+    /// An unregistered id is unavailable, so a binding naming a provider the
+    /// daemon does not know cannot select it.
+    ///
+    /// The **local tier** is the one id whose absence from the map is normal —
+    /// its engine belongs to the daemon rather than to a `[[providers]]` entry —
+    /// and its BR-8 latency duty is reported here, on the *health* axis, rather
+    /// than through `is_usable`. That placement is a legibility decision, not a
+    /// tidiness one: "not routable" is REQ-557 ADR-E's remote-provider-declares-
+    /// no-`model` condition and the resolver's sentence says exactly that, which
+    /// would be a wrong explanation for a local tier shed under memory pressure.
+    /// A tier that cannot serve is *unavailable*, and reads as unavailable.
     fn health_of(&self, provider_id: &str) -> ProviderHealth {
-        self.providers
-            .get(provider_id)
-            .map_or(ProviderHealth::Unavailable, |p| p.health)
+        if self.is_local_tier(provider_id) && !self.local_available {
+            return ProviderHealth::Unavailable;
+        }
+        match self.providers.get(provider_id) {
+            Some(p) => p.health,
+            None if self.is_local_tier(provider_id) => ProviderHealth::Healthy,
+            None => ProviderHealth::Unavailable,
+        }
     }
 
     /// Whether `provider_id` is actually routable — i.e. it entered the provider
     /// map at construction.
     ///
     /// `build_router` deliberately skips a remote provider that declares no
-    /// model (REQ-557 ADR-E), so map membership IS the usability check. Policy
-    /// evaluation gets this for free because `health_of` reports an unmapped id
-    /// as `Unavailable`; the two paths below read a provider id straight out of
-    /// config and so have to ask explicitly (BUG-155).
+    /// model (REQ-557 ADR-E), so map membership IS the usability check.
     fn is_routable(&self, provider_id: &str) -> bool {
         self.providers.contains_key(provider_id)
     }
 
-    /// The configured fallback provider for `phase`'s policy, when the primary
-    /// (`failed`) is the one that failed. Freeform (no phase) has no policy
-    /// fallback.
+    /// Whether the daemon would actually route a turn to `provider_id` — the
+    /// `usable` screen injected into [`teton_core::category::resolve`] (ADR-E).
     ///
-    /// BUG-155: the fallback id is read straight from the policy, so — unlike the
-    /// primary, which `evaluate` screens through `health_of` — it has to be
-    /// screened here. Without this, a mid-turn failure could fail over to a
-    /// provider the router refused to register, and the turn would egress to it
-    /// with the provider id as its model.
-    fn fallback_for(&self, phase: Option<CorePhase>, failed: &str) -> Option<String> {
-        let phase = phase?;
-        let policy = self.policies.iter().find(|p| p.phase == phase)?;
-        if policy.provider_id == failed {
-            policy.fallback_id.clone().filter(|fb| self.is_routable(fb))
-        } else {
-            None
-        }
+    /// Two ways to be usable, because there are two kinds of provider:
+    ///
+    /// - a **registered** provider — [`Router::is_routable`], which is REQ-557
+    ///   ADR-E's rule that a remote provider declaring no `model` never enters
+    ///   the map at all;
+    /// - the **local tier**, whose engine comes from the daemon rather than from
+    ///   `[[providers]]`, so map membership is not its test. Whether it can serve
+    ///   is a health fact, reported by [`Router::health_of`].
+    ///
+    /// Neither branch is consulted by [`Router::resolve_local_pin`]: the taint
+    /// backstop pins local even when the tier is below its BR-8 duty, because
+    /// privacy trumps latency (BR-7).
+    ///
+    /// # What this screen is actually for
+    ///
+    /// Worth being exact, because overstating it is how a guard ends up with no
+    /// coverage. It does **not** currently keep an unusable provider out of a
+    /// route on its own: [`Router::health_of`] reports an unmapped id as
+    /// `Unavailable`, so an unusable remote provider is rejected either way. What
+    /// the screen decides is *which rejection* — and therefore what the user
+    /// reads. `not routable` carries ADR-E's sentence ("a remote provider that
+    /// declares no `model` cannot serve a turn"), which names the cause and the
+    /// remedy; `unavailable` says the provider is down, which for a provider
+    /// missing its `model` is simply untrue and leaves the user nothing to do.
+    ///
+    /// The second, load-bearing direction is the local tier, where the screen
+    /// *widens*: without its arm, a local tier absent from `[[providers]]` — the
+    /// normal case, and every offline install — would be rejected as unroutable
+    /// and nothing would route at all.
+    ///
+    /// Both directions are pinned by tests that fail if this function is replaced
+    /// by `|_| true` or by `is_routable` alone.
+    fn is_usable(&self, provider_id: &str) -> bool {
+        self.is_routable(provider_id) || self.is_local_tier(provider_id)
     }
 
-    fn route_to(
+    /// The fallback to continue `route` on, read **off the resolution the turn
+    /// was routed by** rather than re-read from the configured table.
+    ///
+    /// `category::resolve` already screened this id for usability and health when
+    /// it built the resolution, and set it to `None` once the fallback has itself
+    /// been used — so a second failure has nowhere further to go and says so.
+    /// That is deliberate: re-reading config on the failure path is the shape
+    /// BUG-155 found three times, where one path screened providers and another
+    /// did not.
+    ///
+    /// A route with no resolution — [`Router::resolve_local_pin`], the taint
+    /// backstop — therefore has no fallback at all. A tainted session must not
+    /// fail over to a remote provider (BR-7), and here it cannot.
+    fn fallback_for(&self, route: &Route) -> Option<String> {
+        route.resolution.as_ref()?.fallback_id.clone()
+    }
+
+    /// The route to continue a failed turn on: a new provider, a new reason, the
+    /// same turn.
+    ///
+    /// It carries the failed route's phase and resolution forward, because the
+    /// turn's *category* has not changed — only which provider is serving it. The
+    /// resolution's own `fallback_id` is cleared: it has now been used, and a
+    /// route that could fail over to itself would loop.
+    fn continue_on(
         &self,
-        phase: Option<CorePhase>,
+        failed: &Route,
         provider: &str,
         outcome: RouteOutcome,
         reason: String,
@@ -677,13 +759,14 @@ impl Router {
         Route {
             provider_id: Some(ProviderId::from(provider)),
             model: self.model_of(provider),
-            phase: phase.map(to_protocol_phase),
+            phase: failed.phase,
             reason,
             outcome,
             harness,
-            // A failure re-route names the provider it continues on, not a fresh
-            // category resolution; TASK-050 carries the original one through.
-            resolution: None,
+            resolution: failed.resolution.clone().map(|mut r| {
+                r.fallback_id = None;
+                r
+            }),
         }
     }
 }
@@ -721,6 +804,7 @@ fn to_protocol_failure_class(class: FailureClass) -> ProtoFailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teton_core::category::category_for_phase;
     use teton_core::ToolCallTier;
 
     /// A `Route` carrying `resolution`, with everything else fixed. The point of
@@ -829,8 +913,8 @@ mod tests {
         assert_eq!(route.reason, resolution.reason);
     }
 
-    /// BUG-155: a policy `fallback_id` naming a provider the router never
-    /// registered is not failed over to.
+    /// BUG-155: a `fallback_id` naming a provider the router never registered is
+    /// not failed over to.
     ///
     /// Pinned HERE, at the router, rather than only through an end-to-end
     /// "no bytes reached the provider" assertion. Those two guards — screening
@@ -839,17 +923,21 @@ mod tests {
     /// so mutating either alone looked safe. Defence in depth is fine; two
     /// guards with no independent coverage is not (LESSON-483's shape, one layer
     /// over). This test fails if the screen is removed, whatever the backstop does.
+    ///
+    /// REQ-558 moves *where* the screen happens — `category::resolve` now screens
+    /// the fallback when it builds the resolution, and the failure path reads the
+    /// answer off it rather than re-reading config — so this asserts the same
+    /// property one layer down.
     #[test]
     fn a_fallback_to_an_unregistered_provider_is_not_taken() {
         use teton_providers::FailureClass;
 
         let router = Router::new(
-            vec![RoutingPolicy {
-                phase: CorePhase::Implement,
+            CategoryTable::new().with_tier(TierBinding {
+                tier: CoreTier::Build,
                 provider_id: "primary".to_owned(),
                 fallback_id: Some("unusable".to_owned()),
-            }],
-            None,
+            }),
             None,
         )
         // Only the primary is registered. `build_router` skips a remote provider
@@ -862,11 +950,16 @@ mod tests {
             ProviderHealth::Healthy,
         );
 
-        let outcome = router.on_provider_failure(
-            Some(CorePhase::Implement),
-            "primary",
-            FailureClass::MalformedResponse,
+        let route = router.resolve(CoreCategory::Edit);
+        assert_eq!(route.provider_id.as_ref().unwrap().0, "primary");
+        assert!(
+            route.resolution.as_ref().unwrap().fallback_id.is_none(),
+            "an unroutable fallback must not survive onto the resolution — the \
+             failure path reads it from there: {route:?}"
         );
+
+        let outcome =
+            router.on_provider_failure(&route, "primary", FailureClass::MalformedResponse);
 
         assert!(
             outcome.route.is_none(),
@@ -893,22 +986,24 @@ mod tests {
         }
     }
 
-    fn policy(phase: CorePhase, provider: &str, fallback: Option<&str>) -> RoutingPolicy {
-        RoutingPolicy {
-            phase,
+    fn tier(tier: CoreTier, provider: &str, fallback: Option<&str>) -> TierBinding {
+        TierBinding {
+            tier,
             provider_id: provider.to_owned(),
             fallback_id: fallback.map(str::to_owned),
         }
     }
 
+    /// The fixture table: `think` on a frontier provider, `build` on the cheaper
+    /// one, each falling back to the other, `reflex`/`scan` deliberately left
+    /// unbound so the declared-default inheritance is exercised too.
     fn router() -> Router {
         Router::new(
-            vec![
-                policy(CorePhase::Spec, "anthropic", Some("deepseek")),
-                policy(CorePhase::Implement, "deepseek", Some("anthropic")),
-            ],
+            CategoryTable::new()
+                .with_local_provider("local")
+                .with_tier(tier(CoreTier::Think, "anthropic", Some("deepseek")))
+                .with_tier(tier(CoreTier::Build, "deepseek", Some("anthropic"))),
             Some("deepseek".to_owned()),
-            Some("local".to_owned()),
         )
         .with_provider(
             "anthropic",
@@ -924,65 +1019,267 @@ mod tests {
         )
     }
 
+    /// **AC-1, the headline regression.** `"explain the tradeoffs between these
+    /// two architectures"` is a `design` turn, and `design` inherits `think`. It
+    /// routes to the frontier provider bound there — not to the 3B local model,
+    /// which is where the deleted `AUXILIARY_SIGNALS` list sent it for containing
+    /// the word "explain".
+    ///
+    /// The prompt appears nowhere in this test because it can appear nowhere in
+    /// the router: `resolve` takes a category, and `freeform_category` takes no
+    /// text. That absence is the fix; the sentence above is what it is for.
     #[test]
-    fn structured_resolution_names_the_rule_and_pins_phase_and_model() {
-        let route = router().resolve_structured(CorePhase::Spec);
+    fn a_think_category_routes_to_its_tier_binding_not_to_the_local_tier() {
+        let router = router();
+        let route = router.resolve(CoreCategory::Design);
+        assert_eq!(
+            route.provider_id.as_ref().unwrap().0,
+            "anthropic",
+            "a `design` turn must reach the provider bound to `think`: {}",
+            route.reason
+        );
+        assert_ne!(route.provider_id.as_ref().unwrap().0, "local");
+        assert_eq!(route.model.as_deref(), Some("claude-opus-4"));
+        let resolution = route.resolution.as_ref().expect("resolved by category");
+        assert_eq!(resolution.category, CoreCategory::Design);
+        assert_eq!(resolution.tier, CoreTier::Think);
+    }
+
+    /// BR-1: the configured table is read on **every** turn, in both modes. The
+    /// two modes differ only in where the category comes from — the same table,
+    /// the same resolver, the same answer for the same category.
+    #[test]
+    fn both_session_modes_resolve_through_the_same_table() {
+        let router = router();
+        // Structured: the caller maps its phase to a category (ADR-C) and hands
+        // the router the category.
+        let structured = router.resolve(category_for_phase(CorePhase::Implement));
+        // Freeform: the category comes from the BR-9 declared default until
+        // TASK-053's classifier lands.
+        let freeform = router.resolve(router.freeform_category());
+
+        assert_eq!(router.freeform_category(), CoreCategory::Edit);
+        assert_eq!(structured.provider_id, freeform.provider_id);
+        assert_eq!(structured.reason, freeform.reason);
+        assert_eq!(
+            structured.resolution.as_ref().map(|r| r.category),
+            freeform.resolution.as_ref().map(|r| r.category),
+        );
+        assert_eq!(freeform.provider_id.as_ref().unwrap().0, "deepseek");
+        assert!(freeform.turn_route().is_some());
+    }
+
+    /// BR-9 / AC-12: the freeform default is the *configured* one, not a constant
+    /// compiled into the router. Change the config key, change the category.
+    #[test]
+    fn the_freeform_default_category_comes_from_configuration() {
+        assert_eq!(router().freeform_category(), CoreCategory::Edit);
+        let review = router().with_judgment_default(JudgmentCategory::Review);
+        assert_eq!(review.freeform_category(), CoreCategory::Review);
+        // And it dispatches there: `review` inherits `think`, not `build`.
+        assert_eq!(
+            review
+                .resolve(review.freeform_category())
+                .provider_id
+                .unwrap()
+                .0,
+            "anthropic"
+        );
+    }
+
+    /// A structured turn's decision names the category and pins the model. The
+    /// phase is **not** on the route — the router never saw one (AC-9); the
+    /// caller stamps it on afterwards for cost attribution.
+    #[test]
+    fn structured_resolution_names_the_category_and_pins_the_model() {
+        let route = router().resolve(category_for_phase(CorePhase::Spec));
         assert_eq!(route.provider_id.as_ref().unwrap().0, "anthropic");
         assert_eq!(route.model.as_deref(), Some("claude-opus-4"));
-        assert_eq!(route.phase, Some(ProtoPhase::Spec));
+        assert_eq!(route.phase, None, "the router does not stamp phases");
         assert_eq!(route.outcome, RouteOutcome::Primary);
-        assert!(route.reason.contains("routing policy"), "{}", route.reason);
+        assert!(route.reason.contains("'design'"), "{}", route.reason);
         // A route_decided payload is emittable and carries the reason (BR-5).
         let decided = route.route_decided().expect("provider selected");
         assert_eq!(decided.provider_id.0, "anthropic");
         assert_eq!(decided.reason, route.reason);
+        assert_eq!(decided.category, Some(ProtoCategory::Design));
+        assert_eq!(decided.tier, Some(ProtoTier::Think));
     }
 
-    #[test]
-    fn to_protocol_phase_is_variant_for_variant() {
-        for (core, proto) in [
-            (CorePhase::Spec, ProtoPhase::Spec),
-            (CorePhase::Architect, ProtoPhase::Architect),
-            (CorePhase::Implement, ProtoPhase::Implement),
-            (CorePhase::Review, ProtoPhase::Review),
-            (CorePhase::Io, ProtoPhase::Io),
-        ] {
-            assert_eq!(to_protocol_phase(core), proto);
-        }
-        // And the two enums are the same size, so a variant added on one side
-        // cannot quietly go unmapped on the other.
-        assert_eq!(CorePhase::ALL.len(), 5);
-    }
-
-    /// The wire twins mirror the core enums variant-for-variant, spelling
-    /// included: the daemon's decision and what a client reads are one fact, and
-    /// the shared spelling is what lets a ledger column, a config key, and an
-    /// event all say `digest`.
+    /// **AC-9**, as a compile-level assertion: no routing signature takes a
+    /// `Phase`, in either its core or its protocol form.
     ///
-    /// Driven off `Category::ALL` / `Tier::ALL`, so a variant added to core is
-    /// covered here the moment `to_protocol_category`'s exhaustive match forces
-    /// it to be handled at all.
+    /// Coercing each entry point to an explicitly written `fn` type is what makes
+    /// this a compile-time check rather than a comment — adding a phase parameter
+    /// back to any of them stops compiling here, and it does so whether the
+    /// parameter is `Phase`, `Option<Phase>`, or anything else.
+    ///
+    /// `Phase` has not left the crate: it still reaches [`CostAttribution`]
+    /// through [`Route::phase`], which the caller stamps on *after* the decision,
+    /// and [`to_protocol_phase`] still bridges it at that boundary. What it no
+    /// longer does is decide anything.
     #[test]
-    fn the_wire_category_and_tier_mirror_the_core_ones() {
-        use teton_core::Tier;
+    fn no_routing_signature_takes_a_phase() {
+        let _dispatch: fn(&Router, CoreCategory) -> Route = Router::resolve;
+        let _pin: fn(&Router, String) -> Route = Router::resolve_local_pin;
+        let _failure: fn(&Router, &Route, &str, FailureClass) -> FailureOutcome =
+            Router::on_provider_failure;
 
-        for core in CoreCategory::ALL {
+        // And the phase still travels for attribution, which is the half of AC-9
+        // that must NOT hold trivially: a route with no phase and a route with
+        // one differ only in what they attribute, never in where they went.
+        let attributed = Route {
+            phase: Some(ProtoPhase::Implement),
+            ..router().resolve(CoreCategory::Edit)
+        };
+        assert_eq!(
+            attributed.provider_id,
+            router().resolve(CoreCategory::Edit).provider_id
+        );
+        assert_eq!(
+            attributed.route_decided().unwrap().phase,
+            Some(ProtoPhase::Implement)
+        );
+    }
+
+    /// **AC-10's structural leg (BR-2).** Reintroducing a keyword match for a
+    /// harness-known category needs a routing function that can *see* prompt text
+    /// and return a [`CoreCategory`]. There is exactly one candidate — the seam
+    /// TASK-053's classifier plugs into — and this pins its type: it takes no
+    /// text.
+    ///
+    /// That is the whole of the guarantee at this layer, and it is worth being
+    /// exact about the limit. `JudgmentCategory` already makes `"digest"` from
+    /// prompt text a compile error (AC-3), so a keyword matcher can only reach a
+    /// harness-known category by returning `Category` directly — which requires
+    /// this signature to change, which fails here. What no test at this layer can
+    /// catch is a mutation that changes the signature *and* every call site in one
+    /// go: nothing in the router ever receives a prompt, so there is no behaviour
+    /// left to differ. The end-to-end assertion that closes AC-10 — a freeform
+    /// turn whose prompt contains a harness-known keyword, asserted to route by
+    /// the declared default and not by the word — is TASK-057's, per this task's
+    /// own notes.
+    #[test]
+    fn no_routing_function_can_see_prompt_text() {
+        let _freeform: fn(&Router) -> CoreCategory = Router::freeform_category;
+        let _dispatch: fn(&Router, CoreCategory) -> Route = Router::resolve;
+    }
+
+    /// AC-4's router leg. `redact` and `route` are pinned to the local tier by
+    /// construction — and the pin has to survive [`Router::effective_table`],
+    /// which is new machinery that writes a binding into every tier the config
+    /// leaves unbound. Here that binding is remote for all four tiers, and both
+    /// pinned categories still resolve local, because `resolve` reaches them
+    /// through a branch that consults no binding at all.
+    #[test]
+    fn the_pinned_categories_ignore_an_inherited_remote_binding() {
+        let router = Router::new(
+            CategoryTable::new().with_local_provider("local"),
+            Some("frontier-remote".to_owned()),
+        )
+        .with_provider(
+            "frontier-remote",
+            "claude-opus-4",
+            native(),
+            ProviderHealth::Healthy,
+        );
+
+        // Every tier inherits the remote default...
+        assert_eq!(
+            router.resolve(CoreCategory::Title).provider_id.unwrap().0,
+            "frontier-remote"
+        );
+        // ...and the two pinned categories are unmoved by it.
+        for pinned in [CoreCategory::Redact, CoreCategory::Route] {
+            let route = router.resolve(pinned);
             assert_eq!(
-                to_protocol_category(core).as_str(),
-                core.as_str(),
-                "{core} is spelled differently on the wire"
+                route.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some("local"),
+                "{pinned} escaped its pin: {}",
+                route.reason
             );
         }
-        for core in Tier::ALL {
-            assert_eq!(to_protocol_tier(core).as_str(), core.as_str(), "{core}");
-            // A category's tier survives the crossing intact.
-            for category in CoreCategory::ALL.into_iter().filter(|c| c.tier() == core) {
-                assert_eq!(to_protocol_tier(category.tier()), to_protocol_tier(core));
-            }
-        }
-        // All eleven, pinned-local ones included: the event reports what
-        // happened, not what a config file could have asked for.
-        assert_eq!(CoreCategory::ALL.len(), 11);
+    }
+
+    /// ADR-E: the category chain screens every provider it would select through
+    /// the router's usability rule, so a provider that never entered the provider
+    /// map is never selected — not as a primary, not as a fallback.
+    ///
+    /// This is the leg BUG-155's Critical finding demands of every new dispatch
+    /// path: three config-reading paths each bypassed the screen, and a fourth
+    /// axis is a fourth bypass unless it is screened where the decision is made.
+    ///
+    /// The last assertion is the one that makes this test worth having, and it
+    /// took a mutation run to find out. Dropping the screen (`|_| true`) leaves
+    /// the *outcome* identical — `health_of` reports an unmapped id as
+    /// `Unavailable`, so nothing is selected either way — and every assertion
+    /// above it stays green. What changes is the sentence: the user is told the
+    /// provider is down, rather than that it declares no `model` and how to fix
+    /// it. Two guards with no independent coverage is exactly LESSON-483's shape,
+    /// so the screen is pinned by the thing only it produces.
+    #[test]
+    fn an_unregistered_provider_is_never_selected_by_the_category_chain() {
+        let router = Router::new(
+            CategoryTable::new().with_tier(tier(CoreTier::Think, "ghost", None)),
+            None,
+        )
+        .with_provider("real", "a-model", native(), ProviderHealth::Healthy);
+
+        let route = router.resolve(CoreCategory::Design);
+        assert_eq!(route.provider_id, None, "{route:?}");
+        assert_eq!(route.model, None, "and nothing downstream can bill it");
+        assert_eq!(route.outcome, RouteOutcome::NoHealthyProvider);
+        assert!(route.reason.contains("'ghost'"), "{}", route.reason);
+        assert!(route.reason.contains("'design'"), "{}", route.reason);
+        assert!(
+            route.reason.contains("is not routable")
+                && route.reason.contains("declares no `model`"),
+            "the refusal must name ADR-E's cause and its remedy, not report the \
+             provider as merely down: {}",
+            route.reason
+        );
+    }
+
+    /// BR-8: an unbound tier inherits the **declared** default — `default_provider`
+    /// first (REQ-557 BR-4: "the provider an unrouted turn goes to"), then the
+    /// local tier, which is what makes an offline machine route at all.
+    ///
+    /// Both are ids someone declared; neither is synthesized. With neither
+    /// declared, the category names itself and its unset tier rather than
+    /// borrowing a binding from somewhere else.
+    #[test]
+    fn an_unbound_tier_inherits_the_declared_default_then_the_local_tier() {
+        // `scan` is unbound in the fixture, so `digest` inherits the default.
+        let route = router().resolve(CoreCategory::Digest);
+        assert_eq!(route.provider_id.as_ref().unwrap().0, "deepseek");
+
+        // No default: the local tier serves instead — REQ-544's local-first
+        // promise, and the reason a machine with no remote provider still routes.
+        let offline = Router::new(CategoryTable::new().with_local_provider("local"), None);
+        let route = offline.resolve(CoreCategory::Edit);
+        assert_eq!(route.provider_id.as_ref().unwrap().0, "local");
+
+        // Neither: the category names itself and its unset tier (BR-8), and no
+        // id is invented to fill the hole.
+        let nothing = Router::new(CategoryTable::new(), None);
+        let route = nothing.resolve(CoreCategory::Edit);
+        assert_eq!(route.provider_id, None);
+        assert_eq!(route.outcome, RouteOutcome::NoPolicy);
+        assert!(route.reason.contains("'edit'"), "{}", route.reason);
+        assert!(route.reason.contains("'build'"), "{}", route.reason);
+    }
+
+    /// BR-8: the local tier is usable only while it can meet its latency duty.
+    /// Below the hardware floor, gated on consent, or shed under memory pressure,
+    /// a binding that names it resolves to nothing rather than to a turn that
+    /// will fail with `NoTierAvailable` after the decision was announced.
+    #[test]
+    fn a_local_tier_that_cannot_serve_is_not_selected() {
+        let offline = Router::new(CategoryTable::new().with_local_provider("local"), None)
+            .with_local_available(false);
+        let route = offline.resolve(CoreCategory::Edit);
+        assert_eq!(route.provider_id, None, "{route:?}");
+        assert!(!route.outcome.selected_provider());
     }
 
     #[test]
@@ -995,75 +1292,143 @@ mod tests {
         assert!(cfg.max_turns <= 5);
     }
 
+    /// **BR-7**: session taint overrides every category binding.
+    ///
+    /// The fixture binds `think` to a remote frontier provider, which is where a
+    /// `design` turn goes on any untainted session — and the pin still lands on
+    /// the local tier. Category routing is a cost decision; this is a privacy
+    /// guarantee, and the pin consults no binding to make it.
+    ///
+    /// The *ordering* — taint checked before a category is even chosen — lives in
+    /// `runtime.rs`; what is assertable here is that the pin cannot be talked out
+    /// of the local tier by any table.
     #[test]
-    fn freeform_coding_turn_goes_to_the_default() {
-        let route = router().resolve_freeform("implement the parser");
-        assert_eq!(route.provider_id.as_ref().unwrap().0, "deepseek");
-        assert!(route.phase.is_none());
-        assert!(route.turn_route().is_some());
-    }
+    fn the_taint_pin_overrides_every_category_binding() {
+        let router = router();
+        let think_goes_remote = router.resolve(CoreCategory::Design);
+        assert_eq!(
+            think_goes_remote.provider_id.as_ref().unwrap().0,
+            "anthropic",
+            "this test is only meaningful while `think` is bound remotely"
+        );
 
-    #[test]
-    fn local_pin_forces_the_local_tier_regardless_of_policy() {
-        // REQ-544 C-2 / M-1: the taint backstop pins a session to the local tier,
-        // naming a legible reason — independent of any phase policy that would
-        // otherwise route remote.
-        let route = router().resolve_local_pin("session touched local-only content");
+        let route = router.resolve_local_pin("session touched local-only content");
         assert_eq!(route.provider_id.as_ref().unwrap().0, "local");
         assert!(route.phase.is_none());
         assert_eq!(route.outcome, RouteOutcome::Fallback);
         assert!(route.reason.contains("local-only"));
-        // The Spec phase policy would normally route to anthropic — the pin wins.
-        assert_ne!(
-            route.provider_id.as_ref().unwrap().0,
-            router()
-                .resolve_structured(CorePhase::Spec)
-                .provider_id
-                .unwrap()
-                .0
+        assert!(
+            route.resolution.is_none(),
+            "the pin must not carry a category resolution — it consulted none \
+             (BR-7), and minting one would be a second answer to drift from"
         );
+
+        // Privacy trumps latency: the pin holds even when the local tier is
+        // below its BR-8 duty, where the category chain would refuse it.
+        let shed = router.clone().with_local_available(false);
+        assert_eq!(
+            shed.resolve_local_pin("tainted").provider_id.unwrap().0,
+            "local"
+        );
+    }
+
+    /// A tainted session has **no fallback**, because a fallback is a binding and
+    /// the pin reads none. Before REQ-558 the failure path re-read the phase
+    /// policy, so a tainted *structured* session could fail over to that phase's
+    /// remote fallback — the privacy pin surviving the decision but not the first
+    /// provider error.
+    #[test]
+    fn a_tainted_session_cannot_fail_over_to_a_remote_provider() {
+        let router = router();
+        let pinned = router.resolve_local_pin("session touched local-only content");
+        let outcome = router.on_provider_failure(&pinned, "local", FailureClass::MalformedResponse);
+        assert!(
+            outcome.route.is_none(),
+            "a pinned session must not continue on a provider a binding named: {:?}",
+            outcome.route
+        );
+    }
+
+    /// AC-8, as far as it can be closed by construction: every route the router
+    /// produces carries the resolution it was built from — except the taint pin,
+    /// which is the one path that deliberately resolves no category.
+    #[test]
+    fn every_route_but_the_taint_pin_carries_its_resolution() {
+        let router = router();
+        for category in CoreCategory::ALL {
+            let route = router.resolve(category);
+            let resolution = route
+                .resolution
+                .as_ref()
+                .unwrap_or_else(|| panic!("{category} resolved without a resolution"));
+            assert_eq!(resolution.category, category);
+            assert_eq!(resolution.tier, category.tier());
+            assert_eq!(route.reason, resolution.reason);
+            assert_eq!(route.outcome, resolution.outcome);
+            assert_eq!(
+                route.provider_id.as_ref().map(|p| p.0.as_str()),
+                resolution.provider_id.as_deref()
+            );
+        }
+        // A failure re-route keeps it: the provider changed, the category did not.
+        let route = router.resolve(CoreCategory::Design);
+        let outcome =
+            router.on_provider_failure(&route, "anthropic", FailureClass::MalformedResponse);
+        let next = outcome.route.expect("continues on the fallback");
+        assert_eq!(
+            next.resolution.as_ref().map(|r| r.category),
+            Some(CoreCategory::Design)
+        );
+
+        // And the one exception, named rather than assumed.
+        assert!(router.resolve_local_pin("tainted").resolution.is_none());
     }
 
     #[test]
     fn on_failure_fallback_returns_the_fallback_route_and_degraded_event() {
-        // A Fallback-class failure on the Spec primary (anthropic) → fall back to
-        // deepseek, emit provider_degraded naming it (AC-7).
-        let outcome = router().on_provider_failure(
-            Some(CorePhase::Spec),
-            "anthropic",
-            FailureClass::MalformedResponse,
-        );
+        // A Fallback-class failure on the `think` primary (anthropic) → fall back
+        // to deepseek, emit provider_degraded naming it (AC-7).
+        let router = router();
+        let route = router.resolve(CoreCategory::Design);
+        let outcome =
+            router.on_provider_failure(&route, "anthropic", FailureClass::MalformedResponse);
         let degraded = outcome
             .degraded
             .expect("fallback surfaces provider_degraded");
         assert_eq!(degraded.provider_id.0, "anthropic");
         assert_eq!(degraded.fallback_id.as_ref().unwrap().0, "deepseek");
-        let route = outcome.route.expect("continues on the fallback");
-        assert_eq!(route.provider_id.as_ref().unwrap().0, "deepseek");
+        let next = outcome.route.expect("continues on the fallback");
+        assert_eq!(next.provider_id.as_ref().unwrap().0, "deepseek");
+
+        // The fallback has now been used, so a second failure has nowhere left to
+        // go rather than failing over to itself.
+        let again = router.on_provider_failure(&next, "deepseek", FailureClass::MalformedResponse);
+        assert!(again.route.is_none(), "{:?}", again.route);
     }
 
     #[test]
     fn on_failure_degrade_keeps_provider_with_a_reduced_profile() {
-        let outcome = router().on_provider_failure(
-            Some(CorePhase::Implement),
-            "deepseek",
-            FailureClass::MalformedToolCall,
-        );
+        let router = router();
+        let route = router.resolve(CoreCategory::Edit);
+        let outcome =
+            router.on_provider_failure(&route, "deepseek", FailureClass::MalformedToolCall);
         let degraded = outcome
             .degraded
             .expect("degrade surfaces provider_degraded");
         assert_eq!(degraded.failure_class, ProtoFailureClass::ToolCallFailure);
         assert!(degraded.fallback_id.is_none());
-        let route = outcome.route.expect("continues on the same provider");
-        assert_eq!(route.provider_id.as_ref().unwrap().0, "deepseek");
-        assert!(route.harness.require_verification);
-        assert_eq!(route.harness.max_tools, Some(5));
+        let next = outcome.route.expect("continues on the same provider");
+        assert_eq!(next.provider_id.as_ref().unwrap().0, "deepseek");
+        assert!(next.harness.require_verification);
+        assert_eq!(next.harness.max_tools, Some(5));
     }
 
     #[test]
     fn on_failure_auth_error_aborts_with_no_route() {
-        let outcome = router().on_provider_failure(
-            Some(CorePhase::Spec),
+        let router = router();
+        let route = router.resolve(CoreCategory::Design);
+        let outcome = router.on_provider_failure(
+            &route,
             "anthropic",
             FailureClass::ClientError { status: 401 },
         );

@@ -56,8 +56,13 @@ fn default_provider_key(id: &str) -> String {
     format!("default_provider = \"{id}\"\n\n")
 }
 
-fn routing_block(phase: &str, provider: &str, fallback: Option<&str>) -> String {
-    let mut s = format!("[[routing]]\nphase = \"{phase}\"\nprovider_id = \"{provider}\"\n");
+/// A `[[tiers]]` row (REQ-558). The tier — not the lifecycle phase — is the
+/// configured routing surface, and it is read on **every** turn including
+/// freeform (BR-1). A structured turn maps its phase to a category
+/// (`spec`/`architect` → `design`, `implement` → `edit`, `review` → `review`,
+/// `io` → `digest`), and the category inherits its tier's binding.
+fn tier_block(tier: &str, provider: &str, fallback: Option<&str>) -> String {
+    let mut s = format!("[[tiers]]\ntier = \"{tier}\"\nprovider_id = \"{provider}\"\n");
     if let Some(fb) = fallback {
         s.push_str(&format!("fallback_id = \"{fb}\"\n"));
     }
@@ -204,29 +209,25 @@ fn ac2_two_remote_providers_complete_sessions() {
     let r2 = client.prompt(&s2, "say hello");
     assert_eq!(result_stop_reason(&r2), Some("end_turn"), "{r2}");
 
-    // A freeform coding turn resolves through the DEFAULT provider, and REQ-557
-    // BR-4 removes the implicit one: `build_router`'s positional
-    // `.find(is_remote)` — which silently made "whichever provider was
-    // registered first" the default — is deleted, and the REQ adds no RPC to set
-    // `default_provider` (config-file only; OQ-2/OQ-3 lean "no implicit
-    // default"). So with two providers registered over the wire and no default
-    // set, this turn has nowhere to go and must SAY so rather than route to a
-    // provider nobody chose. Pre-REQ it completed against `deepseek` purely
-    // because that call came first — the routing-by-array-position defect
-    // (BUG-146 root cause #1) this asserts is gone.
+    // **REQ-558 BR-1, end to end.** The freeform turn resolves through the SAME
+    // configured table the structured turns just used: `edit` inherits `build`,
+    // which the second `config/set` above bound to `deepseek`. Before this REQ
+    // the table was not consulted on a freeform turn at all — the default
+    // experience routed on a ten-word substring list — which is the headline
+    // defect the REQ exists to close.
+    //
+    // It is still not an *implicit* default. `deepseek` is here because the user
+    // bound the tier over the wire, not because it was first in the array
+    // (BUG-146 root cause #1) and not because `default_provider` was invented for
+    // them — that absence is pinned in `model_identity::
+    // no_default_provider_is_reported_not_invented`, where nothing is bound at
+    // all and the turn says so.
     let s3 = client.create_session("freeform", None);
     let r3 = client.prompt(&s3, "implement the greeting");
     assert_eq!(
         result_stop_reason(&r3),
-        None,
-        "a freeform coding turn with no `default_provider` must not silently \
-         route to a provider the user never chose: {r3}"
-    );
-    let msg = r3["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        msg.contains("default_provider"),
-        "the failure must name the missing default (AC-4), not just say the turn \
-         did not route: {r3}"
+        Some("end_turn"),
+        "a freeform turn must resolve through the configured table (BR-1): {r3}"
     );
 
     client.drain_events(Duration::from_millis(200));
@@ -264,10 +265,9 @@ fn ac3_phase_routing_is_observable() {
         &cheap.openai_endpoint(),
         "deepseek-chat",
     ));
-    config.push_str(&routing_block("spec", "anthropic", None));
-    config.push_str(&routing_block("architect", "anthropic", None));
-    config.push_str(&routing_block("implement", "deepseek", None));
-    config.push_str(&routing_block("review", "anthropic", None));
+    // spec, architect and review all map to `think`; implement maps to `build`.
+    config.push_str(&tier_block("think", "anthropic", None));
+    config.push_str(&tier_block("build", "deepseek", None));
 
     let ws = Workspace::new("ac3");
     ws.write_config(&config);
@@ -337,8 +337,8 @@ fn ac4_cost_meter_reports_totals_phases_and_savings() {
         &cheap.openai_endpoint(),
         "deepseek-chat",
     ));
-    config.push_str(&routing_block("spec", "anthropic", None));
-    config.push_str(&routing_block("implement", "deepseek", None));
+    config.push_str(&tier_block("think", "anthropic", None));
+    config.push_str(&tier_block("build", "deepseek", None));
 
     let ws = Workspace::new("ac4");
     ws.write_config(&config);
@@ -457,7 +457,7 @@ fn ac5_privacy_boundary_blocks_and_never_leaks() {
         &provider.openai_endpoint(),
         "deepseek-chat",
     ));
-    config.push_str(&routing_block("implement", "deepseek", None));
+    config.push_str(&tier_block("build", "deepseek", None));
     config.push_str(&boundary_block("secrets/**", "local-only"));
 
     let ws = Workspace::new("ac5");
@@ -556,7 +556,7 @@ fn ac7_degraded_provider_falls_back_and_completes() {
         &healthy.openai_endpoint(),
         "deepseek-chat",
     ));
-    config.push_str(&routing_block("implement", "flaky", Some("healthy")));
+    config.push_str(&tier_block("build", "flaky", Some("healthy")));
 
     let ws = Workspace::new("ac7");
     ws.write_config(&config);
@@ -753,7 +753,7 @@ fn live_smoke_real_provider_completes_a_session() {
         &endpoint,
         "deepseek-chat",
     ));
-    config.push_str(&routing_block("implement", "deepseek", None));
+    config.push_str(&tier_block("build", "deepseek", None));
     ws.write_config(&config);
     let daemon = Daemon::spawn(&ws, probe_16gb());
     let mut client = daemon.connect();

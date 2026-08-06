@@ -98,8 +98,18 @@ impl TestDaemon {
         let runtime_dir = root.join("x");
         std::fs::create_dir_all(&runtime_dir).unwrap();
 
-        // A config with one provider so `doctor` has something to render. The
-        // provider is never actually called (no session runs here).
+        // A config with one remote provider so `doctor` has something to render,
+        // deliberately left in the pre-REQ-557 shape (no `model`) because
+        // `provider_list_shows_the_migrated_model` asserts the load-time
+        // migration resolves it.
+        //
+        // Every tier is bound to the **local** tier (REQ-558): this daemon serves
+        // turns from a scripted local engine and cannot call DeepSeek, so the
+        // binding says so rather than leaving it to a heuristic. Before REQ-558 a
+        // turn reached the local model only when the prompt happened to contain
+        // one of `AUXILIARY_SIGNALS`' ten words — which is the defect REQ-558
+        // deletes, and which made every assertion in the slash-command section
+        // silently depend on the wording of its fixture prompts.
         //
         // `[local_model] base_url` points the model download at a port nothing
         // is listening on. Two things follow, both deliberate: no test here can
@@ -108,11 +118,17 @@ impl TestDaemon {
         // consent round-trip these CLI tests are about. Whether the bytes then
         // arrive is `daemon`'s `consent_matrix`, against a mock host.
         let config_path = root.join("config.toml");
+        let tiers: String = ["reflex", "scan", "build", "think"]
+            .iter()
+            .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+            .collect();
         std::fs::write(
             &config_path,
             format!(
                 "[[providers]]\nid = \"deepseek\"\nkind = \"openai-compatible\"\n\
                  endpoint = \"https://api.deepseek.com\"\n\n\
+                 [[providers]]\nid = \"local\"\nkind = \"local\"\n\n\
+                 {tiers}\
                  [local_model]\nauto_accept = false\nbase_url = \"http://127.0.0.1:{}\"\n",
                 closed_port()
             ),
@@ -656,11 +672,12 @@ fn a_refused_config_is_reported_by_the_cli_that_autostarted_the_daemon() {
 //     proposal is outstanding and every stdin line reaches the entry loop. (With
 //     the unscripted daemon the first line would answer a consent question, as
 //     the REQ-547 tests above rely on.)
-//   * A turn is served locally only when the freeform heuristic classifies the
-//     prompt as an *auxiliary* duty — `tetond`'s `AUXILIARY_SIGNALS`. Every
-//     prompt line here therefore carries such a signal ("explain", "what does"),
-//     so the turn reaches the scripted engine rather than the configured remote
-//     default, which this suite deliberately cannot call.
+//   * Every turn is served locally because the fixture config **binds every tier
+//     to the local tier** (REQ-558 BR-1), so the scripted engine answers whatever
+//     the prompt says. Before REQ-558 that depended on the prompt containing one
+//     of `AUXILIARY_SIGNALS`' ten words, which meant these assertions held for the
+//     wording of their fixture prompts rather than for the property under test —
+//     the trap BUG-155 named and this REQ removes.
 
 /// The scripted engine's replies, one per turn in order. Each is a distinct
 /// marker, so a test can say *which* turn produced a line — and so a slash
@@ -950,9 +967,12 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
         "a default session must start quiet; segment:\n{quiet}"
     );
 
-    // Turn two, after the toggle: the routing notice and the turn-end line.
+    // Turn two, after the toggle: the routing notice and the turn-end line. The
+    // notice's key is the **category and tier** the turn resolved through
+    // (REQ-558) — a freeform turn no longer renders as `[freeform]`, because
+    // freeform stopped being a routing value at all.
     assert!(
-        loud.contains("route [freeform] → local"),
+        loud.contains("route [edit/build] → local"),
         "`/verbose` did not surface the routing notice; segment:\n{loud}"
     );
     assert!(
@@ -1150,15 +1170,23 @@ fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
         "an escaped or plain line was run through the dispatch table; output:\n{session}"
     );
 
-    // The daemon classified the escaped line's own text — the routing reason
-    // names the signal it found in it.
-    assert!(
-        session.contains("matched 'what does'"),
-        "the escaped line's text did not reach the daemon's router; output:\n{session}"
-    );
-    assert!(
-        session.contains("matched 'explain'"),
-        "the plain line's text did not reach the daemon's router; output:\n{session}"
+    // Both turns routed through the category chain, and each notice names the
+    // category and tier that decided it (REQ-558 BR-1).
+    //
+    // Until REQ-558 this pair of assertions read `matched 'what does'` /
+    // `matched 'explain'` — the routing reason quoted the `AUXILIARY_SIGNALS`
+    // word it found in the prompt, which was the only evidence here that the
+    // line's *text* reached the daemon rather than merely a turn. That evidence
+    // is gone with the heuristic, and it should be: an assertion that held
+    // because of the wording of its fixture prompt is exactly the trap BUG-155
+    // named. The byte-level property is pinned where it can be pinned exactly —
+    // `slash.rs`'s `the_double_slash_escape_collapses_only_the_leading_pair`,
+    // named in this test's doc comment; what remains this test's own is that the
+    // escaped line defeated the dispatch table and became a routed turn.
+    assert_eq!(
+        session.matches("route [edit/build] → local").count(),
+        2,
+        "both lines must route through the category chain; output:\n{session}"
     );
 }
 

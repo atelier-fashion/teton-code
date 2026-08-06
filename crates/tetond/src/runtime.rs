@@ -90,9 +90,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use teton_core::boundary::BoundaryMatcher;
+use teton_core::category::{
+    categories_for_phase, category_for_phase, Category, CategoryTable, Tier, TierBinding,
+};
 use teton_core::config::{Config, LocalModelConfig};
 use teton_core::entities::{
-    BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind, RoutingPolicy,
+    BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
 };
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
@@ -137,7 +140,7 @@ use crate::model_consent::{
     list_entries, no_local_engine_reason, probe_view, selection_view, ConsentOutcome,
     ModelConsentGate, NoInstaller, PendingModelDecisions, WeightsInstaller,
 };
-use crate::router::Router;
+use crate::router::{to_protocol_phase, Router};
 use crate::selection_store::SelectionStore;
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
@@ -713,7 +716,7 @@ impl DaemonRuntime {
     /// builders it borrows, [`loading_local_engine_reason`] and
     /// [`no_local_engine_reason`], are the same ones the lifecycle stream
     /// already publishes.
-    fn unserved_turn_error(&self, config: &Config, phase: Option<CorePhase>) -> RpcError {
+    fn unserved_turn_error(&self, config: &Config, category: Option<Category>) -> RpcError {
         // Every settled cause codes the same way; only the two transient ones
         // below override it, and each says so at the `return`.
         let settled = |reason: String| RpcError::new(error_code::UNKNOWN_PROVIDER, reason);
@@ -742,22 +745,39 @@ impl DaemonRuntime {
             .default_provider
             .as_ref()
             .is_some_and(|d| unusable.contains(d));
-        // The turn's own policy is the strongest signal: if THIS phase routes to
-        // a provider that declares no model, that provider is the cause even
+        // The turn's own binding is the strongest signal: if THIS category routes
+        // to a provider that declares no model, that provider is the cause even
         // when other providers are perfectly healthy. Without this the message
         // would tell the user their config is fine and point them at
-        // `teton policy show`, while the policy is exactly what is broken.
-        let policy_names_unusable = phase.is_some_and(|ph| {
-            config.routing.iter().any(|r| {
-                r.phase == ph
-                    && (unusable.contains(&r.provider_id)
-                        || r.fallback_id
-                            .as_ref()
-                            .is_some_and(|fb| unusable.contains(fb)))
+        // `teton policy show`, while the binding is exactly what is broken.
+        //
+        // REQ-558: the category, not the phase — a freeform turn has a binding
+        // too and never had a phase, so keying on the phase left the default
+        // experience with no way to reach this arm at all. The category comes
+        // from the resolution the turn was routed by, so the two cannot disagree
+        // about which binding is under discussion.
+        //
+        // What follows is a *lookup*, not a second resolution: it selects nothing
+        // and screens nothing, it only asks which ids this turn's binding names.
+        // Ordering the override ahead of the tier mirrors `category::resolve`
+        // because it is reading the same table, not because it re-decides
+        // anything (ADR-D).
+        let binding_names_unusable = category.is_some_and(|category| {
+            let over = category
+                .configurable()
+                .and_then(|c| config.categories.iter().find(|o| o.name == c))
+                .map(|o| (&o.provider_id, o.fallback_id.as_ref()));
+            let inherited = config
+                .tiers
+                .iter()
+                .find(|t| t.tier == category.tier())
+                .map(|t| (&t.provider_id, t.fallback_id.as_ref()));
+            over.or(inherited).is_some_and(|(primary, fallback)| {
+                unusable.contains(primary) || fallback.is_some_and(|fb| unusable.contains(fb))
             })
         });
         let unusable_is_implicated = !unusable.is_empty()
-            && (usable_remote.is_empty() || default_is_unusable || policy_names_unusable);
+            && (usable_remote.is_empty() || default_is_unusable || binding_names_unusable);
         let add_provider = if unusable_is_implicated {
             // REQ-557 ADR-E, router half. A remote provider with no declared
             // model is a *usability* condition, so the daemon started — that is
@@ -1270,26 +1290,39 @@ impl DaemonRuntime {
             &health_snapshot,
         );
 
-        // Resolve the initial route (BR-5): structured -> phase policy; freeform
-        // -> heuristic. Emitting `route_decided` is the legibility promise.
+        // Resolve the initial route (REQ-558 BR-1): one dispatch key, one
+        // resolver, both session modes. What differs between them is only where
+        // the *category* comes from — a structured turn maps it from the phase it
+        // is already in (ADR-C, no model call), a freeform turn takes the BR-9
+        // declared default until TASK-053's classifier lands. Emitting
+        // `route_decided` is the legibility promise.
         //
-        // REQ-544 C-2: a session tainted by earlier boundary/unknown exposure is
-        // pinned to the local tier for every subsequent turn — the router forces
-        // local regardless of phase policy or heuristic. This is the backstop for
-        // the model-paraphrase residual BR-1 provenance alone cannot catch.
+        // REQ-544 C-2 / REQ-558 BR-7: session taint is the OUTERMOST check,
+        // evaluated before any category is even chosen. A session tainted by
+        // earlier boundary/unknown exposure is pinned to the local tier for every
+        // subsequent turn regardless of what any binding resolves to. Category
+        // routing is a cost decision; this is a privacy guarantee, and the two
+        // deliberately do not compose (LESSON-432).
         let core_phase = phase.map(to_core_phase);
         let mut route = if self.session_taint.is_tainted(&session_id) {
             router.resolve_local_pin(
                 "session previously touched local-only content; pinned to the local tier (BR-1 backstop)",
             )
         } else {
-            match mode {
+            let (category, attributed_phase) = match mode {
                 SessionMode::Structured => {
                     let ph = core_phase.unwrap_or(CorePhase::Implement);
-                    router.resolve_structured(ph)
+                    (category_for_phase(ph), Some(to_protocol_phase(ph)))
                 }
-                SessionMode::Freeform => router.resolve_freeform(&prompt),
-            }
+                // A freeform session has no lifecycle position, so it attributes
+                // no phase — it never has (ADR-G).
+                SessionMode::Freeform => (router.freeform_category(), None),
+            };
+            let mut resolved = router.resolve(category);
+            // BR-11 / AC-9: the phase is stamped on AFTER the decision. It is a
+            // cost-attribution fact, and the resolver never saw it.
+            resolved.phase = attributed_phase;
+            resolved
         };
 
         // Assemble the harness context, tools, and the permission gate once; a
@@ -1426,7 +1459,7 @@ impl DaemonRuntime {
                     if let Some(record) = health_record_after_failure(class, Instant::now()) {
                         self.record_health(&pid.0, record);
                     }
-                    let fo = router.on_provider_failure(core_phase, &pid.0, class);
+                    let fo = router.on_provider_failure(&route, &pid.0, class);
                     if let Some(degraded) = fo.degraded {
                         router.emit_provider_degraded(events, Some(session_id.clone()), degraded);
                     }
@@ -1465,7 +1498,11 @@ impl DaemonRuntime {
                 // BUG-152: and with the code that says whether there is an
                 // action at all, or only a wait.
                 Err(HarnessError::NoTierAvailable) => {
-                    return Err(self.unserved_turn_error(&config, core_phase));
+                    // The category the turn was routed by — read off the
+                    // resolution rather than recomputed, and `None` for the taint
+                    // pin, which resolved no category at all (BR-7).
+                    let category = route.resolution.as_ref().map(|r| r.category);
+                    return Err(self.unserved_turn_error(&config, category));
                 }
                 // REQ-544 M-3: a credential that will not resolve is a config
                 // problem, not a transient fault — surface it clearly (the
@@ -1772,8 +1809,8 @@ fn migrate_and_report_provider_models(
         // REQ-557 deleted `build_router`'s positional `.find(is_remote)` default
         // and added an explicit key — but shipped no migration for it, so every
         // pre-REQ config arrived with `default_provider` unset. On a machine with
-        // a local tier that is silent, not loud: `resolve_freeform` hands the
-        // coding turn to the local model and the session completes, so a user
+        // a local tier that is silent, not loud: the freeform path handed the
+        // coding turn to the local model and the session completed, so a user
         // whose freeform turns went to DeepSeek yesterday gets a 3B local answer
         // today with no error to explain it. REQ-557's own value — "must not
         // silently route somewhere the user never chose" — pointing the other way.
@@ -3008,7 +3045,23 @@ fn build_router(
         .or_else(|| Some(LOCAL_PROVIDER_ID.to_owned()));
     let default_provider = config.default_provider.clone();
 
-    let mut router = Router::new(config.routing.clone(), default_provider, local_provider)
+    // REQ-558 BR-1: the configured tier/category table is what the runtime
+    // reads, on every turn and in both session modes. `config.routing` — the
+    // phase table — is deliberately NOT passed: nothing dispatches on it any
+    // more, and it survives in the schema only so TASK-055's migration can open
+    // it.
+    //
+    // `local_provider_id` is the one entry that can be a constant rather than a
+    // configured choice, and it is one because the tier comes from the engine
+    // rather than from `[[providers]]` (REQ-557 ADR-D).
+    let table = CategoryTable {
+        tiers: config.tiers.clone(),
+        categories: config.categories.clone(),
+        local_provider_id: local_provider,
+    };
+
+    let mut router = Router::new(table, default_provider)
+        .with_judgment_default(config.judgment_default)
         .with_local_available(local_available);
     for p in &config.providers {
         // REQ-544 M-5: seed each provider's health from the persisted map (default
@@ -3196,15 +3249,38 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
             }
         }
         ConfigUpdate::SetRoutingRule(rr) => {
-            let rule = RoutingPolicy {
-                phase: to_core_phase(rr.phase),
-                provider_id: rr.provider_id.0,
-                fallback_id: rr.fallback_id.map(|f| f.0),
-            };
-            if let Some(existing) = config.routing.iter_mut().find(|r| r.phase == rule.phase) {
-                *existing = rule;
-            } else {
-                config.routing.push(rule);
+            // REQ-558 BR-1: `config.routing` is inert — nothing dispatches on it.
+            // This op is the wire form of the pre-REQ `teton policy set <phase>
+            // <provider>`, and TASK-056 replaces it with tier and category forms.
+            // Until then it must not become a configuration surface that silently
+            // does nothing, because a configuration surface the runtime does not
+            // consult is the exact defect this REQ exists to close. So it writes
+            // the tier bindings the phase's categories inherit, through the SAME
+            // `categories_for_phase` map the BR-10 migration uses (ADR-F) rather
+            // than a second table that could disagree with it.
+            //
+            // One phase can therefore write more than one row — `implement`
+            // expands to `edit` and `shell`, both on `build`; `io` expands across
+            // `scan` and `reflex`. That expansion is BR-10's, stated once.
+            let phase = to_core_phase(rr.phase);
+            let provider_id = rr.provider_id.0;
+            let fallback_id = rr.fallback_id.map(|f| f.0);
+            let mut tiers: Vec<Tier> = categories_for_phase(phase)
+                .iter()
+                .map(|c| c.tier())
+                .collect();
+            tiers.dedup();
+            for tier in tiers {
+                let binding = TierBinding {
+                    tier,
+                    provider_id: provider_id.clone(),
+                    fallback_id: fallback_id.clone(),
+                };
+                if let Some(existing) = config.tiers.iter_mut().find(|t| t.tier == tier) {
+                    *existing = binding;
+                } else {
+                    config.tiers.push(binding);
+                }
             }
         }
         ConfigUpdate::SetPrivacyBoundary(pb) => {
@@ -3319,6 +3395,7 @@ fn env_flag(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teton_core::category::{CategoryOverride, ConfigurableCategory};
 
     /// A throwaway directory under the system temp dir, unique per test.
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -3571,11 +3648,52 @@ mod tests {
         );
         config.validate().expect("valid");
 
+        // REQ-558: a `set_routing_rule` op writes the tier bindings the phase's
+        // categories inherit, not a `[[routing]]` row — `implement` expands to
+        // `edit` and `shell`, both on `build`, so one op writes one `build` row.
+        // The phase table it used to write is inert (BR-1), and an op that writes
+        // an inert table is the defect this REQ closes.
+        assert_eq!(config.tiers.len(), 1);
+        assert_eq!(config.tiers[0].tier, Tier::Build);
+        assert_eq!(config.tiers[0].provider_id, "deepseek");
+        assert!(config.routing.is_empty());
+
         let snap = snapshot_from_config(&config);
         assert_eq!(snap.providers.len(), 1);
         assert_eq!(snap.providers[0].kind, ProtoProviderKind::OpenaiCompatible);
-        assert_eq!(snap.routing[0].phase, ProtoPhase::Implement);
         assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
+    }
+
+    /// The one-to-many half of the same op (BR-10): `io` expands to four
+    /// categories across **two** tiers, so a single rule binds both — and binds
+    /// each exactly once, rather than once per category that inherits it.
+    #[test]
+    fn a_routing_rule_for_a_phase_that_spans_two_tiers_binds_both() {
+        let mut config = Config::default();
+        apply_update(
+            &mut config,
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("cheap"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: None,
+            }),
+        );
+        apply_update(
+            &mut config,
+            ConfigUpdate::SetRoutingRule(RoutingRule {
+                phase: ProtoPhase::Io,
+                provider_id: ProviderId::from("cheap"),
+                fallback_id: None,
+            }),
+        );
+        let mut bound: Vec<Tier> = config.tiers.iter().map(|t| t.tier).collect();
+        bound.sort_by_key(|t| t.as_str());
+        assert_eq!(bound, vec![Tier::Reflex, Tier::Scan]);
+        config
+            .validate()
+            .expect("one row per tier, so no duplicate");
     }
 
     #[test]
@@ -4335,15 +4453,19 @@ mod tests {
         );
 
         // And the absence is legible rather than silently routed: a coding turn
-        // with no local tier available selects nobody and says why.
-        let route = router.resolve_freeform("implement the parser");
+        // with no local tier available selects nobody and says why. REQ-558 moves
+        // the sentence itself to `category::resolve`, which names the category and
+        // the id it could not use; the "set `default_provider`" remedy is
+        // `unserved_turn_error`'s, which classifies from the config document.
+        let route = router.resolve(router.freeform_category());
         assert_eq!(
             route.provider_id, None,
             "no provider may be selected when none was configured: {route:?}"
         );
+        assert_eq!(route.model, None, "{route:?}");
         assert!(
-            route.reason.contains("default"),
-            "the reason must name the missing default (BR-5): {route:?}"
+            route.reason.contains("'edit'"),
+            "the reason must name the category that could not be routed (BR-8): {route:?}"
         );
     }
 
@@ -4368,19 +4490,19 @@ mod tests {
                 auth_ref: None,
                 capabilities: ProviderCapabilities::default(),
             }],
-            routing: vec![RoutingPolicy {
-                phase: CorePhase::Io,
+            tiers: vec![TierBinding {
+                tier: Tier::Scan,
                 provider_id: "on-device".to_owned(),
                 fallback_id: None,
             }],
             ..Config::default()
         };
 
-        let route = build_router(&config, true, &BTreeMap::new()).resolve_structured(CorePhase::Io);
+        let route = build_router(&config, true, &BTreeMap::new()).resolve(Category::Digest);
         assert_eq!(
             route.provider_id.as_ref().map(|p| p.0.as_str()),
             Some("on-device"),
-            "a declared local provider must remain selectable by policy: {route:?}"
+            "a declared local provider must remain selectable by a binding: {route:?}"
         );
         // Local calls are unbilled, so the id doubles as the attribution label.
         assert_eq!(route.model.as_deref(), Some("on-device"));
@@ -4403,8 +4525,8 @@ mod tests {
                 auth_ref: None,
                 capabilities: ProviderCapabilities::default(),
             }],
-            routing: vec![RoutingPolicy {
-                phase: CorePhase::Implement,
+            tiers: vec![TierBinding {
+                tier: Tier::Build,
                 provider_id: "blank".to_owned(),
                 fallback_id: None,
             }],
@@ -4412,8 +4534,7 @@ mod tests {
         };
         // The classifier and the router must agree that this provider is unusable.
         assert_eq!(config.unusable_providers(), vec!["blank"]);
-        let route =
-            build_router(&config, false, &BTreeMap::new()).resolve_structured(CorePhase::Implement);
+        let route = build_router(&config, false, &BTreeMap::new()).resolve(Category::Edit);
         assert_eq!(
             route.provider_id, None,
             "a provider reported unusable must not be routable: {route:?}"
@@ -4443,7 +4564,7 @@ mod tests {
 
         let router = build_router(&config, false, &BTreeMap::new());
         assert_eq!(router.default_provider(), Some("broken"));
-        let route = router.resolve_freeform("implement the parser");
+        let route = router.resolve(router.freeform_category());
         assert_eq!(
             route.provider_id, None,
             "an unusable default must not be selected: {route:?}"
@@ -4487,23 +4608,26 @@ mod tests {
             ..Config::default()
         };
 
-        // No policy for this phase: the cause is the missing routing rule, not
+        // No binding for this category: the cause is the unbound tier, not
         // `stale`. The message must not send the user after `stale`.
-        let unrelated = runtime.unserved_turn_error(&with_stale_and_good, Some(CorePhase::Review));
+        let unrelated = runtime.unserved_turn_error(&with_stale_and_good, Some(Category::Review));
         assert!(
             !unrelated.message.contains("stale"),
             "an unrelated failure must not blame an unusable provider: {}",
             unrelated.message
         );
 
-        // Now the phase's policy names `stale` — it IS the cause, and is named.
-        let mut policy_names_stale = with_stale_and_good.clone();
-        policy_names_stale.routing.push(RoutingPolicy {
-            phase: CorePhase::Review,
+        // Now the category's own binding names `stale` — it IS the cause, and is
+        // named. Asserted through a per-category override rather than the tier it
+        // inherits, so the lookup's precedence is exercised and not just its
+        // fallback leg.
+        let mut binding_names_stale = with_stale_and_good.clone();
+        binding_names_stale.categories.push(CategoryOverride {
+            name: ConfigurableCategory::Review,
             provider_id: "stale".to_owned(),
             fallback_id: None,
         });
-        let implicated = runtime.unserved_turn_error(&policy_names_stale, Some(CorePhase::Review));
+        let implicated = runtime.unserved_turn_error(&binding_names_stale, Some(Category::Review));
         assert!(
             implicated.message.contains("stale") && implicated.message.contains("--model"),
             "a turn routed to an unusable provider must name it and the remedy: {}",
@@ -4549,12 +4673,12 @@ mod tests {
                     capabilities: ProviderCapabilities::default(),
                 },
             ],
-            routing: vec![RoutingPolicy {
-                phase: CorePhase::Spec,
+            routing: Vec::new(),
+            tiers: vec![TierBinding {
+                tier: Tier::Think,
                 provider_id: "anthropic".to_owned(),
                 fallback_id: Some("deepseek".to_owned()),
             }],
-            tiers: Vec::new(),
             categories: Vec::new(),
             judgment_default: teton_core::JudgmentCategory::default(),
             boundaries: Vec::new(),
@@ -4571,9 +4695,10 @@ mod tests {
         use teton_core::policy::RouteOutcome;
         let config = two_provider_spec_config();
 
-        // Turn 1: no prior failures → the Spec primary (anthropic) is chosen.
+        // Turn 1: no prior failures → the `think` primary (anthropic) is chosen.
         let fresh = BTreeMap::new();
-        let route1 = build_router(&config, false, &fresh).resolve_structured(CorePhase::Spec);
+        let route1 =
+            build_router(&config, false, &fresh).resolve(category_for_phase(CorePhase::Spec));
         assert_eq!(route1.provider_id.as_ref().unwrap().0, "anthropic");
         assert_eq!(route1.outcome, RouteOutcome::Primary);
 
@@ -4585,10 +4710,12 @@ mod tests {
         let mut persisted = BTreeMap::new();
         persisted.insert("anthropic".to_owned(), downgrade);
 
-        // Turn 2: build_router seeds anthropic Unavailable from the map → policy
-        // fails over to the fallback deepseek. This is the cross-turn fallback that
-        // was previously dead because every turn reseeded Healthy.
-        let route2 = build_router(&config, false, &persisted).resolve_structured(CorePhase::Spec);
+        // Turn 2: build_router seeds anthropic Unavailable from the map → the
+        // category chain fails over to the fallback deepseek. This is the
+        // cross-turn fallback that was previously dead because every turn reseeded
+        // Healthy.
+        let route2 =
+            build_router(&config, false, &persisted).resolve(category_for_phase(CorePhase::Spec));
         assert_eq!(
             route2.provider_id.as_ref().unwrap().0,
             "deepseek",

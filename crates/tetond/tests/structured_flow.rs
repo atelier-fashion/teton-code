@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use teton_core::entities::RoutingPolicy;
+use teton_core::category::{category_for_phase, CategoryTable, Tier, TierBinding};
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
 use teton_core::ToolCallTier;
@@ -43,7 +43,7 @@ use tetond::harness::{
     PendingPermissions, PermissionConfig, PermissionGate, RemoteProviderSource, SessionEvents,
     ToolContext, ToolRegistry,
 };
-use tetond::router::Router;
+use tetond::router::{to_protocol_phase, Router};
 use tetond::structured::{ArtifactKind, ArtifactStore, PhaseMachine};
 
 /// A distinctive marker planted in the task artifact; it must reach the provider
@@ -145,25 +145,24 @@ fn native() -> CapabilityProfile {
     }
 }
 
-fn policy(phase: CorePhase, provider: &str, fallback: Option<&str>) -> RoutingPolicy {
-    RoutingPolicy {
-        phase,
+fn tier(tier: Tier, provider: &str, fallback: Option<&str>) -> TierBinding {
+    TierBinding {
+        tier,
         provider_id: provider.to_owned(),
         fallback_id: fallback.map(str::to_owned),
     }
 }
 
-/// The AC-3 routing shape: frontier on spec/architect/review, cheap on implement.
+/// The AC-3 routing shape in category terms: frontier on `think`
+/// (spec/architect → `design`, review → `review`), cheap on `build`
+/// (implement → `edit`).
 fn structured_router() -> Router {
     Router::new(
-        vec![
-            policy(CorePhase::Spec, "anthropic", Some("deepseek")),
-            policy(CorePhase::Architect, "anthropic", Some("deepseek")),
-            policy(CorePhase::Implement, "deepseek", Some("anthropic")),
-            policy(CorePhase::Review, "anthropic", Some("deepseek")),
-        ],
+        CategoryTable::new()
+            .with_local_provider("local")
+            .with_tier(tier(Tier::Think, "anthropic", Some("deepseek")))
+            .with_tier(tier(Tier::Build, "deepseek", Some("anthropic"))),
         Some("deepseek".to_owned()),
-        Some("local".to_owned()),
     )
     .with_provider(
         "anthropic",
@@ -291,8 +290,11 @@ async fn demo_requirement_flows_all_four_phases_with_per_phase_routing_and_real_
             "machine tracks the flow position"
         );
 
-        // (1) Route this phase and broadcast the decision (BR-5, AC-3).
-        let route = router.resolve_structured(core_of(phase));
+        // (1) Route this phase and broadcast the decision (BR-5, AC-3). The
+        // daemon maps the phase to a category (ADR-C) and hands the router the
+        // category; the phase rides along for cost attribution only (AC-9).
+        let mut route = router.resolve(category_for_phase(core_of(phase)));
+        route.phase = Some(to_protocol_phase(core_of(phase)));
         let provider_id = route.provider_id.as_ref().unwrap().0.clone();
         routed.push((phase, provider_id.clone()));
         router.emit_route_decided(&bus, Some(session.clone()), &route);

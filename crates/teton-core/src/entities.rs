@@ -145,9 +145,14 @@ impl ModelProvider {
     }
 }
 
-/// One row of the phase → provider routing table (System Model:
-/// `RoutingPolicy`). In structured mode this table, not per-prompt heuristics,
-/// determines routing (BR-5).
+/// One row of the **retired** phase → provider routing table (System Model:
+/// `RoutingPolicy`).
+///
+/// Nothing dispatches on it: REQ-558 made the category the runtime dispatch key
+/// in both session modes, and [`crate::TierBinding`] / [`crate::CategoryOverride`]
+/// are the configured table now. This type survives only so TASK-055's migration
+/// can *read* an existing `[[routing]]` table — a table that cannot be opened
+/// cannot be migrated — and goes when that migration lands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingPolicy {
     /// The lifecycle phase this rule applies to.

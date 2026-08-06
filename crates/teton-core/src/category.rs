@@ -16,8 +16,9 @@
 //!   type-level guarantee behind AC-3: there is no path from text into
 //!   [`Category`], so a keyword matcher cannot assign `digest`.
 //! - [`resolve`] — the single resolution function. Pure, with provider health
-//!   **and** provider usability injected as closures, mirroring
-//!   [`crate::policy::evaluate`]'s proven shape.
+//!   **and** provider usability injected as closures, mirroring the shape of the
+//!   phase-policy evaluator it replaced (`policy::evaluate`, deleted with its
+//!   last caller — ADR-J).
 //!
 //! # Two things this module makes impossible rather than merely forbidden
 //!
@@ -774,8 +775,9 @@ enum BindingSource {
 /// current [`ProviderHealth`] and `usable` reports whether the daemon would
 /// route to it at all, both supplied by the caller — the daemon plugs in live
 /// probe results and its provider registry, tests plug in fixed tables. This is
-/// [`crate::policy::evaluate`]'s shape, with the usability screen added because
-/// a new dispatch axis is a new way to bypass it (ADR-E).
+/// This is the shape of the phase-policy evaluator it replaced
+/// (`policy::evaluate`, now deleted — ADR-J), with the usability screen added
+/// because a new dispatch axis is a new way to bypass it (ADR-E).
 ///
 /// # Precedence
 ///

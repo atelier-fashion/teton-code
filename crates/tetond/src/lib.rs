@@ -22,14 +22,12 @@
 //!   preflight before a byte is fetched, download to a temporary path, verify,
 //!   then an atomic rename into place.
 //! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
-//! - [`router`] — phase-policy routing (BR-5), BR-6 degradation, remote wiring
-//!   through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
+//! - [`router`] — category routing (REQ-558 BR-1), BR-6 degradation, remote
+//!   wiring through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
 //! - [`runtime`] — the assembled engine/router/egress/cost/MCP state the JSON-RPC
 //!   handlers drive: `session/prompt` execution, config, and the cost query.
 //! - [`structured`] — structured (ADLC) mode (D-4, BR-3): the phase state machine,
 //!   artifact gates, `.teton/` artifact storage, and bundled generic templates.
-//! - [`heuristics`] — freeform-mode routing (BR-5): local for auxiliary duties,
-//!   the configured default for coding turns, with a BR-8 local-tier bypass.
 //! - [`model_consent`] — the first-run consent gate (REQ-547 BR-1): probe →
 //!   propose → await an answer → only then download. Gates the local *tier*,
 //!   never the session (D-3).
@@ -49,7 +47,6 @@ pub mod cost;
 pub mod download;
 pub mod egress;
 pub mod harness;
-pub mod heuristics;
 pub mod install;
 pub mod keychain;
 pub mod mcp;

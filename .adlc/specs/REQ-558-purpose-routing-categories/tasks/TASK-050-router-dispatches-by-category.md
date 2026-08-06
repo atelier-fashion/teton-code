@@ -1,7 +1,7 @@
 ---
 id: TASK-050
 title: "Router dispatches by category; delete AUXILIARY_SIGNALS and route_freeform"
-status: draft
+status: complete
 parent: REQ-558
 created: 2026-08-05
 updated: 2026-08-05
@@ -28,25 +28,25 @@ experience is deleted.
 
 ## Acceptance Criteria
 
-- [ ] A freeform turn resolves through category → (override or tier) → provider,
+- [x] A freeform turn resolves through category → (override or tier) → provider,
       reading the configured table (BR-1). The table is consulted on **every**
       turn, freeform included.
-- [ ] `AUXILIARY_SIGNALS`, `route_freeform`, `FreeformDuty`, and `classify_duty`
+- [x] `AUXILIARY_SIGNALS`, `route_freeform`, `FreeformDuty`, and `classify_duty`
       no longer exist anywhere in the workspace (BR-2 — "deleted, not relocated").
-- [ ] Session taint remains the **outermost** check, evaluated before any category
+- [x] Session taint remains the **outermost** check, evaluated before any category
       resolution (BR-7). A test asserts a tainted session routes local with
       `think` bound to a remote provider.
-- [ ] The category resolver's provider is screened through `Router::is_routable`,
+- [x] The category resolver's provider is screened through `Router::is_routable`,
       so an unusable provider is never selected (ADR-E, BUG-155).
-- [ ] Existing router tests that assert phase dispatch are migrated to category
+- [x] Existing router tests that assert phase dispatch are migrated to category
       dispatch; the `AUXILIARY_SIGNALS` tests are deleted rather than adapted.
-- [ ] `policy::evaluate` no longer exists anywhere in the workspace, **and neither
+- [x] `policy::evaluate` no longer exists anywhere in the workspace, **and neither
       does its test module** (`policy.rs:129-279`). `RouteOutcome` stays in
       `policy.rs` and is imported by the category resolver (ADR-J).
-- [ ] `grep -r "evaluate(" crates/*/src` returns no routing-policy caller — only
+- [x] `grep -r "evaluate(" crates/*/src` returns no routing-policy caller — only
       the unrelated `DutySpec::evaluate` (`runtime.rs:2714`, `:2845`), which is a
       hardware-benchmark duty check and must be left alone.
-- [ ] `resolve_local_pin`'s behavior is unchanged.
+- [x] `resolve_local_pin`'s behavior is unchanged.
 
 ## Technical Notes
 

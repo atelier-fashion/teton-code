@@ -19,8 +19,9 @@
 //!   BR-7 no-raw-credentials rule.
 //! - [`mcp`] — user-declared MCP servers (the `[[mcp_server]]` config table,
 //!   ADR-003 / AC-9).
-//! - [`policy`] — pure routing-policy evaluation ([`policy::evaluate`]) and the
-//!   shared [`RouteOutcome`] vocabulary both dispatch paths report in.
+//! - [`policy`] — the shared decision vocabulary: [`ProviderHealth`] in,
+//!   [`RouteOutcome`] out. Its phase-policy evaluator was deleted with its last
+//!   caller when [`category::resolve`] became the one resolver (REQ-558 ADR-J).
 //! - [`boundary`] — pure privacy-boundary glob matching.
 
 pub mod boundary;
@@ -48,7 +49,7 @@ pub use entities::{
 };
 pub use mcp::{McpServerConfig, McpTransport};
 pub use phase::Phase;
-pub use policy::{evaluate, ProviderHealth, RouteDecision, RouteOutcome};
+pub use policy::{ProviderHealth, RouteOutcome};
 
 /// Returns the crate version (equal to the workspace version).
 #[must_use]
