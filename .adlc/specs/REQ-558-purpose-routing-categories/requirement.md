@@ -300,6 +300,21 @@ category/tier equivalent (see OQ-2 for the command shape).
 
 ## Assumptions
 
+- **OVERRIDDEN 2026-08-06 (product decision).** The assumption below — that a
+  category with no call site ships "declared but unreached" — is no longer
+  accepted. All eleven settings must do something. This does **not** change
+  REQ-558's scope: the routing axis, the resolver, the schema and the six reached
+  categories (`route`, `digest`, `edit`, `design`, `debug`, `review`) ship here.
+  The five remaining call sites are scheduled as follow-up work, which ADR-A made
+  cheap on purpose — no config migration, no schema change, no protocol change,
+  each call site is a leaf:
+    - **REQ-561** — `triage`, `shell`, `title`, `compact`.
+    - **REQ-562** — `redact`, specced separately: it is a model call *inside* the
+      egress choke point, BR-4 pins it local for a reason, and it needs its own
+      answers to "what on a hit", "what on failure", and "how does it compose with
+      the existing provenance checks". Wiring a privacy control as a task inside a
+      routing REQ would give it the least scrutiny of anything in the change.
+
 - The seven harness-known categories have identifiable single call sites today.
   `compact`, `digest`, and `triage` map onto the existing summarizer paths
   (`summarize_if_large`, the context assembler); `title`, `route`, and `redact`
