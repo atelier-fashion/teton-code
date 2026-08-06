@@ -28,11 +28,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use teton_core::category::{category_for_phase, Category, CategoryTable, Tier, TierBinding};
+use teton_core::category::{
+    category_for_phase, Category, CategoryTable, JudgmentCategory, Tier, TierBinding,
+};
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
 use teton_core::ToolCallTier;
+
+use teton_inference::{ChatFormat, Engine, MockEngine};
 
 use teton_protocol::events::Event;
 use teton_protocol::{Phase as ProtoPhase, ProviderId, SessionId};
@@ -43,6 +47,7 @@ use teton_providers::transport::{
 use teton_providers::{CapabilityProfile, FailureClass};
 
 use tetond::broadcast::{EventBus, Subscription};
+use tetond::classify::{self, ClassificationSignal};
 use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::{Egress, EgressError, NoopSink, Provenance};
 use tetond::router::{to_protocol_phase, Route, Router};
@@ -289,8 +294,10 @@ async fn freeform_decisions_read_the_configured_table_and_emit_route_decided() {
     // list sent that prompt to the 3B local model for containing "explain", and
     // never consulted the table at all.
     //
-    // The prompt is not passed to anything here because it cannot be: `resolve`
-    // takes a category. That absence is the fix.
+    // The prompt is not passed to the ROUTER here because it cannot be: `resolve`
+    // takes a category. That absence is the fix; the classifier that does read the
+    // prompt lives outside the router, and is exercised by
+    // `the_route_classifier_sends_a_design_prompt_to_the_think_binding` below.
     let judgment = router.resolve(Category::Design);
     assert_eq!(
         judgment.provider_id.as_ref().unwrap().0,
@@ -343,6 +350,83 @@ async fn freeform_decisions_read_the_configured_table_and_emit_route_decided() {
         "the reason names the category that fired: {}",
         decided[1].reason
     );
+}
+
+// --------------------------------------------------------------------------
+// 2b. The `route` classifier: prompt → category → the SAME table (REQ-558 AC-1)
+// --------------------------------------------------------------------------
+
+/// **AC-1 through the public seam.** The classifier reads the prompt, the router
+/// never does, and the answer meets the configured table at
+/// [`Router::resolve_judgment`].
+///
+/// The prompt is the one from the requirement, verbatim. Against today's binary
+/// it went to the 3B local model for containing the word `explain`; here it
+/// reaches whatever the user bound to `think`.
+#[tokio::test]
+async fn the_route_classifier_sends_a_design_prompt_to_the_think_binding() {
+    let router = structured_router();
+
+    // The local tier answers the one-word contract. The engine is the local one
+    // because `route` is pinned there by construction — `resolution_for` is what
+    // says so, and it is the only availability question the classifier asks.
+    let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::with_response(
+        "qwen2.5-coder-3b",
+        "design",
+    )));
+    let plan = classify::plan(
+        &router.resolution_for(Category::Route),
+        Some((engine, ChatFormat::Flat)),
+    );
+    let classification = classify::run(
+        plan,
+        "explain the tradeoffs between these two architectures",
+        router.judgment_default(),
+    )
+    .await;
+
+    assert_eq!(classification.category, JudgmentCategory::Design);
+    assert_eq!(classification.signal, ClassificationSignal::Classified);
+
+    let route = router.resolve_judgment(&classification);
+    assert_eq!(
+        route.provider_id.as_ref().unwrap().0,
+        "anthropic",
+        "a classified `design` turn must reach the `think` binding, not the local \
+         tier: {}",
+        route.reason
+    );
+    // BR-3: category, tier, provider, and the signal that fired, all on one event.
+    let decided = route.route_decided().expect("a provider was selected");
+    assert_eq!(decided.category, Some(teton_protocol::Category::Design));
+    assert_eq!(decided.tier, Some(teton_protocol::Tier::Think));
+    assert_eq!(decided.provider_id, ProviderId::from("anthropic"));
+    assert!(decided.reason.contains("classifier"), "{}", decided.reason);
+}
+
+/// The BR-9 declared default is what a *bypassed* turn takes, and it is resolved
+/// through the same chain rather than shortcut past it (LESSON-447). With the
+/// local tier unable to serve, `route` resolves to nothing and no call is made.
+#[tokio::test]
+async fn an_unavailable_local_tier_bypasses_to_the_declared_default() {
+    let router = structured_router().with_local_available(false);
+
+    let engine: Arc<Mutex<dyn Engine>> =
+        Arc::new(Mutex::new(MockEngine::with_response("local", "design")));
+    let plan = classify::plan(
+        &router.resolution_for(Category::Route),
+        Some((engine, ChatFormat::Flat)),
+    );
+    let classification = classify::run(plan, "anything", router.judgment_default()).await;
+
+    assert!(matches!(
+        classification.signal,
+        ClassificationSignal::Bypassed { .. }
+    ));
+    let route = router.resolve_judgment(&classification);
+    // `edit` inherits `build`, bound to deepseek in this fixture.
+    assert_eq!(route.provider_id.as_ref().unwrap().0, "deepseek");
+    assert!(route.reason.contains("bypassed"), "{}", route.reason);
 }
 
 // --------------------------------------------------------------------------

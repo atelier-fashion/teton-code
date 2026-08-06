@@ -123,6 +123,7 @@ use teton_providers::{
 };
 
 use crate::broadcast::EventBus;
+use crate::classify::Classification;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
 use crate::egress::{inspect, origin_of, Egress, HttpTransport};
@@ -176,6 +177,16 @@ fn last_tool_result_body(prompt: &str) -> &str {
         .unwrap_or("")
 }
 
+/// The stand-in engine's answer to a `route` classification.
+///
+/// [`JudgmentCategory::Edit`]'s name — the BR-9 declared default — so a script
+/// that says nothing about routing routes exactly where it always did. Written as
+/// the enum's own `as_str` rather than a literal so it cannot name a category the
+/// parse would reject.
+fn scripted_classification() -> &'static str {
+    teton_core::category::JudgmentCategory::Edit.as_str()
+}
+
 /// A local [`Engine`] that replays a fixed script of replies, one per turn.
 ///
 /// This is the CI/offline stand-in for a real llama.cpp engine: the daemon ships
@@ -183,6 +194,15 @@ fn last_tool_result_body(prompt: &str) -> &str {
 /// canned replies (tool calls and a final answer) and the offline read→edit→verify
 /// path runs deterministically. When the script is exhausted it returns a
 /// plain-text end-of-turn so no runaway loop can outrun it.
+///
+/// **A duty is not a turn** (REQ-558). The script is a sequence of *turns*, and
+/// the daemon also issues local *duty* calls on its own behalf — since TASK-053,
+/// a `route` classification before every freeform judgment turn. Serving those
+/// from the script would silently shift every block by one and make a fixture's
+/// meaning depend on how many duties the daemon happens to run, so a
+/// classification is recognized by its output contract
+/// ([`crate::classify::CLASSIFIER_OUTPUT_CONTRACT`]) and answered off-script with
+/// the declared default, consuming nothing.
 pub struct ScriptedFileEngine {
     model_id: String,
     replies: Vec<String>,
@@ -226,12 +246,17 @@ impl Engine for ScriptedFileEngine {
         params: &GenParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion, EngineError> {
-        let idx = self.calls.fetch_add(1, Ordering::SeqCst);
-        let text = self
-            .replies
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| "Done.".to_owned());
+        // A duty, not a turn: answered off-script so the block sequence keeps
+        // meaning what the fixture author wrote (see the type's docs).
+        let text = if prompt.contains(crate::classify::CLASSIFIER_OUTPUT_CONTRACT) {
+            scripted_classification().to_owned()
+        } else {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.replies
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| "Done.".to_owned())
+        };
         // A reply may quote the current turn's real tool output via the
         // placeholder, so the scripted continuation genuinely depends on the
         // result reaching context (AC-9 execution proof).
@@ -1290,40 +1315,10 @@ impl DaemonRuntime {
             &health_snapshot,
         );
 
-        // Resolve the initial route (REQ-558 BR-1): one dispatch key, one
-        // resolver, both session modes. What differs between them is only where
-        // the *category* comes from — a structured turn maps it from the phase it
-        // is already in (ADR-C, no model call), a freeform turn takes the BR-9
-        // declared default until TASK-053's classifier lands. Emitting
-        // `route_decided` is the legibility promise.
-        //
-        // REQ-544 C-2 / REQ-558 BR-7: session taint is the OUTERMOST check,
-        // evaluated before any category is even chosen. A session tainted by
-        // earlier boundary/unknown exposure is pinned to the local tier for every
-        // subsequent turn regardless of what any binding resolves to. Category
-        // routing is a cost decision; this is a privacy guarantee, and the two
-        // deliberately do not compose (LESSON-432).
         let core_phase = phase.map(to_core_phase);
-        let mut route = if self.session_taint.is_tainted(&session_id) {
-            router.resolve_local_pin(
-                "session previously touched local-only content; pinned to the local tier (BR-1 backstop)",
-            )
-        } else {
-            let (category, attributed_phase) = match mode {
-                SessionMode::Structured => {
-                    let ph = core_phase.unwrap_or(CorePhase::Implement);
-                    (category_for_phase(ph), Some(to_protocol_phase(ph)))
-                }
-                // A freeform session has no lifecycle position, so it attributes
-                // no phase — it never has (ADR-G).
-                SessionMode::Freeform => (router.freeform_category(), None),
-            };
-            let mut resolved = router.resolve(category);
-            // BR-11 / AC-9: the phase is stamped on AFTER the decision. It is a
-            // cost-attribution fact, and the resolver never saw it.
-            resolved.phase = attributed_phase;
-            resolved
-        };
+        let mut route = self
+            .dispatch_route(&router, &session_id, mode, core_phase, &prompt)
+            .await;
 
         // Assemble the harness context, tools, and the permission gate once; a
         // fallback re-runs the loop against the same accumulated context.
@@ -1513,6 +1508,79 @@ impl DaemonRuntime {
                 }
             }
         }
+    }
+
+    /// The route this turn takes, chosen before the harness runs (REQ-558 BR-1).
+    ///
+    /// Three layers, outermost first.
+    ///
+    /// 1. **Session taint** (REQ-544 C-2 / BR-7). A session whose context has
+    ///    touched `local-only` or unknown-provenance content is pinned to the
+    ///    local tier for every subsequent turn regardless of what any binding
+    ///    resolves to. It is evaluated before a category is even chosen, so a
+    ///    tainted turn issues no classification call either: category routing is a
+    ///    cost decision, the boundary is a privacy guarantee, and the two
+    ///    deliberately do not compose (LESSON-432).
+    /// 2. **The category.** One dispatch key in both session modes; what differs
+    ///    is only where the category comes from. A **structured** turn maps it
+    ///    from the phase it is already in — a total function, no model call
+    ///    (ADR-C). A **freeform** turn asks the `route` classifier
+    ///    ([`crate::classify`]), which reads the prompt this function never hands
+    ///    to the router.
+    /// 3. **The resolver**, through [`Router::resolve`] / [`Router::resolve_judgment`]
+    ///    — the same table, the same precedence, both modes (BR-1).
+    ///
+    /// The phase is stamped on **after** the decision (BR-11, AC-9): it is a
+    /// cost-attribution fact and the resolver never saw it. A freeform session has
+    /// no lifecycle position, so it attributes none — it never has (ADR-G).
+    async fn dispatch_route(
+        &self,
+        router: &Router,
+        session_id: &SessionId,
+        mode: SessionMode,
+        core_phase: Option<CorePhase>,
+        prompt: &str,
+    ) -> crate::router::Route {
+        if self.session_taint.is_tainted(session_id) {
+            return router.resolve_local_pin(
+                "session previously touched local-only content; pinned to the local tier \
+                 (BR-1 backstop)",
+            );
+        }
+
+        match mode {
+            SessionMode::Structured => {
+                let ph = core_phase.unwrap_or(CorePhase::Implement);
+                let mut resolved = router.resolve(category_for_phase(ph));
+                resolved.phase = Some(to_protocol_phase(ph));
+                resolved
+            }
+            SessionMode::Freeform => {
+                router.resolve_judgment(&self.classify_freeform(router, prompt).await)
+            }
+        }
+    }
+
+    /// Classify a freeform prompt into a judgment category, or bypass (BR-3, BR-5).
+    ///
+    /// The bypass question is answered by **the resolver**, not here: `route` has
+    /// no `ConfigurableCategory` counterpart, so `category::resolve` reaches it
+    /// through the branch that consults no binding and yields the local tier or
+    /// nothing. Asking a locality question at this call site would be a guard
+    /// placed where it is convenient rather than where the decision is made
+    /// (LESSON-484) — and it would be a *second* answer to a question the resolver
+    /// has already answered (BR-6).
+    ///
+    /// What this function owns is the read of the engine slot, taken once for the
+    /// turn exactly as [`Self::run_one_attempt`] does, with the format read
+    /// alongside the handle so the async path never locks the engine for metadata
+    /// (LESSON-448).
+    async fn classify_freeform(&self, router: &Router, prompt: &str) -> Classification {
+        let plan = crate::classify::plan(
+            &router.resolution_for(Category::Route),
+            self.engine.get_with_format(),
+        );
+        crate::classify::run(plan, prompt, router.judgment_default()).await
     }
 
     /// Build the tool registry for a turn: the built-ins plus any registered MCP
@@ -3546,6 +3614,71 @@ mod tests {
         );
     }
 
+    /// REQ-558: the script is a sequence of **turns**, and the `route`
+    /// classifier is a duty. Serving it from the script would shift every block
+    /// by one and make each fixture's meaning depend on how many duties the
+    /// daemon happens to run — which is precisely what the acceptance suite
+    /// caught when the classifier first landed.
+    #[test]
+    fn a_classification_duty_is_answered_off_script_and_consumes_no_block() {
+        let engine = ScriptedFileEngine::from_script("m", "first reply\n---\nsecond reply");
+        let params = GenParams::default();
+        let mut sink = |_: &str| true;
+
+        let duty = crate::classify::CLASSIFIER_OUTPUT_CONTRACT;
+        assert_eq!(
+            engine
+                .complete(duty, &params, &mut sink)
+                .unwrap()
+                .text
+                .trim(),
+            scripted_classification()
+        );
+        // The turn sequence is untouched, before and after.
+        assert_eq!(
+            engine.complete("p", &params, &mut sink).unwrap().text,
+            "first reply"
+        );
+        assert_eq!(
+            engine
+                .complete(duty, &params, &mut sink)
+                .unwrap()
+                .text
+                .trim(),
+            scripted_classification()
+        );
+        assert_eq!(
+            engine.complete("p", &params, &mut sink).unwrap().text,
+            "second reply"
+        );
+    }
+
+    /// And the answer it gives is one the classifier can actually parse — a
+    /// stand-in whose reply failed the parse would leave every scripted freeform
+    /// turn reporting a classifier failure in `route_decided`.
+    #[tokio::test]
+    async fn the_scripted_classification_parses_into_a_judgment_category() {
+        use crate::classify::{ClassificationSignal, ClassifierPlan};
+        use teton_core::category::JudgmentCategory;
+
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(ScriptedFileEngine::from_script(
+            "m",
+            "a scripted turn",
+        )));
+        let classification = crate::classify::run(
+            ClassifierPlan::Classify {
+                engine,
+                format: ChatFormat::Flat,
+            },
+            "add a button",
+            JudgmentCategory::Review,
+        )
+        .await;
+
+        assert_eq!(classification.signal, ClassificationSignal::Classified);
+        assert_eq!(classification.category, JudgmentCategory::Edit);
+    }
+
     #[test]
     fn last_tool_result_body_extracts_the_most_recent_tool_block() {
         // The flat rendering shape the local engine is handed.
@@ -4845,5 +4978,281 @@ mod tests {
             .expect("weak tool-calling degrades");
         assert_eq!(degraded.health, ProviderHealth::Degraded);
         assert!(degraded.retry_at.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // The turn's category dispatch (REQ-558 TASK-053): `dispatch_route`
+    //
+    // These drive the exact function `run_prompt_turn` calls, so "a structured
+    // turn issues no classifier call" is a property of the daemon's dispatch
+    // rather than of a test that simply declined to call the classifier.
+    // -----------------------------------------------------------------------
+    mod dispatch {
+        use super::*;
+        use crate::classify::test_support::CountingEngine;
+        use teton_core::category::JudgmentCategory;
+        use teton_protocol::Category as ProtoCategory;
+
+        fn remote(id: &str, model: &str) -> ModelProvider {
+            ModelProvider {
+                id: id.to_owned(),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
+                model: Some(model.to_owned()),
+                auth_ref: None,
+                capabilities: ProviderCapabilities::default(),
+            }
+        }
+
+        /// `think` on a frontier provider, `build` on a cheap one — AC-1's shape.
+        /// The local tier names itself (no `[[providers]]` entry), which is the
+        /// ordinary case.
+        fn config() -> Config {
+            Config {
+                providers: vec![
+                    remote("frontier", "claude-opus-4"),
+                    remote("cheap", "deepseek-chat"),
+                ],
+                tiers: vec![
+                    TierBinding {
+                        tier: Tier::Think,
+                        provider_id: "frontier".to_owned(),
+                        fallback_id: None,
+                    },
+                    TierBinding {
+                        tier: Tier::Build,
+                        provider_id: "cheap".to_owned(),
+                        fallback_id: None,
+                    },
+                ],
+                ..Config::default()
+            }
+        }
+
+        /// A runtime with `config`, `engine` in the serving slot, and the local
+        /// tier's BR-8 latency duty set to `local_available`.
+        fn runtime(
+            config: Config,
+            engine: &CountingEngine,
+            local_available: bool,
+        ) -> DaemonRuntime {
+            let runtime = DaemonRuntime::minimal();
+            *runtime.config.lock().expect("config mutex") = config;
+            runtime
+                .engine
+                .install("counting".to_owned(), engine.handle());
+            runtime
+                .local_available
+                .store(local_available, Ordering::SeqCst);
+            runtime
+        }
+
+        /// The router the turn path builds, from the same runtime state.
+        fn router_for(runtime: &DaemonRuntime) -> Router {
+            let config = runtime.config.lock().expect("config mutex").clone();
+            build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+        }
+
+        /// **AC-1, the direct regression, end to end through the daemon's own
+        /// dispatch.**
+        ///
+        /// A freeform session, `think` bound to a frontier provider, and the
+        /// prompt *"explain the tradeoffs between these two architectures"*. The
+        /// deleted `AUXILIARY_SIGNALS` list sent this to the 3B local model for
+        /// containing the word `explain` and never read the table at all. Now the
+        /// local tier is asked what the prompt *is*, answers `design`, and
+        /// `design` inherits `think`.
+        #[tokio::test]
+        async fn a_freeform_design_prompt_reaches_the_think_binding_not_the_local_tier() {
+            let engine = CountingEngine::answering("design");
+            let runtime = runtime(config(), &engine, true);
+            let router = router_for(&runtime);
+
+            let route = runtime
+                .dispatch_route(
+                    &router,
+                    &SessionId::from("sess"),
+                    SessionMode::Freeform,
+                    None,
+                    "explain the tradeoffs between these two architectures",
+                )
+                .await;
+
+            assert_eq!(engine.calls(), 1, "exactly one classification");
+            assert_eq!(
+                route.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some("frontier"),
+                "a design turn goes to the think binding: {}",
+                route.reason
+            );
+            assert_eq!(
+                route.resolution.as_ref().map(|r| r.category),
+                Some(Category::Design)
+            );
+            assert!(route.phase.is_none(), "a freeform turn attributes no phase");
+
+            // BR-3: the decision names the category, the tier, the provider, and
+            // the signal that fired.
+            let decided = route.route_decided().expect("a provider was selected");
+            assert_eq!(decided.category, Some(ProtoCategory::Design));
+            assert_eq!(decided.tier, Some(teton_protocol::Tier::Think));
+            assert!(decided.reason.contains("classifier"), "{}", decided.reason);
+            assert!(decided.reason.contains("'design'"), "{}", decided.reason);
+        }
+
+        /// **ADR-C, by call count.** A structured turn already knows what it is
+        /// doing, so it derives its category from its phase with no model call —
+        /// with a perfectly good classifier engine sitting in the slot.
+        #[tokio::test]
+        async fn a_structured_turn_issues_zero_classifier_calls() {
+            let engine = CountingEngine::answering("design");
+            let runtime = runtime(config(), &engine, true);
+            let router = router_for(&runtime);
+
+            for (phase, provider, category) in [
+                (CorePhase::Implement, "cheap", Category::Edit),
+                (CorePhase::Architect, "frontier", Category::Design),
+                (CorePhase::Review, "frontier", Category::Review),
+            ] {
+                let route = runtime
+                    .dispatch_route(
+                        &router,
+                        &SessionId::from("sess"),
+                        SessionMode::Structured,
+                        Some(phase),
+                        "explain the tradeoffs between these two architectures",
+                    )
+                    .await;
+
+                assert_eq!(
+                    engine.calls(),
+                    0,
+                    "a structured turn classifies nothing (ADR-C)"
+                );
+                assert_eq!(
+                    route.provider_id.as_ref().map(|p| p.0.as_str()),
+                    Some(provider)
+                );
+                assert_eq!(
+                    route.resolution.as_ref().map(|r| r.category),
+                    Some(category)
+                );
+                // BR-11: the phase is attribution, stamped on after the decision.
+                assert_eq!(route.phase, Some(to_protocol_phase(phase)));
+            }
+        }
+
+        /// **AC-5 / BR-5, by call count.** The local tier cannot meet its latency
+        /// duty, so `route` resolves to nothing, classification is skipped
+        /// entirely, and the turn takes the BR-9 declared default *through the
+        /// same resolver chain*. The engine is present and reachable — it is the
+        /// counter, not its absence, that proves no call was issued.
+        #[tokio::test]
+        async fn an_unavailable_local_tier_bypasses_classification_with_no_call() {
+            let engine = CountingEngine::answering("design");
+            let runtime = runtime(config(), &engine, false);
+            let router = router_for(&runtime);
+
+            let route = runtime
+                .dispatch_route(
+                    &router,
+                    &SessionId::from("sess"),
+                    SessionMode::Freeform,
+                    None,
+                    "explain the tradeoffs between these two architectures",
+                )
+                .await;
+
+            assert_eq!(engine.calls(), 0, "the bypass issues no call at all (BR-5)");
+            // The declared default is `edit`, which inherits `build`.
+            assert_eq!(
+                route.resolution.as_ref().map(|r| r.category),
+                Some(Category::Edit)
+            );
+            assert_eq!(
+                route.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some("cheap"),
+                "the degraded means is still a category resolved through the table"
+            );
+            let decided = route.route_decided().expect("a provider was selected");
+            assert!(decided.reason.contains("bypassed"), "{}", decided.reason);
+            assert!(
+                decided
+                    .reason
+                    .contains("no classification call was issued, locally or remotely"),
+                "{}",
+                decided.reason
+            );
+        }
+
+        /// The bypass takes the **configured** default, not a constant: change
+        /// `judgment_default` and the bypassed turn lands somewhere else entirely
+        /// (BR-9, AC-12). `review` inherits `think`, so this one goes frontier.
+        #[tokio::test]
+        async fn the_bypassed_default_is_the_configured_one() {
+            let engine = CountingEngine::answering("design");
+            let runtime = runtime(
+                Config {
+                    judgment_default: JudgmentCategory::Review,
+                    ..config()
+                },
+                &engine,
+                false,
+            );
+            let router = router_for(&runtime);
+
+            let route = runtime
+                .dispatch_route(
+                    &router,
+                    &SessionId::from("sess"),
+                    SessionMode::Freeform,
+                    None,
+                    "anything at all",
+                )
+                .await;
+
+            assert_eq!(engine.calls(), 0);
+            assert_eq!(
+                route.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some("frontier")
+            );
+            assert_eq!(
+                route.resolution.as_ref().map(|r| r.category),
+                Some(Category::Review)
+            );
+        }
+
+        /// **BR-7 / LESSON-432.** Taint is the outermost check, so a pinned
+        /// session does not even reach the classifier. Category routing is a cost
+        /// decision and the boundary is a privacy guarantee; a classification call
+        /// on a tainted turn would be the two starting to compose.
+        #[tokio::test]
+        async fn a_tainted_session_is_pinned_local_and_classifies_nothing() {
+            let engine = CountingEngine::answering("design");
+            let runtime = runtime(config(), &engine, true);
+            let router = router_for(&runtime);
+            let session = SessionId::from("tainted");
+            runtime.session_taint.mark(&session);
+
+            let route = runtime
+                .dispatch_route(
+                    &router,
+                    &session,
+                    SessionMode::Freeform,
+                    None,
+                    "explain the tradeoffs between these two architectures",
+                )
+                .await;
+
+            assert_eq!(engine.calls(), 0, "a tainted turn classifies nothing");
+            assert_eq!(
+                route.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some(LOCAL_PROVIDER_ID)
+            );
+            assert!(
+                route.resolution.is_none(),
+                "the taint pin resolves no category at all (BR-7)"
+            );
+        }
     }
 }

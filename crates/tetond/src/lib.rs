@@ -22,6 +22,11 @@
 //!   preflight before a byte is fetched, download to a temporary path, verify,
 //!   then an atomic rename into place.
 //! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
+//! - [`classify`] — the `route` classifier (REQ-558 BR-3): the one small local
+//!   model call that assigns a *freeform* turn to one of the four judgment
+//!   categories, with a bypass that issues no call at all when the local tier
+//!   cannot serve (BR-5). It lives beside the router rather than inside it
+//!   because no routing function may see prompt text.
 //! - [`router`] — category routing (REQ-558 BR-1), BR-6 degradation, remote
 //!   wiring through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
 //! - [`runtime`] — the assembled engine/router/egress/cost/MCP state the JSON-RPC
@@ -43,6 +48,7 @@
 
 pub mod auth;
 pub mod broadcast;
+pub mod classify;
 pub mod cost;
 pub mod download;
 pub mod egress;

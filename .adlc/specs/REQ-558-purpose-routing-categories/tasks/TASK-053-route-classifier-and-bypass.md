@@ -1,10 +1,10 @@
 ---
 id: TASK-053
 title: "The route classifier: a local model call, with a bypass that costs nothing"
-status: draft
+status: complete
 parent: REQ-558
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-06
 dependencies: [TASK-050, TASK-051]
 ---
 
@@ -27,23 +27,23 @@ no model call.
 
 ## Acceptance Criteria
 
-- [ ] **AC-1, the direct regression**: in a freeform session with `think` bound to
+- [x] **AC-1, the direct regression**: in a freeform session with `think` bound to
       a frontier provider, *"explain the tradeoffs between these two
       architectures"* routes to the `design`/`think` binding, **not** to the local
       tier. This test fails against today's binary.
-- [ ] The classifier returns `JudgmentCategory` — four variants. It is
+- [x] The classifier returns `JudgmentCategory` — four variants. It is
       type-impossible for it to return `digest` or any other harness-known
       category (AC-3, BR-2).
-- [ ] With the local tier unavailable, classification is **bypassed**: the turn
+- [x] With the local tier unavailable, classification is **bypassed**: the turn
       resolves through the BR-9 declared default, `route_decided` names the
       bypass, and **no remote classification call is issued** — asserted by call
       count, not by output text (AC-5, BR-5).
-- [ ] A classifier failure (engine error, unparseable output) falls back to the
+- [x] A classifier failure (engine error, unparseable output) falls back to the
       declared default and says so — never to silence, never to a remote call
       (BR-3, BR-9).
-- [ ] A structured turn issues **zero** classifier calls (ADR-C) — asserted by
+- [x] A structured turn issues **zero** classifier calls (ADR-C) — asserted by
       call count.
-- [ ] Every classification emits `route_decided` naming the category, tier,
+- [x] Every classification emits `route_decided` naming the category, tier,
       provider, and the signal that fired (BR-3).
 
 ## Technical Notes

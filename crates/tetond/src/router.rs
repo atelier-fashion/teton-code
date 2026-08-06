@@ -30,6 +30,17 @@
 //!   the fallback provider (or the same provider under a reduced profile) so the
 //!   session completes rather than failing.
 //!
+//! ## Prompt text is not here
+//!
+//! No routing function in this module takes prompt text, and
+//! `no_routing_function_can_see_prompt_text` pins their types so adding one stops
+//! compiling. The `route` classifier — the thing that *does* read a freeform
+//! prompt — lives in [`crate::classify`] and hands this module a
+//! [`Classification`], whose category is a [`JudgmentCategory`]: four variants,
+//! none of them harness-known (AC-3). A routing function that could see the text
+//! is a routing function a keyword list can be dropped back into, which is the
+//! defect this REQ exists to close (BR-2).
+//!
 //! ## `Phase` is not here
 //!
 //! No routing signature in this module takes a [`teton_core::phase::Phase`]
@@ -62,6 +73,7 @@ use teton_providers::{
 };
 
 use crate::broadcast::EventBus;
+use crate::classify::Classification;
 use crate::cost::CostAttribution;
 use crate::egress::EgressContext;
 use crate::harness::turn_loop::{HarnessConfig, TurnRoute};
@@ -351,8 +363,24 @@ impl Router {
     /// dropped into — the defect this REQ exists to close (BR-2).
     #[must_use]
     pub fn resolve(&self, category: CoreCategory) -> Route {
+        self.route_from(self.resolution_for(category))
+    }
+
+    /// The pure [`CategoryResolution`] behind [`Router::resolve`], for a caller
+    /// that needs the decision itself rather than a turn-ready [`Route`].
+    ///
+    /// It exists for exactly one caller: [`crate::classify::plan`], which asks
+    /// the resolver whether the `route` category can be served *before* deciding
+    /// to classify. Handing it the resolution rather than a `Route` keeps the
+    /// bypass question answered by `teton_core::category::resolve` (ADR-D) and
+    /// keeps the classifier free of any locality check of its own (LESSON-484).
+    ///
+    /// [`Router::resolve`] is defined in terms of this, so there is one
+    /// construction site and the two cannot answer differently.
+    #[must_use]
+    pub fn resolution_for(&self, category: CoreCategory) -> CategoryResolution {
         let table = self.effective_table();
-        let resolution = resolve_category(
+        resolve_category(
             category,
             &table,
             |id| self.health_of(id),
@@ -362,25 +390,51 @@ impl Router {
             // dispatch axis is a fourth unless it is screened where the decision
             // is made (LESSON-484).
             |id| self.is_usable(id),
-        );
-        self.route_from(resolution)
+        )
     }
 
-    /// The category a **freeform** turn dispatches on (ADR-C, BR-3, BR-9).
+    /// The category a freeform judgment turn takes when classification is
+    /// **bypassed or fails** — the BR-9 declared default, read from
+    /// `Config::judgment_default` (AC-12).
+    #[must_use]
+    pub fn judgment_default(&self) -> JudgmentCategory {
+        self.judgment_default
+    }
+
+    /// [`Router::judgment_default`] as a [`CoreCategory`] — what a freeform turn
+    /// dispatches on when the classifier did not choose (ADR-C, BR-3, BR-9).
     ///
-    /// Only the four judgment categories require reading user intent, and the
-    /// `route` classifier that reads it does not exist yet — TASK-053 builds it.
-    /// Until then, and whenever it is bypassed or fails (BR-5), a freeform turn
-    /// takes the **declared default** read from `Config::judgment_default`.
-    ///
-    /// It deliberately takes no prompt, and that is the seam TASK-053 fills: the
-    /// classifier is a `route`-category model call whose return type is
-    /// [`JudgmentCategory`], so it *cannot* name a harness-known category (AC-3).
-    /// Giving this function the prompt text now would be precisely where a
-    /// substring list reappears — which BR-2 deletes rather than relocates.
+    /// It deliberately takes no prompt. That is not an accident of the current
+    /// implementation, it is the guarantee: the `route` classifier lives *outside*
+    /// this module ([`crate::classify`]) and hands the router a
+    /// [`JudgmentCategory`], so no routing function ever receives text. Giving
+    /// this one the prompt would be precisely where a substring list reappears —
+    /// which BR-2 deletes rather than relocates.
     #[must_use]
     pub fn freeform_category(&self) -> CoreCategory {
         CoreCategory::from(self.judgment_default)
+    }
+
+    /// Resolve the category a **freeform** turn was classified into, with the
+    /// classification's own signal folded into the reason (ADR-C, BR-3).
+    ///
+    /// One `route_decided` answers both halves of the question a user asks when a
+    /// turn goes somewhere surprising: *why this category* (the classifier ran,
+    /// or was bypassed, or failed) and *why this provider* (the resolver's
+    /// sentence, verbatim). Composed here, in one place, rather than at each call
+    /// site — a second surface assembling its own version of this sentence is the
+    /// drift BR-6 exists to prevent.
+    ///
+    /// [`Route::resolution`] is untouched: it still carries the resolver's own
+    /// answer, which is what `route_decided` projects the category and tier from
+    /// (AC-11).
+    #[must_use]
+    pub fn resolve_judgment(&self, classification: &Classification) -> Route {
+        let resolved = self.resolve(CoreCategory::from(classification.category));
+        Route {
+            reason: format!("{} {}", classification.sentence(), resolved.reason),
+            ..resolved
+        }
     }
 
     /// Force a route to the **local tier**, ignoring the category table
@@ -822,6 +876,7 @@ fn to_protocol_failure_class(class: FailureClass) -> ProtoFailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classify::ClassificationSignal;
     use teton_core::category::category_for_phase;
     use teton_core::ToolCallTier;
 
@@ -1162,25 +1217,96 @@ mod tests {
 
     /// **AC-10's structural leg (BR-2).** Reintroducing a keyword match for a
     /// harness-known category needs a routing function that can *see* prompt text
-    /// and return a [`CoreCategory`]. There is exactly one candidate — the seam
-    /// TASK-053's classifier plugs into — and this pins its type: it takes no
-    /// text.
+    /// and return a [`CoreCategory`]. This enumerates every candidate and pins its
+    /// type: none of them takes text.
+    ///
+    /// TASK-053's classifier landed against this test rather than around it. It
+    /// runs *outside* this module and its answer arrives as a [`Classification`] —
+    /// a [`JudgmentCategory`] plus the signal that chose it — so
+    /// [`Router::resolve_judgment`] is pinned here too: the day it grows a
+    /// `&str` this stops compiling.
     ///
     /// That is the whole of the guarantee at this layer, and it is worth being
     /// exact about the limit. `JudgmentCategory` already makes `"digest"` from
     /// prompt text a compile error (AC-3), so a keyword matcher can only reach a
     /// harness-known category by returning `Category` directly — which requires
-    /// this signature to change, which fails here. What no test at this layer can
-    /// catch is a mutation that changes the signature *and* every call site in one
-    /// go: nothing in the router ever receives a prompt, so there is no behaviour
-    /// left to differ. The end-to-end assertion that closes AC-10 — a freeform
-    /// turn whose prompt contains a harness-known keyword, asserted to route by
-    /// the declared default and not by the word — is TASK-057's, per this task's
-    /// own notes.
+    /// one of these signatures to change, which fails here. What no test at this
+    /// layer can catch is a mutation that changes the signature *and* every call
+    /// site in one go: nothing in the router ever receives a prompt, so there is
+    /// no behaviour left to differ. The end-to-end assertion that closes AC-10 — a
+    /// freeform turn whose prompt contains a harness-known keyword, asserted to
+    /// route by the declared default and not by the word — is TASK-057's, per this
+    /// task's own notes.
     #[test]
     fn no_routing_function_can_see_prompt_text() {
         let _freeform: fn(&Router) -> CoreCategory = Router::freeform_category;
         let _dispatch: fn(&Router, CoreCategory) -> Route = Router::resolve;
+        let _resolution: fn(&Router, CoreCategory) -> CategoryResolution = Router::resolution_for;
+        let _judgment: fn(&Router, &Classification) -> Route = Router::resolve_judgment;
+        let _default: fn(&Router) -> JudgmentCategory = Router::judgment_default;
+    }
+
+    /// The classification signal reaches `route_decided`, and the resolution the
+    /// event projects its category and tier from is **untouched** by it (AC-11):
+    /// the reason gains a sentence, the decision does not gain a second author.
+    #[test]
+    fn a_classified_route_carries_both_the_signal_and_the_resolver_s_sentence() {
+        let router = router();
+        let classified = Classification {
+            category: JudgmentCategory::Design,
+            signal: ClassificationSignal::Classified,
+        };
+        let route = router.resolve_judgment(&classified);
+        let plain = router.resolve(CoreCategory::Design);
+
+        // Same decision, by every measure except the sentence.
+        assert_eq!(route.provider_id, plain.provider_id);
+        assert_eq!(route.resolution, plain.resolution);
+        assert_eq!(
+            route.resolution.as_ref().map(|r| r.reason.clone()),
+            plain.resolution.as_ref().map(|r| r.reason.clone()),
+            "the resolver's own answer is not rewritten"
+        );
+
+        let decided = route.route_decided().expect("a provider was selected");
+        assert_eq!(decided.category, Some(ProtoCategory::Design));
+        assert_eq!(decided.tier, Some(ProtoTier::Think));
+        assert!(decided.reason.contains("classifier"), "{}", decided.reason);
+        assert!(
+            decided.reason.ends_with(&plain.reason),
+            "the resolver's sentence survives verbatim: {}",
+            decided.reason
+        );
+    }
+
+    /// A bypassed classification still resolves through the configured table —
+    /// the degraded means is a real category, not a shortcut past the resolver
+    /// (LESSON-447) — and `route_decided` names the bypass (AC-5).
+    #[test]
+    fn a_bypassed_classification_resolves_the_declared_default_and_names_the_bypass() {
+        let router = router().with_judgment_default(JudgmentCategory::Edit);
+        let bypassed = Classification {
+            category: router.judgment_default(),
+            signal: ClassificationSignal::Bypassed {
+                reason: "the local tier is unavailable.".to_owned(),
+            },
+        };
+        let route = router.resolve_judgment(&bypassed);
+
+        // `edit` inherits `build`, which this fixture binds to deepseek — the
+        // same answer `resolve` gives, reached through the same chain.
+        assert_eq!(route.provider_id.as_ref().unwrap().0, "deepseek");
+        assert_eq!(
+            route.resolution.as_ref().map(|r| r.category),
+            Some(CoreCategory::Edit)
+        );
+        let decided = route.route_decided().expect("a provider was selected");
+        assert!(decided.reason.contains("bypassed"), "{}", decided.reason);
+        assert!(
+            decided.reason.contains("'edit'"),
+            "and still names the category that fired: {}",
+            decided.reason
+        );
     }
 
     /// AC-4's router leg. `redact` and `route` are pinned to the local tier by
