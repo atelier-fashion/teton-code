@@ -17,11 +17,15 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    ConfigGetParams, ConfigSetParams, ConfigUpdate, CostQueryParams, CostQueryResult,
-    CostReportView, ModelListParams, ModelListResult, ModelSetParams, ModelStatusParams,
-    ModelStatusResult, PrivacyBoundaryConfig, ProviderConfig, RoutingRule, SessionCreateParams,
+    CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSnapshot, ConfigUpdate,
+    CostQueryParams, CostQueryResult, CostReportView, ModelListParams, ModelListResult,
+    ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig, ProviderConfig,
+    SessionCreateParams, TierBindingConfig,
 };
-use teton_protocol::{Phase, PrivacyMode, ProviderId, ProviderKind, SessionMode};
+use teton_protocol::{
+    BindingSource, ConfigurableCategory, PrivacyMode, ProviderId, ProviderKind, SessionMode, Tier,
+    TierBindingSource,
+};
 
 mod banner;
 mod client;
@@ -168,22 +172,47 @@ enum BoundaryAction {
     List,
 }
 
-/// `teton policy …`
+/// `teton policy …` (REQ-558 ADR-H)
 #[derive(Debug, Subcommand)]
 enum PolicyAction {
-    /// Route a phase to a provider (with an optional fallback).
-    Set {
-        /// The lifecycle phase to route.
+    /// Route a tier to a provider — the setting most users want. Every category
+    /// on that tier follows unless it has its own override.
+    SetTier {
+        /// The tier to bind.
         #[arg(value_enum)]
-        phase: CliPhase,
-        /// Provider id to route the phase to.
+        tier: CliTier,
+        /// Provider id to route the tier to.
         provider: String,
         /// Provider used on error/timeout of the primary.
         #[arg(long)]
         fallback: Option<String>,
     },
-    /// Show the current routing policy.
+    /// Route one category to a provider, ahead of its tier's binding.
+    SetCategory {
+        /// The category to bind: title, digest, compact, triage, edit, shell,
+        /// design, debug, or review. `route` and `redact` are pinned to the
+        /// local tier by construction and cannot be bound.
+        #[arg(value_name = "CATEGORY", value_parser = parse_cli_category)]
+        category: CliCategory,
+        /// Provider id to route the category to.
+        provider: String,
+        /// Provider used on error/timeout of the primary.
+        #[arg(long)]
+        fallback: Option<String>,
+    },
+    /// Show the effective routing table: every tier, every category, and where
+    /// each one resolves right now.
     Show,
+    /// The retired phase form. Hidden, and it only explains itself — clap's
+    /// "unrecognized subcommand" would tell a user with muscle memory that they
+    /// mistyped, when what actually happened is that the dispatch axis changed
+    /// underneath them (AC-9).
+    #[command(hide = true)]
+    Set {
+        /// Whatever followed `policy set`; never interpreted.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 /// CLI mirror of [`ProviderKind`] (kebab-case wire names).
@@ -228,31 +257,54 @@ impl From<CliPrivacyMode> for PrivacyMode {
     }
 }
 
-/// CLI mirror of [`Phase`].
+// `CliPhase` retired with `policy set <phase>` (REQ-558 AC-9). Lifecycle phase
+// is still a real concept — it gates a structured session and attributes cost —
+// but it is not something the CLI asks a user to type at a *routing* command any
+// more, and nothing else took an argument of that type.
+
+/// CLI mirror of [`Tier`] — the primary routing surface.
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliPhase {
-    /// Requirement authoring.
-    Spec,
-    /// Architecture / task decomposition.
-    Architect,
-    /// Implementation from task artifacts.
-    Implement,
-    /// Code review.
-    Review,
-    /// Mechanical I/O.
-    Io,
+enum CliTier {
+    /// Sub-second, every turn, never leaves the machine.
+    Reflex,
+    /// Read a lot, emit a little.
+    Scan,
+    /// The agentic loop: read → edit → run → verify.
+    Build,
+    /// Design, debug, critique.
+    Think,
 }
 
-impl From<CliPhase> for Phase {
-    fn from(phase: CliPhase) -> Self {
-        match phase {
-            CliPhase::Spec => Phase::Spec,
-            CliPhase::Architect => Phase::Architect,
-            CliPhase::Implement => Phase::Implement,
-            CliPhase::Review => Phase::Review,
-            CliPhase::Io => Phase::Io,
+impl From<CliTier> for Tier {
+    fn from(tier: CliTier) -> Self {
+        match tier {
+            CliTier::Reflex => Tier::Reflex,
+            CliTier::Scan => Tier::Scan,
+            CliTier::Build => Tier::Build,
+            CliTier::Think => Tier::Think,
         }
     }
+}
+
+/// CLI mirror of [`ConfigurableCategory`] — the **nine** a user may bind.
+///
+/// `redact` and `route` are absent here for the same reason they are absent from
+/// the wire type and from the config schema (ADR-B): the CLI does not offer, and
+/// cannot construct, a binding that BR-4 and BR-5 forbid.
+#[derive(Debug, Clone, Copy)]
+struct CliCategory(ConfigurableCategory);
+
+/// Parse a category argument, naming the pin when a user types a pinned one.
+///
+/// Deliberately **not** a `ValueEnum`: clap would reject `redact` with
+/// "invalid value 'redact' … [possible values: title, digest, …]", which reads
+/// like a typo. AC-4's criterion is that a user who names a pinned category
+/// learns it is *forbidden*, and that sentence comes from the protocol's
+/// `FromStr` rather than being written a third time here.
+fn parse_cli_category(name: &str) -> Result<CliCategory, String> {
+    name.parse::<ConfigurableCategory>()
+        .map(CliCategory)
+        .map_err(|e| e.to_string())
 }
 
 fn main() -> ExitCode {
@@ -282,12 +334,18 @@ fn main() -> ExitCode {
             BoundaryAction::List => run_boundary_list(&paths),
         },
         Some(Command::Policy { action }) => match action {
-            PolicyAction::Set {
-                phase,
+            PolicyAction::SetTier {
+                tier,
                 provider,
                 fallback,
-            } => run_policy_set(&paths, phase.into(), provider, fallback),
+            } => run_policy_set_tier(&paths, tier.into(), provider, fallback),
+            PolicyAction::SetCategory {
+                category,
+                provider,
+                fallback,
+            } => run_policy_set_category(&paths, category.0, provider, fallback),
             PolicyAction::Show => run_policy_show(&paths),
+            PolicyAction::Set { .. } => Err(anyhow::anyhow!(POLICY_SET_RETIRED)),
         },
         Some(Command::Uninstall { keep_data }) => run_uninstall(&paths, keep_data, cli.yes),
     };
@@ -1233,41 +1291,95 @@ fn run_boundary_list(paths: &DaemonPaths) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `teton policy set`.
-fn run_policy_set(
+/// What `teton policy set <phase> <provider>` says now that it is gone (AC-9).
+///
+/// The sentence names the *reason* rather than only the replacement, because the
+/// argument a user is about to retype is a phase, and no amount of "did you
+/// mean" gets them to the right tier if they still think in lifecycle position.
+/// It deliberately does not map their phase to a tier for them: the CLI holds no
+/// routing logic (BR-4), and a phase→tier table written here to be helpful would
+/// be a second copy of `categories_for_phase` (ADR-F).
+const POLICY_SET_RETIRED: &str = "`teton policy set <phase> <provider>` is retired. Routing \
+     dispatches on what a call is *for* — classify, summarize, edit, critique — not on where in \
+     the lifecycle it happens, so a phase is no longer something to route. Bind a tier with \
+     `teton policy set-tier <reflex|scan|build|think> <provider>`, or one category with \
+     `teton policy set-category <category> <provider>`. `teton policy show` prints the whole \
+     table, including which tier each category inherits from.";
+
+/// `teton policy set-tier`.
+fn run_policy_set_tier(
     paths: &DaemonPaths,
-    phase: Phase,
+    tier: Tier,
     provider: String,
     fallback: Option<String>,
+) -> anyhow::Result<()> {
+    run_policy_bind(
+        paths,
+        ConfigUpdate::SetTierBinding(TierBindingConfig {
+            tier,
+            provider_id: ProviderId::from(provider.as_str()),
+            fallback_id: fallback.as_deref().map(ProviderId::from),
+        }),
+        &format!("the '{tier}' tier"),
+        &provider,
+        fallback.as_deref(),
+    )
+}
+
+/// `teton policy set-category`.
+fn run_policy_set_category(
+    paths: &DaemonPaths,
+    category: ConfigurableCategory,
+    provider: String,
+    fallback: Option<String>,
+) -> anyhow::Result<()> {
+    run_policy_bind(
+        paths,
+        ConfigUpdate::SetCategoryBinding(CategoryBindingConfig {
+            name: category,
+            provider_id: ProviderId::from(provider.as_str()),
+            fallback_id: fallback.as_deref().map(ProviderId::from),
+        }),
+        &format!("the '{category}' category"),
+        &provider,
+        fallback.as_deref(),
+    )
+}
+
+/// The shared body of `set-tier` and `set-category`: one round trip, one set of
+/// outcomes, one sentence shape. The two differ only in what they bind.
+fn run_policy_bind(
+    paths: &DaemonPaths,
+    update: ConfigUpdate,
+    what: &str,
+    provider: &str,
+    fallback: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-    let params = ConfigSetParams {
-        update: ConfigUpdate::SetRoutingRule(RoutingRule {
-            phase,
-            provider_id: ProviderId::from(provider.as_str()),
-            fallback_id: fallback.as_deref().map(ProviderId::from),
-        }),
-    };
-    match conn.call(params, &mut ctx)? {
+    let fallback_note = fallback.map_or_else(String::new, |f| format!(" (fallback {f})"));
+    match conn.call(ConfigSetParams { update }, &mut ctx)? {
         Ok(res) if res.applied => ctx.surface.line(
             LineKind::Info,
-            &format!("policy set: {phase:?} → {provider}"),
+            &format!("{what} now routes to `{provider}`{fallback_note}."),
         ),
         Ok(_) => ctx.surface.line(
             LineKind::Notice,
-            "the daemon did not apply the routing rule.",
+            &format!("the daemon did not apply the binding for {what}."),
         ),
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
             LineKind::Notice,
             "this daemon build does not implement config/set yet (wiring in progress).",
         ),
+        // The daemon screens the provider before it writes anything (REQ-557
+        // BR-6, BUG-155 M4's shape), so its message already names what went
+        // wrong and what is registered. Passing it through beats paraphrasing.
         Err(err) => ctx.surface.line(
             LineKind::Error,
-            &format!("routing rule rejected: {}", err.message),
+            &format!("{what} was not bound: {}", err.message),
         ),
     }
     Ok(())
@@ -1281,37 +1393,7 @@ fn run_policy_show(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
     match conn.call(ConfigGetParams::default(), &mut ctx)? {
-        Ok(cfg) => {
-            if cfg.snapshot.routing.is_empty() {
-                // REQ-558 TASK-055 retired the phase table, so this branch is
-                // now the only one taken: `ConfigSnapshot` carries no phase
-                // rules and does not yet carry the tier/category table that
-                // replaced them (TASK-056 adds both, with `set-tier` and
-                // `set-category`). Saying "no routing rules configured" here
-                // would be a lie to a user whose rules were migrated an instant
-                // earlier, and pointing them at `teton policy set` would be a
-                // second one. It says what is true instead.
-                ctx.surface.line(
-                    LineKind::Notice,
-                    "routing moved from phases to tiers and categories (REQ-558), and this \
-                     build cannot render the new table yet. Your config file's `[[tiers]]` \
-                     and `[[categories]]` sections are the routing table — the daemon \
-                     reports what it migrated on startup.",
-                );
-            } else {
-                ctx.surface.line(LineKind::Info, "routing policy:");
-                for rule in &cfg.snapshot.routing {
-                    let fallback = rule
-                        .fallback_id
-                        .as_ref()
-                        .map_or_else(String::new, |f| format!(" (fallback {f})"));
-                    ctx.surface.line(
-                        LineKind::Info,
-                        &format!("  {:?} → {}{fallback}", rule.phase, rule.provider_id),
-                    );
-                }
-            }
-        }
+        Ok(cfg) => render_policy(&cfg.snapshot, ctx.surface),
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
             LineKind::Notice,
             "this daemon build does not implement config/get yet (wiring in progress).",
@@ -1322,6 +1404,139 @@ fn run_policy_show(paths: &DaemonPaths) -> anyhow::Result<()> {
         ),
     }
     Ok(())
+}
+
+/// Render `teton policy show` (REQ-558 ADR-A, ADR-H).
+///
+/// **Every routing fact here was decided by the daemon's resolver** — the same
+/// `category::resolve` a turn goes through, with the same live provider health
+/// (BR-6, AC-11). This function chooses column widths and English connectives
+/// and nothing else. That restraint is the whole design: `policy show` is the
+/// surface most tempting to "just format nicely" with logic of its own, and a
+/// table that computed its own answer would be a second routing implementation
+/// that only a human ever compares against the first.
+fn render_policy(snapshot: &ConfigSnapshot, surface: &mut dyn Surface) {
+    if snapshot.tiers.is_empty() && snapshot.routing.is_empty() {
+        surface.line(
+            LineKind::Notice,
+            "this daemon build reports no routing table.",
+        );
+        return;
+    }
+
+    surface.line(
+        LineKind::Info,
+        "tiers — the primary surface; a category follows its tier unless overridden:",
+    );
+    let tier_width = snapshot
+        .tiers
+        .iter()
+        .map(|t| t.tier.as_str().len())
+        .max()
+        .unwrap_or(0);
+    for row in &snapshot.tiers {
+        let target = match &row.provider_id {
+            Some(id) => format!("→ {id}"),
+            None => "— nothing bound and nothing to inherit".to_owned(),
+        };
+        let fallback = row
+            .fallback_id
+            .as_ref()
+            .map_or_else(String::new, |f| format!(" (fallback {f})"));
+        surface.line(
+            LineKind::Info,
+            &format!(
+                "  {:<tier_width$}  {target}{fallback}  [{}]",
+                row.tier.as_str(),
+                tier_origin_label(row.source),
+            ),
+        );
+    }
+
+    surface.line(LineKind::Info, "categories:");
+    let category_width = snapshot
+        .routing
+        .iter()
+        .map(|c| c.category.as_str().len())
+        .max()
+        .unwrap_or(0);
+    let provider_width = snapshot
+        .routing
+        .iter()
+        .filter_map(|c| c.provider_id.as_ref().map(|p| p.0.len()))
+        .max()
+        .unwrap_or(0);
+    for row in &snapshot.routing {
+        // An unresolvable category carries the resolver's sentence instead of a
+        // blank column: BR-8 requires it to name itself and its unset binding,
+        // and the sentence that does so already exists.
+        let Some(provider) = &row.provider_id else {
+            surface.line(
+                LineKind::Notice,
+                &format!(
+                    "  {:<category_width$}  {:<6}  unresolved — {}",
+                    row.category.as_str(),
+                    row.tier.as_str(),
+                    row.reason,
+                ),
+            );
+            continue;
+        };
+        let fallback = row
+            .fallback_id
+            .as_ref()
+            .map_or_else(String::new, |f| format!(" (fallback {f})"));
+        // ADR-A: a knob with no call site says so, every time it is printed.
+        let marker = if row.reached {
+            ""
+        } else {
+            "  — declared, no call site yet"
+        };
+        surface.line(
+            LineKind::Info,
+            &format!(
+                "  {:<category_width$}  {:<6}  → {:<provider_width$}  [{}]{fallback}{marker}",
+                row.category.as_str(),
+                row.tier.as_str(),
+                provider.0,
+                binding_source_label(row.source),
+            ),
+        );
+    }
+
+    // AC-12: the BR-9 declared default, on the surface a user reads to find out
+    // where a turn will go. A freeform turn the classifier cannot categorize —
+    // or does not run for at all, because the local tier cannot serve it — lands
+    // here, so it is part of the routing answer, not a footnote.
+    if let Some(default) = snapshot.judgment_default {
+        surface.line(
+            LineKind::Info,
+            &format!(
+                "a freeform turn whose category the `route` classifier does not decide is \
+                 treated as `{default}` (judgment_default)."
+            ),
+        );
+    }
+}
+
+/// Label for where an unbound tier's provider came from.
+fn tier_origin_label(source: TierBindingSource) -> &'static str {
+    match source {
+        TierBindingSource::Configured => "configured",
+        TierBindingSource::DefaultProvider => "unbound; inherits default_provider",
+        TierBindingSource::LocalTier => "unbound; inherits the local tier",
+        TierBindingSource::Unbound => "unbound",
+    }
+}
+
+/// Label for which row supplied a category's binding.
+fn binding_source_label(source: BindingSource) -> &'static str {
+    match source {
+        BindingSource::Override => "per-category override",
+        BindingSource::TierInheritance => "via its tier",
+        BindingSource::PinnedLocal => "pinned local, not configurable",
+        BindingSource::Unbound => "unbound",
+    }
 }
 
 /// Build the provider registration, storing any secret in the keychain first so
@@ -1614,6 +1829,182 @@ mod tests {
         );
     }
 
+    /// A snapshot shaped like the one a REQ-557-migrated install produces:
+    /// `default_provider` on a remote provider, so `scan`/`build`/`think`
+    /// inherit it and `reflex` does not.
+    fn migrated_snapshot() -> ConfigSnapshot {
+        use teton_protocol::methods::{CategoryRouteView, TierRouteView};
+        use teton_protocol::Category;
+
+        let tier = |t: Tier, provider: &str, source| TierRouteView {
+            tier: t,
+            provider_id: Some(ProviderId::from(provider)),
+            fallback_id: None,
+            source,
+        };
+        let row =
+            |category: Category, t: Tier, provider: &str, source, reached| CategoryRouteView {
+                category,
+                tier: t,
+                provider_id: Some(ProviderId::from(provider)),
+                fallback_id: None,
+                source,
+                reached,
+                reason: format!("Routing the '{category}' category to '{provider}'."),
+            };
+        use BindingSource::{PinnedLocal, TierInheritance as Inherit};
+        use TierBindingSource::{DefaultProvider, LocalTier};
+        ConfigSnapshot {
+            providers: Vec::new(),
+            tiers: vec![
+                tier(Tier::Reflex, "on-device", LocalTier),
+                tier(Tier::Scan, "anthropic", DefaultProvider),
+                tier(Tier::Build, "anthropic", DefaultProvider),
+                tier(Tier::Think, "anthropic", DefaultProvider),
+            ],
+            routing: vec![
+                row(
+                    Category::Route,
+                    Tier::Reflex,
+                    "on-device",
+                    PinnedLocal,
+                    true,
+                ),
+                row(
+                    Category::Redact,
+                    Tier::Reflex,
+                    "on-device",
+                    PinnedLocal,
+                    false,
+                ),
+                row(Category::Title, Tier::Reflex, "on-device", Inherit, false),
+                row(Category::Digest, Tier::Scan, "anthropic", Inherit, true),
+                row(Category::Compact, Tier::Scan, "anthropic", Inherit, false),
+                row(Category::Triage, Tier::Scan, "anthropic", Inherit, false),
+                row(Category::Edit, Tier::Build, "anthropic", Inherit, true),
+                row(Category::Shell, Tier::Build, "anthropic", Inherit, false),
+                row(Category::Design, Tier::Think, "anthropic", Inherit, true),
+                row(Category::Debug, Tier::Think, "anthropic", Inherit, true),
+                // One override, on the same tier as `design` and `debug`, so
+                // "which row supplied this?" is not recoverable from the tier or
+                // the provider — only from `source`.
+                row(
+                    Category::Review,
+                    Tier::Think,
+                    "anthropic",
+                    BindingSource::Override,
+                    true,
+                ),
+            ],
+            judgment_default: Some(Category::Edit),
+            privacy: Vec::new(),
+        }
+    }
+
+    /// ADR-A + AC-12: the table a human reads names every category, marks the
+    /// five with no call site, and states the BR-9 default.
+    #[test]
+    fn policy_show_marks_the_unreached_categories_and_the_judgment_default() {
+        let mut surface = RecordingSurface::new();
+        render_policy(&migrated_snapshot(), &mut surface);
+        let rendered = surface.lines_of(LineKind::Info).join("\n");
+
+        for unreached in ["redact", "title", "compact", "triage", "shell"] {
+            let line = rendered
+                .lines()
+                .find(|l| l.trim_start().starts_with(unreached))
+                .unwrap_or_else(|| panic!("no row for {unreached}: {rendered}"));
+            assert!(
+                line.contains("declared, no call site yet"),
+                "{unreached} has no call site and must say so: {line}"
+            );
+        }
+        for reached in ["route", "digest", "edit", "design", "debug", "review"] {
+            let line = rendered
+                .lines()
+                .find(|l| l.trim_start().starts_with(reached))
+                .unwrap_or_else(|| panic!("no row for {reached}: {rendered}"));
+            assert!(
+                !line.contains("no call site"),
+                "{reached} is reached and must not be marked: {line}"
+            );
+        }
+
+        // BR-6 / AC-11: the "where did this binding come from" column is the
+        // resolver's `source`, and nothing else.
+        //
+        // The fixture is built so that no other field can stand in for it:
+        // `title` shares a provider with the two pinned rows but is inherited,
+        // and `review` shares a tier *and* a provider with `design` but is an
+        // override. A renderer that recovered the column from the provider id,
+        // the tier, or the reason sentence would mislabel one of those three —
+        // which is the whole failure mode this assertion exists for.
+        for (category, expected) in [
+            ("route", "pinned local, not configurable"),
+            ("redact", "pinned local, not configurable"),
+            ("title", "via its tier"),
+            ("design", "via its tier"),
+            ("review", "per-category override"),
+        ] {
+            let line = rendered
+                .lines()
+                .find(|l| l.trim_start().starts_with(category))
+                .unwrap_or_else(|| panic!("no row for {category}: {rendered}"));
+            assert!(
+                line.contains(expected),
+                "{category} must be labelled `{expected}`: {line}"
+            );
+            for wrong in [
+                "pinned local, not configurable",
+                "via its tier",
+                "per-category override",
+            ] {
+                assert!(
+                    wrong == expected || !line.contains(wrong),
+                    "{category} is labelled `{wrong}` as well as `{expected}`: {line}"
+                );
+            }
+        }
+
+        // AC-12.
+        assert!(rendered.contains("judgment_default"), "{rendered}");
+        assert!(rendered.contains("`edit`"), "{rendered}");
+
+        // The tier table names the fill an unbound tier takes, and `reflex`
+        // differs — the asymmetry a user would otherwise have to infer.
+        assert!(rendered.contains("inherits the local tier"), "{rendered}");
+        assert!(rendered.contains("inherits default_provider"), "{rendered}");
+    }
+
+    /// BR-8: a category that cannot be routed carries the resolver's sentence
+    /// rather than a blank column — and it is a notice, not an info line,
+    /// because it is the answer to "why did my turn fail".
+    #[test]
+    fn policy_show_reports_an_unresolvable_category_with_its_reason() {
+        let mut snapshot = migrated_snapshot();
+        let reason = "No provider is bound to the 'think' tier and the 'design' category has \
+                      no override, so 'design' cannot be routed."
+            .to_owned();
+        for row in &mut snapshot.routing {
+            if row.category == teton_protocol::Category::Design {
+                row.provider_id = None;
+                row.source = BindingSource::Unbound;
+                row.reason.clone_from(&reason);
+            }
+        }
+        let mut surface = RecordingSurface::new();
+        render_policy(&snapshot, &mut surface);
+
+        let notices = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notices.contains("design"), "{notices}");
+        assert!(
+            notices.contains(&reason),
+            "the resolver's sentence must travel verbatim: {notices}"
+        );
+        // And the rest of the table still renders.
+        assert!(surface.any_line_contains(LineKind::Info, "review"));
+    }
+
     /// `--model` is optional *to the parser* (a local provider legitimately has
     /// none — REQ-547 owns that selection) and required for a remote kind by
     /// `run_provider_add`, which rejects it before reading any credential. The
@@ -1656,12 +2047,48 @@ mod tests {
     }
 
     #[test]
-    fn policy_set_parses_phase_provider_and_fallback() {
+    fn policy_set_tier_parses_tier_provider_and_fallback() {
         let cli = parse(&[
             "teton",
             "policy",
-            "set",
-            "implement",
+            "set-tier",
+            "think",
+            "anthropic",
+            "--fallback",
+            "deepseek",
+        ]);
+        match cli.command {
+            Some(Command::Policy {
+                action:
+                    PolicyAction::SetTier {
+                        tier,
+                        provider,
+                        fallback,
+                    },
+            }) => {
+                assert!(matches!(tier, CliTier::Think));
+                assert_eq!(Tier::from(tier), Tier::Think);
+                assert_eq!(provider, "anthropic");
+                assert_eq!(fallback.as_deref(), Some("deepseek"));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        // Every tier is spellable, `reflex` included: never inheriting a remote
+        // default (REQ-557 BR-4) is not the same as never being bindable, and a
+        // user who deliberately puts `reflex` on a fast remote model is making a
+        // choice the config file can already express.
+        for tier in ["reflex", "scan", "build", "think"] {
+            parse(&["teton", "policy", "set-tier", tier, "p"]);
+        }
+    }
+
+    #[test]
+    fn policy_set_category_parses_category_provider_and_fallback() {
+        let cli = parse(&[
+            "teton",
+            "policy",
+            "set-category",
+            "review",
             "deepseek",
             "--fallback",
             "anthropic",
@@ -1669,18 +2096,84 @@ mod tests {
         match cli.command {
             Some(Command::Policy {
                 action:
-                    PolicyAction::Set {
-                        phase,
+                    PolicyAction::SetCategory {
+                        category,
                         provider,
                         fallback,
                     },
             }) => {
-                assert!(matches!(phase, CliPhase::Implement));
-                assert_eq!(Phase::from(phase), Phase::Implement);
+                assert_eq!(category.0, ConfigurableCategory::Review);
                 assert_eq!(provider, "deepseek");
                 assert_eq!(fallback.as_deref(), Some("anthropic"));
             }
             other => panic!("unexpected parse: {other:?}"),
+        }
+        for category in ConfigurableCategory::ALL {
+            parse(&["teton", "policy", "set-category", category.as_str(), "p"]);
+        }
+    }
+
+    /// AC-4 / BR-4 / BR-5: **two** categories are unsettable, and the CLI must
+    /// say *pinned*, not "invalid value".
+    ///
+    /// Asserted for both rather than for `redact` alone (LESSON-479: a subset
+    /// invariant only holds where you iterate), and each must cite its own
+    /// reason — `route` is pinned because a remote classifier costs more than
+    /// the decision saves, which is not `redact`'s reason at all.
+    #[test]
+    fn policy_set_category_rejects_a_pinned_category_by_naming_the_pin() {
+        for pinned in ["redact", "route"] {
+            let err = Cli::try_parse_from(["teton", "policy", "set-category", pinned, "anthropic"])
+                .expect_err("a pinned category cannot be bound")
+                .to_string();
+            assert!(err.contains(pinned), "{pinned}: {err}");
+            assert!(err.contains("pinned"), "{pinned}: {err}");
+            assert!(
+                !err.contains("invalid value") || err.contains("pinned"),
+                "{pinned} reads as a typo: {err}"
+            );
+        }
+        let redact = parse_cli_category("redact").expect_err("pinned");
+        assert!(redact.contains("leave the machine"), "{redact}");
+        let route = parse_cli_category("route").expect_err("pinned");
+        assert!(route.contains("classifier"), "{route}");
+        assert!(
+            !route.contains("leave the machine"),
+            "route inherited redact's explanation: {route}"
+        );
+
+        // And a genuine typo still reads as a typo, listing only bindable names.
+        let typo = parse_cli_category("reviw").expect_err("unknown");
+        assert!(typo.contains("reviw") && typo.contains("review"), "{typo}");
+        assert!(
+            !typo.contains("redact") && !typo.contains("route"),
+            "{typo}"
+        );
+    }
+
+    /// AC-9: the phase form is gone, and says why rather than reading as a typo.
+    #[test]
+    fn the_retired_phase_form_explains_itself() {
+        let cli = parse(&["teton", "policy", "set", "implement", "deepseek"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Policy {
+                action: PolicyAction::Set { .. }
+            })
+        ));
+        assert!(POLICY_SET_RETIRED.contains("set-tier"));
+        assert!(POLICY_SET_RETIRED.contains("set-category"));
+        // It names the reason, not only the replacement: a user still thinking
+        // in lifecycle position needs to stop, not to retype.
+        assert!(POLICY_SET_RETIRED.contains("what a call is *for*"));
+        // And it does not pretend to know which tier their phase became — that
+        // map lives in `teton-core`, and a copy here would be a second one.
+        for phase in ["implement", "architect", "review", "spec", "io"] {
+            assert!(
+                !POLICY_SET_RETIRED.contains(phase),
+                "the retirement notice maps {phase} to a tier; that table is \
+                 `categories_for_phase`'s (ADR-F)"
+            );
         }
     }
 

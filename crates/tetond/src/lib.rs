@@ -22,6 +22,10 @@
 //!   preflight before a byte is fetched, download to a temporary path, verify,
 //!   then an atomic rename into place.
 //! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
+//! - [`call_sites`] — which categories the harness actually dispatches on today
+//!   (REQ-558 ADR-A), and the source-scanning test that keeps the
+//!   `declared, no call site yet` marker from rotting into a hand-maintained
+//!   list.
 //! - [`classify`] — the `route` classifier (REQ-558 BR-3): the one small local
 //!   model call that assigns a *freeform* turn to one of the four judgment
 //!   categories, with a bypass that issues no call at all when the local tier
@@ -48,6 +52,7 @@
 
 pub mod auth;
 pub mod broadcast;
+pub mod call_sites;
 pub mod classify;
 pub mod cost;
 pub mod download;

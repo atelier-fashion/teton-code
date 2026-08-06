@@ -160,8 +160,13 @@ fn ac2_two_remote_providers_complete_sessions() {
         &anthropic.anthropic_endpoint(),
         "claude-opus-4",
     );
-    set_routing(&mut client, "implement", "deepseek", None);
-    set_routing(&mut client, "spec", "anthropic", None);
+    // REQ-558 AC-9: the config surface takes a **tier**, not a phase. An
+    // `implement` turn dispatches on `edit`, which inherits `build`; a `spec`
+    // turn dispatches on `design`, which inherits `think`. The two structured
+    // sessions below still land on the two different providers, but now they get
+    // there through the axis the runtime actually reads.
+    set_tier(&mut client, "build", "deepseek", None);
+    set_tier(&mut client, "think", "anthropic", None);
 
     // Both appear in the config snapshot (registration is durable + visible).
     let snapshot = client.config_get();
@@ -789,10 +794,10 @@ fn register_provider(client: &mut Client, id: &str, kind: &str, endpoint: &str, 
     );
 }
 
-fn set_routing(client: &mut Client, phase: &str, provider: &str, fallback: Option<&str>) {
+fn set_tier(client: &mut Client, tier: &str, provider: &str, fallback: Option<&str>) {
     let mut update = json!({
-        "op": "set_routing_rule",
-        "phase": phase,
+        "op": "set_tier_binding",
+        "tier": tier,
         "provider_id": provider,
     });
     if let Some(fb) = fallback {
@@ -802,7 +807,7 @@ fn set_routing(client: &mut Client, phase: &str, provider: &str, fallback: Optio
     assert_eq!(
         resp["result"]["applied"].as_bool(),
         Some(true),
-        "routing {phase}: {resp}"
+        "binding the {tier} tier: {resp}"
     );
 }
 

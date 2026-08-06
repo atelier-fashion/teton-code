@@ -130,6 +130,40 @@ pub fn to_protocol_tier(tier: CoreTier) -> ProtoTier {
     }
 }
 
+/// Where an **unbound** tier's provider comes from (REQ-557 BR-4).
+///
+/// The distinction exists because it differs per tier and the difference is not
+/// obvious: `reflex` never inherits `default_provider`, because
+/// [`CoreTier::inherits_default_provider`] says so — see
+/// [`Router::inherited_binding`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierOrigin {
+    /// A `[[tiers]]` row the user configured.
+    Configured,
+    /// Unbound; filled from `default_provider`.
+    DefaultProvider,
+    /// Unbound; filled from the local tier.
+    LocalTier,
+    /// Unbound, with nothing to inherit.
+    Unbound,
+}
+
+/// One tier's binding as `teton policy show` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierReport {
+    /// The tier described.
+    pub tier: CoreTier,
+    /// The provider it binds, configured or inherited; `None` when it has
+    /// neither.
+    pub provider_id: Option<String>,
+    /// The configured fallback. An inherited fill carries none — the fill is a
+    /// primary, and inventing a fallback for it would be a synthesized binding
+    /// (BR-8).
+    pub fallback_id: Option<String>,
+    /// Whether that provider was configured or inherited, and from where.
+    pub origin: TierOrigin,
+}
+
 /// A registered provider as the router sees it: the concrete model it bills, its
 /// capability profile (drives BR-6 degradation), and its live health (drives
 /// policy fallback selection).
@@ -391,6 +425,28 @@ impl Router {
             // is made (LESSON-484).
             |id| self.is_usable(id),
         )
+    }
+
+    /// Every category's resolution, for `teton policy show` (ADR-A's table).
+    ///
+    /// The **reporting** surface: it resolves all eleven categories and
+    /// dispatches none of them. That distinction is why it exists as its own
+    /// method rather than as a loop over [`Router::resolution_for`] in the
+    /// snapshot builder — `call_sites`' source scan reads routing calls to
+    /// derive which categories the harness actually reaches, and a loop over
+    /// every category at the reporting surface would either be miscounted as
+    /// eleven call sites or force the scan to special-case a caller. Resolving
+    /// the whole table is the router's own job, stated once, here.
+    ///
+    /// It is defined in terms of [`Router::resolution_for`], so the row a user
+    /// reads for a category and the decision a turn makes for it are the same
+    /// value (BR-6, AC-11).
+    #[must_use]
+    pub fn table_report(&self) -> Vec<CategoryResolution> {
+        CoreCategory::ALL
+            .into_iter()
+            .map(|category| self.resolution_for(category))
+            .collect()
     }
 
     /// The category a freeform judgment turn takes when classification is
@@ -682,12 +738,62 @@ impl Router {
     /// same fill down as real `[[tiers]]` rows and must exclude `reflex` for the
     /// same reason. One fact, one home.
     fn inherited_provider(&self, tier: CoreTier) -> Option<String> {
+        self.inherited_binding(tier).map(|(_, provider)| provider)
+    }
+
+    /// [`Router::inherited_provider`] with *where it came from* attached.
+    ///
+    /// The two exist as one function because `teton policy show` has to report
+    /// the fill, not merely apply it: a user looking at `reflex → local` on a
+    /// machine whose `default_provider` is `anthropic` is owed the reason, and
+    /// the reason is [`CoreTier::inherits_default_provider`]. A second function
+    /// computing the origin by comparing ids against `default_provider` would be
+    /// a restatement of that rule, and would go wrong the first time someone
+    /// sets `default_provider` to the local tier's own id.
+    fn inherited_binding(&self, tier: CoreTier) -> Option<(TierOrigin, String)> {
         if tier.inherits_default_provider() {
-            self.default_provider
-                .clone()
-                .or_else(|| self.table.local_provider_id.clone())
-        } else {
-            self.table.local_provider_id.clone()
+            if let Some(default) = self.default_provider.clone() {
+                return Some((TierOrigin::DefaultProvider, default));
+            }
+        }
+        self.table
+            .local_provider_id
+            .clone()
+            .map(|local| (TierOrigin::LocalTier, local))
+    }
+
+    /// What `tier` is bound to and where that binding came from — the tier half
+    /// of `teton policy show` (ADR-H).
+    ///
+    /// The configured row wins; an unbound tier reports the fill
+    /// [`Router::inherited_binding`] would apply, so the table a user reads is
+    /// the table resolution reads (BR-6). It reports the binding, not a routing
+    /// decision: whether the named provider is healthy and usable is
+    /// `category::resolve`'s answer, and it is given per category in the rows
+    /// below it.
+    #[must_use]
+    pub fn tier_report(&self, tier: CoreTier) -> TierReport {
+        if let Some(binding) = self.table.tier_binding(tier) {
+            return TierReport {
+                tier,
+                provider_id: Some(binding.provider_id.clone()),
+                fallback_id: binding.fallback_id.clone(),
+                origin: TierOrigin::Configured,
+            };
+        }
+        match self.inherited_binding(tier) {
+            Some((origin, provider_id)) => TierReport {
+                tier,
+                provider_id: Some(provider_id),
+                fallback_id: None,
+                origin,
+            },
+            None => TierReport {
+                tier,
+                provider_id: None,
+                fallback_id: None,
+                origin: TierOrigin::Unbound,
+            },
         }
     }
 
@@ -950,6 +1056,7 @@ mod tests {
             tier: CoreTier::Think,
             provider_id: Some("remote".to_owned()),
             fallback_id: None,
+            source: teton_core::category::BindingSource::TierInheritance,
             reason: "a resolution nobody would compute".to_owned(),
             outcome: RouteOutcome::Primary,
         };

@@ -727,6 +727,14 @@ pub struct CategoryResolution {
     /// BUG-155 found three times, where one path screened providers and another
     /// did not.
     pub fallback_id: Option<String>,
+    /// Which row of the configured table supplied the binding.
+    ///
+    /// Carried **structurally** rather than left to be read back out of
+    /// [`Self::reason`], because `teton policy show` has to say whether a
+    /// provider came from a per-category override or from tier inheritance, and
+    /// a surface that recovers that fact by pattern-matching English is a second
+    /// resolver wearing a disguise (BR-6, AC-11).
+    pub source: BindingSource,
     /// Human-readable sentence naming the signal that fired. Always non-empty,
     /// always names the category (BR-8: an unresolvable category names itself).
     pub reason: String,
@@ -787,10 +795,63 @@ where
 
 /// Which row of the table supplied the binding — part of the reason sentence,
 /// because "why here" is as much of the answer as "where".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BindingSource {
+///
+/// Public because it is also a *column* of `teton policy show` (ADR-A's table),
+/// and the alternative — having that surface recover "override or inherited?"
+/// from the reason sentence — is exactly the second answer to a settled question
+/// that BR-6 forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingSource {
+    /// A `[[categories]]` row naming this category.
     Override,
+    /// The `[[tiers]]` row of the category's tier.
     TierInheritance,
+    /// Neither: the category is pinned to the local tier by construction and
+    /// consults no binding at all (`route`, `redact` — BR-4, BR-5, ADR-B).
+    PinnedLocal,
+    /// Neither: nothing is bound, so there was no row to read (BR-8).
+    Unbound,
+}
+
+impl BindingSource {
+    /// The wire/display name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BindingSource::Override => "override",
+            BindingSource::TierInheritance => "tier_inheritance",
+            BindingSource::PinnedLocal => "pinned_local",
+            BindingSource::Unbound => "unbound",
+        }
+    }
+}
+
+impl fmt::Display for BindingSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The two configured rows a *bindable* category can take its provider from.
+///
+/// [`BindingSource`] is this widened by the two legs that return before the row
+/// lookup — the pinned one and the unbound one. Kept as its own private type so
+/// the `via` sentence below matches exhaustively over exactly the cases that can
+/// reach it: with a four-variant match there, two arms would be dead and would
+/// have to invent a sentence for a state that cannot occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Override,
+    Tier,
+}
+
+impl Row {
+    const fn source(self) -> BindingSource {
+        match self {
+            Row::Override => BindingSource::Override,
+            Row::Tier => BindingSource::TierInheritance,
+        }
+    }
 }
 
 /// Resolve `category` to a provider through override → tier → declared error
@@ -852,22 +913,18 @@ where
         .category_override(configurable)
         .map(|o| {
             (
-                BindingSource::Override,
+                Row::Override,
                 o.provider_id.as_str(),
                 o.fallback_id.as_deref(),
             )
         })
         .or_else(|| {
-            table.tier_binding(tier).map(|t| {
-                (
-                    BindingSource::TierInheritance,
-                    t.provider_id.as_str(),
-                    t.fallback_id.as_deref(),
-                )
-            })
+            table
+                .tier_binding(tier)
+                .map(|t| (Row::Tier, t.provider_id.as_str(), t.fallback_id.as_deref()))
         });
 
-    let Some((source, primary, fallback)) = binding else {
+    let Some((row, primary, fallback)) = binding else {
         // BR-8: the category names itself and its unset binding. Nothing is
         // synthesized and no other tier is borrowed from.
         return CategoryResolution {
@@ -875,6 +932,7 @@ where
             tier,
             provider_id: None,
             fallback_id: None,
+            source: BindingSource::Unbound,
             reason: format!(
                 "No provider is bound to the '{tier}' tier and the '{category}' category has no \
                  override, so '{category}' cannot be routed. Bind one with `teton policy set-tier \
@@ -884,9 +942,10 @@ where
         };
     };
 
-    let via = match source {
-        BindingSource::Override => "per its per-category override".to_owned(),
-        BindingSource::TierInheritance => format!("through its '{tier}' tier binding"),
+    let source = row.source();
+    let via = match row {
+        Row::Override => "per its per-category override".to_owned(),
+        Row::Tier => format!("through its '{tier}' tier binding"),
     };
 
     match screen(primary, &health, &usable) {
@@ -895,6 +954,7 @@ where
             tier,
             provider_id: Some(primary.to_owned()),
             fallback_id: usable_fallback(fallback, &health, &usable),
+            source,
             reason: format!(
                 "Routing the '{category}' category to '{primary}' {via}; its tool-calling is \
                  degraded, so the harness will use a reduced profile."
@@ -907,22 +967,29 @@ where
             tier,
             provider_id: Some(primary.to_owned()),
             fallback_id: usable_fallback(fallback, &health, &usable),
+            source,
             reason: format!("Routing the '{category}' category to '{primary}' {via}."),
             outcome: RouteOutcome::Primary,
         },
         Err(rejected) => resolve_fallback(
-            category, tier, primary, rejected, fallback, &health, &usable,
+            category, tier, primary, rejected, source, fallback, &health, &usable,
         ),
     }
 }
 
 /// The fallback leg: the primary was passed over, so try the fallback from the
 /// **same row** and report either the failover or a failure that names both.
+///
+/// `source` travels through unchanged: the fallback comes from the same row as
+/// the primary it belongs to, so failing over does not change *which* row the
+/// binding came from — only which of its two ids served.
+#[allow(clippy::too_many_arguments)]
 fn resolve_fallback<H, U>(
     category: Category,
     tier: Tier,
     primary: &str,
     rejected: Rejection,
+    source: BindingSource,
     fallback: Option<&str>,
     health: &H,
     usable: &U,
@@ -940,6 +1007,7 @@ where
             tier,
             provider_id: None,
             fallback_id: None,
+            source,
             reason: format!(
                 "The '{category}' category resolves to '{primary}', which {why}, and no fallback \
                  provider is configured for it, so '{category}' cannot be routed.{note}"
@@ -955,6 +1023,7 @@ where
             provider_id: Some(fallback.to_owned()),
             // The fallback has itself been used; there is no second one.
             fallback_id: None,
+            source,
             reason: format!(
                 "'{primary}' {why} for the '{category}' category, so it is falling back to \
                  '{fallback}'.{note}"
@@ -966,6 +1035,7 @@ where
             tier,
             provider_id: None,
             fallback_id: None,
+            source,
             reason: format!(
                 "The '{category}' category resolves to '{primary}', which {why}, and its fallback \
                  '{fallback}' {fb_why}, so '{category}' cannot be routed.{note}{fb_note}",
@@ -1035,6 +1105,7 @@ where
             tier,
             provider_id: None,
             fallback_id: None,
+            source: BindingSource::PinnedLocal,
             reason: format!(
                 "The '{category}' category is pinned to the local tier by construction and has no \
                  configuration path, but no local provider is registered, so '{category}' cannot \
@@ -1050,6 +1121,7 @@ where
             tier,
             provider_id: Some(local.to_owned()),
             fallback_id: None,
+            source: BindingSource::PinnedLocal,
             reason: format!(
                 "The '{category}' category is pinned to the local tier by construction, so it \
                  routes to '{local}' regardless of any tier or per-category binding; its \
@@ -1062,6 +1134,7 @@ where
             tier,
             provider_id: Some(local.to_owned()),
             fallback_id: None,
+            source: BindingSource::PinnedLocal,
             reason: format!(
                 "The '{category}' category is pinned to the local tier by construction, so it \
                  routes to '{local}' regardless of any tier or per-category binding."
@@ -1073,6 +1146,7 @@ where
             tier,
             provider_id: None,
             fallback_id: None,
+            source: BindingSource::PinnedLocal,
             reason: format!(
                 "The '{category}' category is pinned to the local tier and '{local}' {why}. It is \
                  never routed to a remote provider — {why_pinned} — so '{category}' cannot be \
@@ -1490,6 +1564,11 @@ mod tests {
             );
             assert_eq!(r.outcome, RouteOutcome::Primary, "{category}");
             assert!(r.outcome.selected_provider(), "{category}");
+            assert_eq!(
+                r.source,
+                expected_source(category, BindingSource::TierInheritance),
+                "{category} came from a tier row and must say so"
+            );
             assert!(!r.reason.is_empty(), "{category}");
             assert!(
                 r.reason.contains(&named(category)),
@@ -1516,6 +1595,11 @@ mod tests {
             );
             assert_eq!(r.tier, category.tier(), "{category}");
             assert_eq!(r.outcome, RouteOutcome::Primary, "{category}");
+            assert_eq!(
+                r.source,
+                expected_source(category, BindingSource::Override),
+                "{category} came from an override and must say so"
+            );
             assert!(
                 r.reason.contains(&named(category)),
                 "{category}: {}",
@@ -1547,9 +1631,65 @@ mod tests {
                 "{category}"
             );
             assert!(!r.outcome.selected_provider(), "{category}");
+            assert_eq!(
+                r.source,
+                expected_source(category, BindingSource::Unbound),
+                "{category} read no row and must say so"
+            );
             assert!(!r.reason.is_empty(), "{category}");
             assert!(r.reason.ends_with('.'), "{category}: {}", r.reason);
         }
+    }
+
+    /// The source a category reports when the table was set up to bind it
+    /// through `configured` — the two pinned ones always report the pin, because
+    /// they read no row at all.
+    fn expected_source(category: Category, configured: BindingSource) -> BindingSource {
+        if category.configurable().is_some() {
+            configured
+        } else {
+            BindingSource::PinnedLocal
+        }
+    }
+
+    /// AC-11: the source names the **row**, so failing over to the fallback in
+    /// that row does not change it.
+    ///
+    /// The fallback comes from the same row as the primary it belongs to, so a
+    /// `policy show` that said `via its tier` before a failover and
+    /// `per-category override` after would be describing a change that did not
+    /// happen. Asserted on the override leg, where the two answers differ.
+    #[test]
+    fn failing_over_within_a_row_does_not_change_which_row_it_was() {
+        let table = tiers_bound_to("tier-provider").with_override(CategoryOverride {
+            name: ConfigurableCategory::Review,
+            provider_id: "down".to_owned(),
+            fallback_id: Some("standby".to_owned()),
+        });
+        let r = resolve(
+            Category::Review,
+            &table,
+            |id| {
+                if id == "down" {
+                    ProviderHealth::Unavailable
+                } else {
+                    ProviderHealth::Healthy
+                }
+            },
+            all_usable,
+        );
+        assert_eq!(r.provider_id.as_deref(), Some("standby"));
+        assert_eq!(r.outcome, RouteOutcome::Fallback);
+        assert_eq!(
+            r.source,
+            BindingSource::Override,
+            "the fallback came out of the override row, so the row is still the override"
+        );
+        assert_eq!(BindingSource::Override.as_str(), "override");
+        assert_eq!(
+            BindingSource::TierInheritance.to_string(),
+            "tier_inheritance"
+        );
     }
 
     #[test]

@@ -1,0 +1,315 @@
+//! Which categories the harness actually dispatches on today (REQ-558 ADR-A).
+//!
+//! REQ-558 declares all eleven categories and resolves all eleven, so the config
+//! schema stabilizes once and the remaining call sites can be tagged later
+//! without a second migration. But five of them have **no model call site at
+//! all**, and a knob that silently does nothing invites a user to tune it —
+//! LESSON-481's shape ("a gate that hides a feature from users also hides it
+//! from the test suite"). So `teton policy show` marks them
+//! `declared, no call site yet`, and this module is where that marker comes from.
+//!
+//! # The marker is only honest because a test derives it
+//!
+//! [`has_call_site`] is an exhaustive match, which makes a *new category*
+//! impossible to add without answering the question. It cannot, on its own, make
+//! a *new call site* impossible to add without updating the answer — and that is
+//! the direction the list actually rots in. The test at the bottom of this file
+//! closes that gap: it reads the daemon's own source, finds every routing call
+//! site, works out which categories reach a router through them, and asserts the
+//! result equals this match. Wire up `triage` and the test fails until the
+//! marker follows.
+//!
+//! That test is the load-bearing half of ADR-A. This match is just where its
+//! answer is written down.
+
+use teton_core::category::Category;
+
+/// Whether any model call in the harness dispatches on `category` today.
+///
+/// Exhaustive on purpose: a twelfth category cannot be added without a decision
+/// here, and the decision is a fact about the daemon's code rather than about
+/// configuration — which is why it lives in `tetond` and not in `teton-core`.
+#[must_use]
+pub const fn has_call_site(category: Category) -> bool {
+    match category {
+        // `DaemonRuntime::classify_freeform` asks the resolver whether `route`
+        // can be served, then `classify::run` makes the call (REQ-558 TASK-053).
+        // The architecture's table listed `route` under "must be built"; it has
+        // been.
+        Category::Route => true,
+        // `summarize_if_large`'s digest duty, routed rather than hardcoded to
+        // the local engine (TASK-054).
+        Category::Digest => true,
+        // Turn completion. All four arrive at the same call, differing only in
+        // what the classifier said (freeform) or what the phase maps to
+        // (structured) — so they are reached together or not at all.
+        Category::Edit | Category::Design | Category::Debug | Category::Review => true,
+        // Declared, unreached. Egress redaction is regex-based and makes no
+        // model call; nothing names sessions or branches; compaction truncates
+        // mechanically; grep/glob hits are returned unranked; and `shell` is
+        // ADR-I's deliberate deferral — you cannot know a turn will emit a shell
+        // call until the model has already answered, and the interpretation half
+        // has no call site either.
+        Category::Redact
+        | Category::Title
+        | Category::Compact
+        | Category::Triage
+        | Category::Shell => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    use teton_core::category::{category_for_phase, JudgmentCategory};
+    use teton_core::Phase;
+
+    /// The `Router` methods that answer "where does this category go".
+    ///
+    /// The source scan below understands calls to exactly these. Asserting the
+    /// set rather than assuming it is what keeps a *fifth* entry point from
+    /// being added and silently going unscanned — at which point the scan would
+    /// keep passing while missing the call site it exists to find, which is the
+    /// same silent rot the hand-maintained list has.
+    const ROUTER_ENTRY_POINTS: [&str; 4] = [
+        "resolve",
+        "resolution_for",
+        "resolve_judgment",
+        // Takes no category: the taint backstop pins the local tier whatever the
+        // table says (BR-7), so it reaches no category through the table and
+        // contributes nothing to the reached set.
+        "resolve_local_pin",
+    ];
+
+    /// The reporting surface, which resolves **every** category and dispatches
+    /// none of them.
+    ///
+    /// Excluded by name, and it must stay excluded: `teton policy show` asks
+    /// about `triage` on every invocation, so counting its calls as call sites
+    /// would mark all eleven reached and make the marker vacuous. It is
+    /// recognized here rather than skipped silently so that the exclusion is a
+    /// stated decision — `Router::table_report` is the only routing call in the
+    /// daemon that is allowed to name no particular category.
+    const REPORTING_ONLY: &str = "table_report";
+
+    /// The three the scan reads a category out of.
+    const CATEGORY_BEARING: [&str; 3] = ["resolve", "resolution_for", "resolve_judgment"];
+
+    fn daemon_src() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("readable source dir") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A file's source with its test modules removed.
+    ///
+    /// Every module in this crate puts `#[cfg(test)]` items last, so truncating
+    /// at the first one is exact today and *conservative* if that ever changes:
+    /// it can only shrink the derived set, which makes the assertion below fail
+    /// loudly rather than pass wrongly.
+    fn production_source(path: &Path) -> String {
+        let text = std::fs::read_to_string(path).expect("readable source file");
+        match text.find("\n#[cfg(test)]") {
+            Some(at) => text[..at].to_owned(),
+            None => text,
+        }
+    }
+
+    /// The argument text of the call whose `(` is at `open`, paren-balanced.
+    fn argument(source: &str, open: usize) -> &str {
+        let bytes = source.as_bytes();
+        let mut depth = 0usize;
+        for (i, b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open + 1..i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parentheses after byte {open}");
+    }
+
+    /// Every `Category::Variant` / `CoreCategory::Variant` named in `expr`.
+    fn categories_named(expr: &str) -> Vec<Category> {
+        let mut found = Vec::new();
+        for (i, _) in expr.match_indices("Category::") {
+            let rest = &expr[i + "Category::".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect();
+            if let Some(c) = Category::ALL
+                .into_iter()
+                .find(|c| c.as_str().eq_ignore_ascii_case(&name))
+            {
+                found.push(c);
+            }
+        }
+        found
+    }
+
+    /// The categories reached through one routing call, or `None` when the
+    /// argument is opaque to a textual scan.
+    fn reached_by(method: &str, arg: &str) -> Option<Vec<Category>> {
+        // A judgment turn dispatches on whatever the classifier returned, and
+        // the classifier's return type is exhaustive — so this call site reaches
+        // all four by construction, no matter what the argument says.
+        if method == "resolve_judgment" {
+            return Some(
+                JudgmentCategory::ALL
+                    .into_iter()
+                    .map(Category::from)
+                    .collect(),
+            );
+        }
+        let mut reached = categories_named(arg);
+        // ADR-C's structured dispatch: `category_for_phase`, the total
+        // phase→**one** category map, over every phase a session can be in.
+        //
+        // Deliberately not its one-to-many sibling `categories_for_phase`, which
+        // is BR-10's *migration* expansion — that one turns `io` into four
+        // categories because one retired knob became several, and using it here
+        // would mark `title`, `compact` and `triage` reached by a call site that
+        // dispatches on `digest` alone.
+        if arg.contains("category_for_phase(") {
+            reached.extend(Phase::ALL.into_iter().map(category_for_phase));
+        }
+        if reached.is_empty() {
+            return None;
+        }
+        Some(reached)
+    }
+
+    /// ADR-A, enforced: the `declared, no call site yet` marker is compared
+    /// against the daemon's actual call sites, not trusted.
+    ///
+    /// This is the test the architecture calls the load-bearing half of ADR-A.
+    /// Wiring up a call site for `triage` — or removing the one for `digest` —
+    /// fails it until [`has_call_site`] is updated to match, which is the
+    /// intended prompt.
+    #[test]
+    fn the_unreached_marker_matches_the_daemons_actual_call_sites() {
+        let mut files = Vec::new();
+        rust_files(&daemon_src(), &mut files);
+        files.sort();
+        assert!(files.len() > 10, "found no daemon sources to scan");
+
+        let mut derived: BTreeSet<&'static str> = BTreeSet::new();
+        let mut opaque: Vec<String> = Vec::new();
+
+        for path in &files {
+            let source = production_source(path);
+            for method in CATEGORY_BEARING {
+                let needle = format!("router.{method}(");
+                for (at, _) in source.match_indices(&needle) {
+                    // `router.resolve(` must not also match `router.resolve_judgment(`
+                    // through its shorter prefix: the `(` is part of the needle,
+                    // so it cannot.
+                    let open = at + needle.len() - 1;
+                    let arg = argument(&source, open);
+                    match reached_by(method, arg) {
+                        Some(categories) => {
+                            derived.extend(categories.into_iter().map(Category::as_str));
+                        }
+                        None => opaque.push(format!(
+                            "{}: router.{method}({arg}) — the scan cannot tell which category \
+                             this dispatches on",
+                            path.display()
+                        )),
+                    }
+                }
+            }
+        }
+
+        assert!(
+            opaque.is_empty(),
+            "a routing call site names its category in a way this scan cannot read, so the \
+             `declared, no call site yet` marker can no longer be derived. Either name the \
+             category literally at the call site or teach `reached_by` the new shape:\n  {}",
+            opaque.join("\n  ")
+        );
+
+        let marked: BTreeSet<&'static str> = Category::ALL
+            .into_iter()
+            .filter(|c| has_call_site(*c))
+            .map(Category::as_str)
+            .collect();
+
+        assert_eq!(
+            derived,
+            marked,
+            "`has_call_site` disagrees with the daemon's own call sites. Categories the code \
+             reaches but the marker calls unreached: {:?}. Categories the marker claims are \
+             reached but nothing calls: {:?}.",
+            derived.difference(&marked).collect::<Vec<_>>(),
+            marked.difference(&derived).collect::<Vec<_>>(),
+        );
+    }
+
+    /// The scan reads three of the router's resolving methods and knows the
+    /// fourth carries no category. A fifth would be unscanned — and unscanned is
+    /// how a derived fact quietly becomes a hand-maintained one again.
+    #[test]
+    fn the_scan_covers_every_router_entry_point() {
+        let source = production_source(&daemon_src().join("router.rs"));
+        let mut declared: BTreeSet<String> = BTreeSet::new();
+        for (at, _) in source.match_indices("pub fn ") {
+            let rest = &source[at + "pub fn ".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.starts_with("resolve")
+                || name.starts_with("resolution")
+                || name == REPORTING_ONLY
+            {
+                declared.insert(name);
+            }
+        }
+        let known: BTreeSet<String> = ROUTER_ENTRY_POINTS
+            .iter()
+            .chain(std::iter::once(&REPORTING_ONLY))
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(
+            declared, known,
+            "the router grew or lost a resolving entry point; \
+             `the_unreached_marker_matches_the_daemons_actual_call_sites` scans for \
+             {CATEGORY_BEARING:?} and will miss anything else"
+        );
+    }
+
+    /// The count is stated once, here, so a reviewer can check it against the
+    /// architecture's table without reading the match.
+    #[test]
+    fn five_categories_are_declared_and_unreached() {
+        let unreached: Vec<&str> = Category::ALL
+            .into_iter()
+            .filter(|c| !has_call_site(*c))
+            .map(Category::as_str)
+            .collect();
+        assert_eq!(
+            unreached,
+            vec!["redact", "title", "compact", "triage", "shell"],
+            "the unreached set changed"
+        );
+    }
+}

@@ -430,6 +430,7 @@ mod tests {
     use super::test_support::CountingEngine;
     use super::*;
 
+    use teton_core::category::BindingSource;
     use teton_core::policy::RouteOutcome;
     use teton_inference::{Completion, EngineError, MockEngine};
 
@@ -462,6 +463,7 @@ mod tests {
             tier: Category::Route.tier(),
             provider_id: Some(provider.to_owned()),
             fallback_id: None,
+            source: BindingSource::PinnedLocal,
             reason: "The 'route' category is pinned to the local tier by construction, so it \
                      routes to 'local' regardless of any tier or per-category binding."
                 .to_owned(),
@@ -476,6 +478,7 @@ mod tests {
             tier: Category::Route.tier(),
             provider_id: None,
             fallback_id: None,
+            source: BindingSource::PinnedLocal,
             reason: "The 'route' category is pinned to the local tier and 'local' is \
                      unavailable. It is never routed to a remote provider — a classifier that \
                      calls a remote model has spent what the routing decision saves — so \

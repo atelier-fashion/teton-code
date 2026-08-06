@@ -91,7 +91,8 @@ use std::time::{Duration, Instant};
 
 use teton_core::boundary::BoundaryMatcher;
 use teton_core::category::{
-    categories_for_phase, category_for_phase, Category, CategoryTable, Tier, TierBinding,
+    category_for_phase, BindingSource as CoreBindingSource, Category, CategoryOverride,
+    CategoryResolution, CategoryTable, ConfigurableCategory, Tier, TierBinding,
 };
 use teton_core::config::{Config, LocalModelConfig, RoutingMigration};
 use teton_core::entities::{
@@ -108,13 +109,15 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 use teton_protocol::events::{ModelLifecycle, ModelLifecycleStage, PrivacyAction};
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    ConfigSnapshot, ConfigUpdate, CostGroupView, CostQueryResult, CostReportView,
-    ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult, ModelSetResult,
-    ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
+    CategoryRouteView, ConfigSnapshot, ConfigUpdate, CostGroupView, CostQueryResult,
+    CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
+    ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
+    TierRouteView,
 };
 use teton_protocol::{
-    Phase as ProtoPhase, PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId,
-    SessionMode,
+    BindingSource, ConfigurableCategory as ProtoConfigurableCategory, Phase as ProtoPhase,
+    PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId, SessionMode,
+    Tier as ProtoTier, TierBindingSource,
 };
 
 use teton_providers::{
@@ -123,6 +126,7 @@ use teton_providers::{
 };
 
 use crate::broadcast::EventBus;
+use crate::call_sites::has_call_site;
 use crate::classify::Classification;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
@@ -141,7 +145,9 @@ use crate::model_consent::{
     list_entries, no_local_engine_reason, probe_view, selection_view, ConsentOutcome,
     ModelConsentGate, NoInstaller, PendingModelDecisions, WeightsInstaller,
 };
-use crate::router::{to_protocol_phase, Router};
+use crate::router::{
+    to_protocol_category, to_protocol_phase, to_protocol_tier, Router, TierOrigin, TierReport,
+};
 use crate::selection_store::SelectionStore;
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
@@ -1203,10 +1209,35 @@ impl DaemonRuntime {
     }
 
     /// A snapshot of the current configuration for `config/get`.
+    ///
+    /// The routing half of the snapshot is **resolved**, not merely echoed: it
+    /// is built by asking the same [`Router`] a turn would ask, with the same
+    /// live provider health, so `teton policy show` reports the decision the
+    /// next turn will actually make (BR-6, AC-11). Echoing the `[[tiers]]` and
+    /// `[[categories]]` rows back would have been less code and a different
+    /// answer — the rows say nothing about an unbound tier's inherited fill, a
+    /// provider that is down, or a remote provider that declares no model.
     #[must_use]
     pub fn config_snapshot(&self) -> ConfigSnapshot {
         let config = self.config.lock().expect("config mutex poisoned");
-        snapshot_from_config(&config)
+        let router = build_router(
+            &config,
+            self.local_tier_available(),
+            &self.health_snapshot(),
+        );
+        snapshot_from_config(&config, &router)
+    }
+
+    /// Each provider's health as routing should see it right now: the persisted
+    /// record, aged through its half-open cooldown (REQ-544 M-5).
+    fn health_snapshot(&self) -> BTreeMap<String, ProviderHealth> {
+        let now = Instant::now();
+        self.provider_health
+            .lock()
+            .expect("provider_health mutex poisoned")
+            .iter()
+            .map(|(id, record)| (id.clone(), record.effective_health(now)))
+            .collect()
     }
 
     /// Apply a `config/set` mutation, validate, and persist it.
@@ -1226,9 +1257,27 @@ impl DaemonRuntime {
     /// far enough to be migrated. **Registering a new one** is a fresh user
     /// action with no legacy to honour, so it fails closed.
     ///
+    /// ## A binding is screened before it is written, not after (REQ-558)
+    ///
+    /// `teton policy set-tier` / `set-category` name a provider, and a provider
+    /// that cannot serve a turn must be refused *here*, with nothing persisted —
+    /// the same shape `provider add` takes when it refuses a duplicate id before
+    /// reading a credential (BUG-155 M4). Two ways to be unservable, and they
+    /// are rejected in different places on purpose:
+    ///
+    /// - **unregistered** — caught by `Config::validate` on the candidate below,
+    ///   which names the provider and lists the registered ids. Nothing is
+    ///   written, because the write happens after validation.
+    /// - **registered but unusable** — a remote provider declaring no `model`
+    ///   (REQ-557 ADR-E). `validate` deliberately *permits* that, because a
+    ///   pre-REQ config full of them still has to load far enough to be
+    ///   migrated. Binding one is a fresh user action with no legacy to honour,
+    ///   so it fails closed here, exactly as registering one does.
+    ///
     /// # Errors
     /// Returns a [`RpcError`] (code `CONFIG_REJECTED`) if the update would
-    /// register a remote provider with no declared model, or if the resulting
+    /// register a remote provider with no declared model, would bind a tier or
+    /// category to a provider that cannot serve a turn, or if the resulting
     /// config fails validation (e.g. a raw key in `auth_ref`, BR-7).
     pub fn apply_config_update(&self, update: ConfigUpdate) -> Result<(), RpcError> {
         if let ConfigUpdate::RegisterProvider(pc) = &update {
@@ -1248,6 +1297,7 @@ impl DaemonRuntime {
             }
         }
         let mut config = self.config.lock().expect("config mutex poisoned");
+        reject_unusable_binding(&config, &update)?;
         let mut candidate = config.clone();
         apply_update(&mut candidate, update);
         candidate
@@ -1325,14 +1375,7 @@ impl DaemonRuntime {
         // UNLESS its half-open cooldown has elapsed, in which case it is offered as
         // Healthy so this turn re-probes it (the recovery path that keeps a single
         // transient failure from stranding a provider daemon-wide until restart).
-        let now = Instant::now();
-        let health_snapshot: BTreeMap<String, ProviderHealth> = self
-            .provider_health
-            .lock()
-            .expect("provider_health mutex poisoned")
-            .iter()
-            .map(|(id, record)| (id.clone(), record.effective_health(now)))
-            .collect();
+        let health_snapshot = self.health_snapshot();
         let router = build_router(
             &config,
             // REQ-547 BR-1/D-3: a tier awaiting a consent decision is withheld
@@ -3508,7 +3551,14 @@ fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBoundary]) ->
 // ---------------------------------------------------------------------------
 
 /// Project a [`Config`] into the protocol [`ConfigSnapshot`] for `config/get`.
-fn snapshot_from_config(config: &Config) -> ConfigSnapshot {
+///
+/// The phase table that used to fill `routing` is gone (AC-9). What replaced it
+/// is not a reverse projection of the category table — that map is one-way
+/// (`design` came from either `spec` or `architect`, and nothing records which)
+/// — but the resolver's own answer for each of the eleven categories, taken from
+/// `router` so that `teton policy show` and `route_decided` are two renderings of
+/// one value rather than two computations of one question (ADR-D, BR-6, AC-11).
+fn snapshot_from_config(config: &Config, router: &Router) -> ConfigSnapshot {
     ConfigSnapshot {
         providers: config
             .providers
@@ -3521,20 +3571,20 @@ fn snapshot_from_config(config: &Config) -> ConfigSnapshot {
                 auth_ref: p.auth_ref.clone(),
             })
             .collect(),
-        // REQ-558 TASK-055: the phase table is retired, and the daemon's own
-        // migration has consumed it by the time any client can call `config/get`
-        // — so there is no phase table left to project. Deliberately empty
-        // rather than reverse-mapping the category table into phase-shaped rows:
-        // that map is one-way (`design` came from either `spec` or `architect`,
-        // and nothing records which), so a reverse projection would have to
-        // invent the missing half.
-        //
-        // This leaves `teton policy show` reporting nothing for one task, which
-        // is TASK-056's to close — it adds the tier and category surface to
-        // `ConfigSnapshot` alongside `policy set-tier` / `set-category`. The
-        // alternative was shipping a `policy show` that shows a table nothing
-        // dispatches on, which is the defect this REQ exists to remove.
-        routing: Vec::new(),
+        tiers: Tier::ALL
+            .into_iter()
+            .map(|tier| tier_route_view(&router.tier_report(tier)))
+            .collect(),
+        routing: router
+            .table_report()
+            .iter()
+            .map(category_route_view)
+            .collect(),
+        // AC-12: the BR-9 default is configuration, so it is readable as
+        // configuration — not only visible in the CLI's rendering of it.
+        judgment_default: Some(to_protocol_category(Category::from(
+            router.judgment_default(),
+        ))),
         privacy: config
             .boundaries
             .iter()
@@ -3544,6 +3594,94 @@ fn snapshot_from_config(config: &Config) -> ConfigSnapshot {
             })
             .collect(),
     }
+}
+
+/// One tier row of the snapshot.
+fn tier_route_view(report: &TierReport) -> TierRouteView {
+    TierRouteView {
+        tier: to_protocol_tier(report.tier),
+        provider_id: report.provider_id.as_deref().map(ProviderId::from),
+        fallback_id: report.fallback_id.as_deref().map(ProviderId::from),
+        source: match report.origin {
+            TierOrigin::Configured => TierBindingSource::Configured,
+            TierOrigin::DefaultProvider => TierBindingSource::DefaultProvider,
+            TierOrigin::LocalTier => TierBindingSource::LocalTier,
+            TierOrigin::Unbound => TierBindingSource::Unbound,
+        },
+    }
+}
+
+/// One category row of the snapshot, read **off** a [`CategoryResolution`].
+///
+/// Every field is copied, none is derived: the provider, the tier, which row the
+/// binding came from, and the sentence all belong to the resolver. The one thing
+/// added here is [`CategoryRouteView::reached`], which is a fact about the
+/// daemon's call sites rather than about routing, and comes from
+/// [`crate::call_sites::has_call_site`] (ADR-A).
+fn category_route_view(resolution: &CategoryResolution) -> CategoryRouteView {
+    CategoryRouteView {
+        category: to_protocol_category(resolution.category),
+        tier: to_protocol_tier(resolution.tier),
+        provider_id: resolution.provider_id.as_deref().map(ProviderId::from),
+        fallback_id: resolution.fallback_id.as_deref().map(ProviderId::from),
+        source: match resolution.source {
+            CoreBindingSource::Override => BindingSource::Override,
+            CoreBindingSource::TierInheritance => BindingSource::TierInheritance,
+            CoreBindingSource::PinnedLocal => BindingSource::PinnedLocal,
+            CoreBindingSource::Unbound => BindingSource::Unbound,
+        },
+        reached: has_call_site(resolution.category),
+        reason: resolution.reason.clone(),
+    }
+}
+
+/// Refuse a tier or category binding that names a provider which cannot serve a
+/// turn — **before** `apply_update` touches even the candidate config.
+///
+/// Only the usability leg lives here; the unregistered leg is
+/// `Config::validate`'s, which already names the provider and lists what *is*
+/// registered. Duplicating that message would be a second sentence for one
+/// condition, and the two would drift.
+///
+/// The local tier is exempt from the model check for the reason `build_router`
+/// gives: its model belongs to the REQ-547 consent flow, not to `[[providers]]`,
+/// so `model = None` there is the normal state rather than an unmigrated one.
+fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(), RpcError> {
+    let (what, ids): (String, Vec<&str>) = match update {
+        ConfigUpdate::SetTierBinding(tb) => (
+            format!("the '{}' tier", tb.tier),
+            std::iter::once(tb.provider_id.0.as_str())
+                .chain(tb.fallback_id.iter().map(|f| f.0.as_str()))
+                .collect(),
+        ),
+        ConfigUpdate::SetCategoryBinding(cb) => (
+            format!("the '{}' category", cb.name),
+            std::iter::once(cb.provider_id.0.as_str())
+                .chain(cb.fallback_id.iter().map(|f| f.0.as_str()))
+                .collect(),
+        ),
+        ConfigUpdate::RegisterProvider(_) | ConfigUpdate::SetPrivacyBoundary(_) => {
+            return Ok(());
+        }
+    };
+
+    for id in ids {
+        let Some(provider) = config.providers.iter().find(|p| p.id == id) else {
+            // Unregistered: `Config::validate` owns this sentence.
+            continue;
+        };
+        if provider.kind.is_remote() && provider.declared_model().is_none() {
+            return Err(RpcError::new(
+                error_code::CONFIG_REJECTED,
+                format!(
+                    "provider '{id}' declares no model, so it cannot serve a turn and \
+                     {what} was not bound to it. Re-register it with \
+                     `teton provider add {id} --model <name>` first. Nothing was changed."
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Apply a single [`ConfigUpdate`] to `config` in place (replace-or-insert).
@@ -3578,39 +3716,36 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
                 config.providers.push(provider);
             }
         }
-        ConfigUpdate::SetRoutingRule(rr) => {
-            // REQ-558 BR-1: the phase table is inert — nothing dispatches on it.
-            // This op is the wire form of the pre-REQ `teton policy set <phase>
-            // <provider>`, and TASK-056 replaces it with tier and category forms.
-            // Until then it must not become a configuration surface that silently
-            // does nothing, because a configuration surface the runtime does not
-            // consult is the exact defect this REQ exists to close. So it writes
-            // the tier bindings the phase's categories inherit, through the SAME
-            // `categories_for_phase` map the BR-10 migration uses (ADR-F) rather
-            // than a second table that could disagree with it.
-            //
-            // One phase can therefore write more than one row — `implement`
-            // expands to `edit` and `shell`, both on `build`; `io` expands across
-            // `scan` and `reflex`. That expansion is BR-10's, stated once.
-            let phase = to_core_phase(rr.phase);
-            let provider_id = rr.provider_id.0;
-            let fallback_id = rr.fallback_id.map(|f| f.0);
-            let mut tiers: Vec<Tier> = categories_for_phase(phase)
-                .iter()
-                .map(|c| c.tier())
-                .collect();
-            tiers.dedup();
-            for tier in tiers {
-                let binding = TierBinding {
-                    tier,
-                    provider_id: provider_id.clone(),
-                    fallback_id: fallback_id.clone(),
-                };
-                if let Some(existing) = config.tiers.iter_mut().find(|t| t.tier == tier) {
-                    *existing = binding;
-                } else {
-                    config.tiers.push(binding);
-                }
+        ConfigUpdate::SetTierBinding(tb) => {
+            // `teton policy set-tier`. One row per tier, replace-or-insert — the
+            // same shape `Config::validate` enforces (a duplicate tier row is a
+            // load error), so this cannot write a config it would then refuse.
+            let binding = TierBinding {
+                tier: to_core_tier(tb.tier),
+                provider_id: tb.provider_id.0,
+                fallback_id: tb.fallback_id.map(|f| f.0),
+            };
+            if let Some(existing) = config.tiers.iter_mut().find(|t| t.tier == binding.tier) {
+                *existing = binding;
+            } else {
+                config.tiers.push(binding);
+            }
+        }
+        ConfigUpdate::SetCategoryBinding(cb) => {
+            // `teton policy set-category`. `redact` and `route` cannot arrive
+            // here: `ConfigurableCategory` has no variant for either, on this
+            // side of the wire or the other (ADR-B). There is deliberately no
+            // guard for them — a guard is a thing a fourth code path can forget,
+            // and this is the fourth code path.
+            let over = CategoryOverride {
+                name: to_core_configurable_category(cb.name),
+                provider_id: cb.provider_id.0,
+                fallback_id: cb.fallback_id.map(|f| f.0),
+            };
+            if let Some(existing) = config.categories.iter_mut().find(|c| c.name == over.name) {
+                *existing = over;
+            } else {
+                config.categories.push(over);
             }
         }
         ConfigUpdate::SetPrivacyBoundary(pb) => {
@@ -3678,8 +3813,11 @@ fn to_core_kind(kind: ProtoProviderKind) -> ProviderKind {
 // `to_proto_phase` went with the snapshot's phase-table projection: the phase
 // table is retired, and it had no other caller. Deleted rather than left behind
 // with an `#[allow(dead_code)]`, per ADR-J — implied dead code is how a deletion
-// ends up owned by nobody. Its inverse survives because `SetRoutingRule` still
-// takes a wire phase in.
+// ends up owned by nobody.
+//
+// `to_core_phase` survives, but its remaining caller is *attribution*, not
+// routing: a structured session names the phase it sits in and the turn records
+// it (BR-11). No config surface takes a wire phase in any more (AC-9).
 
 fn to_core_phase(phase: ProtoPhase) -> CorePhase {
     match phase {
@@ -3688,6 +3826,33 @@ fn to_core_phase(phase: ProtoPhase) -> CorePhase {
         ProtoPhase::Implement => CorePhase::Implement,
         ProtoPhase::Review => CorePhase::Review,
         ProtoPhase::Io => CorePhase::Io,
+    }
+}
+
+fn to_core_tier(tier: ProtoTier) -> Tier {
+    match tier {
+        ProtoTier::Reflex => Tier::Reflex,
+        ProtoTier::Scan => Tier::Scan,
+        ProtoTier::Build => Tier::Build,
+        ProtoTier::Think => Tier::Think,
+    }
+}
+
+/// The wire→core direction for a *bindable* category.
+///
+/// Total in both directions, and that is the whole point: neither enum has a
+/// `redact` or `route` variant, so this conversion cannot be handed one (ADR-B).
+fn to_core_configurable_category(category: ProtoConfigurableCategory) -> ConfigurableCategory {
+    match category {
+        ProtoConfigurableCategory::Title => ConfigurableCategory::Title,
+        ProtoConfigurableCategory::Digest => ConfigurableCategory::Digest,
+        ProtoConfigurableCategory::Compact => ConfigurableCategory::Compact,
+        ProtoConfigurableCategory::Triage => ConfigurableCategory::Triage,
+        ProtoConfigurableCategory::Edit => ConfigurableCategory::Edit,
+        ProtoConfigurableCategory::Shell => ConfigurableCategory::Shell,
+        ProtoConfigurableCategory::Design => ConfigurableCategory::Design,
+        ProtoConfigurableCategory::Debug => ConfigurableCategory::Debug,
+        ProtoConfigurableCategory::Review => ConfigurableCategory::Review,
     }
 }
 
@@ -3721,12 +3886,9 @@ fn env_flag(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use teton_core::category::{CategoryOverride, ConfigurableCategory};
     use teton_core::config::LegacyRoutingRule;
-    // The wire form of the retired phase rule. Test-only: `apply_update`'s
-    // `SetRoutingRule` arm still accepts it (TASK-056 replaces the op), but no
-    // production path in this module names the type any more.
-    use teton_protocol::methods::RoutingRule;
+    use teton_protocol::methods::{CategoryBindingConfig, TierBindingConfig};
+    use teton_protocol::Category as ProtoCategory;
 
     /// A throwaway directory under the system temp dir, unique per test.
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -4273,8 +4435,8 @@ provider_id = "on-device"
         );
         apply_update(
             &mut config,
-            ConfigUpdate::SetRoutingRule(RoutingRule {
-                phase: ProtoPhase::Implement,
+            ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier: ProtoTier::Build,
                 provider_id: ProviderId::from("deepseek"),
                 fallback_id: None,
             }),
@@ -4288,52 +4450,379 @@ provider_id = "on-device"
         );
         config.validate().expect("valid");
 
-        // REQ-558: a `set_routing_rule` op writes the tier bindings the phase's
-        // categories inherit, not a `[[routing]]` row — `implement` expands to
-        // `edit` and `shell`, both on `build`, so one op writes one `build` row.
-        // The phase table it used to write is inert (BR-1), and an op that writes
-        // an inert table is the defect this REQ closes.
         assert_eq!(config.tiers.len(), 1);
         assert_eq!(config.tiers[0].tier, Tier::Build);
         assert_eq!(config.tiers[0].provider_id, "deepseek");
+        // AC-9: no phase-keyed routing row is written by any config op.
         assert!(config.legacy_routing.is_empty());
 
-        let snap = snapshot_from_config(&config);
+        let snap = snapshot_from_config(&config, &router_for_config(&config));
         assert_eq!(snap.providers.len(), 1);
         assert_eq!(snap.providers[0].kind, ProtoProviderKind::OpenaiCompatible);
         assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
     }
 
-    /// The one-to-many half of the same op (BR-10): `io` expands to four
-    /// categories across **two** tiers, so a single rule binds both — and binds
-    /// each exactly once, rather than once per category that inherits it.
-    #[test]
-    fn a_routing_rule_for_a_phase_that_spans_two_tiers_binds_both() {
+    /// A router over `config` with a healthy local tier — what `config/get`
+    /// builds, minus the daemon.
+    fn router_for_config(config: &Config) -> Router {
+        build_router(config, true, &BTreeMap::new())
+    }
+
+    /// A config with one usable remote provider registered.
+    fn config_with_remote(id: &str) -> Config {
         let mut config = Config::default();
         apply_update(
             &mut config,
             ConfigUpdate::RegisterProvider(ProviderConfig {
-                id: ProviderId::from("cheap"),
+                id: ProviderId::from(id),
                 kind: ProtoProviderKind::OpenaiCompatible,
                 endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: None,
             }),
         );
+        config
+    }
+
+    /// One tier op writes exactly one row, and a second op for the same tier
+    /// replaces it rather than duplicating — the shape `Config::validate`
+    /// requires, so `set-tier` cannot write a config the daemon would refuse to
+    /// load.
+    #[test]
+    fn setting_a_tier_twice_replaces_the_row() {
+        let mut config = config_with_remote("cheap");
+        for fallback in [None, Some(ProviderId::from("cheap"))] {
+            apply_update(
+                &mut config,
+                ConfigUpdate::SetTierBinding(TierBindingConfig {
+                    tier: ProtoTier::Scan,
+                    provider_id: ProviderId::from("cheap"),
+                    fallback_id: fallback,
+                }),
+            );
+        }
+        assert_eq!(config.tiers.len(), 1);
+        assert_eq!(config.tiers[0].fallback_id.as_deref(), Some("cheap"));
+        config.validate().expect("one row per tier");
+    }
+
+    /// The same for a per-category override, and it lands in `[[categories]]` —
+    /// not in the tier row it takes precedence over.
+    #[test]
+    fn setting_a_category_writes_an_override_and_leaves_the_tier_alone() {
+        let mut config = config_with_remote("cheap");
         apply_update(
             &mut config,
-            ConfigUpdate::SetRoutingRule(RoutingRule {
-                phase: ProtoPhase::Io,
+            ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier: ProtoTier::Think,
                 provider_id: ProviderId::from("cheap"),
                 fallback_id: None,
             }),
         );
-        let mut bound: Vec<Tier> = config.tiers.iter().map(|t| t.tier).collect();
-        bound.sort_by_key(|t| t.as_str());
-        assert_eq!(bound, vec![Tier::Reflex, Tier::Scan]);
-        config
-            .validate()
-            .expect("one row per tier, so no duplicate");
+        for _ in 0..2 {
+            apply_update(
+                &mut config,
+                ConfigUpdate::SetCategoryBinding(CategoryBindingConfig {
+                    name: ProtoConfigurableCategory::Review,
+                    provider_id: ProviderId::from("cheap"),
+                    fallback_id: None,
+                }),
+            );
+        }
+        assert_eq!(config.categories.len(), 1);
+        assert_eq!(config.categories[0].name, ConfigurableCategory::Review);
+        assert_eq!(config.tiers.len(), 1);
+        config.validate().expect("one row per category");
+
+        // And the resolver reports the override as an override, which is what
+        // `teton policy show` prints — not a re-derivation from the reason.
+        let snap = snapshot_from_config(&config, &router_for_config(&config));
+        let review = snap
+            .routing
+            .iter()
+            .find(|r| r.category == ProtoCategory::Review)
+            .expect("review row");
+        assert_eq!(review.source, BindingSource::Override);
+        let design = snap
+            .routing
+            .iter()
+            .find(|r| r.category == ProtoCategory::Design)
+            .expect("design row");
+        assert_eq!(design.source, BindingSource::TierInheritance);
+    }
+
+    /// The two `ParseCategoryError` types say the same two things, and only this
+    /// crate can see both.
+    ///
+    /// The duplication is deliberate — the CLI depends on `teton-protocol` alone
+    /// and must be able to name the pin — but a duplication nothing checks is
+    /// just a rewording waiting to happen, and the *message* is AC-4's
+    /// acceptance criterion. The protocol's sentence may be shorter (it has no
+    /// config file to tell the user to edit); what it may not do is stop naming
+    /// the category, the pin, or that category's own reason.
+    #[test]
+    fn the_protocol_and_core_pin_sentences_do_not_drift() {
+        use teton_core::category::ParseCategoryError as CoreErr;
+        use teton_protocol::ParseCategoryError as WireErr;
+
+        for (core, wire, own_reason) in [
+            (
+                CoreErr::RedactIsPinned,
+                WireErr::RedactIsPinned,
+                "leave the machine",
+            ),
+            (CoreErr::RouteIsPinned, WireErr::RouteIsPinned, "classifier"),
+        ] {
+            let (core, wire) = (core.to_string(), wire.to_string());
+            for text in [&core, &wire] {
+                assert!(text.contains("pinned"), "{text}");
+                assert!(text.contains(own_reason), "{text}");
+            }
+            // The wire sentence is a prefix of core's, which is what keeps the
+            // two from being independently reworded: core adds "Remove the
+            // entry.", which is advice about a config file the CLI is not
+            // editing.
+            assert!(
+                core.starts_with(wire.trim_end_matches('.')),
+                "the two pin sentences have drifted:\n  core: {core}\n  wire: {wire}"
+            );
+        }
+        // And each names only its own reason.
+        assert!(!WireErr::RouteIsPinned
+            .to_string()
+            .contains("leave the machine"));
+        assert!(!WireErr::RedactIsPinned.to_string().contains("classifier"));
+    }
+
+    /// REQ-557 BR-6 / BUG-155 M4: a binding that names a provider which cannot
+    /// serve a turn is refused, naming it, with nothing persisted.
+    ///
+    /// Both legs, because they fail in different places on purpose: an
+    /// unregistered id is `Config::validate`'s to reject, an unusable one is
+    /// this daemon's — `validate` deliberately permits a modelless provider so a
+    /// pre-REQ config can still load far enough to be migrated.
+    ///
+    /// Driven through [`DaemonRuntime::apply_config_update`] rather than through
+    /// the screen directly, because the screen being *wired in* is half of what
+    /// is being asserted: BUG-155's Critical finding was three config paths that
+    /// each had a check available and none of which called it.
+    #[test]
+    fn binding_a_provider_that_cannot_serve_is_refused_before_anything_is_written() {
+        let mut config = Config::default();
+        apply_update(
+            &mut config,
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("modelless"),
+                kind: ProtoProviderKind::Anthropic,
+                endpoint: Some("https://api.anthropic.com".to_owned()),
+                model: None,
+                auth_ref: None,
+            }),
+        );
+        let before = config.clone();
+
+        // The whole RPC, not just the predicate: a runtime whose config is the
+        // one above, and whose `config_path` is `None` so a leak past the screen
+        // shows up in the in-memory config rather than only on disk.
+        let runtime = DaemonRuntime::minimal();
+        *runtime.config.lock().expect("config") = config.clone();
+        let rejected = runtime
+            .apply_config_update(ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier: ProtoTier::Think,
+                provider_id: ProviderId::from("modelless"),
+                fallback_id: None,
+            }))
+            .expect_err("a provider that cannot serve is not bindable");
+        assert_eq!(rejected.code, error_code::CONFIG_REJECTED);
+        assert!(rejected.message.contains("modelless"), "{rejected:?}");
+        assert_eq!(
+            *runtime.config.lock().expect("config"),
+            before,
+            "the refusal must leave the live config byte-for-byte intact"
+        );
+        // ...and the same RPC accepts a provider that can serve, so the check is
+        // a screen rather than a blanket refusal.
+        let mut usable = before.clone();
+        apply_update(
+            &mut usable,
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("usable"),
+                kind: ProtoProviderKind::Anthropic,
+                endpoint: Some("https://api.anthropic.com".to_owned()),
+                model: Some("claude-opus-5".to_owned()),
+                auth_ref: None,
+            }),
+        );
+        *runtime.config.lock().expect("config") = usable;
+        runtime
+            .apply_config_update(ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier: ProtoTier::Think,
+                provider_id: ProviderId::from("usable"),
+                fallback_id: None,
+            }))
+            .expect("a provider that can serve is bindable");
+        assert_eq!(runtime.config.lock().expect("config").tiers.len(), 1);
+
+        for (update, expect) in [
+            (
+                ConfigUpdate::SetTierBinding(TierBindingConfig {
+                    tier: ProtoTier::Think,
+                    provider_id: ProviderId::from("modelless"),
+                    fallback_id: None,
+                }),
+                "the 'think' tier",
+            ),
+            (
+                ConfigUpdate::SetCategoryBinding(CategoryBindingConfig {
+                    name: ProtoConfigurableCategory::Design,
+                    provider_id: ProviderId::from("modelless"),
+                    fallback_id: None,
+                }),
+                "the 'design' category",
+            ),
+            // The fallback is screened too: it is the id a mid-turn failure
+            // hands the turn to, so a fallback that cannot serve is a failure
+            // deferred rather than avoided.
+            (
+                ConfigUpdate::SetTierBinding(TierBindingConfig {
+                    tier: ProtoTier::Scan,
+                    provider_id: ProviderId::from("modelless"),
+                    fallback_id: Some(ProviderId::from("modelless")),
+                }),
+                "the 'scan' tier",
+            ),
+        ] {
+            let err = reject_unusable_binding(&config, &update).expect_err("must be refused");
+            assert_eq!(err.code, error_code::CONFIG_REJECTED);
+            assert!(err.message.contains("modelless"), "{}", err.message);
+            assert!(err.message.contains(expect), "{}", err.message);
+            assert!(
+                err.message.contains("Nothing was changed"),
+                "{}",
+                err.message
+            );
+        }
+        assert_eq!(config, before, "a refused binding wrote something");
+
+        // The unregistered leg, also through the RPC. It is *not* this screen's
+        // to reject — validation on the candidate stops it, which is why the
+        // sentence naming what is registered is not duplicated here — but the
+        // live config must be untouched either way.
+        *runtime.config.lock().expect("config") = before.clone();
+        let err = runtime
+            .apply_config_update(ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier: ProtoTier::Build,
+                provider_id: ProviderId::from("never-registered"),
+                fallback_id: None,
+            }))
+            .expect_err("an unregistered provider is not bindable");
+        assert_eq!(err.code, error_code::CONFIG_REJECTED);
+        assert!(err.message.contains("never-registered"), "{}", err.message);
+        assert_eq!(
+            *runtime.config.lock().expect("config"),
+            before,
+            "the live config must be untouched"
+        );
+    }
+
+    /// ADR-A + AC-12, on the projection a client actually reads.
+    ///
+    /// The snapshot carries one row per category — all eleven — with the five
+    /// that no model call reaches marked, and the BR-9 judgment default beside
+    /// them. Both are things `teton policy show` renders and nothing else
+    /// computes.
+    #[test]
+    fn the_snapshot_marks_the_unreached_categories_and_the_judgment_default() {
+        let mut config = config_with_remote("cheap");
+        config.default_provider = Some("cheap".to_owned());
+        config.judgment_default = teton_core::category::JudgmentCategory::Debug;
+        let snap = snapshot_from_config(&config, &router_for_config(&config));
+
+        assert_eq!(snap.routing.len(), 11, "every category gets a row");
+        let unreached: Vec<&str> = snap
+            .routing
+            .iter()
+            .filter(|r| !r.reached)
+            .map(|r| r.category.as_str())
+            .collect();
+        assert_eq!(
+            unreached,
+            vec!["redact", "title", "compact", "triage", "shell"],
+            "the marker in the projection must agree with `call_sites::has_call_site`"
+        );
+        for row in &snap.routing {
+            assert_eq!(
+                row.reached,
+                has_call_site(
+                    Category::ALL
+                        .into_iter()
+                        .find(|c| c.as_str() == row.category.as_str())
+                        .expect("category")
+                ),
+                "{} disagrees with the registry",
+                row.category
+            );
+            assert!(!row.reason.is_empty(), "{}", row.category);
+        }
+
+        // AC-12: the declared default is readable as configuration, not only as
+        // a rendered sentence.
+        assert_eq!(snap.judgment_default, Some(ProtoCategory::Debug));
+
+        // The two pinned categories report the pin, whatever the table says.
+        for pinned in [ProtoCategory::Route, ProtoCategory::Redact] {
+            let row = snap
+                .routing
+                .iter()
+                .find(|r| r.category == pinned)
+                .expect("pinned row");
+            assert_eq!(row.source, BindingSource::PinnedLocal, "{pinned}");
+            assert_ne!(
+                row.provider_id.as_ref().map(|p| p.0.as_str()),
+                Some("cheap"),
+                "{pinned} must never resolve to the remote default"
+            );
+        }
+    }
+
+    /// The tier rows report the fill an unbound tier takes, and `reflex` takes a
+    /// different one — `Tier::inherits_default_provider`'s fact, reported rather
+    /// than restated.
+    #[test]
+    fn an_unbound_tier_reports_what_it_inherits_and_reflex_differs() {
+        let mut config = config_with_remote("cheap");
+        config.default_provider = Some("cheap".to_owned());
+        apply_update(
+            &mut config,
+            ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier: ProtoTier::Think,
+                provider_id: ProviderId::from("cheap"),
+                fallback_id: None,
+            }),
+        );
+        let snap = snapshot_from_config(&config, &router_for_config(&config));
+        let row = |tier: ProtoTier| {
+            snap.tiers
+                .iter()
+                .find(|t| t.tier == tier)
+                .unwrap_or_else(|| panic!("{tier} row"))
+        };
+        assert_eq!(snap.tiers.len(), 4);
+        assert_eq!(row(ProtoTier::Think).source, TierBindingSource::Configured);
+        assert_eq!(
+            row(ProtoTier::Scan).source,
+            TierBindingSource::DefaultProvider
+        );
+        assert_eq!(
+            row(ProtoTier::Reflex).source,
+            TierBindingSource::LocalTier,
+            "`reflex` never inherits a remote default (REQ-557 BR-4) — the one \
+             asymmetry this row exists to make visible"
+        );
+        assert_ne!(
+            row(ProtoTier::Reflex).provider_id,
+            row(ProtoTier::Scan).provider_id
+        );
     }
 
     #[test]

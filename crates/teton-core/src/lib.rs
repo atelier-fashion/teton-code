@@ -38,9 +38,9 @@ pub use boundary::{match_boundary, BoundaryError, BoundaryMatcher};
 // unrepresentable (ADR-B) sits next to the match arm that relies on it. They are
 // re-exported here, so `teton_core::TierBinding` is the stable path either way.
 pub use category::{
-    categories_for_phase, category_for_phase, resolve, Category, CategoryOrigin, CategoryOverride,
-    CategoryResolution, CategoryTable, ConfigurableCategory, JudgmentCategory, ParseCategoryError,
-    ParseJudgmentCategoryError, ParseTierError, Tier, TierBinding,
+    categories_for_phase, category_for_phase, resolve, BindingSource, Category, CategoryOrigin,
+    CategoryOverride, CategoryResolution, CategoryTable, ConfigurableCategory, JudgmentCategory,
+    ParseCategoryError, ParseJudgmentCategoryError, ParseTierError, Tier, TierBinding,
 };
 pub use config::{
     Config, ConfigError, LegacyRoutingRule, LoadError, LocalModelConfig, MigratedPhase,
