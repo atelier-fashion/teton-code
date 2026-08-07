@@ -1154,10 +1154,20 @@ fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
         session.contains(TURN_REPLIES[1]),
         "the plain prompt never reached the model; output:\n{session}"
     );
+    // REQ-561 TASK-062: a bare count of routing notices stopped meaning "how
+    // many turns ran" the moment a harness duty could announce one on the same
+    // surface. `title` names the session on its first substantive turn, so the
+    // turn routes and the duty route are counted apart — which is a stronger
+    // statement than the single count was, not a weaker one.
     assert_eq!(
-        session.matches("route [").count(),
+        session.matches("route [edit/build]").count(),
         2,
         "exactly two turns should have been routed; output:\n{session}"
+    );
+    assert_eq!(
+        session.matches("route [title/reflex]").count(),
+        1,
+        "the session is named once, by a duty rather than by a turn; output:\n{session}"
     );
 
     // And neither was treated as a command: no dispatch, no rejection.
@@ -1673,6 +1683,15 @@ fn policy_show_renders_the_daemons_resolved_table() {
     assert!(
         !shell.contains("no call site"),
         "`shell` is wired (REQ-561 TASK-061) and must not carry the marker; row:\n{shell}"
+    );
+    // And `title`, which `DaemonRuntime::title_session` gave a call site in
+    // TASK-062 — the one of the five that belongs to no tool. The field it
+    // populates, `SessionSummary.title`, had been on the wire since the
+    // skeleton and was simply never written to.
+    let title = row(&shown, "title").expect("a `title` row");
+    assert!(
+        !title.contains("no call site"),
+        "`title` is wired (REQ-561 TASK-062) and must not carry the marker; row:\n{title}"
     );
 
     // AC-12: the BR-9 declared default is configuration-visible, and the CLI

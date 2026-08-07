@@ -36,6 +36,13 @@
 //!   firing on every command. The call site is [`tools::ShellTool`]'s
 //!   [`Tool::refine`](tools::Tool::refine). Named `shell_duty` because
 //!   [`tools::shell`] already owns the shorter name.
+//! - [`title`] — what is `title`-specific about the session-naming duty
+//!   (REQ-561): its [`title::TITLE_DUTY`] descriptor, its output contract, its
+//!   prompt builder, and the ADR-11 threshold below which naming a session buys
+//!   nothing. Unlike `triage` and `shell` it is **not** tool-owned — a session is
+//!   named because it is a session — so its call site is the daemon's prompt-turn
+//!   entry point in [`crate::runtime`], guarded once per session by
+//!   [`crate::sessions::SessionRegistry`].
 //! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
@@ -59,6 +66,7 @@ pub mod permissions;
 pub(crate) mod render;
 pub(crate) mod reply;
 pub mod shell_duty;
+pub mod title;
 pub mod tools;
 pub mod triage;
 pub mod turn_loop;
@@ -77,6 +85,7 @@ pub use permissions::{
     PendingPermissions, PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,
 };
 pub use shell_duty::SHELL_DUTY;
+pub use title::TITLE_DUTY;
 pub use tools::{RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome, ToolRegistry};
 pub use triage::TRIAGE_DUTY;
 pub use turn_loop::{

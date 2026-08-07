@@ -43,6 +43,17 @@ It warrants the most adversarial review.
 
 ## Technical Notes
 
+**Before assuming green, check event-shape assertions elsewhere** (ADR-8's
+TASK-062 amendment). Wiring a duty that fires changes what every "a
+`route_decided` naming X means Y" assertion in the suite means. `title` broke two
+such assertions because it fires on every session's first turn; `compact` fires
+under context pressure, so any fixture that crosses the threshold is exposed.
+When one breaks, split the claim so neither half is vacuous — do **not** relax it
+to `>= 1` or delete the discriminating half.
+
+**This duty is NOT tool-owned** — do not use the `Tool::refine` seam (ADR-10),
+which is for `triage`/`shell` only. `compact` hangs off `ContextManager`.
+
 `truncate_to_budget()` at `harness/context.rs:356-369`; called at `:618`. It
 drops oldest blocks while over budget, preserves the system prompt and the most
 recent block, and clamps an oversized single block in place.

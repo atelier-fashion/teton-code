@@ -16,9 +16,9 @@
 //! the direction the list actually rots in. The test at the bottom of this file
 //! closes that gap: it reads the daemon's own source, finds every routing call
 //! site, works out which categories reach a router through them, and asserts the
-//! result equals this match. Wire up `title` and the test fails until the
-//! marker follows — which is exactly how `triage` (REQ-561 TASK-060) and
-//! `shell` (TASK-061) arrived.
+//! result equals this match. Wire up `compact` and the test fails until the
+//! marker follows — which is exactly how `triage` (REQ-561 TASK-060), `shell`
+//! (TASK-061) and `title` (TASK-062) arrived.
 //!
 //! That test is the load-bearing half of ADR-A. This match is just where its
 //! answer is written down.
@@ -59,10 +59,15 @@ pub const fn has_call_site(category: Category) -> bool {
         // category dispatches on **interpreting** the output, which happens after
         // the command has already run and is routable like any other duty.
         Category::Shell => true,
+        // The session's own duty, and the only one of the five that belongs to
+        // no tool: `DaemonRuntime::title_session` names a session from its first
+        // substantive prompt, once for the session's whole life, and publishes
+        // `session_titled` (REQ-561 TASK-062). `SessionSummary.title` was on the
+        // wire long before anything populated it.
+        Category::Title => true,
         // Declared, unreached. Egress redaction is regex-based and makes no
-        // model call; nothing names sessions or branches; and compaction
-        // truncates mechanically.
-        Category::Redact | Category::Title | Category::Compact => false,
+        // model call, and compaction truncates mechanically.
+        Category::Redact | Category::Compact => false,
     }
 }
 
@@ -320,7 +325,7 @@ mod tests {
             .collect();
         assert_eq!(
             unreached,
-            vec!["redact", "title", "compact"],
+            vec!["redact", "compact"],
             "the unreached set changed"
         );
     }

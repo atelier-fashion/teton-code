@@ -1,7 +1,7 @@
 ---
 id: TASK-062
 title: "The title duty — name a session once, and announce it on the wire"
-status: draft
+status: complete
 parent: REQ-561
 created: 2026-08-07
 updated: 2026-08-07

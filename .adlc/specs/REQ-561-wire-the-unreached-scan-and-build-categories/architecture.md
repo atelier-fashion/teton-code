@@ -240,8 +240,27 @@ The decisive evidence was the third failure. `routing_categories::
 a_tainted_session_stays_local_and_the_pre_taint_turn_proves_it_would_not_have`
 is a REQ-544 privacy test whose premise is that a category-less `route_decided`
 naming `local` **is** the taint pin. A resolution-time digest event violates that
-premise. Emit-at-perform leaves the test green untouched — the right outcome
-arrived at for the right reason, not a lucky one.
+premise. Emit-at-perform left the test green untouched at TASK-058.
+
+**Amended at TASK-062.** "Left it green untouched" was true of `digest` and did
+not survive `title`. `title` performs on the **first turn of every session**, so
+it contributes a legitimate local announcement naming its own category before any
+taint occurs — "names `local`" simply stopped being the same set as "is the pin".
+The test's premise needed splitting, into two halves neither of which is vacuous:
+the pin's category-less announcement must really be present (no tier, non-empty
+reason), **and** nothing local may announce the category the pin overrode.
+
+The load-bearing privacy property is unchanged and was re-verified by hand:
+removing the turn's taint pin still turns the test red, and it fails at the
+*captured-route* assertion (line 176 — the post-taint turn reaches `frontier`
+again) before ever reaching the rewritten event-shape checks. The
+`assert_no_boundary_bytes()` claim was not touched at all.
+
+The general point for the duties still to come: **wiring a duty that fires
+unconditionally changes what every event-shape assertion elsewhere means.**
+`triage` and `shell` escaped this only because they do not fire in these
+fixtures. `compact` (TASK-063) fires under context pressure, so check the same
+class of assertion before assuming green.
 
 **On the apparent cost.** Moving emission into the seam was raised as putting "an
 emission concern inside the seam". That is where it belongs: the seam is the one
