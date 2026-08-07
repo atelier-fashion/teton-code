@@ -5,8 +5,13 @@
 //! daemon `try_send`s to each subscriber and never blocks. If a subscriber's
 //! channel is full — a client too slow to drain its stream — that subscription
 //! is evicted on the spot and flagged as lagged; the client's forwarder then
-//! sends it a [`SUBSCRIPTION_LAGGED_METHOD`] notice and closes. A slow client
-//! can thus never buffer unboundedly nor stall the publisher or its peers.
+//! sends it a [`teton_protocol::events::SUBSCRIPTION_LAGGED_METHOD`] notice and
+//! closes. A slow client can thus never buffer unboundedly nor stall the
+//! publisher or its peers.
+//!
+//! The wire vocabulary that notice is built from — the method name and its
+//! [`teton_protocol::jsonrpc::error_code::SUBSCRIPTION_LAGGED`] code — lives in
+//! the protocol crate, where the client reads it from the same declaration.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,17 +24,6 @@ use teton_protocol::SessionId;
 /// Default per-subscriber channel depth. Large enough to absorb normal bursts,
 /// small enough that a truly stuck client is evicted promptly.
 pub const DEFAULT_CAPACITY: usize = 256;
-
-/// Application error code for an evicted (lagged) subscription.
-///
-/// Sits just past the protocol's existing application codes
-/// (`teton_protocol::jsonrpc::error_code`, which end at `-32003`) without
-/// colliding with any of them.
-pub const SUBSCRIPTION_LAGGED_CODE: i64 = -32004;
-
-/// JSON-RPC notification method the daemon sends before dropping a lagged
-/// subscription.
-pub const SUBSCRIPTION_LAGGED_METHOD: &str = "subscription/lagged";
 
 /// One registered subscriber, held by the bus.
 struct SubscriberHandle {
@@ -280,16 +274,8 @@ mod tests {
         assert_eq!(bus.subscriber_count(), 0);
     }
 
-    #[test]
-    fn lagged_code_does_not_collide_with_protocol_error_codes() {
-        use teton_protocol::jsonrpc::error_code;
-        for code in [
-            error_code::UNSUPPORTED_PROTOCOL_VERSION,
-            error_code::UNKNOWN_SESSION,
-            error_code::UNKNOWN_PROVIDER,
-            error_code::CONFIG_REJECTED,
-        ] {
-            assert_ne!(code, SUBSCRIPTION_LAGGED_CODE);
-        }
-    }
+    // The lagged code's non-collision is no longer guarded here. It lives in
+    // `teton_protocol::jsonrpc::error_code` with every other application code,
+    // and `every_application_error_code_is_distinct` there checks the whole set
+    // structurally — including codes added after this comment was written.
 }

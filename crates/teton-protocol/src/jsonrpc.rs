@@ -198,7 +198,15 @@ impl RpcError {
 /// JSON-RPC error codes.
 ///
 /// The standard range (`-32768..=-32000`) is reserved by the JSON-RPC spec;
-/// application errors start at [`SERVER_ERROR_START`] and count downward.
+/// application errors start at [`error_code::SERVER_ERROR_START`] and count
+/// downward.
+///
+/// **Every** application code the protocol uses is declared here, in the one
+/// `application_error_codes!` block below — including codes whose only producer
+/// lives in another crate. One module owning the whole numbering is what makes
+/// a collision impossible rather than merely tested for: a second module
+/// picking "the next free code" can only ever be picking it against a snapshot
+/// of this one.
 pub mod error_code {
     /// Invalid JSON was received (spec-reserved).
     pub const PARSE_ERROR: i64 = -32700;
@@ -215,36 +223,92 @@ pub mod error_code {
     /// implementation-defined server range and count down from here.
     pub const SERVER_ERROR_START: i64 = -32000;
 
-    /// The client and daemon share no compatible protocol version
-    /// (see [`crate::handshake`]).
-    pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32000;
-    /// The referenced session id is unknown to the daemon.
-    pub const UNKNOWN_SESSION: i64 = -32001;
-    /// The referenced provider id is not configured.
-    pub const UNKNOWN_PROVIDER: i64 = -32002;
-    /// A configuration mutation was rejected (e.g. a raw key in `auth_ref`, BR-7).
-    pub const CONFIG_REJECTED: i64 = -32003;
-    /// A turn could not complete because its content is under a `local-only`
-    /// privacy boundary (BR-1) and no local tier was available to serve it after
-    /// the remote egress was blocked (REQ-544 M-1). A specific, content-free
-    /// privacy signal — never a generic `INTERNAL_ERROR`.
-    pub const PRIVACY_BLOCKED: i64 = -32004;
-    /// A turn arrived while the local tier was still coming up — its weights are
-    /// downloading, or they are installed and the daemon is loading and
-    /// benchmarking them — and nothing else could serve it.
-    ///
-    /// Split out of [`UNKNOWN_PROVIDER`] because it is the one unserved-turn
-    /// state that **resolves on its own**: the user has nothing to fix and
-    /// nothing to answer, only to wait. A client renders it as a waiting notice
-    /// rather than as a failure; every other unserved-turn cause — declined,
-    /// unanswered, below the RAM floor, load failed, no loader — needs an action
-    /// and keeps [`UNKNOWN_PROVIDER`].
-    pub const TIER_WARMING: i64 = -32005;
+    /// Declares the application-defined error codes, and derives [`ALL`] from
+    /// the same declarations. The distinctness guard runs over `ALL`, so a code
+    /// added below is covered the moment it is written — there is no second
+    /// list of "codes to check" that can fall behind this one.
+    macro_rules! application_error_codes {
+        ($( $(#[$attr:meta])* $name:ident = $code:literal; )+) => {
+            $( $(#[$attr])* pub const $name: i64 = $code; )+
+
+            /// Every application-defined error code as a `(name, code)` pair,
+            /// generated from the declarations above. Used by the guard test
+            /// that proves no two of them share a number, and available to any
+            /// caller that needs to reason over the whole set.
+            pub const ALL: &[(&str, i64)] = &[$( (stringify!($name), $name) ),+];
+        };
+    }
+
+    application_error_codes! {
+        /// The client and daemon share no compatible protocol version
+        /// (see [`crate::handshake`]).
+        UNSUPPORTED_PROTOCOL_VERSION = -32000;
+        /// The referenced session id is unknown to the daemon.
+        UNKNOWN_SESSION = -32001;
+        /// The referenced provider id is not configured.
+        UNKNOWN_PROVIDER = -32002;
+        /// A configuration mutation was rejected (e.g. a raw key in `auth_ref`, BR-7).
+        CONFIG_REJECTED = -32003;
+        /// A turn could not complete because its content is under a `local-only`
+        /// privacy boundary (BR-1) and no local tier was available to serve it after
+        /// the remote egress was blocked (REQ-544 M-1). A specific, content-free
+        /// privacy signal — never a generic `INTERNAL_ERROR`.
+        PRIVACY_BLOCKED = -32004;
+        /// A turn arrived while the local tier was still coming up — its weights are
+        /// downloading, or they are installed and the daemon is loading and
+        /// benchmarking them — and nothing else could serve it.
+        ///
+        /// Split out of [`UNKNOWN_PROVIDER`] because it is the one unserved-turn
+        /// state that **resolves on its own**: the user has nothing to fix and
+        /// nothing to answer, only to wait. A client renders it as a waiting notice
+        /// rather than as a failure; every other unserved-turn cause — declined,
+        /// unanswered, below the RAM floor, load failed, no loader — needs an action
+        /// and keeps [`UNKNOWN_PROVIDER`].
+        TIER_WARMING = -32005;
+        /// The daemon evicted this client's event subscription because it fell
+        /// too far behind the event stream (`tetond::broadcast`).
+        ///
+        /// Reaches the client as the payload of a `subscription/lagged`
+        /// notification, not as a response error — nothing was requested and so
+        /// nothing failed. It is numbered here anyway: a client that keys off
+        /// the numeric code alone must never confuse an evicted subscription
+        /// with a turn blocked by a privacy boundary.
+        SUBSCRIPTION_LAGGED = -32006;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_application_error_code_is_distinct() {
+        // Structural, not enumerated: it runs over `error_code::ALL`, which the
+        // declaration macro generates from the constants themselves. A code
+        // added later is covered without anyone remembering to extend a list —
+        // a hand-maintained roster of what to check is the same shape of bug as
+        // the collision it is meant to catch.
+        for (i, (name_a, a)) in error_code::ALL.iter().enumerate() {
+            for (name_b, b) in &error_code::ALL[i + 1..] {
+                assert_ne!(a, b, "{name_a} and {name_b} both use code {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_application_error_code_sits_in_the_server_range() {
+        // The JSON-RPC spec reserves -32768..=-32000 and carves out
+        // -32099..=-32000 for implementation-defined server errors. Codes count
+        // down from `SERVER_ERROR_START`; drifting outside that window would
+        // collide with the spec's own vocabulary rather than with a sibling.
+        for (name, code) in error_code::ALL {
+            assert!(
+                (error_code::SERVER_ERROR_START - 99..=error_code::SERVER_ERROR_START)
+                    .contains(code),
+                "{name} ({code}) is outside the implementation-defined server range"
+            );
+        }
+    }
 
     #[test]
     fn jsonrpc_marker_round_trips_and_rejects_other_versions() {
