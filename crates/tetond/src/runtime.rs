@@ -7715,6 +7715,7 @@ provider_id = "on-device"
                 path: "secrets/prod.env".to_owned(),
                 provider_id: ProviderId::from("frontier"),
                 action: teton_protocol::events::PrivacyAction::ReroutedToLocal,
+                cause: teton_protocol::events::BlockCause::Boundary,
             };
 
             crate::egress::PrivacyEventSink::privacy_block(&sink, None, block.clone());

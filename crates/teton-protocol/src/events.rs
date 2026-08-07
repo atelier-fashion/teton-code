@@ -288,12 +288,87 @@ pub struct RouteDecided {
 /// Boundary content would have entered a remote call (spec: `privacy_block`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrivacyBlock {
-    /// Repo-relative path of the boundary-protected content.
+    /// Where the blocked content lives: a repo-relative path for a boundary
+    /// block, and for any other cause a non-secret locus naming the same thing
+    /// (the offending bytes are never the value here — BR-6).
     pub path: String,
     /// Provider the content would have reached.
     pub provider_id: ProviderId,
     /// What the daemon did instead.
     pub action: PrivacyAction,
+    /// Which inspection refused the payload.
+    ///
+    /// `#[serde(default)]` with [`BlockCause::Boundary`] as the default is the
+    /// compatibility posture (REQ-562 ADR-7): every block a build predating this
+    /// field could emit *was* a boundary block, so the default is the historical
+    /// fact rather than a filler value. A frame carrying no `cause` key
+    /// therefore reads correctly here, and a build that has never heard of
+    /// `cause` ignores the key serde does not require it to know — which is why
+    /// this addition does not move [`crate::PROTOCOL_VERSION`] the way REQ-558's
+    /// `ConfigSnapshot` re-typing did.
+    #[serde(default)]
+    pub cause: BlockCause,
+}
+
+/// Which inspection inside the egress choke point refused the payload.
+///
+/// The three are different problems with different fixes, so they are different
+/// values rather than three readings of one sentence: content crossed a declared
+/// boundary, the redaction scan found something, or the redaction scan could not
+/// run at all (REQ-562 BR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "cause", rename_all = "snake_case")]
+pub enum BlockCause {
+    /// Provenance intersected a declared privacy boundary — the block REQ-544
+    /// shipped, and the reading every `cause`-less frame gets.
+    #[default]
+    Boundary,
+    /// The redaction scan (REQ-562) found something in the outbound payload.
+    ///
+    /// Kind and span, and deliberately nothing else: a variant with a field able
+    /// to hold the matched text is a variant that will eventually hold it, and a
+    /// secret detector that echoes the secret has moved it rather than caught it
+    /// (BR-6). The report is actionable from `path` + `kind` + `span` alone.
+    Redaction {
+        /// What the finding looked like.
+        kind: FindingKind,
+        /// Byte range within the outbound payload.
+        span: ByteSpan,
+    },
+    /// The redaction scan **could not run** — no local tier able to serve it, a
+    /// payload past the input cap, an engine error, or a deadline — and the
+    /// payload was blocked unscanned (BR-3, fail closed). This says nothing
+    /// about what the payload contains, because nothing looked.
+    ScanUnavailable,
+}
+
+/// What a redaction finding looked like (REQ-562 System Model: `Finding.kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// A secret: a key, token, or other value whose whole purpose is to be
+    /// unguessable.
+    Secret,
+    /// A credential: a username/password pair, an authorization header, a
+    /// connection string.
+    Credential,
+    /// Personally identifying information.
+    Pii,
+    /// Sensitive-looking, and the classifier declined to say more. Fail-closed
+    /// vocabulary: unclassified is a report, not a pass.
+    Unknown,
+}
+
+/// A half-open byte range `[start, end)` within the outbound payload.
+///
+/// Offsets only — locating a finding is what this carries, and quoting it is
+/// what it structurally cannot (BR-6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteSpan {
+    /// First byte of the finding.
+    pub start: u64,
+    /// One past the last byte of the finding.
+    pub end: u64,
 }
 
 /// The action the egress choke point took on a would-be boundary violation.
@@ -913,6 +988,7 @@ mod tests {
                     path: "secret.txt".to_owned(),
                     provider_id: ProviderId::from("p"),
                     action: PrivacyAction::Stripped,
+                    cause: BlockCause::Boundary,
                 }),
                 "privacy_block",
             ),
@@ -1137,7 +1213,137 @@ mod tests {
             path: "secrets/prod.env".to_owned(),
             provider_id: ProviderId::from("anthropic"),
             action: PrivacyAction::ReroutedToLocal,
+            cause: BlockCause::Boundary,
         });
+    }
+
+    /// A frame emitted before REQ-562 carries no `cause` key at all. It must
+    /// read as the block it actually was — a boundary block — rather than
+    /// failing the envelope, which is the whole claim `#[serde(default)]` makes
+    /// and therefore the thing to assert rather than comment (LESSON-486).
+    #[test]
+    fn a_privacy_block_with_no_cause_key_reads_as_a_boundary_block() {
+        let block: PrivacyBlock = serde_json::from_str(
+            r#"{"path":"secrets/prod.env","provider_id":"anthropic",
+                "action":"rerouted_to_local"}"#,
+        )
+        .unwrap();
+        assert_eq!(block.cause, BlockCause::Boundary);
+        assert_eq!(block.path, "secrets/prod.env");
+        assert_eq!(block.action, PrivacyAction::ReroutedToLocal);
+
+        // Non-vacuity: the default is not swallowing a `cause` that *is* present.
+        let scanned: PrivacyBlock = serde_json::from_str(
+            r#"{"path":"outbound payload","provider_id":"anthropic",
+                "action":"rerouted_to_local","cause":{"cause":"scan_unavailable"}}"#,
+        )
+        .unwrap();
+        assert_eq!(scanned.cause, BlockCause::ScanUnavailable);
+    }
+
+    /// The other direction of the same compatibility claim: a build that has
+    /// never heard of `cause` still reads a frame that carries one. Serde
+    /// ignores unknown fields by default and no type here opts out, but the
+    /// posture is what keeps `PROTOCOL_VERSION` still, so it is asserted rather
+    /// than assumed — modelled by the pre-REQ-562 shape of the struct.
+    #[test]
+    fn a_client_predating_the_cause_field_still_reads_a_frame_that_carries_one() {
+        #[derive(Deserialize)]
+        struct PreCausePrivacyBlock {
+            path: String,
+            action: PrivacyAction,
+        }
+
+        let wire = serde_json::to_string(&PrivacyBlock {
+            path: "outbound payload, bytes 1400-1436".to_owned(),
+            provider_id: ProviderId::from("anthropic"),
+            action: PrivacyAction::ReroutedToLocal,
+            cause: BlockCause::Redaction {
+                kind: FindingKind::Credential,
+                span: ByteSpan {
+                    start: 1400,
+                    end: 1436,
+                },
+            },
+        })
+        .unwrap();
+
+        let old: PreCausePrivacyBlock = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.path, "outbound payload, bytes 1400-1436");
+        assert_eq!(old.action, PrivacyAction::ReroutedToLocal);
+    }
+
+    #[test]
+    fn the_three_block_causes_round_trip_and_serialize_distinctly() {
+        let causes = [
+            BlockCause::Boundary,
+            BlockCause::Redaction {
+                kind: FindingKind::Secret,
+                span: ByteSpan {
+                    start: 1400,
+                    end: 1436,
+                },
+            },
+            BlockCause::ScanUnavailable,
+        ];
+        for cause in causes {
+            round_trip(&PrivacyBlock {
+                path: "secrets/prod.env".to_owned(),
+                provider_id: ProviderId::from("anthropic"),
+                action: PrivacyAction::ReroutedToLocal,
+                cause,
+            });
+        }
+
+        let tags: Vec<String> = causes
+            .iter()
+            .map(|cause| {
+                let wire: serde_json::Value =
+                    serde_json::from_str(&serde_json::to_string(cause).unwrap()).unwrap();
+                wire["cause"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(tags, ["boundary", "redaction", "scan_unavailable"]);
+    }
+
+    /// BR-6 at the protocol layer: a redaction cause can carry a locator and
+    /// nothing else. The key set is asserted exhaustively, so a later field able
+    /// to hold the matched text turns this red instead of shipping quietly.
+    #[test]
+    fn a_redaction_cause_carries_only_a_kind_and_a_span() {
+        let wire: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&BlockCause::Redaction {
+                kind: FindingKind::Pii,
+                span: ByteSpan { start: 0, end: 12 },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut keys: Vec<&str> = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["cause", "kind", "span"]);
+        assert_eq!(wire["kind"], "pii");
+        assert_eq!(wire["span"]["start"], 0);
+        assert_eq!(wire["span"]["end"], 12);
+    }
+
+    #[test]
+    fn every_finding_kind_round_trips_through_its_wire_name() {
+        for (kind, name) in [
+            (FindingKind::Secret, "secret"),
+            (FindingKind::Credential, "credential"),
+            (FindingKind::Pii, "pii"),
+            (FindingKind::Unknown, "unknown"),
+        ] {
+            round_trip(&kind);
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+        }
     }
 
     #[test]

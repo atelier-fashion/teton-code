@@ -87,7 +87,7 @@ use futures::StreamExt;
 
 use teton_core::boundary::BoundaryMatcher;
 use teton_core::entities::PrivacyBoundary;
-use teton_protocol::events::{Event, PrivacyAction, PrivacyBlock};
+use teton_protocol::events::{BlockCause, Event, PrivacyAction, PrivacyBlock};
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
     ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
@@ -306,6 +306,12 @@ impl<T: Transport> Egress<T> {
                     path: violation.path.clone(),
                     provider_id: ctx.provider_id.clone(),
                     action: violation.action,
+                    // Named rather than defaulted: the provenance inspection is
+                    // one of several things that can refuse a payload here
+                    // (REQ-562 ADR-7), and this is the one that says *boundary*.
+                    // `#[serde(default)]` exists for frames a v1 daemon wrote,
+                    // not as a way for this emit site to leave the cause unsaid.
+                    cause: BlockCause::Boundary,
                 };
                 self.sink.privacy_block(ctx.session_id.clone(), block);
                 return Err(EgressError::PrivacyBlocked {

@@ -26,9 +26,10 @@
 use std::collections::{HashMap, HashSet};
 
 use teton_protocol::events::{
-    DaemonClientAttach, Event, EventEnvelope, FailureClass, ModelLifecycle, ModelSelectionProposed,
-    PermissionOption, PermissionOptionKind, PermissionRequest, PhaseTransition, PrivacyAction,
-    PrivacyBlock, ProviderDegraded, RouteDecided, SessionUpdatePayload, ToolCallStatus,
+    BlockCause, DaemonClientAttach, Event, EventEnvelope, FailureClass, FindingKind,
+    ModelLifecycle, ModelSelectionProposed, PermissionOption, PermissionOptionKind,
+    PermissionRequest, PhaseTransition, PrivacyAction, PrivacyBlock, ProviderDegraded,
+    RouteDecided, SessionUpdatePayload, ToolCallStatus,
 };
 use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
 use teton_protocol::{Phase, RequestId};
@@ -447,15 +448,48 @@ fn format_route(rd: &RouteDecided) -> String {
     format!("route [{key}] → {} {model} — {}", rd.provider_id, rd.reason)
 }
 
+/// Renders a block as the sentence its cause earns.
+///
+/// The three causes are three different problems with three different fixes, so
+/// they get three different sentences (REQ-562 BR-3). Two rules hold across all
+/// of them: nothing here interpolates payload content — `path`, `kind` and
+/// `span` are the whole vocabulary, and there is no matched text on the event to
+/// print even if a line wanted to (BR-6) — and the scan-unavailable line says
+/// the scan could not run, never that it found something.
 fn format_privacy(pb: &PrivacyBlock) -> String {
     let action = match pb.action {
         PrivacyAction::Stripped => "stripped from the outbound payload",
         PrivacyAction::ReroutedToLocal => "call re-routed to the local tier",
     };
-    format!(
-        "privacy: {} would have reached {} — {action}",
-        pb.path, pb.provider_id
-    )
+    match &pb.cause {
+        BlockCause::Boundary => format!(
+            "privacy: {} would have reached {} — {action}",
+            pb.path, pb.provider_id
+        ),
+        BlockCause::Redaction { kind, span } => format!(
+            "privacy: the redaction scan detected {} at bytes {}–{} of {}, bound for {} — {action}",
+            finding_kind_label(*kind),
+            span.start,
+            span.end,
+            pb.path,
+            pb.provider_id
+        ),
+        BlockCause::ScanUnavailable => format!(
+            "privacy: the redaction scan could not run on {}, bound for {} — blocked unscanned; {action}",
+            pb.path, pb.provider_id
+        ),
+    }
+}
+
+/// The user-facing noun for a finding kind. The wording lives at the surface,
+/// like every other sentence the CLI prints; `teton-protocol` carries the value.
+fn finding_kind_label(kind: FindingKind) -> &'static str {
+    match kind {
+        FindingKind::Secret => "a secret",
+        FindingKind::Credential => "a credential",
+        FindingKind::Pii => "personal information",
+        FindingKind::Unknown => "a sensitive-looking string",
+    }
 }
 
 fn format_degraded(pd: &ProviderDegraded) -> String {
@@ -501,7 +535,7 @@ mod tests {
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
     use teton_protocol::events::{
-        CostRecord, CostRecorded, ModelSelectionDecided, PlanEntry, PlanEntryStatus,
+        ByteSpan, CostRecord, CostRecorded, ModelSelectionDecided, PlanEntry, PlanEntryStatus,
         SelectionSource, SessionUpdate,
     };
     use teton_protocol::{ProviderId, RequestId, SessionId};
@@ -622,6 +656,7 @@ mod tests {
                 path: "secrets/prod.env".to_owned(),
                 provider_id: ProviderId::from("anthropic"),
                 action: PrivacyAction::ReroutedToLocal,
+                cause: BlockCause::Boundary,
             }),
             Event::ProviderDegraded(ProviderDegraded {
                 provider_id: ProviderId::from("flaky"),
@@ -639,6 +674,74 @@ mod tests {
         assert!(surface.any_line_contains(LineKind::Notice, "re-routed to the local tier"));
         assert!(surface.any_line_contains(LineKind::Notice, "degraded: flaky"));
         assert!(surface.any_line_contains(LineKind::Notice, "fell back to anthropic"));
+    }
+
+    /// The three causes reach the terminal as three different sentences, and the
+    /// scan-unavailable one is the sentence BR-3 is actually about: a guard that
+    /// could not run is a different problem from a guard that fired, with a
+    /// different fix, so the line may not read as a finding.
+    #[test]
+    fn the_three_block_causes_render_as_three_distinguishable_lines() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        let events = [
+            Event::PrivacyBlock(PrivacyBlock {
+                path: "secrets/prod.env".to_owned(),
+                provider_id: ProviderId::from("anthropic"),
+                action: PrivacyAction::ReroutedToLocal,
+                cause: BlockCause::Boundary,
+            }),
+            Event::PrivacyBlock(PrivacyBlock {
+                path: "the outbound payload".to_owned(),
+                provider_id: ProviderId::from("anthropic"),
+                action: PrivacyAction::ReroutedToLocal,
+                cause: BlockCause::Redaction {
+                    kind: FindingKind::Credential,
+                    span: ByteSpan {
+                        start: 1400,
+                        end: 1436,
+                    },
+                },
+            }),
+            Event::PrivacyBlock(PrivacyBlock {
+                path: "the outbound payload".to_owned(),
+                provider_id: ProviderId::from("anthropic"),
+                action: PrivacyAction::ReroutedToLocal,
+                cause: BlockCause::ScanUnavailable,
+            }),
+        ];
+        for event in events {
+            render_event(&envelope(event), &mut surface, &mut state);
+        }
+
+        let lines = surface.lines_of(LineKind::Notice);
+        assert_eq!(lines.len(), 3, "one notice per block: {lines:?}");
+        let unique: HashSet<&str> = lines.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "the causes must not share a line: {lines:?}"
+        );
+
+        let (boundary, redaction, unavailable) = (lines[0], lines[1], lines[2]);
+
+        // Boundary keeps the sentence it has always had.
+        assert!(boundary.contains("secrets/prod.env would have reached anthropic"));
+
+        // A redaction block reports kind and byte span — the whole vocabulary it
+        // has, because there is no matched text on the event to print (BR-6).
+        assert!(redaction.contains("detected a credential"), "{redaction}");
+        assert!(redaction.contains("bytes 1400–1436"), "{redaction}");
+
+        // And the unavailable line says the scan could not run, without ever
+        // claiming something was detected.
+        assert!(unavailable.contains("could not run"), "{unavailable}");
+        assert!(unavailable.contains("unscanned"), "{unavailable}");
+        assert!(
+            !unavailable.contains("detected"),
+            "a scan that never ran cannot have detected anything: {unavailable}"
+        );
     }
 
     #[test]
@@ -659,6 +762,7 @@ mod tests {
                 path: "secrets/prod.env".to_owned(),
                 provider_id: ProviderId::from("anthropic"),
                 action: PrivacyAction::ReroutedToLocal,
+                cause: BlockCause::Boundary,
             }),
             Event::ProviderDegraded(ProviderDegraded {
                 provider_id: ProviderId::from("flaky"),
