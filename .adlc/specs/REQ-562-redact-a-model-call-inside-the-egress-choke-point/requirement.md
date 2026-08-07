@@ -77,14 +77,21 @@ No new RPCs.
       locality guard here would be LESSON-484's error — enforcing a rule where it is
       convenient rather than where the decision is made — and LESSON-443's, since
       such a guard would be predicated on the absence of a binding that cannot exist.
-- [ ] BR-3: **A redactor that cannot run FAILS CLOSED or is DECLARED OFF — never
-      silently permissive.** The two acceptable postures, and the choice is OQ-1:
-      (a) no local tier ⇒ the payload is blocked; (b) no local tier ⇒ redaction is
-      **reported as not performed** and egress proceeds on provenance alone. What is
-      forbidden is proceeding while implying the content was scanned. `scanned:
-      false` exists to make that impossible to fudge.
+- [ ] BR-3: **A redactor that cannot run FAILS CLOSED** (OQ-1, resolved). With
+      `redact` enabled and no local tier able to serve it, the payload is
+      **blocked** — a guard that cannot run does not become a guard that passes
+      everything. `scanned: false` still rides on the report so the *reason* is
+      legible: the user is told the scan could not run, not that it found
+      something, and those are different problems with different fixes.
+
+      This is affordable only because of OQ-3: nobody who has not opted in is
+      affected, so the first-run and weights-still-downloading regressions REQ-547
+      and BUG-152 guarded against do not apply.
 - [ ] BR-4: **A high-confidence finding blocks; a low-confidence finding is the
-      user's call.** Blocking on every low-confidence hit makes the feature
+      user's call** — and confidence is **derived, not self-reported** (OQ-2,
+      resolved): a deterministic pattern hit is high-confidence by construction, a
+      model-only hit is low. The alternative was trusting a 3B model's own estimate
+      of its certainty, which is the least trustworthy thing in the pipeline. Blocking on every low-confidence hit makes the feature
       unusable and trains users to disable it; blocking on none makes it decorative.
       The action per confidence level is a stated rule, not an emergent one.
 - [ ] BR-5: **`redact` never rewrites the payload in v1.** It blocks or it passes.
@@ -218,7 +225,8 @@ No new RPCs.
 
 ## Open Questions
 
-- [ ] OQ-1: **BR-3's posture — block or proceed-and-report when the redactor cannot
+- [x] OQ-1: **RESOLVED 2026-08-07 — FAIL CLOSED.** If the scan cannot run, the
+      payload does not go. *(Original framing follows.)* **BR-3's posture — block or proceed-and-report when the redactor cannot
       run?** Fail-closed is the safer default and matches REQ-544 C-1's treatment of
       unknown provenance. Its cost was that a remote-only machine, or one whose
       weights are still downloading, could make no remote call at all — which
@@ -227,10 +235,12 @@ No new RPCs.
       **OQ-3's resolution largely settles this.** With `redact` opt-in, a user who
       turns it on has accepted that it gates remote calls, and the first-run
       regression disappears — nobody who has not opted in is affected. The
-      recommendation is therefore **fail closed**: if the scan cannot run, the
-      payload does not go. Left formally open only because it is the REQ's central
-      safety posture and deserves an explicit yes rather than an inherited one.
-- [ ] OQ-2: Model-only, or model plus a deterministic pattern pass (the
+      recommendation was therefore fail closed, and that is the decision: a
+      redactor that cannot run does not become a redactor that passes everything.
+      BR-3's `scanned: false` still exists so the *reason* is legible — a blocked
+      payload says the scan could not run, not that it found something.
+- [x] OQ-2: **RESOLVED 2026-08-07 — BOTH.** Model plus a deterministic pattern
+      pass. *(Original framing and rationale follow.)* Model-only, or model plus a deterministic pattern pass (the
       `sk-`/`AKIA`/`ghp_`/`Bearer`/`*_API_KEY=` shapes already used in the delegate
       redaction chain)?
 
@@ -289,10 +299,13 @@ No new RPCs.
       trains people to disable it. That is an argument for getting OQ-2 right
       (patterns keep precision high) rather than for building an override.
 
-      **This recommendation is contingent on OQ-2 going the "both" way.** If v1
-      ships model-only, false positives get likelier, the all-or-nothing hatch gets
-      pulled more often, and the override question sharpens — at which point
-      sequencing behind REQ-560 becomes the right call after all.
+      **The contingency is discharged (2026-08-07).** OQ-2 resolved to "both", so
+      the pattern pass keeps precision high, false positives stay rare, and the
+      all-or-nothing hatch should be pulled rarely. The recommendation therefore
+      stands and **REQ-562 does not sequence behind REQ-560**. If dogfooding shows
+      false positives are common anyway, that is the signal to revisit — the
+      trigger to watch is users disabling `redact` after a block, not the raw
+      false-positive count.
 
 ## Out of Scope
 
