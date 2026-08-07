@@ -70,6 +70,20 @@ impl Engine for ScriptedEngine {
         // whole subject of `a_failing_verify_after_an_edit_does_not_satisfy_the_gate`
         // — is exactly what it fires on. Recognized by its own output contract
         // and answered off-script, consuming no reply and no count.
+        // The fifth duty, `compact`, does **not** reach here today: these
+        // fixtures' contexts stay far under the soft pressure threshold, so it
+        // declines without a model call (verified by making this assertion fire
+        // and watching it not). It gets an assertion rather than an answer,
+        // because inventing a compaction for a fixture that never needed one
+        // would rewrite that fixture's history for no reason — while a fixture
+        // that GREW past the threshold and silently ate a scripted block is the
+        // desync BR-10 exists to prevent. So the day one does, this says so.
+        assert!(
+            !prompt.contains(tetond::harness::compact::COMPACT_OUTPUT_CONTRACT),
+            "a fixture here now crosses the compaction threshold, so the `compact` duty \
+             reaches this stand-in engine — give it an arm of its own before it eats a \
+             scripted reply block (REQ-561 BR-10)"
+        );
         let text = if prompt.contains(SHELL_OUTPUT_CONTRACT) {
             "The command exited non-zero, so the change is not verified.".to_owned()
         } else {

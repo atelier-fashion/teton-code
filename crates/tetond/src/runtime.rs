@@ -139,7 +139,7 @@ use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolDuties,
-    ToolRegistry, DIGEST_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
+    ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -246,6 +246,26 @@ const SCRIPTED_SHELL_INTERPRETATION: &str = "[scripted interpretation of the com
 /// rather than an empty string that looks like a bug.
 const SCRIPTED_TITLE: &str = "Scripted session";
 
+/// The stand-in engine's answer to a `compact` duty: **forget the oldest block**
+/// (REQ-561 BR-10).
+///
+/// The most conservative valid answer available, and a fixed one for the reason
+/// [`SCRIPTED_DIGEST`] is fixed. A stand-in cannot judge what a conversation
+/// still needs, so inventing a forget-set would make a fixture's meaning depend
+/// on a judgement no fixture author wrote; answering with nothing usable would
+/// make every pressured scripted session report a `compact` failure. "The oldest
+/// block" is what
+/// [`truncate_to_budget`](crate::harness::context::ContextManager::truncate_to_budget)
+/// would have dropped anyway, so a scripted session under context pressure ends
+/// up with the conversation it would have had before this REQ — plus one legible
+/// marker saying a compaction ran.
+///
+/// Block 1 is always offered and always droppable when this is reached:
+/// [`COMPACT_MIN_BLOCKS`](crate::harness::compact::COMPACT_MIN_BLOCKS) guarantees
+/// at least two blocks before the protected one.
+const SCRIPTED_COMPACTION: &str =
+    "FORGET: 1\nSUMMARY: [scripted compaction of the earlier conversation]";
+
 /// A local [`Engine`] that replays a fixed script of replies, one per turn.
 ///
 /// This is the CI/offline stand-in for a real llama.cpp engine: the daemon ships
@@ -260,8 +280,9 @@ const SCRIPTED_TITLE: &str = "Scripted session";
 /// whenever a tool result crosses the summarization threshold (TASK-054), a
 /// `triage` whenever a `grep` returns more than one match (REQ-561 TASK-060), a
 /// `shell` interpretation whenever a command fails or overruns its output cap
-/// (REQ-561 TASK-061), and a `title` on the first substantive turn of every
-/// session (REQ-561 TASK-062).
+/// (REQ-561 TASK-061), a `title` on the first substantive turn of every session
+/// (REQ-561 TASK-062), and a `compact` whenever a conversation crosses the soft
+/// context-pressure threshold (REQ-561 TASK-063).
 /// Serving those from the script would silently shift every block by one and
 /// make a fixture's meaning depend on how many duties the daemon happens to run
 /// — so each duty is recognized by its own **output contract**
@@ -269,7 +290,8 @@ const SCRIPTED_TITLE: &str = "Scripted session";
 /// [`crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT`],
 /// [`crate::harness::triage::TRIAGE_OUTPUT_CONTRACT`],
 /// [`crate::harness::shell_duty::SHELL_OUTPUT_CONTRACT`],
-/// [`crate::harness::title::TITLE_OUTPUT_CONTRACT`]) and answered off-script,
+/// [`crate::harness::title::TITLE_OUTPUT_CONTRACT`],
+/// [`crate::harness::compact::COMPACT_OUTPUT_CONTRACT`]) and answered off-script,
 /// consuming nothing.
 ///
 /// `title` is the one that would bite hardest: it fires on the first turn of
@@ -338,6 +360,8 @@ impl Engine for ScriptedFileEngine {
             SCRIPTED_SHELL_INTERPRETATION.to_owned()
         } else if prompt.contains(crate::harness::title::TITLE_OUTPUT_CONTRACT) {
             SCRIPTED_TITLE.to_owned()
+        } else if prompt.contains(crate::harness::compact::COMPACT_OUTPUT_CONTRACT) {
+            SCRIPTED_COMPACTION.to_owned()
         } else {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
             self.replies
@@ -1812,6 +1836,11 @@ impl DaemonRuntime {
         // of resolving them separately: interpreting a failed build is worth a
         // stronger model than ordering a list of grep hits.
         let shell = self.shell_route(router, config, events, session_id, local_engine.as_ref());
+        // REQ-561 TASK-063: and `compact`, which belongs to no tool at all — the
+        // thing that knows a conversation no longer fits is the context manager.
+        // Resolved here with the others and passed separately, because
+        // `ToolDuties` is the tools' own struct.
+        let compact = self.compact_route(router, config, events, session_id, local_engine.as_ref());
         let duties = ToolDuties {
             triage: &triage,
             shell: &shell,
@@ -1835,6 +1864,7 @@ impl DaemonRuntime {
                 &route.harness,
                 &mut hook,
                 &digest,
+                &compact,
                 &duties,
             )
             .await;
@@ -1906,6 +1936,7 @@ impl DaemonRuntime {
             &route.harness,
             &mut hook,
             &digest,
+            &compact,
             &duties,
         )
         .await
@@ -2058,6 +2089,44 @@ impl DaemonRuntime {
             router.resolve(Category::Title)
         };
         self.resolve_duty(TITLE_DUTY, &route, config, events, session_id, local_engine)
+    }
+
+    /// Resolve the `compact` category for this turn (REQ-561 TASK-063).
+    ///
+    /// The same two layers, in the same order, for the same reasons as
+    /// [`Self::digest_route`] — session taint first, then the one resolver — and
+    /// the same reason for existing separately at all: the line naming the
+    /// category is what [`crate::call_sites`]'s derived-marker test reads out of
+    /// the daemon's own source, so it cannot be folded into a helper taking a
+    /// category *variable* without making that scan blind (ADR-3).
+    ///
+    /// `compact` is a `scan` duty, so it inherits whatever `scan` is bound to and
+    /// sends the **conversation itself** there — the widest content class of the
+    /// five, and the one BR-11's disclosure exists for. What holds the line is
+    /// BR-7's scoping at the egress choke point: the conversation's own merged
+    /// provenance, so a session that read a `local-only` file compacts locally or
+    /// not at all, while the turn proceeds either way.
+    fn compact_route(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        let route = if self.session_taint.is_tainted(session_id) {
+            router.resolve_local_pin(taint_pin_reason("the `compact` duty"))
+        } else {
+            router.resolve(Category::Compact)
+        };
+        self.resolve_duty(
+            COMPACT_DUTY,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
     }
 
     /// Name this session after `prompt`, at most once for its whole life
@@ -5687,7 +5756,7 @@ provider_id = "on-device"
             .collect();
         assert_eq!(
             unreached,
-            vec!["redact", "compact"],
+            vec!["redact"],
             "the marker in the projection must agree with `call_sites::has_call_site`"
         );
         for row in &snap.routing {
@@ -8640,6 +8709,209 @@ provider_id = "on-device"
             fn the_stand_in_recognizes_the_contract_the_prompt_carries() {
                 assert!(
                     crate::harness::title::title_prompt(REQUEST).contains(TITLE_OUTPUT_CONTRACT)
+                );
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // The `compact` duty's dispatch (REQ-561 TASK-063).
+        //
+        // The duty itself — what it decides and what it refuses — is tested
+        // against `ContextManager` in `harness::context`, because that is where
+        // it hangs. What is tested here is the half only the daemon owns: where
+        // the category routes, and what reaches the wire when it performs.
+        // -------------------------------------------------------------------
+        mod compact {
+            use super::*;
+            use crate::harness::compact::COMPACT_OUTPUT_CONTRACT;
+            use crate::harness::ContextManager;
+            use teton_core::category::{CategoryOverride, ConfigurableCategory};
+            use teton_protocol::events::Event;
+
+            /// The `compact` route the turn path builds, from the same runtime
+            /// state and through the same router, announcing on `bus`.
+            fn compact_for(
+                runtime: &DaemonRuntime,
+                bus: &Arc<EventBus>,
+                session: &SessionId,
+            ) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.compact_route(&router, &config, bus, session, slot.as_ref())
+            }
+
+            /// A conversation over its byte budget, with a decision in it.
+            fn pressured() -> ContextManager {
+                let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(4_000);
+                for i in 0..5 {
+                    ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+                }
+                assert!(ctx.under_compaction_pressure());
+                ctx
+            }
+
+            /// Every `route_decided` category this subscription saw.
+            ///
+            /// Drained with `try_recv` rather than awaited under a timeout:
+            /// `EventBus::publish` is synchronous, so once the call under test
+            /// has returned, everything it published is already queued
+            /// (LESSON-450).
+            fn decided(sub: &mut crate::broadcast::Subscription) -> Vec<Option<String>> {
+                std::iter::from_fn(|| sub.try_recv())
+                    .filter_map(|env| match env.event {
+                        Event::RouteDecided(d) => Some(d.category.map(|c| c.as_str().to_owned())),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            // -- where it routes --------------------------------------------
+
+            /// **BR-5 / LESSON-432.** Session taint overrides the category
+            /// binding for `compact` as for every other duty — and it matters
+            /// most here, because what this duty sends is the *conversation*.
+            ///
+            /// The mutation-sensitive one: deleting the taint check in
+            /// `compact_route` turns this red on its own, at its own layer. Its
+            /// non-vacuity pair is the same config untainted, which genuinely
+            /// sends the conversation off the machine.
+            #[test]
+            fn a_tainted_session_compacts_on_the_local_tier() {
+                let engine = CountingEngine::answering("FORGET: 1\nSUMMARY: x");
+                let mut config = config();
+                config.categories.push(CategoryOverride {
+                    name: ConfigurableCategory::Compact,
+                    provider_id: "frontier".to_owned(),
+                    fallback_id: None,
+                });
+                let runtime = runtime(config, &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let session = SessionId::from("tainted");
+
+                // Non-vacuity: the same config, untainted, genuinely goes remote.
+                assert_eq!(
+                    compact_for(&runtime, &bus, &SessionId::from("clean")).provider(),
+                    Some("frontier")
+                );
+
+                runtime.session_taint.mark(&session);
+                assert_eq!(
+                    compact_for(&runtime, &bus, &session).provider(),
+                    LOCAL_PROVIDER_ID.into(),
+                    "a tainted session compacts on the machine (BR-5)"
+                );
+            }
+
+            /// A machine with no engine cannot compact, and says why: the
+            /// resolver's own sentence rides onto the route so nothing has to
+            /// invent one (BR-6, LESSON-447). The context is still bounded —
+            /// that is `truncate_to_budget`'s job, not this route's.
+            #[test]
+            fn a_machine_with_no_engine_cannot_compact_and_says_so() {
+                let runtime = DaemonRuntime::minimal();
+                *runtime.config.lock().expect("config mutex") = config();
+
+                let route = compact_for(
+                    &runtime,
+                    &Arc::new(EventBus::new()),
+                    &SessionId::from("sess"),
+                );
+
+                assert_eq!(route.provider(), None);
+                let DutyRoute::Unresolved { reason } = route else {
+                    panic!("there is nothing to serve the duty");
+                };
+                assert!(reason.contains("compact"), "{reason}");
+            }
+
+            // -- what reaches the wire (AC-2, ADR-8) -------------------------
+
+            /// **AC-2 and its ADR-8 pairing.** A compaction that *performs*
+            /// announces its route naming `compact`; a resolved route whose
+            /// context is never pressured announces nothing.
+            ///
+            /// The negative half is what distinguishes emit-on-perform from the
+            /// design it replaced: `compact_route` is built once per turn
+            /// attempt whether or not any conversation ever crosses the
+            /// threshold, so a resolution-time event would fire on every turn in
+            /// the daemon.
+            #[tokio::test]
+            async fn a_performed_compaction_announces_its_route_and_a_declined_one_does_not() {
+                let engine =
+                    CountingEngine::answering("FORGET: 1 2 3\nSUMMARY: the agent looked around.");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let session = SessionId::from("sess");
+
+                // Declined: resolved, never pressured, never performed.
+                let mut roomy = ContextManager::new("sys", 1_000_000).with_budget_bytes(4_000);
+                roomy.push_user("a");
+                roomy.push_user("b");
+                roomy.push_user("c");
+                let out = roomy
+                    .compact_if_pressured(&compact_for(&runtime, &bus, &session))
+                    .await;
+                assert_eq!(out.dropped_blocks, 0);
+                assert_eq!(engine.calls(), 0);
+                assert!(
+                    decided(&mut sub).is_empty(),
+                    "a duty that never ran announces no routing decision"
+                );
+
+                // Performed.
+                let out = pressured()
+                    .compact_if_pressured(&compact_for(&runtime, &bus, &session))
+                    .await;
+                assert_eq!(out.dropped_blocks, 3);
+                assert_eq!(
+                    decided(&mut sub),
+                    vec![Some("compact".to_owned())],
+                    "a performed compaction announces exactly one route, naming its category"
+                );
+            }
+
+            // -- the stand-in engine (BR-10, AC-12) --------------------------
+
+            /// **BR-10 / AC-12.** The `compact` duty is answered by the scripted
+            /// stand-in **off-script**, so it consumes no reply block and every
+            /// fixture's turn sequence means what its author wrote.
+            #[test]
+            fn a_compact_duty_consumes_no_scripted_block() {
+                let engine = ScriptedFileEngine::from_script("m", "first reply\n---\nsecond reply");
+                let params = GenParams::default();
+                let blocks = pressured().blocks().to_vec();
+
+                let duty = engine
+                    .complete(
+                        &crate::harness::compact::compact_prompt(&blocks),
+                        &params,
+                        &mut |_| true,
+                    )
+                    .expect("the stand-in answers the duty");
+                // And with an answer the parser accepts, rather than one that
+                // would make every pressured fixture report a duty failure.
+                let read = crate::harness::compact::read_compaction(&duty.text, blocks.len() - 1)
+                    .expect("the stand-in's answer is a usable compaction");
+                assert_eq!(read.forget(), [0], "the oldest block, as the gate would");
+
+                // The script has not moved: the next *turn* still gets block one.
+                let turn = engine
+                    .complete("an ordinary turn", &params, &mut |_| true)
+                    .expect("a turn");
+                assert_eq!(turn.text.trim(), "first reply");
+            }
+
+            /// The recognition arm keys on the contract the prompt actually
+            /// carries — one constant, both sides, so the stand-in cannot drift
+            /// away from the duty it is meant to answer.
+            #[test]
+            fn the_stand_in_recognizes_the_contract_the_prompt_carries() {
+                assert!(
+                    crate::harness::compact::compact_prompt(pressured().blocks())
+                        .contains(COMPACT_OUTPUT_CONTRACT)
                 );
             }
         }

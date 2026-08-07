@@ -42,6 +42,7 @@ use teton_providers::{HarnessProfile, ProviderError, ToolCall};
 
 use crate::broadcast::EventBus;
 
+use super::compact::COMPACT_DUTY;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
@@ -353,6 +354,8 @@ pub async fn run_session_turn(
     // transport exists here" is not the place to acquire one.
     let triage = DutyRoute::local(TRIAGE_DUTY, "local", Arc::clone(engine));
     let shell = DutyRoute::local(SHELL_DUTY, "local", Arc::clone(engine));
+    // And the context's own duty, which belongs to no tool.
+    let compact = DutyRoute::local(COMPACT_DUTY, "local", Arc::clone(engine));
     run_session_turn_with_source(
         &mut source,
         tools,
@@ -363,6 +366,7 @@ pub async fn run_session_turn(
         config,
         hook,
         &digest,
+        &compact,
         &ToolDuties {
             triage: &triage,
             shell: &shell,
@@ -393,6 +397,13 @@ pub async fn run_session_turn(
 /// shrink its input. [`DutyRoute::Unresolved`] replaces it, and
 /// [`summarize_if_large`] bounds mechanically instead.
 ///
+/// `compact` is the resolved `compact` category (REQ-561 TASK-063), asked which
+/// blocks a pressured conversation may forget. It is a **separate parameter from
+/// `duties`** because it belongs to no tool — the thing that knows a conversation
+/// no longer fits is the context manager, not whatever tool happened to fill it —
+/// and it is deliberately *not* what keeps the context under budget: it runs
+/// ahead of the unconditional `truncate_to_budget()`, which is unchanged (ADR-4).
+///
 /// `duties` carries the duties a **tool** owns rather than the loop — today the
 /// `triage` route a `grep` result is ranked through (REQ-561 TASK-060). It is
 /// one struct rather than one parameter per duty so that wiring the next
@@ -415,6 +426,7 @@ pub async fn run_session_turn_with_source(
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
     digest: &DutyRoute,
+    compact: &DutyRoute,
     duties: &ToolDuties<'_>,
 ) -> Result<TurnOutcome, HarnessError> {
     let exposed = tools.exposed_names(config.max_tools);
@@ -667,6 +679,28 @@ pub async fn run_session_turn_with_source(
                             folded
                         };
                         ctx.push_tool_result_prov(name, provenance, folded);
+                        // REQ-561 ADR-4: the `compact` duty gets a say in WHICH
+                        // blocks go, at a soft fraction of the budget — and it
+                        // gets it *here*, ahead of the gate below, never instead
+                        // of it. The line after this one is unchanged,
+                        // unwrapped, and conditional on nothing: that is what
+                        // makes BR-4 structural rather than a code path someone
+                        // has to remember. A duty that hangs, returns garbage,
+                        // returns an over-budget answer or was never routed
+                        // still ends with a context under budget, because the
+                        // thing enforcing the budget was never the duty.
+                        //
+                        // A failure is never silent, for the reason the `digest`
+                        // failure above is not: this duty guards the context
+                        // window, so the deterministic drop standing in for it is
+                        // logged with the reason it had to.
+                        let compaction = ctx.compact_if_pressured(compact).await;
+                        if let Some(error) = &compaction.reason {
+                            eprintln!(
+                                "tetond: the `compact` duty could not be served ({error}); the \
+                                 context was truncated deterministically instead"
+                            );
+                        }
                         ctx.truncate_to_budget();
                         continue;
                     }
@@ -905,6 +939,136 @@ mod tests {
         out
     }
 
+    /// A source that calls one tool on its first turn and ends on its second —
+    /// the shortest path to the loop's tool-result fold, which is where the
+    /// `compact` duty and the hard budget gate both live.
+    struct ToolThenEndSource {
+        calls: usize,
+    }
+
+    #[async_trait]
+    impl CompletionSource for ToolThenEndSource {
+        fn chat_format(&self) -> ChatFormat {
+            ChatFormat::Flat
+        }
+
+        async fn produce_turn(
+            &mut self,
+            _prompt: &PreparedPrompt,
+            _provenance: &EgressProvenance,
+            _config: &HarnessConfig,
+            _tools: &ToolRegistry,
+            _exposed: &[&str],
+            _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            self.calls += 1;
+            let (text, decision) = if self.calls == 1 {
+                (
+                    "{\"tool\":\"read\",\"arguments\":{\"path\":\"nope.txt\"}}".to_owned(),
+                    TurnDecision::ToolCall {
+                        name: "read".to_owned(),
+                        arguments: serde_json::json!({ "path": "nope.txt" }),
+                    },
+                )
+            } else {
+                (
+                    "Done.".to_owned(),
+                    TurnDecision::EndTurn {
+                        final_text: "Done.".to_owned(),
+                    },
+                )
+            };
+            Ok(SourceTurn {
+                text,
+                decision,
+                usage: TokenUsage::default(),
+                dropped_calls: 0,
+            })
+        }
+    }
+
+    /// **REQ-561 ADR-4, through the loop itself.** The thing that keeps a
+    /// context under budget is the loop's own unconditional
+    /// `truncate_to_budget()`, not the `compact` duty that runs ahead of it.
+    ///
+    /// The unit tests in [`super::super::context`] prove the duty degrades
+    /// safely; this one proves the *wiring* — that the gate is reached on a turn
+    /// where the duty failed. Making that call conditional on the compaction
+    /// having succeeded turns this red and nothing else in the suite, which is
+    /// exactly why it is here rather than there (LESSON-483: the inner link
+    /// needs its own mutation, and so does the link that calls it).
+    #[tokio::test]
+    async fn a_turn_whose_compact_duty_cannot_serve_still_ends_under_budget() {
+        const BUDGET_BYTES: usize = 4_000;
+        let session_id = SessionId::from("compact-gate");
+        let bus = Arc::new(EventBus::new());
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        // One model call, so the loop stops the moment the tool result has been
+        // folded and the gate has run. Letting it take a second turn would push
+        // the model's final answer *after* the gate, and this assertion is about
+        // what the gate guarantees, not about what is appended once it has.
+        let config = HarnessConfig {
+            max_turns: 1,
+            ..HarnessConfig::default()
+        };
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(BUDGET_BYTES);
+        ctx.push_user("do the thing");
+        for i in 0..5 {
+            ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+        }
+        assert!(
+            ctx.estimated_bytes() > BUDGET_BYTES,
+            "non-vacuity: the turn must start over budget, or the gate has nothing to do"
+        );
+
+        let mut source = ToolThenEndSource { calls: 0 };
+        let outcome = run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            // The duty under test: resolved to nothing, so it degrades on every
+            // fold.
+            &DutyRoute::unresolved("nothing serves `compact` here"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes");
+
+        assert_eq!(
+            outcome.stop_reason,
+            StopReason::MaxTurnRequests,
+            "the fixture must stop right after the fold"
+        );
+        assert!(
+            ctx.was_truncated(),
+            "non-vacuity: the deterministic gate really did have to drop something"
+        );
+        assert!(
+            ctx.estimated_bytes() <= BUDGET_BYTES,
+            "the turn ended {} bytes over its budget with a `compact` duty that never served",
+            ctx.estimated_bytes() - BUDGET_BYTES
+        );
+    }
+
     /// Run one loop turn against `source` and return what the user saw.
     async fn run_and_collect_display(source: &mut dyn CompletionSource) -> String {
         let session_id = SessionId::from("gate-format");
@@ -933,6 +1097,9 @@ mod tests {
         // And no tool runs, so no tool duty is reached either.
         let triage = DutyRoute::unresolved("no triage route in this test");
         let shell = DutyRoute::unresolved("no shell route in this test");
+        // `compact` is reached only from the tool-result fold, and only under
+        // context pressure; one short user block is neither.
+        let compact = DutyRoute::unresolved("no compact route in this test");
 
         run_session_turn_with_source(
             source,
@@ -944,6 +1111,7 @@ mod tests {
             &config,
             &mut hook,
             &digest,
+            &compact,
             &ToolDuties {
                 triage: &triage,
                 shell: &shell,

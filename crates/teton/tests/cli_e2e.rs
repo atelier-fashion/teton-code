@@ -1656,7 +1656,14 @@ fn policy_show_renders_the_daemons_resolved_table() {
     // one that has a call site does not. The marker is derived from the
     // daemon's own call sites, so this also shows the CLI is rendering the
     // daemon's answer rather than a table of its own.
-    let unreached = row(&shown, "compact").expect("a `compact` row");
+    //
+    // The marked example is `redact`, the one category REQ-561 leaves unwired
+    // (it is REQ-562's, because a model call inside the egress choke point needs
+    // its own spec). It replaced `compact` here when TASK-063 gave `compact` a
+    // call site — moved rather than dropped, because a test that only checks the
+    // *unmarked* side would pass just as well against a renderer that had
+    // forgotten how to print the marker at all.
+    let unreached = row(&shown, "redact").expect("a `redact` row");
     assert!(
         unreached.contains("declared, no call site yet"),
         "an unreached category must be marked; row:\n{unreached}"
@@ -1692,6 +1699,15 @@ fn policy_show_renders_the_daemons_resolved_table() {
     assert!(
         !title.contains("no call site"),
         "`title` is wired (REQ-561 TASK-062) and must not carry the marker; row:\n{title}"
+    );
+    // And `compact`, which `ContextManager::compact_if_pressured` gave a call
+    // site in TASK-063 — the category this very assertion used to hold up as the
+    // marked example. It runs at a soft fraction of the context budget, ahead of
+    // the unconditional `truncate_to_budget` that still enforces it (ADR-4).
+    let compact = row(&shown, "compact").expect("a `compact` row");
+    assert!(
+        !compact.contains("no call site"),
+        "`compact` is wired (REQ-561 TASK-063) and must not carry the marker; row:\n{compact}"
     );
 
     // AC-12: the BR-9 declared default is configuration-visible, and the CLI

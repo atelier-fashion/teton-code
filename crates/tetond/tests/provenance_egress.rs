@@ -212,6 +212,7 @@ async fn run_touching_tool(
         // stay under the summarization threshold, so nothing is served — and an
         // unresolved route bounds mechanically rather than folding raw.
         &DutyRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no compact route in this test"),
         // REQ-561: and no tool duty either. `triage` would rank a `grep`
         // result; these turns run no multi-match `grep`, and an unresolved
         // route returns the tool's own result unchanged.

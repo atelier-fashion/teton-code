@@ -115,8 +115,17 @@ against that boundary (see "AC-8's testable boundary" below).
 ## ADR-4: `compact` runs *ahead of* the hard gate, never *instead of* it
 
 **Decision.** `ContextManager` gains `compact_if_pressured()`, called immediately
-**before** the existing `ctx.truncate_to_budget()` at `harness/context.rs:618`.
-That existing line is **not modified, not wrapped, and not made conditional**.
+**before** the existing `ctx.truncate_to_budget()` — which lives at
+`harness/turn_loop.rs:704`, **not** at `harness/context.rs:618` as earlier drafts
+of this ADR and TASK-063 both stated. That reference was wrong: `context.rs:618`
+is inside `ceil_char_boundary`, and the only production call site in the
+workspace is in the turn loop. The error came from transcribing an exploration
+agent's "used in turn_loop at line 618" as a `context.rs` line. Corrected after
+TASK-063 surfaced it.
+
+That existing line is **not modified, not wrapped, and not made conditional** —
+verified: it sits outside any conditional, and the only diff lines mentioning it
+are doc comments.
 
 **Why.** This is BR-4a made structural. Because `truncate_to_budget()` still runs
 unconditionally afterward, a `compact` duty that hangs, returns garbage, returns
@@ -343,6 +352,44 @@ testable.** `digest` already had this shape via its size threshold.
 The rule for the remaining duties: if a duty declines under some condition, that
 condition is a named constant and a test asserts the zero-call case. A hidden
 threshold is a cost surprise.
+
+## ADR-12: A compaction summary inherits the provenance of the blocks it replaces
+
+**Decision.** `compact` answers with **both** a `FORGET:` block list and a
+`SUMMARY:` paragraph that replaces them, and the inserted summary block carries
+the **merged `ToolProvenance` of every block it elides** — `Unknown` if any
+elided block was `Unknown`, otherwise the union of their sources.
+
+**Why this is the most safety-critical decision in the REQ.** Without the
+inherited provenance, compaction is a **laundering path**: a summary of a
+`local-only` file read would re-enter the context as ordinary model prose with
+clean provenance, and the next remote turn would send it. The boundary would hold
+on the original read and leak on the summary of it. This is BUG-156's exact
+shape — a path that re-derives its target instead of carrying it — and it is
+worse here, because the laundering is silent and permanent: the original blocks
+are gone.
+
+Verified by mutation: replacing the merged provenance with an empty source set
+turns `a_compaction_inherits_the_provenance_of_what_it_replaces` and
+`a_compaction_of_unknown_provenance_stays_unknown` red.
+
+**Why summary-plus-indices rather than indices alone.** Two constraints pulled
+apart: "decide which blocks to forget" suggests an index list (output measured in
+bytes), while BR-8's own wording gives `compact` the loosest ceiling of the five
+because "a compaction is a conversation". Answering with both resolves it, and
+buys two things beyond consistency:
+
+1. **The over-budget rejection stops being near-vacuous.** An index list is
+   almost incapable of busting a budget, so a test asserting "an over-budget
+   response is rejected" would pass for want of a way to fail. A replacement
+   paragraph has real size and can genuinely fail to fit, which makes
+   `an_over_budget_compaction_is_rejected_rather_than_rescued` a live check.
+2. **"Does not drop the blocks it managed to parse" becomes load-bearing in two
+   independent ways** rather than one.
+
+The cost — model prose entering history — is mitigated by putting the
+replacement through `summarize_if_large`'s control-token cut, and by ADR-12's
+provenance inheritance above.
 
 ## ADR-7: The four duty tasks are chained, not parallel
 

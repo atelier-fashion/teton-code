@@ -16,9 +16,9 @@
 //! the direction the list actually rots in. The test at the bottom of this file
 //! closes that gap: it reads the daemon's own source, finds every routing call
 //! site, works out which categories reach a router through them, and asserts the
-//! result equals this match. Wire up `compact` and the test fails until the
+//! result equals this match. Wire up `redact` and the test fails until the
 //! marker follows — which is exactly how `triage` (REQ-561 TASK-060), `shell`
-//! (TASK-061) and `title` (TASK-062) arrived.
+//! (TASK-061), `title` (TASK-062) and `compact` (TASK-063) arrived.
 //!
 //! That test is the load-bearing half of ADR-A. This match is just where its
 //! answer is written down.
@@ -65,9 +65,18 @@ pub const fn has_call_site(category: Category) -> bool {
         // `session_titled` (REQ-561 TASK-062). `SessionSummary.title` was on the
         // wire long before anything populated it.
         Category::Title => true,
+        // The context's own duty, and the second of the five that belongs to no
+        // tool: `ContextManager::compact_if_pressured` asks which blocks a
+        // pressured conversation may forget, at a soft fraction of the budget
+        // and ahead of the unconditional `truncate_to_budget` (REQ-561 TASK-063,
+        // ADR-4). The deterministic oldest-first drop is still what *enforces*
+        // the budget — the duty only ever improves the choice, which is why
+        // wiring it cannot weaken the gate.
+        Category::Compact => true,
         // Declared, unreached. Egress redaction is regex-based and makes no
-        // model call, and compaction truncates mechanically.
-        Category::Redact | Category::Compact => false,
+        // model call; giving it one means putting a model inside the choke
+        // point, which is REQ-562's subject and its own adversarial review.
+        Category::Redact => false,
     }
 }
 
@@ -323,10 +332,6 @@ mod tests {
             .filter(|c| !has_call_site(*c))
             .map(Category::as_str)
             .collect();
-        assert_eq!(
-            unreached,
-            vec!["redact", "compact"],
-            "the unreached set changed"
-        );
+        assert_eq!(unreached, vec!["redact"], "the unreached set changed");
     }
 }

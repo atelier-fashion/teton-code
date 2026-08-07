@@ -263,6 +263,7 @@ async fn remote_routed_session_streams_dispatches_tools_and_records_cost() {
         // stay under the summarization threshold, so nothing is served — and an
         // unresolved route bounds mechanically rather than folding raw.
         &DutyRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no compact route in this test"),
         // REQ-561: and no tool duty either. `triage` would rank a `grep`
         // result; these turns run no multi-match `grep`, and an unresolved
         // route returns the tool's own result unchanged.
@@ -403,6 +404,7 @@ async fn remote_turn_over_boundary_context_is_blocked_and_never_billed() {
         // stay under the summarization threshold, so nothing is served — and an
         // unresolved route bounds mechanically rather than folding raw.
         &DutyRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no compact route in this test"),
         // REQ-561: and no tool duty either. `triage` would rank a `grep`
         // result; these turns run no multi-match `grep`, and an unresolved
         // route returns the tool's own result unchanged.

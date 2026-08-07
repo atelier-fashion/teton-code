@@ -43,6 +43,14 @@
 //!   named because it is a session — so its call site is the daemon's prompt-turn
 //!   entry point in [`crate::runtime`], guarded once per session by
 //!   [`crate::sessions::SessionRegistry`].
+//! - [`compact`] — what is `compact`-specific about the forget-what-you-can duty
+//!   (REQ-561): its [`compact::COMPACT_DUTY`] descriptor, its output contract, its
+//!   prompt builder, the ADR-11 thresholds below which compaction buys nothing,
+//!   and the strict parser BR-4 requires. Like [`title`] it is **not** tool-owned:
+//!   the thing that knows a conversation no longer fits is the conversation, so
+//!   its call site is [`context::ContextManager::compact_if_pressured`] — which
+//!   runs *ahead of* the unconditional `truncate_to_budget()` and never instead of
+//!   it (ADR-4).
 //! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
@@ -58,6 +66,7 @@
 //!   keyword): context assembly, model call, tool dispatch, result folding, and
 //!   bounded termination.
 
+pub mod compact;
 pub mod completion;
 pub mod context;
 pub mod digest;
@@ -71,13 +80,14 @@ pub mod tools;
 pub mod triage;
 pub mod turn_loop;
 
+pub use compact::COMPACT_DUTY;
 pub use completion::{
     context_provenance, CompletionSource, LocalEngineSource, RemoteProviderSource, SourceTurn,
     TurnDecision,
 };
 pub use context::{
-    ContextBlock, ContextManager, NoopProvenanceHook, Provenance, ProvenanceHook,
-    RecordingProvenanceHook, ToolProvenance,
+    CompactionOutcome, ContextBlock, ContextManager, NoopProvenanceHook, Provenance,
+    ProvenanceHook, RecordingProvenanceHook, ToolProvenance,
 };
 pub use digest::DIGEST_DUTY;
 pub use duty::{Duty, DutyKind, DutyRoute};
