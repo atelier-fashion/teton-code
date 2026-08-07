@@ -199,10 +199,20 @@ rows already exist and already validate (REQ-558 TASK-049).
       same latent exposure. With four more duties it stops being a surprise and
       becomes a checklist item.
 - [ ] AC-13: **`shell` fires only on failure or oversize** (BR-4b): a table-driven
-      test over (exit 0, small output), (exit 0, output over the 8k cap), (exit≠0,
-      small output), (exit≠0, large output) asserts the duty is invoked in exactly
-      the last three and **not** in the first, by call count. The negative case is
-      the load-bearing one — it is the whole cost argument.
+      test over (exit 0, small output), (exit 0, output **exactly at** the 8k cap),
+      (exit 0, output over the cap), (exit≠0, small output), (exit≠0, large output)
+      asserts the duty is invoked in exactly the last three and **not** in the
+      first two, by call count. The zero-call cases are the load-bearing ones —
+      they are the whole cost argument.
+      **The boundary row is not decoration.** This AC originally listed four rows
+      and claimed a mutation reading the post-truncation length would turn the
+      *oversize* row red. It does not: truncation clamps the body to exactly the
+      cap and then appends a notice, so a rendered oversize result is still over
+      the cap and the size arm fires either way. Only the **exactly-at-the-cap**
+      row discriminates. Verified by applying that mutation — it turns the
+      boundary row red and leaves the oversize row green. The general shape: an
+      off-by-truncation guard is caught by a boundary case, never by an extreme
+      one.
 - [ ] AC-14: **`compact`'s soft threshold does not weaken the hard backstop**
       (BR-4a): with the duty stubbed to never return, to return garbage, and to be
       entirely unrouted, the context is under budget after each — proving the

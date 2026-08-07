@@ -350,6 +350,7 @@ async fn demo_requirement_flows_all_four_phases_with_per_phase_routing_and_real_
                 &DutyRoute::unresolved("no digest route in this test"),
                 &ToolDuties {
                     triage: &DutyRoute::unresolved("no triage route in this test"),
+                    shell: &DutyRoute::unresolved("no shell route in this test"),
                 },
             )
             .await

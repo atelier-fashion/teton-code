@@ -268,6 +268,7 @@ async fn remote_routed_session_streams_dispatches_tools_and_records_cost() {
         // route returns the tool's own result unchanged.
         &ToolDuties {
             triage: &DutyRoute::unresolved("no triage route in this test"),
+            shell: &DutyRoute::unresolved("no shell route in this test"),
         },
     )
     .await
@@ -407,6 +408,7 @@ async fn remote_turn_over_boundary_context_is_blocked_and_never_billed() {
         // route returns the tool's own result unchanged.
         &ToolDuties {
             triage: &DutyRoute::unresolved("no triage route in this test"),
+            shell: &DutyRoute::unresolved("no shell route in this test"),
         },
     )
     .await;

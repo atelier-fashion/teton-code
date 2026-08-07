@@ -457,7 +457,12 @@ mod tests {
             .refine(
                 args,
                 "find where the needle is defined",
-                &ToolDuties { triage: route },
+                &ToolDuties {
+                    triage: route,
+                    // `grep` never reaches it; an unresolved route would be a
+                    // reported failure if it somehow did.
+                    shell: &DutyRoute::unresolved("no shell route in this test"),
+                },
                 raw.clone(),
             )
             .await;

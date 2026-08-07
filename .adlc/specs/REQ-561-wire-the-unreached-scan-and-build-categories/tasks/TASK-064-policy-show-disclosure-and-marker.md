@@ -23,6 +23,7 @@ a state that does not exist yet.
 - `crates/teton/src/main.rs` — the `policy show` renderer (~lines 1418-1505); drop the marker for the four wired categories and render each category's content class (~line 1493 holds the `"  — declared, no call site yet"` string).
 - `crates/tetond/src/call_sites.rs` — verify `has_call_site()` agrees with the derived scan for all eleven categories; carry the content-class descriptor if it lives here.
 - `crates/teton/tests/cli_e2e.rs` — update the `policy show` assertions (~line 1651 asserts the marker text) to the new expected output.
+- `crates/teton/src/main.rs` — `policy_show_marks_the_unreached_categories_and_the_judgment_default` (~line 1908) renders a **hand-built** `migrated_snapshot()` fixture, so it tests the renderer rather than the derived marker and stayed green through TASK-060/061. Its fixture still lists all five categories as unreached, which is now stale: only `redact`, `title`, and `compact` are. Update the fixture to match reality — a rendering test fed an impossible snapshot still passes, which is exactly how a stale fixture survives unnoticed (LESSON-485).
 
 ## Acceptance Criteria
 

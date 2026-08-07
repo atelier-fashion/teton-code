@@ -30,6 +30,12 @@
 //!   (REQ-561): its [`triage::TRIAGE_DUTY`] descriptor, its output contract, and
 //!   its prompt builder. The call site is [`tools::GrepTool`]'s
 //!   [`Tool::refine`](tools::Tool::refine).
+//! - [`shell_duty`] — what is `shell`-specific about the command-interpretation
+//!   duty (REQ-561): its [`shell_duty::SHELL_DUTY`] descriptor, its output
+//!   contract, its prompt builder, and the BR-4b trigger that keeps it from
+//!   firing on every command. The call site is [`tools::ShellTool`]'s
+//!   [`Tool::refine`](tools::Tool::refine). Named `shell_duty` because
+//!   [`tools::shell`] already owns the shorter name.
 //! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
@@ -52,6 +58,7 @@ pub mod duty;
 pub mod permissions;
 pub(crate) mod render;
 pub(crate) mod reply;
+pub mod shell_duty;
 pub mod tools;
 pub mod triage;
 pub mod turn_loop;
@@ -69,6 +76,7 @@ pub use duty::{Duty, DutyKind, DutyRoute};
 pub use permissions::{
     PendingPermissions, PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,
 };
+pub use shell_duty::SHELL_DUTY;
 pub use tools::{RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome, ToolRegistry};
 pub use triage::TRIAGE_DUTY;
 pub use turn_loop::{

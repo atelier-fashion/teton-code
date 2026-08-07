@@ -20,6 +20,31 @@
 //!
 //! The command runs synchronously via `sh -c`; a watcher thread enforces the
 //! deadline. Output (stdout + stderr) is captured and capped.
+//!
+//! ## The `shell` duty attaches here (REQ-561 TASK-061)
+//!
+//! [`Tool::run`] answers with the command's status line and its output, capped
+//! at [`MAX_OUTPUT_CHARS`]. [`Tool::refine`] then hands that result to the
+//! `shell` duty — but **only** when reading it unaided is the hard part: the
+//! command failed, or its raw output ran past the cap and what entered context
+//! is a fragment of a thing (BR-4b). A short successful command is returned
+//! verbatim with no model call at all, which matters because `shell` is the
+//! highest-frequency tool call in a session.
+//!
+//! The category is not chosen here and is not inferred from anything: the
+//! resolved route arrives on [`ToolDuties`](super::ToolDuties), and the whole of
+//! this tool's per-category surface is calling
+//! [`shell_duty::interpret_output`] with it. The split between `run` and
+//! `refine` exists because interpretation is a **model call**: doing it inside
+//! the synchronous `run` would park a runtime worker for the length of an
+//! inference.
+//!
+//! Interpretation is an addition to the output, never a precondition for having
+//! it — so every way the duty can fail returns `run`'s own result unchanged,
+//! with the reason on [`RefinedOutcome::duty_error`](super::RefinedOutcome)
+//! (BR-3). And because a `shell` result carries unknown provenance, a remotely
+//! bound duty is *refused* on any machine with a privacy boundary configured;
+//! see [`shell_duty`] for why that is the design working rather than a gap.
 
 use std::io::Result as IoResult;
 use std::os::unix::process::CommandExt;
@@ -27,13 +52,23 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{opt_u64_arg, str_arg, Tool, ToolContext, ToolOutcome};
+use super::{
+    opt_str_arg, opt_u64_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome,
+};
+use crate::harness::digest::tool_result_provenance;
+use crate::harness::shell_duty;
 
 /// Cap on captured output characters, so a chatty command cannot blow the
 /// small-model context budget.
-const MAX_OUTPUT_CHARS: usize = 8_000;
+///
+/// Also the `shell` duty's size trigger — a successful command is worth
+/// interpreting exactly when this cap threw information away — which is why
+/// [`shell_duty::SHELL_TRIGGER_OUTPUT_CHARS`] reads it rather than restating it
+/// (REQ-561 ADR-5).
+pub(crate) const MAX_OUTPUT_CHARS: usize = 8_000;
 
 /// Runs shell commands under a timeout, cwd jail, and scrubbed environment.
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +100,7 @@ impl ShellTool {
     }
 }
 
+#[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
         "shell"
@@ -169,6 +205,110 @@ impl Tool for ShellTool {
             }
         }
     }
+
+    /// Interpret this command's output through the `shell` duty, when reading it
+    /// unaided is the hard part (REQ-561 BR-1/BR-3/BR-4b/BR-7).
+    ///
+    /// Every early return and every failure arm hands back `outcome` — the very
+    /// value [`Tool::run`] produced — so "the fallback is today's 8,000-character
+    /// result" is a property of the code's shape rather than a string someone has
+    /// to keep in step (BR-3, LESSON-447).
+    async fn refine(
+        &self,
+        args: &Value,
+        _request: &str,
+        duties: &ToolDuties<'_>,
+        outcome: ToolOutcome,
+    ) -> RefinedOutcome {
+        // **ADR-5, the whole of it.** The size arm is answered by the length of
+        // the stdout+stderr the command really produced, which `render_output`
+        // captured and recorded at the one moment it existed — before the cap was
+        // applied. Measuring the *rendered* result here instead would compare a
+        // post-truncation length against the cap that produced it, so the arm
+        // could never fire on the results it exists for (LESSON-443).
+        //
+        // A result with no recorded length was never capped, so the raw output
+        // was at most the cap and the size arm is false whatever the exact number
+        // was.
+        const RAW_OUTPUT_WITHIN_CAP: usize = 0;
+        let raw_output_chars =
+            recorded_raw_output_chars(&outcome.content).unwrap_or(RAW_OUTPUT_WITHIN_CAP);
+        if !shell_duty::worth_interpreting(outcome.is_error, raw_output_chars) {
+            // A command that succeeded and fit is already legible. No model call,
+            // and nothing to report: a duty not worth making is not a duty that
+            // failed. This is the case `shell` is in for most of a session.
+            return RefinedOutcome::unrefined(outcome);
+        }
+        // BR-7 / LESSON-432: the egress provenance of the command output, as this
+        // tool itself reported it on the outcome — `Unknown` for anything a
+        // command produced, because the daemon cannot know which files it read.
+        // The choke point fail-closes on that before it looks at a boundary glob,
+        // so a remotely bound duty is refused on any machine with a boundary
+        // configured, and the arm below degrades. That is the guarantee holding,
+        // not a gap.
+        let provenance = tool_result_provenance(&outcome.provenance);
+        let command = opt_str_arg(args, "command").unwrap_or_default();
+        let interpreted =
+            shell_duty::interpret_output(duties.shell, &command, &outcome.content, &provenance)
+                .await;
+        match interpreted {
+            Ok(interpretation) => {
+                let content = render_interpreted(&interpretation, &outcome.content);
+                // `is_error` and the provenance ride through untouched: a failing
+                // command that has been *explained* has still failed, and the
+                // BR-6 verification gate must keep seeing that (REQ-544 MED-4).
+                RefinedOutcome::unrefined(ToolOutcome { content, ..outcome })
+            }
+            Err(error) => RefinedOutcome::degraded(outcome, error),
+        }
+    }
+}
+
+/// The line [`Tool::run`] appends when the command's raw output ran past
+/// [`MAX_OUTPUT_CHARS`], carrying the length the cap threw away.
+///
+/// Written once here and read once in [`recorded_raw_output_chars`], for the
+/// reason every other duty constant in this REQ is shared between its writer and
+/// its reader: two spellings of one sentence drift. This one carries the fact
+/// [`Tool::refine`] cannot recompute — by the time `refine` runs, the raw output
+/// is gone (ADR-5) — and it tells the model how much it is missing, which the
+/// bare "(output truncated)" it replaces did not.
+fn truncation_notice(raw_output_chars: usize) -> String {
+    format!("{TRUNCATION_NOTICE_PREFIX}{raw_output_chars}{TRUNCATION_NOTICE_SUFFIX}")
+}
+
+/// The opening of [`truncation_notice`], up to the recorded length.
+const TRUNCATION_NOTICE_PREFIX: &str = "... (output truncated; ";
+
+/// The close of [`truncation_notice`], after the recorded length.
+const TRUNCATION_NOTICE_SUFFIX: &str = " chars total)";
+
+/// The raw stdout+stderr length [`Tool::run`] recorded on this result, or `None`
+/// when the cap never fired and there was nothing to record.
+///
+/// Read off the last line, which is where [`render_output`] puts it. A command
+/// that prints a forged notice as its own final line can cost itself one model
+/// call and nothing more: the number only ever feeds
+/// [`shell_duty::worth_interpreting`], so the worst it can buy is an
+/// interpretation of output that did not need one.
+fn recorded_raw_output_chars(content: &str) -> Option<usize> {
+    content
+        .lines()
+        .next_back()?
+        .strip_prefix(TRUNCATION_NOTICE_PREFIX)?
+        .strip_suffix(TRUNCATION_NOTICE_SUFFIX)?
+        .parse()
+        .ok()
+}
+
+/// The command's own result with the duty's one-line interpretation above it.
+///
+/// The interpretation goes **first** so a weak model reads what happened before
+/// it reads the wall of output, and the output is kept in full: the duty says
+/// what a failure means, it does not get to decide what the model is allowed to
+/// see.
+fn render_interpreted(interpretation: &str, output: &str) -> String {
+    format!("[shell: {interpretation}]\n{output}")
 }
 
 /// Remove credential-bearing variables from an environment, keeping everything
@@ -238,9 +378,15 @@ fn render_output(command: &str, output: &Output) -> ToolOutcome {
         body.push_str(stderr.trim_end());
         body.push('\n');
     }
-    if body.chars().count() > MAX_OUTPUT_CHARS {
+    // REQ-561 ADR-5: the length of what the command **actually** produced, taken
+    // before the cap is applied. This is the last moment it exists — `run`
+    // returns only the capped text — and it is the number the `shell` duty's size
+    // trigger is decided on, so it is recorded in the notice rather than left to
+    // be re-derived from a string the cap has already clamped (LESSON-443).
+    let raw_output_chars = body.chars().count();
+    if raw_output_chars > MAX_OUTPUT_CHARS {
         let truncated: String = body.chars().take(MAX_OUTPUT_CHARS).collect();
-        body = format!("{truncated}\n... (output truncated)");
+        body = format!("{truncated}\n{}", truncation_notice(raw_output_chars));
     }
 
     let code = output.status.code();
@@ -417,5 +563,316 @@ mod tests {
             "backgrounded grandchild outlived the deadline"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // The `shell` duty at its call site (REQ-561 TASK-061).
+    //
+    // Driven through the real `run` against real commands rather than
+    // hand-written `ToolOutcome`s, because the claims under test are about
+    // *today's* result — the 8,000-character cap, the status line, the error
+    // flag — and today's result is whatever `run` produces, not what a fixture
+    // author believes it produces. It is also the only way the raw-length
+    // capture (ADR-5) is exercised at all: a hand-built outcome would have to
+    // hand-write the notice, which is exactly the code under test.
+    // -----------------------------------------------------------------------
+
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use teton_inference::{Completion, Engine, EngineError, GenParams, MockEngine};
+
+    use crate::harness::context::ToolProvenance;
+    use crate::harness::duty::DutyRoute;
+    use crate::harness::shell_duty::{SHELL_DUTY, SHELL_TRIGGER_OUTPUT_CHARS};
+
+    /// An engine that answers `reply` and counts how often it was asked.
+    ///
+    /// The count is the load-bearing half of AC-13: an outcome that merely
+    /// *looks* unchanged is equally consistent with a duty that ran and returned
+    /// something the caller then discarded. Only the counter distinguishes
+    /// "cost nothing" from "cost a model call and threw it away".
+    struct CountingEngine {
+        reply: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Engine for CountingEngine {
+        fn model_id(&self) -> &str {
+            "counting"
+        }
+        fn complete(
+            &self,
+            _prompt: &str,
+            _params: &GenParams,
+            _on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<Completion, EngineError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Completion {
+                text: self.reply.clone(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+    }
+
+    /// A local `shell` route answering `reply`, and its call counter.
+    fn counting_route(reply: &str) -> (DutyRoute, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(CountingEngine {
+            reply: reply.to_owned(),
+            calls: Arc::clone(&calls),
+        }));
+        (DutyRoute::local(SHELL_DUTY, "local", engine), calls)
+    }
+
+    /// A local `shell` route answering `reply`.
+    fn local_route(reply: &str) -> DutyRoute {
+        let engine: Arc<Mutex<dyn Engine>> =
+            Arc::new(Mutex::new(MockEngine::with_response("mock", reply)));
+        DutyRoute::local(SHELL_DUTY, "local", engine)
+    }
+
+    /// `run` then `refine`, over `route`.
+    async fn run_and_refine(
+        root: &Path,
+        args: &Value,
+        route: &DutyRoute,
+    ) -> (ToolOutcome, RefinedOutcome) {
+        let ctx = ToolContext::new(root);
+        let raw = ShellTool::default().run(&ctx, args);
+        let refined = ShellTool::default()
+            .refine(
+                args,
+                "make the tests pass",
+                &ToolDuties {
+                    // `shell` never reaches it.
+                    triage: &DutyRoute::unresolved("no triage route in this test"),
+                    shell: route,
+                },
+                raw.clone(),
+            )
+            .await;
+        (raw, refined)
+    }
+
+    /// A repo holding `out.txt`, sized so that `cat out.txt` produces a
+    /// [`render_output`] body of **exactly** `body_chars` characters.
+    ///
+    /// `render_output` trims the trailing newline off stdout and appends its own,
+    /// so a file of N `x`s plus a newline yields a body of N + 1 characters —
+    /// hence the one fewer written here. The exactness is what lets the
+    /// at-the-cap row below actually sit on the boundary rather than near it.
+    fn repo_printing(tag: &str, body_chars: usize) -> PathBuf {
+        let root = temp_root(tag);
+        let mut body = "x".repeat(body_chars - 1);
+        body.push('\n');
+        std::fs::write(root.join("out.txt"), body).unwrap();
+        root
+    }
+
+    /// **AC-13, the load-bearing test.** Four commands, one duty, counted calls.
+    ///
+    /// The row that matters is the first: a short successful command — most of
+    /// what a session runs — costs **zero** model calls. Everything else this
+    /// duty does is only affordable because of that row, so it is asserted by
+    /// call count rather than by output shape.
+    ///
+    /// The second row is the mutation detector for ADR-5. Its raw output fills
+    /// the cap exactly and is therefore *not* truncated, so it must not fire —
+    /// and a trigger evaluated on the rendered result instead of on the raw
+    /// length would fire, because the status line pushes the rendered result
+    /// past the cap.
+    #[tokio::test]
+    async fn the_duty_fires_on_failure_or_a_capped_output_and_on_nothing_else() {
+        let over = SHELL_TRIGGER_OUTPUT_CHARS + 1_000;
+        for (label, tag, chars, command, expected_calls) in [
+            ("exit 0, small", "ok-small", 16usize, "cat out.txt", 0usize),
+            (
+                "exit 0, exactly at the cap",
+                "ok-exact",
+                SHELL_TRIGGER_OUTPUT_CHARS,
+                "cat out.txt",
+                0,
+            ),
+            ("exit 0, over the cap", "ok-over", over, "cat out.txt", 1),
+            (
+                "exit non-zero, small",
+                "fail-small",
+                16,
+                "cat out.txt; exit 3",
+                1,
+            ),
+            (
+                "exit non-zero, over the cap",
+                "fail-over",
+                over,
+                "cat out.txt; exit 3",
+                1,
+            ),
+        ] {
+            let root = repo_printing(tag, chars);
+            let args = json!({ "command": command });
+            let (route, calls) = counting_route("The command produced a lot of output.");
+
+            let (raw, refined) = run_and_refine(&root, &args, &route).await;
+
+            // Non-vacuity: the fixture really is in the state its label claims.
+            assert_eq!(
+                raw.is_error,
+                command.contains("exit 3"),
+                "{label}: the fixture's exit status is not what the row says"
+            );
+            assert_eq!(
+                raw.content.contains(TRUNCATION_NOTICE_PREFIX),
+                chars > SHELL_TRIGGER_OUTPUT_CHARS,
+                "{label}: the fixture's output is not on the side of the cap the row says"
+            );
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_calls,
+                "{label}: expected {expected_calls} model call(s)"
+            );
+            if expected_calls == 0 {
+                assert_eq!(
+                    refined.outcome, raw,
+                    "{label}: a result no duty was made for must come back untouched"
+                );
+                assert_eq!(refined.duty_error, None, "{label}");
+            } else {
+                assert!(
+                    refined.outcome.content.starts_with("[shell: "),
+                    "{label}: {}",
+                    &refined.outcome.content[..refined.outcome.content.len().min(120)]
+                );
+            }
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// **BR-3, the whole of it.** Every way the duty can fail returns the value
+    /// `run` produced — asserted by struct equality against that value, so
+    /// "today's 8,000-character truncated output, verbatim" means verbatim — and
+    /// says why on the outcome rather than only in a log.
+    #[tokio::test]
+    async fn every_shell_duty_failure_returns_the_tools_own_capped_result_verbatim() {
+        let root = repo_printing("degrade", SHELL_TRIGGER_OUTPUT_CHARS + 1_000);
+        let args = json!({ "command": "cat out.txt" });
+
+        let unresolvable = DutyRoute::unresolved(
+            "The 'shell' category inherits the 'build' tier, which is not bound to any provider.",
+        );
+        let engine_failure: DutyRoute = {
+            let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::unavailable(
+                "mock",
+                "the local tier is not loaded",
+            )));
+            DutyRoute::local(SHELL_DUTY, "local", engine)
+        };
+        let empty_answer = local_route("   ");
+
+        for (label, route, expected) in [
+            (
+                "unresolvable binding",
+                &unresolvable,
+                "not bound to any provider",
+            ),
+            ("provider failure", &engine_failure, "not loaded"),
+            (
+                "an answer with nothing in it",
+                &empty_answer,
+                "nothing to interpret",
+            ),
+        ] {
+            let (raw, refined) = run_and_refine(&root, &args, route).await;
+            // Non-vacuity: the fallback really is the truncated result, not a
+            // short one that never exercised the cap.
+            assert!(
+                raw.content.contains(TRUNCATION_NOTICE_PREFIX),
+                "{label}: the fixture must exercise the cap"
+            );
+            assert_eq!(
+                refined.outcome, raw,
+                "{label}: the tool's own capped result must come back untouched"
+            );
+            let error = refined
+                .duty_error
+                .expect("a degradation must be visible on the outcome, not only in a log");
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The interpretation is added *above* the command's own result, and the
+    /// facts the rest of the loop reads off that result are untouched.
+    ///
+    /// `is_error` in particular: REQ-544 MED-4 makes the BR-6 verification gate
+    /// turn on it, so a failing `cargo test` that has been *explained* must still
+    /// count as unverified. An interpretation that cleared the flag would let a
+    /// weak model declare victory off a failed check.
+    #[tokio::test]
+    async fn an_interpreted_failure_keeps_its_output_its_error_flag_and_its_provenance() {
+        let root = repo_printing("interpret", 16);
+        let args = json!({ "command": "cat out.txt; exit 3" });
+        let route = local_route("The command exited 3 because the file check failed.");
+
+        let (raw, refined) = run_and_refine(&root, &args, &route).await;
+
+        assert_eq!(refined.duty_error, None);
+        assert_eq!(
+            refined.outcome.content,
+            format!(
+                "[shell: The command exited 3 because the file check failed.]\n{}",
+                raw.content
+            ),
+            "the command's own result must survive under the interpretation"
+        );
+        assert!(
+            refined.outcome.is_error,
+            "an explained failure still failed"
+        );
+        assert_eq!(
+            refined.outcome.provenance,
+            ToolProvenance::Unknown,
+            "interpreting a result cannot make its origin knowable"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **ADR-5, pinned.** The raw stdout+stderr length is captured before the cap
+    /// is applied and recorded on the result, so `refine` reads the length the
+    /// command really produced rather than the one the cap left behind.
+    ///
+    /// Without the recorded number there is nothing to read: the truncated body
+    /// is clamped to exactly [`MAX_OUTPUT_CHARS`], so comparing *it* against the
+    /// cap that produced it is a guard that can never fire (LESSON-443).
+    #[test]
+    fn the_raw_output_length_is_recorded_before_the_cap_is_applied() {
+        let root = repo_printing("raw-len", MAX_OUTPUT_CHARS + 1_000);
+        let ctx = ToolContext::new(&root);
+        let out = ShellTool::default().run(&ctx, &json!({ "command": "cat out.txt" }));
+
+        assert_eq!(
+            recorded_raw_output_chars(&out.content),
+            Some(MAX_OUTPUT_CHARS + 1_000),
+            "the notice must carry the length the command produced, not the capped one"
+        );
+        // And the body really was capped, so the recorded number is the only
+        // place that length still exists.
+        assert!(out.content.contains(TRUNCATION_NOTICE_PREFIX));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The notice is written once and read once, so `refine` and `render_output`
+    /// cannot drift — and an uncapped result records nothing rather than
+    /// reporting a length nobody measured.
+    #[test]
+    fn the_truncation_notice_is_written_once_and_read_once() {
+        let capped = format!("$ cat big\n(exit 0)\nxxx\n{}", truncation_notice(12_345));
+        assert_eq!(recorded_raw_output_chars(&capped), Some(12_345));
+        assert_eq!(recorded_raw_output_chars("$ ls\n(exit 0)\na.txt\n"), None);
+        assert_eq!(recorded_raw_output_chars(""), None);
     }
 }

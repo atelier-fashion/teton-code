@@ -1665,6 +1665,15 @@ fn policy_show_renders_the_daemons_resolved_table() {
         !triaged.contains("no call site"),
         "`triage` is wired (REQ-561 TASK-060) and must not carry the marker; row:\n{triaged}"
     );
+    // And the same for `shell`, which `ShellTool::refine` gave a call site in
+    // TASK-061. REQ-558's ADR-I had deferred it as unroutable; BR-4b answered
+    // that by dispatching on *interpreting* the output rather than on deciding
+    // to run the command, which happens after the command has already run.
+    let shell = row(&shown, "shell").expect("a `shell` row");
+    assert!(
+        !shell.contains("no call site"),
+        "`shell` is wired (REQ-561 TASK-061) and must not carry the marker; row:\n{shell}"
+    );
 
     // AC-12: the BR-9 declared default is configuration-visible, and the CLI
     // says so rather than leaving it compiled in silently.

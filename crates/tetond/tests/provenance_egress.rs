@@ -217,6 +217,7 @@ async fn run_touching_tool(
         // route returns the tool's own result unchanged.
         &ToolDuties {
             triage: &DutyRoute::unresolved("no triage route in this test"),
+            shell: &DutyRoute::unresolved("no shell route in this test"),
         },
     )
     .await;

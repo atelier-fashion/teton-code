@@ -16,8 +16,9 @@
 //! the direction the list actually rots in. The test at the bottom of this file
 //! closes that gap: it reads the daemon's own source, finds every routing call
 //! site, works out which categories reach a router through them, and asserts the
-//! result equals this match. Wire up `shell` and the test fails until the
-//! marker follows — which is exactly how `triage` arrived (REQ-561 TASK-060).
+//! result equals this match. Wire up `title` and the test fails until the
+//! marker follows — which is exactly how `triage` (REQ-561 TASK-060) and
+//! `shell` (TASK-061) arrived.
 //!
 //! That test is the load-bearing half of ADR-A. This match is just where its
 //! answer is written down.
@@ -49,12 +50,19 @@ pub const fn has_call_site(category: Category) -> bool {
         // (REQ-561 TASK-060). Unreached until then — the hits were returned in
         // whatever order the filesystem walk produced.
         Category::Triage => true,
+        // The `shell` tool's own duty: `ShellTool::refine` says what a command's
+        // output means, on the two results a weak model cannot read for itself —
+        // a failure, or output the 8,000-character cap truncated (REQ-561
+        // TASK-061). REQ-558's ADR-I deferred this on the reading that `shell`
+        // meant *deciding to run a command*, which indeed cannot be routed ahead
+        // of the model's answer; BR-4b resolved it the other way round — the
+        // category dispatches on **interpreting** the output, which happens after
+        // the command has already run and is routable like any other duty.
+        Category::Shell => true,
         // Declared, unreached. Egress redaction is regex-based and makes no
-        // model call; nothing names sessions or branches; compaction truncates
-        // mechanically; and `shell` is ADR-I's deliberate deferral — you cannot
-        // know a turn will emit a shell call until the model has already
-        // answered, and the interpretation half has no call site either.
-        Category::Redact | Category::Title | Category::Compact | Category::Shell => false,
+        // model call; nothing names sessions or branches; and compaction
+        // truncates mechanically.
+        Category::Redact | Category::Title | Category::Compact => false,
     }
 }
 
@@ -312,7 +320,7 @@ mod tests {
             .collect();
         assert_eq!(
             unreached,
-            vec!["redact", "title", "compact", "shell"],
+            vec!["redact", "title", "compact"],
             "the unreached set changed"
         );
     }

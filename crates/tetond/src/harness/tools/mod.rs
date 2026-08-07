@@ -231,6 +231,10 @@ pub struct ToolDuties<'a> {
     /// The `triage` category, resolved for this turn (TASK-060). Ranks a `grep`
     /// result against the request before it enters context.
     pub triage: &'a DutyRoute,
+    /// The `shell` category, resolved for this turn (TASK-061). Says what a
+    /// command's output means — but only when the command failed or its output
+    /// was capped, so an ordinary command costs nothing.
+    pub shell: &'a DutyRoute,
 }
 
 /// A tool result after its own tool had the chance to refine it through a duty.

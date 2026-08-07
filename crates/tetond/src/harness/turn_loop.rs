@@ -52,6 +52,7 @@ use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
 use super::reply::StreamGate;
+use super::shell_duty::SHELL_DUTY;
 use super::tools::{RefinedOutcome, ToolContext, ToolDuties, ToolOutcome, ToolRegistry};
 use super::triage::TRIAGE_DUTY;
 
@@ -351,6 +352,7 @@ pub async fn run_session_turn(
     // entry point has no router, and a path whose whole guarantee is "no
     // transport exists here" is not the place to acquire one.
     let triage = DutyRoute::local(TRIAGE_DUTY, "local", Arc::clone(engine));
+    let shell = DutyRoute::local(SHELL_DUTY, "local", Arc::clone(engine));
     run_session_turn_with_source(
         &mut source,
         tools,
@@ -361,7 +363,10 @@ pub async fn run_session_turn(
         config,
         hook,
         &digest,
-        &ToolDuties { triage: &triage },
+        &ToolDuties {
+            triage: &triage,
+            shell: &shell,
+        },
     )
     .await
 }
@@ -927,6 +932,7 @@ mod tests {
         let digest = DutyRoute::unresolved("no digest route in this test");
         // And no tool runs, so no tool duty is reached either.
         let triage = DutyRoute::unresolved("no triage route in this test");
+        let shell = DutyRoute::unresolved("no shell route in this test");
 
         run_session_turn_with_source(
             source,
@@ -938,7 +944,10 @@ mod tests {
             &config,
             &mut hook,
             &digest,
-            &ToolDuties { triage: &triage },
+            &ToolDuties {
+                triage: &triage,
+                shell: &shell,
+            },
         )
         .await
         .expect("the turn completes");

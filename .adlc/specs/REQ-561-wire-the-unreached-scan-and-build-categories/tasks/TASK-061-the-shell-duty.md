@@ -1,7 +1,7 @@
 ---
 id: TASK-061
 title: "The shell duty — interpret command output on failure or oversize"
-status: draft
+status: complete
 parent: REQ-561
 created: 2026-08-07
 updated: 2026-08-07
