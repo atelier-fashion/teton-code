@@ -1,10 +1,10 @@
 ---
 id: REQ-558
 title: "Purpose-oriented routing categories as the runtime dispatch key"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-07
 component: "daemon/router"
 domain: "routing"
 stack: ["rust", "daemon", "cli"]
