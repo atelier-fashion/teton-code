@@ -2019,6 +2019,15 @@ mod tests {
     /// droppable block holds no decision a model is needed for — the hard gate
     /// already makes it, for free — so however hard it is pressing on its budget
     /// it buys nothing.
+    ///
+    /// This is also the one state in which a **declined** outcome leaves the
+    /// context genuinely over budget, which is why the gate afterwards is
+    /// unconditional rather than conditional on the outcome having degraded:
+    /// `degraded: false` here does not mean "there was nothing to do". Pinned
+    /// with an explicit over-budget assertion *before* the gate (REQ-561
+    /// TASK-065) — without it the last two lines are satisfied by a context that
+    /// was under budget all along, and a gate skipped on a non-degraded outcome
+    /// would leave this test green.
     #[tokio::test]
     async fn a_conversation_too_short_to_hold_a_decision_buys_no_compact_call() {
         let mut ctx = conversation(2, 3_000);
@@ -2033,6 +2042,18 @@ mod tests {
 
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
         assert!(!out.degraded);
+        assert_eq!(
+            out.reason, None,
+            "declining explains nothing, because nothing failed"
+        );
+        assert!(
+            ctx.estimated_bytes() > TEST_BUDGET_BYTES,
+            "a declined compaction leaves the context exactly as it found it — over \
+             budget by {} bytes — so the gate below is the only thing standing between \
+             this turn and an over-window prompt",
+            ctx.estimated_bytes() - TEST_BUDGET_BYTES
+        );
+
         // And the budget still holds, because it never depended on the duty.
         ctx.truncate_to_budget();
         assert!(ctx.estimated_bytes() <= TEST_BUDGET_BYTES);

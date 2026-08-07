@@ -571,10 +571,28 @@ mod tests {
         );
     }
 
-    /// The ceiling is wide enough for a ranking of the tool's own cap — a bound
-    /// that truncated a legitimate full ranking would be a silent filter.
+    /// The ceiling is a **band** around the widest legitimate answer, not just a
+    /// floor under it.
+    ///
+    /// The lower half is the obvious one: a bound that truncated a full ranking
+    /// of the tool's own cap would be a silent filter. The upper half is the one
+    /// that makes the bound mean anything — a ceiling is a safety bound on an
+    /// untrusted stream, so a ceiling many times larger than any answer the duty
+    /// could legitimately produce is not bounding the duty, it is bounding
+    /// nothing. Without it, widening this constant kills no test: AC-11's
+    /// enforcement test reads the constant, so it moves with it (the disclosed
+    /// limitation this closes; `title` closes the same gap by deriving its
+    /// ceiling from its contract's word budget).
+    ///
+    /// [`CEILING_HEADROOM`] is the multiple, stated rather than implied.
     #[test]
-    fn the_ceiling_admits_a_ranking_of_every_capped_match() {
+    fn the_ceiling_is_a_band_around_a_ranking_of_every_capped_match() {
+        /// How much bigger than the widest legitimate answer a ceiling may be.
+        ///
+        /// Room for a different separator, a stray token, a slightly larger tool
+        /// cap — and not room for a different order of magnitude.
+        const CEILING_HEADROOM: usize = 4;
+
         let full: String = (1..=200)
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
@@ -584,6 +602,15 @@ mod tests {
             "a full ranking is {} bytes and the ceiling is {TRIAGE_OUTPUT_MAX_BYTES}",
             full.len()
         );
+        assert!(
+            TRIAGE_OUTPUT_MAX_BYTES < CEILING_HEADROOM * full.len(),
+            "the ceiling is {TRIAGE_OUTPUT_MAX_BYTES} bytes against a widest legitimate \
+             answer of {} — more than {CEILING_HEADROOM}× the largest thing this duty \
+             can honestly say is a bound on nothing",
+            full.len()
+        );
+        assert_eq!(TRIAGE_DUTY.ceiling_bytes(), TRIAGE_OUTPUT_MAX_BYTES);
+        assert_eq!(TRIAGE_DUTY.category(), Category::Triage);
     }
 
     // -- the boundary interaction (BR-7) ------------------------------------

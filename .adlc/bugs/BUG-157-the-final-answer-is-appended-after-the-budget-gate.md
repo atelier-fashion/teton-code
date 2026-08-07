@@ -49,7 +49,21 @@ Whichever is chosen, the test to add is the one that does **not** pin
 `max_turns: 1`: assert the context is under budget at turn end, not merely at the
 gate.
 
+## Do this as part of the fix
+
+REQ-561's ADR-4 wants the budget gate to be **structurally** unconditional. At
+TASK-065 the mutation `if compaction.degraded { ctx.truncate_to_budget(); }` was
+found to leave the whole suite green — an *equivalent mutant at the loop*,
+because every reachable outcome there is already under budget. That equivalence
+depends on how many blocks the loop has pushed before compaction runs, which is
+exactly what this bug's fix changes.
+
+**So: re-run that mutation after fixing this.** If it becomes catchable, add the
+test — the guarantee would then rest on a discriminating assertion rather than on
+a reachability argument, which is where ADR-4 wants it.
+
 ## Related
 
 - REQ-561 AC-14 (the budget is enforced by `truncate_to_budget`, not by the duty)
-- ADR-4 in `.adlc/specs/REQ-561-*/architecture.md`
+- ADR-4 in `.adlc/specs/REQ-561-*/architecture.md`, including its "honest
+  limitation" note

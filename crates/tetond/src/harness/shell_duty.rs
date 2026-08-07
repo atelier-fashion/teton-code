@@ -534,6 +534,35 @@ mod tests {
         );
     }
 
+    /// The ceiling is smaller than the output it explains — this module's own
+    /// stated rationale, pinned so it cannot quietly stop being true.
+    ///
+    /// An "interpretation" longer than the 8,000 characters it interprets is not
+    /// an interpretation, and folding one into context would grow the very
+    /// budget this duty exists to make legible. Asserted at compile time because
+    /// the relationship between two constants is a compile-time fact.
+    ///
+    /// **What this does not catch**, stated rather than left to be discovered:
+    /// a widening *within* the range — 2 KiB to 4 KiB — survives it, because
+    /// AC-11's enforcement test reads the constant and moves with it. `title`
+    /// closes that by deriving its number from its contract's word budget and
+    /// `triage` by banding its against the widest answer it can produce; neither
+    /// derivation is available here, because "three sentences of prose" has no
+    /// honest byte size. The neighbour pins in
+    /// [`crate::harness::duty`](super::duty)'s
+    /// `every_duty_declares_a_ceiling_and_the_five_are_ordered` bound the other
+    /// end.
+    #[test]
+    fn the_ceiling_is_smaller_than_the_output_it_interprets() {
+        const {
+            assert!(SHELL_OUTPUT_MAX_BYTES < SHELL_TRIGGER_OUTPUT_CHARS);
+            assert!(SHELL_OUTPUT_MAX_BYTES < crate::harness::context::SUMMARIZER_INPUT_MAX_BYTES);
+        }
+        assert_eq!(SHELL_TRIGGER_OUTPUT_CHARS, MAX_OUTPUT_CHARS);
+        assert_eq!(SHELL_DUTY.ceiling_bytes(), SHELL_OUTPUT_MAX_BYTES);
+        assert_eq!(SHELL_DUTY.category(), Category::Shell);
+    }
+
     // -- the boundary interaction (BR-7) ------------------------------------
 
     fn boundaries() -> Vec<PrivacyBoundary> {

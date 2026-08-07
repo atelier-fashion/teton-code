@@ -618,6 +618,19 @@ mod tests {
             // `DIGEST_OUTPUT_MAX_BYTES` is private and is *defined* as this.
             assert!(COMPACT_OUTPUT_MAX_BYTES > crate::harness::context::SUMMARIZER_INPUT_MAX_BYTES);
         }
+        // And it is that number for a *reason* the code states, not one that
+        // happens to look about right: a replacement paragraph larger than the
+        // window it is making room in could never be applied, because
+        // `compact_if_pressured`'s budget check would reject it. Pinning the
+        // derivation is what stops a widening from silently un-testing AC-11,
+        // whose enforcement assertion reads this constant and therefore moves
+        // with it (the same gap `title` closes by deriving from its contract).
+        assert_eq!(
+            COMPACT_OUTPUT_MAX_BYTES,
+            super::super::HarnessConfig::default().context_budget_bytes,
+            "the ceiling is the default context byte budget, because a compaction \
+             bigger than the window it makes room in is bytes spent to be thrown away"
+        );
         assert_eq!(COMPACT_DUTY.ceiling_bytes(), COMPACT_OUTPUT_MAX_BYTES);
         assert_eq!(COMPACT_DUTY.category(), Category::Compact);
     }

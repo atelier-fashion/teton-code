@@ -137,8 +137,33 @@ written about.
 
 AC-14 tests this by stubbing the duty three ways (never returns, returns
 garbage, entirely unrouted) and asserting the context is under budget after each.
-The mutation that must go red: making the 100% gate conditional on the duty
-having failed.
+
+**Honest limitation, found at TASK-065 and verified by hand.** The mutation this
+ADR names as the one that must go red — making the gate
+`if compaction.degraded { ctx.truncate_to_budget(); }` — leaves the **entire
+suite green**. I applied it myself and confirmed: 1243 passed, 0 failed.
+
+It is an **equivalent mutant at the loop**, not a test gap. Within the turn loop,
+every reachable outcome is already under budget: an applied compaction is under
+budget by construction (the apply step rejects over-budget candidates), and an
+unpressured decline implies under budget. The one arm that would discriminate —
+declining for too few blocks while still over budget — is unreachable *from the
+loop*, which has already pushed a model block and a tool-result block before
+compaction runs. That arm **is** reachable through the public
+`compact_if_pressured` (verified at 6,211 B against a 4,000 B budget with
+`degraded: false`) and is pinned there.
+
+So the property holds, but **at the loop it currently rests on an equivalence
+argument rather than on a discriminating test** — it is true because of an
+incidental fact about how many blocks the loop pushes, not because the gate is
+structurally unconditional. That is precisely the "almost-true invariant a later
+change builds on" shape of BUG-157, and the two are coupled: **BUG-157's fix
+changes when the loop appends blocks, which may make this mutation catchable.
+Re-run it as part of that fix.**
+
+Recorded rather than papered over, per LESSON-485 — a green mutation is a fact
+about the tests, and an equivalent-mutant claim is only worth as much as the
+reachability argument behind it.
 
 ## ADR-5: `shell` decides on the **raw** output, before truncation
 

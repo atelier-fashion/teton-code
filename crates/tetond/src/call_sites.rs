@@ -80,15 +80,100 @@ pub const fn has_call_site(category: Category) -> bool {
     }
 }
 
+/// Reading the daemon's own source as text, for the tests that assert facts
+/// about the code rather than about its behaviour.
+///
+/// Shared rather than copied: the derived-marker test here and the seam
+/// assertions in [`crate::harness::duty`] (REQ-561 AC-8/AC-10) both walk the
+/// daemon's sources and both need the same "production source only" rule. Two
+/// spellings of that rule are two rules that drift, and a drifted one is a scan
+/// that quietly stops seeing a file.
+#[cfg(test)]
+pub(crate) mod scan {
+    use std::path::{Path, PathBuf};
+
+    /// The daemon's own `src/` directory.
+    pub(crate) fn daemon_src() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    pub(crate) fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("readable source dir") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A file's source with its test modules removed.
+    ///
+    /// Every module in this crate puts `#[cfg(test)]` items last, so truncating
+    /// at the first one is exact today and *conservative* if that ever changes:
+    /// it can only shrink what a scan sees, which makes an assertion fail loudly
+    /// rather than pass wrongly.
+    pub(crate) fn production_source(path: &Path) -> String {
+        let text = std::fs::read_to_string(path).expect("readable source file");
+        match text.find("\n#[cfg(test)]") {
+            Some(at) => text[..at].to_owned(),
+            None => text,
+        }
+    }
+
+    /// Every production `.rs` under `src/`, as `(path relative to src/, source)`,
+    /// in sorted order.
+    pub(crate) fn production_sources() -> Vec<(String, String)> {
+        let root = daemon_src();
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        files.sort();
+        files
+            .iter()
+            .map(|path| {
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("a file under src/")
+                    .to_string_lossy()
+                    .into_owned();
+                (rel, production_source(path))
+            })
+            .collect()
+    }
+
+    /// `source` with whole-line comments removed.
+    ///
+    /// The derived-marker scan in this module deliberately reads comments —
+    /// ADR-9 exists because it does. The seam assertions deliberately do not: an
+    /// ADR quoted in a doc comment is not a second implementation. Trailing
+    /// comments are left in place, which can only make a seam assertion
+    /// over-count and fail loudly.
+    pub(crate) fn code_only(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// How many times `needle` occurs in `haystack`.
+    pub(crate) fn count(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
 
     use teton_core::category::{category_for_phase, JudgmentCategory};
     use teton_core::Phase;
+
+    use super::scan::{daemon_src, production_source, rust_files};
 
     /// The `Router` methods that answer "where does this category go".
     ///
@@ -120,35 +205,6 @@ mod tests {
 
     /// The three the scan reads a category out of.
     const CATEGORY_BEARING: [&str; 3] = ["resolve", "resolution_for", "resolve_judgment"];
-
-    fn daemon_src() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-    }
-
-    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("readable source dir") {
-            let path = entry.expect("readable dir entry").path();
-            if path.is_dir() {
-                rust_files(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-
-    /// A file's source with its test modules removed.
-    ///
-    /// Every module in this crate puts `#[cfg(test)]` items last, so truncating
-    /// at the first one is exact today and *conservative* if that ever changes:
-    /// it can only shrink the derived set, which makes the assertion below fail
-    /// loudly rather than pass wrongly.
-    fn production_source(path: &Path) -> String {
-        let text = std::fs::read_to_string(path).expect("readable source file");
-        match text.find("\n#[cfg(test)]") {
-            Some(at) => text[..at].to_owned(),
-            None => text,
-        }
-    }
 
     /// The argument text of the call whose `(` is at `open`, paren-balanced.
     fn argument(source: &str, open: usize) -> &str {

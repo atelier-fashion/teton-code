@@ -71,6 +71,76 @@
 //! [`DutyRoute::Unresolved`] carrying the resolver's own reason. Both leave the
 //! call site holding an explanation it can degrade with, which is the whole
 //! reason neither is a bare `None`.
+//!
+//! # What breaks which test
+//!
+//! REQ-561 AC-9, across all five duties. Every row was **applied to the source,
+//! compiled, and observed** (LESSON-441); none was reasoned about. Test paths
+//! are relative to `tetond`'s lib target unless a `tests/` file is named.
+//! `compact`'s own four-link chain has its own table at
+//! [`super::compact`]'s module head; this one is the cross-cutting set.
+//!
+//! ## AC-9(a) — the session-taint override, one row per duty
+//!
+//! Each row deletes that duty's `is_tainted` arm in [`crate::runtime`], so the
+//! duty resolves its configured binding on a tainted session.
+//!
+//! | Mutation | Fails |
+//! |---|---|
+//! | `digest_route` loses its taint arm | `runtime::tests::dispatch::digest::a_tainted_session_digests_on_the_local_tier` |
+//! | `triage_route` loses its taint arm | `runtime::tests::dispatch::triage::a_tainted_session_triages_on_the_local_tier`, `tests/e2e/duty_taint.rs::a_tainted_sessions_duties_never_reach_the_provider_they_are_bound_to` |
+//! | `shell_route` loses its taint arm | `runtime::tests::dispatch::shell::a_tainted_session_interprets_on_the_local_tier`, and the same e2e test — the duty is then refused at the choke point instead of served locally, so its interpretation vanishes from the reply |
+//! | `title_route` loses its taint arm | `runtime::tests::dispatch::title::a_tainted_session_titles_on_the_local_tier`, and the same e2e test, **by captured bytes** |
+//! | `compact_route` loses its taint arm | `runtime::tests::dispatch::compact::a_tainted_session_compacts_on_the_local_tier` |
+//!
+//! ## AC-9(b) — the failure path stops preserving the call site's invariant
+//!
+//! `digest` and `compact` must *not* return their input unchanged (their whole
+//! job is to shrink it); `triage`, `shell` and `title` must. So the mutation is
+//! whichever direction breaks that duty's invariant.
+//!
+//! | Mutation | Fails |
+//! |---|---|
+//! | `summarize_if_large`'s mechanical fallback folds the raw text instead of truncating it | `harness::context::tests::engine_failure_falls_back_to_bounded_mechanical_truncation`, `harness::digest::tests::an_unresolved_digest_still_bounds_an_oversized_result`, `…::a_local_only_tool_result_is_never_sent_to_a_remote_digest`, `tests/duty_matrix.rs::every_duty_holds_its_call_sites_invariant_on_every_failure_path` |
+//! | `GrepTool::refine`'s failure arm drops the tool's own result instead of returning it | `harness::tools::grep::tests::every_triage_failure_returns_the_tools_own_unranked_result_verbatim`, `tests/duty_matrix.rs::every_duty_holds_…` |
+//! | `ShellTool::refine`'s failure arm drops the tool's own result | `harness::tools::shell::tests::every_shell_duty_failure_returns_the_tools_own_capped_result_verbatim`, `tests/duty_matrix.rs::every_duty_holds_…`, `tests/duty_egress.rs::a_shell_duty_sends_only_on_a_machine_with_no_boundary_configured` |
+//! | `name_session` answers a failure with a blank title instead of no title | `harness::title::tests::an_empty_answer_is_a_failure_not_a_blank_title`, `…::a_title_over_boundary_content_is_refused_before_a_byte_leaves`, `runtime::tests::dispatch::title::a_failed_title_does_not_retry_on_the_next_turn`, `tests/duty_matrix.rs::every_duty_holds_…` |
+//! | the loop's `truncate_to_budget()` becomes conditional on the compaction having **worked** | `harness::turn_loop::tests::a_turn_whose_compact_duty_cannot_serve_still_ends_under_budget` |
+//!
+//! ## The seam's own guarantees
+//!
+//! | Mutation | Fails |
+//! |---|---|
+//! | the ceiling site stops bounding the accumulator (BR-8) | all five `harness::*::tests::a_remote_*_is_bounded_however_much_the_provider_streams` |
+//! | [`Egress::scoped`] is handed an empty provenance instead of the content's (BR-7) | six per-duty boundary tests, every test in `tests/duty_egress.rs`, and `tests/duty_matrix.rs::every_duty_holds_…` |
+//! | a duty module grows a category from a tool name (`if name == "grep" { … }`) | [`tests::no_duty_category_is_ever_produced_from_text`] |
+//! | a per-category route enum grows back (BR-6) | [`tests::one_route_type_one_trait_and_two_implementations_serve_every_duty`] |
+//! | a duty module takes an `Egress` of its own (BR-6) | [`tests::no_duty_module_carries_any_of_the_seams_concerns`] |
+//!
+//! ## One mutation came back green, and it is recorded rather than fixed
+//!
+//! Making the loop's gate conditional the **other** way —
+//! `if compaction.degraded { ctx.truncate_to_budget(); }` — leaves the whole
+//! suite passing. That is not a coverage gap: within the loop it is an
+//! *equivalent* mutant, and the three non-degraded outcomes are why.
+//!
+//! 1. **Applied.** [`ContextManager::compact_if_pressured`](super::context::ContextManager::compact_if_pressured)
+//!    commits a candidate only after checking it fits both budgets, so a
+//!    successful compaction ends under budget and the gate is a no-op.
+//! 2. **Declined for want of pressure.** Under the soft threshold in both
+//!    currencies implies under budget in both, so again a no-op.
+//! 3. **Declined for want of blocks.** This one *can* be over budget — verified:
+//!    a two-block conversation at 6,211 B against a 4,000 B budget declines with
+//!    `degraded: false` — but it is unreachable from the loop, which has pushed
+//!    a model block and a tool-result block on top of the caller's user turn
+//!    before compaction runs, so `blocks.len() >= COMPACT_MIN_BLOCKS` always.
+//!
+//! Reachable through the public method, though, so the state is pinned at the
+//! manager by `harness::context::tests::a_conversation_too_short_to_hold_a_decision_buys_no_compact_call`,
+//! which TASK-065 strengthened with the over-budget assertion the gate's
+//! necessity rests on. The equivalence is a property of today's single caller,
+//! not a guarantee: a second caller that skipped the gate on a non-degraded
+//! outcome would be over budget, which is why the call stays unconditional.
 
 use std::sync::{Arc, Mutex};
 
@@ -490,5 +560,434 @@ impl<T: Transport> Duty for RemoteDuty<T> {
             text.truncate(floor_char_boundary(&text, ceiling));
         }
         Ok(text.trim().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::call_sites::scan::{code_only, count, production_sources};
+
+    /// The five duty modules — where ADR-3 allows per-category source to live,
+    /// and the only place it may.
+    const DUTY_MODULES: [&str; 5] = [
+        "harness/digest.rs",
+        "harness/triage.rs",
+        "harness/shell_duty.rs",
+        "harness/title.rs",
+        "harness/compact.rs",
+    ];
+
+    /// The one place in the daemon that maps text to a routing-category *name*,
+    /// named here so the exception below is a stated decision rather than a hole
+    /// in the scan (the shape `REPORTING_ONLY` established in
+    /// [`crate::call_sites`]).
+    ///
+    /// `cost::ledger::category_from_wire` reads back a column the ledger wrote
+    /// itself, and the value it produces is `teton_protocol::Category` — the
+    /// wire twin, which has no conversion into the routing type. It is not on
+    /// the duty path and cannot reach one. [`the_only_text_to_category_map_is_the_ledgers_own_round_trip`]
+    /// pins both halves of that.
+    const WIRE_ROUND_TRIP: &str = "cost/ledger.rs";
+
+    /// Every production source, comments stripped, as `(path, code)`.
+    fn code() -> Vec<(String, String)> {
+        production_sources()
+            .into_iter()
+            .map(|(rel, src)| (rel, code_only(&src)))
+            .collect()
+    }
+
+    /// The paths whose code contains `needle`.
+    fn files_with(needle: &str) -> Vec<String> {
+        code()
+            .into_iter()
+            .filter(|(_, src)| src.contains(needle))
+            .map(|(rel, _)| rel)
+            .collect()
+    }
+
+    /// The code of one production file.
+    fn source_of(rel: &str) -> String {
+        code()
+            .into_iter()
+            .find(|(path, _)| path == rel)
+            .unwrap_or_else(|| panic!("no production source at {rel}"))
+            .1
+    }
+
+    // =======================================================================
+    // AC-8 — one seam serves all five duties.
+    //
+    // The architecture states the boundary in five points; each is one
+    // assertion below, in order.
+    // =======================================================================
+
+    /// **AC-8, points 1 and 2.** Exactly one route type, exactly one `Duty`
+    /// trait, and exactly two implementations of it — the local one and the
+    /// remote one, generic over the prompt they carry and **not** over the
+    /// category.
+    ///
+    /// This is the assertion ADR-1 was written to make writable. A
+    /// `DutyRoute<T: Duty>` would monomorphise into five distinct types, which
+    /// is the five-parallel-implementations outcome BR-6 forbids expressed in
+    /// the type system instead of in copied code — and it would make this test
+    /// unwritable, because five would then be the expected number.
+    #[test]
+    fn one_route_type_one_trait_and_two_implementations_serve_every_duty() {
+        let mut route_enums: Vec<String> = Vec::new();
+        let mut trait_defs: Vec<String> = Vec::new();
+        let mut duty_impls: Vec<String> = Vec::new();
+        for (rel, src) in code() {
+            for (at, _) in src.match_indices("enum ") {
+                let name: String = src[at + "enum ".len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if name.ends_with("Route") {
+                    route_enums.push(format!("{rel}: {name}"));
+                }
+            }
+            for (at, _) in src.match_indices("trait Duty") {
+                let _ = at;
+                trait_defs.push(rel.clone());
+            }
+            duty_impls.extend(
+                src.match_indices("Duty for")
+                    .map(|_| rel.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        assert_eq!(
+            route_enums,
+            vec!["harness/duty.rs: DutyRoute"],
+            "BR-6: exactly one route enum serves every duty. A second one is the \
+             per-category plumbing this REQ removed, growing back."
+        );
+        assert_eq!(
+            trait_defs,
+            vec!["harness/duty.rs"],
+            "and exactly one `Duty` trait defines what a duty is"
+        );
+        assert_eq!(
+            duty_impls,
+            vec!["harness/duty.rs", "harness/duty.rs"],
+            "with exactly two implementations, both here: the local tier and the \
+             remote one. A third is a duty that grew its own way of running."
+        );
+
+        // And the removed shape does not survive anywhere, under any name.
+        for gone in ["DigestRoute", "Digester", "TriageRoute", "CompactRoute"] {
+            assert!(
+                files_with(gone).is_empty(),
+                "the pre-REQ-561 per-category plumbing `{gone}` is back in {:?}",
+                files_with(gone)
+            );
+        }
+    }
+
+    /// **AC-8, points 3 and 4.** One `Egress::scoped(` call on the duty path,
+    /// and one ceiling-enforcement site.
+    ///
+    /// `.scoped(` occurs twice in the daemon and the two are named here rather
+    /// than counted: the turn path's, in `harness/completion.rs`, and the duty
+    /// path's, here. A *third* is a second way to reach the network, which is
+    /// the thing the single choke point exists to make impossible.
+    ///
+    /// The ceiling is read in exactly one file and bound in exactly one
+    /// statement (LESSON-484 — enforced where the decision is made, not at each
+    /// of five call sites).
+    #[test]
+    fn the_duty_path_has_one_egress_scoping_call_and_one_ceiling_site() {
+        assert_eq!(
+            files_with(".scoped("),
+            vec!["harness/completion.rs", "harness/duty.rs"],
+            "the turn path and the duty path, and nothing else, reach a transport"
+        );
+        assert_eq!(
+            count(&source_of("harness/duty.rs"), ".scoped("),
+            1,
+            "and the duty path scopes its egress exactly once — every duty's \
+             content goes through the same call"
+        );
+
+        assert_eq!(
+            files_with("ceiling_bytes()"),
+            vec!["harness/duty.rs"],
+            "BR-8's bound is read only inside the seam; the duty modules declare \
+             their ceiling and nothing else"
+        );
+        assert_eq!(
+            files_with("let ceiling ="),
+            vec!["harness/duty.rs"],
+            "and it is bound at exactly one enforcement site (LESSON-484)"
+        );
+        assert_eq!(count(&source_of("harness/duty.rs"), "let ceiling ="), 1);
+    }
+
+    /// **AC-8, point 5.** Per-category source is bounded to what ADR-3 allows: a
+    /// resolver line naming the category, an output-contract constant, and a
+    /// prompt builder. None of the plumbing.
+    ///
+    /// The list below is every concern the seam owns. A duty module that grows
+    /// one of them has started reimplementing the seam, which is exactly the
+    /// regression AC-8 exists to catch — and it is the shape REQ-558 shipped for
+    /// `digest` and this REQ removed.
+    #[test]
+    fn no_duty_module_carries_any_of_the_seams_concerns() {
+        /// `(needle, what having it would mean)`.
+        const PLUMBING: [(&str, &str); 8] = [
+            ("trait ", "a second definition of what a duty is"),
+            ("Duty for", "a per-category duty implementation"),
+            ("Egress", "its own path to a transport"),
+            (".scoped(", "its own egress scoping"),
+            ("spawn_blocking", "its own local-execution strategy"),
+            ("EgressContext", "its own egress metadata"),
+            ("CostAttribution", "its own cost attribution"),
+            ("TurnRequest", "its own provider request"),
+        ];
+        for module in DUTY_MODULES {
+            let src = source_of(module);
+            for (needle, meaning) in PLUMBING {
+                assert!(
+                    !src.contains(needle),
+                    "BR-6 VIOLATION: `{module}` contains `{needle}` — {meaning}. The seam \
+                     owns that concern once, for all five duties (ADR-3)."
+                );
+            }
+            assert!(
+                src.contains("DutyKind::new("),
+                "`{module}` must declare its category and its ceiling in one const"
+            );
+        }
+
+        // And exactly five duties exist, each constructed exactly once. A sixth
+        // `DutyKind` built somewhere else is a duty nobody declared.
+        let built: Vec<String> = code()
+            .into_iter()
+            .flat_map(|(rel, src)| std::iter::repeat_n(rel, count(&src, "DutyKind::new(")))
+            .collect();
+        assert_eq!(
+            built.len(),
+            DUTY_MODULES.len(),
+            "one `DutyKind` per duty module and no others, but found: {built:?}"
+        );
+    }
+
+    // =======================================================================
+    // AC-10 — no duty's category comes from text.
+    // =======================================================================
+
+    /// **AC-10.** Every place the daemon names one of the five duty categories,
+    /// it names it as a literal enum variant — never derived from prompt text, a
+    /// tool name, or any string comparison.
+    ///
+    /// The type system already forbids the *judgment* path from naming these
+    /// five (`JudgmentCategory` has no variant for them). Nothing forbids the
+    /// duty path from reintroducing it, and the tempting shape is exactly the
+    /// one ADR-10 rejected: `if name == "grep" { Category::Triage }` in the turn
+    /// loop. This scan is what makes that unwritable.
+    ///
+    /// The rule is mechanical: on every line that names a duty category, there
+    /// may be no string literal and no comparison. A category is *named*, never
+    /// *computed*.
+    #[test]
+    fn no_duty_category_is_ever_produced_from_text() {
+        /// Ways a line could be deciding a category by looking at data.
+        const FROM_DATA: [&str; 8] = [
+            "\"",
+            "==",
+            "!=",
+            ".contains(",
+            ".starts_with(",
+            ".ends_with(",
+            ".eq_ignore_ascii_case(",
+            "name()",
+        ];
+        /// The three shapes ADR-3 allows a duty category to be named in.
+        const ALLOWED: [&str; 3] = ["DutyKind::new(", "router.resolve(", "=>"];
+
+        let mut checked = 0usize;
+        for (rel, src) in code() {
+            if rel == WIRE_ROUND_TRIP {
+                continue;
+            }
+            for line in src.lines() {
+                if !names_a_duty_category(line) {
+                    continue;
+                }
+                checked += 1;
+                for smell in FROM_DATA {
+                    assert!(
+                        !line.contains(smell),
+                        "AC-10 VIOLATION: {rel} decides a duty category from data \
+                         (`{smell}` on the same line). A duty's category is tagged at \
+                         its call site and never derived (BR-1):\n  {}",
+                        line.trim()
+                    );
+                }
+                assert!(
+                    ALLOWED.iter().any(|shape| line.contains(shape)),
+                    "{rel} names a duty category in a shape ADR-3 does not allow \
+                     (expected one of {ALLOWED:?}):\n  {}",
+                    line.trim()
+                );
+            }
+        }
+        assert!(
+            checked >= DUTY_MODULES.len(),
+            "the scan found only {checked} duty-category mentions, which is fewer than \
+             the five `DutyKind` constants that must exist — it is reading the wrong \
+             thing"
+        );
+
+        // ADR-10's own claim, and the sharpest one: the tool layer — where a
+        // name→category map would be most natural to write — never names a
+        // category at all. `ToolRegistry::refine` looks a tool up by the same
+        // name `dispatch` already used and asks the *instance*; the category
+        // rides in on an already-resolved route.
+        for (rel, src) in code() {
+            if !rel.starts_with("harness/tools/") {
+                continue;
+            }
+            assert!(
+                !src.contains("Category::"),
+                "ADR-10 VIOLATION: {rel} names a routing category. The tool layer \
+                 dispatches on the tool, never on a name→category map (BR-1)."
+            );
+        }
+    }
+
+    /// Whether `line` names one of the five duty categories **on the routing
+    /// type**.
+    ///
+    /// The qualifier matters and is read rather than assumed. Three other enums
+    /// in this workspace carry the same variant names and none of them routes
+    /// anything: `ConfigurableCategory` is the *config* surface (which is why
+    /// `migrated.categories.contains(&ConfigurableCategory::Digest)` is a
+    /// migration decision and not a routing one), `ProtoCategory` is the wire
+    /// twin, and `ProtoConfigurableCategory` is the wire twin of the config
+    /// surface. Only `teton_core`'s `Category` — imported here and, in
+    /// `router.rs`, aliased `CoreCategory` — can reach a router.
+    fn names_a_duty_category(line: &str) -> bool {
+        const DUTIES: [&str; 5] = ["Digest", "Triage", "Shell", "Title", "Compact"];
+        const ROUTING_TYPE: [&str; 2] = ["Category", "CoreCategory"];
+        line.match_indices("Category::").any(|(at, _)| {
+            let qualifier: String = line[..at + "Category".len()]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if !ROUTING_TYPE.contains(&qualifier.as_str()) {
+                return false;
+            }
+            let variant: String = line[at + "Category::".len()..]
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect();
+            DUTIES.contains(&variant.as_str())
+        })
+    }
+
+    /// The stated exception to the scan above, pinned so it stays an exception.
+    ///
+    /// The ledger reads back a category column **it wrote itself**, which is a
+    /// round trip rather than a decision — and the value it produces is the
+    /// protocol's `Category`, the wire twin, which has no conversion into
+    /// `teton_core::Category` and therefore cannot reach a router. Both halves
+    /// are asserted, because the exception is only safe while both hold.
+    #[test]
+    fn the_only_text_to_category_map_is_the_ledgers_own_round_trip() {
+        let ledger = source_of(WIRE_ROUND_TRIP);
+        assert!(
+            ledger.contains("use teton_protocol::{Category,"),
+            "the round trip must produce the wire twin, not the routing type"
+        );
+        assert!(
+            !ledger.contains("teton_core"),
+            "the file holding the only text→category map must not be able to name \
+             the routing type at all"
+        );
+
+        // And nothing on the duty path has grown one.
+        for (rel, src) in code() {
+            if !(rel.starts_with("harness/") || rel == "runtime.rs" || rel == "router.rs") {
+                continue;
+            }
+            for line in src.lines() {
+                if !names_a_duty_category(line) {
+                    continue;
+                }
+                assert!(
+                    !line.contains('"'),
+                    "a text→category map appeared on the duty path, in {rel}:\n  {}",
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    // =======================================================================
+    // AC-11 — every duty declares a ceiling, and the five are ordered.
+    // =======================================================================
+
+    /// **AC-11, the cross-cutting half.** Each duty enforces its own bound
+    /// against its own declared constant — asserted per duty, beside each
+    /// constant, in `harness::{digest,triage,shell_duty,title,compact}::tests`.
+    /// What none of those can say is that **all five** declare one, and that the
+    /// five stand in a stated order rather than being five numbers that happen
+    /// to have been written down.
+    ///
+    /// The order is the claim BR-8 makes in prose: "a `title` is a handful of
+    /// words, a `compact` is a conversation". Asserted at compile time, because
+    /// the relationship between two constants is a compile-time fact — widening
+    /// one past its neighbour stops the build rather than waiting for a run.
+    #[test]
+    fn every_duty_declares_a_ceiling_and_the_five_are_ordered() {
+        use crate::harness::{COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY};
+
+        let declared: BTreeSet<&str> = [
+            DIGEST_DUTY,
+            TRIAGE_DUTY,
+            SHELL_DUTY,
+            TITLE_DUTY,
+            COMPACT_DUTY,
+        ]
+        .into_iter()
+        .map(|kind| kind.category().as_str())
+        .collect();
+        assert_eq!(
+            declared.into_iter().collect::<Vec<_>>(),
+            vec!["compact", "digest", "shell", "title", "triage"],
+            "the five duties on the seam, each with its own category"
+        );
+
+        for kind in [
+            DIGEST_DUTY,
+            TRIAGE_DUTY,
+            SHELL_DUTY,
+            TITLE_DUTY,
+            COMPACT_DUTY,
+        ] {
+            assert!(
+                kind.ceiling_bytes() > 0,
+                "`{}` declares no bound, so AC-11 has nothing to assert against \
+                 (BR-8: a bound that lives only in a reviewer's head is not a bound)",
+                kind.category().as_str()
+            );
+        }
+
+        const {
+            assert!(TITLE_DUTY.ceiling_bytes() < TRIAGE_DUTY.ceiling_bytes());
+            assert!(TITLE_DUTY.ceiling_bytes() < SHELL_DUTY.ceiling_bytes());
+            assert!(TRIAGE_DUTY.ceiling_bytes() < DIGEST_DUTY.ceiling_bytes());
+            assert!(SHELL_DUTY.ceiling_bytes() < DIGEST_DUTY.ceiling_bytes());
+            assert!(DIGEST_DUTY.ceiling_bytes() < COMPACT_DUTY.ceiling_bytes());
+        }
     }
 }
