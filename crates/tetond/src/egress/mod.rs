@@ -78,6 +78,7 @@
 
 pub mod inspector;
 pub mod provenance;
+pub mod redact;
 
 use std::sync::Arc;
 

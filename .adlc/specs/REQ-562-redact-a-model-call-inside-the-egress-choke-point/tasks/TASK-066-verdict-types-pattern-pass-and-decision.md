@@ -1,7 +1,7 @@
 ---
 id: TASK-066
 title: "Redaction verdict types, deterministic pattern pass, and the pure decision function"
-status: draft
+status: complete
 parent: REQ-562
 created: 2026-08-07
 updated: 2026-08-07
