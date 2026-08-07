@@ -32,12 +32,12 @@ It warrants the most adversarial review.
 - [ ] **The existing `ctx.truncate_to_budget()` call at `context.rs:618` is not modified, not wrapped, and not made conditional** (ADR-4). The duty runs ahead of it; it still runs unconditionally afterward.
 - [ ] **AC-14**: with the duty stubbed three ways — never returns, returns garbage, entirely unrouted — the context is under budget after each. This proves the budget is enforced by `truncate_to_budget()` and not by the duty.
 - [ ] **AC-7**: a forced failure leaves the context under budget with `degraded: true` on the `CompactionOutcome`. A test asserts the "keep everything" fallback is **not** taken — an over-budget context after a failed compaction is the failure this AC exists to catch.
-- [ ] Never applies a compaction partially. A parse failure discards the whole response and degrades; it does not drop the blocks it managed to parse.
-- [ ] An **over-budget** duty response (one that would leave the context above budget) is rejected and degrades, rather than being applied and then rescued by the hard gate. The hard gate is a backstop, not the plan.
-- [ ] `router.resolve(Category::Compact)` appears literally; the scan finds it.
+- [ ] **BR-4**: never applies a compaction partially. A parse failure discards the whole response and degrades; it does not drop the blocks it managed to parse. A half-applied compaction is the worst outcome available — it corrupts the context *and* leaves the budget unmet.
+- [ ] **BR-4**: an **over-budget** duty response (one that would leave the context above budget) is rejected and degrades, rather than being applied and then rescued by the hard gate. The hard gate is a backstop, not the plan. Equally, the fallback is never "keep everything" — that breaks the budget by a different route.
+- [ ] `router.resolve(Category::Compact)` appears literally; the scan finds it. The literal is the BR-1 call-site tag — the category is named in source, never derived from prompt text or a tool name.
 - [ ] Emits `route_decided` (AC-2).
 - [ ] Egress scoped to the conversation blocks' own provenance (BR-7). A `local-only` source in the conversation refuses the remote compaction while the turn proceeds.
-- [ ] Bounded by `COMPACT_OUTPUT_MAX_BYTES`, test reads the constant (AC-11). This is the loosest ceiling of the five — a compaction is a conversation.
+- [ ] Bounded by `COMPACT_OUTPUT_MAX_BYTES`, test reads the constant (BR-8, AC-11). This is the loosest ceiling of the five — a compaction is a conversation.
 - [ ] `ScriptedFileEngine` arm + no-block-consumed test (AC-12, BR-10) + contract-verbatim test.
 - [ ] `cargo test --workspace --no-fail-fast` is green.
 

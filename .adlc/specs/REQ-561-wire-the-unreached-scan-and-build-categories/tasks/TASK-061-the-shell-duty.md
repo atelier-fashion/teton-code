@@ -30,11 +30,11 @@ tool call in a coding session.
 
 - [ ] **AC-13, the load-bearing one**: a table-driven test over (exit 0, small), (exit 0, >8k), (exit≠0, small), (exit≠0, large) asserts the duty is invoked in exactly the last three and **not** in the first, by call count. The zero-call case is the assertion that matters.
 - [ ] The trigger reads the **raw** output length, not the post-truncation length (ADR-5). A mutation moving the check after `render_output()` must turn AC-13's oversize case red.
-- [ ] `router.resolve(Category::Shell)` appears literally; the derived-marker scan finds it.
+- [ ] `router.resolve(Category::Shell)` appears literally; the derived-marker scan finds it. The literal is the BR-1 call-site tag — the category is named in source, never derived from prompt text or a tool name.
 - [ ] Emits `route_decided` (AC-2).
 - [ ] Every failure path returns today's 8k-truncated output with degradation visible on the outcome (BR-3).
 - [ ] Egress scoped to the command output's own provenance (BR-7). Shell output is tagged `with_unknown_provenance()` today (`tools/shell.rs:140,145,164,168`) — so it fails closed, which is correct and must be asserted rather than worked around.
-- [ ] Bounded by `SHELL_OUTPUT_MAX_BYTES`, test reads the constant (AC-11).
+- [ ] Bounded by `SHELL_OUTPUT_MAX_BYTES`, test reads the constant (BR-8, AC-11).
 - [ ] `ScriptedFileEngine` arm + no-block-consumed test (AC-12, BR-10) + contract-verbatim test.
 - [ ] `cargo test --workspace --no-fail-fast` is green.
 

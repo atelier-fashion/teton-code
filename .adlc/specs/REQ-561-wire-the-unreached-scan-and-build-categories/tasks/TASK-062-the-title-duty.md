@@ -29,11 +29,11 @@ Depends on TASK-059 for the event type.
 - [ ] **AC-6**: `title` is requested exactly once across a multi-turn session, asserted by **call count**, not by inspecting the stored value. A session that already has a title requests zero times.
 - [ ] **AC-15**: exactly one `session_titled` with a non-empty title reaches the wire per session; a session that already has one emits none. Asserted on **captured events**, not daemon-internal state.
 - [ ] An existing title is never overwritten (BR-9). The guard is keyed on `title.is_none()`, so a re-derivation cannot occur even if the duty is invoked again.
-- [ ] `router.resolve(Category::Title)` appears literally; the scan finds it.
+- [ ] `router.resolve(Category::Title)` appears literally; the scan finds it. The literal is the BR-1 call-site tag — the category is named in source, never derived from prompt text or a tool name.
 - [ ] Emits `route_decided` (AC-2).
 - [ ] Failure path leaves the session with **no** title and does not retry on every subsequent turn — a failed title must not become a per-turn model call (BR-3, and a cost trap).
 - [ ] Runs on the local tier even when `reflex` has a remote binding attempt, and under a tainted session (BR-5). Asserted by captured bytes.
-- [ ] Bounded by `TITLE_OUTPUT_MAX_BYTES`, test reads the constant (AC-11). A title is a handful of words — this is the tightest ceiling of the five.
+- [ ] Bounded by `TITLE_OUTPUT_MAX_BYTES`, test reads the constant (BR-8, AC-11). A title is a handful of words — this is the tightest ceiling of the five.
 - [ ] `ScriptedFileEngine` arm + no-block-consumed test (AC-12, BR-10) + contract-verbatim test.
 - [ ] `cargo test --workspace --no-fail-fast` is green.
 

@@ -28,11 +28,11 @@ duty failure is indistinguishable from today.
 
 ## Acceptance Criteria
 
-- [ ] `router.resolve(Category::Triage)` appears literally in `runtime.rs`, and the `call_sites.rs:209` derived-marker scan finds it.
+- [ ] `router.resolve(Category::Triage)` appears literally in `runtime.rs`, and the `call_sites.rs:209` derived-marker scan finds it. The literal is the BR-1 call-site tag — the category is named in source, never derived from prompt text or a tool name.
 - [ ] Emits `route_decided` naming category, tier, provider, non-empty reason (AC-2).
 - [ ] Every failure path (unresolvable / provider error / tainted session) returns the current first-200 unranked result, and the degradation is visible **on the outcome**, not only in a log (BR-3).
 - [ ] Egress is scoped to the **matched files'** provenance, not the turn's (BR-7). A `local-only` match refuses while the rest of the turn proceeds.
-- [ ] Output bounded by `TRIAGE_OUTPUT_MAX_BYTES`; the test reads the constant, never a literal (AC-11).
+- [ ] Output bounded by `TRIAGE_OUTPUT_MAX_BYTES`; the test reads the constant, never a literal (BR-8, AC-11).
 - [ ] `ScriptedFileEngine` gains a `TRIAGE_OUTPUT_CONTRACT` arm; a test asserts the duty consumes **no** scripted block and the turn sequence is unchanged (AC-12, BR-10).
 - [ ] A test asserts the prompt carries `TRIAGE_OUTPUT_CONTRACT` verbatim — mirroring `the_duty_prompt_carries_the_output_contract_verbatim` at `context.rs:1104`.
 - [ ] `cargo test --workspace --no-fail-fast` is green.
