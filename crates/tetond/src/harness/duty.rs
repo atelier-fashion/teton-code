@@ -122,6 +122,27 @@
 //! | a duty module takes an `Egress` of its own (BR-6) | [`tests::no_duty_module_carries_any_of_the_seams_concerns`] |
 //! | the choke point stops pinning the session it refused | `runtime::tests::dispatch::a_duty_refused_at_the_choke_point_taints_its_session`, `…::an_unattributable_privacy_block_pins_no_session` |
 //!
+//! ## REQ-562 — the sixth caller, and the gate it is called from
+//!
+//! `redact` reaches this seam from the egress choke point rather than from the
+//! harness (ADR-1), so its rows are about the *wiring*, not about a call site
+//! inside a turn. The rows below are TASK-070's; the AC-8 mutation runs those
+//! rows are the documentation of belong to TASK-071, which owns the e2e matrix
+//! and applies them (this table is where it records what it observed).
+//!
+//! | Mutation | Fails |
+//! |---|---|
+//! | the gate hook moves **above** the provenance early-return in [`Egress::send`](crate::egress::Egress::send) | `egress::tests::a_payload_refused_by_provenance_is_never_scanned` — AC-11's ordering, by scanner call count |
+//! | `Egress::send` forwards on a `Block` decision (the permissive-guard mutation, AC-8a) | `egress::tests::an_unavailable_scan_blocks_the_send_and_says_it_could_not_run`, `…::a_high_confidence_finding_blocks_with_its_kind_span_and_locus` |
+//! | `block_cause` reports `ScanUnavailable` for a findings verdict, or `Redaction` for an unavailable one | `egress::tests::a_redaction_block_reports_the_first_high_finding_and_never_a_low_one`, and both block tests by `cause` |
+//! | the gate is installed unconditionally, ignoring `[privacy] redact` | `runtime::tests::dispatch::redact::off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine` — the off leg, by engine call count |
+//! | `redact_route` grows a session-taint arm (the "uniformity fix" ADR-3 forbids) | nothing turns red, and that is the point: the arm cannot change the answer, which is what `runtime::tests::dispatch::redact::a_tainted_session_resolves_redact_exactly_as_a_clean_one_does` pins from the other direction |
+//! | `redact_route` falls through to the squatting provider when `local_tier_id` yields nothing | `runtime::tests::dispatch::redact::a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote` |
+//! | `redact_route` treats an unresolved route as clean instead of unresolved | `runtime::tests::dispatch::redact::a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan` |
+//! | `build_duty_route` stops installing the gate on a remotely bound duty's choke point | [`tests::a_remote_duty_send_is_scanned_by_the_choke_points_gate`] (at the seam) |
+//! | the forward path rebuilds the request from the scanned text instead of passing it through | `egress::tests::a_low_only_or_clean_verdict_forwards_the_exact_bytes`, `…::the_gate_reads_the_exact_bytes_that_would_go_on_the_wire` (AC-9) |
+//! | the gate hook is placed after `inner.execute`, or metering moves ahead of it | `egress::tests::a_blocked_send_bills_nothing_while_an_allowed_one_still_bills` |
+//!
 //! ## What draining past the ceiling buys, and why it is still done
 //!
 //! Past the ceiling [`RemoteDuty::perform`] stops *accumulating* but keeps
@@ -765,7 +786,7 @@ pub(crate) mod testing {
     };
 
     use super::{DutyKind, DutyRoute};
-    use crate::egress::{Egress, NoopSink};
+    use crate::egress::{Egress, NoopSink, RedactionGate};
 
     /// The request bodies a [`CaptureTransport`] was handed, newest last.
     ///
@@ -858,9 +879,30 @@ pub(crate) mod testing {
         reply: &str,
         repeat: usize,
     ) -> (DutyRoute, Sent) {
+        remote_duty_route_gated(kind, boundaries, reply, repeat, None)
+    }
+
+    /// The same route, optionally with a redaction gate at its choke point —
+    /// which is how the daemon builds it when `[privacy] redact` is on
+    /// (REQ-562 TASK-070).
+    ///
+    /// `None` is the shape every pre-REQ-562 caller gets, and it is the *same*
+    /// construction rather than a parallel one: a duty route built without a
+    /// gate has to keep behaving exactly as it did, and that is only checkable
+    /// if both come out of one builder.
+    pub(crate) fn remote_duty_route_gated(
+        kind: DutyKind,
+        boundaries: Vec<PrivacyBoundary>,
+        reply: &str,
+        repeat: usize,
+        gate: Option<Arc<dyn RedactionGate>>,
+    ) -> (DutyRoute, Sent) {
         let transport = CaptureTransport::default();
         let sent = Arc::clone(&transport.sent);
-        let egress = Egress::new(transport, boundaries, Arc::new(NoopSink));
+        let mut egress = Egress::new(transport, boundaries, Arc::new(NoopSink));
+        if let Some(gate) = gate {
+            egress = egress.with_redaction_gate(gate);
+        }
         let route = DutyRoute::remote(
             kind,
             "frontier",
@@ -1662,5 +1704,106 @@ mod tests {
             assert!(SHELL_DUTY.ceiling_bytes() < DIGEST_DUTY.ceiling_bytes());
             assert!(DIGEST_DUTY.ceiling_bytes() < COMPACT_DUTY.ceiling_bytes());
         }
+    }
+
+    // =======================================================================
+    // REQ-562 TASK-070 — every remote path crosses the redaction gate.
+    // =======================================================================
+
+    /// A gate that records every payload it is shown and answers `verdict`.
+    struct RecordingGate {
+        verdict: crate::egress::RedactionVerdict,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl RecordingGate {
+        fn new(verdict: crate::egress::RedactionVerdict) -> Arc<Self> {
+            Arc::new(Self {
+                verdict,
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().expect("gate poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::egress::RedactionGate for RecordingGate {
+        async fn scan(&self, payload: &str) -> crate::egress::RedactionVerdict {
+            self.seen
+                .lock()
+                .expect("gate poisoned")
+                .push(payload.to_owned());
+            self.verdict.clone()
+        }
+    }
+
+    /// **REQ-562 ADR-1.** A remotely bound duty reaches the network through the
+    /// same [`Egress::send`] a turn does, so with the gate installed its prompt
+    /// is scanned too — and a blocking verdict stops it before a byte leaves.
+    ///
+    /// `boundaries` is deliberately **empty**: the provenance inspection must
+    /// not be what refuses this, or the test would pass against a choke point
+    /// with no gate at all. The two legs share everything but the verdict, so
+    /// what discriminates them is the scan and nothing else.
+    #[tokio::test]
+    async fn a_remote_duty_send_is_scanned_by_the_choke_points_gate() {
+        use crate::egress::redact::{Finding, FindingKind, RedactionVerdict};
+        use crate::harness::duty::testing;
+        use crate::harness::DIGEST_DUTY;
+
+        const PROMPT: &str = "summarize this tool result for the turn";
+
+        // Blocked: the duty fails and the wire is empty.
+        let blocking = RecordingGate::new(RedactionVerdict::from_findings(vec![Finding::pattern(
+            FindingKind::Credential,
+            0..4,
+        )]));
+        let (route, sent) = testing::remote_duty_route_gated(
+            DIGEST_DUTY,
+            Vec::new(),
+            "a summary",
+            1,
+            Some(blocking.clone()),
+        );
+        let err = route
+            .perform(PROMPT, &Provenance::empty())
+            .await
+            .expect_err("a blocking verdict must refuse the duty's send");
+        assert!(
+            testing::wire(&sent).is_empty(),
+            "not a byte of a blocked duty prompt may leave: {}",
+            testing::wire(&sent)
+        );
+        assert!(!err.is_empty(), "the call site is handed a sentence");
+        let scanned = blocking.seen();
+        assert_eq!(scanned.len(), 1, "the duty's send was scanned exactly once");
+        assert!(
+            scanned[0].contains(PROMPT),
+            "and what it scanned is the duty's own outbound body: {}",
+            scanned[0]
+        );
+
+        // Allowed: the same route, the same prompt, a clean verdict — and now
+        // the prompt really is on the wire, which is what makes the leg above
+        // an assertion about the gate rather than about a route that cannot
+        // send at all.
+        let clean = RecordingGate::new(RedactionVerdict::clean());
+        let (route, sent) = testing::remote_duty_route_gated(
+            DIGEST_DUTY,
+            Vec::new(),
+            "a summary",
+            1,
+            Some(clean.clone()),
+        );
+        let answer = route
+            .perform(PROMPT, &Provenance::empty())
+            .await
+            .expect("a clean verdict forwards");
+        assert_eq!(answer, "a summary");
+        assert!(testing::wire(&sent).contains(PROMPT));
+        assert_eq!(clean.seen().len(), 1);
     }
 }

@@ -132,14 +132,16 @@ use crate::call_sites::has_call_site;
 use crate::classify::Classification;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
-use crate::egress::{inspect, origin_of, Egress, HttpTransport, Provenance};
+use crate::egress::{
+    inspect, origin_of, Egress, HttpTransport, Provenance, RedactionGate, RedactionVerdict,
+};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolDuties,
-    ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
+    ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -1647,7 +1649,7 @@ impl DaemonRuntime {
         // snapshot itself is cheap when that decision is made.
         // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
         // semantics are decided.
-        let tools = self.build_tools(events, &session_id).await;
+        let tools = self.build_tools(&router, events, &session_id).await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
         // not send one — under launchd it is `/`, which is what had every tool
@@ -1896,20 +1898,26 @@ impl DaemonRuntime {
 
     /// Build the tool registry for a turn: the built-ins plus any registered MCP
     /// server tools (ADR-003), namespaced and egress-gated.
-    async fn build_tools(&self, events: &Arc<EventBus>, session_id: &SessionId) -> ToolRegistry {
+    async fn build_tools(
+        &self,
+        router: &Router,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> ToolRegistry {
         let mut tools = ToolRegistry::with_builtins();
         if !self.mcp_servers.is_empty() {
-            let boundaries = self
-                .config
-                .lock()
-                .expect("config mutex poisoned")
-                .boundaries
-                .clone();
+            let config = self.config.lock().expect("config mutex poisoned").clone();
+            let boundaries = config.boundaries.clone();
             if let Ok(transport) = HttpTransport::new() {
-                let egress = Arc::new(
-                    Egress::new(transport, boundaries, events.clone())
-                        .with_cost_meter(Arc::new(self.ledger.clone())),
-                );
+                let mut egress = Egress::new(transport, boundaries, events.clone())
+                    .with_cost_meter(Arc::new(self.ledger.clone()));
+                // ADR-003 makes an MCP call remote egress, so REQ-562 ADR-1's
+                // "every remote path" includes it: a tool argument carrying a
+                // credential is scanned exactly like a prompt carrying one.
+                if let Some(gate) = self.redaction_gate(router, &config, events, session_id) {
+                    egress = egress.with_redaction_gate(gate);
+                }
+                let egress = Arc::new(egress);
                 let registry = Arc::new(McpRegistry::with_egress(
                     egress as Arc<dyn crate::mcp::EgressGate>,
                     Some(session_id.clone()),
@@ -2043,8 +2051,13 @@ impl DaemonRuntime {
         // to this endpoint's origin — never MCP, never another provider.
         let transport = build_remote_transport(provider_cfg, &self.secret_resolver)?;
         let boundaries = config.boundaries.clone();
-        let egress = Egress::new(transport, boundaries, events.clone())
+        let mut egress = Egress::new(transport, boundaries, events.clone())
             .with_cost_meter(Arc::new(self.ledger.clone()));
+        // REQ-562 ADR-1/ADR-2: the turn's own outbound payload is scanned here,
+        // and only when the user opted in.
+        if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
+            egress = egress.with_redaction_gate(gate);
+        }
 
         let mut source = RemoteProviderSource::new(
             &*provider,
@@ -2124,6 +2137,7 @@ impl DaemonRuntime {
         };
         self.resolve_duty(
             DIGEST_DUTY,
+            router,
             &route,
             config,
             events,
@@ -2161,6 +2175,7 @@ impl DaemonRuntime {
         };
         self.resolve_duty(
             TRIAGE_DUTY,
+            router,
             &route,
             config,
             events,
@@ -2196,7 +2211,15 @@ impl DaemonRuntime {
         } else {
             router.resolve(Category::Shell)
         };
-        self.resolve_duty(SHELL_DUTY, &route, config, events, session_id, local_engine)
+        self.resolve_duty(
+            SHELL_DUTY,
+            router,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
     }
 
     /// Resolve the `title` category for this session (REQ-561 TASK-062).
@@ -2229,7 +2252,15 @@ impl DaemonRuntime {
         } else {
             router.resolve(Category::Title)
         };
-        self.resolve_duty(TITLE_DUTY, &route, config, events, session_id, local_engine)
+        self.resolve_duty(
+            TITLE_DUTY,
+            router,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
     }
 
     /// Resolve the `compact` category for this turn (REQ-561 TASK-063).
@@ -2262,12 +2293,44 @@ impl DaemonRuntime {
         };
         self.resolve_duty(
             COMPACT_DUTY,
+            router,
             &route,
             config,
             events,
             session_id,
             local_engine,
         )
+    }
+
+    /// The redaction scanner this turn's egress carries, or `None` when the
+    /// feature is off (REQ-562 ADR-2).
+    ///
+    /// The **only** place the `[privacy] redact` switch is read. "Off" is the
+    /// absence of the collaborator, not a flag the gate consults: an
+    /// un-opted-in machine builds no gate, so its choke point makes zero
+    /// scanner calls, loads no weights, pays no latency, and has no `if
+    /// enabled` branch in the hot path for a later change to invert (AC-13).
+    ///
+    /// Called at every [`Egress`] construction site the daemon has — the turn
+    /// path, the duty path, and the MCP path — because ADR-1's guarantee is
+    /// about *every* remote path, and a choke point built without a gate is a
+    /// remote path the scan does not cover.
+    fn redaction_gate(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> Option<Arc<dyn RedactionGate>> {
+        if !config.privacy.redact {
+            return None;
+        }
+        Some(Arc::new(RedactionGateImpl {
+            router: router.clone(),
+            events: Arc::clone(events),
+            session_id: session_id.clone(),
+            engine: Arc::clone(&self.engine),
+        }))
     }
 
     /// Name this session after `prompt`, at most once for its whole life
@@ -2403,17 +2466,27 @@ impl DaemonRuntime {
     /// not resolve fails the **turn** on the turn path (a config error the user
     /// must fix), but only the **duty** here — a duty is never fatal, and the
     /// failure is reported on the duty's own outcome instead.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_duty(
         &self,
         duty: DutyKind,
+        router: &Router,
         route: &crate::router::Route,
         config: &Config,
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
     ) -> DutyRoute {
-        self.build_duty_route(duty, route, config, events, session_id, local_engine)
-            .announcing(events, Some(session_id.clone()), route.route_decided())
+        self.build_duty_route(
+            duty,
+            router,
+            route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
+        .announcing(events, Some(session_id.clone()), route.route_decided())
     }
 
     /// Build the [`DutyRoute`] `route` calls for, without announcing anything.
@@ -2429,9 +2502,11 @@ impl DaemonRuntime {
     /// worth knowing that after REQ-557's migration (`default_provider` set to the
     /// first remote provider, no `[[tiers]]` rows) an unbound tier inherits that
     /// provider, so this is the *ordinary* upgraded config and not an exotic one.
+    #[allow(clippy::too_many_arguments)]
     fn build_duty_route(
         &self,
         duty: DutyKind,
+        router: &Router,
         route: &crate::router::Route,
         config: &Config,
         events: &Arc<EventBus>,
@@ -2507,8 +2582,16 @@ impl DaemonRuntime {
             events: events.clone(),
             taint: Arc::clone(&self.session_taint),
         });
-        let egress = Egress::new(transport, config.boundaries.clone(), sink)
+        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()));
+        // REQ-562 ADR-1: a remotely-bound duty's prompt is an outbound payload
+        // like any other, so it crosses the same gate the turn path's does. It
+        // is the same construction for the same reason the boundaries and the
+        // meter are: a duty that egressed through a laxer choke point is the
+        // hole the single choke point exists to close.
+        if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
+            egress = egress.with_redaction_gate(gate);
+        }
         DutyRoute::remote(
             duty,
             provider_id,
@@ -2517,6 +2600,119 @@ impl DaemonRuntime {
             model,
             session_id.clone(),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The redaction gate (REQ-562 TASK-070)
+// ---------------------------------------------------------------------------
+
+/// The daemon's [`RedactionGate`]: resolve the `redact` duty, run it over the
+/// payload, hand the verdict back to the choke point (REQ-562 ADR-1).
+///
+/// ## What is *not* in this struct is the guarantee
+///
+/// No transport, no provider, no secret resolver, no ledger — the same absence
+/// that makes `LocalDuty` unable to reach a network, one layer up. The redactor
+/// is what inspects a payload *before* it may leave; a redactor that egressed
+/// would re-enter [`Egress::send`], be handed its own prompt to scan, and do it
+/// again. The fields here are the reason that cannot happen, rather than a
+/// depth counter or a re-entrancy flag that says it must not.
+///
+/// ## Cheap to build, because it is built per turn attempt
+///
+/// A [`Router`] clone (a table and a provider map), two `Arc` handles and a
+/// session id. It is constructed at each [`Egress`] construction site and only
+/// when the user opted in, so a machine with the feature off pays for none of
+/// it (ADR-2).
+struct RedactionGateImpl {
+    /// This turn's router — the same one the turn and its five sibling duties
+    /// resolved through, so the scan cannot be routed by a different table than
+    /// the payload it is scanning.
+    router: Router,
+    /// Where `route_decided` goes when a scan actually runs (BR-2).
+    events: Arc<EventBus>,
+    /// The session the scanned payload belongs to.
+    session_id: SessionId,
+    /// The engine slot, read **per scan** rather than captured once: a real
+    /// engine arrives mid-run when a consent install completes, and a gate that
+    /// snapshotted an empty slot at construction would keep failing closed on a
+    /// machine whose local tier came up thirty seconds ago.
+    engine: Arc<EngineSlot>,
+}
+
+impl RedactionGateImpl {
+    /// Resolve the `redact` category for this scan (REQ-562 ADR-3).
+    ///
+    /// The sixth resolver, and it names its category literally for the same
+    /// reason [`DaemonRuntime::digest_route`] and its four siblings do: the
+    /// [`crate::call_sites`] derived-marker test reads the daemon's own source
+    /// looking for a routing call with a `Category::` literal inside it, and a
+    /// helper taking a category *variable* would make that scan blind.
+    ///
+    /// ## No session-taint arm, deliberately (ADR-3)
+    ///
+    /// The five REQ-561 resolvers check taint *first*, because for them taint
+    /// changes the answer: a configurable category bound to a remote provider
+    /// resolves local instead. It cannot change this one. `redact` is pinned
+    /// local by construction — REQ-558 ADR-B gives it no configurable
+    /// counterpart, so the resolver reaches it through the pinned-local branch,
+    /// which consults no binding and yields the engine-backed local tier or
+    /// nothing. A taint arm here would be a guard predicated on a distinction
+    /// that cannot occur (LESSON-443): dead code wearing a safety costume.
+    ///
+    /// AC-12's property — a tainted session produces zero scanner calls — holds
+    /// one layer up and more strongly: a tainted turn is pinned local, never
+    /// reaches remote egress, and so never reaches the gate at all. This
+    /// asymmetry with the sibling resolvers is intentional and this comment is
+    /// the written reason, so it does not get "fixed" into uniformity.
+    ///
+    /// ## No remote arm, also deliberately (ADR-1)
+    ///
+    /// The siblings share [`DaemonRuntime::build_duty_route`], which can build
+    /// a remote route. This one cannot, and that is the anti-recursion
+    /// guarantee: the only route it constructs is
+    /// [`DutyRoute::local`](crate::harness::DutyRoute::local), which holds an
+    /// engine handle and no transport. It is not a locality *check* — there is
+    /// no id comparison here and BR-2 forbids one — it is simply the one
+    /// construction available. The resolver's answer for this category can only
+    /// ever be the engine-backed local tier anyway: `local_tier_id` yields
+    /// `None` when a non-local provider has taken the canonical id
+    /// (BUG-156/TASK-057), so the pin has nothing remote to name.
+    ///
+    /// A route that resolved to nothing, or a tier with no engine loaded,
+    /// returns [`DutyRoute::unresolved`] — which the scan turns into
+    /// `Unavailable`, which blocks (ADR-6). Fail closed, with the resolver's own
+    /// sentence carried verbatim (BR-6).
+    fn redact_route(&self) -> DutyRoute {
+        let route = self.router.resolve(Category::Redact);
+        let Some(provider_id) = route.provider_id.as_ref().map(|p| p.0.clone()) else {
+            return DutyRoute::unresolved(route.reason.clone());
+        };
+        let Some((engine, _format)) = self.engine.get_with_format() else {
+            return DutyRoute::unresolved(format!(
+                "The 'redact' category resolves to '{provider_id}', but no local engine is \
+                 loaded to serve it yet."
+            ));
+        };
+        DutyRoute::local(REDACT_DUTY, provider_id, engine).announcing(
+            &self.events,
+            Some(self.session_id.clone()),
+            route.route_decided(),
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl RedactionGate for RedactionGateImpl {
+    async fn scan(&self, payload: &str) -> RedactionVerdict {
+        // The route is resolved per scan, not per turn: it is two map lookups
+        // and an `Arc` clone, and resolving it here means a scan reflects the
+        // engine slot as it is *now*. Nothing is held across the await below —
+        // `get_with_format` takes the slot lock, clones the handle, and drops
+        // it before this line returns.
+        let route = self.redact_route();
+        crate::harness::redact::scan(&route, payload).await
     }
 }
 
@@ -5936,9 +6132,13 @@ provider_id = "on-device"
             .filter(|r| !r.reached)
             .map(|r| r.category.as_str())
             .collect();
+        // Empty since REQ-562 TASK-070 wired `redact`, the last of the eleven.
+        // Stated as the census rather than dropped: the loop below is the
+        // invariant (every row agrees with `has_call_site`), and this line is
+        // what makes a *change* to the set show up as a diff a reviewer reads.
         assert_eq!(
             unreached,
-            vec!["redact"],
+            Vec::<&str>::new(),
             "the marker in the projection must agree with `call_sites::has_call_site`"
         );
         for row in &snap.routing {
@@ -9639,6 +9839,304 @@ provider_id = "on-device"
                     crate::harness::compact::compact_prompt(pressured().blocks())
                         .contains(COMPACT_OUTPUT_CONTRACT)
                 );
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // The `redact` duty's own dispatch (REQ-562 TASK-070).
+        //
+        // The sixth caller of the seam, and the only one whose resolver does
+        // not live on the runtime: it lives on the gate the choke point holds,
+        // because that is where the scan happens (ADR-1). Two things it has
+        // that the five do not — and both are asserted here rather than only
+        // commented:
+        //
+        // - **no taint arm** (ADR-3): taint cannot change a pinned-local
+        //   resolution, so a taint check would be a guard on a distinction that
+        //   cannot occur. The test below proves the *resolution* is identical
+        //   tainted and clean, against a sibling on the same runtime that
+        //   genuinely changes.
+        // - **no remote arm** (ADR-1): the pin can only name an engine-backed
+        //   tier, so a squatted local id leaves the scan unavailable rather
+        //   than routing it through the squatter — which is what makes the
+        //   scan structurally unable to re-enter the choke point.
+        // -------------------------------------------------------------------
+        mod redact {
+            use super::*;
+            use crate::egress::redact::{decide, EgressDecision, Outcome};
+            use teton_core::config::PrivacyConfig;
+
+            /// `config` with the `[privacy]` opt-in switched on.
+            fn opted_in(mut config: Config) -> Config {
+                config.privacy = PrivacyConfig { redact: true };
+                config
+            }
+
+            /// `config()` plus a remote `reflex` binding — the tier `redact`
+            /// declares, and the one a resolver that consulted the table would
+            /// inherit.
+            fn reflex_bound_to(provider_id: &str) -> Config {
+                let mut config = config();
+                config.tiers.push(TierBinding {
+                    tier: Tier::Reflex,
+                    provider_id: provider_id.to_owned(),
+                    fallback_id: None,
+                });
+                config
+            }
+
+            /// The gate the turn path installs, from the same runtime state and
+            /// through the same router, announcing on `bus`.
+            fn gate_on(
+                runtime: &DaemonRuntime,
+                bus: &Arc<EventBus>,
+                session: &SessionId,
+            ) -> Option<Arc<dyn RedactionGate>> {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                runtime.redaction_gate(&router, &config, bus, session)
+            }
+
+            fn gate_for(runtime: &DaemonRuntime, session: &SessionId) -> Arc<dyn RedactionGate> {
+                gate_on(runtime, &Arc::new(EventBus::new()), session)
+                    .expect("the privacy switch is on")
+            }
+
+            /// A runtime with `config` and **no** engine in the slot, whose
+            /// local tier the router still registers.
+            ///
+            /// The discriminating state for fail-closed: the pin resolves to a
+            /// tier that exists and nothing is loaded to serve it.
+            fn runtime_without_an_engine(config: Config) -> DaemonRuntime {
+                let runtime = DaemonRuntime::minimal();
+                *runtime.config.lock().expect("config mutex") = config;
+                runtime.local_available.store(true, Ordering::SeqCst);
+                runtime
+            }
+
+            // -- the switch (ADR-2, AC-13) -----------------------------------
+
+            /// **AC-13, both legs.** With no `[privacy]` table there is no gate
+            /// at all — not a gate that permits — so a turn makes zero scanner
+            /// calls and nothing exists to claim one ran. Flipping the switch on
+            /// the same runtime produces exactly one call per scan.
+            #[tokio::test]
+            async fn off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(config(), &engine, true);
+                let session = SessionId::from("sess");
+
+                assert!(
+                    gate_on(&runtime, &Arc::new(EventBus::new()), &session).is_none(),
+                    "absence of the [privacy] table is the off state (ADR-2)"
+                );
+                assert_eq!(
+                    engine.calls(),
+                    0,
+                    "an un-opted-in machine makes zero scanner calls"
+                );
+
+                *runtime.config.lock().expect("config mutex") = opted_in(config());
+                let verdict = gate_for(&runtime, &session)
+                    .scan("an ordinary prompt")
+                    .await;
+                assert_eq!(verdict.outcome(), Outcome::Clean);
+                assert!(verdict.scanned(), "and it really did scan");
+                assert_eq!(engine.calls(), 1, "exactly one scan for one payload");
+            }
+
+            // -- where it routes (ADR-3, BR-2) -------------------------------
+
+            /// **The pin ignores the table.** `redact` declares the `reflex`
+            /// tier, so a remotely bound `reflex` is the configuration that
+            /// would send the scan off the machine if anything consulted the
+            /// binding. Nothing does: the scan runs on the local engine.
+            ///
+            /// The non-vacuity is `title`, the other `reflex` duty, on the same
+            /// runtime and the same router — it genuinely goes remote, so the
+            /// binding under test is real rather than inert.
+            #[tokio::test]
+            async fn the_redact_pin_ignores_a_remote_reflex_binding_that_title_obeys() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(reflex_bound_to("frontier")), &engine, true);
+                let session = SessionId::from("sess");
+
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                assert_eq!(
+                    runtime
+                        .title_route(
+                            &router,
+                            &config,
+                            &Arc::new(EventBus::new()),
+                            &session,
+                            slot.as_ref()
+                        )
+                        .provider(),
+                    Some("frontier"),
+                    "the reflex binding is live for the duty that reads it"
+                );
+
+                let verdict = gate_for(&runtime, &session).scan("ordinary prose").await;
+                assert_eq!(verdict.outcome(), Outcome::Clean);
+                assert_eq!(
+                    engine.calls(),
+                    1,
+                    "the scan ran on the local engine regardless of the binding"
+                );
+            }
+
+            /// **ADR-3's asymmetry, asserted.** Taint changes a sibling's
+            /// resolution and cannot change this one, because this one was never
+            /// anything but local. Without the sibling leg this test would pass
+            /// against a resolver that ignored everything.
+            #[tokio::test]
+            async fn a_tainted_session_resolves_redact_exactly_as_a_clean_one_does() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(reflex_bound_to("frontier")), &engine, true);
+                let clean = SessionId::from("clean");
+                let tainted = SessionId::from("tainted");
+                runtime.session_taint.mark(&tainted);
+
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                let bus = Arc::new(EventBus::new());
+                // The sibling: taint moves it from the frontier to the tier.
+                assert_eq!(
+                    runtime
+                        .title_route(&router, &config, &bus, &clean, slot.as_ref())
+                        .provider(),
+                    Some("frontier")
+                );
+                assert_eq!(
+                    runtime
+                        .title_route(&router, &config, &bus, &tainted, slot.as_ref())
+                        .provider(),
+                    Some(LOCAL_PROVIDER_ID)
+                );
+
+                // And `redact` answers the same on both sessions.
+                for session in [&clean, &tainted] {
+                    let verdict = gate_for(&runtime, session).scan("ordinary prose").await;
+                    assert_eq!(
+                        verdict.outcome(),
+                        Outcome::Clean,
+                        "the pin resolves identically on a tainted session"
+                    );
+                }
+                assert_eq!(engine.calls(), 2, "both scans really ran");
+            }
+
+            /// **BR-2.** A scan that runs announces its route, with the four
+            /// things every other duty announces — and the provider is the local
+            /// tier, which is the visible half of the pin.
+            #[tokio::test]
+            async fn a_scan_that_runs_announces_its_route_like_every_other_duty() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(config()), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+
+                let gate = gate_on(&runtime, &bus, &SessionId::from("sess"))
+                    .expect("the privacy switch is on");
+                let verdict = gate.scan("ordinary prose").await;
+                assert_eq!(verdict.outcome(), Outcome::Clean);
+
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Redact,
+                    ProtoTier::Reflex,
+                    LOCAL_PROVIDER_ID,
+                );
+            }
+
+            // -- fail closed (ADR-6, BR-3) -----------------------------------
+
+            /// **Fail closed at the resolver.** The switch is on, the tier
+            /// exists, and nothing is loaded to serve it: the route is
+            /// unresolved, the verdict is `Unavailable`, and it blocks.
+            ///
+            /// The payload is deliberately **clean** — the one case that would
+            /// forward if an unresolved route were treated permissively, so a
+            /// permissive failure turns this red rather than leaving it green.
+            #[tokio::test]
+            async fn a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan() {
+                let runtime = runtime_without_an_engine(opted_in(config()));
+                let verdict = gate_for(&runtime, &SessionId::from("sess"))
+                    .scan("entirely ordinary prose")
+                    .await;
+                assert_eq!(verdict.outcome(), Outcome::Unavailable);
+                assert!(
+                    !verdict.scanned(),
+                    "a scan that could not run must not claim it did"
+                );
+                assert_eq!(decide(&verdict), EgressDecision::Block);
+            }
+
+            /// **The anti-recursion foundation (ADR-1), stated as behaviour.**
+            ///
+            /// A non-local provider that has taken the canonical local-tier id
+            /// does not become the local tier (BUG-156/TASK-057): `local_tier_id`
+            /// yields nothing, so the pin has nothing to name and the scan is
+            /// unavailable. It does **not** fall through to the squatter — which
+            /// is the case that would put a `RemoteDuty` behind the gate and let
+            /// a scan re-enter the choke point with its own prompt.
+            ///
+            /// Non-vacuity: the same runtime, the same engine, without the
+            /// squatter, scans normally.
+            #[tokio::test]
+            async fn a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote() {
+                let engine = CountingEngine::answering("NONE");
+                let mut squatted = opted_in(config());
+                squatted
+                    .providers
+                    .push(remote(LOCAL_PROVIDER_ID, "squatter-model"));
+                let runtime = runtime(squatted, &engine, true);
+                let session = SessionId::from("sess");
+
+                let verdict = gate_for(&runtime, &session).scan("ordinary prose").await;
+                assert_eq!(verdict.outcome(), Outcome::Unavailable);
+                assert_eq!(decide(&verdict), EgressDecision::Block);
+                assert_eq!(
+                    engine.calls(),
+                    0,
+                    "nothing was asked to scan, locally or otherwise"
+                );
+
+                *runtime.config.lock().expect("config mutex") = opted_in(config());
+                let verdict = gate_for(&runtime, &session).scan("ordinary prose").await;
+                assert_eq!(verdict.outcome(), Outcome::Clean);
+                assert_eq!(engine.calls(), 1);
+            }
+
+            // -- what it finds -----------------------------------------------
+
+            /// The gate end to end: a planted credential blocks, and the *same*
+            /// gate lets clean prose through. The pattern pass is what catches
+            /// this one — the stand-in engine answers "found nothing" — which is
+            /// exactly the division of labour ADR-4 describes.
+            #[tokio::test]
+            async fn a_planted_credential_blocks_and_the_same_gate_forwards_clean_prose() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(config()), &engine, true);
+                let gate = gate_for(&runtime, &SessionId::from("sess"));
+
+                let dirty = gate
+                    .scan("please summarize sk-ABCDEFGHIJKLMNOPQRSTUVWX for me")
+                    .await;
+                assert_eq!(dirty.outcome(), Outcome::Findings);
+                assert_eq!(decide(&dirty), EgressDecision::Block);
+
+                let clean = gate.scan("please summarize src/main.rs for me").await;
+                assert_eq!(clean.outcome(), Outcome::Clean);
+                assert_eq!(decide(&clean), EgressDecision::Forward);
+
+                assert_eq!(engine.calls(), 2, "both payloads were really scanned");
             }
         }
     }

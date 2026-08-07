@@ -2,11 +2,16 @@
 //!
 //! REQ-558 declares all eleven categories and resolves all eleven, so the config
 //! schema stabilizes once and the remaining call sites can be tagged later
-//! without a second migration. But some of them have **no model call site at
+//! without a second migration. But some of them had **no model call site at
 //! all**, and a knob that silently does nothing invites a user to tune it —
 //! LESSON-481's shape ("a gate that hides a feature from users also hides it
-//! from the test suite"). So `teton policy show` marks them
+//! from the test suite"). So `teton policy show` marks such a category
 //! `declared, no call site yet`, and this module is where that marker comes from.
+//!
+//! As of REQ-562 the marked set is **empty**: every declared category is
+//! dispatched on. The module stays because the marker is derived rather than
+//! trusted — an exhaustive match plus the source scan below — and a twelfth
+//! category, or a call site someone deletes, still has to answer for itself.
 //!
 //! # The marker is only honest because a test derives it
 //!
@@ -16,9 +21,11 @@
 //! the direction the list actually rots in. The test at the bottom of this file
 //! closes that gap: it reads the daemon's own source, finds every routing call
 //! site, works out which categories reach a router through them, and asserts the
-//! result equals this match. Wire up `redact` and the test fails until the
+//! result equals this match. Wire up a category and the test fails until the
 //! marker follows — which is exactly how `triage` (REQ-561 TASK-060), `shell`
-//! (TASK-061), `title` (TASK-062) and `compact` (TASK-063) arrived.
+//! (TASK-061), `title` (TASK-062), `compact` (TASK-063) and finally `redact`
+//! (REQ-562 TASK-070) arrived. It works in the other direction too: delete a
+//! call site and the marker is caught still claiming the category is reached.
 //!
 //! That test is the load-bearing half of ADR-A. This match is just where its
 //! answer is written down.
@@ -73,10 +80,13 @@ pub const fn has_call_site(category: Category) -> bool {
         // the budget — the duty only ever improves the choice, which is why
         // wiring it cannot weaken the gate.
         Category::Compact => true,
-        // Declared, unreached. Egress redaction is regex-based and makes no
-        // model call; giving it one means putting a model inside the choke
-        // point, which is REQ-562's subject and its own adversarial review.
-        Category::Redact => false,
+        // The last of the eleven, and the only one whose call site is not in
+        // the harness at all: `RedactionGateImpl::redact_route` resolves it
+        // inside the egress choke point, where the scan runs on the exact bytes
+        // that would leave the machine (REQ-562 ADR-1, TASK-070). Unreached
+        // until then — egress refused by provenance and nothing else, because a
+        // regex pass with no model behind it is not a call site.
+        Category::Redact => true,
     }
 }
 
@@ -378,9 +388,15 @@ mod tests {
     /// The unreached set is stated once, here, so a reviewer can check it
     /// against the architecture's table without reading the match.
     ///
-    /// Named for the list rather than its length (REQ-561 shrinks it one
-    /// category per task, and a test whose *name* has to change with each one is
-    /// a rename nobody wants four times).
+    /// Named for the list rather than its length (REQ-561 shrank it one category
+    /// per task and REQ-562 emptied it, and a test whose *name* has to change
+    /// with each one is a rename nobody wants five times).
+    ///
+    /// **The list is now empty**, which is a stronger assertion than it looks:
+    /// every declared category has a call site, so the `declared, no call site
+    /// yet` marker has nothing to mark. It is not deleted — the exhaustive match
+    /// is what makes a twelfth category answer the question, and this row is
+    /// what makes an answer of `false` visible to a reviewer.
     #[test]
     fn the_declared_unreached_categories_are_stated_once() {
         let unreached: Vec<&str> = Category::ALL
@@ -388,6 +404,10 @@ mod tests {
             .filter(|c| !has_call_site(*c))
             .map(Category::as_str)
             .collect();
-        assert_eq!(unreached, vec!["redact"], "the unreached set changed");
+        assert_eq!(
+            unreached,
+            Vec::<&str>::new(),
+            "the unreached set changed; every category REQ-558 declared is now dispatched on"
+        );
     }
 }

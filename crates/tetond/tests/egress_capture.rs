@@ -153,10 +153,15 @@ async fn scripted_session_leaks_zero_boundary_bytes_and_blocks_deliberate_egress
             path,
             provider_id,
             action,
+            // REQ-562 ADR-7: the provenance inspection is one of several things
+            // that can refuse a payload here, and this is the one that says
+            // *boundary*.
+            cause,
         }) => {
             assert_eq!(path, "secrets/prod.env");
             assert_eq!(provider_id, ProviderId::from("anthropic"));
             assert_eq!(action, PrivacyAction::ReroutedToLocal);
+            assert_eq!(cause, teton_protocol::events::BlockCause::Boundary);
         }
         other => panic!("turn 2 must be a privacy block, got {other:?}"),
     }

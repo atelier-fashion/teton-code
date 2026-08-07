@@ -1972,24 +1972,32 @@ mod tests {
     }
 
     /// AC-1 + ADR-A + AC-12: the table a human reads names every category, marks
-    /// the one with no call site, and states the BR-9 default.
+    /// any with no call site, and states the BR-9 default.
     ///
     /// **AC-1 is "the marker becomes accurate", not "delete the marker."** The
     /// `redact` assertion below is what keeps that distinction load-bearing: a
     /// renderer that had simply forgotten how to print the marker would satisfy
     /// every `!contains("no call site")` in this file and fail only there.
+    ///
+    /// Since REQ-562 TASK-070 wired `redact`, **no real category is unreached**
+    /// — so the `reached: false` row is a property of this fixture rather than
+    /// of the daemon, and deliberately kept. This is now the only layer at which
+    /// the marker can be exercised at all (the e2e half of the pair had to give
+    /// it up when the derived set emptied), which makes it more load-bearing
+    /// than before, not less. Nothing derives `reached` here; the daemon sends
+    /// it, and `tetond`'s own tests hold the daemon to its call sites.
     #[test]
     fn policy_show_marks_the_unreached_categories_and_the_judgment_default() {
         let mut surface = RecordingSurface::new();
         render_policy(&migrated_snapshot(), &mut surface);
         let rendered = surface.lines_of(LineKind::Info).join("\n");
 
-        // `redact` alone. Egress redaction is regex-based and makes no model
-        // call; giving it one is REQ-562's subject.
+        // The fixture's unreached row. A live daemon marks none of the eleven
+        // today; a twelfth arriving unwired would be marked exactly like this.
         let unreached = category_row(&rendered, "redact");
         assert!(
             unreached.contains("declared, no call site yet"),
-            "`redact` has no call site and must say so: {unreached}"
+            "a row the daemon sent as unreached must say so: {unreached}"
         );
         // The four REQ-561 wired (TASK-060..063) join the six that were already
         // reached. `triage`, `shell`, `title` and `compact` were on the marked
@@ -2163,12 +2171,16 @@ mod tests {
     /// class and the call-site marker render as one adjacent phrase.
     ///
     /// TASK-059 shipped no `Nothing` variant on purpose. `content_class` is what
-    /// a category *would* transmit — `redact` will carry the outbound payload the
-    /// moment REQ-562 wires it, so calling it `Nothing` would be a lie with a
-    /// short shelf life — and `reached` is whether anything transmits it today.
-    /// The cost of that (correct) division is that a class printed on its own
-    /// reads as a live egress path. This is the assertion that keeps the two
-    /// facts from drifting apart in the rendering.
+    /// a category *would* transmit — `redact` carries the outbound payload now
+    /// that REQ-562 TASK-070 has wired it, so calling it `Nothing` would have
+    /// been a lie with a short shelf life — and `reached` is whether anything
+    /// transmits it today. The cost of that (correct) division is that a class
+    /// printed on its own reads as a live egress path. This is the assertion
+    /// that keeps the two facts from drifting apart in the rendering.
+    ///
+    /// The fixture below still carries an unreached `redact` row, because the
+    /// *rendering* of a conditional class beside its marker has to stay covered
+    /// after the last real category was wired.
     #[test]
     fn policy_show_renders_the_content_class_beside_the_call_site_marker() {
         use teton_protocol::Category;
@@ -2177,8 +2189,8 @@ mod tests {
         render_policy(&migrated_snapshot(), &mut surface);
         let rendered = surface.lines_of(LineKind::Info).join("\n");
 
-        // The still-unreached one: class and marker in a single phrase, in that
-        // order, with nothing between them.
+        // The fixture's unreached row: class and marker in a single phrase, in
+        // that order, with nothing between them.
         let redact = category_row(&rendered, "redact");
         let class = ContentClass::for_category(Category::Redact).describe();
         assert!(

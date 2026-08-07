@@ -2,11 +2,17 @@
 //! pass, and the pure forward/block decision (REQ-562, ADR-4/ADR-5/ADR-6).
 //!
 //! This module is the **foundation** the redaction duty (`harness::redact`) and
-//! the egress gate hook (`egress::Egress::send`) consume. It is deliberately
-//! pure: no async, no engine, no I/O, no events. That is what makes AC-10's
-//! decision table exhaustively testable at unit cost, and it keeps the one
-//! security-relevant rule of the feature — *which verdicts block* — in a
+//! the egress gate hook (`egress::Egress::send`) consume. Every line of *code*
+//! in it is pure: no async body, no engine, no I/O, no events. That is what
+//! makes AC-10's decision table exhaustively testable at unit cost, and it keeps
+//! the one security-relevant rule of the feature — *which verdicts block* — in a
 //! function with no collaborators to mock.
+//!
+//! [`RedactionGate`] is the one exception, and it is a *declaration* rather than
+//! an implementation: the choke point needs a name for "the thing that produces
+//! a verdict" and the verdict type lives here, so the trait lives beside it.
+//! Nothing in this module implements it — `runtime::RedactionGateImpl` does,
+//! where the router, the engine slot and the duty seam already are.
 //!
 //! ## The two passes and where confidence comes from (ADR-4, BR-4)
 //!
@@ -63,6 +69,8 @@
 //! these scans produce are always valid `str` char boundaries.
 
 use std::ops::Range;
+
+use async_trait::async_trait;
 
 /// The largest payload the redactor will scan, in bytes (ADR-6).
 ///
@@ -329,6 +337,36 @@ pub fn decide(verdict: &RedactionVerdict) -> EgressDecision {
             }
         }
     }
+}
+
+/// Something that can scan an outbound payload and return a verdict (ADR-1,
+/// ADR-2).
+///
+/// The collaborator [`Egress`](crate::egress::Egress) holds, and the whole
+/// interface between the choke point and the redactor: text in, verdict out.
+/// The choke point knows nothing about routers, engines, prompts or contracts —
+/// it knows [`decide`].
+///
+/// ## Total, like the scan behind it
+///
+/// There is no `Result`. Every way a scan can fail — no local tier, an over-cap
+/// payload, an engine error, a deadline, an unreadable reply — is already
+/// [`Outcome::Unavailable`], which [`decide`] blocks on (ADR-6, BR-3). An error
+/// arm here would be a *second* spelling of "the scan could not run", and the
+/// two spellings would eventually disagree about whether that means block.
+///
+/// ## Absence is the off state (ADR-2)
+///
+/// The gate is installed only when `[privacy] redact` is true, so there is no
+/// `enabled` flag on this trait and no `if enabled` branch behind it. "Off" is
+/// `Option::None` at the choke point: zero calls, no model interaction, nothing
+/// that could claim a scan ran (AC-13). A flag *inside* an installed gate would
+/// be a switch a mutation could flip to "on and permissive".
+#[async_trait]
+pub trait RedactionGate: Send + Sync {
+    /// Scan `payload` — the lossy-UTF-8 text of the exact bytes that would go on
+    /// the wire (ADR-1) — and say what was found.
+    async fn scan(&self, payload: &str) -> RedactionVerdict;
 }
 
 /// The deterministic credential pattern pass over `text` (ADR-4).
