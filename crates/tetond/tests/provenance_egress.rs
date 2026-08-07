@@ -35,7 +35,7 @@ use tetond::broadcast::EventBus;
 use tetond::egress::Egress;
 use tetond::harness::{
     build_system_prompt, context_provenance, run_session_turn_with_source, ContextManager,
-    DigestRoute, HarnessConfig, HarnessError, NoopProvenanceHook, PendingPermissions,
+    DutyRoute, HarnessConfig, HarnessError, NoopProvenanceHook, PendingPermissions,
     PermissionConfig, PermissionGate, RemoteProviderSource, SessionEvents, ToolContext,
     ToolRegistry,
 };
@@ -211,7 +211,7 @@ async fn run_touching_tool(
         // REQ-558: this loop digests through the `digest` category. These turns
         // stay under the summarization threshold, so nothing is served — and an
         // unresolved route bounds mechanically rather than folding raw.
-        &DigestRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no digest route in this test"),
     )
     .await;
 

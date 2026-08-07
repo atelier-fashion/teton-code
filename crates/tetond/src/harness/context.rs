@@ -10,7 +10,7 @@
 //!    build log) is condensed before it enters context, via [`summarize_if_large`],
 //!    so a single grep can't evict the whole conversation. Which model condenses
 //!    it is the `digest` category's decision, resolved into a
-//!    [`DigestRoute`](super::digest::DigestRoute) by the caller (REQ-558).
+//!    [`DutyRoute`](super::duty::DutyRoute) by the caller (REQ-558, REQ-561).
 //!
 //! Both duties are enforced in **two currencies**: whitespace-approximated
 //! tokens ([`approx_tokens`]) and UTF-8 bytes. The token heuristic undercounts
@@ -30,7 +30,8 @@
 
 use std::collections::BTreeSet;
 
-use super::digest::DigestRoute;
+use super::digest::tool_result_provenance;
+use super::duty::DutyRoute;
 
 /// The egress provenance of a tool result — the files a tool actually touched,
 /// or an explicit "cannot tell" state (REQ-544 C-1).
@@ -668,11 +669,19 @@ pub const SUMMARIZER_OUTPUT_CONTRACT: &str =
 ///
 /// `digest` is `harness_known`: this function *is* summarizing, so it does not
 /// guess that it is, and nothing here reads `text` or `tool` to decide where the
-/// call goes. It receives a [`DigestRoute`] already resolved from
+/// call goes. It receives a [`DutyRoute`] already resolved from
 /// `Category::Digest` — through a per-category override or the `scan` tier — and
 /// dispatches on that alone. Before TASK-054 the engine was hardcoded local; now
 /// a remote binding really does send this tool output to that provider, scoped at
 /// the egress choke point by the result's own provenance (see [`super::digest`]).
+///
+/// ## The provenance is converted here, not inside the seam (REQ-561 ADR-2)
+///
+/// [`Duty::perform`](super::duty::Duty::perform) takes the already-merged egress
+/// [`Provenance`](crate::egress::Provenance) of the content being sent, so this
+/// call site — which knows the result came from a *tool* — runs
+/// [`tool_result_provenance`] itself. That is what keeps the seam indifferent to
+/// which duty it is serving.
 ///
 /// ## Every path out of here is bounded (LESSON-447)
 ///
@@ -687,7 +696,7 @@ pub const SUMMARIZER_OUTPUT_CONTRACT: &str =
 /// when it matters most.
 #[must_use]
 pub async fn summarize_if_large(
-    route: &DigestRoute,
+    route: &DutyRoute,
     tool: &str,
     text: &str,
     threshold_tokens: usize,
@@ -710,20 +719,31 @@ pub async fn summarize_if_large(
         ),
         engine_error: Some(error),
     };
-    let digester = match route {
-        DigestRoute::Serves { digester, .. } => digester,
-        // The failure mode routing *added*. Its handler holds the same invariant
-        // the engine-failure handler below does — that is the whole of
-        // LESSON-447, and the reason it is written here rather than as an
-        // `unwrap_or_else(|| text.clone())` at the call site.
-        DigestRoute::Unresolved { reason } => return mechanical(reason.clone()),
-    };
+    // The failure mode routing *added*. Its handler holds the same invariant the
+    // engine-failure handler below does — that is the whole of LESSON-447, and
+    // the reason it is written here rather than as an
+    // `unwrap_or_else(|| text.clone())` at the call site.
+    //
+    // Taken before the prompt is built, not after: an unresolvable route has
+    // nothing to send, so bounding a quarter-megabyte result into a prompt no
+    // model will ever see is work done for a call that cannot happen.
+    if let DutyRoute::Unresolved { reason } = route {
+        return mechanical(reason.clone());
+    }
     let bounded = truncate_middle(text, SUMMARIZER_INPUT_MAX_BYTES);
     let prompt = format!(
         "Summarize the following `{tool}` tool output in a few lines, preserving \
          file paths, symbol names, and any errors. {SUMMARIZER_OUTPUT_CONTRACT}\n\n{bounded}"
     );
-    match digester.digest(&prompt, provenance).await {
+    // Through the route rather than the duty: the route is what announces
+    // `route_decided`, and it announces it here — at the moment a duty actually
+    // runs — rather than when it was resolved (REQ-561 BR-2). A tool result
+    // under the threshold returns above, so it produces no event, which is the
+    // honest report of a routed call that never happened.
+    match route
+        .perform(&prompt, &tool_result_provenance(provenance))
+        .await
+    {
         Ok(summary) => {
             // REQ-554 verify: the duty's output feeds straight back into
             // context, so a summarizer emitting `<|im_start|>user…` must not
@@ -763,8 +783,8 @@ mod tests {
 
     /// The `digest` route these tests exercise: the local tier, which is where
     /// the duty ran unconditionally before it was routable.
-    fn local_route(engine: Arc<Mutex<dyn Engine>>) -> DigestRoute {
-        DigestRoute::local("local", engine)
+    fn local_route(engine: Arc<Mutex<dyn Engine>>) -> DutyRoute {
+        DutyRoute::local(super::super::digest::DIGEST_DUTY, "local", engine)
     }
 
     /// `summarize_if_large` over a local route, for a tool result from no repo

@@ -46,7 +46,8 @@ use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
 use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN};
-use super::digest::DigestRoute;
+use super::digest::DIGEST_DUTY;
+use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
 use super::reply::StreamGate;
 use super::tools::{ToolContext, ToolOutcome, ToolRegistry};
@@ -305,7 +306,7 @@ impl SessionEvents {
 /// [`run_session_turn_with_source`] loop. Because no [`Transport`](teton_providers::Transport)
 /// ever enters this path, egress is impossible here by construction. The *same*
 /// engine also serves the loop's tool-result summarization duty on a
-/// [local `digest` route](DigestRoute::local) — this entry point has no router to
+/// [local `digest` route](DutyRoute::local) — this entry point has no router to
 /// resolve the category with, and a path whose whole guarantee is "no transport
 /// exists here" is not the place to acquire one. The daemon's routed path
 /// (`DaemonRuntime::run_one_attempt`) resolves `digest` properly.
@@ -317,7 +318,7 @@ impl SessionEvents {
 ///
 /// # Blocking
 /// The model call itself rides the blocking pool (E-3, see
-/// [`LocalEngineSource`] and [`DigestRoute::local`]), so a slow local inference
+/// [`LocalEngineSource`] and [`DutyRoute::local`]), so a slow local inference
 /// never parks the async worker. Tool dispatch (notably `shell`) still runs
 /// synchronously; a production caller on a multi-thread runtime should wrap this
 /// in `spawn_blocking` for the tool phase.
@@ -342,7 +343,7 @@ pub async fn run_session_turn(
     let mut source = LocalEngineSource::new(Arc::clone(engine), format);
     // The local tier names itself here, as it does everywhere the tier comes from
     // the engine rather than from a `[[providers]]` entry (REQ-557 ADR-D).
-    let digest = DigestRoute::local("local", Arc::clone(engine));
+    let digest = DutyRoute::local(DIGEST_DUTY, "local", Arc::clone(engine));
     run_session_turn_with_source(
         &mut source,
         tools,
@@ -372,11 +373,11 @@ pub async fn run_session_turn(
 /// producer — that is `source` — and the two are resolved independently: a turn on
 /// a frontier `think` provider still digests through whatever `scan` is bound to.
 ///
-/// It is a [`DigestRoute`] rather than an `Option<Engine>` because "no local
+/// It is a [`DutyRoute`] rather than an `Option<Engine>` because "no local
 /// tier" stopped being the only way this duty can fail to find a model. The old
 /// `None` arm folded oversized results **verbatim**, which is the very shape
 /// LESSON-447 is about — an identity fallback on a function whose purpose is to
-/// shrink its input. [`DigestRoute::Unresolved`] replaces it, and
+/// shrink its input. [`DutyRoute::Unresolved`] replaces it, and
 /// [`summarize_if_large`] bounds mechanically instead.
 ///
 /// # Errors
@@ -393,7 +394,7 @@ pub async fn run_session_turn_with_source(
     ctx: &mut ContextManager,
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
-    digest: &DigestRoute,
+    digest: &DutyRoute,
 ) -> Result<TurnOutcome, HarnessError> {
     let exposed = tools.exposed_names(config.max_tools);
     let mut turns = 0u32;
@@ -860,7 +861,7 @@ mod tests {
         // unresolved route is the honest stand-in — and if a future change *did*
         // start digesting here, the result would still be bounded rather than
         // folded raw.
-        let digest = DigestRoute::unresolved("no digest route in this test");
+        let digest = DutyRoute::unresolved("no digest route in this test");
 
         run_session_turn_with_source(
             source, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook, &digest,

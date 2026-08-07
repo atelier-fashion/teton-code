@@ -37,7 +37,7 @@ use tetond::broadcast::EventBus;
 use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::Egress;
 use tetond::harness::{
-    build_system_prompt, run_session_turn_with_source, ContextManager, DigestRoute, HarnessConfig,
+    build_system_prompt, run_session_turn_with_source, ContextManager, DutyRoute, HarnessConfig,
     HarnessError, NoopProvenanceHook, PendingPermissions, PermissionConfig, PermissionGate,
     RemoteProviderSource, SessionEvents, ToolContext, ToolRegistry,
 };
@@ -262,7 +262,7 @@ async fn remote_routed_session_streams_dispatches_tools_and_records_cost() {
         // REQ-558: this loop digests through the `digest` category. These turns
         // stay under the summarization threshold, so nothing is served — and an
         // unresolved route bounds mechanically rather than folding raw.
-        &DigestRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no digest route in this test"),
     )
     .await
     .expect("remote turn completes");
@@ -395,7 +395,7 @@ async fn remote_turn_over_boundary_context_is_blocked_and_never_billed() {
         // REQ-558: this loop digests through the `digest` category. These turns
         // stay under the summarization threshold, so nothing is served — and an
         // unresolved route bounds mechanically rather than folding raw.
-        &DigestRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no digest route in this test"),
     )
     .await;
 

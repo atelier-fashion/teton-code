@@ -135,8 +135,9 @@ use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
-    build_system_prompt, ContextManager, DigestRoute, LocalEngineSource, PendingPermissions,
-    PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolRegistry,
+    build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
+    PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolRegistry,
+    DIGEST_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -1830,26 +1831,21 @@ impl DaemonRuntime {
     ///    the category table is a cost decision, and the two deliberately do not
     ///    compose (LESSON-432). Checked before a category is resolved, so nothing
     ///    here reads a binding on a tainted turn.
-    /// 2. **The resolver**, through [`Router::resolve`] — one table, one
-    ///    precedence, the same one the turn itself went through (BR-6).
+    /// 2. **The resolver** — one table, one precedence, the same one the turn
+    ///    itself went through (BR-6).
     ///
-    /// Every unresolvable outcome carries a **reason**, never a bare `None`: the
-    /// duty guards an invariant, so its caller must be able to say why it fell
-    /// back to mechanical truncation (LESSON-447). Where the sentence exists
-    /// already — the resolver's — it is carried verbatim rather than re-authored
-    /// (BR-6). Note what is *not* here: a credential that will not resolve fails
-    /// the **turn** on the turn path (a config error the user must fix), but only
-    /// the **duty** here — a duty is never fatal, and the failure is reported on
-    /// the summarize outcome instead.
+    /// ## Why this function exists at all (REQ-561 ADR-3)
     ///
-    /// A remotely-bound `digest` builds its provider and transport eagerly, once
-    /// per attempt, whether or not any tool result ends up crossing the
-    /// threshold. That costs a keychain read and an HTTP client per turn against
-    /// a turn whose floor is one model inference, so it is not worth the
-    /// machinery to defer — but it is worth knowing that after REQ-557's
-    /// migration (`default_provider` set to the first remote provider, no
-    /// `[[tiers]]` rows) the unbound `scan` tier inherits that provider, so this
-    /// is the *ordinary* upgraded config and not an exotic one.
+    /// Everything below the two lines that pick a [`Route`](crate::router::Route)
+    /// is shared with every other duty and lives in [`Self::resolve_duty`]. What
+    /// cannot be shared is the line naming the category, because
+    /// [`crate::call_sites`]'s derived-marker test reads the daemon's own source
+    /// looking for a routing call with a `Category::X` literal inside it. Fold
+    /// that literal into a helper taking a category *variable* and the scan finds
+    /// nothing — the `declared, no call site yet` marker would then keep claiming
+    /// `digest` is unreached while it is fully wired, and the test would fail
+    /// pointing at the marker rather than at the receiver. So the shared helper
+    /// sits **behind** the literal, not in front of it.
     fn digest_route(
         &self,
         router: &Router,
@@ -1857,15 +1853,96 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
-    ) -> DigestRoute {
+    ) -> DutyRoute {
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `digest` duty"))
         } else {
             router.resolve(Category::Digest)
         };
+        self.resolve_duty(
+            DIGEST_DUTY,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
+    }
+
+    /// Turn a resolved [`Route`](crate::router::Route) into the [`DutyRoute`]
+    /// that serves `duty` — the shared half of every duty resolver (REQ-561 BR-6).
+    ///
+    /// The per-duty resolvers differ only in which category they name; from the
+    /// `Route` onward, locality, provider construction, egress wiring, the cost
+    /// meter and every failure sentence are one implementation. Adding a duty
+    /// adds a four-line resolver, not a copy of this.
+    ///
+    /// ## `route_decided` is *attached* here and *published* on use (BR-2)
+    ///
+    /// This is the one place that holds the `Route`, so this is where the event
+    /// payload is projected off it — but publishing waits until
+    /// [`DutyRoute::perform`] actually runs the duty. `digest_route` is built
+    /// unconditionally once per turn attempt whether or not any tool result
+    /// crosses the summarization threshold, so emitting here would announce a
+    /// routed model call for every turn that never makes one — and would do it
+    /// five times per turn once the remaining four duties are wired. BR-2 exists
+    /// to make an egress path visible; a path that never fires produced no
+    /// egress.
+    ///
+    /// [`Route::route_decided`](crate::router::Route::route_decided) self-guards
+    /// on the other side: it yields nothing when no provider was selected, so an
+    /// unroutable duty carries no announcement at all.
+    ///
+    /// ## Every unresolvable outcome carries a reason
+    ///
+    /// Never a bare `None`: the duty guards an invariant, so its caller must be
+    /// able to say why it fell back to degraded means (LESSON-447). Where the
+    /// sentence exists already — the resolver's — it is carried verbatim rather
+    /// than re-authored (BR-6). Note what is *not* here: a credential that will
+    /// not resolve fails the **turn** on the turn path (a config error the user
+    /// must fix), but only the **duty** here — a duty is never fatal, and the
+    /// failure is reported on the duty's own outcome instead.
+    fn resolve_duty(
+        &self,
+        duty: DutyKind,
+        route: &crate::router::Route,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        self.build_duty_route(duty, route, config, events, session_id, local_engine)
+            .announcing(events, Some(session_id.clone()), route.route_decided())
+    }
+
+    /// Build the [`DutyRoute`] `route` calls for, without announcing anything.
+    ///
+    /// Split from [`Self::resolve_duty`] so the announcement has exactly **one**
+    /// attachment site: this function has five returns, and an
+    /// `.announcing(...)` on each is five chances for the sixth to forget.
+    ///
+    /// A remotely-bound duty builds its provider and transport eagerly, once per
+    /// attempt, whether or not the duty ends up being called. That costs a
+    /// keychain read and an HTTP client per turn against a turn whose floor is one
+    /// model inference, so it is not worth the machinery to defer — but it is
+    /// worth knowing that after REQ-557's migration (`default_provider` set to the
+    /// first remote provider, no `[[tiers]]` rows) an unbound tier inherits that
+    /// provider, so this is the *ordinary* upgraded config and not an exotic one.
+    fn build_duty_route(
+        &self,
+        duty: DutyKind,
+        route: &crate::router::Route,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        // The category's own name, read off the duty rather than spelled again:
+        // two surfaces describing one routing state must not be able to drift.
+        let name = duty.category().as_str();
 
         let Some(provider_id) = route.provider_id.as_ref().map(|p| p.0.clone()) else {
-            return DigestRoute::unresolved(route.reason);
+            return DutyRoute::unresolved(route.reason.clone());
         };
 
         // Locality is decided exactly as the turn path decides it, from the same
@@ -1880,9 +1957,9 @@ impl DaemonRuntime {
 
         if is_local {
             return match local_engine {
-                Some((engine, _format)) => DigestRoute::local(provider_id, Arc::clone(engine)),
-                None => DigestRoute::unresolved(format!(
-                    "The 'digest' category resolves to '{provider_id}', but no local engine is \
+                Some((engine, _format)) => DutyRoute::local(duty, provider_id, Arc::clone(engine)),
+                None => DutyRoute::unresolved(format!(
+                    "The '{name}' category resolves to '{provider_id}', but no local engine is \
                      loaded to serve it yet."
                 )),
             };
@@ -1892,24 +1969,24 @@ impl DaemonRuntime {
         // returning a bare "unavailable" — an unresolvable duty is a
         // configuration fact the user can act on.
         let Some(provider_cfg) = provider_cfg else {
-            return DigestRoute::unresolved(format!(
-                "The 'digest' category resolves to '{provider_id}', which this daemon has no \
+            return DutyRoute::unresolved(format!(
+                "The '{name}' category resolves to '{provider_id}', which this daemon has no \
                  provider entry for, and no local engine is loaded to serve it instead."
             ));
         };
         // REQ-557 BR-1 / BUG-155: no model, no call. A provider id is not a model
         // name and must never stand in for one.
         let Some(model) = route.model.clone() else {
-            return DigestRoute::unresolved(format!(
-                "The 'digest' category resolves to '{provider_id}', which declares no model, so \
+            return DutyRoute::unresolved(format!(
+                "The '{name}' category resolves to '{provider_id}', which declares no model, so \
                  there is nothing to call."
             ));
         };
         let transport = match build_remote_transport(provider_cfg, &self.secret_resolver) {
             Ok(transport) => transport,
             Err(err) => {
-                return DigestRoute::unresolved(format!(
-                    "The 'digest' category resolves to '{provider_id}', whose transport could \
+                return DutyRoute::unresolved(format!(
+                    "The '{name}' category resolves to '{provider_id}', whose transport could \
                      not be built: {err}"
                 ))
             }
@@ -1921,7 +1998,8 @@ impl DaemonRuntime {
         // second, laxer path is the hole BR-1 exists to close.
         let egress = Egress::new(transport, config.boundaries.clone(), events.clone())
             .with_cost_meter(Arc::new(self.ledger.clone()));
-        DigestRoute::remote(
+        DutyRoute::remote(
+            duty,
             provider_id,
             build_provider(provider_cfg, caps),
             egress,
@@ -3520,7 +3598,7 @@ fn build_provider(provider: &ModelProvider, caps: CapabilityProfile) -> Box<dyn 
 /// merely warming is still a wait, not an error (BUG-152).
 ///
 /// This mirrors what the `digest` duty already does with the same value
-/// (`DigestRoute::unresolved(route.reason)`); before this, the duty path carried
+/// (`DutyRoute::unresolved(route.reason)`); before this, the duty path carried
 /// the resolver's sentence and the *turn* path — the one a user actually reads —
 /// discarded it.
 fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) -> RpcError {
@@ -3575,7 +3653,7 @@ const LOCAL_PROVIDER_ID: &str = "local";
 /// every one of those guarantees resolves to a remote endpoint while its own
 /// sentence says the turn is pinned local: `run_one_attempt` decides locality
 /// from `ProviderKind::Local` and dispatches over HTTP, `digest_route` builds a
-/// `RemoteDigester` for a tainted session, and `resolve(Category::Redact)`
+/// remote duty for a tainted session, and `resolve(Category::Redact)`
 /// hands back a vendor API.
 ///
 /// Two ways the tier can be real, and nothing else counts:
@@ -4805,7 +4883,7 @@ provider_id = "on-device"
         )));
 
         let out = crate::harness::context::summarize_if_large(
-            &DigestRoute::local("local", Arc::clone(&engine)),
+            &DutyRoute::local(DIGEST_DUTY, "local", Arc::clone(&engine)),
             "read",
             &"word ".repeat(500),
             50,
@@ -5537,7 +5615,7 @@ provider_id = "on-device"
         // engine or the provider entry. The pin sentence it passes to
         // `resolve_local_pin` therefore reaches no user today — worth knowing,
         // and the reason this half is pinned at the helper only. Making it
-        // observable means carrying the reason onto `DigestRoute::Serves`,
+        // observable means carrying the reason onto `DutyRoute::Serves`,
         // which is a change to the type rather than to this test.
     }
 
@@ -7306,6 +7384,7 @@ provider_id = "on-device"
         mod digest {
             use super::*;
             use teton_core::category::{CategoryOverride, ConfigurableCategory};
+            use teton_protocol::events::{Event, RouteDecided};
 
             /// `config()` plus a `scan` binding — the tier `digest` inherits.
             fn scan_bound_to(provider_id: &str) -> Config {
@@ -7320,7 +7399,7 @@ provider_id = "on-device"
 
             /// The `digest` route the turn path builds, from the same runtime
             /// state and through the same router.
-            fn digest_for(runtime: &DaemonRuntime, session: &SessionId) -> DigestRoute {
+            fn digest_for(runtime: &DaemonRuntime, session: &SessionId) -> DutyRoute {
                 let config = runtime.config.lock().expect("config mutex").clone();
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
@@ -7421,7 +7500,7 @@ provider_id = "on-device"
                 let route = digest_for(&runtime, &SessionId::from("sess"));
 
                 assert_eq!(route.provider(), None);
-                let DigestRoute::Unresolved { reason } = route else {
+                let DutyRoute::Unresolved { reason } = route else {
                     panic!("an unroutable binding must not resolve to a provider");
                 };
                 assert!(reason.contains("digest"), "{reason}");
@@ -7441,7 +7520,7 @@ provider_id = "on-device"
                 let route = digest_for(&runtime, &SessionId::from("sess"));
 
                 assert_eq!(route.provider(), None);
-                let DigestRoute::Unresolved { reason } = route else {
+                let DutyRoute::Unresolved { reason } = route else {
                     panic!("there is nothing to serve the duty");
                 };
                 // Byte-for-byte the resolver's own sentence for this state.
@@ -7451,6 +7530,134 @@ provider_id = "on-device"
                         .resolve(Category::Digest);
                 assert_eq!(reason, resolved.reason);
                 assert!(reason.contains("'digest' cannot be routed"), "{reason}");
+            }
+
+            // ---------------------------------------------------------------
+            // REQ-561 BR-2: `route_decided` for the duty, and *when* it fires.
+            //
+            // These two are a pair (LESSON-485). The positive alone would pass
+            // against an emitter that announced at resolution time; the negative
+            // alone would pass against an emitter that never announced at all.
+            // Only together do they pin "announced iff the duty actually ran".
+            // ---------------------------------------------------------------
+
+            /// Every `route_decided` the duty path published, oldest first.
+            ///
+            /// Drained with `try_recv` rather than awaited under a timeout:
+            /// `EventBus::publish` is synchronous, so once the call under test
+            /// has returned, everything it published is already queued
+            /// (LESSON-450 — a wall-clock poll is the assertion shape that goes
+            /// flaky first).
+            fn announced(sub: &mut crate::broadcast::Subscription) -> Vec<RouteDecided> {
+                std::iter::from_fn(|| sub.try_recv())
+                    .filter_map(|env| match env.event {
+                        Event::RouteDecided(rd) => Some(rd),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            /// The `digest` route the turn path builds, on a bus the test can
+            /// watch. `config()` leaves `scan` unbound, so `digest` inherits the
+            /// **local** tier — which is what makes performing it in-process
+            /// possible without a network call.
+            fn watched_digest(
+                runtime: &DaemonRuntime,
+                bus: &Arc<EventBus>,
+                session: &SessionId,
+            ) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.digest_route(&router, &config, bus, session, slot.as_ref())
+            }
+
+            /// **REQ-561 BR-2, the positive half.** A `digest` that actually runs
+            /// announces where it went, on the same `route_decided` surface a
+            /// turn uses: the category, the tier it resolved through, the
+            /// provider serving it, and a non-empty reason.
+            ///
+            /// REQ-558 routed the duty and told nobody. That is the one category
+            /// whose whole premise is that it resolves *independently of the
+            /// turn* — so a user watching only the turn's `route_decided` saw a
+            /// frontier `think` provider while their file bodies went to whatever
+            /// `scan` was bound to, with no event saying so.
+            ///
+            /// Deliberately asserted off the **bus**, not off the returned route:
+            /// "the user can see it" is a claim about a published event, and a
+            /// duty that ran correctly while announcing nothing is exactly the
+            /// state this test exists to fail on.
+            #[tokio::test]
+            async fn a_performed_digest_announces_its_route() {
+                let engine = CountingEngine::answering("CONDENSED");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+
+                let route = watched_digest(&runtime, &bus, &SessionId::from("sess"));
+                assert_eq!(
+                    route.provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "the duty must resolve, or this test proves nothing"
+                );
+
+                let out = route
+                    .perform("Summarize this.", &crate::egress::Provenance::empty())
+                    .await;
+                assert_eq!(out.as_deref(), Ok("CONDENSED"), "the duty really ran");
+
+                let decided = announced(&mut sub);
+                assert_eq!(
+                    decided.len(),
+                    1,
+                    "one performed duty announces exactly one route: {decided:?}"
+                );
+                let rd = &decided[0];
+                assert_eq!(rd.category, Some(ProtoCategory::Digest), "{rd:?}");
+                assert_eq!(rd.tier, Some(ProtoTier::Scan), "{rd:?}");
+                assert_eq!(rd.provider_id.0, LOCAL_PROVIDER_ID, "{rd:?}");
+                assert!(!rd.reason.is_empty(), "{rd:?}");
+            }
+
+            /// **REQ-561 BR-2, the negative half — and the whole point of it.**
+            ///
+            /// `digest_route` is built unconditionally once per turn attempt,
+            /// whether or not any tool result crosses the summarization
+            /// threshold. Announcing at *resolution* would therefore put a
+            /// `route_decided` on the wire for a routed model call that never
+            /// happened, on every turn — and five of them per turn once the
+            /// remaining four duties are wired. BR-2 exists to make an egress
+            /// path visible, and a path that never fires produced no egress.
+            ///
+            /// This is the assertion that fails if emission moves back to the
+            /// resolver. Its non-vacuity is the test above, which shows this same
+            /// route *does* announce the moment it is performed.
+            #[test]
+            fn a_digest_that_never_runs_announces_nothing() {
+                let engine = CountingEngine::answering("CONDENSED");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+
+                let route = watched_digest(&runtime, &bus, &SessionId::from("sess"));
+
+                // The discriminating state is reachable: this route resolved to a
+                // provider and carries an announcement it is holding back. A
+                // fixture that could not resolve would pass this vacuously.
+                assert_eq!(route.provider(), Some(LOCAL_PROVIDER_ID));
+                assert_eq!(
+                    engine.calls(),
+                    0,
+                    "resolving a duty must not call the model"
+                );
+
+                let decided = announced(&mut sub);
+                assert!(
+                    decided.is_empty(),
+                    "resolving a duty is not performing one; announcing here would \
+                     report a routed model call that never happened: {decided:?}"
+                );
             }
         }
     }

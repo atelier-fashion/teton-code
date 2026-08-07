@@ -1,7 +1,7 @@
 ---
 id: TASK-058
 title: "The shared DutyRoute/Duty seam, with digest migrated onto it"
-status: draft
+status: complete
 parent: REQ-561
 created: 2026-08-07
 updated: 2026-08-07
@@ -31,12 +31,12 @@ before any of them start.
 
 ## Acceptance Criteria
 
-- [ ] `DutyRoute` is a single non-generic type holding `Arc<dyn Duty>` (ADR-1). No `DigestRoute` type survives; no per-category route type is introduced.
-- [ ] `Duty` exposes `category()`, `ceiling_bytes()`, and `async perform(&self, prompt: &str, provenance: &Provenance) -> Result<String, String>` (ADR-2). Note the `&Provenance` signature — **not** `&ToolProvenance`.
-- [ ] Exactly one `Egress::scoped(` call exists on the duty path, and exactly one ceiling-enforcement site.
-- [ ] `digest` routes through the seam and **every existing digest test passes unmodified**. A test edited to accommodate the refactor is a violation, not an accommodation — if a digest test needs changing, the seam changed behaviour and that is the bug.
-- [ ] `digest` emits `route_decided` naming `Category::Digest`, a tier, a provider, and a non-empty reason **when the duty actually performs** (BR-2, part of AC-2, ADR-8). Paired with the negative: a turn where the duty resolves but never performs emits **no** digest `route_decided`. The negative is what pins the design — without it the test passes equally under emit-at-resolve (LESSON-485).
-- [ ] `cargo test --workspace --no-fail-fast` is green.
+- [x] `DutyRoute` is a single non-generic type holding `Arc<dyn Duty>` (ADR-1). No `DigestRoute` type survives; no per-category route type is introduced.
+- [x] `Duty` exposes `category()`, `ceiling_bytes()`, and `async perform(&self, prompt: &str, provenance: &Provenance) -> Result<String, String>` (ADR-2). Note the `&Provenance` signature — **not** `&ToolProvenance`.
+- [x] Exactly one `Egress::scoped(` call exists on the duty path, and exactly one ceiling-enforcement site.
+- [x] `digest` routes through the seam and **every existing digest test passes unmodified**. A test edited to accommodate the refactor is a violation, not an accommodation — if a digest test needs changing, the seam changed behaviour and that is the bug.
+- [x] `digest` emits `route_decided` naming `Category::Digest`, a tier, a provider, and a non-empty reason **when the duty actually performs** (BR-2, part of AC-2, ADR-8). Paired with the negative: a turn where the duty resolves but never performs emits **no** digest `route_decided`. The negative is what pins the design — without it the test passes equally under emit-at-resolve (LESSON-485).
+- [x] `cargo test --workspace --no-fail-fast` is green.
 
 ## Technical Notes
 

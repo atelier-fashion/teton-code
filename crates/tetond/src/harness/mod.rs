@@ -19,9 +19,13 @@
 //!   client round-trip over TASK-004's bus, and session-scoped grants.
 //! - [`context`] — small-model context management: truncation, tool-result
 //!   summarization, and the provenance-tagging seam for egress.
-//! - [`digest`] — the resolved `digest` route the summarization duty runs on
-//!   (REQ-558): the local engine or a remote provider behind the egress choke
-//!   point, or an explained refusal to resolve.
+//! - [`duty`] — the shared duty seam (REQ-561): one [`duty::DutyRoute`], one
+//!   [`duty::Duty`] trait, one local impl, one remote impl behind the egress
+//!   choke point, and one output ceiling — for every model call the harness
+//!   makes on its own behalf rather than on the user's.
+//! - [`digest`] — what is `digest`-specific about the summarization duty
+//!   (REQ-558): its [`digest::DIGEST_DUTY`] descriptor and the tool-result
+//!   provenance bridge. Everything else it used to own now lives in [`duty`].
 //! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
@@ -40,6 +44,7 @@
 pub mod completion;
 pub mod context;
 pub mod digest;
+pub mod duty;
 pub mod permissions;
 pub(crate) mod render;
 pub(crate) mod reply;
@@ -54,7 +59,8 @@ pub use context::{
     ContextBlock, ContextManager, NoopProvenanceHook, Provenance, ProvenanceHook,
     RecordingProvenanceHook, ToolProvenance,
 };
-pub use digest::{DigestRoute, Digester};
+pub use digest::DIGEST_DUTY;
+pub use duty::{Duty, DutyKind, DutyRoute};
 pub use permissions::{
     PendingPermissions, PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,
 };
