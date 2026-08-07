@@ -901,14 +901,23 @@ mod tests {
     use teton_inference::{Completion, Engine, EngineError, GenParams};
     use teton_protocol::Category;
 
-    /// The five duty modules — where ADR-3 allows per-category source to live,
-    /// and the only place it may.
-    const DUTY_MODULES: [&str; 5] = [
+    /// The duty modules — where ADR-3 allows per-category source to live, and
+    /// the only place it may.
+    ///
+    /// A census, not a bound: REQ-561 shipped five and REQ-562 adds `redact` as
+    /// the sixth caller of this seam, so a task that wires a new duty adds its
+    /// module here and the scans below start covering it. What the list is *for*
+    /// is the rule beneath it — one `DutyKind` per duty module and no others,
+    /// and no duty module carrying any of the seam's concerns — which is
+    /// unchanged by how many entries it has. (`redact`'s call site is not in the
+    /// harness at all: it is the egress choke point, REQ-562 ADR-1.)
+    const DUTY_MODULES: [&str; 6] = [
         "harness/digest.rs",
         "harness/triage.rs",
         "harness/shell_duty.rs",
         "harness/title.rs",
         "harness/compact.rs",
+        "harness/redact.rs",
     ];
 
     /// The one place in the daemon that maps text to a routing-category *name*,
@@ -1420,7 +1429,7 @@ mod tests {
                 assert!(
                     !src.contains(needle),
                     "BR-6 VIOLATION: `{module}` contains `{needle}` — {meaning}. The seam \
-                     owns that concern once, for all five duties (ADR-3)."
+                     owns that concern once, for every duty (ADR-3)."
                 );
             }
             assert!(
@@ -1429,8 +1438,8 @@ mod tests {
             );
         }
 
-        // And exactly five duties exist, each constructed exactly once. A sixth
-        // `DutyKind` built somewhere else is a duty nobody declared.
+        // And one `DutyKind` per duty module, each constructed exactly once. One
+        // built anywhere else is a duty nobody declared.
         let built: Vec<String> = code()
             .into_iter()
             .flat_map(|(rel, src)| std::iter::repeat_n(rel, count(&src, "DutyKind::new(")))
@@ -1505,8 +1514,7 @@ mod tests {
         assert!(
             checked >= DUTY_MODULES.len(),
             "the scan found only {checked} duty-category mentions, which is fewer than \
-             the five `DutyKind` constants that must exist — it is reading the wrong \
-             thing"
+             the `DutyKind` constants that must exist — it is reading the wrong thing"
         );
 
         // ADR-10's own claim, and the sharpest one: the tool layer — where a
@@ -1526,8 +1534,7 @@ mod tests {
         }
     }
 
-    /// Whether `line` names one of the five duty categories **on the routing
-    /// type**.
+    /// Whether `line` names one of the duty categories **on the routing type**.
     ///
     /// The qualifier matters and is read rather than assumed. Three other enums
     /// in this workspace carry the same variant names and none of them routes
@@ -1538,7 +1545,7 @@ mod tests {
     /// surface. Only `teton_core`'s `Category` — imported here and, in
     /// `router.rs`, aliased `CoreCategory` — can reach a router.
     fn names_a_duty_category(line: &str) -> bool {
-        const DUTIES: [&str; 5] = ["Digest", "Triage", "Shell", "Title", "Compact"];
+        const DUTIES: [&str; 6] = ["Digest", "Triage", "Shell", "Title", "Compact", "Redact"];
         const ROUTING_TYPE: [&str; 2] = ["Category", "CoreCategory"];
         line.match_indices("Category::").any(|(at, _)| {
             let qualifier: String = line[..at + "Category".len()]

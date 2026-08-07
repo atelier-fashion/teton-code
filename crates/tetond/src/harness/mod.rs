@@ -51,6 +51,15 @@
 //!   its call site is [`context::ContextManager::compact_if_pressured`] — which
 //!   runs *ahead of* the unconditional `truncate_to_budget()` and never instead of
 //!   it (ADR-4).
+//! - [`redact`] — what is `redact`-specific about the egress-scan duty
+//!   (REQ-562): its [`redact::REDACT_DUTY`] descriptor, its output contract, its
+//!   prompt builder, and the quarantined parser that turns the model's quoted
+//!   strings into located spans and drops the ones it invented (ADR-5). Like
+//!   [`title`] and [`compact`] it is **not** tool-owned; unlike any of the five
+//!   its call site is not in the harness at all — it is the egress choke point,
+//!   [`crate::egress`], which is the one place every outbound byte crosses. The
+//!   verdict types, the deterministic pattern pass it composes with, and the
+//!   forward/block decision live in [`crate::egress::redact`].
 //! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
@@ -72,6 +81,7 @@ pub mod context;
 pub mod digest;
 pub mod duty;
 pub mod permissions;
+pub mod redact;
 pub(crate) mod render;
 pub(crate) mod reply;
 pub mod shell_duty;
@@ -94,6 +104,7 @@ pub use duty::{Duty, DutyKind, DutyRoute};
 pub use permissions::{
     PendingPermissions, PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,
 };
+pub use redact::REDACT_DUTY;
 pub use shell_duty::SHELL_DUTY;
 pub use title::TITLE_DUTY;
 pub use tools::{RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome, ToolRegistry};

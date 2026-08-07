@@ -266,6 +266,25 @@ const SCRIPTED_TITLE: &str = "Scripted session";
 const SCRIPTED_COMPACTION: &str =
     "FORGET: 1\nSUMMARY: [scripted compaction of the earlier conversation]";
 
+/// The stand-in engine's answer to a `redact` duty: **nothing sensitive found**
+/// (REQ-562 TASK-069).
+///
+/// The one answer that is both *valid* — it parses as a completed scan rather
+/// than as an unreadable reply, which would fail closed and block every scripted
+/// remote call — and *neutral*. A stand-in cannot judge whether a string is a
+/// secret, and inventing a finding would make a fixture's meaning depend on a
+/// judgement no fixture author wrote.
+///
+/// It does not make the gate vacuous in a scripted fixture: the model pass is
+/// only half the scan, and the deterministic pattern pass runs on the real bytes
+/// either way — so a fixture that plants an `sk-…` credential in an outbound
+/// payload is still blocked, at `High`, with no model involved.
+///
+/// Written as the word the contract asks for rather than as a marker sentence,
+/// because unlike the other four duties this one's answer is *parsed*, and a
+/// legible-but-unparseable marker would fail every scripted scan closed.
+const SCRIPTED_REDACTION: &str = "NONE";
+
 /// A local [`Engine`] that replays a fixed script of replies, one per turn.
 ///
 /// This is the CI/offline stand-in for a real llama.cpp engine: the daemon ships
@@ -281,8 +300,9 @@ const SCRIPTED_COMPACTION: &str =
 /// `triage` whenever a `grep` returns more than one match (REQ-561 TASK-060), a
 /// `shell` interpretation whenever a command fails or overruns its output cap
 /// (REQ-561 TASK-061), a `title` on the first substantive turn of every session
-/// (REQ-561 TASK-062), and a `compact` whenever a conversation crosses the soft
-/// context-pressure threshold (REQ-561 TASK-063).
+/// (REQ-561 TASK-062), a `compact` whenever a conversation crosses the soft
+/// context-pressure threshold (REQ-561 TASK-063), and — where the opt-in is on —
+/// a `redact` scan of **every** outbound payload (REQ-562 TASK-069).
 /// Serving those from the script would silently shift every block by one and
 /// make a fixture's meaning depend on how many duties the daemon happens to run
 /// — so each duty is recognized by its own **output contract**
@@ -291,13 +311,17 @@ const SCRIPTED_COMPACTION: &str =
 /// [`crate::harness::triage::TRIAGE_OUTPUT_CONTRACT`],
 /// [`crate::harness::shell_duty::SHELL_OUTPUT_CONTRACT`],
 /// [`crate::harness::title::TITLE_OUTPUT_CONTRACT`],
-/// [`crate::harness::compact::COMPACT_OUTPUT_CONTRACT`]) and answered off-script,
-/// consuming nothing.
+/// [`crate::harness::compact::COMPACT_OUTPUT_CONTRACT`],
+/// [`crate::harness::redact::REDACTION_OUTPUT_CONTRACT`]) and answered
+/// off-script, consuming nothing.
 ///
-/// `title` is the one that would bite hardest: it fires on the first turn of
-/// **every** session rather than on some particular tool result, so a missing
-/// recognition arm would desynchronize the whole suite at once rather than one
-/// fixture at a time.
+/// `title` is the one that would have bitten hardest among the five: it fires on
+/// the first turn of **every** session rather than on some particular tool
+/// result, so a missing recognition arm would desynchronize the whole suite at
+/// once rather than one fixture at a time. `redact` fires on every *remote call*
+/// once its opt-in is on, which is the same shape again — and it is also the one
+/// whose answer is parsed rather than pasted, so its scripted reply has to be a
+/// valid one (see [`SCRIPTED_REDACTION`]).
 ///
 /// The `digest` half was latent before this task and is not: `summarize_if_large`
 /// has always called this engine, and it *did* consume a block. It has never
@@ -340,14 +364,23 @@ impl ScriptedFileEngine {
 /// How far into a prompt a duty's output contract may start and still be the
 /// **harness's own instruction** rather than material that quotes it.
 ///
-/// Every one of the five harness duty prompts is built the same way: a fixed
+/// Every one of the harness duty prompts is built the same way: a fixed
 /// instruction, then the contract that closes it, then the material. The longest
 /// of those instructions is a few hundred bytes, so a kilobyte is roomy for all
-/// five and for the chat template `render_duty` may wrap them in — while a turn
-/// prompt opens with the system prompt, which is itself several kilobytes of
-/// tool documentation before any conversation block is reached. Nothing a
-/// conversation can say lands inside this window.
-const DUTY_CONTRACT_PREFIX_BYTES: usize = 1_024;
+/// of them and for the chat template `render_duty` may wrap them in — while a
+/// turn prompt opens with the system prompt, which is itself several kilobytes
+/// of tool documentation before any conversation block is reached. Nothing a
+/// *conversation* can say lands inside this window.
+///
+/// One duty's material can, and it is the reason the arms below are ordered
+/// rather than merely enumerated. `redact` (REQ-562) scans an outbound request
+/// body, which for a duty going to a remote provider **is another duty's prompt
+/// verbatim** — so a redact prompt carries `title`'s contract a few hundred
+/// bytes in, well inside this window. Widening the window would not help and
+/// narrowing it would break the prompts it is sized for; checking the redaction
+/// contract first is what settles it, because only the harness builds a redact
+/// prompt and its material can only follow.
+pub(crate) const DUTY_CONTRACT_PREFIX_BYTES: usize = 1_024;
 
 /// Whether `prompt` is a duty prompt built around `contract` — i.e. the contract
 /// appears where a *builder* puts it, in the instruction the prompt opens with.
@@ -400,7 +433,18 @@ impl Engine for ScriptedFileEngine {
         // embedded material happens to end with the classifier's contract — a
         // `grep` hit on this very file, say — is still recognized as the duty it
         // is.
-        let text = if instructs(prompt, crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
+        //
+        // And `redact` comes first among those, because it is the one duty whose
+        // material is another duty's prompt: it scans an outbound request body,
+        // and a body going to a remote provider carries that duty's own contract
+        // a few hundred bytes in — inside the window every arm reads. Only the
+        // harness builds a redact prompt, and its material can only follow the
+        // instruction, so testing this arm first is what keeps a scan *of* a
+        // title prompt from being answered as a title (see
+        // `DUTY_CONTRACT_PREFIX_BYTES`).
+        let text = if instructs(prompt, crate::harness::redact::REDACTION_OUTPUT_CONTRACT) {
+            SCRIPTED_REDACTION.to_owned()
+        } else if instructs(prompt, crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
             SCRIPTED_DIGEST.to_owned()
         } else if instructs(prompt, crate::harness::triage::TRIAGE_OUTPUT_CONTRACT) {
             scripted_triage(prompt)
