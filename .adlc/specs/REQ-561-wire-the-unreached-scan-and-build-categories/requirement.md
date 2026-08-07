@@ -59,6 +59,7 @@ rows already exist and already validate (REQ-558 TASK-049).
 |-------|---------|---------|
 | route_decided | **now also emitted for duties** | gains nothing; the duty emits the same payload the turn does, with its own category |
 | cost_recorded | unchanged | already carries `category` (REQ-558) |
+| session_titled | **new**; the `title` duty resolved a title (OQ-2, resolved) | `session_id`, `title`. Emitted once per session. The daemon owns the value; rendering it is REQ-560's status line, not this REQ. |
 
 ## Business Rules
 
@@ -79,6 +80,23 @@ rows already exist and already validate (REQ-558 TASK-049).
       malformed, or over-budget compaction falls back to deterministic truncation —
       never to "keep everything" (which breaks the budget) and never to a partial
       application.
+- [ ] BR-4a: **`compact` runs at a soft threshold; `truncate_to_budget` stays the
+      hard backstop** (OQ-3, resolved). The duty fires at a soft fraction of the
+      budget and `truncate_to_budget` still fires unconditionally at 100%. This is
+      what makes BR-4 *structural* rather than a code path someone has to remember
+      to take: the deterministic floor is not a fallback branch inside the duty, it
+      is a separate gate the duty runs ahead of and cannot disable. A duty that
+      hangs, returns garbage, or is never routed at all still ends with a context
+      under budget, because the thing that enforces the budget was never the duty.
+      Corollary: the duty runs with headroom instead of stalling a turn at the
+      exact moment context is already full.
+- [ ] BR-4b: **`shell` interprets on failure or on oversized output, not on every
+      result** (OQ-1, resolved). The duty fires when the command exits non-zero
+      **or** when its output would be truncated by the existing 8,000-char cap —
+      the two cases where the raw bytes are either alarming or unreadable. A short,
+      successful command is returned verbatim with no model call. `shell` is the
+      highest-frequency tool call in a coding session, so "every result" is the one
+      rule whose cost scales with session length rather than with incident count.
 - [ ] BR-5: Session taint overrides every duty binding, on all four, as it does for
       the turn path and `digest` (REQ-558 BR-7). Verified by egress capture.
 - [ ] BR-6: **The duty plumbing is generalised before the fourth caller lands.**
@@ -96,6 +114,22 @@ rows already exist and already validate (REQ-558 TASK-049).
 - [ ] BR-9: `title` runs **once per session**, not per turn, and never re-derives an
       existing title. It is `reflex`-tier and therefore local (REQ-558: `reflex`
       inherits the local tier and never `default_provider`).
+- [ ] BR-9a: **`title` reaches the wire in this REQ** (OQ-2, resolved) via
+      `session_titled`. Rendering belongs to REQ-560's status line, but REQ-560
+      cannot render a value that was never sent — and a title no consumer can
+      observe is a model call bought for nothing. This REQ ships the data and the
+      event; the pixels are REQ-560's.
+- [ ] BR-11: **`policy show` states what content each category sends** (OQ-4,
+      resolved). The `scan` tier carries both `triage` (grep match text — file
+      content) and `compact` (conversation blocks), so a user who binds `scan`
+      remotely for cheap long-context summarisation also moves conversation
+      compaction off the machine. Re-splitting the tier→category bindings is Out of
+      Scope (that is REQ-558's decision), so the mitigation is legibility, not
+      re-binding: each category's row names the content class it transmits, making
+      the remote binding an informed choice rather than a surprise. BR-7's
+      per-content egress scoping remains the enforcement — a `local-only` source is
+      refused whatever the binding says. Legibility is not a substitute for that
+      enforcement, and this BR does not claim to be one.
 - [ ] BR-10: The `ScriptedFileEngine` duty-recognition seam gains an arm per duty.
       REQ-558 established the pattern — one constant that both writes a duty's
       output contract and recognises it — because a duty that consumes a scripted
@@ -146,6 +180,25 @@ rows already exist and already validate (REQ-558 TASK-049).
       `cli_e2e` tests before anyone noticed, and `summarize_if_large` carried the
       same latent exposure. With four more duties it stops being a surprise and
       becomes a checklist item.
+- [ ] AC-13: **`shell` fires only on failure or oversize** (BR-4b): a table-driven
+      test over (exit 0, small output), (exit 0, output over the 8k cap), (exit≠0,
+      small output), (exit≠0, large output) asserts the duty is invoked in exactly
+      the last three and **not** in the first, by call count. The negative case is
+      the load-bearing one — it is the whole cost argument.
+- [ ] AC-14: **`compact`'s soft threshold does not weaken the hard backstop**
+      (BR-4a): with the duty stubbed to never return, to return garbage, and to be
+      entirely unrouted, the context is under budget after each — proving the
+      budget is enforced by `truncate_to_budget` and not by the duty. A mutation
+      that removes the unconditional 100% gate turns at least one of these red.
+- [ ] AC-15: **`session_titled` reaches the wire once** (BR-9a): a multi-turn
+      session emits exactly one `session_titled` carrying a non-empty title, and a
+      session that already has a title emits none. Asserted on captured events, not
+      on daemon-internal state.
+- [ ] AC-16: **`policy show` names the content class per category** (BR-11): the
+      rendered output states, for each of the eleven categories, what content that
+      category transmits — and a test pins that `triage` and `compact` disclose
+      distinct content classes despite sharing the `scan` tier. This AC asserts
+      disclosure only; the enforcement assertion is AC-4.
 - [ ] AC-9: Mutation checks — for each duty, (a) removing the taint override and
       (b) making the failure path return its input unchanged each turn at least one
       test red. **A mutation that comes back green is reported as a finding**
@@ -171,20 +224,32 @@ rows already exist and already validate (REQ-558 TASK-049).
 
 ## Open Questions
 
-- [ ] OQ-1: Does `shell` interpretation run on **every** command result, or only on
-      failure / above a size threshold? Every result is the simplest rule and the
-      most expensive; failure-only is cheap but blind to a command that succeeded
-      and did something surprising.
-- [ ] OQ-2: Does `title` need a wire surface? A session title nobody can read is a
-      cost with no benefit — but the client-side rendering may belong to REQ-560's
-      status line rather than here.
-- [ ] OQ-3: `compact` currently has no trigger of its own — `truncate_to_budget` is
-      called when the budget is exceeded. Does the duty replace that call, or run
-      earlier at a soft threshold so compaction is not always an emergency?
-- [ ] OQ-4: Should `triage` and `compact` share the `scan` tier's binding, given
-      REQ-558 made `scan` inherit the **local** tier by default? A user who binds
-      `scan` remotely for cheap long-context summarisation also gets remote
-      conversation compaction, which is a different privacy posture.
+- [x] OQ-1: **RESOLVED — failure or oversize.** `shell` interprets when the command
+      exits non-zero **or** when its output would hit the 8k cap; a short successful
+      command is returned verbatim with no model call. "Every result" was rejected
+      on cost: `shell` is the highest-frequency tool call, so that rule's spend
+      scales with session length rather than with incident count. "Failure only" was
+      rejected as blind to the 40k-line successful build log that gets truncated to
+      8k — the size arm is what covers it. See BR-4b, AC-13.
+- [x] OQ-2: **RESOLVED — yes, in this REQ.** `title` reaches the wire via
+      `session_titled`; REQ-560's status line renders it. Deferring the wire would
+      have left BR-9 paying for a model call whose output no consumer could observe,
+      and would have blocked REQ-560 on data that was never sent. See BR-9a, AC-15.
+- [x] OQ-3: **RESOLVED — soft threshold, hard backstop retained.** The duty fires at
+      a soft fraction of the budget; `truncate_to_budget` still fires
+      unconditionally at 100%. This is the choice that makes BR-4 structural: the
+      deterministic floor is a separate gate the duty runs ahead of, not a fallback
+      branch inside it, so a duty that hangs or was never routed still ends under
+      budget. See BR-4a, AC-14.
+- [x] OQ-4: **RESOLVED — keep the binding, disclose the content class.**
+      Re-splitting tier→category bindings is Out of Scope (REQ-558's decision), so
+      the mitigation is legibility: `policy show` names what content each category
+      transmits, making a remote `scan` binding an informed choice. Enforcement is
+      unchanged and remains BR-7's per-content egress scoping — legibility is a
+      disclosure, not a control. **Revisit trigger:** a user who binds `scan`
+      remotely and is then surprised that conversation blocks left the machine.
+      That report, not the abstract asymmetry, is what would reopen REQ-558's
+      binding decision. See BR-11, AC-16.
 
 ## Out of Scope
 
