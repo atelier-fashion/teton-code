@@ -1710,6 +1710,58 @@ fn policy_show_renders_the_daemons_resolved_table() {
         "`compact` is wired (REQ-561 TASK-063) and must not carry the marker; row:\n{compact}"
     );
 
+    // REQ-561 AC-16 / BR-11: every row names the content class it transmits,
+    // through the shipped binary against a live daemon.
+    //
+    // What this adds over the `main.rs` unit test is that the daemon populates
+    // the field at all and that a real `config/get` carried it. What it does
+    // *not* show is that the CLI read the wire rather than recomputing the class
+    // from the category — the two agree by construction, so this stays green
+    // either way. `policy_show_prints_the_daemons_content_class_rather_than_
+    // recomputing_it` is the test for that, and it exists because a mutation
+    // proved this one blind to it.
+    for (category, disclosed) in [
+        ("route", "your prompt"),
+        ("redact", "outbound payloads"),
+        ("title", "your prompt"),
+        ("digest", "tool output"),
+        ("compact", "conversation history"),
+        ("triage", "file content"),
+        ("edit", "the whole turn"),
+        ("shell", "command output"),
+        ("design", "the whole turn"),
+        ("debug", "the whole turn"),
+        ("review", "the whole turn"),
+    ] {
+        let line = row(&shown, category).expect("a row for every category");
+        assert!(
+            line.contains(disclosed),
+            "category `{category}` must disclose that it sends `{disclosed}`; row:\n{line}"
+        );
+    }
+
+    // OQ-4's resolution, on the two rows a user would actually compare: one
+    // `scan` binding, two different kinds of content leaving the machine. Binding
+    // `scan` remotely for cheap long-context work also moves conversation history
+    // off it, and re-splitting the binding is out of scope — so this line pair is
+    // the whole mitigation, and it is worth nothing if both rows read alike.
+    let triage_row = row(&shown, "triage").expect("a `triage` row");
+    let compact_row = row(&shown, "compact").expect("a `compact` row");
+    assert!(
+        !triage_row.contains("conversation history") && !compact_row.contains("file content"),
+        "the `scan` tier's two categories must not read as one disclosure;\
+         \ntriage:\n{triage_row}\ncompact:\n{compact_row}"
+    );
+
+    // AC-16's other half: `redact` transmits nothing today, and its row says so
+    // in one phrase rather than leaving a reader to join a content class at one
+    // end of the line to a marker at the other. A class printed alone reads as a
+    // live egress path.
+    assert!(
+        unreached.contains("would send outbound payloads; declared, no call site yet"),
+        "`redact`'s class and its call-site marker must render adjacently; row:\n{unreached}"
+    );
+
     // AC-12: the BR-9 declared default is configuration-visible, and the CLI
     // says so rather than leaving it compiled in silently.
     assert!(
