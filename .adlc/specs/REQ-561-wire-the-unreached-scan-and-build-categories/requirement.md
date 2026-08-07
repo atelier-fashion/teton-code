@@ -1,7 +1,7 @@
 ---
 id: REQ-561
 title: "Wire the four unreached categories: triage, shell, title, compact"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-07
 updated: 2026-08-07
