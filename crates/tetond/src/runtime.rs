@@ -446,6 +446,44 @@ impl SessionTaint {
     }
 }
 
+/// A [`PrivacyEventSink`] that publishes the block **and** taints the session it
+/// happened in (REQ-544 C-2, extended to the duty path by REQ-561).
+///
+/// The turn path marks taint from its own `is_privacy_blocked()` arm, which
+/// works because a refused turn comes back as a typed error the runtime handles.
+/// A refused **duty** does not: the seam turns it into a failure sentence, the
+/// call site degrades by its own means (a mechanical truncation, the tool's own
+/// unrefined result, an unnamed session, a deterministic drop), and the turn
+/// carries on — correctly. So the one thing that *knows* a boundary was crossed
+/// is the choke point, and marking there is enforcing the rule where the
+/// decision is made rather than at whichever caller happens to notice
+/// (LESSON-484).
+///
+/// The gap it closes is not hypothetical but it is currently *masked*: the
+/// content that got the duty refused is still in the turn's context, so
+/// `context_is_sensitive` taints the session when the turn ends. That is an
+/// incidental cover — it depends on the refusing content still being in `ctx`
+/// at the end of the turn, which compaction and truncation are both entitled to
+/// change — and it is exactly the almost-true invariant a later change builds
+/// on.
+struct TaintingPrivacySink {
+    events: Arc<EventBus>,
+    taint: Arc<SessionTaint>,
+}
+
+impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
+    fn privacy_block(
+        &self,
+        session_id: Option<SessionId>,
+        block: teton_protocol::events::PrivacyBlock,
+    ) {
+        if let Some(session_id) = &session_id {
+            self.taint.mark(session_id);
+        }
+        self.events.privacy_block(session_id, block);
+    }
+}
+
 /// Default half-open cooldown for a provider marked [`ProviderHealth::Unavailable`]
 /// by a persistent failure (a malformed response, a repeated protocol break)
 /// (REQ-544 M-5). Once this window has elapsed the provider is re-probed on the
@@ -595,7 +633,12 @@ pub struct DaemonRuntime {
     turn_counter: AtomicU64,
     /// Per-session privacy taint: sessions pinned to the local tier because their
     /// context touched `local-only` or unknown-provenance content (REQ-544 C-2).
-    session_taint: SessionTaint,
+    ///
+    /// Behind an `Arc` so the egress choke point can mark it directly: a duty
+    /// refused there is not a turn error anybody up here ever sees, so the turn
+    /// path's own `is_privacy_blocked` arm cannot cover it (see
+    /// [`TaintingPrivacySink`]).
+    session_taint: Arc<SessionTaint>,
     /// Daemon-wide provider health, persisted across turns (REQ-544 M-5). Updated
     /// by turn outcomes and READ by [`Self::run_prompt_turn`] when it seeds the
     /// router each turn, so a provider observed `Unavailable` stays `Unavailable`
@@ -653,7 +696,7 @@ impl DaemonRuntime {
             mcp_servers: Vec::new(),
             probe: None,
             turn_counter: AtomicU64::new(0),
-            session_taint: SessionTaint::new(),
+            session_taint: Arc::new(SessionTaint::new()),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         }
@@ -789,7 +832,7 @@ impl DaemonRuntime {
             mcp_servers,
             probe: Some(probe),
             turn_counter: AtomicU64::new(0),
-            session_taint: SessionTaint::new(),
+            session_taint: Arc::new(SessionTaint::new()),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         })
@@ -2325,7 +2368,17 @@ impl DaemonRuntime {
         // this daemon's boundaries and this session's cost meter — the same
         // construction the turn path uses, because a duty that egresses through a
         // second, laxer path is the hole BR-1 exists to close.
-        let egress = Egress::new(transport, config.boundaries.clone(), events.clone())
+        //
+        // The sink is the one thing that differs, and it differs because the
+        // *outcome* does: a refused duty is degraded here and never surfaces as
+        // a turn error, so nothing above would ever mark the session. Marking at
+        // the choke point makes the backstop direct rather than dependent on the
+        // refusing content still being in `ctx` when the turn ends.
+        let sink = Arc::new(TaintingPrivacySink {
+            events: events.clone(),
+            taint: Arc::clone(&self.session_taint),
+        });
+        let egress = Egress::new(transport, config.boundaries.clone(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()));
         DutyRoute::remote(
             duty,
@@ -7430,6 +7483,116 @@ provider_id = "on-device"
         fn router_for(runtime: &DaemonRuntime) -> Router {
             let config = runtime.config.lock().expect("config mutex").clone();
             build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+        }
+
+        // -- a refused DUTY marks the session, directly (REQ-544 C-2) --------
+
+        /// **The choke point marks the session it refused, not just the turn.**
+        ///
+        /// A refused duty never becomes a turn error, so
+        /// [`DaemonRuntime::run_prompt_turn`]'s own `is_privacy_blocked` arm
+        /// cannot see it: the seam turns the refusal into a sentence, the call
+        /// site degrades by its own means, and the turn completes. Today the
+        /// session is tainted anyway — but only *incidentally*, because the
+        /// content that got the duty refused is still in `ctx` when the turn
+        /// ends and `context_is_sensitive` reads it there. That cover depends on
+        /// truncation and compaction not having dropped it, which both are
+        /// entitled to do. This makes it direct.
+        ///
+        /// No byte leaves in either leg: the refusal happens before the
+        /// transport is reached, which is the whole point of the choke point.
+        #[tokio::test]
+        async fn a_duty_refused_at_the_choke_point_taints_its_session() {
+            let engine = CountingEngine::answering("Retry the download client");
+            let mut config = config();
+            // `title` is `reflex` and never inherits a tier, so an explicit
+            // category override is the one way a user binds it off the machine —
+            // and it is what makes this route remote enough to be refusable.
+            config.categories.push(CategoryOverride {
+                name: ConfigurableCategory::Title,
+                provider_id: "frontier".to_owned(),
+                fallback_id: None,
+            });
+            config.boundaries = vec![PrivacyBoundary {
+                path_glob: "secrets/**".to_owned(),
+                mode: BoundaryMode::LocalOnly,
+            }];
+            let runtime = runtime(config.clone(), &engine, true);
+            let router = router_for(&runtime);
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+
+            let blocked = SessionId::from("blocked");
+            let bystander = SessionId::from("bystander");
+            let slot = runtime.engine.get_with_format();
+            let route = runtime.title_route(&router, &config, &bus, &blocked, slot.as_ref());
+
+            // Non-vacuity, both halves: the route really is remote — so there
+            // really was a transport a byte could have left through — and the
+            // session really was clean before the duty ran.
+            assert_eq!(
+                route.provider(),
+                Some("frontier"),
+                "a local route has no choke point to be refused at"
+            );
+            assert!(!runtime.session_taint.is_tainted(&blocked));
+
+            let err = route
+                .perform(
+                    "name this",
+                    &crate::egress::Provenance::tainted_by("secrets/prod.env"),
+                )
+                .await
+                .expect_err("boundary content must not be titled remotely");
+            assert!(err.contains("privacy boundary"), "{err}");
+
+            assert!(
+                runtime.session_taint.is_tainted(&blocked),
+                "a duty refused at the choke point left its session unpinned, so the \
+                 next turn is free to reroute remotely"
+            );
+            assert!(
+                !runtime.session_taint.is_tainted(&bystander),
+                "and it taints only the session it happened in"
+            );
+            // The event is still published — marking is in addition to
+            // announcing, never instead of it.
+            assert!(
+                std::iter::from_fn(|| sub.try_recv())
+                    .any(|env| matches!(env.event, Event::PrivacyBlock(_))),
+                "the authoritative `privacy_block` stopped being emitted"
+            );
+        }
+
+        /// The other half of the same rule, stated at the sink because it is the
+        /// one case the wiring test above cannot reach: a block the choke point
+        /// could not attribute to a session pins nothing, rather than pinning
+        /// something arbitrary.
+        #[test]
+        fn an_unattributable_privacy_block_pins_no_session() {
+            let taint = Arc::new(SessionTaint::new());
+            let sink = TaintingPrivacySink {
+                events: Arc::new(EventBus::new()),
+                taint: Arc::clone(&taint),
+            };
+            let block = teton_protocol::events::PrivacyBlock {
+                path: "secrets/prod.env".to_owned(),
+                provider_id: ProviderId::from("frontier"),
+                action: teton_protocol::events::PrivacyAction::ReroutedToLocal,
+            };
+
+            crate::egress::PrivacyEventSink::privacy_block(&sink, None, block.clone());
+            crate::egress::PrivacyEventSink::privacy_block(
+                &sink,
+                Some(SessionId::from("s")),
+                block,
+            );
+
+            assert!(
+                taint.is_tainted(&SessionId::from("s")),
+                "non-vacuity: a scoped block really does pin"
+            );
+            assert!(!taint.is_tainted(&SessionId::from("somebody-else")));
         }
 
         /// **AC-1, the direct regression, end to end through the daemon's own

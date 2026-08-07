@@ -112,10 +112,27 @@
 //! | Mutation | Fails |
 //! |---|---|
 //! | the ceiling site stops bounding the accumulator (BR-8) | all five `harness::*::tests::a_remote_*_is_bounded_however_much_the_provider_streams` |
+//! | [`LocalDuty::perform`] returns the engine's answer unbounded | `harness::title::tests::a_local_title_duty_is_bounded_however_much_the_engine_generates`, `…::a_runaway_local_answer_still_names_the_session_within_the_ceiling`, `harness::shell_duty::tests::a_local_shell_duty_is_bounded_however_much_the_engine_generates`, [`tests::the_duty_path_has_one_egress_scoping_call_and_one_ceiling_site`] |
+//! | either leg asks for `GenParams::default().max_tokens` instead of [`DutyKind::max_tokens`] | local: `harness::compact::tests::a_local_compaction_may_write_the_paragraph_its_ceiling_allows`; remote: `harness::title::tests::an_unbounded_machine_sends_the_title_prompt_and_returns_its_answer` |
+//! | [`DutyRoute::perform`] loses its [`DUTY_DEADLINE`] | [`tests::a_duty_that_never_answers_fails_at_the_deadline`] — which then **hangs** rather than failing, exactly as the turn it is on would |
 //! | [`Egress::scoped`] is handed an empty provenance instead of the content's (BR-7) | six per-duty boundary tests, every test in `tests/duty_egress.rs`, and `tests/duty_matrix.rs::every_duty_holds_…` |
 //! | a duty module grows a category from a tool name (`if name == "grep" { … }`) | [`tests::no_duty_category_is_ever_produced_from_text`] |
 //! | a per-category route enum grows back (BR-6) | [`tests::one_route_type_one_trait_and_two_implementations_serve_every_duty`] |
 //! | a duty module takes an `Egress` of its own (BR-6) | [`tests::no_duty_module_carries_any_of_the_seams_concerns`] |
+//! | the choke point stops pinning the session it refused | `runtime::tests::dispatch::a_duty_refused_at_the_choke_point_taints_its_session`, `…::an_unattributable_privacy_block_pins_no_session` |
+//!
+//! ## What draining past the ceiling buys, and why it is still done
+//!
+//! Past the ceiling [`RemoteDuty::perform`] stops *accumulating* but keeps
+//! draining the provider's stream. Breaking out instead looks like the obvious
+//! saving and is not: `MeteredBody` records its `CostRecord` on the terminal
+//! `None` of the response body and has no `Drop` fallback, and both supported
+//! provider families report usage only in their **final** chunk — so an early
+//! break unbills the call. The ceilings are tight enough (`title`'s is 128 bytes)
+//! that ordinary chatty answers cross them, which would make "overran its
+//! ceiling" and "was never billed" the same set. The unbounded *wait* was the
+//! real harm and [`DUTY_DEADLINE`] is what bounds it; memory is already bounded,
+//! because the accumulator stops growing.
 //!
 //! ## One mutation came back green, and it is recorded rather than fixed
 //!
@@ -143,6 +160,7 @@
 //! outcome would be over budget, which is why the call stays unconditional.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -194,6 +212,94 @@ impl DutyKind {
     pub const fn ceiling_bytes(self) -> usize {
         self.ceiling_bytes
     }
+
+    /// The generation budget this duty **requests**, sized from its own ceiling.
+    ///
+    /// The request and the bound are two different things and both have to exist
+    /// (LESSON-484). [`Self::ceiling_bytes`] is the bound — enforced by
+    /// [`bound_to_ceiling`] on both legs, because a provider or an engine that
+    /// runs on is not a hypothetical. This is the *request*, and it exists so a
+    /// duty does not pay to generate bytes it can never keep: a shared default
+    /// asks for the same number of tokens for a `title` (a handful of words) as
+    /// for a `compact` (a conversation), which for the tight ceilings means
+    /// generating several times over and throwing the excess away.
+    ///
+    /// Sized at [`DUTY_REQUEST_BYTES_PER_TOKEN`] bytes per token — deliberately
+    /// *below* what real BPE averages for prose, so the request can always cover
+    /// the ceiling and the ceiling stays the thing that binds. Capped at
+    /// [`DUTY_MAX_TOKENS_REQUEST`] because the loosest ceilings would otherwise
+    /// ask for more output than a mainstream provider will accept in one call,
+    /// turning a routed duty into a 400.
+    #[must_use]
+    pub const fn max_tokens(self) -> u32 {
+        let requested = self.ceiling_bytes / DUTY_REQUEST_BYTES_PER_TOKEN;
+        if requested > DUTY_MAX_TOKENS_REQUEST as usize {
+            DUTY_MAX_TOKENS_REQUEST
+        } else if requested == 0 {
+            // Totality guard: a ceiling under one token's worth of bytes still
+            // asks for something, so the duty degrades by truncation rather than
+            // by being handed a budget of nothing.
+            1
+        } else {
+            requested as u32
+        }
+    }
+}
+
+/// Bytes per token assumed when sizing a duty's generation *request* from its
+/// byte ceiling ([`DutyKind::max_tokens`]).
+///
+/// Deliberately conservative — real BPE averages nearer four bytes per token on
+/// English prose and code, so asking at two keeps the byte ceiling, not the token
+/// request, as the thing that actually bounds the answer. Erring the other way
+/// would make `max_tokens` the real bound and the declared ceiling decorative,
+/// which is the shape LESSON-443 warns about: a guard that can never fire.
+const DUTY_REQUEST_BYTES_PER_TOKEN: usize = 2;
+
+/// Ceiling on the `max_tokens` any duty asks a provider for.
+///
+/// Not a safety bound — [`bound_to_ceiling`] is — but a compatibility one: the
+/// loosest duty ceiling is 32 KiB, and a request for the ~16k output tokens that
+/// implies is above the per-call output cap of several mainstream models, which
+/// answer it with a 400 rather than with a shorter completion. 4,096 is at or
+/// under every supported provider's cap and still well above what any duty
+/// realistically writes.
+const DUTY_MAX_TOKENS_REQUEST: u32 = 4_096;
+
+/// How long a single duty call may take before the harness stops waiting.
+///
+/// A duty is best-effort by construction (BR-3), so the interesting failure is
+/// not "it errored" but "it never answered": a provider that streams without
+/// ever completing, a connection that stalls after its headers, an engine that
+/// will not return. None of those produce an error to degrade on, so without a
+/// deadline the call site simply waits — and every one of the five call sites is
+/// on the path of a turn a person is watching.
+///
+/// Generous rather than tight, because the local tier is the common case and a
+/// `compact` over a full conversation on a small machine is genuinely slow. The
+/// number this replaces is not a smaller number; it is no number at all.
+pub const DUTY_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Bound `text` to `ceiling` bytes — **the** ceiling-enforcement site on the duty
+/// path (BR-8, LESSON-484).
+///
+/// One function rather than one per implementation, and called by both, because
+/// a ceiling enforced on only one leg is a ceiling on none of some duties'
+/// production paths: `title` is `reflex`-tier and has no remote implementation
+/// at all, so a remote-only bound would leave the tightest ceiling of the five
+/// unenforced everywhere it actually runs.
+///
+/// The cut is at a character boundary rather than at the byte, so a bound that
+/// lands mid-codepoint drops that character instead of producing invalid UTF-8;
+/// the result is trimmed because a bound applied to a model's answer routinely
+/// lands on trailing whitespace.
+fn bound_to_ceiling(text: &str, ceiling: usize) -> String {
+    let bounded = if text.len() > ceiling {
+        &text[..floor_char_boundary(text, ceiling)]
+    } else {
+        text
+    };
+    bounded.trim().to_owned()
 }
 
 /// Something that can serve one duty call (ADR-2).
@@ -390,9 +496,24 @@ impl DutyRoute {
     /// results are two routed model calls, and collapsing them would under-report
     /// egress on exactly the turns that egress most.
     ///
+    /// A duty that never answers is a duty that failed (BR-3)
+    ///
+    /// [`DUTY_DEADLINE`] is applied here rather than at each call site for the
+    /// reason the ceiling is enforced here: five call sites each remembering to
+    /// bound their own wait is five chances to forget, and the one that forgets
+    /// is the one that hangs a turn. Past the deadline the call site is handed a
+    /// sentence like any other failure and takes the degraded path it already
+    /// has — a mechanical truncation, the tool's own unrefined result, an
+    /// unnamed session, a deterministic drop.
+    ///
+    /// It is a deadline, not a cancellation: a [`LocalDuty`] completion is
+    /// already running on the blocking pool and cannot be interrupted, so what
+    /// this bounds is how long the *turn* waits, not how long the engine runs.
+    /// That is the half that matters — the other end of the wait is a person.
+    ///
     /// # Errors
-    /// The duty's own failure sentence, or — for a route that resolved to
-    /// nothing — the resolver's reason. Callers normally take the
+    /// The duty's own failure sentence, the deadline's, or — for a route that
+    /// resolved to nothing — the resolver's reason. Callers normally take the
     /// [`Unresolved`](DutyRoute::Unresolved) arm before reaching here, so that
     /// case is a belt rather than a path.
     pub async fn perform(&self, prompt: &str, provenance: &Provenance) -> Result<String, String> {
@@ -401,7 +522,14 @@ impl DutyRoute {
                 if let Some(announce) = announce {
                     announce.publish();
                 }
-                duty.perform(prompt, provenance).await
+                match tokio::time::timeout(DUTY_DEADLINE, duty.perform(prompt, provenance)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(format!(
+                        "the `{}` duty did not answer within {} seconds",
+                        duty.category().as_str(),
+                        DUTY_DEADLINE.as_secs()
+                    )),
+                }
             }
             DutyRoute::Unresolved { reason } => Err(reason.clone()),
         }
@@ -447,8 +575,16 @@ impl Duty for LocalDuty {
         // engine a duty takes seconds, and this is awaited from the async turn
         // loop, where running it inline would park the tokio worker and stall
         // every other session's RPCs.
+        // The generation budget is this duty's own, not a shared default: a
+        // `title` that may keep 128 bytes has no use for a `compact`'s token
+        // budget, and asking for one buys latency that is thrown away at the
+        // ceiling below.
+        let max_tokens = self.kind.max_tokens();
         let result = tokio::task::spawn_blocking(move || {
-            let params = GenParams::default();
+            let params = GenParams {
+                max_tokens,
+                ..GenParams::default()
+            };
             let guard = engine.lock().expect("engine mutex poisoned");
             // REQ-554 BR-7: a duty prompt gets the same template treatment an
             // agent turn does. The format is read from the guard already held
@@ -463,7 +599,12 @@ impl Duty for LocalDuty {
         })
         .await;
         match result {
-            Ok(Ok(text)) => Ok(text),
+            // Bounded on the way out, at the shared ceiling site (BR-8). An
+            // engine budget is a request like a provider's is: a single
+            // unbroken token carries as many bytes as the model feels like
+            // emitting, and `title`'s answer lands in a session record that is
+            // never revised.
+            Ok(Ok(text)) => Ok(bound_to_ceiling(&text, self.ceiling_bytes())),
             Ok(Err(err)) => Err(err.to_string()),
             Err(_) => Err("the local summarization task did not complete".to_owned()),
         }
@@ -510,7 +651,9 @@ impl<T: Transport> Duty for RemoteDuty<T> {
                 content: prompt.to_owned(),
             }],
             tools: Vec::new(),
-            max_tokens: GenParams::default().max_tokens,
+            // This duty's own budget, sized from its own ceiling — the same
+            // number the local leg asks its engine for, from the same place.
+            max_tokens: self.kind.max_tokens(),
         };
         // BR-2: a duty has no lifecycle position, so it attributes no phase — but
         // it does attribute its category, which is the whole point of routing it.
@@ -556,18 +699,24 @@ impl<T: Transport> Duty for RemoteDuty<T> {
         // The last delta may straddle the bound, so trim to it here rather than
         // refusing a partial delta above — dropping a whole delta would cut the
         // answer at an arbitrary earlier point for no gain.
-        if text.len() > ceiling {
-            text.truncate(floor_char_boundary(&text, ceiling));
-        }
-        Ok(text.trim().to_owned())
+        Ok(bound_to_ceiling(&text, self.ceiling_bytes()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::future::pending;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    use super::{
+        Duty, DutyKind, DutyRoute, Provenance, DUTY_DEADLINE, DUTY_MAX_TOKENS_REQUEST,
+        DUTY_REQUEST_BYTES_PER_TOKEN,
+    };
     use crate::call_sites::scan::{code_only, count, production_sources};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use teton_protocol::Category;
 
     /// The five duty modules — where ADR-3 allows per-category source to live,
     /// and the only place it may.
@@ -696,9 +845,19 @@ mod tests {
     /// path's, here. A *third* is a second way to reach the network, which is
     /// the thing the single choke point exists to make impossible.
     ///
-    /// The ceiling is read in exactly one file and bound in exactly one
-    /// statement (LESSON-484 — enforced where the decision is made, not at each
-    /// of five call sites).
+    /// The ceiling is read in exactly one file, enforced by exactly one
+    /// function, and **every** implementation of [`Duty`](super::Duty) runs its
+    /// answer through it (LESSON-484 — enforced where the decision is made, not
+    /// at each of five call sites).
+    ///
+    /// The per-leg half is the one this test learned the hard way. Counting the
+    /// enforcement *site* is satisfied by a ceiling that exists on the remote
+    /// leg and nowhere else, which is what shipped: `LocalDuty::perform` read a
+    /// shared `GenParams::default()` and returned whatever the engine produced.
+    /// For `title` that is not a partial gap but a total one — it is
+    /// `reflex`-tier with no remote implementation at all, so its ceiling was
+    /// enforced on **zero** of the paths it actually runs on, and its answer
+    /// lands in a session record that is never revised.
     #[test]
     fn the_duty_path_has_one_egress_scoping_call_and_one_ceiling_site() {
         assert_eq!(
@@ -719,12 +878,146 @@ mod tests {
             "BR-8's bound is read only inside the seam; the duty modules declare \
              their ceiling and nothing else"
         );
+        let seam = source_of("harness/duty.rs");
         assert_eq!(
-            files_with("let ceiling ="),
-            vec!["harness/duty.rs"],
-            "and it is bound at exactly one enforcement site (LESSON-484)"
+            count(&seam, "fn bound_to_ceiling("),
+            1,
+            "and there is exactly one function that enforces it (LESSON-484)"
         );
-        assert_eq!(count(&source_of("harness/duty.rs"), "let ceiling ="), 1);
+
+        // Split at each `impl … Duty for …` header: every implementation of the
+        // trait must bound its own answer. `no_duty_module_carries_any_of_the_seams_concerns`
+        // already pins that the only two live here.
+        let legs: Vec<&str> = seam.split("Duty for").skip(1).collect();
+        assert_eq!(
+            legs.len(),
+            2,
+            "the local leg and the remote leg, and this assertion knows about both"
+        );
+        for leg in legs {
+            let bounded = leg
+                .split("\nfn bound_to_ceiling(")
+                .next()
+                .expect("split always yields a first part");
+            assert!(
+                bounded.contains("bound_to_ceiling(&text, self.ceiling_bytes())"),
+                "BR-8 VIOLATION: an implementation of `Duty` returns its answer \
+                 without bounding it. A ceiling on one of the two legs is no \
+                 ceiling at all for a duty that only has the other one:\n{}",
+                &leg[..leg.len().min(400)]
+            );
+        }
+    }
+
+    /// **BR-8's request half.** Every duty asks for a generation budget sized
+    /// from its **own** ceiling, not from one number shared by all five.
+    ///
+    /// A shared `GenParams::default()` asked for the same 256 tokens for a
+    /// `title` (128 bytes, a handful of words) as for a `compact` (32 KiB, a
+    /// conversation) — so the tight duties paid to generate several times what
+    /// they could keep, and the loose ones were bounded by a number that has
+    /// nothing to do with their declared contract. The ordering assertion is
+    /// what makes this fail if the derivation is replaced by a constant again.
+    #[test]
+    fn every_duty_asks_for_a_generation_budget_sized_from_its_own_ceiling() {
+        use crate::harness::{COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY};
+
+        assert!(
+            TITLE_DUTY.max_tokens() < TRIAGE_DUTY.max_tokens(),
+            "a title asks for less than a ranking: {} vs {}",
+            TITLE_DUTY.max_tokens(),
+            TRIAGE_DUTY.max_tokens()
+        );
+        assert!(TRIAGE_DUTY.max_tokens() < DIGEST_DUTY.max_tokens());
+        assert_eq!(SHELL_DUTY.max_tokens(), TRIAGE_DUTY.max_tokens());
+
+        // The request must be able to cover the ceiling, or `max_tokens` is the
+        // real bound and the declared ceiling is decorative (LESSON-443).
+        for kind in [TITLE_DUTY, TRIAGE_DUTY, SHELL_DUTY] {
+            assert!(
+                kind.max_tokens() as usize * DUTY_REQUEST_BYTES_PER_TOKEN >= kind.ceiling_bytes(),
+                "`{}` asks for {} tokens, too few to reach its own {}-byte ceiling",
+                kind.category().as_str(),
+                kind.max_tokens(),
+                kind.ceiling_bytes()
+            );
+        }
+        // And the two loosest are capped for provider compatibility rather than
+        // by their ceilings — stated, so the exception is visible.
+        assert_eq!(DIGEST_DUTY.max_tokens(), DUTY_MAX_TOKENS_REQUEST);
+        assert_eq!(COMPACT_DUTY.max_tokens(), DUTY_MAX_TOKENS_REQUEST);
+
+        // Totality: a ceiling smaller than one token's worth of bytes still asks
+        // for something rather than for nothing.
+        assert_eq!(DutyKind::new(Category::Title, 1).max_tokens(), 1);
+    }
+
+    // =======================================================================
+    // A duty that never answers is a duty that failed (BR-3).
+    // =======================================================================
+
+    /// A duty that is asked, counts it, and then never returns — the failure a
+    /// provider streaming without completing, or a stalled connection, actually
+    /// produces. Neither is an `Err` to degrade on.
+    struct NeverAnswers {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Duty for NeverAnswers {
+        fn category(&self) -> Category {
+            Category::Title
+        }
+        fn ceiling_bytes(&self) -> usize {
+            128
+        }
+        async fn perform(&self, _prompt: &str, _provenance: &Provenance) -> Result<String, String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            pending().await
+        }
+    }
+
+    /// **The deadline.** A duty that never answers becomes a failure sentence
+    /// the call site can degrade with, rather than a turn that waits forever.
+    ///
+    /// Run on a paused clock, so the assertion is about the deadline existing
+    /// rather than about two minutes elapsing. Without the timeout this test
+    /// does not fail — it hangs, which is precisely the production symptom.
+    #[tokio::test(start_paused = true)]
+    async fn a_duty_that_never_answers_fails_at_the_deadline() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route = DutyRoute::Serves {
+            provider_id: "stub".to_owned(),
+            duty: Arc::new(NeverAnswers {
+                calls: Arc::clone(&calls),
+            }),
+            announce: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = route
+            .perform("name this", &Provenance::empty())
+            .await
+            .expect_err("a duty that never answers cannot have succeeded");
+
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "non-vacuity: the duty really was asked, so this is the deadline \
+             firing rather than the route declining"
+        );
+        assert!(
+            err.contains("did not answer within"),
+            "the call site is handed an explanation, not a silence: {err}"
+        );
+        assert!(
+            err.contains("title"),
+            "and it names the duty that hung: {err}"
+        );
+        assert!(
+            started.elapsed() >= DUTY_DEADLINE,
+            "the wait really was the deadline's, not something shorter"
+        );
     }
 
     /// **AC-8, point 5.** Per-category source is bounded to what ADR-3 allows: a

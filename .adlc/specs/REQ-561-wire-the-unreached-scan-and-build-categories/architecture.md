@@ -382,8 +382,31 @@ threshold is a cost surprise.
 
 **Decision.** `compact` answers with **both** a `FORGET:` block list and a
 `SUMMARY:` paragraph that replaces them, and the inserted summary block carries
-the **merged `ToolProvenance` of every block it elides** — `Unknown` if any
-elided block was `Unknown`, otherwise the union of their sources.
+the merged `ToolProvenance` of **every block the prompt showed the duty** —
+`Unknown` if any was `Unknown`, otherwise the union of their sources.
+
+**Amended after the Phase-5 security audit.** This ADR originally said "every
+block it **elides**". That was too narrow and the audit caught it: `compact_prompt`
+hands the model the **whole** conversation, including blocks it will keep, and
+nothing constrains the summary to describe only the forgotten set. So a summary
+describing a *retained* `local-only` block would have inherited only the
+forgotten blocks' provenance — i.e. clean. The invariant "a summary of a secret
+is a secret" was true of what the summary *replaces*, not of what it *contains*.
+
+It was unexploitable at the time only because the retained block was still in
+context and would refuse the next completion — an ordering accident, the same
+"almost-true invariant" shape recorded for ADR-4's equivalent mutant and for
+BUG-157. Scoping the merge to every block shown makes it structural: one line,
+and it now matches the provenance already computed for `Egress::scoped` at the
+same call site.
+
+**Also added (C4):** the summary is wrapped in the untrusted-data envelope before
+insertion. REQ-544 frames every content-bearing tool result as untrusted and
+does so deliberately *after* `digest` so the frame is never eroded. `compact`
+inverted that — the blocks it replaced were framed, the model-authored summary
+standing in for them was not, and the framed originals are gone permanently.
+Cost: the envelope adds ~345 bytes per summary (~1% of the default budget),
+which slightly reduces how much a single compaction can save.
 
 **Why this is the most safety-critical decision in the REQ.** Without the
 inherited provenance, compaction is a **laundering path**: a summary of a

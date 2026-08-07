@@ -496,6 +496,42 @@ mod tests {
             .collect()
     }
 
+    /// **AC-11, on the local leg.** The counterpart to the remote test below,
+    /// and the one that matters on a machine with nothing bound remotely: an
+    /// engine that runs on cannot grow the shell duty's answer past its ceiling
+    /// either.
+    ///
+    /// One unbroken run of bytes on purpose. A token budget is a request
+    /// measured in *tokens*, and one token carries as many bytes as the model
+    /// put in it — which is why the ceiling is stated in bytes and enforced
+    /// after generation rather than asked for before it (LESSON-484).
+    #[tokio::test]
+    async fn a_local_shell_duty_is_bounded_however_much_the_engine_generates() {
+        let runaway = "e".repeat(SHELL_OUTPUT_MAX_BYTES * 32);
+        let route = local_route(&runaway);
+        let DutyRoute::Serves { duty, .. } = &route else {
+            panic!("the fixture must resolve, or the ceiling is never exercised");
+        };
+
+        let answer = duty
+            .perform("interpret this", &unknown())
+            .await
+            .expect("the local duty served");
+
+        assert!(
+            answer.len() <= SHELL_OUTPUT_MAX_BYTES,
+            "a local shell duty accepted {} bytes from an engine that ran on; the \
+             ceiling is {SHELL_OUTPUT_MAX_BYTES}",
+            answer.len()
+        );
+        assert!(runaway.len() > SHELL_OUTPUT_MAX_BYTES * 4);
+        assert!(
+            answer.len() > SHELL_OUTPUT_MAX_BYTES / 2,
+            "the cap must let a real interpretation through: {} bytes",
+            answer.len()
+        );
+    }
+
     /// **AC-11.** A provider ignoring `max_tokens` cannot grow the shell duty's
     /// buffer without limit. The assertion reads [`SHELL_OUTPUT_MAX_BYTES`]
     /// rather than a literal, so raising the ceiling cannot silently un-test the

@@ -375,7 +375,12 @@ async fn a_compaction_of_a_boundary_bearing_conversation_is_refused_whole() {
         assert!(ctx.under_compaction_pressure());
         ctx
     }
-    const ANSWER: &str = "FORGET: 1 2\nSUMMARY: the agent read the production config.";
+    // Three blocks rather than two, because the replacement paragraph re-enters
+    // context inside the untrusted-data envelope (REQ-544 M-2) and the envelope
+    // is real bytes: against this fixture's deliberately tiny 4 KB budget,
+    // forgetting two no longer fits — which is the over-budget rejection working,
+    // not the refusal under test.
+    const ANSWER: &str = "FORGET: 1 2 3\nSUMMARY: the agent read the production config.";
 
     // NON-VACUITY, first: with no boundary configured this very route, this very
     // conversation, genuinely sends.
@@ -383,7 +388,7 @@ async fn a_compaction_of_a_boundary_bearing_conversation_is_refused_whole() {
     let (open_route, open_sent) = remote(COMPACT_DUTY, Vec::new(), ANSWER);
     let served = open.compact_if_pressured(&open_route).await;
     assert!(!served.degraded, "{served:?}");
-    assert_eq!(served.dropped_blocks, 2);
+    assert_eq!(served.dropped_blocks, 3);
     assert!(
         wire(&open_sent).contains("Below is a numbered list of the blocks"),
         "the compaction prompt never reached the transport"

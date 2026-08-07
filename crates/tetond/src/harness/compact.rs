@@ -84,6 +84,10 @@
 //! | the soft threshold becomes the hard gate's own (compaction only at the emergency) | `harness::compact::tests::only_a_pressured_context_is_worth_compacting`, `harness::context::tests::compaction_runs_ahead_of_the_hard_gate_not_at_it` + 3 others |
 //! | the protected most-recent block becomes droppable | `harness::compact::tests::the_block_the_turn_is_working_on_cannot_be_forgotten` |
 //! | the replacement block does not inherit the provenance of what it replaced | `harness::context::tests::a_compaction_inherits_the_provenance_of_what_it_replaces`, `…::a_compaction_of_unknown_provenance_stays_unknown` |
+//! | that inheritance is scoped to the **forgotten** blocks rather than to every block the prompt showed | `harness::context::tests::a_compaction_inherits_the_provenance_of_everything_it_was_shown` |
+//! | the replacement paragraph re-enters context without the untrusted-data envelope (REQ-544 M-2) | `harness::context::tests::a_compaction_summary_re_enters_context_as_untrusted_data` |
+//! | the per-turn failure latch is removed, so every fold re-buys a broken duty | `harness::context::tests::a_failed_compaction_is_not_bought_again_for_the_rest_of_the_turn` |
+//! | the regrowth margin is removed, so a fold that adds nothing re-buys a decision | `harness::context::tests::a_compaction_is_not_repeated_until_the_context_has_grown_back` |
 //! | the replacement text skips the control-token cut | `harness::context::tests::a_fabricating_compaction_is_cut_before_context`, `…::a_compaction_whose_summary_is_only_a_forged_frame_is_refused` |
 //! | a summary that is empty after that cut is accepted rather than refused | `harness::context::tests::a_compaction_whose_summary_is_only_a_forged_frame_is_refused` |
 //! | the session-taint override is removed from the resolver (AC-9a) | `runtime::tests::dispatch::compact::a_tainted_session_compacts_on_the_local_tier` |
@@ -171,6 +175,32 @@ pub const COMPACT_PRESSURE_PERCENT: usize = 70;
 /// The negative case is the cost argument: a session whose context is two blocks
 /// long pays nothing however hard it is pressing on its budget.
 pub const COMPACT_MIN_BLOCKS: usize = 3;
+
+/// How much the context must have **grown** since the last applied compaction
+/// before another one is worth buying, as a percentage of the byte budget
+/// (ADR-11).
+///
+/// The soft threshold alone is a re-entry condition, not a rate limit. A
+/// successful compaction only has to land under 100% — nothing makes it land
+/// under [`COMPACT_PRESSURE_PERCENT`] — so a long turn that stays pressured
+/// buys one `compact` model call per **tool result**, each one asking a model to
+/// re-decide a conversation that has grown by one fold. This is the shape
+/// `SessionRegistry::claim_title` exists to avoid for `title`, and the shape
+/// `TRIAGE_MIN_MATCHES` and BR-4b's resolved trigger avoid for their duties.
+///
+/// A named constant with its own zero-call test rather than an inline literal,
+/// because a hidden threshold is a cost surprise (ADR-11).
+pub const COMPACT_REGROWTH_PERCENT: usize = 10;
+
+/// Whether a context already compacted at `committed` bytes has grown enough to
+/// be worth compacting again (ADR-11).
+///
+/// A zero budget always says yes, matching [`under_pressure`]'s answer for the
+/// same input: a context with no room at all is never spared a decision.
+#[must_use]
+pub const fn worth_compacting_again(estimated: usize, committed: usize, budget: usize) -> bool {
+    estimated >= committed.saturating_add(budget.saturating_mul(COMPACT_REGROWTH_PERCENT) / 100)
+}
 
 /// Display bound on one block's text inside the duty prompt, in bytes.
 ///
@@ -599,6 +629,48 @@ mod tests {
         let engine: Arc<Mutex<dyn Engine>> =
             Arc::new(Mutex::new(MockEngine::with_response("mock", reply)));
         DutyRoute::local(COMPACT_DUTY, "local", engine)
+    }
+
+    /// **The generation budget is this duty's, not one shared with the other
+    /// four.** A compaction stands in for a conversation — that is the whole
+    /// argument for [`COMPACT_OUTPUT_MAX_BYTES`] being the loosest of the five —
+    /// so a duty asking for the same handful of tokens a `title` asks for has a
+    /// ceiling that describes nothing it can actually produce.
+    ///
+    /// The marker at the end of the fixture is what makes this discriminating:
+    /// the answer is well inside the byte ceiling and well outside the shared
+    /// default's token budget, so a summary cut short is a summary the tail of
+    /// which never arrives.
+    #[tokio::test]
+    async fn a_local_compaction_may_write_the_paragraph_its_ceiling_allows() {
+        const TAIL: &str = "END-OF-SUMMARY";
+        let long = format!("FORGET: 1 2\nSUMMARY: {}{TAIL}", "word ".repeat(900));
+        assert!(
+            long.len() < COMPACT_OUTPUT_MAX_BYTES,
+            "non-vacuity: the fixture must fit the ceiling, or this tests the ceiling"
+        );
+
+        let route = local_route(&long);
+        let DutyRoute::Serves { duty, .. } = &route else {
+            panic!("the fixture must resolve");
+        };
+        let answer = duty
+            .perform("compact this", &EgressProvenance::empty())
+            .await
+            .expect("the local duty served");
+
+        assert!(
+            answer.ends_with(TAIL),
+            "the compaction was cut {} bytes short of the paragraph it wrote — a \
+             generation budget shared with `title` is not this duty's ceiling",
+            long.len() - answer.len()
+        );
+        assert_eq!(
+            read_compaction(&answer, 3)
+                .expect("a whole answer parses")
+                .forget(),
+            &[0, 1]
+        );
     }
 
     /// The ceiling is the loosest of the five, and it is loosest **by

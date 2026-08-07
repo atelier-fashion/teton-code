@@ -396,6 +396,71 @@ mod tests {
         }
     }
 
+    // -- the local leg: the harness-owned ceiling (BR-8, AC-11) --------------
+
+    /// **AC-11, BR-8, on the leg `title` actually runs on.** An engine that runs
+    /// on cannot grow the title duty's answer without limit either.
+    ///
+    /// This is the sharper of the two ceiling tests and it was the missing one.
+    /// `title` is `reflex`-tier and REQ-558 settled that `reflex` never inherits
+    /// `default_provider`, so on every ordinary configuration it has **no remote
+    /// leg at all** — a bound enforced only where the provider streams is a
+    /// bound on none of this duty's production paths. And the answer is written
+    /// into a session record that is never revised (BR-9) and announced on the
+    /// wire as `session_titled`, so an unbounded one is permanent.
+    ///
+    /// The fixture is one unbroken run of bytes on purpose: a token budget is a
+    /// request measured in *tokens*, and a single token carries as many bytes as
+    /// the model felt like putting in it. That is why the ceiling is stated in
+    /// bytes and enforced after generation rather than asked for before it.
+    #[tokio::test]
+    async fn a_local_title_duty_is_bounded_however_much_the_engine_generates() {
+        let runaway = "e".repeat(TITLE_OUTPUT_MAX_BYTES * 32);
+        let route = local_route(&runaway);
+        let DutyRoute::Serves { duty, .. } = &route else {
+            panic!("the fixture must resolve, or the ceiling is never exercised");
+        };
+
+        let answer = duty
+            .perform("name this", &user_text())
+            .await
+            .expect("the local duty served");
+
+        assert!(
+            answer.len() <= TITLE_OUTPUT_MAX_BYTES,
+            "a local title duty accepted {} bytes from an engine that ran on; the \
+             ceiling is {TITLE_OUTPUT_MAX_BYTES}",
+            answer.len()
+        );
+        // Non-vacuity, both directions: the engine really did offer far more than
+        // the bound, and the duty really did accumulate up to it — so this is a
+        // cap and not a refusal.
+        assert!(runaway.len() > TITLE_OUTPUT_MAX_BYTES * 4);
+        assert!(
+            answer.len() > TITLE_OUTPUT_MAX_BYTES / 2,
+            "the cap must let a real title through: {} bytes",
+            answer.len()
+        );
+    }
+
+    /// And the same bound reached through the duty's own call site, because that
+    /// is where an unbounded title would actually land.
+    #[tokio::test]
+    async fn a_runaway_local_answer_still_names_the_session_within_the_ceiling() {
+        let named = name_session(
+            &local_route(&"unbounded ".repeat(TITLE_OUTPUT_MAX_BYTES)),
+            REQUEST,
+            &user_text(),
+        )
+        .await
+        .expect("a bounded answer is still an answer");
+        assert!(
+            named.len() <= TITLE_OUTPUT_MAX_BYTES,
+            "a session was named with {} bytes: {named}",
+            named.len()
+        );
+    }
+
     // -- the remote leg: the harness-owned ceiling (BR-8, AC-11) -------------
 
     /// A transport that records every request body it is asked to send.
@@ -585,6 +650,18 @@ mod tests {
         assert!(
             wire(&sent).contains("Give the session a short name"),
             "the duty prompt never reached the transport"
+        );
+        // And it asked for **this duty's** budget, not a default shared with the
+        // four duties whose ceilings are an order of magnitude looser.
+        assert!(
+            wire(&sent).contains(&format!("\"max_tokens\":{}", TITLE_DUTY.max_tokens())),
+            "the request carried a generation budget that is not this duty's: {}",
+            wire(&sent)
+        );
+        assert!(
+            TITLE_DUTY.max_tokens() < crate::harness::COMPACT_DUTY.max_tokens(),
+            "non-vacuity: the budget really is per-duty, so this is not one number \
+             spelled two ways"
         );
     }
 
