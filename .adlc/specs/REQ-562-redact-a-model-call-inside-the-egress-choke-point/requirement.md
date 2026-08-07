@@ -195,7 +195,13 @@ No new RPCs.
 - **REQ-561** — the shared `DutyRoute`/`Duty` seam and duty `route_decided`.
   `redact` should be the fifth caller of that seam, not a sixth bespoke path.
   If REQ-561 slips, this REQ inherits BR-6 of it.
-- No new crates. Whether detection is model-only or model-plus-pattern is OQ-2.
+- No new crates. OQ-2's recommendation (model **plus** a deterministic pattern
+  pass) needs no dependency — the pattern chain already exists in the delegate
+  redaction path and is a `sed`-equivalent regex sweep.
+- **Not blocked on REQ-560.** OQ-4's recommendation is that v1 ships reporting and
+  no override, which needs no permission model. If OQ-2 is settled model-only
+  instead, revisit — false positives get likelier and the override question
+  sharpens.
 
 ## Assumptions
 
@@ -225,20 +231,68 @@ No new RPCs.
       payload does not go. Left formally open only because it is the REQ's central
       safety posture and deserves an explicit yes rather than an inherited one.
 - [ ] OQ-2: Model-only, or model plus a deterministic pattern pass (the
-      `sk-`/`AKIA`/`ghp_` shapes already used in the delegate redaction chain)?
-      Patterns are fast, precise, and catch the common case; the model catches
-      paraphrase. Running both costs one model call plus a regex sweep and makes
-      recall explainable.
+      `sk-`/`AKIA`/`ghp_`/`Bearer`/`*_API_KEY=` shapes already used in the delegate
+      redaction chain)?
+
+      **Recommendation: both.** The two fail in opposite directions, which is the
+      whole argument. Patterns have near-perfect precision and poor recall — a
+      string matching `AKIA[A-Z0-9]{16}` essentially *is* an AWS key, but the pass
+      is blind to anything off-shape. A model has moderate recall and *uncertain*
+      precision: it catches what patterns structurally cannot (a key paraphrased
+      into prose, a credential described rather than pasted, PII with no fixed
+      shape) and can both miss and invent.
+
+      **This also largely answers BR-4.** Confidence has to come from somewhere,
+      and model-only means trusting a 3B model's self-reported confidence — the
+      thing least worth trusting. Running both derives it structurally: a pattern
+      hit is high-confidence by construction, a model-only hit is low. BR-4 stops
+      being a judgment call and becomes a consequence of the design.
+
+      Cost is roughly a wash — a regex sweep is microseconds against a model call
+      of hundreds of milliseconds.
+
+      **The argument against**, recorded because it is real: a pattern pass makes
+      the feature *look* like it works, which reduces the pressure to measure the
+      model's recall — and the model is the part that justifies this REQ existing.
+      Mitigation: scope the dogfooding measurement to *"what did the model catch
+      that patterns did not?"* That question, not raw recall, is the honest test of
+      whether the model call earns its latency.
 - [x] OQ-3: **RESOLVED 2026-08-07 — `redact` is opt-in in v1.** An always-on scan
       on every remote call is a large behaviour and latency change for a guarantee
       users have not asked for yet, and BR-9 puts it on the critical path of every
       remote turn. Opt-in ships the capability and lets its recall be measured
       before anything depends on it. See BR-10 for the switch, and note what the
       switch must **not** be.
-- [ ] OQ-4: What does a user *do* with a block? A blocked turn with "a credential
-      was detected at bytes 1400–1436" and no way to proceed is a dead end. An
-      override needs a permission model — which is REQ-560's subject, so this may
-      need to sequence after it.
+- [ ] OQ-4: What does a user *do* with a block?
+
+      **This is two questions, and only one of them needs REQ-560.**
+
+      *"Can the user act?"* is answerable now. BR-6 forbids quoting the matched
+      text, so a block currently offers "a credential was detected at bytes
+      1400–1436" — useless, because the user cannot see those bytes. But kind +
+      span + **which content block it came from** is both permitted and actionable:
+      *"a credential-shaped string in the file you read at `src/config.rs`"* tells
+      them what to fix without echoing the secret. That is a reporting decision,
+      independent of permissions.
+
+      *"Can the user override?"* needs REQ-560 — any "send anyway" is a permission
+      prompt with a durable answer, which is that REQ's subject.
+
+      **Recommendation: v1 ships good reporting and no override, and this REQ does
+      NOT sequence behind REQ-560.** OQ-3's opt-in resolution is what makes that
+      safe: a user who hits a false positive can turn `redact` off, so a blocked
+      turn is never a true dead end.
+
+      **The risk in relying on that**, recorded because it is the likely failure
+      mode: the escape hatch is all-or-nothing. One false positive and the safety
+      feature gets switched off permanently — the classic shape where a noisy check
+      trains people to disable it. That is an argument for getting OQ-2 right
+      (patterns keep precision high) rather than for building an override.
+
+      **This recommendation is contingent on OQ-2 going the "both" way.** If v1
+      ships model-only, false positives get likelier, the all-or-nothing hatch gets
+      pulled more often, and the override question sharpens — at which point
+      sequencing behind REQ-560 becomes the right call after all.
 
 ## Out of Scope
 
