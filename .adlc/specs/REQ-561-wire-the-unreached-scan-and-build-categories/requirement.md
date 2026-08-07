@@ -1,7 +1,7 @@
 ---
 id: REQ-561
 title: "Wire the four unreached categories: triage, shell, title, compact"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-07
 updated: 2026-08-07
@@ -110,15 +110,26 @@ rows already exist and already validate (REQ-558 TASK-049).
       rest of the turn proceeds.
 - [ ] BR-8: **A duty's output is bounded by the harness, not by the provider.**
       REQ-558 capped the remote digest's accumulator for this reason; the same bound
-      applies to every duty that reads a remote response.
+      applies to every duty that reads a remote response. **Each duty declares an
+      explicit ceiling as a named constant** — a bound that lives only in a
+      reviewer's head is not a bound, and AC-11 has nothing to assert against
+      without one. The ceiling is per-duty because the duties differ by an order of
+      magnitude in what a legitimate response looks like: a `title` is a handful of
+      words, a `compact` is a conversation.
 - [ ] BR-9: `title` runs **once per session**, not per turn, and never re-derives an
       existing title. It is `reflex`-tier and therefore local (REQ-558: `reflex`
       inherits the local tier and never `default_provider`).
 - [ ] BR-9a: **`title` reaches the wire in this REQ** (OQ-2, resolved) via
-      `session_titled`. Rendering belongs to REQ-560's status line, but REQ-560
-      cannot render a value that was never sent — and a title no consumer can
-      observe is a model call bought for nothing. This REQ ships the data and the
-      event; the pixels are REQ-560's.
+      `session_titled`. The reasoning: a title no consumer *can* observe is a model
+      call bought for nothing, and no downstream renderer can ever show a value
+      that was never sent. So this REQ ships the data and the event, and stops
+      there. **It does not commit any other REQ to rendering it.** REQ-560's spec
+      does not currently mention a session title and its AC-7 pins the status-line
+      matrix to `(level × effort)`; its BR-8 input tuple ends in `…`, so adding a
+      title later is *possible* there, but that is REQ-560's decision to make and
+      not a dependency of this REQ. REQ-561 is complete and verifiable whether or
+      not anything ever renders the title — AC-15 asserts the event on the wire,
+      not a pixel.
 - [ ] BR-11: **`policy show` states what content each category sends** (OQ-4,
       resolved). The `scan` tier carries both `triage` (grep match text — file
       content) and `compact` (conversation blocks), so a user who binds `scan`
@@ -170,9 +181,10 @@ rows already exist and already validate (REQ-558 TASK-049).
       judgment path from naming these four; this pins that the duty path does not
       reintroduce it.
 - [ ] AC-11: **A duty's output is bounded by the harness** (BR-8): a remote
-      provider returning an unbounded response yields a result no larger than the
-      duty's declared ceiling. Asserted per duty, with a mock that deliberately
-      overruns.
+      provider returning an unbounded response yields a result no larger than that
+      duty's declared ceiling constant. Asserted per duty, with a mock that
+      deliberately overruns. The assertion reads the declared constant rather than
+      a literal, so raising a ceiling cannot silently un-test the bound.
 - [ ] AC-12: **Every duty is answerable off-script** (BR-10): a scripted-engine
       test asserts each of the four duties consumes **no** block, and that the turn
       sequence after a duty fires is unchanged. REQ-558 shipped this fix twice
@@ -198,7 +210,10 @@ rows already exist and already validate (REQ-558 TASK-049).
       rendered output states, for each of the eleven categories, what content that
       category transmits — and a test pins that `triage` and `compact` disclose
       distinct content classes despite sharing the `scan` tier. This AC asserts
-      disclosure only; the enforcement assertion is AC-4.
+      disclosure only; the enforcement assertion is AC-4. Declaring a content class
+      for a still-unreached category (`redact`, REQ-562) **describes intent, not a
+      call site** — it does not wire that category and does not intrude on
+      REQ-562's scope. A category that transmits nothing today says so.
 - [ ] AC-9: Mutation checks — for each duty, (a) removing the taint override and
       (b) making the failure path return its input unchanged each turn at least one
       test red. **A mutation that comes back green is reported as a finding**
@@ -212,9 +227,15 @@ rows already exist and already validate (REQ-558 TASK-049).
 
 ## Assumptions
 
-- The four call sites are all inside `tetond`'s harness and tool layer, so no
-  protocol or config change is needed. `route_decided` for duties (BR-2) is the one
-  wire-visible addition, and its payload type already exists.
+- The four call sites are all inside `tetond`'s harness and tool layer, so **no
+  config change is needed** — the schema is stable and this REQ must not migrate.
+- **A protocol change *is* needed, for exactly one thing.** There are two
+  wire-visible additions, not one. `route_decided` for duties (BR-2) reuses the
+  existing `RouteDecided` payload, so it costs nothing new. `session_titled`
+  (BR-9a) does **not** exist — verified: no `SessionTitled` variant or payload
+  struct anywhere in `crates/`. It needs a new `Event` variant and payload in
+  `teton-protocol`, whose no-`teton-core`-dependency rule the payload must
+  respect (`session_id` + `title` are both plain strings, so it does).
 - `triage` and `shell` are lower-risk than `compact` because their fallbacks are the
   current behaviour verbatim; `compact` replaces a deterministic algorithm with a
   model call and is the one that warrants the most adversarial review.
