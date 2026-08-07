@@ -116,7 +116,10 @@ rows already exist and already validate (REQ-558 TASK-049).
 - [ ] AC-4: Egress capture — with each duty bound to a remote provider and a
       `local-only` boundary configured, no boundary content appears in any captured
       payload, and each test proves the duty **would** have sent when the content is
-      clean (the non-vacuity pairing REQ-558 TASK-054 established).
+      clean (the non-vacuity pairing REQ-558 TASK-054 established). The scoping rule
+      is asserted too (BR-7): a duty whose *own* content is clean still sends while
+      the turn's wider context contains boundary material, so the scope is
+      demonstrably the content sent rather than the turn.
 - [ ] AC-5: A tainted session runs all four duties on the local tier regardless of
       binding, asserted by captured bytes (BR-5).
 - [ ] AC-6: `title` is requested exactly once for a multi-turn session, asserted by
@@ -127,6 +130,22 @@ rows already exist and already validate (REQ-558 TASK-049).
 - [ ] AC-8: One `DutyRoute`/`Duty` seam serves all four plus `digest`; a
       grep-level or type-level assertion pins that no per-category duty plumbing
       survives (BR-6).
+- [ ] AC-10: **Each duty is tagged at its call site** (BR-1): a compile-level or
+      grep-level assertion that no duty's category is produced from prompt text,
+      tool name, or any string comparison. The type system already forbids the
+      judgment path from naming these four; this pins that the duty path does not
+      reintroduce it.
+- [ ] AC-11: **A duty's output is bounded by the harness** (BR-8): a remote
+      provider returning an unbounded response yields a result no larger than the
+      duty's declared ceiling. Asserted per duty, with a mock that deliberately
+      overruns.
+- [ ] AC-12: **Every duty is answerable off-script** (BR-10): a scripted-engine
+      test asserts each of the four duties consumes **no** block, and that the turn
+      sequence after a duty fires is unchanged. REQ-558 shipped this fix twice
+      reactively — the classifier consumed a block and desynchronised two
+      `cli_e2e` tests before anyone noticed, and `summarize_if_large` carried the
+      same latent exposure. With four more duties it stops being a surprise and
+      becomes a checklist item.
 - [ ] AC-9: Mutation checks — for each duty, (a) removing the taint override and
       (b) making the failure path return its input unchanged each turn at least one
       test red. **A mutation that comes back green is reported as a finding**
