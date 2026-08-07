@@ -26,7 +26,7 @@ before any of them start.
 - `crates/tetond/src/harness/duty.rs` — **new**. `DutyRoute`, the `Duty` trait, `LocalDuty`, `RemoteDuty`, ceiling enforcement, egress scoping. The single home for all five concerns.
 - `crates/tetond/src/harness/digest.rs` — collapse `DigestRoute`/`Digester`/`LocalDigester`/`RemoteDigester` into the shared seam; keep only the digest prompt builder and `SUMMARIZER_OUTPUT_CONTRACT`-adjacent bits. `tool_result_provenance()` becomes a caller-side helper.
 - `crates/tetond/src/harness/mod.rs` — declare and export the `duty` module.
-- `crates/tetond/src/runtime.rs` — add the shared `resolve_duty()` helper; rewrite `digest_route()` (line ~1853) as a thin wrapper that keeps its literal `router.resolve(Category::Digest)` (line 1864) and delegates. Emit `route_decided` from the shared helper.
+- `crates/tetond/src/runtime.rs` — add the shared `resolve_duty()` helper; rewrite `digest_route()` (line ~1853) as a thin wrapper that keeps its literal category-resolving call (line 1864) and delegates. **`route_decided` is emitted from the shared *perform* path, not from the resolver** — see ADR-8.
 - `crates/tetond/src/harness/context.rs` — update `summarize_if_large()` (line ~689) to consume `DutyRoute` instead of `DigestRoute`. Its degraded-fallback behaviour must not change.
 
 ## Acceptance Criteria
@@ -35,7 +35,7 @@ before any of them start.
 - [ ] `Duty` exposes `category()`, `ceiling_bytes()`, and `async perform(&self, prompt: &str, provenance: &Provenance) -> Result<String, String>` (ADR-2). Note the `&Provenance` signature — **not** `&ToolProvenance`.
 - [ ] Exactly one `Egress::scoped(` call exists on the duty path, and exactly one ceiling-enforcement site.
 - [ ] `digest` routes through the seam and **every existing digest test passes unmodified**. A test edited to accommodate the refactor is a violation, not an accommodation — if a digest test needs changing, the seam changed behaviour and that is the bug.
-- [ ] `digest` now emits `route_decided` naming `Category::Digest`, a tier, a provider, and a non-empty reason (BR-2, part of AC-2). Asserted by a new test.
+- [ ] `digest` emits `route_decided` naming `Category::Digest`, a tier, a provider, and a non-empty reason **when the duty actually performs** (BR-2, part of AC-2, ADR-8). Paired with the negative: a turn where the duty resolves but never performs emits **no** digest `route_decided`. The negative is what pins the design — without it the test passes equally under emit-at-resolve (LESSON-485).
 - [ ] `cargo test --workspace --no-fail-fast` is green.
 
 ## Technical Notes

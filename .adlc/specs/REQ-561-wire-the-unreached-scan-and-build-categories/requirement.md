@@ -66,10 +66,16 @@ rows already exist and already validate (REQ-558 TASK-049).
 - [ ] BR-1: All four categories are tagged **at their call sites**. No prompt text,
       tool name, or keyword list may assign one — REQ-558 BR-2's rule, which the
       type system already enforces (`JudgmentCategory` cannot name them).
-- [ ] BR-2: **Every duty emits `route_decided`.** REQ-558 shipped `digest` routable
-      but silent: the one genuinely new egress path it opened announced itself
-      nowhere in the event stream. With four more duties that becomes five of
-      eleven categories routable and unobservable. `digest` is retrofitted here.
+- [ ] BR-2: **Every duty emits `route_decided` — when it performs, not when it
+      resolves.** REQ-558 shipped `digest` routable but silent: the one genuinely
+      new egress path it opened announced itself nowhere in the event stream. With
+      four more duties that becomes five of eleven categories routable and
+      unobservable. `digest` is retrofitted here. The timing is load-bearing:
+      duties are resolved eagerly once per turn but usually never perform, so
+      emitting at resolution would announce model calls that never happen — five
+      spurious events per turn once all five duties are wired — and would observe
+      a *resolution* rather than the egress this rule exists to make visible. See
+      ADR-8, which records the three test failures that established this.
 - [ ] BR-3: **Every duty's failure preserves the invariant its call site guards**
       (LESSON-447). `triage` falls back to today's first-200 cap; `shell` to today's
       8k truncation; `compact` to `truncate_to_budget`'s deterministic drop; `title`

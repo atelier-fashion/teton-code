@@ -192,6 +192,57 @@ Anything beyond (5) appearing per-category is the regression AC-8 catches.
 - **LESSON-432** — provenance comes from files, not argument names. ADR-2's
   `&Provenance` signature.
 
+## ADR-8: `route_decided` is emitted when a duty **performs**, not when it resolves
+
+**Decision.** `DutyRoute::Serves` carries the `RouteDecided` payload, and the
+shared seam publishes it at the moment `perform` is actually invoked — once per
+invocation. Emission does **not** happen in `resolve_duty()`.
+
+**Why — this corrects an error in the original ADR set.** The first draft of
+TASK-058 specified emission from the shared *resolver*. That was wrong, and
+implementing it turned three tests red, which is how it was caught:
+
+`digest_route()` is called unconditionally once per turn attempt, whether or not
+any tool result ever crosses the summarization threshold. Emitting at resolution
+therefore announces a routing decision for a model call that usually never
+happens. BR-2 exists to make a new **egress path** visible; a path that never
+fires produced no egress, so a resolution-time event observes a *resolution*, not
+an egress. It also scales badly in exactly the direction this REQ moves: with all
+five duties resolved eagerly, every turn would carry five spurious
+`route_decided` events for calls that mostly never occur.
+
+The decisive evidence was the third failure. `routing_categories::
+a_tainted_session_stays_local_and_the_pre_taint_turn_proves_it_would_not_have`
+is a REQ-544 privacy test whose premise is that a category-less `route_decided`
+naming `local` **is** the taint pin. A resolution-time digest event violates that
+premise. Emit-at-perform leaves the test green untouched — the right outcome
+arrived at for the right reason, not a lucky one.
+
+**On the apparent cost.** Moving emission into the seam was raised as putting "an
+emission concern inside the seam". That is where it belongs: the seam is the one
+place all five duties share, so a single emission site there is precisely BR-6's
+intent — strictly better than five call sites each remembering to emit.
+
+**Testing consequence.** The positive test (a performed duty announces its route)
+is not sufficient on its own. It must be paired with the negative — a turn where
+the duty resolves but never performs emits **no** `route_decided` for that
+category. Without the negative, nothing distinguishes this design from the one it
+replaced (LESSON-485).
+
+## ADR-9: Never write the literal `router.resolve(Category::X)` in prose
+
+**Decision.** The spelling `router.<method>(Category::X)` must not appear in doc
+comments, module docs, or any non-code text inside `crates/tetond/src/`.
+
+**Why.** `call_sites.rs` derives the call-site marker by scanning production
+source as **text**, not as parsed Rust. A doc comment containing that spelling
+registers as a call site and turns
+`the_unreached_marker_matches_the_daemons_actual_call_sites` red before the
+described code exists. This was hit during TASK-058 — the marker test failed on
+a comment. Refer to it descriptively in prose ("resolve the `digest` category")
+and keep the literal spelling to actual call sites only. The next four duty tasks
+all write similar documentation and would each rediscover this.
+
 ## ADR-7: The four duty tasks are chained, not parallel
 
 **Decision.** TASK-060 → 061 → 062 → 063 run in sequence, not concurrently.
