@@ -49,7 +49,8 @@ pub use failure::{
 };
 pub use openai_compat::{OpenAiCompatAdapter, OpenAiCompatConfig};
 pub use transport::{
-    ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
+    BlockDetail, ByteStream, HttpMethod, Transport, TransportError, TransportRequest,
+    TransportResponse,
 };
 
 /// A single normalized event emitted while a turn streams in. Both adapters emit
@@ -263,15 +264,18 @@ pub enum ProviderError {
     /// has no [`FailureClass`].
     #[error("failed to build provider request: {0}")]
     Build(String),
-    /// The egress choke point refused the call because its content provenance
-    /// intersected a `local-only` privacy boundary (BR-1). This is **not** a
-    /// provider fault and is deliberately non-retryable: the authoritative
-    /// `privacy_block` event already fired at the choke point, and the daemon
-    /// must reroute the turn to the local tier rather than retry the blocked
-    /// provider (REQ-544 M-1). It has no [`FailureClass`] because it is not a
-    /// failure the retry/fallback/degrade machinery should ever act on.
-    #[error("egress refused: content is under a local-only privacy boundary")]
-    PrivacyBlocked,
+    /// The egress choke point refused the call — a `local-only` boundary (BR-1)
+    /// or the REQ-562 redaction scan. This is **not** a provider fault and is
+    /// deliberately non-retryable: the authoritative `privacy_block` event
+    /// already fired at the choke point, and the daemon must reroute the turn to
+    /// the local tier rather than retry the blocked provider (REQ-544 M-1). It
+    /// has no [`FailureClass`] because it is not a failure the
+    /// retry/fallback/degrade machinery should ever act on.
+    ///
+    /// The [`BlockDetail`] rides through unchanged from the transport seam so
+    /// the daemon can say which inspection refused the turn (REQ-562 BR-3).
+    #[error("egress refused: {0}")]
+    PrivacyBlocked(BlockDetail),
 }
 
 impl ProviderError {
@@ -289,7 +293,7 @@ impl ProviderError {
             // A privacy block is not a provider failure and must never be
             // retried/fallen-back-on: the daemon handles it out-of-band by
             // rerouting to the local tier (REQ-544 M-1).
-            ProviderError::Build(_) | ProviderError::PrivacyBlocked => return None,
+            ProviderError::Build(_) | ProviderError::PrivacyBlocked(_) => return None,
         })
     }
 
@@ -298,7 +302,22 @@ impl ProviderError {
     /// retrying the blocked provider (REQ-544 M-1).
     #[must_use]
     pub fn is_privacy_blocked(&self) -> bool {
-        matches!(self, ProviderError::PrivacyBlocked)
+        self.privacy_block_detail().is_some()
+    }
+
+    /// Which inspection refused the call, or `None` if this is not a privacy
+    /// block (REQ-562 BR-3).
+    ///
+    /// [`Self::is_privacy_blocked`] is defined in terms of this rather than
+    /// beside it, so "is it a block" and "which block is it" cannot come to
+    /// disagree — a third refusal added to [`BlockDetail`] is answered by both
+    /// at once.
+    #[must_use]
+    pub fn privacy_block_detail(&self) -> Option<BlockDetail> {
+        match self {
+            ProviderError::PrivacyBlocked(detail) => Some(*detail),
+            _ => None,
+        }
     }
 
     /// The retry / fallback / degrade decision for this error, or `None` for a
@@ -315,7 +334,7 @@ impl ProviderError {
             TransportError::Connect | TransportError::Io => ProviderError::Transport,
             // Preserve the privacy-block signal end to end: it must NOT collapse
             // into the retryable transport class (REQ-544 M-1).
-            TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
+            TransportError::PrivacyBlocked(detail) => ProviderError::PrivacyBlocked(detail),
         }
     }
 }
@@ -398,13 +417,77 @@ mod tests {
         // REQ-544 M-1: a privacy block must NOT collapse into the retryable
         // transport class, and it carries no FailureClass (the daemon reroutes to
         // local out-of-band rather than retrying/falling back).
-        let err = ProviderError::from_transport(TransportError::PrivacyBlocked);
-        assert_eq!(err, ProviderError::PrivacyBlocked);
+        let err =
+            ProviderError::from_transport(TransportError::PrivacyBlocked(BlockDetail::Boundary));
+        assert_eq!(err, ProviderError::PrivacyBlocked(BlockDetail::Boundary));
         assert!(err.is_privacy_blocked());
         assert_eq!(err.failure_class(), None);
         assert_eq!(err.decision(), None);
         // The other transport errors are unchanged.
         assert!(!ProviderError::from_transport(TransportError::Connect).is_privacy_blocked());
+    }
+
+    /// **REQ-562 BR-3.** Every detail survives the transport→provider hop
+    /// unchanged, and each stays non-retryable.
+    ///
+    /// The mapping is a `match` over three values, which is exactly the shape
+    /// that silently collapses when someone adds a fourth: this loop is what
+    /// makes a collapsed arm fail rather than quietly report the wrong cause.
+    #[test]
+    fn every_block_detail_survives_the_hop_and_stays_non_retryable() {
+        let details = [
+            BlockDetail::Boundary,
+            BlockDetail::Redaction,
+            BlockDetail::ScanUnavailable,
+        ];
+        for detail in details {
+            let err = ProviderError::from_transport(TransportError::PrivacyBlocked(detail));
+            assert_eq!(
+                err.privacy_block_detail(),
+                Some(detail),
+                "the cause must reach the daemon unchanged"
+            );
+            assert!(err.is_privacy_blocked());
+            assert_eq!(err.failure_class(), None, "{detail:?}");
+        }
+        // Non-vacuity: a non-block error has no detail at all, so `Some(..)`
+        // above is a fact about the variant rather than about the accessor.
+        assert_eq!(ProviderError::Timeout.privacy_block_detail(), None);
+    }
+
+    /// The seam's own log clauses stay distinct, and the scan-unavailable one
+    /// never reads as a finding (BR-3). No clause can carry payload content —
+    /// [`BlockDetail`] has no field to carry it in.
+    #[test]
+    fn the_three_block_details_render_three_distinct_log_clauses() {
+        let rendered: Vec<String> = [
+            BlockDetail::Boundary,
+            BlockDetail::Redaction,
+            BlockDetail::ScanUnavailable,
+        ]
+        .into_iter()
+        .map(|d| ProviderError::PrivacyBlocked(d).to_string())
+        .collect();
+        let unique: std::collections::BTreeSet<&String> = rendered.iter().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "the causes must not share a line: {rendered:?}"
+        );
+
+        assert!(
+            rendered[0].contains("local-only privacy boundary"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered[1].contains("found sensitive content"),
+            "{rendered:?}"
+        );
+        assert!(rendered[2].contains("could not run"), "{rendered:?}");
+        assert!(
+            !rendered[2].contains("found"),
+            "a scan that never ran cannot have found anything: {rendered:?}"
+        );
     }
 
     #[test]

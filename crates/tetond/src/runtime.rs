@@ -123,7 +123,7 @@ use teton_protocol::{
 };
 
 use teton_providers::{
-    classify, AnthropicAdapter, CapabilityProfile, FailureAction, FailureClass,
+    classify, AnthropicAdapter, BlockDetail, CapabilityProfile, FailureAction, FailureClass,
     OpenAiCompatAdapter, OpenAiCompatConfig, Provider,
 };
 
@@ -1698,13 +1698,16 @@ impl DaemonRuntime {
             // one reroute. The egress choke point already emitted the single
             // authoritative `privacy_block`.
             if let Err(err) = &result {
-                if err.is_privacy_blocked() {
+                // REQ-562 BR-3: the *cause* travels with the signal, so all
+                // three sentences below name which inspection refused the turn.
+                // Read as one value rather than asked twice — a block with no
+                // detail is not a block (see `HarnessError::privacy_block_detail`).
+                if let Some(detail) = err.privacy_block_detail() {
                     self.session_taint.mark(&session_id);
                     if !self.engine.present() {
                         return Err(RpcError::new(
                             error_code::PRIVACY_BLOCKED,
-                            "this turn's content is under a local-only privacy boundary \
-                             and no local tier is available to serve it",
+                            unrerouteable_block_sentence(detail),
                         ));
                     }
                     if rerouted_local {
@@ -1712,14 +1715,10 @@ impl DaemonRuntime {
                         // cannot privacy-block) — never loop.
                         return Err(RpcError::new(
                             error_code::PRIVACY_BLOCKED,
-                            "privacy boundary blocked this turn and the local reroute \
-                             could not serve it",
+                            failed_reroute_block_sentence(detail),
                         ));
                     }
-                    route = router.resolve_local_pin(
-                        "remote egress blocked by a local-only boundary; rerouted to the \
-                         local tier (BR-1)",
-                    );
+                    route = router.resolve_local_pin(reroute_after_block_reason(detail));
                     rerouted_local = true;
                     continue;
                 }
@@ -4335,6 +4334,82 @@ fn taint_pin_reason(what: &str) -> String {
     format!(
         "session previously touched local-only content; {what} is pinned to the local tier \
          (BR-1 backstop)"
+    )
+}
+
+/// What refused this turn at the egress choke point, as a clause the three
+/// turn-surface sentences below are built around (REQ-562 BR-3).
+///
+/// ## Why one clause and three sentences, rather than nine literals
+///
+/// The daemon says three different things after a block — "and there is no
+/// local tier", "and the reroute failed too", "…rerouted" — and each of them
+/// now has to name one of three causes. Nine hand-written sentences is nine
+/// places for the scan-unavailable wording to drift into claiming a finding,
+/// which is exactly the untruth BR-3 forbids. The cause is worded **once**,
+/// here, and the situation is what varies — the same shape, and for the same
+/// reason, as [`taint_pin_reason`] directly above.
+///
+/// ## The rule these clauses exist to keep
+///
+/// A scan that **could not run** and a scan that **found a credential** are
+/// different problems with different fixes: the first is answered by loading a
+/// local tier, the second by taking the secret out of the payload. Told the
+/// wrong one, a user goes hunting for a `local-only` glob that does not exist,
+/// or for a secret that was never there. So the scan-unavailable clause says
+/// the scan could not run and never that it found something.
+///
+/// No clause carries payload content, and cannot: a
+/// [`Finding`](crate::egress::redact::Finding) has no text field, and
+/// [`BlockDetail`] carries no fields at all — the byte span stops at the
+/// `privacy_block` event, which is where a locatable finding belongs.
+fn refusal_clause(detail: BlockDetail) -> &'static str {
+    match detail {
+        // REQ-544's sentence, preserved: this is the one users have seen.
+        BlockDetail::Boundary => "this turn's content is under a local-only privacy boundary",
+        BlockDetail::Redaction => {
+            "the redaction scan found sensitive content in this turn's outbound payload"
+        }
+        BlockDetail::ScanUnavailable => {
+            "the redaction scan could not run, so this turn's outbound payload was blocked \
+             unscanned"
+        }
+    }
+}
+
+/// The turn-failure sentence for a block on a machine with **no local tier** to
+/// reroute to.
+///
+/// The scan-unavailable row is the one this function was written for: with the
+/// redaction switch on and no engine loaded, the scan cannot run, so *every*
+/// remote turn fails closed — and the two halves of this sentence are cause and
+/// remedy in one line, because the missing local tier is simultaneously why the
+/// scan could not run and why there is nowhere to serve the turn instead.
+fn unrerouteable_block_sentence(detail: BlockDetail) -> String {
+    format!(
+        "{}, and no local tier is available to serve it",
+        refusal_clause(detail)
+    )
+}
+
+/// The turn-failure sentence for a block whose local reroute *also* failed.
+fn failed_reroute_block_sentence(detail: BlockDetail) -> String {
+    format!(
+        "{}, and the local reroute could not serve it either",
+        refusal_clause(detail)
+    )
+}
+
+/// The `route_decided` reason a turn carries when the choke point refused it and
+/// the daemon is re-running it locally.
+///
+/// The third surface, and the one a user sees on an ordinary successful reroute
+/// — the turn recovers, so the two sentences above never fire and this line is
+/// the only account of what happened.
+fn reroute_after_block_reason(detail: BlockDetail) -> String {
+    format!(
+        "remote egress refused — {}; rerouted to the local tier (BR-1)",
+        refusal_clause(detail)
     )
 }
 
@@ -9872,6 +9947,22 @@ provider_id = "on-device"
                 config
             }
 
+            /// `config` with every remote endpoint pointed at a closed local
+            /// port.
+            ///
+            /// The two turn-path tests below drive a real turn through a real
+            /// transport, and the point of the first is that the gate refuses
+            /// the payload **before** the transport is ever used. A fixture
+            /// reaching the public internet would make that claim depend on
+            /// what answered, and would put a DNS lookup inside a unit test.
+            /// Port 1 on the loopback refuses instantly and resolves nothing.
+            fn offline_endpoints(mut config: Config) -> Config {
+                for provider in &mut config.providers {
+                    provider.endpoint = Some("http://127.0.0.1:1/v1/chat/completions".to_owned());
+                }
+                config
+            }
+
             /// `config()` plus a remote `reflex` binding — the tier `redact`
             /// declares, and the one a resolver that consulted the table would
             /// inherit.
@@ -10137,6 +10228,201 @@ provider_id = "on-device"
                 assert_eq!(decide(&clean), EgressDecision::Forward);
 
                 assert_eq!(engine.calls(), 2, "both payloads were really scanned");
+            }
+
+            // -- the turn-failure sentence (BR-3) ----------------------------
+
+            /// **BR-3 on the primary user surface.** The three causes produce
+            /// three different sentences in each of the three situations the
+            /// turn path can report a block from, and the scan-unavailable
+            /// wording never reads as a finding.
+            ///
+            /// Exhaustive over cause × situation rather than three examples,
+            /// because the failure this replaced was not a wrong sentence — it
+            /// was **one** sentence used for every cause, which is what a table
+            /// with a missing row silently reproduces. The `unique.len()`
+            /// assertion per situation is what makes a collapsed clause fail.
+            #[test]
+            fn the_three_block_causes_produce_three_distinct_turn_failure_sentences() {
+                use std::collections::BTreeSet;
+
+                let details = [
+                    BlockDetail::Boundary,
+                    BlockDetail::Redaction,
+                    BlockDetail::ScanUnavailable,
+                ];
+                /// One of the three places the turn path reports a block.
+                type Situation = (&'static str, fn(BlockDetail) -> String);
+
+                let situations: [Situation; 3] = [
+                    ("no local tier", unrerouteable_block_sentence),
+                    ("reroute failed", failed_reroute_block_sentence),
+                    ("rerouted", reroute_after_block_reason),
+                ];
+
+                for (situation, compose) in situations {
+                    let rendered: Vec<String> = details.into_iter().map(compose).collect();
+                    let unique: BTreeSet<&String> = rendered.iter().collect();
+                    assert_eq!(
+                        unique.len(),
+                        3,
+                        "{situation}: the three causes must not share a sentence: {rendered:?}"
+                    );
+
+                    // REQ-544's sentence, unchanged: it is what is already in
+                    // every log and what a user has seen before.
+                    assert!(
+                        rendered[0].contains("local-only privacy boundary"),
+                        "{situation}: {}",
+                        rendered[0]
+                    );
+                    // A finding says something was found...
+                    assert!(
+                        rendered[1].contains("found sensitive content"),
+                        "{situation}: {}",
+                        rendered[1]
+                    );
+                    // ...and the scan that could not run says exactly that, and
+                    // never the other thing. This is the assertion BR-3 is
+                    // about: told the wrong one, a user hunts for a secret that
+                    // is not there instead of for the tier that is not loaded.
+                    assert!(
+                        rendered[2].contains("could not run"),
+                        "{situation}: {}",
+                        rendered[2]
+                    );
+                    assert!(
+                        !rendered[2].contains("found"),
+                        "{situation}: a scan that never ran cannot have found \
+                         anything: {}",
+                        rendered[2]
+                    );
+                    assert!(
+                        !rendered[2].contains("local-only privacy boundary"),
+                        "{situation}: a scan-unavailable block is not a boundary \
+                         block: {}",
+                        rendered[2]
+                    );
+                }
+            }
+
+            /// **The bug this replaced, through the real turn path.**
+            ///
+            /// `[privacy] redact = true` on a machine with no local tier is not
+            /// an exotic configuration — it is remote-only operation with the
+            /// switch on — and in it *every* remote turn fails closed, because
+            /// the scan has no engine to run on. That turn used to be reported
+            /// as "this turn's content is under a local-only privacy boundary",
+            /// which is false and sends the user looking for a glob that does
+            /// not exist.
+            ///
+            /// This drives `run_prompt_turn` itself rather than the sentence
+            /// helper: what is being pinned is that the cause survives the whole
+            /// journey — choke point, `BlockCause`, the transport seam's
+            /// `BlockDetail`, `ProviderError`, `HarnessError` — and reaches the
+            /// RPC error a client renders. Any hop that collapses it turns this
+            /// red at the end.
+            ///
+            /// No network is touched: the gate refuses the payload before
+            /// `inner.execute`, which is the same reason the boundary check
+            /// needs none.
+            #[tokio::test]
+            async fn a_scan_that_could_not_run_fails_the_turn_saying_so_not_blaming_a_boundary() {
+                const SENTINEL: &str = "sk-ZZQUUXSENTINELCREDENTIAL0123";
+
+                // Remote-only: a bound `build` tier, the switch on, no engine.
+                let runtime = Arc::new(runtime_without_an_engine(offline_endpoints(opted_in(
+                    config(),
+                ))));
+                runtime.local_available.store(false, Ordering::SeqCst);
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let err = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        format!("please summarize {SENTINEL} for me"),
+                    )
+                    .await
+                    .expect_err("a scan that cannot run must fail the turn closed");
+
+                assert_eq!(err.code, error_code::PRIVACY_BLOCKED);
+                assert!(
+                    err.message.contains("the redaction scan could not run"),
+                    "the user must be told the scan could not run: {}",
+                    err.message
+                );
+                // The discriminating half: this is the sentence that used to be
+                // emitted here, and emitting it again turns this red.
+                assert!(
+                    !err.message.contains("local-only privacy boundary"),
+                    "a scan-unavailable block must not be reported as a boundary \
+                     block: {}",
+                    err.message
+                );
+                assert!(
+                    !err.message.contains("found"),
+                    "nothing looked, so nothing was found: {}",
+                    err.message
+                );
+                // BR-6: the sentence names a cause, never the payload.
+                assert!(
+                    !err.message.contains("QUUXSENTINEL") && !err.message.contains(SENTINEL),
+                    "no payload content may reach a turn-failure sentence: {}",
+                    err.message
+                );
+            }
+
+            /// The non-vacuity twin: the **same** turn with the switch off
+            /// reaches the provider instead of failing closed.
+            ///
+            /// Without it, the test above would pass just as well against a
+            /// daemon that refused every remote turn for some unrelated reason
+            /// and happened to word it this way. The turn here fails — there is
+            /// no server at the fixture's endpoint — but it fails as a
+            /// *provider* problem, with no privacy sentence anywhere in it.
+            #[tokio::test]
+            async fn the_same_turn_with_the_switch_off_is_not_blocked_at_all() {
+                let runtime = Arc::new(runtime_without_an_engine(offline_endpoints(config())));
+                runtime.local_available.store(false, Ordering::SeqCst);
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let err = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        "please summarize src/main.rs for me".to_owned(),
+                    )
+                    .await
+                    .expect_err("the fixture endpoint answers nothing");
+
+                assert_ne!(
+                    err.code,
+                    error_code::PRIVACY_BLOCKED,
+                    "with the switch off nothing inspects the payload: {}",
+                    err.message
+                );
+                assert!(
+                    !err.message.contains("redaction scan"),
+                    "an un-opted-in machine must not mention a scan: {}",
+                    err.message
+                );
             }
         }
     }

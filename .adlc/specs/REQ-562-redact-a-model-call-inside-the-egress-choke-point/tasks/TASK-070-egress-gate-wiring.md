@@ -131,27 +131,76 @@ Consequence for reviewers: `redact_route` lives on the gate, not on
 inline with them. It still names `Category::Redact` literally at a
 `router.resolve` call, which is what `call_sites.rs`'s scanner reads.
 
-### Known gap: the turn-loop `RpcError` sentences cannot see the cause
+### The turn-failure sentence names its cause (BR-3 on the primary surface)
 
-**Reported rather than worked around.** `run_prompt_turn`'s two privacy
-sentences (runtime.rs, the `err.is_privacy_blocked()` arm) still say *"this
-turn's content is under a local-only privacy boundary…"* for **every** cause.
-The cause cannot reach them: it is erased at
-`EgressError::into_transport_error()` → `TransportError::PrivacyBlocked`, a unit
-variant in `teton-providers` — a crate that deliberately does **not** depend on
-`teton-protocol`, where `BlockCause` lives. Carrying it across needs either a
-new dependency edge or a protocol-free cause enum in `teton-providers`, both
-cross-crate changes outside this task's declared files.
+This shipped as a **follow-up commit** to TASK-070; the first pass reported it
+as a gap, which was the wrong call — BR-3's promise ("the user is told the scan
+could not run, not that it found something") is made on the surface a person
+actually reads, so a cause-blind sentence there is a violation, not a debt.
 
-The user-visible case where this bites: `[privacy] redact = true` on a machine
-with **no local tier**. Every remote turn then fails closed with
-`ScanUnavailable`, and the turn-failure sentence blames a boundary. The
-`privacy_block` **event** is correct and the CLI renders it correctly ("the
-redaction scan could not run on the outbound payload… blocked unscanned"), so
-the user does get the true explanation — on the event stream, not in the error.
+**The problem.** `run_prompt_turn`'s privacy arm said *"this turn's content is
+under a local-only privacy boundary…"* for every cause, because the cause was
+erased at `EgressError::into_transport_error()` → `TransportError::PrivacyBlocked`,
+a unit variant in `teton-providers` — a crate that deliberately declares no
+`teton-protocol` dependency, which is what keeps the single choke point
+enforceable. The configuration where this bit is not exotic: `[privacy] redact =
+true` with **no local tier** is remote-only operation with the switch on, and in
+it every remote turn fails closed with `ScanUnavailable` and was told to go look
+for a `local-only` glob that does not exist.
 
-TASK-071 or a follow-up should decide whether to thread the cause across the
-`Transport` seam. Nothing in this task depends on it.
+**What shipped.** A providers-local `BlockDetail { Boundary, Redaction,
+ScanUnavailable }` in `teton_providers::transport`, carried by
+`TransportError::PrivacyBlocked(BlockDetail)` and
+`ProviderError::PrivacyBlocked(BlockDetail)`. The crate boundary holds: no
+protocol type crosses it, and the projection is deliberately **lossy** — the
+finding's kind and byte span stay behind at the `privacy_block` event, which is
+where a locatable finding belongs. `BlockDetail` derives no `Default`, so the
+one construction site (`into_transport_error`) must name a real cause.
+
+The chain is: `BlockCause` → `BlockDetail` → `ProviderError::privacy_block_detail()`
+→ `HarnessError::privacy_block_detail()` → the daemon's sentence.
+`is_privacy_blocked()` is now *defined in terms of* the detail accessor on both
+error types, so "is it a block" and "which block is it" cannot come to disagree.
+
+**Sentence ownership survived.** The value travels; the wording does not. Three
+surfaces word it independently, as they already did: `BlockDetail`'s `Display`
+is the transport seam's log clause, `egress::privacy_blocked_sentence` is
+`EgressError`'s, `session_ui::format_privacy` is the CLI's, and
+`runtime::refusal_clause` is the daemon's. The daemon composes one clause into
+three situations — no local tier, reroute also failed, and the `route_decided`
+reason on a successful reroute (that third one was cause-blind too, and is the
+only account a user gets on a turn that recovers).
+
+**Tests, each with its mutation applied and observed (LESSON-441):**
+
+| Mutation | Turns red |
+|---|---|
+| the pre-fix hardcoded boundary sentence is restored at the no-local-tier arm | `runtime::tests::dispatch::redact::a_scan_that_could_not_run_fails_the_turn_saying_so_not_blaming_a_boundary` |
+| `into_transport_error` collapses `ScanUnavailable` onto `BlockDetail::Boundary` | `egress::tests::every_block_cause_projects_onto_its_own_transport_detail`, and the turn test above |
+| the transport→provider hop drops the detail and substitutes `Boundary` | `teton_providers::tests::every_block_detail_survives_the_hop_and_stays_non_retryable` |
+| the scan-unavailable clause starts claiming a finding | `runtime::tests::dispatch::redact::the_three_block_causes_produce_three_distinct_turn_failure_sentences`, and the turn test above |
+
+The turn test drives **`run_prompt_turn` itself**, not the sentence helper, so
+what it pins is that the cause survives the whole journey. Its discriminating
+assertion is the exact one the AC asks for: the message must contain "the
+redaction scan could not run" and must **not** contain "local-only privacy
+boundary" — the sentence the old code emitted there. It also asserts no payload
+content reaches the message (a planted `sk-…` sentinel is absent). Its
+non-vacuity twin, `the_same_turn_with_the_switch_off_is_not_blocked_at_all`,
+runs the identical turn with the switch off and confirms it is not privacy
+blocked at all — so "blocked with this sentence" is a fact about the gate rather
+than about a runtime that refuses everything.
+
+Both turn tests point their fixture endpoints at a closed loopback port: the
+first must reach no network *at all* (the gate refuses before `inner.execute`),
+and a fixture reaching the public internet would put a DNS lookup in a unit test.
+
+**Not reachable end to end, and why that is fine.** Two of the nine
+(cause × situation) rows cannot be produced through `run_prompt_turn`: a
+`Redaction` block needs a local engine for the scan to run, and the no-local-tier
+arm needs the opposite; and the reroute-also-failed arm is a belt rather than a
+path (the local tier has no egress, so it cannot privacy-block twice). Those rows
+are covered exhaustively at the composition layer, which is where they exist.
 
 ### Two census tests were updated (not weakened)
 

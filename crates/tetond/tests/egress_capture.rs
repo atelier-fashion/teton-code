@@ -281,7 +281,11 @@ async fn adapter_seam_is_enforced() {
     let err = Transport::execute(&scoped, request)
         .await
         .expect_err("scoped transport must refuse");
-    assert_eq!(err, TransportError::PrivacyBlocked);
+    assert_eq!(
+        err,
+        TransportError::PrivacyBlocked(teton_providers::BlockDetail::Boundary),
+        "REQ-562 BR-3: and it names the inspection that refused it"
+    );
     assert!(capture.captured().is_empty(), "nothing may reach the wire");
     assert_eq!(sink.events().len(), 1, "the block still emitted its event");
 }

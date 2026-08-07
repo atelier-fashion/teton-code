@@ -854,7 +854,7 @@ pub(crate) mod testing {
                 })
                 .await
                 .map_err(|err| match err {
-                    TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
+                    TransportError::PrivacyBlocked(detail) => ProviderError::PrivacyBlocked(detail),
                     _ => ProviderError::Transport,
                 })?;
             // `repeat` models a provider that ignores `max_tokens`: the same

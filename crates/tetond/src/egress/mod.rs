@@ -92,7 +92,8 @@ use teton_protocol::events::{
 };
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
-    ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
+    BlockDetail, ByteStream, HttpMethod, Transport, TransportError, TransportRequest,
+    TransportResponse,
 };
 
 use crate::broadcast::EventBus;
@@ -151,13 +152,35 @@ impl EgressError {
     /// **non-retryable** [`TransportError::PrivacyBlocked`] — never a
     /// connect refusal — so it cannot be misclassified as a transient transport
     /// fault and retried against the blocked provider (REQ-544 M-1). The
-    /// authoritative typed signal (this error) and the `privacy_block` event
-    /// carry the real reason; the daemon reroutes the turn to the local tier.
+    /// `privacy_block` event carries the full reason; the daemon reroutes the
+    /// turn to the local tier.
+    ///
+    /// ## What survives the collapse, and what does not (REQ-562 BR-3)
+    ///
+    /// The [`BlockCause`] does not fit through this seam — `teton-providers`
+    /// declares no protocol dependency, by design — so it is projected onto
+    /// [`BlockDetail`], which names *which inspection* refused the payload and
+    /// nothing else. That projection is lossy on purpose: the finding's kind and
+    /// byte span stay behind, because the `privacy_block` event already carries
+    /// them straight from the choke point and a byte range has no business
+    /// travelling through an adapter.
+    ///
+    /// What must **not** be lost is which of the three it was. The daemon's
+    /// turn-failure sentence is composed from this value, and a redaction block
+    /// reported as a boundary sends the user looking for a `local-only` glob
+    /// that does not exist — or, worse, tells someone whose scan could not run
+    /// that something was found.
     #[must_use]
     pub fn into_transport_error(self) -> TransportError {
         match self {
             EgressError::Transport(t) => t,
-            EgressError::PrivacyBlocked { .. } => TransportError::PrivacyBlocked,
+            EgressError::PrivacyBlocked { cause, .. } => {
+                TransportError::PrivacyBlocked(match cause {
+                    BlockCause::Boundary => BlockDetail::Boundary,
+                    BlockCause::Redaction { .. } => BlockDetail::Redaction,
+                    BlockCause::ScanUnavailable => BlockDetail::ScanUnavailable,
+                })
+            }
             EgressError::ClientInit => TransportError::Connect,
             EgressError::BoundaryCompile => TransportError::Io,
         }
@@ -885,7 +908,12 @@ mod tests {
             .expect_err("scoped transport must refuse");
         // REQ-544 M-1: a block surfaces as the dedicated, non-retryable variant,
         // never a connect refusal.
-        assert_eq!(err, TransportError::PrivacyBlocked);
+        assert_eq!(
+            err,
+            TransportError::PrivacyBlocked(BlockDetail::Boundary),
+            "and the cause travels with it, so the daemon can say which \
+             inspection refused the turn"
+        );
         // The event still fired even though the adapter only saw a transport error.
         assert_eq!(sink.events.lock().unwrap().len(), 1);
     }
@@ -1313,12 +1341,69 @@ mod tests {
             action: PrivacyAction::ReroutedToLocal,
             cause: BlockCause::Boundary,
         };
-        assert_eq!(err.into_transport_error(), TransportError::PrivacyBlocked);
+        assert_eq!(
+            err.into_transport_error(),
+            TransportError::PrivacyBlocked(BlockDetail::Boundary)
+        );
         // ClientInit is unrelated and still a connect refusal.
         assert_eq!(
             EgressError::ClientInit.into_transport_error(),
             TransportError::Connect
         );
+    }
+
+    /// **REQ-562 BR-3.** Each cause projects onto its own [`BlockDetail`] as the
+    /// error collapses to the transport seam, so the daemon's turn-failure
+    /// sentence can name which inspection refused the turn.
+    ///
+    /// Table-driven and exhaustive over the three, because the failure mode is a
+    /// `match` arm quietly collapsing two causes into one value — which reads as
+    /// working code and produces a sentence that sends the user after the wrong
+    /// problem. The `assert_ne` pass is what catches a collapse that a
+    /// per-row `assert_eq` on a single row would not.
+    #[test]
+    fn every_block_cause_projects_onto_its_own_transport_detail() {
+        fn collapse(cause: BlockCause) -> TransportError {
+            EgressError::PrivacyBlocked {
+                path: "the outbound payload".to_owned(),
+                provider_id: ProviderId::from("p"),
+                action: PrivacyAction::ReroutedToLocal,
+                cause,
+            }
+            .into_transport_error()
+        }
+
+        let rows = [
+            (BlockCause::Boundary, BlockDetail::Boundary),
+            (
+                BlockCause::Redaction {
+                    kind: WireFindingKind::Credential,
+                    span: ByteSpan {
+                        start: 1400,
+                        end: 1436,
+                    },
+                },
+                BlockDetail::Redaction,
+            ),
+            (BlockCause::ScanUnavailable, BlockDetail::ScanUnavailable),
+        ];
+        for (cause, expected) in rows {
+            assert_eq!(
+                collapse(cause),
+                TransportError::PrivacyBlocked(expected),
+                "{cause:?} must reach the seam as {expected:?}"
+            );
+        }
+        // No two causes may arrive as the same detail.
+        for (i, (cause, _)) in rows.iter().enumerate() {
+            for (other, _) in rows.iter().skip(i + 1) {
+                assert_ne!(
+                    collapse(*cause),
+                    collapse(*other),
+                    "{cause:?} and {other:?} must not collapse into one signal"
+                );
+            }
+        }
     }
 
     const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";

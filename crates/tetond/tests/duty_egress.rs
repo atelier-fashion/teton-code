@@ -126,7 +126,7 @@ impl Provider for WireProvider {
             })
             .await
             .map_err(|err| match err {
-                TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
+                TransportError::PrivacyBlocked(detail) => ProviderError::PrivacyBlocked(detail),
                 _ => ProviderError::Transport,
             })?;
         Ok(Box::pin(stream::iter(vec![
