@@ -1,0 +1,28 @@
+{
+  "req": "REQ-561",
+  "branch": "feat/REQ-561-wire-unreached-categories",
+  "startedAt": "2026-08-07T00:00:00Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "integrationBranch": "main",
+  "phaseHistory": [],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-561",
+      "branch": "feat/REQ-561-wire-unreached-categories",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
