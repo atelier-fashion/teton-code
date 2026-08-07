@@ -56,6 +56,18 @@
   subsystem re-derives an identifier from another subsystem's table, and an
   absent identifier stays `None` rather than becoming a plausible literal
   (REQ-557 ADR-A/ADR-D).
+- **Dispatch on purpose, not on lifecycle position** — what a call is *for*
+  (classify, summarize, edit, critique) decides which model serves it. Lifecycle
+  phase remains an attribution and gating fact, never a routing input. A call site
+  that knows its own purpose states it; only genuine ambiguity is classified, and
+  only into a type that cannot name a purpose the call site already knew
+  (REQ-558 ADR-C/ADR-D).
+- **A privacy pin asserts a property, never a name** — a category or route pinned
+  to the local tier is pinned by a type with no configurable counterpart, and
+  resolves through a derivation that yields an id only when it is genuinely
+  engine-backed. Asserting an id (`provider_id == "local"`) is not asserting
+  locality: a provider registered under that id can be a remote endpoint
+  (REQ-558, BUG-156, LESSON-485).
 - **Adapter degradation** — providers with weak tool-calling get a reduced
   harness profile (smaller tool set, shorter loops, mandatory verification)
   rather than the full loop (BR-6).
