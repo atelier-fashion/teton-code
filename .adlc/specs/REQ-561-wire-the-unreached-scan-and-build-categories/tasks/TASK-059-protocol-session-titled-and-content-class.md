@@ -1,7 +1,7 @@
 ---
 id: TASK-059
 title: "Protocol: the session_titled event and the per-category content class"
-status: draft
+status: complete
 parent: REQ-561
 created: 2026-08-07
 updated: 2026-08-07
@@ -24,11 +24,30 @@ against the current tree.
 
 ## Acceptance Criteria
 
-- [ ] `Event::SessionTitled` exists, serialises with `"event": "session_titled"`, and round-trips through the wire encoding.
-- [ ] `teton-protocol` still has **no** dependency on `teton-core` — assert by inspecting `crates/teton-protocol/Cargo.toml`. The payload is `SessionId` + `String`, both plain, so this holds.
-- [ ] The content class is expressible for **all eleven** categories, including the ones with no call site. A category that transmits nothing today says so explicitly rather than being absent (AC-16).
-- [ ] The module-level event table at the head of `events.rs` lists `session_titled` — that comment is a documented index, and omitting the new event makes it wrong.
-- [ ] `cargo test --workspace --no-fail-fast` is green.
+- [x] `Event::SessionTitled` exists, serialises with `"event": "session_titled"`, and round-trips through the wire encoding.
+- [x] `teton-protocol` still has **no** dependency on `teton-core` — assert by inspecting `crates/teton-protocol/Cargo.toml`. The payload is `SessionId` + `String`, both plain, so this holds. Asserted by `the_protocol_crate_depends_on_no_other_teton_crate` (`lib.rs`), which reads the manifest's dependency tables; the manifest is unchanged.
+- [x] The content class is expressible for **all eleven** categories, including the ones with no call site. A category that transmits nothing today says so explicitly rather than being absent (AC-16).
+- [x] The module-level event table at the head of `events.rs` lists `session_titled` — that comment is a documented index, and omitting the new event makes it wrong.
+- [x] `cargo test --workspace --no-fail-fast` is green.
+
+## Deviations
+
+- **`SessionTitled` carries `title` only; the session is named by
+  `EventEnvelope.session_id`.** ADR-6's literal `SessionTitled { session_id,
+  title }` is unrepresentable: `Event` is internally tagged and flattened, so a
+  payload `session_id` collides with the envelope's, emits the key twice, and
+  fails to deserialize (`Error("duplicate field \`session_id\`", line: 1, column:
+  64)`, observed). The **wire object is exactly ADR-6's shape** —
+  `{"session_id":…,"seq":…,"event":"session_titled","title":…}` — assembled by
+  the envelope, as it is for `route_decided` and every other session-scoped
+  event. Consequence for TASK-062: the emitter must scope the envelope with
+  `Some(session_id)`, since the payload no longer self-identifies.
+- **Three construction sites outside `teton-protocol` were updated because the
+  compiler requires it**, not because this task wires anything: the new `Event`
+  variant makes `teton/src/session_ui.rs`'s match non-exhaustive, and the new
+  `CategoryRouteView` field makes two struct literals incomplete
+  (`teton/src/main.rs` test helper, `tetond/src/runtime.rs::category_route_view`).
+  No resolver, call site, or `has_call_site` arm was touched.
 
 ## Technical Notes
 

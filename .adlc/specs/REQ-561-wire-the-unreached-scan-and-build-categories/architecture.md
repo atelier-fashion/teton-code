@@ -154,8 +154,33 @@ state — `SessionSummary.title: Option<String>` already exists at
 says otherwise. The field is already on the wire type and is simply never
 populated. So this REQ populates an existing field and adds the event that
 announces it, which is strictly less change than the spec assumed. The payload
-is two plain types (`SessionId`, `String`), so `teton-protocol` gains no
-`teton-core` dependency — the layering rule holds.
+carries plain types only, so `teton-protocol` gains no `teton-core` dependency —
+the layering rule holds, and is now pinned by
+`the_protocol_crate_depends_on_no_other_teton_crate`.
+
+**Amendment (found during TASK-059).** This ADR originally specified the payload
+as `SessionTitled { session_id, title }`. That shape is **unrepresentable**:
+`Event` is internally tagged (`#[serde(tag = "event")]`) and flattened into
+`EventEnvelope`, which already carries `session_id`. A payload field of the same
+name emits the key twice and fails to deserialize —
+`Error("duplicate field 'session_id'", line: 1, column: 64)`, observed, not
+reasoned about.
+
+The shipped payload is `SessionTitled { title }`, with the session named by
+`EventEnvelope.session_id` exactly as `route_decided`, `privacy_block`, and
+`phase_transition` already do. **The wire object is unchanged from what this ADR
+specified** — `{"session_id":…,"seq":…,"event":"session_titled","title":…}` —
+because the envelope assembles it. So the deviation is representational, not
+contractual, and `session_titled_round_trips_under_its_wire_name` asserts the
+full envelope shape including `session_id` to keep it that way.
+
+`CostRecord` carries its own `session_id` only because `cost_recorded` *nests*
+its payload under a `record` key rather than flattening; it is not a
+counter-example.
+
+**Consequence for TASK-062**: the emitter must scope the envelope with
+`Some(session_id)`, because the payload no longer self-identifies. A `None` there
+produces an event nobody can attribute.
 
 `title` is `reflex`-tier and therefore local (REQ-558: `reflex` never inherits
 `default_provider`), so its duty has no remote impl at all. It still routes

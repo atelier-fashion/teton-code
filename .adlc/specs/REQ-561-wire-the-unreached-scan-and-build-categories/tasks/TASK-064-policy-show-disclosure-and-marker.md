@@ -30,6 +30,7 @@ a state that does not exist yet.
 - [ ] The marker still renders for the categories that genuinely have no call site — `redact` (REQ-562). AC-1 is not "delete the marker"; it is "the marker becomes accurate". A test asserts the marker is still present for `redact`, which is what keeps this from being a deletion.
 - [ ] `the_unreached_marker_matches_the_daemons_actual_call_sites` (`call_sites.rs:209`) passes with the derived set and the marked set agreeing on all eleven.
 - [ ] **AC-16**: the rendered output names, for each of the eleven categories, the content class it transmits — and a test pins that `triage` and `compact` disclose **distinct** classes despite sharing the `scan` tier. That distinctness is the whole point of OQ-4's resolution.
+- [ ] **`content_class` and `reached` render as a legible pair.** TASK-059 deliberately shipped no `Nothing` variant: `content_class` says *what a category would transmit* (intent), and `reached` says *whether it transmits anything today*. That division is right — `redact` will carry the outbound payload once REQ-562 wires it, so classing it `Nothing` would be a lie with a short shelf life. But it only discharges AC-16's "a category that transmits nothing today says so" **if the rendering presents both facts together**. A row showing a content class with no visible `reached` marker reads as a live egress path. Render them adjacently and assert it.
 - [ ] `cargo test --workspace --no-fail-fast` is green.
 
 ## Technical Notes

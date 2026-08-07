@@ -546,14 +546,142 @@ pub struct TierRouteView {
     pub source: TierBindingSource,
 }
 
+/// What kind of content a category sends to its model (REQ-561 BR-11, AC-16).
+///
+/// A fixed descriptor per category, not a runtime choice: what a category is
+/// *for* determines what its call must carry, so the answer is the same on every
+/// machine and under every binding. [`ContentClass::for_category`] is the whole
+/// definition, and it is total over all eleven categories — a category with no
+/// call site is described, not omitted, because the question a reader is asking
+/// ("what would leave this machine if I bound that tier remotely?") has an
+/// answer before the call site exists.
+///
+/// The point (REQ-561 OQ-4) is that the `scan` tier carries both
+/// [`Category::Triage`] and [`Category::Compact`], and those disclose
+/// **different** classes: a user who binds `scan` to a remote provider for cheap
+/// long-context summarisation also moves conversation history off the machine.
+/// Re-splitting the binding is REQ-558's decision and out of scope, so
+/// legibility is the mitigation.
+///
+/// **Disclosure, not enforcement.** Nothing here refuses anything. BR-7's
+/// per-content egress scoping is what keeps boundary content local, and a
+/// `local-only` source is refused whatever this says. A reader who takes a class
+/// named here as a control has read it wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentClass {
+    /// The user's own prompt text.
+    UserPrompt,
+    /// Contents of files in the workspace, including the text around a search
+    /// hit.
+    FileContent,
+    /// Blocks of the session's own conversation history.
+    ConversationHistory,
+    /// Output a tool produced and the harness took into context.
+    ToolOutput,
+    /// The stdout and stderr of a shell command the harness ran.
+    CommandOutput,
+    /// The assembled turn — the prompt, the conversation, and whatever file and
+    /// tool content was gathered into it.
+    TurnContext,
+    /// A payload already assembled for an outbound call, inspected before it
+    /// leaves.
+    OutboundPayload,
+}
+
+impl ContentClass {
+    /// The class of content `category` sends to its model.
+    ///
+    /// Exhaustive on purpose, in the same spirit as `has_call_site`: a twelfth
+    /// category cannot be added without stating what it transmits.
+    ///
+    /// For a category with no call site the class describes what it *would*
+    /// carry once built — [`Category::Redact`]'s is REQ-562's — which is a
+    /// description of intent, not evidence of a call site. What a category
+    /// transmits *today* is [`CategoryRouteView::reached`]'s answer, and the two
+    /// are read together.
+    #[must_use]
+    pub const fn for_category(category: Category) -> Self {
+        match category {
+            // `route` classifies the prompt just typed; `title` names the
+            // session from its first one. Both carry prompt text and nothing
+            // else, which is why they share a class despite sharing no purpose.
+            Category::Route | Category::Title => ContentClass::UserPrompt,
+            // Screens an outbound payload for secrets before it leaves. No model
+            // call today (REQ-562 builds it); the class states what that call
+            // will see.
+            Category::Redact => ContentClass::OutboundPayload,
+            // Summarises a tool result on its way into context.
+            Category::Digest => ContentClass::ToolOutput,
+            // Decides which conversation blocks to forget, so it reads them.
+            Category::Compact => ContentClass::ConversationHistory,
+            // Ranks grep and glob hits, which are file text.
+            Category::Triage => ContentClass::FileContent,
+            // Interprets what a command printed.
+            Category::Shell => ContentClass::CommandOutput,
+            // Turn completion: all four arrive at the same call and carry the
+            // same thing — everything the turn has assembled.
+            Category::Edit | Category::Design | Category::Debug | Category::Review => {
+                ContentClass::TurnContext
+            }
+        }
+    }
+
+    /// The lowercase wire name — identical to the serde form, as with
+    /// [`Category::as_str`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ContentClass::UserPrompt => "user_prompt",
+            ContentClass::FileContent => "file_content",
+            ContentClass::ConversationHistory => "conversation_history",
+            ContentClass::ToolOutput => "tool_output",
+            ContentClass::CommandOutput => "command_output",
+            ContentClass::TurnContext => "turn_context",
+            ContentClass::OutboundPayload => "outbound_payload",
+        }
+    }
+
+    /// The phrase a human reads in `teton policy show` (AC-16).
+    ///
+    /// Separate from [`Self::as_str`] because the two answer different
+    /// questions: `as_str` is the wire spelling a client parses, this is the
+    /// sentence fragment it prints. It lives here so the daemon and every client
+    /// disclose one wording rather than each inventing its own.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            ContentClass::UserPrompt => "your prompt",
+            ContentClass::FileContent => "file content",
+            ContentClass::ConversationHistory => "conversation history",
+            ContentClass::ToolOutput => "tool output",
+            ContentClass::CommandOutput => "command output",
+            ContentClass::TurnContext => "the whole turn",
+            ContentClass::OutboundPayload => "outbound payloads",
+        }
+    }
+}
+
+impl std::fmt::Display for ContentClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One category row of `teton policy show` — the effective routing state of a
 /// single category, **as the daemon's own resolver answers it**.
 ///
-/// Every field here is read off `teton_core::category::CategoryResolution`, the
-/// same value `route_decided` is built from (BR-6, AC-11). Nothing in this
-/// struct is recomputed by the surface that renders it, which is the point: the
-/// table a human reads and the event a turn emits describe one routing state, so
-/// they must not be able to disagree.
+/// Every routing field here is read off
+/// `teton_core::category::CategoryResolution`, the same value `route_decided` is
+/// built from (BR-6, AC-11). Nothing in this struct is recomputed by the surface
+/// that renders it, which is the point: the table a human reads and the event a
+/// turn emits describe one routing state, so they must not be able to disagree.
+///
+/// Two fields are not routing state and say so where they are declared:
+/// [`Self::reached`] is a fact about the daemon's call sites, and
+/// [`Self::content_class`] is a fact about what the category is for. Both are
+/// still answered by the daemon rather than by the renderer, for the same reason
+/// the routing fields are.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CategoryRouteView {
     /// The category.
@@ -579,6 +707,22 @@ pub struct CategoryRouteView {
     /// are. The daemon derives this from its own call sites; it is not a
     /// configured value.
     pub reached: bool,
+    /// What kind of content this category sends to its model (BR-11, AC-16).
+    ///
+    /// Populated for all eleven categories from [`ContentClass::for_category`],
+    /// including the ones with no call site: a blank cell would read as "this
+    /// one is safe", which is the opposite of what an unbuilt call site means.
+    ///
+    /// Read it with [`Self::reached`]. The class says what kind of content the
+    /// call carries; `reached` says whether any call is made today. A category
+    /// that transmits nothing today is the pair `reached: false` plus its
+    /// declared class — it says so, rather than going absent from the table.
+    ///
+    /// It is on the wire rather than derived by each renderer for the reason the
+    /// struct's own doc gives: the daemon answers, the surface prints. The
+    /// TypeScript mirror (ADR-002) gets the same answer without re-deriving a
+    /// table that could drift from this one.
+    pub content_class: ContentClass,
     /// The resolver's sentence naming the signal that fired, verbatim.
     pub reason: String,
 }
@@ -1154,6 +1298,7 @@ mod tests {
                     fallback_id: Some(ProviderId::from("local")),
                     source: BindingSource::TierInheritance,
                     reached: true,
+                    content_class: ContentClass::TurnContext,
                     reason: "Routing the 'design' category to 'anthropic' through its 'think' \
                              tier binding."
                         .to_owned(),
@@ -1165,6 +1310,111 @@ mod tests {
                 }],
             },
         });
+    }
+
+    /// The eleven categories, spelled out rather than iterated, so a twelfth
+    /// has to be added here by hand — the same reason the `Category` tests in
+    /// `lib.rs` spell them.
+    const ALL_CATEGORIES: [Category; 11] = [
+        Category::Route,
+        Category::Redact,
+        Category::Title,
+        Category::Digest,
+        Category::Compact,
+        Category::Triage,
+        Category::Edit,
+        Category::Shell,
+        Category::Design,
+        Category::Debug,
+        Category::Review,
+    ];
+
+    /// AC-16: the disclosure covers **all eleven** categories, and every class it
+    /// can name is one some category actually uses.
+    ///
+    /// The second half is what keeps the first from being vacuous: a mapping
+    /// that answered one constant for everything would satisfy "every category
+    /// has a class" and disclose nothing. Asserting that all seven classes are
+    /// reachable also means no variant of [`ContentClass`] is decoration.
+    #[test]
+    fn every_category_declares_a_content_class() {
+        assert_eq!(ALL_CATEGORIES.len(), 11);
+
+        let mut seen = std::collections::HashSet::new();
+        for category in ALL_CATEGORIES {
+            let class = ContentClass::for_category(category);
+            // The wire spelling and the display form are one string, as with
+            // `Category` — a variant whose `as_str` drifts from its serde
+            // rename fails here.
+            let json = serde_json::to_string(&class).unwrap();
+            assert_eq!(json, format!("\"{}\"", class.as_str()), "{category}");
+            assert_eq!(class.to_string(), class.as_str());
+            assert_eq!(
+                serde_json::from_str::<ContentClass>(&json).unwrap(),
+                class,
+                "{category} must round-trip"
+            );
+            assert!(
+                !class.describe().is_empty(),
+                "{category} must have something to say to a human"
+            );
+            seen.insert(class);
+        }
+        assert_eq!(
+            seen.len(),
+            7,
+            "every ContentClass variant should be some category's answer: {seen:?}"
+        );
+    }
+
+    /// OQ-4, the whole reason BR-11 exists: one tier, two categories, two
+    /// different kinds of content.
+    ///
+    /// A user binds `scan` to a remote provider for cheap long-context
+    /// summarisation. `triage` sending file content is what they expected;
+    /// `compact` sending the conversation is what surprises them. The two rows
+    /// disclosing different classes is the entire mitigation, so it is pinned
+    /// rather than left to the mapping's good intentions.
+    #[test]
+    fn triage_and_compact_disclose_different_content_despite_sharing_a_tier() {
+        let triage = ContentClass::for_category(Category::Triage);
+        let compact = ContentClass::for_category(Category::Compact);
+        assert_ne!(
+            triage, compact,
+            "the scan tier's two categories must not read as one disclosure"
+        );
+        assert_eq!(triage, ContentClass::FileContent);
+        assert_eq!(compact, ContentClass::ConversationHistory);
+    }
+
+    /// AC-16's other half: a category with no call site is described, not
+    /// omitted — and the pair of fields says both things at once.
+    ///
+    /// `redact` is REQ-562's to build. Declaring what its call *would* see is a
+    /// description of intent; `reached: false` is what says nothing is sent
+    /// today. Neither field alone is the disclosure, which is why the row is
+    /// asserted rather than the mapping.
+    #[test]
+    fn an_unreached_category_still_says_what_it_would_send() {
+        let row = CategoryRouteView {
+            category: Category::Redact,
+            tier: Tier::Reflex,
+            provider_id: Some(ProviderId::from("on-device")),
+            fallback_id: None,
+            source: BindingSource::PinnedLocal,
+            reached: false,
+            content_class: ContentClass::for_category(Category::Redact),
+            reason: "The 'redact' category is pinned to the local tier.".to_owned(),
+        };
+        assert_eq!(row.content_class, ContentClass::OutboundPayload);
+        assert!(!row.reached, "redact has no call site until REQ-562");
+        round_trip(&row);
+
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(
+            json.contains("\"content_class\":\"outbound_payload\""),
+            "the class must reach a client, not stay a daemon-side fact: {json}"
+        );
     }
 
     #[test]

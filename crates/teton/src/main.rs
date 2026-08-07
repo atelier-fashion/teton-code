@@ -1833,7 +1833,7 @@ mod tests {
     /// `default_provider` on a remote provider, so `scan`/`build`/`think`
     /// inherit it and `reflex` does not.
     fn migrated_snapshot() -> ConfigSnapshot {
-        use teton_protocol::methods::{CategoryRouteView, TierRouteView};
+        use teton_protocol::methods::{CategoryRouteView, ContentClass, TierRouteView};
         use teton_protocol::Category;
 
         let tier = |t: Tier, provider: &str, source| TierRouteView {
@@ -1850,6 +1850,7 @@ mod tests {
                 fallback_id: None,
                 source,
                 reached,
+                content_class: ContentClass::for_category(category),
                 reason: format!("Routing the '{category}' category to '{provider}'."),
             };
         use BindingSource::{PinnedLocal, TierInheritance as Inherit};

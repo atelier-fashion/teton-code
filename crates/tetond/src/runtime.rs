@@ -109,7 +109,7 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 use teton_protocol::events::{ModelLifecycle, ModelLifecycleStage, PrivacyAction};
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    CategoryRouteView, ConfigSnapshot, ConfigUpdate, CostGroupView, CostQueryResult,
+    CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
     TierRouteView,
@@ -3944,11 +3944,13 @@ fn tier_route_view(report: &TierReport) -> TierRouteView {
 
 /// One category row of the snapshot, read **off** a [`CategoryResolution`].
 ///
-/// Every field is copied, none is derived: the provider, the tier, which row the
-/// binding came from, and the sentence all belong to the resolver. The one thing
-/// added here is [`CategoryRouteView::reached`], which is a fact about the
-/// daemon's call sites rather than about routing, and comes from
-/// [`crate::call_sites::has_call_site`] (ADR-A).
+/// Every routing field is copied, none is derived: the provider, the tier, which
+/// row the binding came from, and the sentence all belong to the resolver. Two
+/// fields are about the category rather than about its routing:
+/// [`CategoryRouteView::reached`], a fact about the daemon's call sites, from
+/// [`crate::call_sites::has_call_site`] (ADR-A); and
+/// [`CategoryRouteView::content_class`], what the category sends to a model,
+/// from [`ContentClass::for_category`] (REQ-561 BR-11).
 fn category_route_view(resolution: &CategoryResolution) -> CategoryRouteView {
     CategoryRouteView {
         category: to_protocol_category(resolution.category),
@@ -3962,6 +3964,7 @@ fn category_route_view(resolution: &CategoryResolution) -> CategoryRouteView {
             CoreBindingSource::Unbound => BindingSource::Unbound,
         },
         reached: has_call_site(resolution.category),
+        content_class: ContentClass::for_category(to_protocol_category(resolution.category)),
         reason: resolution.reason.clone(),
     }
 }
