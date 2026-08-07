@@ -36,6 +36,7 @@ use teton_core::config::LocalModelConfig;
 use teton_core::entities::{ModelSelection, SelectionSource};
 use teton_core::policy::ProviderHealth;
 use teton_core::ToolCallTier;
+use teton_protocol::{PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
 
 use teton_inference::catalog::{Catalog, ModelEntry, TierBand};
 use teton_inference::download::{DownloadError, RangeFetcher};
@@ -2256,8 +2257,8 @@ impl TestClient {
                 "client_kind": "cli",
                 "client_name": "consent-test",
                 "client_version": "0.1.0",
-                "protocol_min": 1,
-                "protocol_max": 1,
+                "protocol_min": PROTOCOL_VERSION_MIN,
+                "protocol_max": PROTOCOL_VERSION_MAX,
             }),
         )
         .await;

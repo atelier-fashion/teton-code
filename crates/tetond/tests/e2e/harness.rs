@@ -34,6 +34,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use teton_protocol::{PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
 
 /// The secret that lives in the fixture repo's `secrets/prod.env`. It must never
 /// appear in any captured egress payload across the whole suite run (BR-1).
@@ -651,8 +652,8 @@ impl Client {
                 "client_kind": "cli",
                 "client_name": "e2e",
                 "client_version": "0.1.0",
-                "protocol_min": 1,
-                "protocol_max": 1,
+                "protocol_min": PROTOCOL_VERSION_MIN,
+                "protocol_max": PROTOCOL_VERSION_MAX,
             }),
         );
         let resp = self.await_response(id);

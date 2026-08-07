@@ -1,12 +1,13 @@
 ---
 id: BUG-158
 title: "A new CLI cannot read a running v0.1.10 daemon's config — policy show and config get fail with a raw serde error"
-status: open
+status: fixed
 severity: medium
 created: 2026-08-07
 component: "protocol"
 domain: "upgrade-path"
 found_by: REQ-561 Phase-5 verify panel
+fixed_by: "#64 — fix(protocol): gate the v1/v2 ConfigSnapshot skew at the handshake"
 introduced_by: REQ-558
 ---
 
@@ -50,7 +51,27 @@ they are genuinely additive and four sibling fields in the same file already do
 this. That is correct hygiene, but it does **not** fix the break above and was
 not claimed to.
 
-## Suggested fix
+## Fixed
+
+Resolved on `main` by **#64** (`e523d3d`), independently and while REQ-561 was
+still in flight — exactly the remedy suggested below. `PROTOCOL_VERSION_MIN` is
+now `2`, so a v1 daemon is turned away at the handshake with a sentence naming
+which half is stale and the restart command, instead of a serde error from a
+command the user just typed.
+
+#64 also pinned the reasoning with a test carrying a verbatim v0.1.10
+`config/get` snapshot and asserting it does **not** deserialize — with the
+instruction that if anyone ever makes it parse, `PROTOCOL_VERSION_MIN` must drop
+back to 1 in the same change. That keeps the version pin and the fact it rests
+on from drifting apart.
+
+REQ-561's `#[serde(default)]` on `content_class` and `reached` remains correct
+and is unaffected: it does not make a v1 snapshot parse (that fails on `category`
+and `tiers`, which have no defaults), so it neither contradicts #64's test nor
+weakens the gate. It covers additive skew *within* v2, which is a different
+problem.
+
+## Suggested fix (as filed — now implemented by #64)
 
 Bump `PROTOCOL_VERSION_MIN` so the handshake refuses the skew with a clear
 sentence — "your daemon is running an older protocol; restart it with

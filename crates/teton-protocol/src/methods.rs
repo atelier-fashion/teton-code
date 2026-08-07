@@ -1537,6 +1537,48 @@ mod tests {
         );
     }
 
+    /// The concrete reason [`crate::PROTOCOL_VERSION_MIN`] is 2.
+    ///
+    /// This is a verbatim `config/get` snapshot from the last release (v0.1.10),
+    /// which predates REQ-558. Today's type cannot read it: `routing` was a
+    /// phase-keyed table and is now category-keyed, so the very first row is
+    /// missing `category`. `tiers` is absent entirely.
+    ///
+    /// Kept as an assertion rather than a comment because the two facts have to
+    /// move together. **If you make this parse, lower `PROTOCOL_VERSION_MIN` to
+    /// 1 in the same change** — a build that can read v1 should say so, and a
+    /// build that cannot must not.
+    #[test]
+    fn the_last_releases_snapshot_is_unreadable_which_is_why_the_version_is_pinned() {
+        let v0_1_10 = serde_json::json!({
+            "providers": [{
+                "id": "anthropic",
+                "kind": "anthropic",
+                "endpoint": "https://api.anthropic.com",
+                "model": "claude-opus-5",
+                "auth_ref": "keychain://teton/anthropic"
+            }],
+            "routing": [
+                {"phase": "implement", "provider_id": "anthropic", "fallback_id": "local"},
+                {"phase": "io", "provider_id": "local"}
+            ],
+            "privacy": [{"path_glob": "secrets/**", "mode": "local_only"}]
+        });
+
+        let err = serde_json::from_value::<ConfigSnapshot>(v0_1_10)
+            .expect_err("a v1 snapshot must not deserialize into the v2 type");
+        assert!(
+            err.to_string().contains("category"),
+            "expected the category-keyed routing row to be the break; got: {err}"
+        );
+
+        // And the absence is mutual: the v2 shape carries a `tiers` array and a
+        // `category` key that no v1 client knew to send, so neither direction of
+        // the pairing is serviceable and the handshake is the right gate.
+        let today = serde_json::to_value(ConfigSnapshot::default()).unwrap();
+        assert!(today.get("tiers").is_some());
+    }
+
     #[test]
     fn config_set_round_trips_each_update_variant() {
         for update in [

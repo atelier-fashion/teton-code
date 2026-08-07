@@ -93,8 +93,16 @@ impl TestDaemon {
     fn spawn_with_script(daemon: &Path, replies: Option<&[&str]>) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        // The `-` is load-bearing: without it `tc{pid}{seq}` is ambiguous — pid
+        // `0x123`/seq `0x45` and pid `0x1234`/seq `0x5` both render `tc12345`, and
+        // two colliding daemons would share a runtime dir, a socket, and the
+        // single-instance flock, with each `drop` deleting the other's root. That
+        // cannot happen under plain `cargo test` (one process, unique `seq`) but it
+        // can under `cargo nextest`, which runs test binaries in parallel. The name
+        // stays short because `root` becomes an `XDG_RUNTIME_DIR` and the socket
+        // under it has to fit in `SUN_LEN`.
         let root =
-            PathBuf::from("/tmp").join(format!("tc{:x}{:x}", std::process::id() & 0xffff, seq));
+            PathBuf::from("/tmp").join(format!("tc{:x}-{:x}", std::process::id() & 0xffff, seq));
         let runtime_dir = root.join("x");
         std::fs::create_dir_all(&runtime_dir).unwrap();
 
