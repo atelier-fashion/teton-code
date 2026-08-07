@@ -122,9 +122,11 @@ No new RPCs.
       captured bytes **and** by `scanned: false` in the report. No configuration
       makes the scan appear to have run when it did not.
 - [ ] AC-4: `redact` cannot be bound by any path — config file, `policy
-      set-category`, `config/set` RPC, tier inheritance, or migration. Inherited
-      from REQ-558; re-asserted here because this REQ is the one that gives the pin
-      consequences.
+      set-category`, `config/set` RPC, tier inheritance, or migration (BR-2).
+      Inherited from REQ-558; re-asserted here because this REQ is the one that
+      gives the pin consequences. A test also asserts **no locality guard was
+      added** — the pin is the type and the engine-backed derivation, and a runtime
+      check here would be LESSON-484's error.
 - [ ] AC-5: **The pin resolves to an engine-backed provider only.** With a
       remote-kind provider registered under the id `local`, `redact` does not
       dispatch over HTTP — asserted by captured bytes, not by an id comparison
@@ -132,11 +134,34 @@ No new RPCs.
 - [ ] AC-6: No finding, event, log line, or error message contains matched text.
       Asserted by planting a distinctive sentinel and grepping every emitted
       surface for it (BR-6).
-- [ ] AC-7: Latency measured on real weights and recorded. If it cannot be measured
+- [ ] AC-7: Latency measured on real weights and recorded against BR-9's stated
+      budget. If it cannot be measured
       in CI, `docs/manual-verification.md` records the procedure and says **NOT
       RUN** — the standard REQ-557 and REQ-558 set.
+- [ ] AC-9: **The payload is never modified** (BR-5). A scan that finds nothing and
+      a scan that finds something both leave the outbound bytes byte-for-byte
+      identical to what provenance inspection passed through — the second case
+      blocks, it does not send an altered payload. Asserted by capture, not by
+      reading the code path. Without this, "v1 detects, it does not substitute" is
+      a comment rather than a rule (LESSON-486).
+- [ ] AC-10: **Confidence drives the action** (BR-4). A table-driven test over
+      (high, low) × (single finding, mixed findings) asserts which verdicts block
+      and which pass, and that a low-confidence-only payload is not blocked. This
+      is the rule that decides whether the feature is usable or decorative, and it
+      is the one a later change is most likely to quietly retune.
+- [ ] AC-11: **The ordering holds** (BR-1). A payload that provenance already
+      refuses is never handed to the redactor — asserted by a call count on the
+      scanner, not by output text. Redaction is a second pass over content that
+      provenance permitted, and a scanner that sees refused payloads is doing work
+      on content that was never going anywhere.
+- [ ] AC-12: **Session taint still short-circuits ahead of this** (BR-8): a
+      tainted session's payloads never reach the redactor at all, asserted by a
+      call count on the scanner. `redact` is a second line for content that was
+      going to leave; it is not a substitute for the pin that stops content
+      leaving, and a change that made it one would weaken BR-1 while appearing to
+      strengthen it.
 - [ ] AC-8: Mutation checks — (a) making the unavailable-redactor path permissive,
-      (b) removing the bound on scan input, (c) letting a finding carry its matched
+      (b) removing the bound on scan input (BR-7), (c) letting a finding carry its matched
       text, and (d) restoring an id-based locality assertion each turn at least one
       test red. **A green mutation is reported, not quietly fixed** (LESSON-485).
 
