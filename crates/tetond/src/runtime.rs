@@ -7423,7 +7423,56 @@ provider_id = "on-device"
         use super::*;
         use crate::classify::test_support::CountingEngine;
         use teton_core::category::JudgmentCategory;
+        use teton_protocol::events::{Event as ProtoEvent, RouteDecided};
         use teton_protocol::Category as ProtoCategory;
+
+        /// Every `route_decided` this subscription saw, oldest first.
+        ///
+        /// Drained with `try_recv` rather than awaited under a timeout:
+        /// `EventBus::publish` is synchronous, so once the call under test has
+        /// returned, everything it published is already queued (LESSON-450 — a
+        /// wall-clock poll is the assertion shape that goes flaky first).
+        ///
+        /// One helper for all five duties, returning the **whole** event rather
+        /// than a projection of it. A per-duty helper that extracted only the
+        /// category was what let `compact` claim AC-2 while asserting a quarter
+        /// of it: AC-2 asks for the category, the tier, the provider *and* a
+        /// reason, and a helper that cannot see three of the four cannot be
+        /// asked about them.
+        fn announced(sub: &mut crate::broadcast::Subscription) -> Vec<RouteDecided> {
+            std::iter::from_fn(|| sub.try_recv())
+                .filter_map(|env| match env.event {
+                    ProtoEvent::RouteDecided(rd) => Some(rd),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Assert `decided` is the one `route_decided` a performed duty
+        /// announces, and that it names all four things AC-2 asks for.
+        ///
+        /// Shared so that every duty is held to the same four, rather than to
+        /// whichever subset its own test happened to spell out.
+        fn assert_announced_route(
+            decided: &[RouteDecided],
+            category: ProtoCategory,
+            tier: ProtoTier,
+            provider_id: &str,
+        ) {
+            assert_eq!(
+                decided.len(),
+                1,
+                "one performed duty announces exactly one route: {decided:?}"
+            );
+            let rd = &decided[0];
+            assert_eq!(rd.category, Some(category), "{rd:?}");
+            assert_eq!(rd.tier, Some(tier), "{rd:?}");
+            assert_eq!(rd.provider_id.0, provider_id, "{rd:?}");
+            assert!(
+                !rd.reason.is_empty(),
+                "a routing decision with no reason explains nothing: {rd:?}"
+            );
+        }
 
         fn remote(id: &str, model: &str) -> ModelProvider {
             ModelProvider {
@@ -7973,7 +8022,6 @@ provider_id = "on-device"
         mod digest {
             use super::*;
             use teton_core::category::{CategoryOverride, ConfigurableCategory};
-            use teton_protocol::events::{Event, RouteDecided};
 
             /// `config()` plus a `scan` binding — the tier `digest` inherits.
             fn scan_bound_to(provider_id: &str) -> Config {
@@ -8130,22 +8178,6 @@ provider_id = "on-device"
             // Only together do they pin "announced iff the duty actually ran".
             // ---------------------------------------------------------------
 
-            /// Every `route_decided` the duty path published, oldest first.
-            ///
-            /// Drained with `try_recv` rather than awaited under a timeout:
-            /// `EventBus::publish` is synchronous, so once the call under test
-            /// has returned, everything it published is already queued
-            /// (LESSON-450 — a wall-clock poll is the assertion shape that goes
-            /// flaky first).
-            fn announced(sub: &mut crate::broadcast::Subscription) -> Vec<RouteDecided> {
-                std::iter::from_fn(|| sub.try_recv())
-                    .filter_map(|env| match env.event {
-                        Event::RouteDecided(rd) => Some(rd),
-                        _ => None,
-                    })
-                    .collect()
-            }
-
             /// The `digest` route the turn path builds, on a bus the test can
             /// watch. `config()` leaves `scan` unbound, so `digest` inherits the
             /// **local** tier — which is what makes performing it in-process
@@ -8196,17 +8228,12 @@ provider_id = "on-device"
                     .await;
                 assert_eq!(out.as_deref(), Ok("CONDENSED"), "the duty really ran");
 
-                let decided = announced(&mut sub);
-                assert_eq!(
-                    decided.len(),
-                    1,
-                    "one performed duty announces exactly one route: {decided:?}"
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Digest,
+                    ProtoTier::Scan,
+                    LOCAL_PROVIDER_ID,
                 );
-                let rd = &decided[0];
-                assert_eq!(rd.category, Some(ProtoCategory::Digest), "{rd:?}");
-                assert_eq!(rd.tier, Some(ProtoTier::Scan), "{rd:?}");
-                assert_eq!(rd.provider_id.0, LOCAL_PROVIDER_ID, "{rd:?}");
-                assert!(!rd.reason.is_empty(), "{rd:?}");
             }
 
             /// **REQ-561 BR-2, the negative half — and the whole point of it.**
@@ -8499,6 +8526,136 @@ provider_id = "on-device"
                 };
                 assert!(reason.contains("shell"), "{reason}");
                 assert!(reason.contains("ghost"), "{reason}");
+            }
+
+            // ---------------------------------------------------------------
+            // REQ-561 AC-2 / BR-2: `route_decided` for the duty, and *when* it
+            // fires.
+            //
+            // Missing until now. The seam's publish arm was mutated away and
+            // the whole workspace was run: five tests went red, and not one of
+            // them was `shell`'s — the category's routing was pinned only by
+            // `.provider()` on the resolved route, which says where the duty
+            // *would* go and nothing about what reached the wire. The five
+            // `*_route` resolvers differ by one `Category::` literal, so that
+            // gap is one copy-paste away from a `shell` duty announcing itself
+            // as something else with every test still green.
+            // ---------------------------------------------------------------
+
+            /// The `shell` route the turn path builds, on a bus the test can
+            /// watch. The `build` binding is dropped by the caller so `shell`
+            /// inherits the **local** tier, which is what makes performing it
+            /// in-process possible without a network call.
+            fn watched_shell(
+                runtime: &DaemonRuntime,
+                bus: &Arc<EventBus>,
+                session: &SessionId,
+            ) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.shell_route(&router, &config, bus, session, slot.as_ref())
+            }
+
+            /// `ShellTool::run` then `ShellTool::refine` over `route`, in `root`.
+            ///
+            /// Driven through the real tool rather than a hand-built outcome
+            /// because the negative half's whole claim is that *the call site*
+            /// declined — `worth_interpreting` reading a status and a length off
+            /// a result `run` produced. A fixture that hand-wrote that result
+            /// would be asserting against its author's belief about the trigger.
+            async fn run_and_refine(
+                root: &std::path::Path,
+                command: &str,
+                route: &DutyRoute,
+            ) -> crate::harness::RefinedOutcome {
+                use crate::harness::tools::{ShellTool, Tool, ToolContext};
+                use crate::harness::ToolDuties;
+
+                let args = serde_json::json!({ "command": command });
+                let raw = ShellTool::default().run(&ToolContext::new(root), &args);
+                ShellTool::default()
+                    .refine(
+                        &args,
+                        "make the tests pass",
+                        &ToolDuties {
+                            // `shell` never reaches it.
+                            triage: &DutyRoute::unresolved("no triage route in this test"),
+                            shell: route,
+                        },
+                        raw,
+                    )
+                    .await
+            }
+
+            /// **AC-2 / BR-2 for `shell`, both halves against one route**
+            /// (LESSON-485).
+            ///
+            /// The command's exit status is the only difference between the two
+            /// calls. The failing one reaches the duty, so the route announces;
+            /// the succeeding one — a short, successful command, which is most
+            /// of what a session runs — returns before the duty is touched, so
+            /// it announces nothing. Split apart, the negative half would be
+            /// satisfied by an emitter that never emits and the positive by one
+            /// that emits at resolution; only the pair pins "announced iff
+            /// performed".
+            ///
+            /// The route comes from `shell_route` rather than from a
+            /// hand-assembled announcement, so the four fields asserted below
+            /// are the **resolver's** answers. That is what makes a category
+            /// swap inside `shell_route` fail here rather than only showing up
+            /// as a different provider in a tier-binding test.
+            #[tokio::test]
+            async fn a_shell_duty_announces_its_route_only_when_the_output_needs_reading() {
+                let engine = CountingEngine::answering("The check failed: the file is missing.");
+                // `config()` binds `build` remotely and `shell` is a `build`
+                // duty; dropping the binding leaves it on the local tier, which
+                // is what lets the duty actually run here. Where it routes is
+                // `shell_inherits_the_build_tier_binding`'s claim, not this
+                // one's.
+                let mut config = config();
+                config.tiers.retain(|t| t.tier != Tier::Build);
+                let runtime = runtime(config, &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+
+                let route = watched_shell(&runtime, &bus, &SessionId::from("sess"));
+                assert_eq!(
+                    route.provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "the duty must resolve, or this test proves nothing"
+                );
+
+                let root = scratch_dir("shell-announce");
+
+                // Declined: exit 0, output nowhere near the cap. No duty, and so
+                // no routed model call to announce.
+                let refined = run_and_refine(&root, "echo hi", &route).await;
+                assert_eq!(refined.duty_error, None);
+                assert_eq!(
+                    engine.calls(),
+                    0,
+                    "a short successful command must buy no model call"
+                );
+                assert!(
+                    announced(&mut sub).is_empty(),
+                    "a duty that never ran announces a routed model call that never happened"
+                );
+
+                // Performed: the command failed, so reading it unaided is the
+                // hard part.
+                let refined = run_and_refine(&root, "echo hi; exit 3", &route).await;
+                assert_eq!(refined.duty_error, None, "the fixture must reach the duty");
+                assert_eq!(engine.calls(), 1);
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Shell,
+                    ProtoTier::Build,
+                    LOCAL_PROVIDER_ID,
+                );
+
+                let _ = std::fs::remove_dir_all(&root);
             }
         }
 
@@ -8834,6 +8991,73 @@ provider_id = "on-device"
                 assert_eq!(titles(&mut sub).len(), 1);
             }
 
+            // -- what reaches the wire (AC-2, ADR-8) -------------------------
+            //
+            // Missing until now, and pinned only by accident: mutating the
+            // seam's publish arm away turned `cli_e2e`'s
+            // `an_escaped_line_and_a_plain_line_both_reach_the_model` red — but
+            // only because that test counts `route [title/reflex]` lines while
+            // proving something else entirely. A `title` announcement is a BR-2
+            // guarantee and deserves a test that says so.
+
+            /// **AC-2 / BR-2 for `title`, both halves against one bus**
+            /// (LESSON-485).
+            ///
+            /// The length of the opener is the only difference between the two
+            /// sessions. The real request reaches the duty, so the route
+            /// announces; the bare opener is refused by ADR-11's threshold
+            /// before the route is even built, so it announces nothing.
+            ///
+            /// **What this pair does not show, stated rather than implied.**
+            /// `title_session` builds its route and performs it on the next
+            /// line — there is no state where a `title` route exists and is not
+            /// about to run — so for this duty an emit-at-resolution design and
+            /// ADR-8's emit-on-perform are indistinguishable. The negative half
+            /// here pins "no spurious announcement", not "not at resolution".
+            /// The duties whose routes are built unconditionally per turn
+            /// (`digest`, `shell`, `compact`) are where that distinction is
+            /// discriminated, and their negatives do it.
+            ///
+            /// Driven through `title_session` — the exact function
+            /// `run_prompt_turn` calls — so the four fields asserted below are
+            /// the **resolver's** answers on the daemon's own path, and a
+            /// category swap inside `title_route` fails here.
+            #[tokio::test]
+            async fn a_title_announces_its_route_only_when_it_names_a_session() {
+                let engine = CountingEngine::answering("Retry the download client");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let sessions = SessionRegistry::new();
+
+                // Declined: an opener with nothing in it to name a session by.
+                let bare = one_session(&sessions);
+                run_title(&runtime, &bus, &sessions, &bare, "hi").await;
+                assert_eq!(engine.calls(), 0, "a bare opener buys no model call");
+                assert!(
+                    announced(&mut sub).is_empty(),
+                    "a duty that never ran announces a routed model call that never happened"
+                );
+
+                // Performed. `reflex` is unbound in `config()` and never
+                // inherits `default_provider`, so this resolves locally — which
+                // is both the guarantee and what lets the duty run in-process.
+                let named = one_session(&sessions);
+                run_title(&runtime, &bus, &sessions, &named, REQUEST).await;
+                assert_eq!(engine.calls(), 1, "the real request names the session");
+                assert_eq!(
+                    sessions.get(&named).expect("the session").title.as_deref(),
+                    Some("Retry the download client"),
+                    "non-vacuity: the duty really produced a name"
+                );
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Title,
+                    ProtoTier::Reflex,
+                    LOCAL_PROVIDER_ID,
+                );
+            }
+
             /// **BR-10 / AC-12.** The `title` duty is answered by the scripted
             /// stand-in **off-script**, so it consumes no reply block and every
             /// fixture's turn sequence means what its author wrote.
@@ -8889,7 +9113,6 @@ provider_id = "on-device"
             use crate::harness::compact::COMPACT_OUTPUT_CONTRACT;
             use crate::harness::ContextManager;
             use teton_core::category::{CategoryOverride, ConfigurableCategory};
-            use teton_protocol::events::Event;
 
             /// The `compact` route the turn path builds, from the same runtime
             /// state and through the same router, announcing on `bus`.
@@ -8913,21 +9136,6 @@ provider_id = "on-device"
                 }
                 assert!(ctx.under_compaction_pressure());
                 ctx
-            }
-
-            /// Every `route_decided` category this subscription saw.
-            ///
-            /// Drained with `try_recv` rather than awaited under a timeout:
-            /// `EventBus::publish` is synchronous, so once the call under test
-            /// has returned, everything it published is already queued
-            /// (LESSON-450).
-            fn decided(sub: &mut crate::broadcast::Subscription) -> Vec<Option<String>> {
-                std::iter::from_fn(|| sub.try_recv())
-                    .filter_map(|env| match env.event {
-                        Event::RouteDecided(d) => Some(d.category.map(|c| c.as_str().to_owned())),
-                        _ => None,
-                    })
-                    .collect()
             }
 
             // -- where it routes --------------------------------------------
@@ -9020,7 +9228,7 @@ provider_id = "on-device"
                 assert_eq!(out.dropped_blocks, 0);
                 assert_eq!(engine.calls(), 0);
                 assert!(
-                    decided(&mut sub).is_empty(),
+                    announced(&mut sub).is_empty(),
                     "a duty that never ran announces no routing decision"
                 );
 
@@ -9029,10 +9237,15 @@ provider_id = "on-device"
                     .compact_if_pressured(&compact_for(&runtime, &bus, &session))
                     .await;
                 assert_eq!(out.dropped_blocks, 3);
-                assert_eq!(
-                    decided(&mut sub),
-                    vec![Some("compact".to_owned())],
-                    "a performed compaction announces exactly one route, naming its category"
+                // All four of AC-2's fields, not just the category: `compact`
+                // is the duty that sends the *conversation*, so "where did it
+                // go, through which tier, and why" is the whole of what a user
+                // watching this event needs.
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Compact,
+                    ProtoTier::Scan,
+                    LOCAL_PROVIDER_ID,
                 );
             }
 

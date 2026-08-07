@@ -2085,8 +2085,9 @@ mod tests {
         let triage = category_row(&rendered, "triage");
         let compact = category_row(&rendered, "compact");
         assert!(
-            triage.contains("file content"),
-            "`triage` ranks grep hits, which are file text: {triage}"
+            triage.contains("file content and your request"),
+            "`triage` ranks grep hits — file text — and is told the request and the search \
+             terms in the same prompt, so its row must name all of it: {triage}"
         );
         assert!(
             compact.contains("conversation history"),

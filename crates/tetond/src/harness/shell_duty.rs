@@ -656,4 +656,43 @@ mod tests {
         assert!(!wire(&sent).contains("super-secret-xyzzy"));
         assert!(err.contains("privacy boundary"), "{err}");
     }
+
+    /// **BR-11 / AC-16: the disclosure must cover the whole payload.**
+    ///
+    /// A `shell` row that discloses only "command output" omits the command
+    /// itself — and a command line is routinely the more revealing half, since
+    /// it carries paths, hostnames, branch and ticket names that the output may
+    /// never print. The prompt is read here rather than described, so a builder
+    /// that starts carrying something else turns this red rather than widening
+    /// the egress under a stale sentence.
+    #[test]
+    fn the_disclosed_content_class_names_everything_the_shell_prompt_carries() {
+        use teton_protocol::methods::ContentClass;
+
+        let command = "cargo test -p tetond --features internal-staging";
+        let prompt = shell_prompt(command, &output());
+
+        // Non-vacuity: the prompt really does carry both halves.
+        assert!(prompt.contains(command), "the command rides in the prompt");
+        assert!(
+            prompt.contains("mismatched types"),
+            "and so does its output"
+        );
+
+        let disclosed = ContentClass::for_category(teton_protocol::Category::Shell).describe();
+        assert!(
+            disclosed.contains("output"),
+            "the stdout and stderr are sent: {disclosed}"
+        );
+        // `contains("command")` alone would not discriminate: the understating
+        // wording this replaced was the single noun phrase "command output",
+        // which contains the word and still names only one thing. The claim is
+        // that the command is disclosed as an item *conjoined with* the output.
+        assert!(
+            disclosed.contains("command and"),
+            "the command line is sent in its own right, not merely as the thing \
+             whose output is sent, and a row that does not say so understates \
+             what leaves: {disclosed}"
+        );
+    }
 }

@@ -673,4 +673,44 @@ mod tests {
         assert!(!wire(&sent).contains("super-secret-xyzzy"));
         assert!(err.contains("privacy boundary"), "{err}");
     }
+
+    /// **BR-11 / AC-16: the disclosure must cover the whole payload.**
+    ///
+    /// `policy show` tells a user what binding `scan` remotely would send, and
+    /// that sentence is the entire mitigation for the `scan` tier carrying two
+    /// very different categories. So it is worth only as much as it is accurate.
+    ///
+    /// The prompt is read here rather than described, because the prompt is what
+    /// actually leaves: a builder that later starts carrying the conversation
+    /// too would turn this red instead of quietly widening the egress under a
+    /// disclosure that still says "file content".
+    #[test]
+    fn the_disclosed_content_class_names_everything_the_triage_prompt_carries() {
+        use teton_protocol::methods::ContentClass;
+
+        let request = "find where the retry budget is decided";
+        let search = "grep `retry_budget`";
+        let prompt = triage_prompt(request, search, &matches());
+
+        // Non-vacuity: the prompt really does carry all three, so the disclosure
+        // below has three things to be accurate about.
+        assert!(prompt.contains(request), "the request rides in the prompt");
+        assert!(prompt.contains(search), "so does the search");
+        assert!(
+            prompt.contains("fn parse(input: &str)"),
+            "and the file text"
+        );
+
+        let disclosed = ContentClass::for_category(teton_protocol::Category::Triage).describe();
+        assert!(
+            disclosed.contains("file content"),
+            "the match lines are file text: {disclosed}"
+        );
+        assert!(
+            disclosed.contains("request"),
+            "the user's own request is sent with them, and a row that does not \
+             say so understates what a remote `scan` binding moves off the \
+             machine: {disclosed}"
+        );
+    }
 }

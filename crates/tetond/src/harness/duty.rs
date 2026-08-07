@@ -606,7 +606,17 @@ impl Duty for LocalDuty {
             // never revised.
             Ok(Ok(text)) => Ok(bound_to_ceiling(&text, self.ceiling_bytes())),
             Ok(Err(err)) => Err(err.to_string()),
-            Err(_) => Err("the local summarization task did not complete".to_owned()),
+            // Named by the duty that failed, like every other sentence the seam
+            // mints. This is the **one** local implementation for all five
+            // duties, so a hardcoded noun here reports a `title`, `triage`,
+            // `shell` or `compact` join failure as a summarization failure — on
+            // `RefinedOutcome::duty_error`, on `CompactionOutcome::reason`, and
+            // in the turn loop's log, which are the three places a user or a
+            // maintainer goes to find out which duty broke.
+            Err(_) => Err(format!(
+                "the local `{}` task did not complete",
+                self.category().as_str()
+            )),
         }
     }
 }
@@ -715,7 +725,8 @@ mod tests {
     };
     use crate::call_sites::scan::{code_only, count, production_sources};
     use async_trait::async_trait;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use teton_inference::{Completion, Engine, EngineError, GenParams};
     use teton_protocol::Category;
 
     /// The five duty modules — where ADR-3 allows per-category source to live,
@@ -1017,6 +1028,57 @@ mod tests {
         assert!(
             started.elapsed() >= DUTY_DEADLINE,
             "the wait really was the deadline's, not something shorter"
+        );
+    }
+
+    /// An engine whose completion panics on the blocking pool — the one way a
+    /// `spawn_blocking` handle comes back as a `JoinError` rather than as a
+    /// result the seam can read.
+    struct PanickingEngine;
+
+    impl Engine for PanickingEngine {
+        fn model_id(&self) -> &str {
+            "panicking"
+        }
+        fn complete(
+            &self,
+            _prompt: &str,
+            _params: &GenParams,
+            _on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<Completion, EngineError> {
+            panic!("the blocking pool lost this task");
+        }
+    }
+
+    /// **The join-failure sentence names the duty that failed.**
+    ///
+    /// [`LocalDuty`] is the single local implementation behind all five duties,
+    /// so this arm is reached by `title`, `triage`, `shell` and `compact` as
+    /// readily as by `digest` — and its sentence surfaces to the user through
+    /// `RefinedOutcome::duty_error`, `CompactionOutcome::reason`, and the turn
+    /// loop's log. A hardcoded noun there tells a person that summarization
+    /// failed on a turn that never summarized anything.
+    ///
+    /// Driven through `TITLE_DUTY` precisely because `title` is not the duty the
+    /// old sentence named: the assertion is that the sentence *changed with the
+    /// category*, which is exactly what a fixed string cannot do.
+    #[tokio::test]
+    async fn a_local_duty_that_never_joins_names_itself_rather_than_summarization() {
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(PanickingEngine));
+        let route = DutyRoute::local(crate::harness::title::TITLE_DUTY, "local", engine);
+
+        let err = route
+            .perform("name this session", &Provenance::empty())
+            .await
+            .expect_err("a duty whose task panicked cannot have succeeded");
+
+        assert!(
+            err.contains("title"),
+            "the call site must be told which duty failed: {err}"
+        );
+        assert!(
+            !err.contains("summarization"),
+            "one shared local impl must not report every duty as a summarization: {err}"
         );
     }
 
