@@ -45,13 +45,148 @@ impl RpcMethod for HandshakeParams {
     type Result = HandshakeResult;
 }
 
+/// Which half of a version-incompatible pairing is the older build.
+///
+/// The two cases need *opposite* remedies — restart the daemon versus upgrade
+/// the client — so a surface that renders one sentence for both is telling half
+/// its users to do the wrong thing. Derived here, from the numbers alone, so the
+/// daemon's log line and the CLI's terminal line cannot disagree about who is
+/// behind.
+///
+/// The sentences themselves deliberately live at the surfaces: this crate is
+/// transport-free and knows nothing about `brew`, launchd, or how a particular
+/// client is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VersionSkew {
+    /// The daemon speaks only versions below everything the client offers — an
+    /// older daemon still running after the binaries on disk were upgraded.
+    /// This is the common one: the socket path is stable across releases
+    /// (ADR-007), so a new CLI finds the old daemon and attaches to it.
+    DaemonIsOlder,
+    /// The daemon speaks only versions above everything the client offers — a
+    /// stale client against a current daemon.
+    ClientIsOlder,
+}
+
+impl VersionSkew {
+    /// Classifies two disjoint ranges. `None` when they overlap (no skew) or
+    /// when either range is itself inverted (`min > max`), which is a malformed
+    /// advertisement rather than a version difference.
+    #[must_use]
+    pub fn classify(
+        client_min: ProtocolVersion,
+        client_max: ProtocolVersion,
+        daemon_min: ProtocolVersion,
+        daemon_max: ProtocolVersion,
+    ) -> Option<Self> {
+        if client_min > client_max || daemon_min > daemon_max {
+            return None;
+        }
+        if daemon_max < client_min {
+            Some(VersionSkew::DaemonIsOlder)
+        } else if daemon_min > client_max {
+            Some(VersionSkew::ClientIsOlder)
+        } else {
+            None
+        }
+    }
+
+    /// A neutral clause naming who is behind, with no installer-specific advice.
+    /// Surfaces that know how the binaries are managed append their own remedy.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            VersionSkew::DaemonIsOlder => "the running daemon is the older build",
+            VersionSkew::ClientIsOlder => "this client is the older build",
+        }
+    }
+}
+
+/// The four advertised bounds, recovered from a wire
+/// [`error_code::UNSUPPORTED_PROTOCOL_VERSION`] response.
+///
+/// [`HandshakeError::to_rpc_error`] puts them in the error's `data` member
+/// precisely so the rejected client can say something better than the daemon's
+/// own generic sentence — and the released daemons this build has to explain
+/// itself to already emit exactly this shape, which is what makes the remedy
+/// reachable without changing them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionMismatch {
+    /// Lowest version the client offered.
+    pub client_min: ProtocolVersion,
+    /// Highest version the client offered.
+    pub client_max: ProtocolVersion,
+    /// Lowest version the daemon supports.
+    pub daemon_min: ProtocolVersion,
+    /// Highest version the daemon supports.
+    pub daemon_max: ProtocolVersion,
+}
+
+impl VersionMismatch {
+    /// Reads the bounds out of an `UNSUPPORTED_PROTOCOL_VERSION` error.
+    ///
+    /// `None` for any other error code, and for a matching code whose `data` is
+    /// absent or malformed — a caller still knows it is a version problem from
+    /// the code, and must not present a fabricated range.
+    #[must_use]
+    pub fn from_rpc_error(err: &RpcError) -> Option<Self> {
+        if err.code != error_code::UNSUPPORTED_PROTOCOL_VERSION {
+            return None;
+        }
+        let data = err.data.as_ref()?;
+        let field = |name: &str| {
+            data.get(name)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .map(ProtocolVersion)
+        };
+        Some(Self {
+            client_min: field("client_min")?,
+            client_max: field("client_max")?,
+            daemon_min: field("daemon_min")?,
+            daemon_max: field("daemon_max")?,
+        })
+    }
+
+    /// Which side is behind, or `None` if these bounds in fact overlap.
+    #[must_use]
+    pub fn skew(&self) -> Option<VersionSkew> {
+        VersionSkew::classify(
+            self.client_min,
+            self.client_max,
+            self.daemon_min,
+            self.daemon_max,
+        )
+    }
+}
+
+/// Renders an inclusive range the way a person reads it: a single number when
+/// the build speaks exactly one version, `a–b` when it spans several.
+#[must_use]
+pub fn format_range(min: ProtocolVersion, max: ProtocolVersion) -> String {
+    if min == max {
+        min.to_string()
+    } else {
+        format!("{min}–{max}")
+    }
+}
+
 /// A handshake could not be completed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HandshakeError {
     /// The client and daemon ranges do not overlap.
+    ///
+    /// The message names the numbers *and* who is behind: this string is what a
+    /// client too old to decode the error's `data` prints verbatim, so it is the
+    /// only diagnosis some readers ever get.
     #[error(
-        "no mutually supported protocol version: client [{client_min}, {client_max}], \
-         daemon [{daemon_min}, {daemon_max}]"
+        "no mutually supported protocol version: client speaks {}, daemon speaks {} — {}. \
+         An upgrade that replaced the binaries on disk does not restart a daemon that is \
+         already running.",
+        format_range(*client_min, *client_max),
+        format_range(*daemon_min, *daemon_max),
+        VersionSkew::classify(*client_min, *client_max, *daemon_min, *daemon_max)
+            .map_or("the advertised ranges do not overlap", VersionSkew::as_str)
     )]
     IncompatibleVersion {
         /// Lowest version the client offered.
@@ -226,5 +361,145 @@ mod tests {
         assert!(rpc.data.is_some());
         // The wire error round-trips like any other RpcError.
         round_trip(&rpc);
+    }
+
+    /// A released v1 daemon meeting this build is the pairing the whole version
+    /// gate exists for: an upgrade replaced the binaries, nothing restarted the
+    /// daemon, and the stable socket path (ADR-007) hands the new CLI straight
+    /// to the old process. It must be refused *at the handshake*, before any
+    /// method can return a shape this build cannot read.
+    #[test]
+    fn a_released_v1_daemon_is_refused_before_any_method_runs() {
+        let err = negotiate(
+            ProtocolVersion(1),
+            ProtocolVersion(1),
+            PROTOCOL_VERSION_MIN,
+            PROTOCOL_VERSION_MAX,
+        )
+        .unwrap_err();
+        let HandshakeError::IncompatibleVersion {
+            client_min,
+            client_max,
+            daemon_min,
+            daemon_max,
+        } = err;
+        assert_eq!(
+            VersionSkew::classify(client_min, client_max, daemon_min, daemon_max),
+            Some(VersionSkew::DaemonIsOlder)
+        );
+    }
+
+    #[test]
+    fn skew_names_whichever_side_is_behind_and_stays_silent_when_ranges_overlap() {
+        let v = ProtocolVersion;
+        assert_eq!(
+            VersionSkew::classify(v(2), v(2), v(1), v(1)),
+            Some(VersionSkew::DaemonIsOlder)
+        );
+        assert_eq!(
+            VersionSkew::classify(v(1), v(1), v(2), v(2)),
+            Some(VersionSkew::ClientIsOlder)
+        );
+        // Touching ranges overlap at a single version — negotiable, no skew.
+        assert_eq!(VersionSkew::classify(v(1), v(2), v(2), v(3)), None);
+        assert_eq!(VersionSkew::classify(v(1), v(5), v(1), v(5)), None);
+        // An inverted advertisement is malformed, not a version difference —
+        // reporting it as "the daemon is older" would send the reader off to
+        // restart a daemon that is not the problem.
+        assert_eq!(VersionSkew::classify(v(5), v(1), v(2), v(2)), None);
+        assert_eq!(VersionSkew::classify(v(2), v(2), v(5), v(1)), None);
+    }
+
+    /// The client's remedy is only reachable if the bounds survive the trip
+    /// through the wire error — including from a released daemon, which emits
+    /// this same `data` shape and is the one build we cannot change.
+    #[test]
+    fn the_bounds_survive_the_round_trip_through_the_wire_error() {
+        let err = negotiate(
+            ProtocolVersion(1),
+            ProtocolVersion(1),
+            ProtocolVersion(2),
+            ProtocolVersion(2),
+        )
+        .unwrap_err();
+        let rpc = err.to_rpc_error();
+        let recovered = VersionMismatch::from_rpc_error(&rpc).expect("bounds are in `data`");
+        assert_eq!(
+            recovered,
+            VersionMismatch {
+                client_min: ProtocolVersion(2),
+                client_max: ProtocolVersion(2),
+                daemon_min: ProtocolVersion(1),
+                daemon_max: ProtocolVersion(1),
+            }
+        );
+        assert_eq!(recovered.skew(), Some(VersionSkew::DaemonIsOlder));
+
+        // Anything else, or a truncated payload, yields nothing rather than a
+        // fabricated range.
+        assert_eq!(
+            VersionMismatch::from_rpc_error(&RpcError::new(
+                error_code::UNKNOWN_SESSION,
+                "no such session"
+            )),
+            None
+        );
+        assert_eq!(
+            VersionMismatch::from_rpc_error(&RpcError::new(
+                error_code::UNSUPPORTED_PROTOCOL_VERSION,
+                "no data member"
+            )),
+            None
+        );
+        assert_eq!(
+            VersionMismatch::from_rpc_error(
+                &RpcError::new(error_code::UNSUPPORTED_PROTOCOL_VERSION, "partial")
+                    .with_data(serde_json::json!({"client_min": 2, "client_max": 2}))
+            ),
+            None
+        );
+    }
+
+    /// The daemon's own sentence is what a client too old to decode `data`
+    /// prints verbatim, so it has to carry the diagnosis itself.
+    #[test]
+    fn the_rejection_sentence_names_the_versions_and_who_is_behind() {
+        let err = negotiate(
+            ProtocolVersion(1),
+            ProtocolVersion(1),
+            ProtocolVersion(2),
+            ProtocolVersion(2),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("client speaks 2"), "{text}");
+        assert!(text.contains("daemon speaks 1"), "{text}");
+        assert!(
+            text.contains("the running daemon is the older build"),
+            "{text}"
+        );
+        assert!(text.contains("does not restart a daemon"), "{text}");
+
+        // The mirror image reads as the mirror image, not as a copy.
+        let flipped = negotiate(
+            ProtocolVersion(3),
+            ProtocolVersion(4),
+            ProtocolVersion(1),
+            ProtocolVersion(2),
+        )
+        .unwrap_err();
+        let flipped = flipped.to_string();
+        assert!(flipped.contains("client speaks 1–2"), "{flipped}");
+        assert!(flipped.contains("daemon speaks 3–4"), "{flipped}");
+        assert!(
+            flipped.contains("this client is the older build"),
+            "{flipped}"
+        );
+    }
+
+    #[test]
+    fn a_single_version_range_reads_as_one_number() {
+        assert_eq!(format_range(ProtocolVersion(2), ProtocolVersion(2)), "2");
+        assert_eq!(format_range(ProtocolVersion(1), ProtocolVersion(3)), "1–3");
     }
 }

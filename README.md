@@ -65,6 +65,11 @@ the `teton-code` already running is still the old one until something restarts i
 and `teton doctor` names the running daemon's version so you can tell which one
 answered.
 
+Forget it and nothing is silently wrong: the two halves negotiate a protocol
+version when the CLI attaches, so a daemon left behind by an upgrade is turned
+away at that point — every command answers with which half is stale and the
+restart command, rather than failing partway through with an internal error.
+
 ### Uninstalling
 
 ```sh

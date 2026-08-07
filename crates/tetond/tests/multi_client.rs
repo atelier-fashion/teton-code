@@ -18,6 +18,9 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
+use teton_protocol::handshake::{VersionMismatch, VersionSkew};
+use teton_protocol::jsonrpc::{error_code, RpcError};
+use teton_protocol::{PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
 use tetond::{server, Daemon};
 
 /// A minimal in-test JSON-RPC client over the daemon socket.
@@ -90,8 +93,8 @@ impl TestClient {
                 "client_kind": "cli",
                 "client_name": "test-client",
                 "client_version": "0.1.0",
-                "protocol_min": 1,
-                "protocol_max": 1,
+                "protocol_min": PROTOCOL_VERSION_MIN,
+                "protocol_max": PROTOCOL_VERSION_MAX,
             }),
         )
         .await;
@@ -199,6 +202,80 @@ async fn a_method_before_handshake_is_refused() {
     );
     // -32600 == INVALID_REQUEST.
     assert_eq!(response["error"]["code"].as_i64().unwrap(), -32600);
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A client speaking the pre-REQ-558 protocol is refused at the handshake, and
+/// stays refused for every method after it.
+///
+/// This is the released-pairing bug from the daemon's side. `ConfigSnapshot`
+/// changed shape in REQ-558 while the version stayed at 1, so the two builds
+/// negotiated happily and then failed inside `config/get` with a bare
+/// `missing field \`category\`` — a serde string, out of `Connection::call`,
+/// with nothing in it a user could act on. The version bump moves that failure
+/// here, where it is a typed code carrying the four bounds a client turns into
+/// "restart the daemon".
+///
+/// The second half matters as much as the first: a refused client must not be
+/// left half-attached, able to call `config/get` anyway and hit the original
+/// serde error by another road.
+#[tokio::test]
+async fn a_client_from_the_previous_protocol_is_refused_at_the_handshake() {
+    let path = temp_socket("skew");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut old = TestClient::connect(&path).await;
+    old.send(
+        1,
+        "handshake",
+        json!({
+            "client_kind": "cli",
+            "client_name": "teton-cli",
+            "client_version": "0.1.10",
+            "protocol_min": 1,
+            "protocol_max": 1,
+        }),
+    )
+    .await;
+    let response = old.read_response(1).await;
+
+    let error = response
+        .get("error")
+        .unwrap_or_else(|| panic!("a v1 client must be refused, got: {response}"));
+    assert_eq!(
+        error["code"].as_i64().unwrap(),
+        error_code::UNSUPPORTED_PROTOCOL_VERSION
+    );
+
+    // The bounds ride in `data` — that payload is what lets the rejected client
+    // say which half is stale instead of restating the daemon's sentence.
+    //
+    // The skew reads `ClientIsOlder` because the daemon under test is always
+    // this build: staged from here, the old half is the client. The released
+    // pairing is the mirror image — an old *daemon* rejecting a new CLI — and
+    // its arithmetic is identical, which is why the direction is pinned in
+    // `handshake`'s unit tests and the sentence in the CLI's, where the old
+    // daemon's range can actually be stood up.
+    let rpc: RpcError = serde_json::from_value(error.clone()).unwrap();
+    let mismatch = VersionMismatch::from_rpc_error(&rpc).expect("bounds are on the wire");
+    assert_eq!(mismatch.skew(), Some(VersionSkew::ClientIsOlder));
+    assert_eq!(mismatch.client_max, teton_protocol::ProtocolVersion(1));
+    assert_eq!(mismatch.daemon_min, PROTOCOL_VERSION_MIN);
+    assert_eq!(mismatch.daemon_max, PROTOCOL_VERSION_MAX);
+
+    // Still unauthenticated: the config call that used to blow up on a serde
+    // error never reaches the snapshot at all.
+    old.send(2, "config/get", json!({})).await;
+    let after = old.read_response(2).await;
+    assert_eq!(
+        after["error"]["code"].as_i64().unwrap(),
+        -32600,
+        "a refused client must stay refused, got: {after}"
+    );
 
     server_task.abort();
     let _ = std::fs::remove_file(&path);

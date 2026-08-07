@@ -22,8 +22,8 @@ use std::time::Duration;
 use anyhow::{anyhow, bail};
 use serde_json::Value;
 
-use teton_protocol::handshake::{HandshakeParams, HandshakeResult};
-use teton_protocol::jsonrpc::{Id, Response, RpcError};
+use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
+use teton_protocol::jsonrpc::{error_code, Id, Response, RpcError};
 use teton_protocol::methods::{self, RpcMethod};
 use teton_protocol::{ClientKind, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
 
@@ -157,8 +157,9 @@ impl Connection {
             if let Incoming::Response(resp) = self.recv()? {
                 if resp.id == id {
                     return match resp.error {
-                        Some(err) => Err(anyhow::Error::new(err)),
-                        None => Ok(serde_json::from_value(resp.result.unwrap_or(Value::Null))?),
+                        Some(err) => Err(explain_handshake_failure(err)),
+                        None => Ok(serde_json::from_value(resp.result.unwrap_or(Value::Null))
+                            .map_err(|e| stale_daemon_hint(HandshakeParams::METHOD, &e))?),
                     };
                 }
             }
@@ -186,7 +187,8 @@ impl Connection {
                             return Ok(match resp.error {
                                 Some(err) => Err(err),
                                 None => {
-                                    Ok(serde_json::from_value(resp.result.unwrap_or(Value::Null))?)
+                                    Ok(serde_json::from_value(resp.result.unwrap_or(Value::Null))
+                                        .map_err(|e| stale_daemon_hint(P::METHOD, &e))?)
                                 }
                             });
                         }
@@ -452,6 +454,86 @@ fn route_response(pending: &Id, resp_id: &Id, has_error: bool) -> RespRoute {
     }
 }
 
+/// The command that replaces a running daemon with the upgraded binary.
+///
+/// `brew services restart` covers the managed install, which is how the README
+/// tells every user to upgrade. An unmanaged daemon (a direct `teton-code`, a
+/// dev build) has no service to restart, so the parenthetical names the manual
+/// equivalent — `teton` autostarts a fresh one from beside its own binary, which
+/// is by construction the build the user just installed.
+const RESTART_REMEDY: &str = "restart it with `brew services restart teton` (or stop the running \
+                              `teton-code` — `teton` starts a fresh one on the next command)";
+/// The command that replaces a stale CLI.
+const UPGRADE_REMEDY: &str = "upgrade it with `brew upgrade teton`";
+
+/// Turn a rejected handshake into a sentence with an action in it.
+///
+/// The version-skew arm is the whole reason this function exists. The socket and
+/// lock filenames are stable across releases (ADR-007), so `brew upgrade teton`
+/// without the matching `brew services restart` leaves a new CLI talking to a
+/// daemon from the previous release — the single commonest way these two
+/// binaries disagree, and one the user resolves in one command *if* anybody
+/// tells them which command.
+///
+/// Anything else is passed through untouched: inventing a remedy for an error
+/// this function does not understand is how a user ends up restarting a daemon
+/// over a problem the restart cannot fix.
+fn explain_handshake_failure(err: RpcError) -> anyhow::Error {
+    if err.code != error_code::UNSUPPORTED_PROTOCOL_VERSION {
+        return anyhow::Error::new(err);
+    }
+    let Some(mismatch) = handshake::VersionMismatch::from_rpc_error(&err) else {
+        // The code says "version", but the bounds did not survive. Name both
+        // remedies in likelihood order rather than guessing at one.
+        return anyhow!(
+            "the daemon refused this client's protocol version ({}). Most often the daemon is \
+             an older build still running after an upgrade — {RESTART_REMEDY}. If it persists, \
+             this CLI is the older half — {UPGRADE_REMEDY}.",
+            err.message
+        );
+    };
+    let client = handshake::format_range(mismatch.client_min, mismatch.client_max);
+    let daemon = handshake::format_range(mismatch.daemon_min, mismatch.daemon_max);
+    match mismatch.skew() {
+        // No daemon *build* version to quote: it only ever arrives in a
+        // successful handshake, and this is the failed one. The protocol number
+        // is the whole of what the rejection carries.
+        Some(handshake::VersionSkew::DaemonIsOlder) => anyhow!(
+            "the running daemon speaks protocol {daemon} but this CLI speaks {client}, so they \
+             share no version and no command can be served. An upgrade replaces the binaries on \
+             disk without restarting a daemon that is already running — {RESTART_REMEDY}."
+        ),
+        Some(handshake::VersionSkew::ClientIsOlder) => anyhow!(
+            "this CLI speaks protocol {client} but the running daemon speaks {daemon}, so they \
+             share no version and no command can be served. The CLI is the older half here — \
+             {UPGRADE_REMEDY}."
+        ),
+        // Disjoint enough for the daemon to refuse, yet not classifiable —
+        // a malformed advertisement. Report it as the version problem it is
+        // without prescribing a fix that may not apply.
+        None => anyhow!(
+            "the daemon refused this client's protocol version: it speaks {daemon} and this CLI \
+             offered {client}. Check that both binaries come from the same release."
+        ),
+    }
+}
+
+/// Explain a daemon reply this build's protocol types could not read.
+///
+/// The version handshake is the real gate, and once both halves are on a build
+/// that has it, this is unreachable for a *released* skew. It stays as the
+/// backstop for the case the handshake cannot catch: two builds that agree on
+/// the protocol version while a shape changed underneath it — exactly the
+/// mistake that produced this bug, whose only symptom was a bare
+/// `missing field \`category\`` with no hint that a daemon restart would fix it.
+fn stale_daemon_hint(method: &str, err: &serde_json::Error) -> anyhow::Error {
+    anyhow!(
+        "the daemon's reply to `{method}` does not match this build's protocol types ({err}). \
+         That means the two binaries disagree about a message shape: the likeliest cause is a \
+         daemon left running from a previous release — {RESTART_REMEDY}."
+    )
+}
+
 /// Render a subscription-lag eviction as a visible error line.
 fn report_lag(err: &RpcError, surface: &mut dyn Surface) {
     surface.line(
@@ -700,9 +782,141 @@ mod tests {
     use std::io::BufWriter;
     use std::os::unix::net::UnixListener;
     use teton_protocol::events::ModelLifecycleStage;
-    use teton_protocol::jsonrpc::error_code;
+    use teton_protocol::handshake::HandshakeError;
+    use teton_protocol::ProtocolVersion;
 
     use crate::render::RecordingSurface;
+
+    /// The rejection a daemon of the given range sends a client of this build —
+    /// produced by the protocol's own negotiator rather than hand-built, so the
+    /// test cannot pass against a `data` payload the daemon never emits.
+    fn rejection_from_daemon(daemon_min: u32, daemon_max: u32) -> RpcError {
+        teton_protocol::handshake::negotiate(
+            ProtocolVersion(daemon_min),
+            ProtocolVersion(daemon_max),
+            PROTOCOL_VERSION_MIN,
+            PROTOCOL_VERSION_MAX,
+        )
+        .map(|v| panic!("expected a rejection, negotiated {v}"))
+        .unwrap_err()
+        .to_rpc_error()
+    }
+
+    /// The released pairing, in the words the user gets.
+    ///
+    /// `brew upgrade teton` without `brew services restart teton` leaves a v1
+    /// daemon (v0.1.10, the last release) answering a v2 CLI on the socket path
+    /// ADR-007 keeps stable. Before the version bump that combination produced
+    /// `missing field \`category\`` and nothing else. The bar here is that the
+    /// replacement is *actionable*: it says who is stale and names the command.
+    #[test]
+    fn a_daemon_left_running_across_an_upgrade_is_told_to_restart() {
+        let text = explain_handshake_failure(rejection_from_daemon(1, 1)).to_string();
+
+        assert!(
+            text.contains("running daemon speaks protocol 1"),
+            "must name the daemon's version: {text}"
+        );
+        assert!(
+            text.contains("this CLI speaks 2"),
+            "must name the CLI's version: {text}"
+        );
+        assert!(
+            text.contains("brew services restart teton"),
+            "the remedy is the point of the message: {text}"
+        );
+        // The cause is the half users get wrong — an upgrade is two steps.
+        assert!(text.contains("without restarting a daemon"), "{text}");
+        // Not a serde error, and not a bare error code.
+        assert!(!text.contains("missing field"), "{text}");
+        assert!(!text.contains("-32000"), "{text}");
+    }
+
+    /// The mirror case needs the opposite remedy: telling someone to restart a
+    /// daemon that is already newer than their CLI sends them in a circle.
+    #[test]
+    fn a_stale_cli_is_told_to_upgrade_itself_not_to_restart_the_daemon() {
+        let future = PROTOCOL_VERSION_MAX.0 + 3;
+        let text = explain_handshake_failure(rejection_from_daemon(future, future)).to_string();
+
+        assert!(text.contains("this CLI speaks protocol 2"), "{text}");
+        assert!(text.contains(&format!("daemon speaks {future}")), "{text}");
+        assert!(text.contains("brew upgrade teton"), "{text}");
+        assert!(
+            !text.contains("brew services restart"),
+            "the restart remedy does not apply and must not be offered: {text}"
+        );
+    }
+
+    /// A daemon that reports the version code without decodable bounds still has
+    /// to leave the user with something to do — but must not fabricate a range.
+    #[test]
+    fn a_version_rejection_without_bounds_still_names_both_remedies() {
+        let bare = RpcError::new(
+            error_code::UNSUPPORTED_PROTOCOL_VERSION,
+            "no mutually supported protocol version",
+        );
+        let text = explain_handshake_failure(bare).to_string();
+
+        assert!(text.contains("brew services restart teton"), "{text}");
+        assert!(text.contains("brew upgrade teton"), "{text}");
+        // Nothing invented: no version number appears at all.
+        assert!(!text.contains("protocol 1"), "{text}");
+        assert!(!text.contains("protocol 2"), "{text}");
+    }
+
+    /// Every other rejection passes through verbatim. A remedy attached to an
+    /// error this code does not understand sends the user to restart a daemon
+    /// over a problem a restart cannot fix.
+    #[test]
+    fn a_non_version_rejection_keeps_its_own_words() {
+        let err = RpcError::new(error_code::INVALID_PARAMS, "invalid handshake params");
+        let text = explain_handshake_failure(err).to_string();
+
+        assert!(text.contains("invalid handshake params"), "{text}");
+        assert!(!text.contains("brew"), "{text}");
+    }
+
+    /// The backstop for a shape that drifts *without* a version bump — the
+    /// mistake that caused this bug. A user who hits it gets the same diagnosis
+    /// as a version skew, because the cause and the fix are the same.
+    #[test]
+    fn an_unreadable_reply_blames_the_stale_daemon_rather_than_leaking_serde() {
+        // The real failure: the v1 routing row, read by the v2 type.
+        let err =
+            serde_json::from_value::<teton_protocol::methods::ConfigSnapshot>(serde_json::json!({
+                "providers": [],
+                "routing": [{"phase": "io", "provider_id": "local"}],
+                "privacy": []
+            }))
+            .unwrap_err();
+        let text = stale_daemon_hint("config/get", &err).to_string();
+
+        assert!(text.contains("config/get"), "{text}");
+        assert!(text.contains("brew services restart teton"), "{text}");
+        assert!(
+            text.contains("previous release"),
+            "must name the cause, not just the symptom: {text}"
+        );
+        // The serde detail is kept — it is the only clue to *which* shape drifted
+        // — but it is no longer the entire message.
+        assert!(text.contains("missing field"), "{text}");
+        assert!(text.len() > err.to_string().len() * 3, "{text}");
+    }
+
+    /// The daemon's own sentence is the fallback for a client too old to decode
+    /// `data`, so it must survive a trip through `anyhow` intact.
+    #[test]
+    fn the_daemons_sentence_reaches_a_client_that_cannot_decode_the_bounds() {
+        let err = HandshakeError::IncompatibleVersion {
+            client_min: ProtocolVersion(1),
+            client_max: ProtocolVersion(1),
+            daemon_min: PROTOCOL_VERSION_MIN,
+            daemon_max: PROTOCOL_VERSION_MAX,
+        };
+        let text = err.to_string();
+        assert!(text.contains("this client is the older build"), "{text}");
+    }
 
     /// A `Connection` whose channel the test feeds directly. `UnixStream::pair`
     /// gives the writer half a real, connected socket without a daemon, so
