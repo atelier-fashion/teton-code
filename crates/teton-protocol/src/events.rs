@@ -18,6 +18,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Category, ClientKind, Phase, ProtocolVersion, ProviderId, RequestId, SessionId, Tier};
 
+/// JSON-RPC notification method every broadcast event is delivered under. Its
+/// params are an [`EventEnvelope`].
+pub const EVENT_METHOD: &str = "event";
+
+/// JSON-RPC notification method the daemon sends before dropping a subscription
+/// it evicted for lagging (see `tetond::broadcast`). Its params are a
+/// [`crate::jsonrpc::RpcError`] carrying
+/// [`crate::jsonrpc::error_code::SUBSCRIPTION_LAGGED`].
+///
+/// Declared here, with the event vocabulary, rather than once per crate: the
+/// daemon's `Notification::new` and the client's method-name match are two
+/// halves of one wire contract, and a copy on each side agrees only until
+/// someone edits one of them.
+pub const SUBSCRIPTION_LAGGED_METHOD: &str = "subscription/lagged";
+
 /// A broadcast event plus its shared envelope metadata.
 ///
 /// The [`Event`] is internally tagged and flattened, so the wire form is a flat

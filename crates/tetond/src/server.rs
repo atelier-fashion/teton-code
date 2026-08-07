@@ -33,7 +33,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use teton_protocol::events::{DaemonClientAttach, Event, PhaseTransition};
+use teton_protocol::events::{
+    DaemonClientAttach, Event, PhaseTransition, EVENT_METHOD, SUBSCRIPTION_LAGGED_METHOD,
+};
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
 use teton_protocol::methods::{
@@ -45,17 +47,12 @@ use teton_protocol::methods::{
 };
 
 use crate::auth;
-use crate::broadcast::{
-    EventBus, Subscription, DEFAULT_CAPACITY, SUBSCRIPTION_LAGGED_CODE, SUBSCRIPTION_LAGGED_METHOD,
-};
+use crate::broadcast::{EventBus, Subscription, DEFAULT_CAPACITY};
 use crate::runtime::DaemonRuntime;
 use crate::sessions::SessionRegistry;
 
 /// Depth of a client's outbound message queue (responses + events).
 const OUTBOUND_CAPACITY: usize = 1024;
-
-/// JSON-RPC method name events are delivered under.
-const EVENT_METHOD: &str = "event";
 
 /// Shared daemon state: the session registry and the event bus.
 ///
@@ -692,7 +689,7 @@ async fn forward_events(
             None => {
                 if sub.is_lagged() {
                     let err = RpcError::new(
-                        SUBSCRIPTION_LAGGED_CODE,
+                        error_code::SUBSCRIPTION_LAGGED,
                         "subscription evicted: the client fell too far behind the event stream",
                     );
                     let note = Notification::new(SUBSCRIPTION_LAGGED_METHOD, err);

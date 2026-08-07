@@ -22,6 +22,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail};
 use serde_json::Value;
 
+use teton_protocol::events::{EVENT_METHOD, SUBSCRIPTION_LAGGED_METHOD};
 use teton_protocol::handshake::{HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{Id, Response, RpcError};
 use teton_protocol::methods::{self, RpcMethod};
@@ -38,10 +39,6 @@ use teton_protocol::socket_path::DaemonPaths;
 const CLIENT_NAME: &str = "teton-cli";
 /// This build's version, advertised in the handshake.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// JSON-RPC method events are delivered under (matches the daemon).
-const EVENT_METHOD: &str = "event";
-/// Method a lag eviction is delivered under (matches `tetond::broadcast`).
-const LAGGED_METHOD: &str = "subscription/lagged";
 /// How many times autostart polls for the socket before giving up.
 const POLL_ATTEMPTS: usize = 50;
 /// Delay between autostart connection attempts.
@@ -493,7 +490,7 @@ fn classify(raw: &str) -> Option<Incoming> {
             let envelope = serde_json::from_value(params).ok()?;
             Some(Incoming::Event(Box::new(envelope)))
         }
-        Some(LAGGED_METHOD) => {
+        Some(SUBSCRIPTION_LAGGED_METHOD) => {
             let params = value.get("params")?.clone();
             let err = serde_json::from_value(params).ok()?;
             Some(Incoming::Lagged(err))
@@ -924,10 +921,15 @@ mod tests {
 
     #[test]
     fn classify_reads_a_lag_notice() {
-        let raw = r#"{"jsonrpc":"2.0","method":"subscription/lagged","params":{
-            "code":-32004,"message":"subscription evicted"}}"#;
-        match classify(raw) {
-            Some(Incoming::Lagged(err)) => assert_eq!(err.code, -32004),
+        let raw = format!(
+            r#"{{"jsonrpc":"2.0","method":"subscription/lagged","params":{{
+            "code":{},"message":"subscription evicted"}}}}"#,
+            error_code::SUBSCRIPTION_LAGGED
+        );
+        match classify(&raw) {
+            Some(Incoming::Lagged(err)) => {
+                assert_eq!(err.code, error_code::SUBSCRIPTION_LAGGED);
+            }
             _ => panic!("expected a lag notice"),
         }
     }
