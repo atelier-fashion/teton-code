@@ -6994,6 +6994,7 @@ provider_id = "on-device"
             // The whole point: unset.
             default_provider: None,
             local_model: teton_core::LocalModelConfig::default(),
+            privacy: teton_core::PrivacyConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -7305,6 +7306,7 @@ provider_id = "on-device"
             pinned_local_model: None,
             default_provider: Some("anthropic".to_owned()),
             local_model: teton_core::LocalModelConfig::default(),
+            privacy: teton_core::PrivacyConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),

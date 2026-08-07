@@ -953,6 +953,7 @@ impl RpcMethod for CostQueryParams {
 mod tests {
     use super::*;
     use crate::events::{ChosenBand, GpuClass, TierBand};
+    use crate::ParseCategoryError;
 
     /// **Mixed-version skew, on the pairing ADR-007 explicitly endorses.**
     ///
@@ -1607,6 +1608,54 @@ mod tests {
             round_trip(&ConfigSetParams { update });
         }
         round_trip(&ConfigSetResult { applied: true });
+    }
+
+    /// REQ-562 AC-4, RPC leg: `config/set` cannot carry a binding for a pinned
+    /// category, and REQ-562's `[privacy]` opt-in does not change that.
+    ///
+    /// This asserts the **protocol** type, which is a different type from the
+    /// config-file `FromStr` path with a different rejection mechanism
+    /// (LESSON-486 #2): the daemon deserializes [`ConfigSetParams`] straight out
+    /// of the request, so the pin here is serde refusing a variant that does not
+    /// exist. The [`ParseCategoryError::RedactIsPinned`] *sentence* belongs to
+    /// `FromStr`, which is the CLI's path — asserted below so the two legs are
+    /// visibly distinct rather than assumed to be one.
+    ///
+    /// The payload is derived from a valid one by swapping only the category
+    /// name, so the test cannot pass because the request was malformed for some
+    /// unrelated reason.
+    #[test]
+    fn a_config_set_payload_naming_a_pinned_category_cannot_be_deserialized() {
+        let valid = ConfigSetParams {
+            update: ConfigUpdate::SetCategoryBinding(CategoryBindingConfig {
+                name: ConfigurableCategory::Review,
+                provider_id: ProviderId::from("on-device"),
+                fallback_id: None,
+            }),
+        };
+        let mut payload = serde_json::to_value(&valid).expect("serialize");
+        assert_eq!(payload["update"]["name"], "review", "payload: {payload}");
+        assert!(
+            serde_json::from_value::<ConfigSetParams>(payload.clone()).is_ok(),
+            "the fixture must be a payload the daemon would otherwise accept"
+        );
+
+        for pinned in ["redact", "route"] {
+            payload["update"]["name"] = serde_json::Value::String(pinned.to_owned());
+            assert!(
+                serde_json::from_value::<ConfigSetParams>(payload.clone()).is_err(),
+                "config/set accepted a binding for the pinned category {pinned}: {payload}"
+            );
+            // The FromStr leg — what `teton policy set-category` parses — names
+            // the pin rather than reading as a typo.
+            assert!(
+                matches!(
+                    pinned.parse::<ConfigurableCategory>(),
+                    Err(ParseCategoryError::RedactIsPinned | ParseCategoryError::RouteIsPinned)
+                ),
+                "{pinned} lost its pinned-category sentence"
+            );
+        }
     }
 
     #[test]
