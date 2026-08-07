@@ -131,16 +131,27 @@ pub struct ToolOutcome {
     /// The files this result was derived from (or `Unknown`). Defaults to no
     /// provenance for tools that surface no repo-file content.
     pub provenance: ToolProvenance,
-    /// **How much this call found, measured before the tool's own cap** — the
-    /// one number [`Tool::refine`]'s duty trigger is decided on, carried beside
-    /// `content` rather than re-derived from it (REQ-561 verify M3).
+    /// **How much this call found** — the one number [`Tool::refine`]'s duty
+    /// trigger is decided on, carried beside `content` rather than re-derived
+    /// from it (REQ-561 verify M3).
     ///
     /// The unit is the measuring tool's own and only that tool's `refine` reads
-    /// it: `grep` counts matching lines (before the 200-match cap), `shell`
-    /// counts characters of stdout+stderr (before the 8,000-character cap).
-    /// `None` means **nothing was measured** — the call did not get far enough
-    /// to produce a result of the kind this number describes, which for `shell`
-    /// is exactly "no command ran".
+    /// it. `None` means **nothing was measured** — the call did not get far
+    /// enough to produce a result of the kind this number describes, which for
+    /// `shell` is exactly "no command ran".
+    ///
+    /// **It is not a total, and only one tool measures past its own cap.** Read
+    /// it as "at least this much", never as "exactly this much":
+    ///
+    /// - `shell` counts characters of stdout+stderr **before** the
+    ///   8,000-character cap, so it is the true length — that is the whole of
+    ///   ADR-5, since the reason to interpret a *successful* command is that the
+    ///   cap threw information away, and a post-cap length could never say so.
+    /// - `grep` counts matching lines, but its search stops walking at the
+    ///   200-match cap, so a 5,000-hit pattern reports about 201. Only
+    ///   `>= TRIAGE_MIN_MATCHES` is asked of it, and that survives the
+    ///   under-count; a caller wanting a hit *total* would have to change the
+    ///   search, not read this field harder.
     ///
     /// It is a field and not a line in `content` because `content` is
     /// *model-visible text*, and every tool that recovered this number by

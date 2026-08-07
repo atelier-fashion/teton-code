@@ -1298,6 +1298,15 @@ jobs:
           # being broken or absent, which is the release tooling in an unknown
           # state, and that does stop the run: those two outcomes have separate
           # exit codes precisely so this step can treat them differently.
+          #
+          # Exit 65 is the third one, and it is why the `*)` arm below is not
+          # decoration. It means the script READ the changelog and will not
+          # publish what it found — an unbalanced fence, headings it cannot
+          # reach, or a section forging this body's own `### Checksums` block.
+          # Every one of those used to arrive as 75, so the notice below would
+          # state that CHANGELOG.md had nothing to publish while the file sat
+          # there full of notes, and the release shipped with the disclosure
+          # gone. The `*)` arm stops the run instead.
           upgrade_notes=""
           notes_status=0
           upgrade_notes="$(bash tools/release/changelog-section.sh)" || notes_status=$?

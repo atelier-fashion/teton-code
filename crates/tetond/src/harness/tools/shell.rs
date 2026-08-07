@@ -124,12 +124,17 @@ impl Tool for ShellTool {
     }
 
     fn run(&self, ctx: &ToolContext, args: &Value) -> ToolOutcome {
-        // The two pre-spawn failures. Both carry no provenance — nothing ran, so
-        // no bytes came off this machine — and, as `ToolOutcome::error` leaves
-        // `measured` at `None`, both are invisible to the `shell` duty. That
-        // `None` is the load-bearing half: a duty asked to interpret "invalid
-        // arguments: missing `command`" with an empty command line is a model
-        // call bought for a harness sentence (REQ-561 verify).
+        // The first two of the three arms that leave `measured` at `None`. All
+        // three carry no provenance — no command output exists, so no bytes came
+        // off this machine — and, as `ToolOutcome::error` leaves `measured`
+        // unset, all three are invisible to the `shell` duty. That `None` is the
+        // load-bearing half: a duty asked to interpret "invalid arguments:
+        // missing `command`" with an empty command line is a model call bought
+        // for a harness sentence (REQ-561 verify).
+        //
+        // The third is the `cmd.spawn()` failure below — the only one of the
+        // three where a launch was actually attempted, and still one where no
+        // command output exists to interpret.
         let command = match str_arg(args, "command") {
             Ok(c) => c,
             Err(e) => return e.into(),
@@ -173,14 +178,20 @@ impl Tool for ShellTool {
         // BR-1 (REQ-544 C-1): a shell command runs arbitrary code, so the daemon
         // cannot know which files its output was derived from. Every result of a
         // command that actually started is therefore tagged UNKNOWN provenance,
-        // which egress fail-closes whenever a boundary is configured. (The
-        // pre-spawn argument/config errors above surface no command output and
-        // carry no provenance.)
+        // which egress fail-closes whenever a boundary is configured. (The three
+        // arms above — two pre-spawn, one failed spawn — surface no command
+        // output and carry no provenance.)
         //
         // Every arm below also *measures* — `Some(n)`, even when `n` is zero —
         // because a spawned command's arms are exactly the arms where a command
         // ran. That is what makes `refine`'s "did a command run at all" question
         // answerable without re-reading the rendered text (REQ-561 verify).
+        //
+        // `Some(0)` answers that question with a yes and the next one with a no:
+        // a command ran, and it captured nothing. `shell_duty::worth_interpreting`
+        // reads the second half and declines, so the three harness-authored
+        // sentences below buy no model call either — the same argument the
+        // `None` above makes, one step further along.
         const NO_OUTPUT_CAPTURED: usize = 0;
         match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
             Ok(Ok(output)) => {
@@ -996,9 +1007,9 @@ mod tests {
                 "{label}: a call that ran no command surfaced no command output"
             );
             assert!(
-                shell_duty::worth_interpreting(raw.is_error, 0),
-                "{label}: non-vacuity — the trigger predicate itself says yes, so the \
-                 gate under test is what refuses"
+                shell_duty::worth_interpreting(raw.is_error, 1),
+                "{label}: non-vacuity — this failure would be worth interpreting if it \
+                 had said anything, so what refuses here is the missing measurement"
             );
             assert_eq!(
                 calls.load(Ordering::SeqCst),
@@ -1007,6 +1018,75 @@ mod tests {
             );
             assert_eq!(refined.outcome, raw, "{label}");
             assert_eq!(refined.duty_error, None, "{label}");
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// **A failure with nothing to say buys no model call either** (REQ-561
+    /// verify).
+    ///
+    /// The `measured` gate above stops the arms where no command ran. It does
+    /// not stop the arms where a command ran and captured **nothing** — those
+    /// measure `Some(0)`, so the old `failed || oversize` predicate said yes and
+    /// the duty was handed one of three sentences the *harness* wrote:
+    /// `command timed out after 50ms and was killed`, `command failed to run: …`,
+    /// `command watcher disconnected`. That is the same purchase the `measured`
+    /// gate exists to decline, made one step further along, and it is what the
+    /// empty-output arm of [`shell_duty::worth_interpreting`] now refuses.
+    ///
+    /// The silent non-zero exit is in the same set and reaches it by a different
+    /// route: `test -f missing` fails with an empty body, so what a duty would
+    /// be given is a command line and `(exit 1)`.
+    ///
+    /// The last row is the non-vacuity, and it is the one that keeps this
+    /// honest: the *same* failing command with one line of output still fires.
+    /// What was removed is the empty case, not the failure trigger.
+    #[tokio::test]
+    async fn a_failure_that_captured_no_output_is_not_worth_interpreting() {
+        for (label, args, expected_calls) in [
+            (
+                "timed out and was killed",
+                json!({ "command": "sleep 5", "timeout_ms": 50 }),
+                0usize,
+            ),
+            ("non-zero exit, silent", json!({ "command": "exit 3" }), 0),
+            (
+                "non-zero exit, with something to read",
+                json!({ "command": "echo boom >&2; exit 3" }),
+                1,
+            ),
+        ] {
+            let root = temp_root(&format!("silent-{expected_calls}-{}", label.len()));
+            let (route, calls) = counting_route("Something went wrong.");
+            let (raw, refined) = run_and_refine(&root, &args, &route).await;
+
+            assert!(raw.is_error, "{label}: the fixture must be a failure");
+            assert!(
+                raw.measured.is_some(),
+                "{label}: a command that reached a shell always measures"
+            );
+            assert_eq!(
+                raw.measured == Some(0),
+                expected_calls == 0,
+                "{label}: the fixture is not on the side of 'captured nothing' the row says"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_calls,
+                "{label}: expected {expected_calls} model call(s)"
+            );
+            if expected_calls == 0 {
+                assert_eq!(
+                    refined.outcome, raw,
+                    "{label}: a result no duty was made for must come back untouched"
+                );
+                assert_eq!(refined.duty_error, None, "{label}");
+            } else {
+                assert!(
+                    refined.outcome.content.starts_with("[shell: "),
+                    "{label}: the failure trigger itself must still work"
+                );
+            }
             std::fs::remove_dir_all(&root).ok();
         }
     }

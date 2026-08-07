@@ -12,15 +12,24 @@
 //! every `cargo check`, every `git status`. A duty that fired on all of them
 //! would put a model call behind every command the agent runs, which is a cost
 //! nobody asked for and a latency everybody would feel. So it fires on exactly
-//! the two results a weak model cannot read for itself (BR-4b):
+//! the two results a weak model cannot read for itself (BR-4b) — and, in both
+//! cases, only when the command produced output to read:
 //!
-//! - **the command failed** — a non-zero exit, a timeout, a call that never
-//!   started. The output is a stack trace or a compiler wall, and what the model
-//!   needs out of it is one sentence: what broke.
+//! - **the command failed** — a non-zero exit, or a command that started and
+//!   then did not come back cleanly. The output is a stack trace or a compiler
+//!   wall, and what the model needs out of it is one sentence: what broke.
 //! - **the output was capped** — the raw stdout+stderr ran past
 //!   [`SHELL_TRIGGER_OUTPUT_CHARS`], so the tool threw the rest away and what
 //!   entered context is a fragment of a thing. Interpretation is the only way to
 //!   recover what the fragment was part of.
+//!
+//! **A call that never reached a shell is not in either set.** A missing
+//! `command` argument or an unreachable repo root produces a fixed harness
+//! sentence and no command line at all; those arms measure nothing
+//! ([`ToolOutcome::measured`](super::tools::ToolOutcome)) and
+//! [`tools::shell`](super::tools::shell)'s `refine` returns before this
+//! module is consulted. Neither is a result with **no captured output**, for the
+//! same reason one step later — see [`worth_interpreting`].
 //!
 //! A short successful command is returned **verbatim, with no model call at
 //! all**. That negative case is the cost argument, and it is asserted by call
@@ -167,16 +176,37 @@ const SHELL_OUTPUT_PROMPT_MAX_BYTES: usize = 12_288;
 
 /// Whether a finished `shell` result is worth a model call (BR-4b).
 ///
-/// `failed` is the tool's own error flag — a non-zero exit, a timeout, a command
-/// that never started. `raw_output_chars` is the length of the stdout+stderr the
+/// `failed` is the tool's own error flag — a non-zero exit, or a command that
+/// started and then did not come back cleanly (a timeout, a watcher that
+/// disconnected). `raw_output_chars` is the length of the stdout+stderr the
 /// command really produced, **before** the tool capped it (ADR-5); a result the
 /// cap never touched supplies a length that cannot be oversize, which is the
 /// honest answer for it.
 ///
 /// The negative case is the cost argument: a session running `ls`, `git status`
 /// and a passing `cargo check` pays nothing at all.
+///
+/// ## Nothing to read is nothing to interpret (REQ-561 verify)
+///
+/// A result with **no captured output** buys no call, whatever its exit status.
+/// This duty's job is stated as reading what a command *said*; with an empty
+/// body there is nothing for it to read, and what it would be handed instead is
+/// a sentence the harness wrote — `command timed out after 30000ms and was
+/// killed`, `command watcher disconnected`, or a bare `(exit 1)` from something
+/// like `test -f missing`. Those are already one legible line. Paraphrasing them
+/// is the same purchase [`ToolOutcome::measured`](super::tools::ToolOutcome)
+/// declines for the pre-spawn arms — a model call bought for text the harness
+/// authored — and declining it there while making it here was one argument
+/// applied to two halves of one set.
+///
+/// The gate costs nothing real: a command that failed with something to say has
+/// something to say, and the size arm is unaffected, since output past the cap
+/// is output.
 #[must_use]
 pub const fn worth_interpreting(failed: bool, raw_output_chars: usize) -> bool {
+    if raw_output_chars == 0 {
+        return false;
+    }
     failed || raw_output_chars > SHELL_TRIGGER_OUTPUT_CHARS
 }
 

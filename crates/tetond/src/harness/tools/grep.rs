@@ -187,8 +187,16 @@ impl Tool for GrepTool {
         match ranked {
             Ok(order) => {
                 let content = render_ranked(&matches, &order, capped);
-                let tagged = outcome.provenance.clone();
-                RefinedOutcome::unrefined(ToolOutcome::ok(content).with_provenance(tagged))
+                // Rebuilt by *update*, not from scratch — the same shape
+                // `ShellTool::refine` uses, and for a reason that outlives
+                // today's caller. `ToolOutcome::ok(content)` would reset
+                // `measured` to `None`, which means "this call never got far
+                // enough to produce a result of this kind" — the exact opposite
+                // of the truth for a ranked 200-match search — and would drop
+                // `is_error` and the provenance with it. Only `content` changed
+                // here; everything the outcome already knew about itself rides
+                // through (REQ-561 verify).
+                RefinedOutcome::unrefined(ToolOutcome { content, ..outcome })
             }
             Err(error) => RefinedOutcome::degraded(outcome, error),
         }
@@ -635,6 +643,50 @@ mod tests {
             .outcome
             .content
             .starts_with("[triage: 1 of 6 matches"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **Ranking edits the content and nothing else** (REQ-561 verify).
+    ///
+    /// The refined outcome used to be rebuilt with `ToolOutcome::ok(content)`
+    /// and the provenance re-attached by hand, which silently reset `measured`
+    /// to `None`. `None` is not "unknown" — it is defined as *the call did not
+    /// get far enough to produce a result of this kind*, which for a ranked
+    /// 200-match search is the exact opposite of the truth. Nothing downstream
+    /// reads it today ([`super::super::turn_loop`] discards the field), so this
+    /// is a claim the type makes about itself going wrong quietly, which is the
+    /// kind that outlives the person who introduced it.
+    ///
+    /// [`super::shell::ShellTool::refine`] rebuilds by update (`..outcome`) and
+    /// always did. This pins `grep` to the same rule: after a ranking, the only
+    /// field that may differ from what `run` produced is `content`.
+    #[tokio::test]
+    async fn a_ranked_result_still_reports_what_the_search_measured() {
+        let root = repo_with_matches("measured-survives", 6, 1);
+        let args = json!({ "pattern": "needle" });
+        let route = local_route("2");
+
+        let (raw, refined) = run_and_refine(&root, &args, &route).await;
+
+        assert_eq!(refined.duty_error, None, "the fixture must reach the duty");
+        assert_ne!(
+            refined.outcome.content, raw.content,
+            "non-vacuity: the ranking really did rewrite the content"
+        );
+        assert_eq!(
+            raw.measured,
+            Some(6),
+            "the fixture must offer a measurement to preserve"
+        );
+        assert_eq!(
+            refined.outcome.measured, raw.measured,
+            "ranking a search does not un-measure it"
+        );
+        assert_eq!(
+            refined.outcome.provenance, raw.provenance,
+            "nor does it change which files the result came from"
+        );
+        assert_eq!(refined.outcome.is_error, raw.is_error);
         std::fs::remove_dir_all(&root).ok();
     }
 

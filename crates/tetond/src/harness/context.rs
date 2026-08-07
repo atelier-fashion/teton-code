@@ -257,8 +257,16 @@ struct CompactionGate {
     /// about the failure is fold-dependent, and nothing about the budget depends
     /// on the answer (ADR-4), so the second ask buys nothing the first did not.
     failed: bool,
-    /// [`ContextManager::estimated_bytes`] immediately after the last compaction
-    /// this manager applied, or `None` if none has been.
+    /// The **low-water mark** the regrowth gate measures from: the smallest
+    /// [`ContextManager::estimated_bytes`] this context has been since the last
+    /// compaction it applied, or `None` if none has been.
+    ///
+    /// Set at the commit and lowered again by
+    /// [`ContextManager::truncate_to_budget`], which is the only other thing
+    /// that shrinks a context. Not simply "the size at the commit": that number
+    /// can sit above the budget ceiling the deterministic drop then enforces, in
+    /// which case a threshold built on it is unreachable and compaction is
+    /// retired rather than paced. See `truncate_to_budget`'s own doc.
     committed_bytes: Option<usize>,
 }
 
@@ -608,9 +616,12 @@ impl ContextManager {
     ///   that is already degrading.
     /// - **A success is not repeated until the context has grown back**, by
     ///   [`COMPACT_REGROWTH_PERCENT`](super::compact::COMPACT_REGROWTH_PERCENT)
-    ///   of the byte budget. Re-deciding a conversation that has grown by one
-    ///   small tool result is a model call bought for a decision that cannot
-    ///   have changed.
+    ///   of the byte budget, measured from the smallest the context has been
+    ///   since that compaction — not from the size it committed at. Re-deciding
+    ///   a conversation that has grown by one small tool result is a model call
+    ///   bought for a decision that cannot have changed; measuring from a mark
+    ///   the deterministic drop has since moved past would decline forever
+    ///   instead, which is a different thing (see [`Self::truncate_to_budget`]).
     ///
     /// Neither weakens ADR-4: `truncate_to_budget` still runs unconditionally
     /// after every fold, so a turn that stops asking still ends under budget.
@@ -810,6 +821,27 @@ impl ContextManager {
     /// elision marker. The assembled prompt is therefore bounded in bytes no
     /// matter what any single block carries: the turn degrades instead of
     /// handing the engine an over-window prompt it can only refuse.
+    ///
+    /// ## It re-baselines the regrowth mark (REQ-561 verify)
+    ///
+    /// This method only ever makes the context *smaller*, and the size it leaves
+    /// behind is the one the next
+    /// [`compact_if_pressured`](Self::compact_if_pressured) has to have grown
+    /// from. Leaving the mark where the last compaction set it made the gate
+    /// unreachable rather than merely patient: this method holds
+    /// `estimated_bytes() <= budget_bytes`, so a compaction that committed above
+    /// `(100 − COMPACT_REGROWTH_PERCENT)%` of the budget — a tight one, which is
+    /// to say a *successful* one — put the threshold at or past the budget and
+    /// retired compaction for the whole turn. Budget safety never depended on
+    /// that (the unconditional call below is what enforces it), but every later
+    /// fold then fell back to the oldest-first drop with no model asked, which
+    /// is not what ADR-11 describes.
+    ///
+    /// The mark is lowered, never raised: it is the context's **low-water mark**
+    /// since the last compaction, so growth is measured from the floor the
+    /// context actually reached. Untouched when nothing has been compacted this
+    /// turn — a `None` mark means the first compaction has yet to be bought, and
+    /// nothing here should buy it.
     pub fn truncate_to_budget(&mut self) {
         while (self.estimated_tokens() > self.budget_tokens
             || self.estimated_bytes() > self.budget_bytes)
@@ -833,6 +865,11 @@ impl ContextManager {
                     last.text = truncate_middle(&last.text, room);
                 }
             }
+        }
+        // Read after both shrink steps, so it is the size this method really
+        // left behind rather than the one it started from.
+        if let Some(committed) = self.compaction.committed_bytes {
+            self.compaction.committed_bytes = Some(committed.min(self.estimated_bytes()));
         }
     }
 
@@ -2358,6 +2395,75 @@ mod tests {
             2,
             "the gate is a margin, not a one-shot latch: real growth must still \
              be worth a decision"
+        );
+    }
+
+    /// **The regrowth mark must stay reachable** (REQ-561 verify).
+    ///
+    /// The gate above is meant to *pace* compaction, not retire it. Measured
+    /// from the absolute size the last compaction committed at, it did the
+    /// second thing whenever that compaction was a tight one: the mark is
+    /// recorded before the unconditional `truncate_to_budget` that follows it in
+    /// the loop, and that call holds `estimated_bytes() <= budget_bytes`. So a
+    /// compaction committing above `(100 − COMPACT_REGROWTH_PERCENT)%` of the
+    /// budget — 3,600 B of 4,000 here — sets a threshold at or past the budget,
+    /// and the deterministic drop then keeps the context on the wrong side of it
+    /// fold after fold. One successful compaction, and no further decision is
+    /// ever bought for that turn.
+    ///
+    /// The budget was never at risk (ADR-4's unconditional gate is what holds
+    /// it) — what was lost is that every later fold was chosen oldest-first by
+    /// the harness rather than by a model, silently, on a turn that had already
+    /// paid to establish that a model's choice was worth having.
+    ///
+    /// The fixture is arranged so the stale rule declines **every** fold, which
+    /// is asserted rather than assumed; with the mark re-baselined to the size
+    /// the context was actually left at, real growth re-earns a decision.
+    #[tokio::test]
+    async fn a_tight_compaction_does_not_retire_compaction_for_the_rest_of_the_turn() {
+        const FOLDS: usize = 4;
+        const FOLD_CHARS: usize = 300;
+        let margin = TEST_BUDGET_BYTES * COMPACT_REGROWTH_PERCENT / 100;
+
+        // Six 1 KB blocks, forgetting three: a compaction that works and lands
+        // just under budget, which is what a compaction under real pressure
+        // looks like.
+        let mut ctx = conversation(6, 1_000);
+        let (route, calls) = stub(StubAnswer::Says(forget_first(3)));
+
+        assert!(!ctx.compact_if_pressured(&route).await.degraded);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        let committed = ctx.estimated_bytes();
+        assert!(
+            committed > TEST_BUDGET_BYTES - margin,
+            "non-vacuity: this fixture must commit TIGHTLY ({committed} B of a \
+             {TEST_BUDGET_BYTES} B budget), or the stale mark is reachable and there \
+             is nothing here to break"
+        );
+
+        // The turn loop's own order, four folds of it: fold, ask, truncate.
+        for fold in 0..FOLDS {
+            ctx.push_tool_result("read", None, "y".repeat(FOLD_CHARS));
+            let before = ctx.estimated_bytes();
+            assert!(
+                !worth_compacting_again(before, committed, TEST_BUDGET_BYTES),
+                "fold {fold}: the fixture must sit under the STALE threshold \
+                 ({before} B against {} B), or this passes without the re-baseline",
+                committed + margin
+            );
+            let _ = ctx.compact_if_pressured(&route).await;
+            ctx.truncate_to_budget();
+            assert!(
+                ctx.estimated_bytes() <= TEST_BUDGET_BYTES,
+                "fold {fold}: the budget is held throughout, by the gate that always held it"
+            );
+        }
+
+        assert!(
+            calls.load(AtomicOrdering::SeqCst) > 1,
+            "one tight compaction retired the duty for the whole turn: {} folds of \
+             real growth bought no further decision",
+            FOLDS
         );
     }
 

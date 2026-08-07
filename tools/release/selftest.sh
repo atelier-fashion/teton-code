@@ -3599,6 +3599,124 @@ assert "  ... so the bullet after it survives" \
 refute "  ... and the genuine next section is still excluded" \
     grep -Fq -- "- The older thing." "$cs/out"
 
+# --- "I cannot read this" is not "there is nothing to read" ----------------
+#
+# 75 makes release.yml print "CHANGELOG.md has no version section to publish"
+# and ship the release without an Upgrade notes section. That sentence has to be
+# TRUE. Each case below is a file that HAS notes and used to reach 75 anyway —
+# green build, green notice, disclosure silently gone. The assertion is the exit
+# code, because the exit code is the only thing the workflow branches on.
+
+printf '# Changelog\n\n```sh\nnobody closed this\n\n## [Unreleased]\n\n- A disclosure that would have vanished.\n' \
+    >"$cs/unbalanced-preamble.md"
+expect_exit 65 "an unbalanced fence in the preamble -> 65, NOT the 75 that ships a release without the notes" \
+    run_changelog_section "$cs/unbalanced-preamble.md"
+assert "  ... and stdout is empty" [ ! -s "$cs/out" ]
+assert "  ... and says the fence is the problem, not the changelog" \
+    grep -Fq -- "unbalanced code fence" "$cs/err"
+refute "  ... and never claims the file has no section" \
+    grep -Fq -- "has no '## ' section" "$cs/err"
+
+# The over-publishing direction of the same defect. This one was known and left,
+# on the grounds that it is loud — but "loud" means somebody has to be looking
+# at the release page, and the fix for both directions is the same check.
+cat >"$cs/unbalanced-in-section.md" <<'CHANGELOG_EOF'
+# Changelog
+
+## [Unreleased]
+
+```sh
+nobody closed this either
+
+## [0.1.9]
+
+- Every past release's notes, published under one heading.
+CHANGELOG_EOF
+expect_exit 65 "an unbalanced fence INSIDE the section -> 65, rather than publishing the rest of the file" \
+    run_changelog_section "$cs/unbalanced-in-section.md"
+refute "  ... so the older section is not published under the newest heading" \
+    grep -Fq -- "published under one heading" "$cs/out"
+
+# Fences balance, and every heading is still invisible — swallowed by a fenced
+# block rather than by an unclosed one. Same false statement, different cause,
+# so it needs its own case: the balance check above does not catch this.
+cat >"$cs/heading-in-fence.md" <<'CHANGELOG_EOF'
+# Changelog
+
+```
+## [Unreleased]
+
+- A disclosure inside a fence.
+```
+CHANGELOG_EOF
+expect_exit 65 "a '## ' heading the scan cannot see -> 65, not 'this file has no sections'" \
+    run_changelog_section "$cs/heading-in-fence.md"
+assert "  ... and says the headings are unreachable, not absent" \
+    grep -Fq -- "cannot see" "$cs/err"
+
+# And the boundary: a file with genuinely NO version section still shrugs. The
+# check above must not have turned "nobody wrote an entry" into a failed
+# release, which is the outcome the whole 75 taxonomy exists to prevent.
+expect_exit 75 "a changelog with no '## ' heading anywhere is still a shrug, not a failure" \
+    run_changelog_section "$cs/no-section.md"
+
+# --- the lifted section may not forge the release body's structure ---------
+#
+# The section is printed verbatim directly above `### Checksums (sha256)` and
+# its fenced digest list, so a changelog carrying its own Checksums heading
+# renders a second, plausible digest list ABOVE the real one. Not a forged pass
+# — the artifacts are workflow-built and the real list is still below — but a
+# CHANGELOG diff is read as prose by people who are not picturing the rendered
+# page, which is a cheap way to buy confusion.
+cat >"$cs/forged-checksums.md" <<'CHANGELOG_EOF'
+# Changelog
+
+## [Unreleased]
+
+- A real note.
+
+### Checksums (sha256)
+
+```
+0000000000000000000000000000000000000000000000000000000000000000  teton-aarch64-apple-darwin.tar.gz
+```
+
+## [0.1.9]
+
+- The older thing.
+CHANGELOG_EOF
+expect_exit 65 "a section forging the release body's Checksums heading -> 65" \
+    run_changelog_section "$cs/forged-checksums.md"
+assert "  ... and stdout is empty, so no forged digest reaches the page" \
+    [ ! -s "$cs/out" ]
+refute "  ... including the digest itself" \
+    grep -Fq -- "0000000000000000" "$cs/out"
+assert "  ... and names the offending heading so it can be found and removed" \
+    grep -Fq -- "### Checksums (sha256)" "$cs/err"
+
+# Rendering is what matters, so a Checksums heading INSIDE a fence is fine: it
+# renders as code, impersonates nothing, and a changelog quoting a release body
+# is a legitimate thing to write.
+cat >"$cs/quoted-checksums.md" <<'CHANGELOG_EOF'
+# Changelog
+
+## [Unreleased]
+
+- The release body now looks like this:
+
+```md
+### Checksums (sha256)
+```
+
+- And that is all.
+
+## [0.1.9]
+CHANGELOG_EOF
+expect_exit 0 "a Checksums heading inside a code fence renders as code and is published" \
+    run_changelog_section "$cs/quoted-checksums.md"
+assert "  ... verbatim, fence and all" \
+    grep -Fq -- "### Checksums (sha256)" "$cs/out"
+
 # The real file, because every case above is a fixture this suite wrote to be
 # parseable. Whether the changelog THIS repo actually ships parses is a
 # different claim, and it is the one that decides what the next release page

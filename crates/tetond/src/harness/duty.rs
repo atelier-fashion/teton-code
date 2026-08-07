@@ -115,6 +115,7 @@
 //! | [`LocalDuty::perform`] returns the engine's answer unbounded | `harness::title::tests::a_local_title_duty_is_bounded_however_much_the_engine_generates`, `…::a_runaway_local_answer_still_names_the_session_within_the_ceiling`, `harness::shell_duty::tests::a_local_shell_duty_is_bounded_however_much_the_engine_generates`, [`tests::the_duty_path_has_one_egress_scoping_call_and_one_ceiling_site`] |
 //! | either leg asks for `GenParams::default().max_tokens` instead of [`DutyKind::max_tokens`] | local: `harness::compact::tests::a_local_compaction_may_write_the_paragraph_its_ceiling_allows`; remote: `harness::title::tests::an_unbounded_machine_sends_the_title_prompt_and_returns_its_answer` |
 //! | [`DutyRoute::perform`] loses its [`DUTY_DEADLINE`] | [`tests::a_duty_that_never_answers_fails_at_the_deadline`] — which then **hangs** rather than failing, exactly as the turn it is on would |
+//! | `MeteredBody` loses its `Drop` impl, so the deadline buys calls off-ledger | [`tests::a_duty_cut_off_at_the_deadline_is_still_on_the_ledger`], `cost::ledger::tests::a_stream_abandoned_mid_flight_still_bills_what_the_provider_reported` |
 //! | [`Egress::scoped`] is handed an empty provenance instead of the content's (BR-7) | six per-duty boundary tests, every test in `tests/duty_egress.rs`, and `tests/duty_matrix.rs::every_duty_holds_…` |
 //! | a duty module grows a category from a tool name (`if name == "grep" { … }`) | [`tests::no_duty_category_is_ever_produced_from_text`] |
 //! | a per-category route enum grows back (BR-6) | [`tests::one_route_type_one_trait_and_two_implementations_serve_every_duty`] |
@@ -125,14 +126,26 @@
 //!
 //! Past the ceiling [`RemoteDuty::perform`] stops *accumulating* but keeps
 //! draining the provider's stream. Breaking out instead looks like the obvious
-//! saving and is not: `MeteredBody` records its `CostRecord` on the terminal
-//! `None` of the response body and has no `Drop` fallback, and both supported
-//! provider families report usage only in their **final** chunk — so an early
-//! break unbills the call. The ceilings are tight enough (`title`'s is 128 bytes)
-//! that ordinary chatty answers cross them, which would make "overran its
-//! ceiling" and "was never billed" the same set. The unbounded *wait* was the
-//! real harm and [`DUTY_DEADLINE`] is what bounds it; memory is already bounded,
-//! because the accumulator stops growing.
+//! saving, and the reason it is not has moved but not gone away.
+//!
+//! It used to be that an early break **unbilled the call outright**:
+//! `MeteredBody` recorded on the terminal `None` of the response body and had no
+//! `Drop` fallback. That was a hole rather than a trade — [`DUTY_DEADLINE`] hit
+//! it too, since `tokio::time::timeout` drops the future that owns the body — so
+//! it is closed at the meter, where cancellation safety belongs, and a dropped
+//! body now records what it saw.
+//!
+//! What survives is an accuracy argument. Both supported provider families
+//! report **output** tokens only in their final chunk (Anthropic's terminal
+//! `message_delta`, OpenAI's terminal usage chunk), so a stream cut short is
+//! billed for its input and for whatever output was reported by then — real, but
+//! short. The ceilings are tight enough (`title`'s is 128 bytes) that ordinary
+//! chatty answers cross them, which would make "overran its ceiling" and
+//! "under-billed" the same set — and a systematic under-count reads as a
+//! cheaper harness rather than as a bug. Draining costs bytes off a socket
+//! already open; memory is bounded either way, because the accumulator stops
+//! growing. The unbounded *wait* was the real harm and the deadline is what
+//! bounds it.
 //!
 //! ## One mutation came back green, and it is recorded rather than fixed
 //!
@@ -1187,6 +1200,145 @@ mod tests {
         assert!(
             started.elapsed() >= DUTY_DEADLINE,
             "the wait really was the deadline's, not something shorter"
+        );
+    }
+
+    /// **The deadline must not buy calls off the ledger** (REQ-561 verify).
+    ///
+    /// `tokio::time::timeout` does not cancel the work, it **drops the future**
+    /// — and for a [`RemoteDuty`] that future owns the `TurnStream`, and through
+    /// it the `MeteredBody` the choke point wrapped the response in. So the
+    /// exact thing the deadline is for — a provider slow enough, or adversarial
+    /// enough, to sit past two minutes — was also the thing that made its calls
+    /// invisible: the request left the machine, the provider reported the input
+    /// tokens it was charging for, and no `CostRecord` was ever written. Serving
+    /// duties off-ledger indefinitely needed nothing more than stalling.
+    ///
+    /// This is the whole path, not the unit: a real [`Egress`] with a real
+    /// [`CostLedger`] behind it, a provider that puts its prompt on the wire and
+    /// streams the response body back, and [`DutyRoute::perform`]'s own
+    /// deadline. Deleting `MeteredBody`'s `Drop` impl leaves the duty failing
+    /// exactly as it does here and the ledger empty.
+    #[tokio::test(start_paused = true)]
+    async fn a_duty_cut_off_at_the_deadline_is_still_on_the_ledger() {
+        use futures::StreamExt;
+        use teton_providers::transport::{
+            ByteStream, HttpMethod, TransportError, TransportRequest, TransportResponse,
+        };
+        use teton_providers::{
+            CapabilityProfile, Provider, ProviderError, TurnEvent, TurnRequest, TurnStream,
+        };
+
+        use crate::cost::{CostLedger, CostMeter, NoopCostSink, PriceTable};
+        use crate::egress::{Egress, NoopSink};
+
+        /// A transport whose response starts and then stops: the usage the
+        /// provider has already reported, and then nothing, forever.
+        struct StallingTransport;
+
+        #[async_trait]
+        impl teton_providers::Transport for StallingTransport {
+            async fn execute(
+                &self,
+                _request: TransportRequest,
+            ) -> Result<TransportResponse, TransportError> {
+                let first: Result<Vec<u8>, TransportError> = Ok(b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":900,\"output_tokens\":1}}}\n\n".to_vec());
+                let body: ByteStream =
+                    Box::pin(futures::stream::iter(vec![first]).chain(futures::stream::pending()));
+                Ok(TransportResponse { status: 200, body })
+            }
+        }
+
+        /// A provider that behaves like the real adapters: it sends through the
+        /// transport it was handed and builds its `TurnStream` **from the
+        /// response body**, so the body's lifetime is the duty future's. A
+        /// fixture that dropped the response and answered from a canned list
+        /// would pass this test with the fix reverted.
+        struct StreamsTheBody;
+
+        #[async_trait]
+        impl Provider for StreamsTheBody {
+            fn id(&self) -> &str {
+                "stalling"
+            }
+            fn capabilities(&self) -> CapabilityProfile {
+                CapabilityProfile::default()
+            }
+            async fn stream_turn(
+                &self,
+                request: TurnRequest,
+                transport: &dyn teton_providers::Transport,
+            ) -> Result<TurnStream, ProviderError> {
+                let body = serde_json::to_vec(&request)
+                    .map_err(|e| ProviderError::Build(e.to_string()))?;
+                let response = transport
+                    .execute(TransportRequest {
+                        method: HttpMethod::Post,
+                        url: "https://api.example.com/v1/messages".to_owned(),
+                        headers: Vec::new(),
+                        body,
+                    })
+                    .await
+                    .map_err(|_| ProviderError::Transport)?;
+                // The body is folded into the returned stream, so it lives
+                // exactly as long as whoever holds that stream — which is the
+                // duty future the deadline drops.
+                Ok(Box::pin(futures::stream::unfold(
+                    response.body,
+                    |mut body| async move {
+                        let chunk = body.next().await?;
+                        let event = match chunk {
+                            Ok(bytes) => {
+                                Ok(TurnEvent::TextDelta(String::from_utf8_lossy(&bytes).into()))
+                            }
+                            Err(_) => Err(ProviderError::Transport),
+                        };
+                        Some((event, body))
+                    },
+                )))
+            }
+        }
+
+        let ledger = Arc::new(
+            CostLedger::open_in_memory(PriceTable::bundled(), Arc::new(NoopCostSink))
+                .expect("in-memory ledger"),
+        );
+        let egress = Egress::new(StallingTransport, Vec::new(), Arc::new(NoopSink))
+            .with_cost_meter(Arc::clone(&ledger) as Arc<dyn CostMeter>);
+        let route = DutyRoute::remote(
+            super::super::title::TITLE_DUTY,
+            "frontier",
+            Box::new(StreamsTheBody),
+            egress,
+            "claude-opus-4",
+            "sess-stalled",
+        );
+
+        let err = route
+            .perform("name this session", &Provenance::empty())
+            .await
+            .expect_err("a provider that never finishes cannot have answered");
+        assert!(
+            err.contains("did not answer within"),
+            "non-vacuity: this is the deadline firing, not a transport error: {err}"
+        );
+
+        let rows = ledger.all_records().expect("read the ledger");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a duty call that went out and burned tokens must appear on the ledger \
+             even when the wait was cut short"
+        );
+        assert_eq!(rows[0].session_id, "sess-stalled");
+        assert_eq!(
+            rows[0].category,
+            Some(Category::Title),
+            "attributed to the duty that made it (BR-2)"
+        );
+        assert_eq!(
+            rows[0].input_tokens, 900,
+            "at the tokens the provider had already reported, not at zero"
         );
     }
 

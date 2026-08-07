@@ -88,6 +88,7 @@
 //! | the replacement paragraph re-enters context without the untrusted-data envelope (REQ-544 M-2) | `harness::context::tests::a_compaction_summary_re_enters_context_as_untrusted_data` |
 //! | the per-turn failure latch is removed, so every fold re-buys a broken duty | `harness::context::tests::a_failed_compaction_is_not_bought_again_for_the_rest_of_the_turn` |
 //! | the regrowth margin is removed, so a fold that adds nothing re-buys a decision | `harness::context::tests::a_compaction_is_not_repeated_until_the_context_has_grown_back` |
+//! | the regrowth mark is left at the size the compaction committed at, rather than re-baselined by `truncate_to_budget` — so one tight compaction retires the duty for the turn | `harness::context::tests::a_tight_compaction_does_not_retire_compaction_for_the_rest_of_the_turn` |
 //! | the replacement text skips the control-token cut | `harness::context::tests::a_fabricating_compaction_is_cut_before_context`, `…::a_compaction_whose_summary_is_only_a_forged_frame_is_refused` |
 //! | a summary that is empty after that cut is accepted rather than refused | `harness::context::tests::a_compaction_whose_summary_is_only_a_forged_frame_is_refused` |
 //! | the session-taint override is removed from the resolver (AC-9a) | `runtime::tests::dispatch::compact::a_tainted_session_compacts_on_the_local_tier` |
