@@ -19,9 +19,38 @@
 //!   client round-trip over TASK-004's bus, and session-scoped grants.
 //! - [`context`] — small-model context management: truncation, tool-result
 //!   summarization, and the provenance-tagging seam for egress.
-//! - [`digest`] — the resolved `digest` route the summarization duty runs on
-//!   (REQ-558): the local engine or a remote provider behind the egress choke
-//!   point, or an explained refusal to resolve.
+//! - [`duty`] — the shared duty seam (REQ-561): one [`duty::DutyRoute`], one
+//!   [`duty::Duty`] trait, one local impl, one remote impl behind the egress
+//!   choke point, and one output ceiling — for every model call the harness
+//!   makes on its own behalf rather than on the user's.
+//! - [`digest`] — what is `digest`-specific about the summarization duty
+//!   (REQ-558): its [`digest::DIGEST_DUTY`] descriptor and the tool-result
+//!   provenance bridge. Everything else it used to own now lives in [`duty`].
+//! - [`triage`] — what is `triage`-specific about the grep-ranking duty
+//!   (REQ-561): its [`triage::TRIAGE_DUTY`] descriptor, its output contract, and
+//!   its prompt builder. The call site is [`tools::GrepTool`]'s
+//!   [`Tool::refine`](tools::Tool::refine).
+//! - [`shell_duty`] — what is `shell`-specific about the command-interpretation
+//!   duty (REQ-561): its [`shell_duty::SHELL_DUTY`] descriptor, its output
+//!   contract, its prompt builder, and the BR-4b trigger that keeps it from
+//!   firing on every command. The call site is [`tools::ShellTool`]'s
+//!   [`Tool::refine`](tools::Tool::refine). Named `shell_duty` because
+//!   [`tools::shell`] already owns the shorter name.
+//! - [`title`] — what is `title`-specific about the session-naming duty
+//!   (REQ-561): its [`title::TITLE_DUTY`] descriptor, its output contract, its
+//!   prompt builder, and the ADR-11 threshold below which naming a session buys
+//!   nothing. Unlike `triage` and `shell` it is **not** tool-owned — a session is
+//!   named because it is a session — so its call site is the daemon's prompt-turn
+//!   entry point in [`crate::runtime`], guarded once per session by
+//!   [`crate::sessions::SessionRegistry`].
+//! - [`compact`] — what is `compact`-specific about the forget-what-you-can duty
+//!   (REQ-561): its [`compact::COMPACT_DUTY`] descriptor, its output contract, its
+//!   prompt builder, the ADR-11 thresholds below which compaction buys nothing,
+//!   and the strict parser BR-4 requires. Like [`title`] it is **not** tool-owned:
+//!   the thing that knows a conversation no longer fits is the conversation, so
+//!   its call site is [`context::ContextManager::compact_if_pressured`] — which
+//!   runs *ahead of* the unconditional `truncate_to_budget()` and never instead of
+//!   it (ADR-4).
 //! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
@@ -37,28 +66,38 @@
 //!   keyword): context assembly, model call, tool dispatch, result folding, and
 //!   bounded termination.
 
+pub mod compact;
 pub mod completion;
 pub mod context;
 pub mod digest;
+pub mod duty;
 pub mod permissions;
 pub(crate) mod render;
 pub(crate) mod reply;
+pub mod shell_duty;
+pub mod title;
 pub mod tools;
+pub mod triage;
 pub mod turn_loop;
 
+pub use compact::COMPACT_DUTY;
 pub use completion::{
     context_provenance, CompletionSource, LocalEngineSource, RemoteProviderSource, SourceTurn,
     TurnDecision,
 };
 pub use context::{
-    ContextBlock, ContextManager, NoopProvenanceHook, Provenance, ProvenanceHook,
-    RecordingProvenanceHook, ToolProvenance,
+    CompactionOutcome, ContextBlock, ContextManager, NoopProvenanceHook, Provenance,
+    ProvenanceHook, RecordingProvenanceHook, ToolProvenance,
 };
-pub use digest::{DigestRoute, Digester};
+pub use digest::DIGEST_DUTY;
+pub use duty::{Duty, DutyKind, DutyRoute};
 pub use permissions::{
     PendingPermissions, PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,
 };
-pub use tools::{Tool, ToolContext, ToolOutcome, ToolRegistry};
+pub use shell_duty::SHELL_DUTY;
+pub use title::TITLE_DUTY;
+pub use tools::{RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome, ToolRegistry};
+pub use triage::TRIAGE_DUTY;
 pub use turn_loop::{
     build_system_prompt, run_session_turn, run_session_turn_with_source, HarnessConfig,
     HarnessError, SessionEvents, TurnOutcome,

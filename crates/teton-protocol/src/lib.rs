@@ -78,9 +78,35 @@ impl fmt::Display for ProtocolVersion {
 }
 
 /// Lowest protocol version this build understands.
-pub const PROTOCOL_VERSION_MIN: ProtocolVersion = ProtocolVersion(1);
+///
+/// Equal to [`PROTOCOL_VERSION_MAX`], and that is the whole point: this build
+/// speaks exactly one version, because it has no compatibility path to any
+/// other. Widening the range is a claim that the *types in this crate* can read
+/// an older daemon's frames — see the note on [`PROTOCOL_VERSION_MAX`].
+pub const PROTOCOL_VERSION_MIN: ProtocolVersion = ProtocolVersion(2);
 /// Highest protocol version this build understands.
-pub const PROTOCOL_VERSION_MAX: ProtocolVersion = ProtocolVersion(1);
+///
+/// # Version 2 (REQ-558): the routing table changed shape
+///
+/// [`methods::ConfigSnapshot`] gained a required `tiers` array and re-typed its
+/// `routing` array from a phase-keyed `{phase, provider_id, fallback_id}` to a
+/// category-keyed [`methods::CategoryRouteView`]. Neither side can read the
+/// other's `config/get` result: a v1 snapshot deserialized by this build fails
+/// on `routing[0].category` (pinned by `methods::tests`).
+///
+/// The socket and lock filenames are stable across releases by design (ADR-007),
+/// so an upgraded CLI routinely meets a daemon that has not been restarted yet.
+/// With the range left at `1..=1` on both sides, that pairing negotiated
+/// *successfully* and then failed at the first `config/get` with a raw serde
+/// error — no sentence, no remedy. Bumping **both** ends moves the failure to
+/// the handshake, where it is a typed
+/// [`jsonrpc::error_code::UNSUPPORTED_PROTOCOL_VERSION`] the client can turn
+/// into "restart the daemon" (see [`handshake::VersionSkew`]).
+///
+/// The rule this encodes: **advertise only what the types can actually read.**
+/// A range wider than the shapes support is not backwards compatibility, it is
+/// a promise the deserializer will break.
+pub const PROTOCOL_VERSION_MAX: ProtocolVersion = ProtocolVersion(2);
 /// The version this build prefers to speak (equal to [`PROTOCOL_VERSION_MAX`]).
 pub const PROTOCOL_VERSION: ProtocolVersion = PROTOCOL_VERSION_MAX;
 
@@ -496,6 +522,66 @@ pub enum ClientKind {
 mod tests {
     use super::*;
 
+    /// The layering rule as a test rather than a habit: this crate is the shared
+    /// vocabulary, so no crate above it may become a dependency of it.
+    ///
+    /// The manifest is where the assertion belongs, because the manifest is
+    /// where the rule can actually be broken. A stray `use teton_core::…` does
+    /// not compile; a dependency added "just for one type" compiles fine, and
+    /// then these types stop being mirrorable in TypeScript (ADR-002) because
+    /// the mirror cannot follow a link into the daemon's crates. REQ-561's
+    /// `session_titled` is the occasion for writing it down: its payload is a
+    /// `String` scoped by a `SessionId`, both already here, so the event costs
+    /// this crate no new edge — and that is a property worth being told about if
+    /// it ever stops holding.
+    #[test]
+    fn the_protocol_crate_depends_on_no_other_teton_crate() {
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .expect("teton-protocol's own manifest is readable");
+
+        let mut in_dependencies = false;
+        let mut declared: Vec<String> = Vec::new();
+        for raw in manifest.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                in_dependencies = header.contains("dependencies");
+                // `[dependencies.foo]` and `[target.'cfg(unix)'.dependencies.foo]`
+                // name the crate in the header instead of on a key line.
+                if in_dependencies && !header.ends_with("dependencies") {
+                    if let Some((_, name)) = header.rsplit_once('.') {
+                        declared.push(name.to_owned());
+                    }
+                }
+                continue;
+            }
+            if !in_dependencies || line.is_empty() {
+                continue;
+            }
+            declared.push(
+                line.split(['=', '.'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+            );
+        }
+
+        // Non-vacuity: a scan that read nothing would pass every assertion below
+        // while checking nothing at all (LESSON-485).
+        assert!(
+            declared.iter().any(|d| d == "serde"),
+            "the scan did not find the dependencies it is meant to read: {declared:?}"
+        );
+        for name in &declared {
+            assert!(
+                !name.starts_with("teton"),
+                "teton-protocol must depend on no teton crate; found '{name}' in {declared:?}"
+            );
+        }
+    }
+
     #[test]
     fn version_is_reported() {
         assert!(!version().is_empty());
@@ -507,6 +593,27 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.0 KiB");
         assert_eq!(format_bytes(1_572_864), "1.5 MiB");
         assert_eq!(format_bytes(16 * 1024 * 1024 * 1024), "16.0 GiB");
+    }
+
+    /// This build advertises exactly the one version its types can read.
+    ///
+    /// Not a tautology: the range and the shapes are edited in different files,
+    /// and the failure mode of letting them drift is silent — a successful
+    /// handshake followed by a serde error mid-command. Widening this range is
+    /// only honest once some shape actually has a compatibility path, so the
+    /// assertion is here to be *deliberately* changed alongside one.
+    #[test]
+    fn this_build_advertises_only_the_version_its_types_can_read() {
+        assert_eq!(
+            PROTOCOL_VERSION_MIN, PROTOCOL_VERSION_MAX,
+            "no protocol type in this crate deserializes an older frame, so offering a range \
+             wider than one version promises compatibility the deserializer will break"
+        );
+        assert_eq!(PROTOCOL_VERSION, PROTOCOL_VERSION_MAX);
+        assert!(
+            PROTOCOL_VERSION_MIN > ProtocolVersion(1),
+            "v1 is the pre-REQ-558 ConfigSnapshot shape this build cannot read"
+        );
     }
 
     #[test]

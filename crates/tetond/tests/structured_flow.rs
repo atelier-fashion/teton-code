@@ -39,9 +39,9 @@ use tetond::broadcast::EventBus;
 use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::{Egress, NoopSink};
 use tetond::harness::{
-    build_system_prompt, run_session_turn_with_source, ContextManager, DigestRoute,
+    build_system_prompt, run_session_turn_with_source, ContextManager, DutyRoute,
     NoopProvenanceHook, PendingPermissions, PermissionConfig, PermissionGate, RemoteProviderSource,
-    SessionEvents, ToolContext, ToolRegistry,
+    SessionEvents, ToolContext, ToolDuties, ToolRegistry,
 };
 use tetond::router::{to_protocol_phase, Router};
 use tetond::structured::{ArtifactKind, ArtifactStore, PhaseMachine};
@@ -347,7 +347,12 @@ async fn demo_requirement_flows_all_four_phases_with_per_phase_routing_and_real_
                 &mut ctx,
                 &config,
                 &mut hook,
-                &DigestRoute::unresolved("no digest route in this test"),
+                &DutyRoute::unresolved("no digest route in this test"),
+                &DutyRoute::unresolved("no compact route in this test"),
+                &ToolDuties {
+                    triage: &DutyRoute::unresolved("no triage route in this test"),
+                    shell: &DutyRoute::unresolved("no shell route in this test"),
+                },
             )
             .await
             .expect("the implement turn runs remotely");

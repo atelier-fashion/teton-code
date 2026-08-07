@@ -339,12 +339,18 @@ fn spawn_prompt_turn(
     let prompt = flatten_prompt(&params.prompt);
     let runtime = Arc::clone(&daemon.runtime);
     let events = Arc::clone(&daemon.events);
+    // The turn carries the registry, not just the summary read out of it: the
+    // `title` duty (REQ-561 TASK-062) has to *write back* the name it derives
+    // and take the once-per-session claim that keeps it from re-deriving one.
+    // The summary above is a snapshot, so it cannot serve either purpose.
+    let daemon = Arc::clone(daemon);
     let out = out_tx.clone();
 
     Some(tokio::spawn(async move {
         let result = runtime
             .run_prompt_turn(
                 &events,
+                &daemon.sessions,
                 summary.session_id.clone(),
                 summary.mode,
                 summary.phase,

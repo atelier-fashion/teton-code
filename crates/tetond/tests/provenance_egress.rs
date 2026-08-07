@@ -35,8 +35,8 @@ use tetond::broadcast::EventBus;
 use tetond::egress::Egress;
 use tetond::harness::{
     build_system_prompt, context_provenance, run_session_turn_with_source, ContextManager,
-    DigestRoute, HarnessConfig, HarnessError, NoopProvenanceHook, PendingPermissions,
-    PermissionConfig, PermissionGate, RemoteProviderSource, SessionEvents, ToolContext,
+    DutyRoute, HarnessConfig, HarnessError, NoopProvenanceHook, PendingPermissions,
+    PermissionConfig, PermissionGate, RemoteProviderSource, SessionEvents, ToolContext, ToolDuties,
     ToolRegistry,
 };
 
@@ -211,7 +211,15 @@ async fn run_touching_tool(
         // REQ-558: this loop digests through the `digest` category. These turns
         // stay under the summarization threshold, so nothing is served — and an
         // unresolved route bounds mechanically rather than folding raw.
-        &DigestRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no compact route in this test"),
+        // REQ-561: and no tool duty either. `triage` would rank a `grep`
+        // result; these turns run no multi-match `grep`, and an unresolved
+        // route returns the tool's own result unchanged.
+        &ToolDuties {
+            triage: &DutyRoute::unresolved("no triage route in this test"),
+            shell: &DutyRoute::unresolved("no shell route in this test"),
+        },
     )
     .await;
 

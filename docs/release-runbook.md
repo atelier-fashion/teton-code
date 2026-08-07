@@ -122,6 +122,37 @@ git add Cargo.toml Cargo.lock
 git commit -m 'chore(release): vX.Y.Z'
 ```
 
+### Before the tag: did any wire shape change?
+
+The crate version and the **protocol** version are different numbers with
+different rules. The crate version bumps every release; the protocol version
+bumps only when a client and a daemon of adjacent releases can no longer read
+each other's frames — and it is not derived from anything, so nothing catches a
+missed bump for you.
+
+Diff the protocol types against the last release and read the result:
+
+```sh
+git diff vLAST..HEAD -- crates/teton-protocol/src/
+```
+
+A **required** field added or removed, a field re-typed, or an enum variant
+retired means the two builds cannot interoperate. Bump both
+`PROTOCOL_VERSION_MIN` and `PROTOCOL_VERSION_MAX` in
+`crates/teton-protocol/src/lib.rs` in the release PR. Purely additive changes —
+a new `#[serde(default)]` field, a new optional member, a new enum variant
+nothing older has to match on — do not.
+
+Both ends, not just the max. `MIN` is a claim that *this build's types can read
+that version's frames*; there is no compatibility path in the crate, so a range
+wider than one version promises something the deserializer breaks. A unit test
+asserts `MIN == MAX` precisely so widening it has to be deliberate.
+
+Getting this wrong does not fail CI — both halves of a CI run are the same
+build, so a skew is unrepresentable there. It fails on a **user's** machine, at
+the first command after an upgrade they did not restart. That asymmetry is why
+this is a runbook step and not a test.
+
 4. Open the PR, get CI green, merge to `main`.
 
 5. Tag **the merge commit on `main`**, annotated, and push the tag on its own:
@@ -300,10 +331,46 @@ teton doctor        # confirm the RUNNING daemon reports the new version
 
 The restart is the part worth writing down. `brew upgrade` replaces the binaries
 on disk; a `teton-code` that is already running is still the old binary until
-something restarts it, and every symptom of that is confusing (a CLI on the new
-version talking to a daemon on the old one). Do not rely on the upgrade to
-restart the service for you — run the restart, and confirm with `doctor`, which
-prints the version of the daemon that actually answered.
+something restarts it. Do not rely on the upgrade to restart the service for you
+— run the restart, and confirm with `doctor`, which prints the version of the
+daemon that actually answered.
+
+### Skipping the restart is now a refusal, not a mystery
+
+Until PR #64 the consequence of forgetting the restart was a *confusing* one: a
+CLI on the new version talking to a daemon on the old one, failing in whatever
+way the first shape mismatch happened to produce. The concrete instance was
+`ConfigSnapshot` changing shape in REQ-558 while the protocol version stayed at
+1 — the handshake negotiated `1..=1` happily and then `teton policy show` died
+on ``missing field `category` ``, a serde string with no remedy in it.
+
+The two halves now negotiate a protocol version that is actually bumped when a
+wire shape changes, so the skew is refused at the handshake and every command
+answers with which half is stale and the command that fixes it:
+
+```
+teton: the running daemon speaks protocol 1 but this CLI speaks 2, so they share
+no version and no command can be served. An upgrade replaces the binaries on disk
+without restarting a daemon that is already running — restart it with `brew
+services restart teton` (…).
+```
+
+**When verifying an upgrade, that message is a pass, not a finding.** It is what
+a correctly-built release says to a daemon nobody restarted. The finding would
+be the *absence* of it — a raw serde error, or a command that half-works.
+
+### The next release crosses a protocol boundary
+
+`PROTOCOL_VERSION_MIN`/`MAX` went from 1 to 2 in PR #64, so the first release
+cut after it is the first one where an un-restarted daemon is refused outright
+rather than degraded. Say so in that release's notes: users who upgrade without
+restarting will see the refusal on *every* command, and the fix is the restart
+line that has always been in §6.
+
+This is the intended shape of the guarantee — a loud, actionable refusal beats a
+quiet half-working pair — but it is a visible behavior change on the release
+where it first lands, and it is cheap to mention and expensive to be surprised
+by.
 
 AC-4 is **staged at v0.1.0**: with no release N-1 there is nothing to upgrade
 from, so the path is documented but unexercised. The first `v0.1.x` release is

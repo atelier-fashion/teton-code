@@ -42,14 +42,18 @@ use teton_providers::{HarnessProfile, ProviderError, ToolCall};
 
 use crate::broadcast::EventBus;
 
+use super::compact::COMPACT_DUTY;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
 use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN};
-use super::digest::DigestRoute;
+use super::digest::DIGEST_DUTY;
+use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
 use super::reply::StreamGate;
-use super::tools::{ToolContext, ToolOutcome, ToolRegistry};
+use super::shell_duty::SHELL_DUTY;
+use super::tools::{RefinedOutcome, ToolContext, ToolDuties, ToolOutcome, ToolRegistry};
+use super::triage::TRIAGE_DUTY;
 
 /// Tools that count as a verification step after an edit.
 const VERIFY_TOOLS: &[&str] = &["shell", "read", "grep"];
@@ -305,7 +309,7 @@ impl SessionEvents {
 /// [`run_session_turn_with_source`] loop. Because no [`Transport`](teton_providers::Transport)
 /// ever enters this path, egress is impossible here by construction. The *same*
 /// engine also serves the loop's tool-result summarization duty on a
-/// [local `digest` route](DigestRoute::local) — this entry point has no router to
+/// [local `digest` route](DutyRoute::local) — this entry point has no router to
 /// resolve the category with, and a path whose whole guarantee is "no transport
 /// exists here" is not the place to acquire one. The daemon's routed path
 /// (`DaemonRuntime::run_one_attempt`) resolves `digest` properly.
@@ -317,7 +321,7 @@ impl SessionEvents {
 ///
 /// # Blocking
 /// The model call itself rides the blocking pool (E-3, see
-/// [`LocalEngineSource`] and [`DigestRoute::local`]), so a slow local inference
+/// [`LocalEngineSource`] and [`DutyRoute::local`]), so a slow local inference
 /// never parks the async worker. Tool dispatch (notably `shell`) still runs
 /// synchronously; a production caller on a multi-thread runtime should wrap this
 /// in `spawn_blocking` for the tool phase.
@@ -342,7 +346,14 @@ pub async fn run_session_turn(
     let mut source = LocalEngineSource::new(Arc::clone(engine), format);
     // The local tier names itself here, as it does everywhere the tier comes from
     // the engine rather than from a `[[providers]]` entry (REQ-557 ADR-D).
-    let digest = DigestRoute::local("local", Arc::clone(engine));
+    let digest = DutyRoute::local(DIGEST_DUTY, "local", Arc::clone(engine));
+    // The same engine serves the tools' own duties, for the same reason: this
+    // entry point has no router, and a path whose whole guarantee is "no
+    // transport exists here" is not the place to acquire one.
+    let triage = DutyRoute::local(TRIAGE_DUTY, "local", Arc::clone(engine));
+    let shell = DutyRoute::local(SHELL_DUTY, "local", Arc::clone(engine));
+    // And the context's own duty, which belongs to no tool.
+    let compact = DutyRoute::local(COMPACT_DUTY, "local", Arc::clone(engine));
     run_session_turn_with_source(
         &mut source,
         tools,
@@ -353,6 +364,11 @@ pub async fn run_session_turn(
         config,
         hook,
         &digest,
+        &compact,
+        &ToolDuties {
+            triage: &triage,
+            shell: &shell,
+        },
     )
     .await
 }
@@ -372,12 +388,26 @@ pub async fn run_session_turn(
 /// producer — that is `source` — and the two are resolved independently: a turn on
 /// a frontier `think` provider still digests through whatever `scan` is bound to.
 ///
-/// It is a [`DigestRoute`] rather than an `Option<Engine>` because "no local
+/// It is a [`DutyRoute`] rather than an `Option<Engine>` because "no local
 /// tier" stopped being the only way this duty can fail to find a model. The old
 /// `None` arm folded oversized results **verbatim**, which is the very shape
 /// LESSON-447 is about — an identity fallback on a function whose purpose is to
-/// shrink its input. [`DigestRoute::Unresolved`] replaces it, and
+/// shrink its input. [`DutyRoute::Unresolved`] replaces it, and
 /// [`summarize_if_large`] bounds mechanically instead.
+///
+/// `compact` is the resolved `compact` category (REQ-561 TASK-063), asked which
+/// blocks a pressured conversation may forget. It is a **separate parameter from
+/// `duties`** because it belongs to no tool — the thing that knows a conversation
+/// no longer fits is the context manager, not whatever tool happened to fill it —
+/// and it is deliberately *not* what keeps the context under budget: it runs
+/// ahead of the unconditional `truncate_to_budget()`, which is unchanged (ADR-4).
+///
+/// `duties` carries the duties a **tool** owns rather than the loop — today the
+/// `triage` route a `grep` result is ranked through (REQ-561 TASK-060). It is
+/// one struct rather than one parameter per duty so that wiring the next
+/// category adds a field, not another argument to this signature; and it is
+/// handed to every tool result rather than switched on a tool name, because a
+/// category selected by a string comparison is exactly what BR-1 forbids.
 ///
 /// # Errors
 /// [`HarnessError::Engine`] on a local backend failure, or
@@ -393,9 +423,15 @@ pub async fn run_session_turn_with_source(
     ctx: &mut ContextManager,
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
-    digest: &DigestRoute,
+    digest: &DutyRoute,
+    compact: &DutyRoute,
+    duties: &ToolDuties<'_>,
 ) -> Result<TurnOutcome, HarnessError> {
     let exposed = tools.exposed_names(config.max_tools);
+    // What "relevant" is measured against, read once: the loop appends model
+    // turns and tool results as it runs, never another user block, so the
+    // request cannot change underneath it.
+    let request = latest_request(ctx);
     let mut turns = 0u32;
     let mut edited = false;
     let mut verified = false;
@@ -537,13 +573,43 @@ pub async fn run_session_turn_with_source(
                             verified = true;
                         }
 
+                        // The tool's own duty, if it has one (REQ-561 BR-1).
+                        //
+                        // Asked of **every** result, not of a list of tool names:
+                        // the tool that produced this outcome is the thing that
+                        // knows whether a duty applies to it, so no string
+                        // comparison here assigns a category. `grep` ranks its
+                        // matches through `triage`; every other tool answers with
+                        // the result it already had.
+                        //
+                        // A failure is never silent, and never fatal: the tool's
+                        // own unrefined result comes back with the reason on the
+                        // outcome, which is logged here exactly as the `digest`
+                        // duty's failure is below.
+                        let RefinedOutcome {
+                            outcome,
+                            duty_error,
+                        } = tools
+                            .refine(&name, &arguments, &request, duties, outcome)
+                            .await;
+                        if let Some(error) = &duty_error {
+                            eprintln!(
+                                "tetond: the `{name}` tool's duty could not be served \
+                                 ({error}); folded its own unrefined result instead"
+                            );
+                        }
+
                         // REQ-544 C-1: the result's egress provenance is the files
                         // the tool actually touched (or UNKNOWN for `shell`), as
                         // the tool reported — never a literal `path` argument.
+                        // `measured` is the tool's own trigger input and was
+                        // already consumed by `refine` above; nothing downstream
+                        // of the fold reads it.
                         let ToolOutcome {
                             content,
                             is_error,
                             provenance,
+                            measured: _,
                         } = outcome;
                         let folded = if is_error {
                             format!("ERROR: {content}")
@@ -615,6 +681,28 @@ pub async fn run_session_turn_with_source(
                             folded
                         };
                         ctx.push_tool_result_prov(name, provenance, folded);
+                        // REQ-561 ADR-4: the `compact` duty gets a say in WHICH
+                        // blocks go, at a soft fraction of the budget — and it
+                        // gets it *here*, ahead of the gate below, never instead
+                        // of it. The line after this one is unchanged,
+                        // unwrapped, and conditional on nothing: that is what
+                        // makes BR-4 structural rather than a code path someone
+                        // has to remember. A duty that hangs, returns garbage,
+                        // returns an over-budget answer or was never routed
+                        // still ends with a context under budget, because the
+                        // thing enforcing the budget was never the duty.
+                        //
+                        // A failure is never silent, for the reason the `digest`
+                        // failure above is not: this duty guards the context
+                        // window, so the deterministic drop standing in for it is
+                        // logged with the reason it had to.
+                        let compaction = ctx.compact_if_pressured(compact).await;
+                        if let Some(error) = &compaction.reason {
+                            eprintln!(
+                                "tetond: the `compact` duty could not be served ({error}); the \
+                                 context was truncated deterministically instead"
+                            );
+                        }
                         ctx.truncate_to_budget();
                         continue;
                     }
@@ -689,6 +777,24 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     s.push_str("\nAvailable tools:\n");
     s.push_str(&tools.docs(config.max_tools));
     s
+}
+
+/// The request this turn is serving.
+///
+/// This is what a [`Tool::refine`](super::tools::Tool::refine) duty measures
+/// "relevant" against, and it is read from the context rather than threaded down
+/// from the RPC so that every entry point into the loop — the daemon's, the
+/// offline one, a test's — gets the same answer from the same place.
+///
+/// It reads [`ContextManager::request`] and **not** the newest `User` block.
+/// Those two agree on a first attempt and diverge on a retry: `run_one_attempt`
+/// re-enters this loop against the same accumulated manager, by which point
+/// `compact_if_pressured` may have replaced the user block with a `Tool`-role
+/// summary or `truncate_to_budget` may have dropped it as the oldest thing
+/// present. Scanning the blocks then returned `""`, and a duty ranked against an
+/// empty request while still spending the model call (REQ-561 verify).
+fn latest_request(ctx: &ContextManager) -> String {
+    ctx.request().to_owned()
 }
 
 /// A short human title for a tool call (drives the `tool_call` event title).
@@ -836,6 +942,136 @@ mod tests {
         out
     }
 
+    /// A source that calls one tool on its first turn and ends on its second —
+    /// the shortest path to the loop's tool-result fold, which is where the
+    /// `compact` duty and the hard budget gate both live.
+    struct ToolThenEndSource {
+        calls: usize,
+    }
+
+    #[async_trait]
+    impl CompletionSource for ToolThenEndSource {
+        fn chat_format(&self) -> ChatFormat {
+            ChatFormat::Flat
+        }
+
+        async fn produce_turn(
+            &mut self,
+            _prompt: &PreparedPrompt,
+            _provenance: &EgressProvenance,
+            _config: &HarnessConfig,
+            _tools: &ToolRegistry,
+            _exposed: &[&str],
+            _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            self.calls += 1;
+            let (text, decision) = if self.calls == 1 {
+                (
+                    "{\"tool\":\"read\",\"arguments\":{\"path\":\"nope.txt\"}}".to_owned(),
+                    TurnDecision::ToolCall {
+                        name: "read".to_owned(),
+                        arguments: serde_json::json!({ "path": "nope.txt" }),
+                    },
+                )
+            } else {
+                (
+                    "Done.".to_owned(),
+                    TurnDecision::EndTurn {
+                        final_text: "Done.".to_owned(),
+                    },
+                )
+            };
+            Ok(SourceTurn {
+                text,
+                decision,
+                usage: TokenUsage::default(),
+                dropped_calls: 0,
+            })
+        }
+    }
+
+    /// **REQ-561 ADR-4, through the loop itself.** The thing that keeps a
+    /// context under budget is the loop's own unconditional
+    /// `truncate_to_budget()`, not the `compact` duty that runs ahead of it.
+    ///
+    /// The unit tests in [`super::super::context`] prove the duty degrades
+    /// safely; this one proves the *wiring* — that the gate is reached on a turn
+    /// where the duty failed. Making that call conditional on the compaction
+    /// having succeeded turns this red and nothing else in the suite, which is
+    /// exactly why it is here rather than there (LESSON-483: the inner link
+    /// needs its own mutation, and so does the link that calls it).
+    #[tokio::test]
+    async fn a_turn_whose_compact_duty_cannot_serve_still_ends_under_budget() {
+        const BUDGET_BYTES: usize = 4_000;
+        let session_id = SessionId::from("compact-gate");
+        let bus = Arc::new(EventBus::new());
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        // One model call, so the loop stops the moment the tool result has been
+        // folded and the gate has run. Letting it take a second turn would push
+        // the model's final answer *after* the gate, and this assertion is about
+        // what the gate guarantees, not about what is appended once it has.
+        let config = HarnessConfig {
+            max_turns: 1,
+            ..HarnessConfig::default()
+        };
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(BUDGET_BYTES);
+        ctx.push_user("do the thing");
+        for i in 0..5 {
+            ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+        }
+        assert!(
+            ctx.estimated_bytes() > BUDGET_BYTES,
+            "non-vacuity: the turn must start over budget, or the gate has nothing to do"
+        );
+
+        let mut source = ToolThenEndSource { calls: 0 };
+        let outcome = run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            // The duty under test: resolved to nothing, so it degrades on every
+            // fold.
+            &DutyRoute::unresolved("nothing serves `compact` here"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes");
+
+        assert_eq!(
+            outcome.stop_reason,
+            StopReason::MaxTurnRequests,
+            "the fixture must stop right after the fold"
+        );
+        assert!(
+            ctx.was_truncated(),
+            "non-vacuity: the deterministic gate really did have to drop something"
+        );
+        assert!(
+            ctx.estimated_bytes() <= BUDGET_BYTES,
+            "the turn ended {} bytes over its budget with a `compact` duty that never served",
+            ctx.estimated_bytes() - BUDGET_BYTES
+        );
+    }
+
     /// Run one loop turn against `source` and return what the user saw.
     async fn run_and_collect_display(source: &mut dyn CompletionSource) -> String {
         let session_id = SessionId::from("gate-format");
@@ -860,10 +1096,29 @@ mod tests {
         // unresolved route is the honest stand-in — and if a future change *did*
         // start digesting here, the result would still be bounded rather than
         // folded raw.
-        let digest = DigestRoute::unresolved("no digest route in this test");
+        let digest = DutyRoute::unresolved("no digest route in this test");
+        // And no tool runs, so no tool duty is reached either.
+        let triage = DutyRoute::unresolved("no triage route in this test");
+        let shell = DutyRoute::unresolved("no shell route in this test");
+        // `compact` is reached only from the tool-result fold, and only under
+        // context pressure; one short user block is neither.
+        let compact = DutyRoute::unresolved("no compact route in this test");
 
         run_session_turn_with_source(
-            source, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook, &digest,
+            source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &digest,
+            &compact,
+            &ToolDuties {
+                triage: &triage,
+                shell: &shell,
+            },
         )
         .await
         .expect("the turn completes");
@@ -1033,5 +1288,61 @@ mod tests {
                 "the tool-call format is missing:\n{system}"
             );
         }
+    }
+
+    /// **The request a duty is measured against survives a retry**
+    /// (REQ-561 verify).
+    ///
+    /// `run_one_attempt` re-enters this loop against the same accumulated
+    /// manager on every retry and every fallback. By then the user block may be
+    /// gone: `compact_if_pressured` replaces forgotten blocks with a `Tool`-role
+    /// summary, and `truncate_to_budget` drops oldest-first — and the user block
+    /// is the oldest thing there is. Reading the request back out of `blocks`
+    /// therefore returned `""` on the second attempt, and `triage` ranked
+    /// against an empty request while still spending the model call.
+    ///
+    /// The fixture drops the block through the deterministic path, then asserts
+    /// both halves: the block really is gone (so this is not a manager that
+    /// still had it), and the request is still there.
+    #[test]
+    fn the_turns_request_outlives_the_block_that_carried_it() {
+        const REQUEST: &str = "find where the retry budget is decided";
+
+        let mut ctx = ContextManager::new("system", 64).with_budget_bytes(512);
+        ctx.push_user(REQUEST);
+        for i in 0..40 {
+            ctx.push_model(format!(
+                "step {i}: reading yet another file to fill the budget"
+            ));
+        }
+        ctx.truncate_to_budget();
+
+        assert!(
+            !ctx.blocks()
+                .iter()
+                .any(|b| b.role == crate::harness::context::BlockRole::User),
+            "the fixture must actually drop the user block, or it tests nothing"
+        );
+        assert_eq!(
+            latest_request(&ctx),
+            REQUEST,
+            "a retry ranked its matches against an empty request"
+        );
+    }
+
+    /// And it is the *latest* request, not the first one a manager ever saw —
+    /// the name means what it says.
+    #[test]
+    fn the_turns_request_is_the_most_recent_one_pushed() {
+        let mut ctx = ContextManager::new("system", 4_096);
+        assert_eq!(
+            latest_request(&ctx),
+            "",
+            "a system-only assembly asks nothing"
+        );
+        ctx.push_user("first");
+        ctx.push_model("...");
+        ctx.push_user("second");
+        assert_eq!(latest_request(&ctx), "second");
     }
 }

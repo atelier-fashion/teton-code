@@ -24,6 +24,7 @@ use teton_protocol::SessionId;
 
 use tetond::broadcast::EventBus;
 use tetond::harness::context::Provenance;
+use tetond::harness::shell_duty::SHELL_OUTPUT_CONTRACT;
 use tetond::harness::{
     build_system_prompt, run_session_turn, ContextManager, HarnessConfig, PendingPermissions,
     PermissionConfig, PermissionGate, RecordingProvenanceHook, SessionEvents, ToolContext,
@@ -58,12 +59,40 @@ impl Engine for ScriptedEngine {
         params: &GenParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion, EngineError> {
-        let idx = self.calls.fetch_add(1, Ordering::SeqCst);
-        let text = self
-            .replies
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| "Done.".to_owned());
+        // **A duty is not a turn** (REQ-561 BR-10). The daemon also makes model
+        // calls on its own behalf, and this script is a sequence of *turns* —
+        // `calls` is what the tests below read as the turn count. Serving a duty
+        // from the script would shift every reply after it by one and make that
+        // count mean something else, which is the desync REQ-558 shipped twice.
+        //
+        // `shell` is the one that reaches here: the offline entry point resolves
+        // it onto this same engine, and a *deliberately failing* verify — the
+        // whole subject of `a_failing_verify_after_an_edit_does_not_satisfy_the_gate`
+        // — is exactly what it fires on. Recognized by its own output contract
+        // and answered off-script, consuming no reply and no count.
+        // The fifth duty, `compact`, does **not** reach here today: these
+        // fixtures' contexts stay far under the soft pressure threshold, so it
+        // declines without a model call (verified by making this assertion fire
+        // and watching it not). It gets an assertion rather than an answer,
+        // because inventing a compaction for a fixture that never needed one
+        // would rewrite that fixture's history for no reason — while a fixture
+        // that GREW past the threshold and silently ate a scripted block is the
+        // desync BR-10 exists to prevent. So the day one does, this says so.
+        assert!(
+            !prompt.contains(tetond::harness::compact::COMPACT_OUTPUT_CONTRACT),
+            "a fixture here now crosses the compaction threshold, so the `compact` duty \
+             reaches this stand-in engine — give it an arm of its own before it eats a \
+             scripted reply block (REQ-561 BR-10)"
+        );
+        let text = if prompt.contains(SHELL_OUTPUT_CONTRACT) {
+            "The command exited non-zero, so the change is not verified.".to_owned()
+        } else {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.replies
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| "Done.".to_owned())
+        };
 
         let full = text;
         let mut text = String::new();

@@ -93,8 +93,16 @@ impl TestDaemon {
     fn spawn_with_script(daemon: &Path, replies: Option<&[&str]>) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        // The `-` is load-bearing: without it `tc{pid}{seq}` is ambiguous — pid
+        // `0x123`/seq `0x45` and pid `0x1234`/seq `0x5` both render `tc12345`, and
+        // two colliding daemons would share a runtime dir, a socket, and the
+        // single-instance flock, with each `drop` deleting the other's root. That
+        // cannot happen under plain `cargo test` (one process, unique `seq`) but it
+        // can under `cargo nextest`, which runs test binaries in parallel. The name
+        // stays short because `root` becomes an `XDG_RUNTIME_DIR` and the socket
+        // under it has to fit in `SUN_LEN`.
         let root =
-            PathBuf::from("/tmp").join(format!("tc{:x}{:x}", std::process::id() & 0xffff, seq));
+            PathBuf::from("/tmp").join(format!("tc{:x}-{:x}", std::process::id() & 0xffff, seq));
         let runtime_dir = root.join("x");
         std::fs::create_dir_all(&runtime_dir).unwrap();
 
@@ -183,6 +191,16 @@ impl TestDaemon {
         };
         daemon.wait_for_socket();
         daemon
+    }
+
+    /// The daemon's own stderr so far.
+    ///
+    /// The other half of the story in any assertion about what the daemon
+    /// published: the CLI's stdout says what arrived, and only this says what
+    /// was sent. Quoted into the assertions that turn on an event, because a
+    /// failure that shows one side is a failure nobody can act on.
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.root.join("tetond.log")).unwrap_or_default()
     }
 
     fn wait_for_socket(&self) {
@@ -330,6 +348,27 @@ impl Drop for TestDaemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // **Keep the evidence when the test is failing.**
+        //
+        // This used to delete the root unconditionally, panicking or not — and
+        // the root holds `tetond.log`, the daemon's whole stderr. So the one run
+        // that could say what the daemon actually did was also the run that
+        // destroyed the record of it. `an_escaped_line_and_a_plain_line_both_reach_the_model`
+        // failed once, on a cold build, with a routing notice missing; the CLI's
+        // stdout was quoted in the panic and the daemon's side was already gone,
+        // which is why that failure could not be diagnosed after the fact.
+        //
+        // `panicking()` rather than an env switch: a passing run still cleans up
+        // after itself, so nothing accumulates in `/tmp` in the normal case.
+        if std::thread::panicking() {
+            eprintln!(
+                "cli_e2e: test failed — keeping the daemon's working directory at {} \
+                 (its stderr is {}/tetond.log)",
+                self.root.display(),
+                self.root.display()
+            );
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -1154,10 +1193,42 @@ fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
         session.contains(TURN_REPLIES[1]),
         "the plain prompt never reached the model; output:\n{session}"
     );
+    // REQ-561 TASK-062: a bare count of routing notices stopped meaning "how
+    // many turns ran" the moment a harness duty could announce one on the same
+    // surface. `title` names the session on its first substantive turn, so the
+    // turn routes and the duty route are counted apart — which is a stronger
+    // statement than the single count was, not a weaker one.
     assert_eq!(
-        session.matches("route [").count(),
+        session.matches("route [edit/build]").count(),
         2,
         "exactly two turns should have been routed; output:\n{session}"
+    );
+    // **On the one observed flake here, and what it was not** (REQ-561 verify).
+    //
+    // This assertion failed once on a cold-build run — `left: 0, right: 1`, the
+    // `route [title/reflex]` line absent while both `route [edit/build]` lines
+    // were present — and did not reproduce in isolation or under repetition. The
+    // obvious suspect was a subscription race, since `title` is the first event
+    // of a session's life and `wait_for_socket` only proves the daemon is
+    // listening. It is not one: the daemon registers the connection on the event
+    // bus *inside* the handshake handler and queues the handshake response
+    // afterwards, synchronously and on the same connection, and the CLI blocks on
+    // that response before it can send `session/create` or `session/prompt`. The
+    // window is closed by construction. Nor was it a lagged subscription: an
+    // overflowing subscriber is evicted from the bus outright, which is terminal,
+    // so the two later routing notices could not have survived it.
+    //
+    // No code path was found that drops this event while keeping those, so the
+    // cause is recorded as **undiagnosed** rather than guessed at. What is fixed
+    // is the reason it could not be diagnosed: the daemon's stderr is now kept
+    // when a test panics (see `Drop`) and quoted here, so a recurrence says which
+    // side lost the event instead of only that the count was wrong.
+    assert_eq!(
+        session.matches("route [title/reflex]").count(),
+        1,
+        "the session is named once, by a duty rather than by a turn.\n\
+         --- CLI output ---\n{session}\n--- daemon stderr ---\n{}",
+        daemon.log()
     );
 
     // And neither was treated as a command: no dispatch, no rejection.
@@ -1646,7 +1717,14 @@ fn policy_show_renders_the_daemons_resolved_table() {
     // one that has a call site does not. The marker is derived from the
     // daemon's own call sites, so this also shows the CLI is rendering the
     // daemon's answer rather than a table of its own.
-    let unreached = row(&shown, "triage").expect("a `triage` row");
+    //
+    // The marked example is `redact`, the one category REQ-561 leaves unwired
+    // (it is REQ-562's, because a model call inside the egress choke point needs
+    // its own spec). It replaced `compact` here when TASK-063 gave `compact` a
+    // call site — moved rather than dropped, because a test that only checks the
+    // *unmarked* side would pass just as well against a renderer that had
+    // forgotten how to print the marker at all.
+    let unreached = row(&shown, "redact").expect("a `redact` row");
     assert!(
         unreached.contains("declared, no call site yet"),
         "an unreached category must be marked; row:\n{unreached}"
@@ -1655,6 +1733,94 @@ fn policy_show_renders_the_daemons_resolved_table() {
     assert!(
         !reached.contains("no call site"),
         "`edit` has a call site and must not carry the marker; row:\n{reached}"
+    );
+    // REQ-561 AC-1, the half this REQ has answered so far: `triage` was on the
+    // marked side of this very assertion until `GrepTool::refine` gave it a call
+    // site. The marker is derived, so the row follows the code — and this is
+    // where a regression that unwired the duty would surface.
+    let triaged = row(&shown, "triage").expect("a `triage` row");
+    assert!(
+        !triaged.contains("no call site"),
+        "`triage` is wired (REQ-561 TASK-060) and must not carry the marker; row:\n{triaged}"
+    );
+    // And the same for `shell`, which `ShellTool::refine` gave a call site in
+    // TASK-061. REQ-558's ADR-I had deferred it as unroutable; BR-4b answered
+    // that by dispatching on *interpreting* the output rather than on deciding
+    // to run the command, which happens after the command has already run.
+    let shell = row(&shown, "shell").expect("a `shell` row");
+    assert!(
+        !shell.contains("no call site"),
+        "`shell` is wired (REQ-561 TASK-061) and must not carry the marker; row:\n{shell}"
+    );
+    // And `title`, which `DaemonRuntime::title_session` gave a call site in
+    // TASK-062 — the one of the five that belongs to no tool. The field it
+    // populates, `SessionSummary.title`, had been on the wire since the
+    // skeleton and was simply never written to.
+    let title = row(&shown, "title").expect("a `title` row");
+    assert!(
+        !title.contains("no call site"),
+        "`title` is wired (REQ-561 TASK-062) and must not carry the marker; row:\n{title}"
+    );
+    // And `compact`, which `ContextManager::compact_if_pressured` gave a call
+    // site in TASK-063 — the category this very assertion used to hold up as the
+    // marked example. It runs at a soft fraction of the context budget, ahead of
+    // the unconditional `truncate_to_budget` that still enforces it (ADR-4).
+    let compact = row(&shown, "compact").expect("a `compact` row");
+    assert!(
+        !compact.contains("no call site"),
+        "`compact` is wired (REQ-561 TASK-063) and must not carry the marker; row:\n{compact}"
+    );
+
+    // REQ-561 AC-16 / BR-11: every row names the content class it transmits,
+    // through the shipped binary against a live daemon.
+    //
+    // What this adds over the `main.rs` unit test is that the daemon populates
+    // the field at all and that a real `config/get` carried it. What it does
+    // *not* show is that the CLI read the wire rather than recomputing the class
+    // from the category — the two agree by construction, so this stays green
+    // either way. `policy_show_prints_the_daemons_content_class_rather_than_
+    // recomputing_it` is the test for that, and it exists because a mutation
+    // proved this one blind to it.
+    for (category, disclosed) in [
+        ("route", "your prompt"),
+        ("redact", "outbound payloads"),
+        ("title", "your prompt"),
+        ("digest", "tool output"),
+        ("compact", "conversation history"),
+        ("triage", "file content and your request"),
+        ("edit", "the whole turn"),
+        ("shell", "the command and its output"),
+        ("design", "the whole turn"),
+        ("debug", "the whole turn"),
+        ("review", "the whole turn"),
+    ] {
+        let line = row(&shown, category).expect("a row for every category");
+        assert!(
+            line.contains(disclosed),
+            "category `{category}` must disclose that it sends `{disclosed}`; row:\n{line}"
+        );
+    }
+
+    // OQ-4's resolution, on the two rows a user would actually compare: one
+    // `scan` binding, two different kinds of content leaving the machine. Binding
+    // `scan` remotely for cheap long-context work also moves conversation history
+    // off it, and re-splitting the binding is out of scope — so this line pair is
+    // the whole mitigation, and it is worth nothing if both rows read alike.
+    let triage_row = row(&shown, "triage").expect("a `triage` row");
+    let compact_row = row(&shown, "compact").expect("a `compact` row");
+    assert!(
+        !triage_row.contains("conversation history") && !compact_row.contains("file content"),
+        "the `scan` tier's two categories must not read as one disclosure;\
+         \ntriage:\n{triage_row}\ncompact:\n{compact_row}"
+    );
+
+    // AC-16's other half: `redact` transmits nothing today, and its row says so
+    // in one phrase rather than leaving a reader to join a content class at one
+    // end of the line to a marker at the other. A class printed alone reads as a
+    // live egress path.
+    assert!(
+        unreached.contains("would send outbound payloads; declared, no call site yet"),
+        "`redact`'s class and its call-site marker must render adjacently; row:\n{unreached}"
     );
 
     // AC-12: the BR-9 declared default is configuration-visible, and the CLI

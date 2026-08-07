@@ -12,7 +12,12 @@
 //! streaming turn, permission prompts, and local-model lifecycle (BR-9); the
 //! first two borrow ACP vocabulary. REQ-547 adds
 //! `model_selection_proposed`/`model_selection_decided`, the consent round-trip
-//! that gates the local tier before any weights are fetched.
+//! that gates the local tier before any weights are fetched. REQ-561 adds
+//! `session_titled` (BR-9a), which announces the title the `title` category
+//! produced for a session.
+//!
+//! This list is an index, not decoration: a new variant of [`Event`] that is not
+//! named here makes the paragraph above wrong.
 
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +78,9 @@ impl EventEnvelope {
 pub enum Event {
     /// Streaming update within a prompt turn. ACP: `session/update`.
     SessionUpdate(SessionUpdate),
+    /// A session was given a title (REQ-561 BR-9a). Teton differentiator — no
+    /// ACP equivalent.
+    SessionTitled(SessionTitled),
     /// A model was selected for a step (spec: `route_decided`). Teton
     /// differentiator — no ACP equivalent.
     RouteDecided(RouteDecided),
@@ -103,6 +111,7 @@ impl Event {
     pub fn name(&self) -> &'static str {
         match self {
             Event::SessionUpdate(_) => "session_update",
+            Event::SessionTitled(_) => "session_titled",
             Event::RouteDecided(_) => "route_decided",
             Event::PrivacyBlock(_) => "privacy_block",
             Event::CostRecorded(_) => "cost_recorded",
@@ -203,6 +212,45 @@ pub enum PlanEntryStatus {
     InProgress,
     /// Done.
     Completed,
+}
+
+// ---------------------------------------------------------------------------
+// session_titled (Teton differentiator)
+// ---------------------------------------------------------------------------
+
+/// A session was given a title (REQ-561 BR-9a).
+///
+/// The title itself is not new state: [`crate::methods::SessionSummary::title`]
+/// has always been on the wire and was simply never populated (ADR-6). This
+/// event is what makes a change to it observable on the stream, so a client
+/// learns the session was named without polling `session/list`.
+///
+/// A session is titled once — the emitter's contract is one event per session,
+/// carrying a non-empty title, and none for a session that already has one.
+/// Neither is enforceable by a wire type, so a consumer that renders the title
+/// should treat an empty string as no title rather than as a name.
+///
+/// # Which session
+///
+/// The session is named by [`EventEnvelope::session_id`], as it is for every
+/// other session-scoped event ([`RouteDecided`], [`PrivacyBlock`],
+/// [`PhaseTransition`]). The wire object therefore still reads
+/// `{ "session_id": …, "seq": …, "event": "session_titled", "title": … }` —
+/// ADR-6's `SessionTitled { session_id, title }` shape, assembled by the
+/// envelope rather than repeated inside the payload.
+///
+/// Repeating it here is not a stylistic choice but an unrepresentable one:
+/// [`Event`] is internally tagged and flattened, so a `session_id` field on this
+/// struct would land in the same JSON object as the envelope's, emit the key
+/// twice, and fail to deserialize with serde's `duplicate field` error.
+/// [`CostRecord`] can carry its own `session_id` because `cost_recorded`
+/// *nests* it under `record` instead of flattening it. A contributor who adds
+/// the field back turns `session_titled_round_trips_under_its_wire_name` red,
+/// which is where that discovery is meant to happen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTitled {
+    /// The title the `title` category produced for the session.
+    pub title: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +978,12 @@ mod tests {
                 "session_update",
             ),
             (
+                Event::SessionTitled(SessionTitled {
+                    title: "wire the unreached categories".to_owned(),
+                }),
+                "session_titled",
+            ),
+            (
                 Event::PermissionRequest(PermissionRequest {
                     request_id: RequestId::from("r"),
                     tool_name: "shell".to_owned(),
@@ -968,6 +1022,31 @@ mod tests {
             assert_eq!(wire["event"], expected, "wire tag mismatch");
             assert_eq!(env.event_name(), expected);
         }
+    }
+
+    /// AC-15's wire half (BR-9a): the title reaches a client as a flat
+    /// `session_titled` object naming its session, and survives the round trip
+    /// unchanged.
+    ///
+    /// `session_id` is asserted on the wire object rather than on the payload
+    /// because the envelope is what carries it — the assertion is about what a
+    /// client receives, which is the only level at which "the event names its
+    /// session" is a claim worth making. `envelope_wire` round-trips before
+    /// returning, so re-adding `session_id` to [`SessionTitled`] fails here on
+    /// the resulting duplicate key rather than reaching a client.
+    #[test]
+    fn session_titled_round_trips_under_its_wire_name() {
+        let titled = SessionTitled {
+            title: "wire the unreached categories".to_owned(),
+        };
+        round_trip(&titled);
+
+        let wire = envelope_wire(Event::SessionTitled(titled.clone()));
+        assert_eq!(wire["event"], "session_titled");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["title"], "wire the unreached categories");
+
+        assert_eq!(Event::SessionTitled(titled).name(), "session_titled");
     }
 
     #[test]
