@@ -1,7 +1,7 @@
 ---
 id: REQ-562
 title: "redact: a model-based secret and PII scan inside the egress choke point"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-07
 updated: 2026-08-07
@@ -273,7 +273,9 @@ No new RPCs.
       remote turn. Opt-in ships the capability and lets its recall be measured
       before anything depends on it. See BR-10 for the switch, and note what the
       switch must **not** be.
-- [ ] OQ-4: What does a user *do* with a block?
+- [x] OQ-4: **RESOLVED 2026-08-07 — v1 ships good reporting and no override; does
+      NOT sequence behind REQ-560.** The contingency on OQ-2 is discharged (see
+      final paragraph). *(Original framing follows.)* What does a user *do* with a block?
 
       **This is two questions, and only one of them needs REQ-560.**
 

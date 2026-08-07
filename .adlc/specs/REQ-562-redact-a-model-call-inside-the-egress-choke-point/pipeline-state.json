@@ -1,0 +1,33 @@
+{
+  "req": "REQ-562",
+  "branch": "feat/REQ-562-redact-egress-scan",
+  "startedAt": "2026-08-07T00:00:00Z",
+  "completed": false,
+  "currentPhase": 2,
+  "completedPhases": [0, 1],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    { "phase": 0, "name": "Resolve Repos + Worktree + Preflight", "completedAt": "2026-08-07T00:10:00Z", "note": "draft PR deferred to Phase 6 fallback (LESSON-004: no commits yet)" },
+    { "phase": 1, "name": "Validate Requirement Spec", "completedAt": "2026-08-07T00:20:00Z", "note": "APPROVED; OQ-4 checkbox synced to recorded resolution; BR-9 latency budget carried to Phase 2 as an architecture obligation" }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-562",
+      "branch": "feat/REQ-562-redact-egress-scan",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
