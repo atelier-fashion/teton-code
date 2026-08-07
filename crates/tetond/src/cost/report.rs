@@ -166,7 +166,9 @@ fn phase_key(phase: Option<Phase>) -> String {
         Some(Phase::Implement) => "implement",
         Some(Phase::Review) => "review",
         Some(Phase::Io) => "io",
-        Some(Phase::Freeform) => "freeform",
+        // Every phaseless call lands here: freeform turns, which have always
+        // recorded `phase: NULL`, and rows from a build that still wrote the
+        // retired `"freeform"` string (ADR-G).
         None => "none",
     }
     .to_owned()
@@ -297,6 +299,9 @@ mod tests {
         LedgerRow {
             session_id: session.to_owned(),
             phase,
+            // The rollups group by session, phase, and provider (REQ-544 AC-4);
+            // the category rides on the row without changing that shape.
+            category: None,
             provider_id: provider.to_owned(),
             model: model.to_owned(),
             input_tokens: input,

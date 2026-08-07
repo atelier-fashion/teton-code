@@ -24,10 +24,11 @@ use teton_protocol::methods::StopReason;
 use teton_protocol::SessionId;
 
 use tetond::broadcast::EventBus;
-use tetond::harness::context::summarize_if_large;
+use tetond::harness::context::{summarize_if_large, ToolProvenance};
 use tetond::harness::{
-    build_system_prompt, run_session_turn, ContextManager, HarnessConfig, NoopProvenanceHook,
-    PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolRegistry,
+    build_system_prompt, run_session_turn, ContextManager, DigestRoute, HarnessConfig,
+    NoopProvenanceHook, PendingPermissions, PermissionConfig, PermissionGate, SessionEvents,
+    ToolContext, ToolRegistry,
 };
 
 /// How long a [`GatedEngine`] waits to be released before completing anyway.
@@ -169,7 +170,10 @@ async fn a_slow_summarization_does_not_stall_an_unrelated_task() {
         let engine = Arc::clone(&engine);
         async move {
             let big = "word ".repeat(500);
-            summarize_if_large(&engine, "grep", &big, 50).await
+            // The `digest` duty on the local tier — the route the daemon resolves
+            // when `digest` (or its `scan` tier) is bound to the local provider.
+            let route = DigestRoute::local("local", engine);
+            summarize_if_large(&route, "grep", &big, 50, &ToolProvenance::none()).await
         }
     });
 

@@ -188,16 +188,17 @@ async fn a_turns_events_precede_the_turns_response_on_the_wire() {
         Some(true),
         "provider registration failed: {registered}"
     );
-    // A phase policy, so a structured turn resolves through the routing table
+    // A tier binding, so a structured turn resolves through the routing table
     // rather than through `default_provider` (which no RPC can set — REQ-557
-    // adds none, by design).
+    // adds none, by design). An `implement` turn dispatches on `edit`, which
+    // inherits the `build` tier (REQ-558 AC-9: the config op takes no phase).
     let (_, routed) = client
         .call_collecting_events(
             1001,
             "config/set",
             json!({ "update": {
-                "op": "set_routing_rule",
-                "phase": "implement",
+                "op": "set_tier_binding",
+                "tier": "build",
                 "provider_id": "ordering",
             }}),
         )
@@ -205,7 +206,7 @@ async fn a_turns_events_precede_the_turns_response_on_the_wire() {
     assert_eq!(
         routed["result"]["applied"].as_bool(),
         Some(true),
-        "routing rule failed: {routed}"
+        "tier binding failed: {routed}"
     );
 
     for turn in 0..TURNS {

@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ClientKind, Phase, ProtocolVersion, ProviderId, RequestId, SessionId};
+use crate::{Category, ClientKind, Phase, ProtocolVersion, ProviderId, RequestId, SessionId, Tier};
 
 /// A broadcast event plus its shared envelope metadata.
 ///
@@ -198,9 +198,30 @@ pub enum PlanEntryStatus {
 ///
 /// Every routing decision emits this with its `reason` — the legibility promise
 /// (BR-5). The `session` scoping lives in the [`EventEnvelope`].
+///
+/// REQ-558 AC-8: a decision names the **category** it was made for, the tier
+/// that category resolved through, the provider, and a non-empty reason.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteDecided {
-    /// Phase that drove the decision; `None` for heuristic freeform routing.
+    /// The category this call was made for — the dispatch key in both session
+    /// modes (REQ-558 BR-1).
+    ///
+    /// `None` only for a decision reached by the pre-category path (phase policy
+    /// or the freeform heuristic) that TASK-050 replaces; once every route
+    /// resolves through `teton_core::category::resolve`, every event names its
+    /// category. The absence is the honest shape of a decision made without one,
+    /// not a placeholder to be filled in by a caller.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub category: Option<Category>,
+    /// The tier the category resolved through, **as reported by the resolution**
+    /// — never recomputed from `category` (ADR-D, BR-6, AC-11). Set exactly when
+    /// `category` is.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tier: Option<Tier>,
+    /// Lifecycle phase in effect; `None` for a freeform turn.
+    ///
+    /// Retained for cost attribution and ADLC gating (REQ-558 BR-11), **not** as
+    /// a routing key: `category` is what drove the decision above.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub phase: Option<Phase>,
     /// Provider selected.
@@ -249,8 +270,17 @@ pub struct CostRecord {
     /// Session that incurred the cost.
     pub session_id: SessionId,
     /// Phase, or `None` in freeform mode.
+    ///
+    /// Retained alongside `category` (REQ-558 BR-11): the phase is what the
+    /// spend is *attributed* to, the category is what it was *for*.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub phase: Option<Phase>,
+    /// The routing category the call was made for (REQ-558), or `None` for a
+    /// call recorded with no category attribution — including every row written
+    /// by a build that predates categories, which is why the ledger column is
+    /// nullable rather than backfilled with a guess.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub category: Option<Category>,
     /// Provider billed.
     pub provider_id: ProviderId,
     /// Concrete model billed.
@@ -798,6 +828,8 @@ mod tests {
     #[test]
     fn envelope_is_flat_and_tagged_by_event_name() {
         let wire = envelope_wire(Event::RouteDecided(RouteDecided {
+            category: Some(Category::Design),
+            tier: Some(Tier::Think),
             phase: Some(Phase::Architect),
             provider_id: ProviderId::from("anthropic"),
             model: Some("opus".to_owned()),
@@ -808,6 +840,8 @@ mod tests {
         assert_eq!(wire["seq"], 1);
         assert_eq!(wire["session_id"], "s1");
         assert_eq!(wire["provider_id"], "anthropic");
+        assert_eq!(wire["category"], "design");
+        assert_eq!(wire["tier"], "think");
     }
 
     #[test]
@@ -817,6 +851,8 @@ mod tests {
         let cases: Vec<(Event, &str)> = vec![
             (
                 Event::RouteDecided(RouteDecided {
+                    category: None,
+                    tier: None,
                     phase: None,
                     provider_id: ProviderId::from("p"),
                     model: None,
@@ -845,6 +881,7 @@ mod tests {
                     record: CostRecord {
                         session_id: SessionId::from("s"),
                         phase: None,
+                        category: None,
                         provider_id: ProviderId::from("p"),
                         model: "m".to_owned(),
                         input_tokens: 1,
@@ -958,11 +995,61 @@ mod tests {
     #[test]
     fn route_decided_round_trips() {
         round_trip(&RouteDecided {
+            category: Some(Category::Edit),
+            tier: Some(Tier::Build),
             phase: Some(Phase::Implement),
             provider_id: ProviderId::from("deepseek"),
             model: Some("deepseek-coder".to_owned()),
             reason: "implement phase routes to the configured cheap tier".to_owned(),
         });
+    }
+
+    /// REQ-558 AC-8: the four things a decision must name travel together, and
+    /// they survive the wire. Asserted on the JSON rather than only on the
+    /// round-tripped struct, because a client reads the JSON.
+    #[test]
+    fn route_decided_names_its_category_tier_provider_and_reason() {
+        let decided = RouteDecided {
+            category: Some(Category::Digest),
+            tier: Some(Tier::Scan),
+            phase: None,
+            provider_id: ProviderId::from("on-device"),
+            model: Some("qwen2.5-coder-3b".to_owned()),
+            reason: "Routing the 'digest' category to 'on-device' through its 'scan' tier binding."
+                .to_owned(),
+        };
+        round_trip(&decided);
+        let wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&decided).unwrap()).unwrap();
+        assert_eq!(wire["category"], "digest");
+        assert_eq!(wire["tier"], "scan");
+        assert_eq!(wire["provider_id"], "on-device");
+        assert!(!wire["reason"].as_str().unwrap().is_empty());
+        // BR-11: a freeform turn has no phase, and the absent phase does not
+        // take the category with it — the two are independent facts now.
+        assert!(wire.get("phase").is_none());
+    }
+
+    /// A pre-REQ-558 client (or a replayed pre-REQ event) omits the new keys
+    /// entirely. They must deserialize as absent rather than fail the envelope —
+    /// the same `default` posture every other optional payload field takes.
+    #[test]
+    fn route_decided_and_cost_record_accept_a_payload_with_no_category() {
+        let decided: RouteDecided = serde_json::from_str(
+            r#"{"phase":"review","provider_id":"anthropic","reason":"because"}"#,
+        )
+        .unwrap();
+        assert_eq!(decided.category, None);
+        assert_eq!(decided.tier, None);
+        assert_eq!(decided.phase, Some(Phase::Review));
+
+        let record: CostRecord = serde_json::from_str(
+            r#"{"session_id":"s1","provider_id":"anthropic","model":"m",
+                "input_tokens":1,"output_tokens":2,"usd_micros":3}"#,
+        )
+        .unwrap();
+        assert_eq!(record.category, None);
+        assert_eq!(record.phase, None);
     }
 
     #[test]
@@ -980,6 +1067,7 @@ mod tests {
             record: CostRecord {
                 session_id: SessionId::from("s1"),
                 phase: Some(Phase::Review),
+                category: Some(Category::Review),
                 provider_id: ProviderId::from("anthropic"),
                 model: "claude-opus".to_owned(),
                 input_tokens: 1000,

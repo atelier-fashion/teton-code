@@ -9,7 +9,7 @@
 //! Two rules shape the design:
 //!
 //! - **Freeform is the degenerate case (BR-3).** A [`PhaseMachine::freeform`]
-//!   session sits in [`Phase::Freeform`] with no gates and no transitions: it can
+//!   session sits at **no phase at all** with no gates and no transitions: it can
 //!   never be *required* to produce an artifact. Entering structured mode is an
 //!   explicit choice ([`PhaseMachine::structured`]).
 //! - **A gate never generates silently.** A missing or still-templated artifact
@@ -56,11 +56,11 @@ pub enum GateError {
         /// Repo-relative path of the offending artifact.
         path: String,
     },
-    /// There is no phase to advance to — [`Phase::Review`] is terminal and
-    /// [`Phase::Freeform`] has no structured flow.
+    /// There is no phase to advance to — [`Phase::Review`] is terminal, and a
+    /// freeform session has no structured flow to walk.
     NoNextPhase {
-        /// The current (final or freeform) phase.
-        phase: Phase,
+        /// The current phase, or `None` for a freeform session.
+        phase: Option<Phase>,
     },
 }
 
@@ -77,9 +77,14 @@ impl fmt::Display for GateError {
                 "cannot leave the {phase:?} phase: the {kind:?} artifact at `{path}` is \
                  empty or an unfilled template. Fill in its placeholders before advancing."
             ),
-            GateError::NoNextPhase { phase } => {
+            GateError::NoNextPhase { phase: Some(phase) } => {
                 write!(f, "the {phase:?} phase has no next phase to advance to")
             }
+            GateError::NoNextPhase { phase: None } => write!(
+                f,
+                "a freeform session has no structured flow to advance through. \
+                 Start a structured session to walk the ADLC phases."
+            ),
         }
     }
 }
@@ -90,7 +95,10 @@ impl std::error::Error for GateError {}
 #[derive(Debug, Clone)]
 pub struct PhaseMachine {
     mode: Mode,
-    phase: Phase,
+    /// The lifecycle position, or `None` for a freeform session — see
+    /// [`PhaseMachine::freeform`] for why freeform is `None` rather than some
+    /// nominated phase.
+    phase: Option<Phase>,
     req_id: String,
 }
 
@@ -100,30 +108,48 @@ impl PhaseMachine {
     pub fn structured(req_id: impl Into<String>) -> Self {
         Self {
             mode: Mode::Structured,
-            phase: Phase::Spec,
+            phase: Some(Phase::Spec),
             req_id: req_id.into(),
         }
     }
 
-    /// A freeform session: one phase, no gates, no required artifacts (BR-3).
+    /// A freeform session: no phase, no gates, no required artifacts (BR-3).
+    ///
+    /// # Why `None` and not a nominated phase
+    ///
+    /// REQ-558 ADR-G retires `Phase::Freeform`, and this constructor was its
+    /// last meaningful producer — so this is the one place in TASK-051 where a
+    /// *behavioural* choice had to be made rather than a type mechanically
+    /// updated. The choice was between naming a substitute lifecycle phase
+    /// (`Io`, `Implement`, …) and admitting the session has none.
+    ///
+    /// It has none. A freeform session is not at some point in the ADLC flow;
+    /// it is not in the flow. Nominating a substitute would make this the only
+    /// type in the workspace claiming otherwise — `Session.phase`,
+    /// `Route.phase`, `RouteDecided.phase`, and the ledger's `phase` column are
+    /// all `Option`, and a freeform turn has always written `None` into every
+    /// one of them. It would also be a lie with teeth: the moment this machine
+    /// gains a production caller that feeds cost attribution, a nominated phase
+    /// would silently bill freeform work to a lifecycle bucket nobody worked in.
     #[must_use]
     pub fn freeform() -> Self {
         Self {
             mode: Mode::Freeform,
-            phase: Phase::Freeform,
+            phase: None,
             req_id: String::new(),
         }
     }
 
-    /// The session mode.
+    /// The session mode. The *declared* intent; [`PhaseMachine::phase`] being
+    /// `None` is the operative fact the flow logic reads.
     #[must_use]
     pub fn mode(&self) -> Mode {
         self.mode
     }
 
-    /// The current phase.
+    /// The current phase, or `None` for a freeform session.
     #[must_use]
-    pub fn phase(&self) -> Phase {
+    pub fn phase(&self) -> Option<Phase> {
         self.phase
     }
 
@@ -134,16 +160,18 @@ impl PhaseMachine {
     }
 
     /// The next phase in the structured flow, or `None` if terminal or freeform.
+    ///
+    /// Derived from `self.phase` alone, not from `self.mode`: a freeform session
+    /// has no phase, so it falls out of the same match rather than needing a
+    /// second representation of "not in the flow" that could disagree with the
+    /// first.
     #[must_use]
     pub fn next_phase(&self) -> Option<Phase> {
-        match self.mode {
-            Mode::Freeform => None,
-            Mode::Structured => match self.phase {
-                Phase::Spec => Some(Phase::Architect),
-                Phase::Architect => Some(Phase::Implement),
-                Phase::Implement => Some(Phase::Review),
-                _ => None,
-            },
+        match self.phase? {
+            Phase::Spec => Some(Phase::Architect),
+            Phase::Architect => Some(Phase::Implement),
+            Phase::Implement => Some(Phase::Review),
+            Phase::Review | Phase::Io => None,
         }
     }
 
@@ -174,9 +202,9 @@ impl PhaseMachine {
     #[must_use]
     pub fn context_artifacts(&self, store: &ArtifactStore) -> Vec<TaskArtifact> {
         let kinds: &[ArtifactKind] = match self.phase {
-            Phase::Architect => &[ArtifactKind::Requirement],
-            Phase::Implement => &[ArtifactKind::Task],
-            Phase::Review => &[ArtifactKind::Requirement, ArtifactKind::Task],
+            Some(Phase::Architect) => &[ArtifactKind::Requirement],
+            Some(Phase::Implement) => &[ArtifactKind::Task],
+            Some(Phase::Review) => &[ArtifactKind::Requirement, ArtifactKind::Task],
             _ => &[],
         };
         kinds
@@ -198,18 +226,20 @@ impl PhaseMachine {
     /// absent or an unfilled stub; [`GateError::NoNextPhase`] at the end of the
     /// flow or in freeform mode.
     pub fn try_advance(&mut self, store: &ArtifactStore) -> Result<PhaseTransition, GateError> {
-        let Some(to) = self.next_phase() else {
+        // `next_phase` is `Some` only when `self.phase` is, so `from` is the
+        // concrete phase whose gate is about to be checked — the gate errors
+        // below can name a real phase rather than an `Option`.
+        let (Some(from), Some(to)) = (self.phase, self.next_phase()) else {
             return Err(GateError::NoNextPhase { phase: self.phase });
         };
 
         let mut refs: Vec<TaskArtifactRef> = Vec::new();
-        for &kind in Self::gate_kinds(self.phase) {
-            let artifact = self.require_valid(store, kind)?;
+        for &kind in Self::gate_kinds(from) {
+            let artifact = self.require_valid(store, from, kind)?;
             refs.push(artifact.to_ref());
         }
 
-        let from = self.phase;
-        self.phase = to;
+        self.phase = Some(to);
         Ok(PhaseTransition {
             from_phase: Some(from),
             to_phase: to,
@@ -221,20 +251,15 @@ impl PhaseMachine {
     fn require_valid(
         &self,
         store: &ArtifactStore,
+        phase: Phase,
         kind: ArtifactKind,
     ) -> Result<TaskArtifact, GateError> {
         let path = store.rel_path(&self.req_id, kind);
         match store.load(&self.req_id, kind) {
-            None => Err(GateError::Missing {
-                phase: self.phase,
-                kind,
-                path,
-            }),
-            Some(artifact) if !is_authored(&artifact.content) => Err(GateError::Invalid {
-                phase: self.phase,
-                kind,
-                path,
-            }),
+            None => Err(GateError::Missing { phase, kind, path }),
+            Some(artifact) if !is_authored(&artifact.content) => {
+                Err(GateError::Invalid { phase, kind, path })
+            }
             Some(artifact) => Ok(artifact),
         }
     }
@@ -284,13 +309,19 @@ mod tests {
         let store = ArtifactStore::new(&repo);
         let mut machine = PhaseMachine::freeform();
         assert_eq!(machine.mode(), Mode::Freeform);
-        assert_eq!(machine.phase(), Phase::Freeform);
+        // ADR-G: a freeform session has no lifecycle position, rather than
+        // sitting in a nominated substitute phase.
+        assert_eq!(machine.phase(), None);
         assert!(machine.is_terminal());
         assert!(machine.context_artifacts(&store).is_empty());
         // BR-3: advancing a freeform session is a no-op refusal, not a gate on a
         // missing artifact.
         match machine.try_advance(&store) {
-            Err(GateError::NoNextPhase { phase }) => assert_eq!(phase, Phase::Freeform),
+            Err(GateError::NoNextPhase { phase }) => {
+                assert_eq!(phase, None);
+                let msg = GateError::NoNextPhase { phase }.to_string();
+                assert!(msg.contains("freeform"), "actionable message: {msg}");
+            }
             other => panic!("freeform must not gate on artifacts: {other:?}"),
         }
         std::fs::remove_dir_all(&repo).ok();
@@ -303,7 +334,7 @@ mod tests {
         author_all(&store, "demo");
 
         let mut machine = PhaseMachine::structured("demo");
-        assert_eq!(machine.phase(), Phase::Spec);
+        assert_eq!(machine.phase(), Some(Phase::Spec));
 
         let t1 = machine.try_advance(&store).expect("spec → architect");
         assert_eq!(t1.from_phase, Some(Phase::Spec));
@@ -346,7 +377,7 @@ mod tests {
         assert!(msg.contains(".teton/demo/requirement.md"));
         assert!(msg.contains("Author it"), "message is actionable: {msg}");
         // The machine did not move.
-        assert_eq!(machine.phase(), Phase::Spec);
+        assert_eq!(machine.phase(), Some(Phase::Spec));
         std::fs::remove_dir_all(&repo).ok();
     }
 
@@ -365,7 +396,7 @@ mod tests {
         }
         assert_eq!(
             machine.phase(),
-            Phase::Spec,
+            Some(Phase::Spec),
             "gate did not advance on a stub"
         );
         std::fs::remove_dir_all(&repo).ok();
@@ -384,7 +415,7 @@ mod tests {
             .unwrap();
 
         let mut machine = PhaseMachine::structured("demo");
-        machine.phase = Phase::Implement; // jump straight to implement for the check
+        machine.phase = Some(Phase::Implement); // jump straight to implement for the check
 
         let artifacts = machine.context_artifacts(&store);
         assert_eq!(artifacts.len(), 1);

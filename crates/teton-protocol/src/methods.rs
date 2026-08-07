@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::events::{CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource};
 use crate::jsonrpc::{Id, Request};
 use crate::{
-    Phase, PrivacyMode, ProviderId, ProviderKind, RequestId, SessionId, SessionMode, TurnId,
+    BindingSource, Category, ConfigurableCategory, Phase, PrivacyMode, ProviderId, ProviderKind,
+    RequestId, SessionId, SessionMode, Tier, TierBindingSource, TurnId,
 };
 
 /// Binds a request-parameter type to its wire method name and result type.
@@ -492,16 +493,94 @@ pub struct ProviderConfig {
     pub auth_ref: Option<String>,
 }
 
-/// A single phase→provider routing rule (spec entity `RoutingPolicy`).
+// `RoutingRule` and `ConfigUpdate::SetRoutingRule` are **gone** (REQ-558 AC-9).
+// The protocol carries no phase-keyed routing type at all now: a category is the
+// dispatch key, lifecycle phase is a cost-attribution fact, and the two are not
+// the same axis. `TierBindingConfig` and `CategoryBindingConfig` below are what
+// replaced them.
+
+/// Bind a routing tier to a provider — the primary configuration surface
+/// (REQ-558 ADR-H, `teton policy set-tier`).
+///
+/// Four of these configure every category, because a category inherits its
+/// tier's binding unless a [`CategoryBindingConfig`] overrides it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RoutingRule {
-    /// The phase this rule governs.
-    pub phase: Phase,
-    /// Provider selected for the phase.
+pub struct TierBindingConfig {
+    /// The tier this row binds.
+    pub tier: Tier,
+    /// Provider the tier routes to.
     pub provider_id: ProviderId,
-    /// Provider used on error/timeout of `provider_id`.
+    /// Provider used when the primary is unavailable or not routable.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fallback_id: Option<ProviderId>,
+}
+
+/// Override one category's binding (`teton policy set-category`).
+///
+/// `name` is a [`ConfigurableCategory`], so a binding for `route` or `redact` is
+/// not a request the daemon rejects — it is a request that cannot be encoded
+/// (ADR-B).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategoryBindingConfig {
+    /// The category this row binds.
+    pub name: ConfigurableCategory,
+    /// Provider this category routes to, ahead of its tier's binding.
+    pub provider_id: ProviderId,
+    /// Provider used when the primary is unavailable or not routable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fallback_id: Option<ProviderId>,
+}
+
+/// One tier row of `teton policy show`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TierRouteView {
+    /// The tier.
+    pub tier: Tier,
+    /// The provider it routes to, or `None` when it has none and inherits none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider_id: Option<ProviderId>,
+    /// Its configured fallback, when the row carries one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fallback_id: Option<ProviderId>,
+    /// Whether the provider is the configured one or an inherited fill.
+    pub source: TierBindingSource,
+}
+
+/// One category row of `teton policy show` — the effective routing state of a
+/// single category, **as the daemon's own resolver answers it**.
+///
+/// Every field here is read off `teton_core::category::CategoryResolution`, the
+/// same value `route_decided` is built from (BR-6, AC-11). Nothing in this
+/// struct is recomputed by the surface that renders it, which is the point: the
+/// table a human reads and the event a turn emits describe one routing state, so
+/// they must not be able to disagree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategoryRouteView {
+    /// The category.
+    pub category: Category,
+    /// The tier it inherits from — a compile-time property, populated even when
+    /// nothing is bound.
+    pub tier: Tier,
+    /// The provider it resolves to, or `None` when it cannot be routed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider_id: Option<ProviderId>,
+    /// The fallback that would serve a mid-turn failure, already screened.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fallback_id: Option<ProviderId>,
+    /// Override, tier inheritance, pinned, or unbound.
+    pub source: BindingSource,
+    /// Whether any model call site in the harness dispatches on this category
+    /// yet (REQ-558 ADR-A).
+    ///
+    /// `false` is rendered as `declared, no call site yet`. The schema is
+    /// complete for all eleven categories so the remaining call sites can be
+    /// tagged without another config migration — but a knob that silently does
+    /// nothing invites a user to tune it, so the table says which ones those
+    /// are. The daemon derives this from its own call sites; it is not a
+    /// configured value.
+    pub reached: bool,
+    /// The resolver's sentence naming the signal that fired, verbatim.
+    pub reason: String,
 }
 
 /// A privacy boundary over a path glob (spec entity `PrivacyBoundary`).
@@ -522,8 +601,24 @@ pub struct ConfigGetParams {}
 pub struct ConfigSnapshot {
     /// Registered providers.
     pub providers: Vec<ProviderConfig>,
-    /// Routing policy table.
-    pub routing: Vec<RoutingRule>,
+    /// The four tier rows — the primary configuration surface.
+    pub tiers: Vec<TierRouteView>,
+    /// The effective routing state of every category, resolver-answered.
+    ///
+    /// Named `routing` because that is what it is; it replaced a phase-keyed
+    /// table of the same name (AC-9). One row per [`Category`], all eleven,
+    /// including the two that are pinned and the ones with no call site yet.
+    pub routing: Vec<CategoryRouteView>,
+    /// The category a freeform turn takes when classification is bypassed or
+    /// fails (BR-9, AC-12).
+    ///
+    /// `Option` only so the field is additive on the wire: a daemon that sends
+    /// it always sends one of the four judgment categories. It is here, and not
+    /// only in `teton policy show`, because AC-12 asks for the declared default
+    /// to be *configuration-visible* — a value a client can read is the
+    /// difference between a declared default and a hidden constant.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub judgment_default: Option<Category>,
     /// Privacy boundaries.
     pub privacy: Vec<PrivacyBoundaryConfig>,
 }
@@ -549,8 +644,10 @@ impl RpcMethod for ConfigGetParams {
 pub enum ConfigUpdate {
     /// Register or replace a provider.
     RegisterProvider(ProviderConfig),
-    /// Set the routing rule for a phase.
-    SetRoutingRule(RoutingRule),
+    /// Bind a routing tier to a provider (`teton policy set-tier`).
+    SetTierBinding(TierBindingConfig),
+    /// Override one category's binding (`teton policy set-category`).
+    SetCategoryBinding(CategoryBindingConfig),
     /// Add or replace a privacy boundary.
     SetPrivacyBoundary(PrivacyBoundaryConfig),
 }
@@ -1044,11 +1141,24 @@ mod tests {
                     model: Some("claude-opus-5".to_owned()),
                     auth_ref: Some("keychain://teton/anthropic".to_owned()),
                 }],
-                routing: vec![RoutingRule {
-                    phase: Phase::Architect,
-                    provider_id: ProviderId::from("anthropic"),
+                tiers: vec![TierRouteView {
+                    tier: Tier::Think,
+                    provider_id: Some(ProviderId::from("anthropic")),
                     fallback_id: Some(ProviderId::from("local")),
+                    source: TierBindingSource::Configured,
                 }],
+                routing: vec![CategoryRouteView {
+                    category: Category::Design,
+                    tier: Tier::Think,
+                    provider_id: Some(ProviderId::from("anthropic")),
+                    fallback_id: Some(ProviderId::from("local")),
+                    source: BindingSource::TierInheritance,
+                    reached: true,
+                    reason: "Routing the 'design' category to 'anthropic' through its 'think' \
+                             tier binding."
+                        .to_owned(),
+                }],
+                judgment_default: Some(Category::Edit),
                 privacy: vec![PrivacyBoundaryConfig {
                     path_glob: "secrets/**".to_owned(),
                     mode: PrivacyMode::LocalOnly,
@@ -1067,10 +1177,15 @@ mod tests {
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain://teton/deepseek".to_owned()),
             }),
-            ConfigUpdate::SetRoutingRule(RoutingRule {
-                phase: Phase::Implement,
+            ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier: Tier::Build,
                 provider_id: ProviderId::from("deepseek"),
                 fallback_id: None,
+            }),
+            ConfigUpdate::SetCategoryBinding(CategoryBindingConfig {
+                name: ConfigurableCategory::Review,
+                provider_id: ProviderId::from("deepseek"),
+                fallback_id: Some(ProviderId::from("anthropic")),
             }),
             ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
                 path_glob: "*.env".to_owned(),

@@ -165,6 +165,7 @@ mod tests {
         CostRecord {
             session_id: SessionId::from("s1"),
             phase,
+            category: None,
             provider_id: ProviderId::from("deepseek"),
             model: "coder".to_owned(),
             input_tokens: 100,

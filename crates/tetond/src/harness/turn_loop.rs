@@ -46,6 +46,7 @@ use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
 use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN};
+use super::digest::DigestRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
 use super::reply::StreamGate;
 use super::tools::{ToolContext, ToolOutcome, ToolRegistry};
@@ -128,7 +129,8 @@ pub struct HarnessConfig {
     /// size it to `n_ctx` when configuring a different engine.
     pub context_budget_bytes: usize,
     /// Tool results larger than this (in approx tokens, or its byte twin) are
-    /// summarized locally.
+    /// condensed through the `digest` category (REQ-558) before they enter
+    /// context — locally, or wherever `digest` is bound.
     pub summarize_threshold_tokens: usize,
     /// Cap on tools exposed to the model (`None` = all).
     pub max_tools: Option<u32>,
@@ -302,7 +304,11 @@ impl SessionEvents {
 /// engine in a [`LocalEngineSource`] and drives the unified
 /// [`run_session_turn_with_source`] loop. Because no [`Transport`](teton_providers::Transport)
 /// ever enters this path, egress is impossible here by construction. The *same*
-/// engine also serves the loop's local tool-result summarization duty (BR-8).
+/// engine also serves the loop's tool-result summarization duty on a
+/// [local `digest` route](DigestRoute::local) — this entry point has no router to
+/// resolve the category with, and a path whose whole guarantee is "no transport
+/// exists here" is not the place to acquire one. The daemon's routed path
+/// (`DaemonRuntime::run_one_attempt`) resolves `digest` properly.
 ///
 /// # Errors
 /// Returns [`HarnessError::Engine`] if the local engine cannot serve. Tool
@@ -311,7 +317,7 @@ impl SessionEvents {
 ///
 /// # Blocking
 /// The model call itself rides the blocking pool (E-3, see
-/// [`LocalEngineSource`] and [`summarize_if_large`]), so a slow local inference
+/// [`LocalEngineSource`] and [`DigestRoute::local`]), so a slow local inference
 /// never parks the async worker. Tool dispatch (notably `shell`) still runs
 /// synchronously; a production caller on a multi-thread runtime should wrap this
 /// in `spawn_blocking` for the tool phase.
@@ -334,6 +340,9 @@ pub async fn run_session_turn(
     // stores the format beside the handle; tests pass the format their test
     // engine reports.
     let mut source = LocalEngineSource::new(Arc::clone(engine), format);
+    // The local tier names itself here, as it does everywhere the tier comes from
+    // the engine rather than from a `[[providers]]` entry (REQ-557 ADR-D).
+    let digest = DigestRoute::local("local", Arc::clone(engine));
     run_session_turn_with_source(
         &mut source,
         tools,
@@ -343,7 +352,7 @@ pub async fn run_session_turn(
         ctx,
         config,
         hook,
-        Some(Arc::clone(engine)),
+        &digest,
     )
     .await
 }
@@ -358,10 +367,17 @@ pub async fn run_session_turn(
 /// the permission gate, fold the result back, and repeat under the same bounded
 /// termination and mandatory-verification rules the local loop uses.
 ///
-/// `summarizer` is the *local* engine used to condense oversized tool results
-/// (BR-8, a latency duty): pass `Some(engine)` on any machine with a local tier,
-/// or `None` (remote-only machines) to fold results verbatim. It is never the turn
-/// producer — that is `source`.
+/// `digest` is the resolved `digest` category (REQ-558 TASK-054) that condenses
+/// oversized tool results before they enter context. It is never the turn
+/// producer — that is `source` — and the two are resolved independently: a turn on
+/// a frontier `think` provider still digests through whatever `scan` is bound to.
+///
+/// It is a [`DigestRoute`] rather than an `Option<Engine>` because "no local
+/// tier" stopped being the only way this duty can fail to find a model. The old
+/// `None` arm folded oversized results **verbatim**, which is the very shape
+/// LESSON-447 is about — an identity fallback on a function whose purpose is to
+/// shrink its input. [`DigestRoute::Unresolved`] replaces it, and
+/// [`summarize_if_large`] bounds mechanically instead.
 ///
 /// # Errors
 /// [`HarnessError::Engine`] on a local backend failure, or
@@ -377,7 +393,7 @@ pub async fn run_session_turn_with_source(
     ctx: &mut ContextManager,
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
-    summarizer: Option<Arc<Mutex<dyn Engine>>>,
+    digest: &DigestRoute,
 ) -> Result<TurnOutcome, HarnessError> {
     let exposed = tools.exposed_names(config.max_tools);
     let mut turns = 0u32;
@@ -534,30 +550,42 @@ pub async fn run_session_turn_with_source(
                         } else {
                             content
                         };
-                        // Summarize oversized results on the local tier when one is
-                        // present; a remote-only machine folds them verbatim. A
-                        // summarizer engine failure is never silent: the duty
-                        // guards the context window, so the fallback (mechanical
-                        // truncation) is logged with the error that forced it.
-                        let folded = match &summarizer {
-                            Some(engine) => {
-                                let outcome = summarize_if_large(
-                                    engine,
-                                    &name,
-                                    &folded,
-                                    config.summarize_threshold_tokens,
-                                )
-                                .await;
-                                if let Some(error) = &outcome.engine_error {
-                                    eprintln!(
-                                        "tetond: local summarizer failed on a `{name}` \
-                                         result ({error}); folded a mechanically \
-                                         truncated result instead"
-                                    );
-                                }
-                                outcome.text
+                        // Condense an oversized result before it enters context.
+                        //
+                        // **REQ-558 BR-2: the category is tagged here.** This is
+                        // the `digest` call site, and it knows that by being it —
+                        // no keyword list, no substring match, and nothing that
+                        // reads `folded` or `name` to decide what kind of call
+                        // this is. The route was resolved from `Category::Digest`
+                        // before the loop started; all that is passed in is the
+                        // answer.
+                        //
+                        // The result's own provenance goes with it, so a remote
+                        // digest is scoped at the egress choke point by the files
+                        // this tool actually touched (BR-1) — narrower than the
+                        // turn's context, and the reason a `local-only` read is
+                        // refused while the rest of the conversation still goes.
+                        //
+                        // A failure is never silent: the duty guards the context
+                        // window, so the fallback (mechanical truncation) is
+                        // logged with the error that forced it — an unresolvable
+                        // binding included.
+                        let folded = {
+                            let outcome = summarize_if_large(
+                                digest,
+                                &name,
+                                &folded,
+                                config.summarize_threshold_tokens,
+                                &provenance,
+                            )
+                            .await;
+                            if let Some(error) = &outcome.engine_error {
+                                eprintln!(
+                                    "tetond: the `digest` duty failed on a `{name}` result \
+                                     ({error}); folded a mechanically truncated result instead"
+                                );
                             }
-                            None => folded,
+                            outcome.text
                         };
                         // REQ-544 M-2: frame built-in file/command output as
                         // untrusted data (after any summarization, so the frame is
@@ -828,9 +856,14 @@ mod tests {
         let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
         ctx.push_user("do the thing");
         let mut hook = NoopProvenanceHook;
+        // This turn dispatches no tool, so `digest` is never reached; an
+        // unresolved route is the honest stand-in — and if a future change *did*
+        // start digesting here, the result would still be bounded rather than
+        // folded raw.
+        let digest = DigestRoute::unresolved("no digest route in this test");
 
         run_session_turn_with_source(
-            source, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook, None,
+            source, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook, &digest,
         )
         .await
         .expect("the turn completes");

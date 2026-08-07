@@ -98,8 +98,18 @@ impl TestDaemon {
         let runtime_dir = root.join("x");
         std::fs::create_dir_all(&runtime_dir).unwrap();
 
-        // A config with one provider so `doctor` has something to render. The
-        // provider is never actually called (no session runs here).
+        // A config with one remote provider so `doctor` has something to render,
+        // deliberately left in the pre-REQ-557 shape (no `model`) because
+        // `provider_list_shows_the_migrated_model` asserts the load-time
+        // migration resolves it.
+        //
+        // Every tier is bound to the **local** tier (REQ-558): this daemon serves
+        // turns from a scripted local engine and cannot call DeepSeek, so the
+        // binding says so rather than leaving it to a heuristic. Before REQ-558 a
+        // turn reached the local model only when the prompt happened to contain
+        // one of `AUXILIARY_SIGNALS`' ten words — which is the defect REQ-558
+        // deletes, and which made every assertion in the slash-command section
+        // silently depend on the wording of its fixture prompts.
         //
         // `[local_model] base_url` points the model download at a port nothing
         // is listening on. Two things follow, both deliberate: no test here can
@@ -108,11 +118,17 @@ impl TestDaemon {
         // consent round-trip these CLI tests are about. Whether the bytes then
         // arrive is `daemon`'s `consent_matrix`, against a mock host.
         let config_path = root.join("config.toml");
+        let tiers: String = ["reflex", "scan", "build", "think"]
+            .iter()
+            .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+            .collect();
         std::fs::write(
             &config_path,
             format!(
                 "[[providers]]\nid = \"deepseek\"\nkind = \"openai-compatible\"\n\
                  endpoint = \"https://api.deepseek.com\"\n\n\
+                 [[providers]]\nid = \"local\"\nkind = \"local\"\n\n\
+                 {tiers}\
                  [local_model]\nauto_accept = false\nbase_url = \"http://127.0.0.1:{}\"\n",
                 closed_port()
             ),
@@ -656,11 +672,12 @@ fn a_refused_config_is_reported_by_the_cli_that_autostarted_the_daemon() {
 //     proposal is outstanding and every stdin line reaches the entry loop. (With
 //     the unscripted daemon the first line would answer a consent question, as
 //     the REQ-547 tests above rely on.)
-//   * A turn is served locally only when the freeform heuristic classifies the
-//     prompt as an *auxiliary* duty — `tetond`'s `AUXILIARY_SIGNALS`. Every
-//     prompt line here therefore carries such a signal ("explain", "what does"),
-//     so the turn reaches the scripted engine rather than the configured remote
-//     default, which this suite deliberately cannot call.
+//   * Every turn is served locally because the fixture config **binds every tier
+//     to the local tier** (REQ-558 BR-1), so the scripted engine answers whatever
+//     the prompt says. Before REQ-558 that depended on the prompt containing one
+//     of `AUXILIARY_SIGNALS`' ten words, which meant these assertions held for the
+//     wording of their fixture prompts rather than for the property under test —
+//     the trap BUG-155 named and this REQ removes.
 
 /// The scripted engine's replies, one per turn in order. Each is a distinct
 /// marker, so a test can say *which* turn produced a line — and so a slash
@@ -950,9 +967,12 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
         "a default session must start quiet; segment:\n{quiet}"
     );
 
-    // Turn two, after the toggle: the routing notice and the turn-end line.
+    // Turn two, after the toggle: the routing notice and the turn-end line. The
+    // notice's key is the **category and tier** the turn resolved through
+    // (REQ-558) — a freeform turn no longer renders as `[freeform]`, because
+    // freeform stopped being a routing value at all.
     assert!(
-        loud.contains("route [freeform] → local"),
+        loud.contains("route [edit/build] → local"),
         "`/verbose` did not surface the routing notice; segment:\n{loud}"
     );
     assert!(
@@ -1150,15 +1170,23 @@ fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
         "an escaped or plain line was run through the dispatch table; output:\n{session}"
     );
 
-    // The daemon classified the escaped line's own text — the routing reason
-    // names the signal it found in it.
-    assert!(
-        session.contains("matched 'what does'"),
-        "the escaped line's text did not reach the daemon's router; output:\n{session}"
-    );
-    assert!(
-        session.contains("matched 'explain'"),
-        "the plain line's text did not reach the daemon's router; output:\n{session}"
+    // Both turns routed through the category chain, and each notice names the
+    // category and tier that decided it (REQ-558 BR-1).
+    //
+    // Until REQ-558 this pair of assertions read `matched 'what does'` /
+    // `matched 'explain'` — the routing reason quoted the `AUXILIARY_SIGNALS`
+    // word it found in the prompt, which was the only evidence here that the
+    // line's *text* reached the daemon rather than merely a turn. That evidence
+    // is gone with the heuristic, and it should be: an assertion that held
+    // because of the wording of its fixture prompt is exactly the trap BUG-155
+    // named. The byte-level property is pinned where it can be pinned exactly —
+    // `slash.rs`'s `the_double_slash_escape_collapses_only_the_leading_pair`,
+    // named in this test's doc comment; what remains this test's own is that the
+    // escaped line defeated the dispatch table and became a routed turn.
+    assert_eq!(
+        session.matches("route [edit/build] → local").count(),
+        2,
+        "both lines must route through the category chain; output:\n{session}"
     );
 }
 
@@ -1532,5 +1560,107 @@ fn provider_add_refuses_an_id_that_is_already_registered() {
     assert!(
         !listed.contains("deepseek-reasoner"),
         "the refused registration must not have landed; output:\n{listed}"
+    );
+}
+
+/// REQ-558 AC-11 / ADR-A / ADR-H: `teton policy show` renders the **daemon's**
+/// resolved table through the real CLI binary.
+///
+/// The daemon-side half of AC-11 — that the projection `policy show` renders is
+/// the resolver's own answer, byte for byte, and agrees with `route_decided`
+/// and with the turn-failure sentence — is pinned in
+/// `tetond/tests/e2e/routing_categories.rs`. What that cannot show is that the
+/// shipped CLI reaches `config/get` at all and renders what comes back: a
+/// `render_policy` unit test formats a struct nobody proved the binary fetched.
+/// This closes that last mile, which is the same seam TASK-007 deferred here
+/// for the consent flow.
+///
+/// A **scripted** tier, because a resolved row and an unresolved one take
+/// different branches of the renderer and only the resolved one carries ADR-A's
+/// call-site marker — a daemon with no engine renders eleven `unresolved` rows
+/// and would leave the marker untested.
+#[test]
+fn policy_show_renders_the_daemons_resolved_table() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, &["Done."]);
+    let teton = teton_bin();
+
+    let shown = daemon.run_cli(&teton, &["policy", "show"]);
+
+    // Both halves of ADR-H's table are rendered.
+    assert!(
+        shown.contains("tiers —"),
+        "the tier table is the primary surface and must be rendered; output:\n{shown}"
+    );
+    assert!(
+        shown.contains("categories:"),
+        "and the per-category rows below it; output:\n{shown}"
+    );
+
+    /// The rendered row whose first word is `name`, or `None`.
+    fn row<'a>(shown: &'a str, name: &str) -> Option<&'a str> {
+        shown.lines().find(|l| {
+            l.trim_start_matches(['>', ' '])
+                .starts_with(&format!("{name} "))
+        })
+    }
+
+    // All four tiers, each showing this fixture's binding to the local tier.
+    for tier in ["reflex", "scan", "build", "think"] {
+        let line =
+            row(&shown, tier).unwrap_or_else(|| panic!("no `{tier}` tier row; output:\n{shown}"));
+        assert!(
+            line.contains("→ local"),
+            "tier `{tier}` must render its binding; row:\n{line}"
+        );
+    }
+
+    // All eleven categories have a row, each naming its tier and its provider.
+    // Matched on the row prefix rather than by bare substring, so `route` is
+    // not satisfied by the word "Routing" inside somebody else's reason.
+    for (category, tier) in [
+        ("route", "reflex"),
+        ("redact", "reflex"),
+        ("title", "reflex"),
+        ("digest", "scan"),
+        ("compact", "scan"),
+        ("triage", "scan"),
+        ("edit", "build"),
+        ("shell", "build"),
+        ("design", "think"),
+        ("debug", "think"),
+        ("review", "think"),
+    ] {
+        let line = row(&shown, category)
+            .unwrap_or_else(|| panic!("no `{category}` category row; output:\n{shown}"));
+        assert!(
+            line.contains(tier) && line.contains("→ local"),
+            "category `{category}` must render its `{tier}` tier and its \
+             provider; row:\n{line}"
+        );
+    }
+
+    // ADR-A: a category with no call site says so every time it is printed, and
+    // one that has a call site does not. The marker is derived from the
+    // daemon's own call sites, so this also shows the CLI is rendering the
+    // daemon's answer rather than a table of its own.
+    let unreached = row(&shown, "triage").expect("a `triage` row");
+    assert!(
+        unreached.contains("declared, no call site yet"),
+        "an unreached category must be marked; row:\n{unreached}"
+    );
+    let reached = row(&shown, "edit").expect("an `edit` row");
+    assert!(
+        !reached.contains("no call site"),
+        "`edit` has a call site and must not carry the marker; row:\n{reached}"
+    );
+
+    // AC-12: the BR-9 declared default is configuration-visible, and the CLI
+    // says so rather than leaving it compiled in silently.
+    assert!(
+        shown.contains("judgment_default"),
+        "the declared default must be reported; output:\n{shown}"
     );
 }

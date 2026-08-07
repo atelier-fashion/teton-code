@@ -39,8 +39,12 @@ fn provider_block(id: &str, kind: &str, endpoint: &str, model: &str) -> String {
     )
 }
 
-fn routing_block(phase: &str, provider: &str) -> String {
-    format!("[[routing]]\nphase = \"{phase}\"\nprovider_id = \"{provider}\"\n\n")
+/// A `[[tiers]]` row (REQ-558). The tier — not the lifecycle phase — is the
+/// configured routing surface: `build` serves `edit`/`shell`, `think` serves
+/// `design`/`debug`/`review`, and a structured turn maps its phase to a category
+/// which inherits one of them.
+fn tier_block(tier: &str, provider: &str) -> String {
+    format!("[[tiers]]\ntier = \"{tier}\"\nprovider_id = \"{provider}\"\n\n")
 }
 
 fn boundary_block(glob: &str, mode: &str) -> String {
@@ -87,7 +91,7 @@ fn taint_and_reroute(tag: &str, tool_call: (&str, &str, &str)) {
         &provider.openai_endpoint(),
         "deepseek-chat",
     ));
-    config.push_str(&routing_block("implement", "deepseek"));
+    config.push_str(&tier_block("build", "deepseek"));
     config.push_str(&boundary_block("secrets/**", "local-only"));
 
     let ws = Workspace::new(tag);

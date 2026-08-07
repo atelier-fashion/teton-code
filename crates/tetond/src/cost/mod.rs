@@ -38,7 +38,7 @@ pub mod prices;
 pub mod report;
 
 use teton_protocol::events::{CostRecord, CostRecorded, Event};
-use teton_protocol::{Phase, ProviderId, SessionId};
+use teton_protocol::{Category, Phase, ProviderId, SessionId};
 use teton_providers::transport::TransportResponse;
 
 use crate::broadcast::EventBus;
@@ -58,17 +58,26 @@ pub use report::{CostReport, GroupTotals, SavingsEstimate, UnpricedTotals};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CostAttribution {
     /// Lifecycle phase in effect at call time; `None` in freeform mode.
+    ///
+    /// Retained after REQ-558 moved dispatch onto `category` (BR-11): the phase
+    /// is what the spend is *attributed* to, the category is what it was *for*,
+    /// and a freeform session has the second without the first.
     pub phase: Option<Phase>,
+    /// Routing category the call was made for (REQ-558); `None` when the call
+    /// was not routed through the category chain.
+    pub category: Option<Category>,
     /// Concrete model the call bills (drives the price-table lookup).
     pub model: String,
 }
 
 impl CostAttribution {
-    /// Attribution for `model` with no structured phase (freeform mode).
+    /// Attribution for `model` with no structured phase (freeform mode) and no
+    /// category.
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             phase: None,
+            category: None,
             model: model.into(),
         }
     }
@@ -77,6 +86,16 @@ impl CostAttribution {
     #[must_use]
     pub fn with_phase(mut self, phase: Phase) -> Self {
         self.phase = Some(phase);
+        self
+    }
+
+    /// Attribution for `model` under routing `category`.
+    ///
+    /// The caller passes the category the routing decision *resolved*, never one
+    /// derived a second time from the phase (REQ-558 ADR-D, BR-6).
+    #[must_use]
+    pub fn with_category(mut self, category: Category) -> Self {
+        self.category = Some(category);
         self
     }
 }
@@ -136,12 +155,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attribution_builder_sets_phase_and_model() {
-        let attr = CostAttribution::new("claude-opus-4").with_phase(Phase::Review);
+    fn attribution_builder_sets_phase_category_and_model() {
+        let attr = CostAttribution::new("claude-opus-4")
+            .with_phase(Phase::Review)
+            .with_category(Category::Review);
         assert_eq!(attr.model, "claude-opus-4");
         assert_eq!(attr.phase, Some(Phase::Review));
+        assert_eq!(attr.category, Some(Category::Review));
 
-        let freeform = CostAttribution::new("deepseek-chat");
+        // BR-11: the two are independent. A freeform turn has a category and no
+        // phase, which is exactly why adding the first did not replace the
+        // second.
+        let freeform = CostAttribution::new("deepseek-chat").with_category(Category::Design);
         assert_eq!(freeform.phase, None);
+        assert_eq!(freeform.category, Some(Category::Design));
+
+        let unrouted = CostAttribution::new("deepseek-chat");
+        assert_eq!(unrouted.phase, None);
+        assert_eq!(unrouted.category, None);
     }
 }

@@ -1,7 +1,7 @@
 ---
 id: REQ-558
 title: "Purpose-oriented routing categories as the runtime dispatch key"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-05
 updated: 2026-08-05
@@ -155,6 +155,16 @@ category/tier equivalent (see OQ-2 for the command shape).
       expressed as an unconditional property of the category, not as a guard
       predicated on the absence of a binding. (informed by LESSON-432,
       LESSON-443)
+
+      **Two mechanisms, deliberately distinct** (validation W1): `redact` is
+      absent from the configurable category enum, so *resolution* has no branch
+      for it and cannot be made to have one — that is the unconditional
+      property. Separately, config *validation* rejects a `categories.redact`
+      key at load and names the pin, so a user who tries is told why rather
+      than having the key silently ignored. The second is a config-validation
+      error, not the runtime guard this rule forbids. Note this is new
+      machinery: `Config` has no `deny_unknown_fields`, so an unrecognized key
+      is dropped silently today.
 - [ ] BR-5: `route` MUST resolve to the local tier when the local tier is
       available. When it is not (below the hardware floor, benchmark-disabled,
       shed under memory pressure), classification is **bypassed** rather than
@@ -196,6 +206,18 @@ category/tier equivalent (see OQ-2 for the command shape).
       freeform/structured distinction lives in `Session.mode`, which already
       carries it, and a value that exists in two places is a value that can
       disagree with itself.
+
+      **Historical ledger rows must be handled explicitly** (validation W2). The
+      cost ledger persists `phase` as SQLite `TEXT` and `phase_from_wire` maps
+      an unrecognized string to `None`, so retiring the variant does not crash
+      on an existing `cost.db` — but every historical `"freeform"` row silently
+      moves from the `freeform` bucket to `none` in the per-phase rollup. This
+      REQ keeps `Phase` *specifically* for cost attribution, so quietly
+      rewriting that history is not acceptable as a side effect. The
+      architecture must choose and record one of: retain a read-only
+      `Phase::Freeform` for deserialization of historical rows; migrate the
+      stored rows; or accept the reattribution and state it in the release
+      note. Silence is the one option ruled out.
 - [ ] BR-12: The category→provider resolution is a **pure function** in
       `teton-core` with no I/O and no clock, table-driven-testable for all
       eleven categories × (bound, inherited, unresolvable) — conventions.md
@@ -214,10 +236,13 @@ category/tier equivalent (see OQ-2 for the command shape).
       resolves through override → tier → declared error, with no path producing a
       synthesized provider id. Removing a tier binding makes the corresponding
       category name itself in the failure. (BR-8)
-- [ ] AC-3: A grep-style assertion pins that no `harness_known` category is
-      reachable from any prompt-text path: the classifier's output type admits
-      only the four judgment categories, so assigning `digest` from text does not
-      compile. (BR-2)
+- [ ] AC-3: No `harness_known` category is reachable from any prompt-text path,
+      enforced **by the type system**: the classifier's return type admits only
+      the four judgment categories, so assigning `digest` from prompt text does
+      not compile. A type-level guarantee subsumes the grep-style assertion this
+      AC originally also asked for (validation I1) — if the type holds, the grep
+      is redundant; if the grep is needed, the type is not doing its job. Build
+      the type. (BR-2)
 - [ ] AC-4: `redact` has no configuration path — a config file setting
       `categories.redact` is rejected at load naming the pin, and a test asserts
       the resolution function returns the local provider for `redact` even when
@@ -245,6 +270,25 @@ category/tier equivalent (see OQ-2 for the command shape).
 - [ ] AC-10: Mutation check — reintroducing a keyword match for any
       harness-known category, or removing the taint override in BR-7, makes at
       least one test red. (informed by LESSON-441, LESSON-479)
+- [ ] AC-11: **One resolver, asserted by construction** (BR-6). Every surface
+      that describes a routing state — `route_decided`'s payload,
+      `teton policy show` (or its successor), and the turn-failure sentence for
+      an unresolvable category — is built from the return value of the single
+      resolution function, and a test asserts they agree for the same input:
+      resolve one category with a deliberately unset binding and assert the
+      provider, category, tier, and reason are byte-identical across all three
+      surfaces. A second call site computing its own answer must make this test
+      red.
+
+      This AC exists because BUG-155 shipped four instances of exactly this
+      defect in this subsystem one REQ earlier — a rule enforced where it was
+      convenient rather than where the decision is made (LESSON-484). BR-6 was
+      the only business rule in this spec with no acceptance criterion.
+- [ ] AC-12: The BR-9 declared default is **configuration-visible**: it appears
+      in the effective-configuration projection any attached client can read,
+      and a test asserts it is reported rather than compiled in silently.
+      Changing it in config changes the category a bypassed classification
+      resolves to.
 
 ## External Dependencies
 
@@ -255,6 +299,21 @@ category/tier equivalent (see OQ-2 for the command shape).
   `route_decided` event all exist.
 
 ## Assumptions
+
+- **OVERRIDDEN 2026-08-06 (product decision).** The assumption below — that a
+  category with no call site ships "declared but unreached" — is no longer
+  accepted. All eleven settings must do something. This does **not** change
+  REQ-558's scope: the routing axis, the resolver, the schema and the six reached
+  categories (`route`, `digest`, `edit`, `design`, `debug`, `review`) ship here.
+  The five remaining call sites are scheduled as follow-up work, which ADR-A made
+  cheap on purpose — no config migration, no schema change, no protocol change,
+  each call site is a leaf:
+    - **REQ-561** — `triage`, `shell`, `title`, `compact`.
+    - **REQ-562** — `redact`, specced separately: it is a model call *inside* the
+      egress choke point, BR-4 pins it local for a reason, and it needs its own
+      answers to "what on a hit", "what on failure", and "how does it compose with
+      the existing provenance checks". Wiring a privacy control as a task inside a
+      routing REQ would give it the least scrutiny of anything in the change.
 
 - The seven harness-known categories have identifiable single call sites today.
   `compact`, `digest`, and `triage` map onto the existing summarizer paths
@@ -276,6 +335,14 @@ category/tier equivalent (see OQ-2 for the command shape).
   allocator).
 
 ## Open Questions
+
+**OQ-1, OQ-2, and OQ-5 must be closed as ADRs during `/architect`, not carried
+into implementation** (validation W3/W4). OQ-1 and OQ-5 question the size of a
+set the System Model declares *closed* and AC-2 tests exhaustively ("all eleven
+categories") — a spec cannot both fix a closed enum and ask how many members it
+has. OQ-2 determines a user-facing CLI contract the spec itself flags as a
+breaking change. The remaining OQs (3, 4) are tuning questions that can ship
+recorded.
 
 - [ ] OQ-1: Does `shell` split further? Command *construction* is a `build`
       shape; interpreting a 5,000-line test log is a `scan` shape. One category

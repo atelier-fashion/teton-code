@@ -21,7 +21,7 @@
 use std::time::Duration;
 
 use crate::harness::{
-    assert_no_boundary_bytes, openai_turn, Client, Daemon, DaemonOptions, MockProvider,
+    assert_no_boundary_bytes, openai_turn, tier_block, Client, Daemon, DaemonOptions, MockProvider,
     MockResponse, Workspace,
 };
 
@@ -41,10 +41,6 @@ fn probe_16gb() -> DaemonOptions {
 /// migration has to accept.
 fn legacy_provider_block(id: &str, kind: &str, endpoint: &str) -> String {
     format!("[[providers]]\nid = \"{id}\"\nkind = \"{kind}\"\nendpoint = \"{endpoint}\"\n\n")
-}
-
-fn routing_block(phase: &str, provider: &str) -> String {
-    format!("[[routing]]\nphase = \"{phase}\"\nprovider_id = \"{provider}\"\n\n")
 }
 
 /// The `model` the config file declares for `id`, or `None` when it declares
@@ -97,8 +93,8 @@ fn migration_resolves_what_it_can_reports_what_it_cannot_and_does_not_re_run() {
         "openai-compatible",
         &unresolvable.openai_endpoint(),
     ));
-    config.push_str(&routing_block("implement", "deepseek"));
-    config.push_str(&routing_block("review", "mystery"));
+    config.push_str(&tier_block("build", "deepseek"));
+    config.push_str(&tier_block("think", "mystery"));
 
     let ws = Workspace::new("mig");
     ws.write_config(&config);
@@ -201,7 +197,7 @@ fn route_decided_carries_the_declared_model_not_a_price_table_lookup() {
          endpoint = \"{}\"\nmodel = \"custom-model-v9\"\n\n",
         provider.openai_endpoint()
     ));
-    config.push_str(&routing_block("implement", "no-such-vendor"));
+    config.push_str(&tier_block("build", "no-such-vendor"));
 
     let ws = Workspace::new("declared");
     ws.write_config(&config);
@@ -316,8 +312,8 @@ fn one_unusable_provider_does_not_stop_the_others_from_serving() {
         "openai-compatible",
         &broken.openai_endpoint(),
     ));
-    config.push_str(&routing_block("implement", "good"));
-    config.push_str(&routing_block("review", "broken"));
+    config.push_str(&tier_block("build", "good"));
+    config.push_str(&tier_block("think", "broken"));
 
     let ws = Workspace::new("mixed");
     ws.write_config(&config);
@@ -543,15 +539,21 @@ fn remote_routes(client: &Client, provider: &str) -> usize {
 ///
 /// `Config::validate` accepts this config — BR-6 only rejects a default naming an
 /// *unregistered* id — so the daemon starts, correctly, with the provider
-/// unusable (ADR-E). But `resolve_freeform`'s coding branch trusts
-/// `default_provider` unconditionally, unlike `resolve_structured`, which routes
-/// through `health_of` and so cannot select a provider missing from the router
-/// map. The resulting `Route` carries `provider_id: Some("mystery")` with
-/// `model: None`, and `run_one_attempt` then resolves the model as
+/// unusable (ADR-E). The freeform path used to trust `default_provider`
+/// unconditionally, unlike the structured path, which went through `health_of`
+/// and so could not select a provider missing from the router map. The resulting
+/// `Route` carried `provider_id: Some("mystery")` with `model: None`, and
+/// `run_one_attempt` then resolved the model as
 /// `route.model.unwrap_or_else(|| provider_cfg.id.clone())` — the provider id
 /// standing in for a model, on a real outbound call.
 ///
 /// That is precisely the fallback BR-1 says is "deleted, not relocated".
+///
+/// REQ-558 closes the asymmetry the bug rested on: there is one dispatch path
+/// now, `default_provider` is an ordinary tier binding rather than a branch that
+/// skipped the screen, and every resolved provider is screened through the same
+/// `usable` closure (ADR-E). This test is kept because the property is what
+/// matters, not the shape of the code that used to violate it.
 #[test]
 fn an_unusable_default_provider_never_sends_its_id_as_the_model() {
     let provider = MockProvider::always(openai_turn("Done.", None, 10, 5));

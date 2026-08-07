@@ -34,7 +34,7 @@ use futures::Stream;
 use rusqlite::Connection;
 
 use teton_protocol::events::CostRecord;
-use teton_protocol::{Phase, ProviderId, SessionId};
+use teton_protocol::{Category, Phase, ProviderId, SessionId};
 use teton_providers::transport::{ByteStream, TransportError, TransportResponse};
 
 use super::prices::PriceTable;
@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS cost_records (
     recorded_at_ms INTEGER NOT NULL,
     session_id     TEXT    NOT NULL,
     phase          TEXT,
+    category       TEXT,
     provider_id    TEXT    NOT NULL,
     model          TEXT    NOT NULL,
     input_tokens   INTEGER NOT NULL,
@@ -62,6 +63,22 @@ CREATE TRIGGER IF NOT EXISTS cost_records_no_delete
     BEFORE DELETE ON cost_records
     BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
 ";
+
+/// Columns [`SCHEMA`] creates on a fresh ledger but an older build's file does
+/// not have, with the DDL that adds each one.
+///
+/// `CREATE TABLE IF NOT EXISTS` is a no-op against an existing file, so a column
+/// added to [`SCHEMA`] reaches a pre-existing `cost.db` only through here. Every
+/// entry MUST be `ADD COLUMN`-shaped and nullable: the store is append-only, and
+/// a migration that rewrote historical rows would both fail the no-update trigger
+/// and invent an attribution nobody recorded. Rows written before a column
+/// existed read back as `None`, which is the truth about them — they predate the
+/// concept.
+const ADDITIVE_COLUMNS: [(&str, &str); 1] = [(
+    // REQ-558: the routing category the call was made for.
+    "category",
+    "ALTER TABLE cost_records ADD COLUMN category TEXT",
+)];
 
 /// How many trailing bytes of one chunk the usage scanner carries into the next,
 /// so a usage key or its number split across a chunk boundary is still matched.
@@ -89,8 +106,12 @@ pub enum LedgerError {
 pub struct LedgerRow {
     /// Session that incurred the call.
     pub session_id: String,
-    /// Lifecycle phase at call time; `None` for a freeform call.
+    /// Lifecycle phase at call time; `None` for a freeform call. Retained
+    /// alongside `category` for cost attribution (REQ-558 BR-11).
     pub phase: Option<Phase>,
+    /// Routing category the call was made for (REQ-558); `None` for a call with
+    /// no category attribution, and for every row a pre-REQ build wrote.
+    pub category: Option<Category>,
     /// Provider that served the call.
     pub provider_id: String,
     /// Concrete model billed.
@@ -117,6 +138,7 @@ impl LedgerRow {
         CostRecord {
             session_id: SessionId::from(self.session_id.clone()),
             phase: self.phase,
+            category: self.category,
             provider_id: ProviderId::from(self.provider_id.clone()),
             model: self.model.clone(),
             input_tokens: self.input_tokens,
@@ -167,6 +189,7 @@ impl CostLedger {
         sink: Arc<dyn CostEventSink>,
     ) -> Result<Self, LedgerError> {
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             prices: Arc::new(prices),
@@ -212,6 +235,7 @@ impl CostLedger {
         self.record(LedgerRow {
             session_id: session_id.into(),
             phase: attribution.phase,
+            category: attribution.category,
             provider_id,
             model: attribution.model.clone(),
             input_tokens,
@@ -227,20 +251,23 @@ impl CostLedger {
     pub fn all_records(&self) -> Result<Vec<LedgerRow>, LedgerError> {
         let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
         let mut stmt = guard.prepare(
-            "SELECT session_id, phase, provider_id, model, input_tokens, output_tokens, usd_micros
+            "SELECT session_id, phase, category, provider_id, model,
+                    input_tokens, output_tokens, usd_micros
              FROM cost_records ORDER BY id",
         )?;
         let rows = stmt
             .query_map([], |r| {
                 let phase: Option<String> = r.get(1)?;
+                let category: Option<String> = r.get(2)?;
                 Ok(LedgerRow {
                     session_id: r.get(0)?,
                     phase: phase.as_deref().and_then(phase_from_wire),
-                    provider_id: r.get(2)?,
-                    model: r.get(3)?,
-                    input_tokens: to_u64(r.get::<_, i64>(4)?),
-                    output_tokens: to_u64(r.get::<_, i64>(5)?),
-                    usd_micros: r.get(6)?,
+                    category: category.as_deref().and_then(category_from_wire),
+                    provider_id: r.get(3)?,
+                    model: r.get(4)?,
+                    input_tokens: to_u64(r.get::<_, i64>(5)?),
+                    output_tokens: to_u64(r.get::<_, i64>(6)?),
+                    usd_micros: r.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -316,6 +343,7 @@ impl MeteredBody {
         let row = LedgerRow {
             session_id: self.session_id.0.clone(),
             phase: self.attribution.phase,
+            category: self.attribution.category,
             provider_id: self.provider_id.0.clone(),
             model: self.attribution.model.clone(),
             input_tokens: usage.input,
@@ -463,13 +491,14 @@ fn insert_and_emit(
         let guard = conn.lock().map_err(|_| LedgerError::Poisoned)?;
         guard.execute(
             "INSERT INTO cost_records
-               (recorded_at_ms, session_id, phase, provider_id, model,
+               (recorded_at_ms, session_id, phase, category, provider_id, model,
                 input_tokens, output_tokens, usd_micros)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 now_ms(),
                 row.session_id,
                 row.phase.map(phase_to_wire),
+                row.category.map(category_to_wire),
                 row.provider_id,
                 row.model,
                 to_i64(row.input_tokens),
@@ -480,6 +509,30 @@ fn insert_and_emit(
     }
     sink.cost_recorded(row.to_wire());
     Ok(())
+}
+
+/// Bring a ledger written by an older build up to [`SCHEMA`], additively.
+///
+/// Adds any [`ADDITIVE_COLUMNS`] entry the table is missing and touches nothing
+/// else. `ALTER TABLE … ADD COLUMN` is DDL, so it does not fire the row-level
+/// `cost_records_no_update` trigger and the append-only guarantee survives
+/// intact: no existing row is read, rewritten, or backfilled. They keep the NULL
+/// the new column defaults to, which is the honest value for a call recorded
+/// before the concept existed.
+fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
+    for (column, ddl) in ADDITIVE_COLUMNS {
+        if !has_column(conn, column)? {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `cost_records` already has `column`.
+fn has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM pragma_table_info('cost_records') WHERE name = ?1")?;
+    stmt.exists([column])
 }
 
 /// Milliseconds since the Unix epoch (0 if the clock is before it).
@@ -509,11 +562,13 @@ fn phase_to_wire(phase: Phase) -> &'static str {
         Phase::Implement => "implement",
         Phase::Review => "review",
         Phase::Io => "io",
-        Phase::Freeform => "freeform",
     }
 }
 
 /// Parse a phase back from its wire form; unknown strings become `None`.
+///
+/// A ledger written by an older build can still hold `"freeform"`, and that row
+/// now reads back as "no phase" — see the explicit arm below.
 fn phase_from_wire(s: &str) -> Option<Phase> {
     Some(match s {
         "spec" => Phase::Spec,
@@ -521,7 +576,47 @@ fn phase_from_wire(s: &str) -> Option<Phase> {
         "implement" => Phase::Implement,
         "review" => Phase::Review,
         "io" => Phase::Io,
-        "freeform" => Phase::Freeform,
+        // `"freeform"` is the phase variant REQ-558 ADR-G retired. Its rows are
+        // reattributed to the no-phase bucket, and that is a decision, not the
+        // catch-all below happening to swallow it: freeform was never a
+        // lifecycle position, the freeform path has always recorded `phase:
+        // NULL`, and the only rows carrying the literal string came from a
+        // structured session explicitly created at `Phase::Freeform`. Keep this
+        // arm above the catch-all so a reader six months from now can tell a
+        // human chose this rather than a `_ => None` swallowing a live value.
+        "freeform" => return None,
+        _ => return None,
+    })
+}
+
+/// The lowercase wire form of a routing category (matches
+/// `teton_protocol::Category`'s serde and its `as_str`).
+fn category_to_wire(category: Category) -> &'static str {
+    category.as_str()
+}
+
+/// Parse a category back from its stored wire form; unknown strings become
+/// `None`.
+///
+/// This is the ledger reading back a column **it wrote itself**, not a parse of
+/// anything a user or a model can author, so it does not reopen the hole
+/// REQ-558 AC-3 closes: `teton_core::Category` still has no path in from text,
+/// and the value produced here is the wire twin, which has no conversion into
+/// the core type. Kept as a private function rather than a `FromStr` impl for
+/// exactly that reason.
+fn category_from_wire(s: &str) -> Option<Category> {
+    Some(match s {
+        "route" => Category::Route,
+        "redact" => Category::Redact,
+        "title" => Category::Title,
+        "digest" => Category::Digest,
+        "compact" => Category::Compact,
+        "triage" => Category::Triage,
+        "edit" => Category::Edit,
+        "shell" => Category::Shell,
+        "design" => Category::Design,
+        "debug" => Category::Debug,
+        "review" => Category::Review,
         _ => return None,
     })
 }
@@ -575,7 +670,9 @@ mod tests {
             .record_call(
                 "sess-1",
                 "anthropic",
-                &CostAttribution::new("claude-opus-4").with_phase(Phase::Review),
+                &CostAttribution::new("claude-opus-4")
+                    .with_phase(Phase::Review)
+                    .with_category(Category::Review),
                 1000,
                 500,
             )
@@ -584,6 +681,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, "sess-1");
         assert_eq!(rows[0].phase, Some(Phase::Review));
+        assert_eq!(rows[0].category, Some(Category::Review));
         assert_eq!(rows[0].provider_id, "anthropic");
         assert_eq!(rows[0].model, "claude-opus-4");
         assert_eq!(rows[0].input_tokens, 1000);
@@ -594,7 +692,52 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].session_id, SessionId::from("sess-1"));
         assert_eq!(recorded[0].phase, Some(Phase::Review));
+        assert_eq!(recorded[0].category, Some(Category::Review));
         assert_eq!(recorded[0].usd_micros, 15_000 + 37_500);
+    }
+
+    /// REQ-558 BR-11: a freeform call has a category and no phase, and a
+    /// structured call has both. The two travel independently, so adding the
+    /// category cannot quietly reattribute the phase rollup.
+    #[test]
+    fn a_freeform_call_records_a_category_without_a_phase() {
+        let (ledger, sink) = ledger();
+        ledger
+            .record_call(
+                "sess-2",
+                "anthropic",
+                &CostAttribution::new("claude-opus-4").with_category(Category::Design),
+                10,
+                5,
+            )
+            .expect("record");
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows[0].phase, None);
+        assert_eq!(rows[0].category, Some(Category::Design));
+        assert_eq!(
+            sink.records.lock().unwrap()[0].category,
+            Some(Category::Design)
+        );
+    }
+
+    /// Every category survives the store → read-back round trip, swept from
+    /// `teton_core::Category::ALL` through the router's wire conversion rather
+    /// than a hand-kept list. A category added to the core enum reaches this
+    /// test without anyone remembering to extend it.
+    #[test]
+    fn every_category_round_trips_through_the_stored_wire_form() {
+        for core in teton_core::Category::ALL {
+            let category = crate::router::to_protocol_category(core);
+            let stored = category_to_wire(category);
+            assert_eq!(
+                category_from_wire(stored),
+                Some(category),
+                "{core} does not survive the ledger round trip as '{stored}'"
+            );
+        }
+        // A column value this build does not recognize reads as absent rather
+        // than as some other category.
+        assert_eq!(category_from_wire("summarize"), None);
     }
 
     #[test]
@@ -616,6 +759,149 @@ mod tests {
         assert_eq!(rows[0].output_tokens, 1000);
         // On the wire the non-optional cost projects to 0.
         assert_eq!(sink.records.lock().unwrap()[0].usd_micros, 0);
+    }
+
+    /// The `cost_records` table exactly as a build before REQ-558 created it —
+    /// no `category` column. Reproduced verbatim (rather than derived from
+    /// [`SCHEMA`]) because the point of the test is that *this* file, the one
+    /// already on a user's disk, still opens.
+    const PRE_REQ_SCHEMA: &str = "
+CREATE TABLE cost_records (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at_ms INTEGER NOT NULL,
+    session_id     TEXT    NOT NULL,
+    phase          TEXT,
+    provider_id    TEXT    NOT NULL,
+    model          TEXT    NOT NULL,
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    usd_micros     INTEGER
+);
+CREATE TRIGGER cost_records_no_update
+    BEFORE UPDATE ON cost_records
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+CREATE TRIGGER cost_records_no_delete
+    BEFORE DELETE ON cost_records
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+";
+
+    /// A unique on-disk path for one test (no `tempfile` dependency in this
+    /// crate; this is the house pattern).
+    fn scratch_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("teton-ledger-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join(format!("{tag}.db"))
+    }
+
+    /// A `cost.db` written before categories existed must still open, still read,
+    /// and still accept new rows. Its historical rows get a NULL category — they
+    /// predate the concept, and the append-only store has no business inventing
+    /// an attribution for a call nobody categorized.
+    #[test]
+    fn a_pre_req_ledger_still_opens_and_its_rows_read_back_uncategorized() {
+        let path = scratch_db("pre-req");
+        let _ = std::fs::remove_file(&path);
+        {
+            let old = Connection::open(&path).expect("create pre-REQ ledger");
+            old.execute_batch(PRE_REQ_SCHEMA).expect("pre-REQ schema");
+            old.execute(
+                "INSERT INTO cost_records
+                   (recorded_at_ms, session_id, phase, provider_id, model,
+                    input_tokens, output_tokens, usd_micros)
+                 VALUES (1, 'old-session', 'review', 'anthropic', 'claude-opus-4', 900, 100, 42)",
+                [],
+            )
+            .expect("historical row");
+        }
+
+        let sink = Arc::new(CapturingSink::default());
+        let ledger = CostLedger::open(&path, PriceTable::bundled(), sink.clone())
+            .expect("open pre-REQ file");
+
+        // The historical row survives the migration untouched, with no category.
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 1, "the migration must not drop or rewrite rows");
+        assert_eq!(rows[0].session_id, "old-session");
+        assert_eq!(rows[0].phase, Some(Phase::Review));
+        assert_eq!(rows[0].category, None, "a pre-REQ row has no category");
+        assert_eq!(rows[0].input_tokens, 900);
+        assert_eq!(rows[0].usd_micros, Some(42));
+
+        // And the migrated file takes new categorized rows.
+        ledger
+            .record_call(
+                "new-session",
+                "anthropic",
+                &CostAttribution::new("claude-opus-4").with_category(Category::Debug),
+                10,
+                20,
+            )
+            .expect("append after migration");
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].category, Some(Category::Debug));
+        // Append-only still holds after the ALTER TABLE.
+        {
+            let guard = ledger.conn.lock().unwrap();
+            assert!(guard
+                .execute("UPDATE cost_records SET model = 'x'", [])
+                .is_err());
+        }
+
+        // Re-opening is idempotent: the migration sees the column and does
+        // nothing, rather than failing on a duplicate ADD COLUMN.
+        let reopened = CostLedger::open(&path, PriceTable::bundled(), sink)
+            .expect("re-open a migrated ledger");
+        assert_eq!(reopened.all_records().expect("read").len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// REQ-558 ADR-G: `Phase::Freeform` is retired, so a historical row storing
+    /// the literal `"freeform"` reads back as **no phase** and rolls up into the
+    /// `none` bucket. That reattribution is a decision, so it is pinned by a
+    /// test and by an explicit arm in [`phase_from_wire`] — not left to the
+    /// catch-all, where it would read as an oversight.
+    #[test]
+    fn a_stored_freeform_phase_reattributes_to_the_no_phase_bucket() {
+        assert_eq!(
+            phase_from_wire("freeform"),
+            None,
+            "the retired variant must not resolve to any live phase"
+        );
+        // Every phase that still exists is unaffected — the reattribution is
+        // scoped to the one retired value, not a general loosening. Swept from
+        // `teton_core::Phase::ALL` so a phase added later lands here without
+        // anyone remembering to extend the list.
+        for core in teton_core::phase::Phase::ALL {
+            let phase = crate::router::to_protocol_phase(core);
+            assert_eq!(
+                phase_from_wire(phase_to_wire(phase)),
+                Some(phase),
+                "{core} does not survive the ledger round trip"
+            );
+        }
+
+        // And end to end, against a row an older build could really have
+        // written: it survives (the ledger is append-only), it is simply
+        // unattributed.
+        let (ledger, _sink) = ledger();
+        {
+            let guard = ledger.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO cost_records
+                       (recorded_at_ms, session_id, phase, category, provider_id, model,
+                        input_tokens, output_tokens, usd_micros)
+                     VALUES (1, 'old', 'freeform', NULL, 'deepseek', 'deepseek-chat', 10, 5, 7)",
+                    [],
+                )
+                .expect("a pre-ADR-G row");
+        }
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 1, "the row is kept, not dropped");
+        assert_eq!(rows[0].phase, None);
+        assert_eq!(rows[0].usd_micros, Some(7), "its cost is still attributed");
     }
 
     #[test]

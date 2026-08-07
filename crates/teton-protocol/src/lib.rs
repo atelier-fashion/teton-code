@@ -133,24 +133,318 @@ id_newtype!(
     TurnId
 );
 
-/// Lifecycle phase that drives workflow-aware routing (spec `RoutingPolicy.phase`).
+/// Lifecycle phase of a structured (ADLC) session.
 ///
-/// Structured mode pins a session to a phase; freeform mode leaves it `None`.
+/// **Not a routing key** (REQ-558 BR-1/AC-9) — [`Category`] is. Phase travels on
+/// the wire for cost attribution (`cost_recorded`, BR-11) and to report which
+/// gate a structured session sits behind. Structured mode pins a session to a
+/// phase; freeform mode leaves every `phase` field `None`, which is why there is
+/// no `Freeform` variant (ADR-G).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// Requirement authoring — routes to a frontier model.
+    /// Requirement authoring.
     Spec,
-    /// Architecture / task decomposition — routes to a frontier model.
+    /// Architecture / task decomposition.
     Architect,
-    /// Implementation from task artifacts — routes to a cheap/mid model.
+    /// Implementation from task artifacts.
     Implement,
-    /// Code review — routes to a frontier model.
+    /// Code review.
     Review,
-    /// Mechanical I/O (summaries, commit messages) — routes to the local tier.
+    /// Mechanical I/O (summaries, commit messages).
     Io,
-    /// No structured phase; heuristic routing applies.
-    Freeform,
+}
+
+/// The routing tier a category inherits its provider binding from (REQ-558).
+///
+/// Mirrors `teton_core::category::Tier` variant-for-variant, so the daemon's
+/// resolution and this wire form cannot drift apart — the precedent
+/// [`ProviderKind`] and [`crate::events::SelectionSource`] set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// Sub-second, every turn, never leaves the machine — latency and privacy
+    /// dominate.
+    Reflex,
+    /// Read a lot, emit a little — context window and $/input-token dominate.
+    Scan,
+    /// The agentic loop (read → edit → run → verify) — tool-call fidelity
+    /// dominates.
+    Build,
+    /// Design, debug, critique — reasoning depth dominates.
+    Think,
+}
+
+impl Tier {
+    /// The lowercase wire/display name — identical to the serde form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Tier::Reflex => "reflex",
+            Tier::Scan => "scan",
+            Tier::Build => "build",
+            Tier::Think => "think",
+        }
+    }
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The routing category a model call was made for — the dispatch key in both
+/// session modes (REQ-558 BR-1).
+///
+/// Mirrors **all eleven** variants of `teton_core::category::Category`,
+/// including the two `route` and `redact` that are pinned to the local tier and
+/// have no configurable counterpart: this type reports what *happened*, not what
+/// a config file may bind, and a pinned category still routes a call.
+///
+/// # The conversion is one-way on purpose
+///
+/// `teton_core::category::Category` deliberately carries no `FromStr` and no
+/// `Deserialize` — that absence is AC-3's type-level guarantee that no
+/// prompt-text path can name a harness-known category. This wire twin *is*
+/// deserializable, because a client has to read the event it appears in, and
+/// that stays safe only while the conversion runs core → wire and never back.
+/// Adding a `teton_protocol::Category -> teton_core::Category` conversion (or a
+/// `FromStr` on either side) reopens the hole the core type closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Category {
+    /// Classifies the four judgment categories; pinned local (BR-5).
+    Route,
+    /// Secret/PII scan before egress; pinned local (BR-4).
+    Redact,
+    /// Session and branch naming.
+    Title,
+    /// File and diff summarization into context.
+    Digest,
+    /// Conversation compaction.
+    Compact,
+    /// Ranking grep/glob hits.
+    Triage,
+    /// Write code from a task artifact.
+    Edit,
+    /// Command construction and output interpretation.
+    Shell,
+    /// Architecture, decomposition, spec authoring.
+    Design,
+    /// Root-cause on a failure.
+    Debug,
+    /// Adversarial critique.
+    Review,
+}
+
+impl Category {
+    /// The lowercase wire/display name — identical to the serde form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Category::Route => "route",
+            Category::Redact => "redact",
+            Category::Title => "title",
+            Category::Digest => "digest",
+            Category::Compact => "compact",
+            Category::Triage => "triage",
+            Category::Edit => "edit",
+            Category::Shell => "shell",
+            Category::Design => "design",
+            Category::Debug => "debug",
+            Category::Review => "review",
+        }
+    }
+}
+
+impl fmt::Display for Category {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The nine categories a client may **bind** to a provider (REQ-558 ADR-B).
+///
+/// Mirrors `teton_core::category::ConfigurableCategory` variant-for-variant, and
+/// mirrors its *absences* too: `route` and `redact` have no variant here either,
+/// so `config/set` cannot carry a binding for them. The pin is a property of the
+/// wire type rather than a check the daemon performs on arrival — the same
+/// argument ADR-B makes about the config file, applied to the protocol, because
+/// a check is something a fourth code path can forget (BUG-155).
+///
+/// [`Category`] is the *reporting* type and keeps all eleven variants: a pinned
+/// category still routes a call, and an event has to be able to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigurableCategory {
+    /// Session and branch naming.
+    Title,
+    /// File and diff summarization into context.
+    Digest,
+    /// Conversation compaction.
+    Compact,
+    /// Ranking grep/glob hits.
+    Triage,
+    /// Write code from a task artifact.
+    Edit,
+    /// Command construction and output interpretation.
+    Shell,
+    /// Architecture, decomposition, spec authoring.
+    Design,
+    /// Root-cause on a failure.
+    Debug,
+    /// Adversarial critique.
+    Review,
+}
+
+impl ConfigurableCategory {
+    /// Every bindable category, in the order `teton policy show` prints them.
+    pub const ALL: [ConfigurableCategory; 9] = [
+        ConfigurableCategory::Title,
+        ConfigurableCategory::Digest,
+        ConfigurableCategory::Compact,
+        ConfigurableCategory::Triage,
+        ConfigurableCategory::Edit,
+        ConfigurableCategory::Shell,
+        ConfigurableCategory::Design,
+        ConfigurableCategory::Debug,
+        ConfigurableCategory::Review,
+    ];
+
+    /// The lowercase wire/display name — identical to the [`Category`] it names.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.reported().as_str()
+    }
+
+    /// The reporting [`Category`] this binds. Total, like its core twin (ADR-B).
+    #[must_use]
+    pub const fn reported(self) -> Category {
+        match self {
+            ConfigurableCategory::Title => Category::Title,
+            ConfigurableCategory::Digest => Category::Digest,
+            ConfigurableCategory::Compact => Category::Compact,
+            ConfigurableCategory::Triage => Category::Triage,
+            ConfigurableCategory::Edit => Category::Edit,
+            ConfigurableCategory::Shell => Category::Shell,
+            ConfigurableCategory::Design => Category::Design,
+            ConfigurableCategory::Debug => Category::Debug,
+            ConfigurableCategory::Review => Category::Review,
+        }
+    }
+}
+
+impl fmt::Display for ConfigurableCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A string that does not name a [`ConfigurableCategory`].
+///
+/// The two pinned categories get a variant each rather than falling into
+/// `Unknown`, because AC-4's acceptance criterion *is* the message: a user who
+/// types `teton policy set-category redact anthropic` must learn the category is
+/// **forbidden**, not that it is misspelled.
+///
+/// # Why these sentences exist twice
+///
+/// `teton_core::category::ParseCategoryError` says the same two things, and the
+/// CLI cannot read it — the CLI depends on this crate alone, deliberately (it
+/// holds no routing logic and no HTTP client). Duplicating the *variants* is
+/// already this crate's contract with `teton-core` ([`Category`], [`Tier`]); the
+/// duplication of the *sentences* is pinned by a test in `tetond`, the one crate
+/// that can see both, which fails if either side is reworded alone.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ParseCategoryError {
+    /// The caller named `redact`, which has no configuration path (BR-4).
+    #[error(
+        "'redact' is pinned to the local tier by construction and cannot be bound to a provider: \
+         it inspects content before that content is allowed to leave the machine."
+    )]
+    RedactIsPinned,
+    /// The caller named `route`, which has no configuration path (BR-5).
+    #[error(
+        "'route' is pinned to the local tier by construction and cannot be bound to a provider: \
+         a classifier that calls a remote model has spent what the routing decision saves, so no \
+         binding for it could name a valid state."
+    )]
+    RouteIsPinned,
+    /// The caller named something that is not a bindable category at all.
+    #[error("unknown category '{name}'; expected one of: {expected}")]
+    Unknown {
+        /// The unrecognized name, as written.
+        name: String,
+        /// The accepted names, comma-separated. Never advertises a pinned one.
+        expected: String,
+    },
+}
+
+impl std::str::FromStr for ConfigurableCategory {
+    type Err = ParseCategoryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(c) = ConfigurableCategory::ALL
+            .into_iter()
+            .find(|c| c.as_str() == s)
+        {
+            return Ok(c);
+        }
+        // A name that IS a category but has no bindable counterpart is *pinned*,
+        // not misspelled. Derived from the reporting enum rather than listed, so
+        // the two cannot disagree about which names are categories at all.
+        match s {
+            _ if s == Category::Redact.as_str() => Err(ParseCategoryError::RedactIsPinned),
+            _ if s == Category::Route.as_str() => Err(ParseCategoryError::RouteIsPinned),
+            _ => Err(ParseCategoryError::Unknown {
+                name: s.to_owned(),
+                expected: ConfigurableCategory::ALL
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        }
+    }
+}
+
+/// Where a category's effective provider came from (REQ-558 ADR-A's table).
+///
+/// Mirrors `teton_core::category::BindingSource`. Carried structurally so
+/// `teton policy show` reports the resolver's answer instead of re-deriving one
+/// from the reason sentence (BR-6, AC-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingSource {
+    /// A per-category override named this category.
+    Override,
+    /// The binding of the category's tier.
+    TierInheritance,
+    /// Neither: the category is pinned to the local tier by construction.
+    PinnedLocal,
+    /// Neither: nothing is bound.
+    Unbound,
+}
+
+/// Where an **unbound** tier's provider came from (REQ-557 BR-4).
+///
+/// A tier with no `[[tiers]]` row still resolves, because the daemon fills it —
+/// and `reflex` fills differently from the other three, which is the fact
+/// `teton_core::category::Tier::inherits_default_provider` owns. This enum is
+/// how `teton policy show` reports that fill instead of restating the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierBindingSource {
+    /// A `[[tiers]]` row the user configured.
+    Configured,
+    /// Unbound, filled from `default_provider`.
+    DefaultProvider,
+    /// Unbound, filled from the local tier — every tier's last resort, and
+    /// `reflex`'s only one.
+    LocalTier,
+    /// Unbound, with nothing to inherit.
+    Unbound,
 }
 
 /// Session interaction mode (spec entity `Session.mode`).
@@ -239,6 +533,133 @@ mod tests {
             serde_json::to_string(&Phase::Architect).unwrap(),
             "\"architect\""
         );
+    }
+
+    /// The display name and the serde form are two renderings of one wire
+    /// spelling, so they are asserted to be the same string rather than
+    /// maintained in parallel. A variant whose `as_str` drifts from its serde
+    /// rename fails here.
+    #[test]
+    fn category_and_tier_display_names_are_their_wire_form() {
+        let categories = [
+            Category::Route,
+            Category::Redact,
+            Category::Title,
+            Category::Digest,
+            Category::Compact,
+            Category::Triage,
+            Category::Edit,
+            Category::Shell,
+            Category::Design,
+            Category::Debug,
+            Category::Review,
+        ];
+        for category in categories {
+            let json = serde_json::to_string(&category).unwrap();
+            assert_eq!(json, format!("\"{}\"", category.as_str()));
+            assert_eq!(category.to_string(), category.as_str());
+            assert_eq!(
+                serde_json::from_str::<Category>(&json).unwrap(),
+                category,
+                "{category} must round-trip"
+            );
+        }
+        // All eleven, including the two pinned-local ones: the event reports
+        // what happened, and a pinned category still routes a call.
+        assert_eq!(categories.len(), 11);
+
+        for tier in [Tier::Reflex, Tier::Scan, Tier::Build, Tier::Think] {
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(json, format!("\"{}\"", tier.as_str()));
+            assert_eq!(tier.to_string(), tier.as_str());
+            assert_eq!(serde_json::from_str::<Tier>(&json).unwrap(), tier);
+        }
+    }
+
+    /// ADR-B on the wire: a binding for a pinned category is unrepresentable,
+    /// and the nine that *are* representable share their spelling with the
+    /// reporting enum, so one name serves config, CLI, and the wire.
+    #[test]
+    fn a_binding_can_name_nine_categories_and_only_nine() {
+        assert_eq!(ConfigurableCategory::ALL.len(), 9);
+        for c in ConfigurableCategory::ALL {
+            let json = serde_json::to_string(&c).unwrap();
+            assert_eq!(json, format!("\"{}\"", c.as_str()));
+            assert_eq!(
+                serde_json::from_str::<ConfigurableCategory>(&json).unwrap(),
+                c
+            );
+            assert_eq!(c.as_str(), c.reported().as_str());
+            assert_eq!(c.as_str().parse::<ConfigurableCategory>().unwrap(), c);
+            assert_ne!(c.reported(), Category::Redact);
+            assert_ne!(c.reported(), Category::Route);
+        }
+        // The pins are a deserialization failure, not a check to remember.
+        for pinned in ["redact", "route"] {
+            assert!(
+                serde_json::from_str::<ConfigurableCategory>(&format!("\"{pinned}\"")).is_err(),
+                "{pinned} must not deserialize into a binding"
+            );
+        }
+    }
+
+    /// AC-4: a pinned name reads as *forbidden*, not misspelled — and each names
+    /// its own reason, because a borrowed justification tells a user why some
+    /// other category is pinned.
+    #[test]
+    fn parsing_a_pinned_category_names_the_pin_and_its_own_reason() {
+        let redact = "redact".parse::<ConfigurableCategory>().unwrap_err();
+        assert_eq!(redact, ParseCategoryError::RedactIsPinned);
+        assert!(redact.to_string().contains("leave the machine"));
+
+        let route = "route".parse::<ConfigurableCategory>().unwrap_err();
+        assert_eq!(route, ParseCategoryError::RouteIsPinned);
+        assert!(route.to_string().contains("classifier"));
+        assert!(
+            !route.to_string().contains("leave the machine"),
+            "route inherited redact's explanation: {route}"
+        );
+
+        for err in [&redact, &route] {
+            let text = err.to_string();
+            assert!(text.contains("pinned"), "{text}");
+            assert!(!matches!(err, ParseCategoryError::Unknown { .. }));
+        }
+
+        let typo = "reviw".parse::<ConfigurableCategory>().unwrap_err();
+        let text = typo.to_string();
+        assert!(text.contains("reviw") && text.contains("review"), "{text}");
+        // The accepted list never advertises a name that cannot be accepted.
+        assert!(
+            !text.contains("redact") && !text.contains("route"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn binding_sources_use_snake_case_wire_form() {
+        for (source, wire) in [
+            (BindingSource::Override, "override"),
+            (BindingSource::TierInheritance, "tier_inheritance"),
+            (BindingSource::PinnedLocal, "pinned_local"),
+            (BindingSource::Unbound, "unbound"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{wire}\"")
+            );
+        }
+        for (source, wire) in [
+            (TierBindingSource::Configured, "configured"),
+            (TierBindingSource::DefaultProvider, "default_provider"),
+            (TierBindingSource::LocalTier, "local_tier"),
+            (TierBindingSource::Unbound, "unbound"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{wire}\"")
+            );
+        }
     }
 
     #[test]

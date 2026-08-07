@@ -1540,3 +1540,47 @@ pub fn fixture_catalog_toml(models: &[TestModel]) -> String {
 pub fn local_model_block(base_url: &str, auto_accept: bool) -> String {
     format!("[local_model]\nauto_accept = {auto_accept}\nbase_url = \"{base_url}\"\n\n")
 }
+
+// ---------------------------------------------------------------------------
+// REQ-558 fixture builders: providers, tiers, categories
+// ---------------------------------------------------------------------------
+//
+// These live here rather than in one suite file because two suites now write
+// the same config shapes (`model_identity` and `routing_categories`), and a
+// fixture builder written twice is a fixture builder that drifts — which for a
+// *routing* suite means two tests believing they configured the same table.
+
+/// A `[[providers]]` row for a remote, OpenAI-compatible provider that declares
+/// its `model` — the post-REQ-557 shape, and the only one that is usable.
+pub fn remote_provider_block(id: &str, endpoint: &str, model: &str) -> String {
+    format!(
+        "[[providers]]\nid = \"{id}\"\nkind = \"openai-compatible\"\n\
+         endpoint = \"{endpoint}\"\nmodel = \"{model}\"\n\n"
+    )
+}
+
+/// A `[[tiers]]` row (REQ-558). The tier — not the lifecycle phase — is the
+/// configured routing surface: `build` serves `edit`/`shell`, `think` serves
+/// `design`/`debug`/`review`, `scan` serves `digest`/`compact`/`triage`, and a
+/// turn maps its category to one of them unless a `[[categories]]` row
+/// overrides it.
+pub fn tier_block(tier: &str, provider: &str) -> String {
+    format!("[[tiers]]\ntier = \"{tier}\"\nprovider_id = \"{provider}\"\n\n")
+}
+
+/// A `[[tiers]]` row that also names a `fallback_id`.
+pub fn tier_block_with_fallback(tier: &str, provider: &str, fallback: &str) -> String {
+    format!(
+        "[[tiers]]\ntier = \"{tier}\"\nprovider_id = \"{provider}\"\n\
+         fallback_id = \"{fallback}\"\n\n"
+    )
+}
+
+/// A `[[categories]]` row: the per-category override of a tier binding.
+///
+/// `redact` is deliberately unrepresentable here as it is in the config schema
+/// (ADR-B) — this builder takes a `&str` only because a test fixture writes
+/// TOML, and a test that passes `"redact"` should and does fail at config load.
+pub fn category_block(category: &str, provider: &str) -> String {
+    format!("[[categories]]\nname = \"{category}\"\nprovider_id = \"{provider}\"\n\n")
+}

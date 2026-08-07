@@ -22,14 +22,21 @@
 //!   preflight before a byte is fetched, download to a temporary path, verify,
 //!   then an atomic rename into place.
 //! - [`harness`] — the agentic tool-use loop (local-first: read/edit/verify).
-//! - [`router`] — phase-policy routing (BR-5), BR-6 degradation, remote wiring
-//!   through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
+//! - [`call_sites`] — which categories the harness actually dispatches on today
+//!   (REQ-558 ADR-A), and the source-scanning test that keeps the
+//!   `declared, no call site yet` marker from rotting into a hand-maintained
+//!   list.
+//! - [`classify`] — the `route` classifier (REQ-558 BR-3): the one small local
+//!   model call that assigns a *freeform* turn to one of the four judgment
+//!   categories, with a bypass that issues no call at all when the local tier
+//!   cannot serve (BR-5). It lives beside the router rather than inside it
+//!   because no routing function may see prompt text.
+//! - [`router`] — category routing (REQ-558 BR-1), BR-6 degradation, remote
+//!   wiring through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
 //! - [`runtime`] — the assembled engine/router/egress/cost/MCP state the JSON-RPC
 //!   handlers drive: `session/prompt` execution, config, and the cost query.
 //! - [`structured`] — structured (ADLC) mode (D-4, BR-3): the phase state machine,
 //!   artifact gates, `.teton/` artifact storage, and bundled generic templates.
-//! - [`heuristics`] — freeform-mode routing (BR-5): local for auxiliary duties,
-//!   the configured default for coding turns, with a BR-8 local-tier bypass.
 //! - [`model_consent`] — the first-run consent gate (REQ-547 BR-1): probe →
 //!   propose → await an answer → only then download. Gates the local *tier*,
 //!   never the session (D-3).
@@ -45,11 +52,12 @@
 
 pub mod auth;
 pub mod broadcast;
+pub mod call_sites;
+pub mod classify;
 pub mod cost;
 pub mod download;
 pub mod egress;
 pub mod harness;
-pub mod heuristics;
 pub mod install;
 pub mod keychain;
 pub mod mcp;
