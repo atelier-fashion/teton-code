@@ -2229,7 +2229,10 @@ provider_id = "on-device"
         // they disagree — the read is what is under test, not the parse.
         let on = Config::load("[privacy]\nredact = true\n").expect("must load");
         let off = Config::load("[privacy]\nredact = false\n").expect("must load");
-        assert!(on.privacy.redact, "`redact = true` did not survive the load");
+        assert!(
+            on.privacy.redact,
+            "`redact = true` did not survive the load"
+        );
         assert!(!off.privacy.redact);
         assert_ne!(
             on.privacy, off.privacy,
