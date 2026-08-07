@@ -28,6 +28,7 @@ naming the pin (AC-14).
 - [ ] A config with no `[privacy]` table loads with `privacy.redact == false` (AC-13's "off by default" leg).
 - [ ] `[privacy]\nredact = true` parses; a round-trip test proves the value is read, not defaulted (LESSON-485: the fixture must discriminate — assert `true`, not merely "loads").
 - [ ] AC-14 test: `ConfigurableCategory` has no `Redact` variant — assert `"redact".parse::<ConfigurableCategory>()` still fails with `RedactIsPinned`, and a `[[categories]]` TOML entry naming `redact` still fails to deserialize with a message naming the pin.
+- [ ] AC-4 RPC/CLI legs re-asserted, not assumed: `config/set` deserializes the PROTOCOL type, which is a different type from the config `FromStr` path (LESSON-486 #2) — locate the protocol-side category type and assert `redact` is unbindable there too (a `config/set`-shaped payload naming `redact` is rejected), and that `policy set-category redact …` fails naming the pin. If REQ-558 tests already pin these exact paths, cite them by test name in the task completion note instead of duplicating.
 - [ ] `[privacy]` with an unknown key behaves consistently with the rest of `Config`'s unknown-key posture (match existing serde attributes; do not invent a new posture).
 - [ ] `cargo test -p teton-core` green; no clippy warnings.
 

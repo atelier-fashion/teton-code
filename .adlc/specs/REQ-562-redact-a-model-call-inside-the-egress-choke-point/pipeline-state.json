@@ -3,12 +3,14 @@
   "branch": "feat/REQ-562-redact-egress-scan",
   "startedAt": "2026-08-07T00:00:00Z",
   "completed": false,
-  "currentPhase": 2,
-  "completedPhases": [0, 1],
+  "currentPhase": 4,
+  "completedPhases": [0, 1, 2, 3],
   "integrationBranch": "main",
   "phaseHistory": [
     { "phase": 0, "name": "Resolve Repos + Worktree + Preflight", "completedAt": "2026-08-07T00:10:00Z", "note": "draft PR deferred to Phase 6 fallback (LESSON-004: no commits yet)" },
-    { "phase": 1, "name": "Validate Requirement Spec", "completedAt": "2026-08-07T00:20:00Z", "note": "APPROVED; OQ-4 checkbox synced to recorded resolution; BR-9 latency budget carried to Phase 2 as an architecture obligation" }
+    { "phase": 1, "name": "Validate Requirement Spec", "completedAt": "2026-08-07T00:20:00Z", "note": "APPROVED; OQ-4 checkbox synced to recorded resolution; BR-9 latency budget carried to Phase 2 as an architecture obligation" },
+    { "phase": 2, "name": "Architect & Break Into Tasks", "completedAt": "2026-08-07T00:50:00Z", "note": "8 ADRs; 6 tasks TASK-066..071 in 4 tiers; draft PR #69 opened (Step-0 retry) and footprint published" },
+    { "phase": 3, "name": "Validate Architecture & Tasks", "completedAt": "2026-08-07T01:00:00Z", "note": "PASS after closing the AC-4 ownership gap (TASK-067 RPC/CLI legs, TASK-071 behavioral no-guard leg)" }
   ],
   "repos": {
     "teton-code": {
@@ -17,8 +19,8 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-562",
       "branch": "feat/REQ-562-redact-egress-scan",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/69",
+      "prNumber": 69,
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
