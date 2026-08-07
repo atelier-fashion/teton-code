@@ -20,9 +20,15 @@
 //! [`MeteredBody`] that passes every chunk through untouched (so the adapter
 //! still parses the real response) while a [`UsageScan`] reads the turn's token
 //! usage out of the provider's own SSE payload. When the stream ends, the call
-//! is priced and one row is written — exactly one `CostRecord` per completed
-//! remote call, and none for a blocked one (a blocked call never reaches egress'
-//! forward point).
+//! is priced and one row is written — exactly one `CostRecord` per remote call
+//! this daemon began to read, and none for a blocked one (a blocked call never
+//! reaches egress' forward point) or one refused on its status before its body
+//! was touched.
+//!
+//! "Ends" means completed **or dropped**: a stream abandoned mid-flight — a duty
+//! cut off at its deadline, a cancelled turn — is a call that really went out,
+//! and billing only the drained path left those off the ledger entirely. See
+//! [`MeteredBody`] for where that line is drawn and what it does not fix.
 
 use std::path::Path;
 use std::pin::Pin;
@@ -305,6 +311,7 @@ impl CostMeter for CostLedger {
             provider_id,
             attribution,
             scan: UsageScan::default(),
+            polled: false,
             recorded: false,
         };
         TransportResponse {
@@ -314,13 +321,46 @@ impl CostMeter for CostLedger {
     }
 }
 
-/// A response body that records a `CostRecord` when the stream completes.
+/// A response body that records a `CostRecord` when the stream ends — by
+/// completing **or** by being dropped.
 ///
 /// Every chunk is yielded to the caller unchanged; a copy feeds the
-/// [`UsageScan`]. Recording happens exactly once, on the terminal `None`, so a
+/// [`UsageScan`]. Recording happens exactly once, on whichever comes first, so a
 /// caller that drains the stream (to read the completion) always bills the call
 /// once. Recording is best-effort: a store failure is swallowed so it can never
 /// corrupt delivery of the actual model response.
+///
+/// ## Why the terminal `None` cannot be the only trigger (REQ-561 verify)
+///
+/// A metered body is not always drained. `tokio::time::timeout` **drops** the
+/// future it is racing, and that future owns the provider's `TurnStream` and so
+/// this body — so with recording keyed on `Poll::Ready(None)` alone, a call that
+/// went out and burned tokens produced no row whenever the wait was cut short.
+/// [`DUTY_DEADLINE`](crate::harness::duty::DUTY_DEADLINE) makes that a *routine*
+/// outcome rather than an exotic one: a provider slow enough — or adversarial
+/// enough — to sit past the deadline served every one of its calls off-ledger.
+/// The same hole swallows a cancelled turn and any consumer that stops reading
+/// early. Recording from [`Drop`] closes all of them at one site rather than at
+/// each caller, which is where a cancellation-safety rule belongs.
+///
+/// ## `polled` is the line between "abandoned" and "never begun"
+///
+/// [`Drop`] records only a body the caller actually asked for a chunk. That
+/// distinction is not fastidiousness — it is what keeps this fix from inventing
+/// rows. A 4xx/5xx response is rejected on its **status**, before a byte of its
+/// body is read (see the provider adapters' `stream_turn`), and that body is
+/// then dropped unpolled. Recording it would append a 0-token, $0 row for a call
+/// the provider refused, inflating `CostReport::calls` with requests that bought
+/// nothing — a change to what the ledger *means*, made as a side effect of
+/// closing a leak. One `bool` draws the line where the ledger already draws it:
+/// a row means a response this daemon began to consume.
+///
+/// What [`Drop`] does **not** do is complete the token counts. A stream
+/// abandoned before its provider reported usage records what the scan saw, which
+/// for an OpenAI-compatible family that only reports in its terminal chunk is
+/// zero — the same answer the drained path gives for a stream that carries no
+/// usage at all. So this makes an interrupted call *visible*; it does not make
+/// it *fully priced*, and no `Drop` impl could.
 struct MeteredBody {
     inner: ByteStream,
     conn: Arc<Mutex<Connection>>,
@@ -330,10 +370,27 @@ struct MeteredBody {
     provider_id: ProviderId,
     attribution: CostAttribution,
     scan: UsageScan,
+    /// Whether the caller ever asked this body for a chunk. See the type doc:
+    /// an unpolled body is a response that was refused on its status, not a call
+    /// that was served and abandoned.
+    polled: bool,
     recorded: bool,
 }
 
 impl MeteredBody {
+    /// Write this call's row, at most once per body.
+    ///
+    /// The latch is checked here rather than at each of the two callers, so
+    /// "exactly one `CostRecord` per call" holds by construction whichever of
+    /// them fires first — and a third trigger added later cannot double-bill.
+    fn record_once(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        self.finalize();
+    }
+
     fn finalize(&self) {
         let usage = self.scan.usage();
         // REQ-557 ADR-A: priced by declared model (see `record_call`).
@@ -362,6 +419,10 @@ impl Stream for MeteredBody {
         // MeteredBody is Unpin (the inner stream is already `Pin<Box<..>>`), so a
         // plain `get_mut` projection is sound.
         let this = self.get_mut();
+        // Set before the inner poll, not after a successful one: a body that
+        // answers `Pending` forever — the stalling provider the deadline exists
+        // for — has still been begun, and is exactly the call `Drop` must bill.
+        this.polled = true;
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 this.scan.feed(&chunk);
@@ -369,13 +430,28 @@ impl Stream for MeteredBody {
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => {
-                if !this.recorded {
-                    this.recorded = true;
-                    this.finalize();
-                }
+                this.record_once();
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// The other end of the stream's life: a body that was begun and then abandoned
+/// is billed here (see the type doc).
+///
+/// Nothing on this path can panic — [`UsageScan::usage`] answers zero for a
+/// stream that reported nothing, the price table clamps, and `insert_and_emit`
+/// maps a poisoned mutex to an error rather than unwrapping it — which matters
+/// more here than on the polled path: a panic in a `Drop` running during
+/// unwinding aborts the process instead of propagating. The one call that is not
+/// this module's is `CostEventSink::cost_recorded`, which the completed-stream
+/// path already makes from inside the same `finalize`.
+impl Drop for MeteredBody {
+    fn drop(&mut self) {
+        if self.polled {
+            self.record_once();
         }
     }
 }
@@ -1005,6 +1081,128 @@ CREATE TRIGGER cost_records_no_delete
             ledger.all_records().expect("read").is_empty(),
             "an unattributed (session-less) call must not be recorded"
         );
+    }
+
+    /// A body that never terminates: it yields its chunks and then answers
+    /// `Pending` forever, which is what a stalled connection or a provider that
+    /// simply stops finishing its stream produces. `drain` would hang on it —
+    /// that is the point.
+    fn stalling_body_from(chunks: Vec<&str>) -> ByteStream {
+        let owned: Vec<Result<Vec<u8>, TransportError>> = chunks
+            .into_iter()
+            .map(|c| Ok(c.as_bytes().to_vec()))
+            .collect();
+        Box::pin(futures::stream::iter(owned).chain(futures::stream::pending()))
+    }
+
+    /// **REQ-561 verify — an abandoned stream is still a call that went out.**
+    ///
+    /// `tokio::time::timeout` drops the future it is racing, and that future
+    /// owns the response body. Keyed on the terminal `None` alone, the row for
+    /// this call is never written: the request left the machine, the provider
+    /// reported the input tokens it charged for, and the ledger says nothing
+    /// happened. Deleting the `Drop` impl fails here.
+    #[tokio::test]
+    async fn a_stream_abandoned_mid_flight_still_bills_what_the_provider_reported() {
+        let (ledger, sink) = ledger();
+        let ledger = Arc::new(ledger);
+        // Anthropic-shaped: `message_start` carries the input tokens up front,
+        // which is why the count is knowable before the stream ends.
+        let body = stalling_body_from(vec![
+            "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":1200,\"output_tokens\":1}}}\n\n",
+        ]);
+        let response = TransportResponse { status: 200, body };
+        let metered = CostMeter::meter_response(
+            ledger.as_ref(),
+            response,
+            Some(SessionId::from("sess-stalled")),
+            ProviderId::from("anthropic"),
+            CostAttribution::new("claude-opus-4").with_category(Category::Title),
+        );
+
+        // Read what the provider did send, then give up on it — the shape a
+        // deadline, a cancelled turn, or an early `break` leaves behind.
+        {
+            let mut body = metered.body;
+            let first = body.next().await.expect("the provider did send a chunk");
+            assert!(first.is_ok(), "non-vacuity: the body really was read");
+            assert!(
+                ledger.all_records().expect("read").is_empty(),
+                "nothing is billed while the stream is still alive"
+            );
+        }
+
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 1, "an abandoned call is still one CostRecord");
+        assert_eq!(rows[0].session_id, "sess-stalled");
+        assert_eq!(rows[0].category, Some(Category::Title));
+        assert_eq!(
+            rows[0].input_tokens, 1200,
+            "billed at what the provider had already reported, not at zero"
+        );
+        assert_eq!(
+            sink.records.lock().unwrap().len(),
+            1,
+            "and a subscriber watching cost sees it, not just the store"
+        );
+    }
+
+    /// The other half of that line, and the reason `Drop` is gated on `polled`.
+    ///
+    /// A 4xx/5xx response is refused on its **status** by every provider
+    /// adapter, before a byte of its body is read; the body is then dropped
+    /// unpolled. Billing it would append a 0-token, $0 row per rejected request
+    /// — a call that bought nothing, inflating `CostReport::calls`. Removing the
+    /// `polled` guard fails here.
+    #[tokio::test]
+    async fn a_response_refused_on_its_status_is_never_billed() {
+        let (ledger, sink) = ledger();
+        let ledger = Arc::new(ledger);
+        let body = body_from(vec!["{\"error\":{\"type\":\"rate_limit_error\"}}"]);
+        let response = TransportResponse { status: 429, body };
+        let metered = CostMeter::meter_response(
+            ledger.as_ref(),
+            response,
+            Some(SessionId::from("sess-429")),
+            ProviderId::from("anthropic"),
+            CostAttribution::new("claude-opus-4"),
+        );
+        // What `stream_turn` does with a >= 400: return an error and drop the
+        // response, body unread.
+        assert_eq!(metered.status, 429);
+        drop(metered);
+
+        assert!(
+            ledger.all_records().expect("read").is_empty(),
+            "a request the provider refused is not a metered call"
+        );
+        assert!(sink.records.lock().unwrap().is_empty());
+    }
+
+    /// The latch holds across both triggers: a drained stream that is then
+    /// dropped bills once, not twice.
+    #[tokio::test]
+    async fn a_drained_stream_is_not_billed_again_when_it_is_dropped() {
+        let (ledger, sink) = ledger();
+        let ledger = Arc::new(ledger);
+        let body = body_from(vec![
+            "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+        ]);
+        let response = TransportResponse { status: 200, body };
+        let metered = CostMeter::meter_response(
+            ledger.as_ref(),
+            response,
+            Some(SessionId::from("sess-once")),
+            ProviderId::from("deepseek"),
+            CostAttribution::new("deepseek-chat"),
+        );
+        drain(metered.body).await; // drains to the terminal `None`, then drops
+        assert_eq!(
+            ledger.all_records().expect("read").len(),
+            1,
+            "exactly one CostRecord per call, whichever trigger fires first"
+        );
+        assert_eq!(sink.records.lock().unwrap().len(), 1);
     }
 
     #[test]

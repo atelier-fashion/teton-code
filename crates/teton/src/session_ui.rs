@@ -178,6 +178,14 @@ pub fn render_event(
             surface.line(LineKind::Info, &format_attach(a));
             EventOutcome::Rendered
         }
+        // REQ-561 BR-9a ships the title as data and stops there: the event is
+        // what makes `SessionSummary.title` observable, and it commits no
+        // surface to drawing it. The CLI's session view has nowhere a title
+        // belongs today — the status line is REQ-560's — so this arm handles the
+        // event by consuming it, and a client that wants the title reads the
+        // stream or `session/list`. Rendering it here would be this REQ deciding
+        // another one's layout.
+        Event::SessionTitled(_) => EventOutcome::Rendered,
         Event::PermissionRequest(pr) => EventOutcome::Permission(Box::new(pr.clone())),
         // REQ-547: the consent round-trip. The proposal is *not* rendered here —
         // it is handed back so the caller can decide whether this client owns the

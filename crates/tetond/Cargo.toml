@@ -90,6 +90,9 @@ security-framework = "2"
 [dev-dependencies]
 # Integration tests act as clients over the socket and need the test macro. The
 # MCP egress test (TASK-011) spawns a mock stdio server, so `process` here too.
+# `test-util` is test-only: the duty seam's deadline (REQ-561) is a two-minute
+# wall-clock bound, and asserting it on a paused clock is the difference between
+# a test and a two-minute test.
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -98,6 +101,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "process",
+    "test-util",
 ] }
 serde_json = "1"
 # The egress-capture harness implements a mock `Transport` (async-trait) and

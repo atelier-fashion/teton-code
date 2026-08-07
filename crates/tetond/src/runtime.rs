@@ -106,10 +106,12 @@ use teton_inference::catalog::Catalog;
 use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GIB};
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
-use teton_protocol::events::{ModelLifecycle, ModelLifecycleStage, PrivacyAction};
+use teton_protocol::events::{
+    Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction, SessionTitled,
+};
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    CategoryRouteView, ConfigSnapshot, ConfigUpdate, CostGroupView, CostQueryResult,
+    CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
     TierRouteView,
@@ -130,13 +132,14 @@ use crate::call_sites::has_call_site;
 use crate::classify::Classification;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
-use crate::egress::{inspect, origin_of, Egress, HttpTransport};
+use crate::egress::{inspect, origin_of, Egress, HttpTransport, Provenance};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
-    build_system_prompt, ContextManager, DigestRoute, LocalEngineSource, PendingPermissions,
-    PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolRegistry,
+    build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
+    PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolDuties,
+    ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -149,6 +152,7 @@ use crate::router::{
     to_protocol_category, to_protocol_phase, to_protocol_tier, Router, TierOrigin, TierReport,
 };
 use crate::selection_store::SelectionStore;
+use crate::sessions::SessionRegistry;
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
 const SCRIPT_SEPARATOR: &str = "---";
@@ -203,6 +207,65 @@ fn scripted_classification() -> &'static str {
 /// turns later.
 const SCRIPTED_DIGEST: &str = "[scripted digest of the tool output]";
 
+/// The stand-in's answer to a `triage` duty: **the identity ranking** — every
+/// match offered, in the order it was offered (REQ-561 BR-10).
+///
+/// A stand-in cannot judge relevance. Inventing an order would silently reorder
+/// every fixture's `grep` output and make a fixture's meaning depend on a
+/// judgement no fixture author wrote; answering with nothing usable would make
+/// every scripted session report a `triage` failure. So it keeps every match and
+/// drops none, which is the one answer that is both *valid* (it parses as a
+/// ranking) and *neutral*.
+///
+/// The count is read off the prompt rather than guessed, so a change to the
+/// prompt's numbering shows up here rather than as an unusable answer two
+/// fixtures later.
+fn scripted_triage(prompt: &str) -> String {
+    (1..=crate::harness::triage::offered_match_count(prompt))
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The stand-in engine's answer to a `shell` duty (REQ-561 BR-10).
+///
+/// A fixed marker for the same reason [`SCRIPTED_DIGEST`] is one: a stand-in
+/// cannot say what a build failure means, and echoing the command output back
+/// would make a fixture pass while proving nothing. A fixture whose command
+/// failed or overran the cap can see in one legible string that the duty fired,
+/// rather than discovering it as a mysterious extra line two assertions later.
+const SCRIPTED_SHELL_INTERPRETATION: &str = "[scripted interpretation of the command output]";
+
+/// The stand-in engine's answer to a `title` duty (REQ-561 BR-10).
+///
+/// A fixed marker, for the reason [`SCRIPTED_DIGEST`] is one — and with more at
+/// stake: `title` fires on the **first turn of every session**, so a stand-in
+/// that consumed a scripted block here would shift the reply sequence of every
+/// fixture in the suite by one. It is deliberately readable as a name, so a
+/// fixture that renders session titles shows something a person can recognize
+/// rather than an empty string that looks like a bug.
+const SCRIPTED_TITLE: &str = "Scripted session";
+
+/// The stand-in engine's answer to a `compact` duty: **forget the oldest block**
+/// (REQ-561 BR-10).
+///
+/// The most conservative valid answer available, and a fixed one for the reason
+/// [`SCRIPTED_DIGEST`] is fixed. A stand-in cannot judge what a conversation
+/// still needs, so inventing a forget-set would make a fixture's meaning depend
+/// on a judgement no fixture author wrote; answering with nothing usable would
+/// make every pressured scripted session report a `compact` failure. "The oldest
+/// block" is what
+/// [`truncate_to_budget`](crate::harness::context::ContextManager::truncate_to_budget)
+/// would have dropped anyway, so a scripted session under context pressure ends
+/// up with the conversation it would have had before this REQ — plus one legible
+/// marker saying a compaction ran.
+///
+/// Block 1 is always offered and always droppable when this is reached:
+/// [`COMPACT_MIN_BLOCKS`](crate::harness::compact::COMPACT_MIN_BLOCKS) guarantees
+/// at least two blocks before the protected one.
+const SCRIPTED_COMPACTION: &str =
+    "FORGET: 1\nSUMMARY: [scripted compaction of the earlier conversation]";
+
 /// A local [`Engine`] that replays a fixed script of replies, one per turn.
 ///
 /// This is the CI/offline stand-in for a real llama.cpp engine: the daemon ships
@@ -213,14 +276,28 @@ const SCRIPTED_DIGEST: &str = "[scripted digest of the tool output]";
 ///
 /// **A duty is not a turn** (REQ-558). The script is a sequence of *turns*, and
 /// the daemon also issues local *duty* calls on its own behalf: a `route`
-/// classification before every freeform judgment turn (TASK-053), and a `digest`
-/// whenever a tool result crosses the summarization threshold (TASK-054). Serving
-/// those from the script would silently shift every block by one and make a
-/// fixture's meaning depend on how many duties the daemon happens to run — so
-/// each duty is recognized by its own **output contract**
+/// classification before every freeform judgment turn (TASK-053), a `digest`
+/// whenever a tool result crosses the summarization threshold (TASK-054), a
+/// `triage` whenever a `grep` returns more than one match (REQ-561 TASK-060), a
+/// `shell` interpretation whenever a command fails or overruns its output cap
+/// (REQ-561 TASK-061), a `title` on the first substantive turn of every session
+/// (REQ-561 TASK-062), and a `compact` whenever a conversation crosses the soft
+/// context-pressure threshold (REQ-561 TASK-063).
+/// Serving those from the script would silently shift every block by one and
+/// make a fixture's meaning depend on how many duties the daemon happens to run
+/// — so each duty is recognized by its own **output contract**
 /// ([`crate::classify::CLASSIFIER_OUTPUT_CONTRACT`],
-/// [`crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT`]) and answered
-/// off-script, consuming nothing.
+/// [`crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT`],
+/// [`crate::harness::triage::TRIAGE_OUTPUT_CONTRACT`],
+/// [`crate::harness::shell_duty::SHELL_OUTPUT_CONTRACT`],
+/// [`crate::harness::title::TITLE_OUTPUT_CONTRACT`],
+/// [`crate::harness::compact::COMPACT_OUTPUT_CONTRACT`]) and answered off-script,
+/// consuming nothing.
+///
+/// `title` is the one that would bite hardest: it fires on the first turn of
+/// **every** session rather than on some particular tool result, so a missing
+/// recognition arm would desynchronize the whole suite at once rather than one
+/// fixture at a time.
 ///
 /// The `digest` half was latent before this task and is not: `summarize_if_large`
 /// has always called this engine, and it *did* consume a block. It has never
@@ -260,6 +337,46 @@ impl ScriptedFileEngine {
     }
 }
 
+/// How far into a prompt a duty's output contract may start and still be the
+/// **harness's own instruction** rather than material that quotes it.
+///
+/// Every one of the five harness duty prompts is built the same way: a fixed
+/// instruction, then the contract that closes it, then the material. The longest
+/// of those instructions is a few hundred bytes, so a kilobyte is roomy for all
+/// five and for the chat template `render_duty` may wrap them in — while a turn
+/// prompt opens with the system prompt, which is itself several kilobytes of
+/// tool documentation before any conversation block is reached. Nothing a
+/// conversation can say lands inside this window.
+const DUTY_CONTRACT_PREFIX_BYTES: usize = 1_024;
+
+/// Whether `prompt` is a duty prompt built around `contract` — i.e. the contract
+/// appears where a *builder* puts it, in the instruction the prompt opens with.
+///
+/// The `contains` this replaces read the whole rendered prompt, so a conversation
+/// block that quoted a contract sentence — a compaction summary that echoed one,
+/// a repository file carrying one, a `grep` result over this repository —
+/// diverted an ordinary turn into a canned duty answer *without consuming a
+/// script block*, which then shifts every later reply in the fixture by one. That
+/// is the failure mode [`ScriptedFileEngine`]'s own docs describe having shipped
+/// twice, arriving by a different route (REQ-561 verify).
+fn instructs(prompt: &str, contract: &str) -> bool {
+    prompt
+        .find(contract)
+        .is_some_and(|at| at < DUTY_CONTRACT_PREFIX_BYTES)
+}
+
+/// Whether `prompt` ends with `contract` — the classifier's shape, and only the
+/// classifier's.
+///
+/// [`crate::classify`] deliberately states its contract **last**, "because it is
+/// the instruction the model should be holding when it starts generating", so
+/// the prefix anchor above does not describe it. Its material is embedded
+/// upstream between `---` fences, so nothing untrusted can occupy the position
+/// this checks.
+fn concludes(prompt: &str, contract: &str) -> bool {
+    prompt.trim_end().ends_with(contract)
+}
+
 impl Engine for ScriptedFileEngine {
     fn model_id(&self) -> &str {
         &self.model_id
@@ -273,10 +390,28 @@ impl Engine for ScriptedFileEngine {
     ) -> Result<Completion, EngineError> {
         // A duty, not a turn: answered off-script so the block sequence keeps
         // meaning what the fixture author wrote (see the type's docs).
-        let text = if prompt.contains(crate::classify::CLASSIFIER_OUTPUT_CONTRACT) {
-            scripted_classification().to_owned()
-        } else if prompt.contains(crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
+        //
+        // The five harness duties are recognized by their contract appearing in
+        // the prompt's **instruction prefix** and the classifier by its contract
+        // *terminating* the prompt — never by a bare `contains` over the whole
+        // rendered text. See `instructs` and `concludes`.
+        //
+        // The prefix-anchored arms come first so that a duty prompt whose
+        // embedded material happens to end with the classifier's contract — a
+        // `grep` hit on this very file, say — is still recognized as the duty it
+        // is.
+        let text = if instructs(prompt, crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
             SCRIPTED_DIGEST.to_owned()
+        } else if instructs(prompt, crate::harness::triage::TRIAGE_OUTPUT_CONTRACT) {
+            scripted_triage(prompt)
+        } else if instructs(prompt, crate::harness::shell_duty::SHELL_OUTPUT_CONTRACT) {
+            SCRIPTED_SHELL_INTERPRETATION.to_owned()
+        } else if instructs(prompt, crate::harness::title::TITLE_OUTPUT_CONTRACT) {
+            SCRIPTED_TITLE.to_owned()
+        } else if instructs(prompt, crate::harness::compact::COMPACT_OUTPUT_CONTRACT) {
+            SCRIPTED_COMPACTION.to_owned()
+        } else if concludes(prompt, crate::classify::CLASSIFIER_OUTPUT_CONTRACT) {
+            scripted_classification().to_owned()
         } else {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
             self.replies
@@ -358,6 +493,44 @@ impl SessionTaint {
             .lock()
             .expect("taint mutex poisoned")
             .contains(session)
+    }
+}
+
+/// A [`PrivacyEventSink`] that publishes the block **and** taints the session it
+/// happened in (REQ-544 C-2, extended to the duty path by REQ-561).
+///
+/// The turn path marks taint from its own `is_privacy_blocked()` arm, which
+/// works because a refused turn comes back as a typed error the runtime handles.
+/// A refused **duty** does not: the seam turns it into a failure sentence, the
+/// call site degrades by its own means (a mechanical truncation, the tool's own
+/// unrefined result, an unnamed session, a deterministic drop), and the turn
+/// carries on — correctly. So the one thing that *knows* a boundary was crossed
+/// is the choke point, and marking there is enforcing the rule where the
+/// decision is made rather than at whichever caller happens to notice
+/// (LESSON-484).
+///
+/// The gap it closes is not hypothetical but it is currently *masked*: the
+/// content that got the duty refused is still in the turn's context, so
+/// `context_is_sensitive` taints the session when the turn ends. That is an
+/// incidental cover — it depends on the refusing content still being in `ctx`
+/// at the end of the turn, which compaction and truncation are both entitled to
+/// change — and it is exactly the almost-true invariant a later change builds
+/// on.
+struct TaintingPrivacySink {
+    events: Arc<EventBus>,
+    taint: Arc<SessionTaint>,
+}
+
+impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
+    fn privacy_block(
+        &self,
+        session_id: Option<SessionId>,
+        block: teton_protocol::events::PrivacyBlock,
+    ) {
+        if let Some(session_id) = &session_id {
+            self.taint.mark(session_id);
+        }
+        self.events.privacy_block(session_id, block);
     }
 }
 
@@ -510,7 +683,12 @@ pub struct DaemonRuntime {
     turn_counter: AtomicU64,
     /// Per-session privacy taint: sessions pinned to the local tier because their
     /// context touched `local-only` or unknown-provenance content (REQ-544 C-2).
-    session_taint: SessionTaint,
+    ///
+    /// Behind an `Arc` so the egress choke point can mark it directly: a duty
+    /// refused there is not a turn error anybody up here ever sees, so the turn
+    /// path's own `is_privacy_blocked` arm cannot cover it (see
+    /// [`TaintingPrivacySink`]).
+    session_taint: Arc<SessionTaint>,
     /// Daemon-wide provider health, persisted across turns (REQ-544 M-5). Updated
     /// by turn outcomes and READ by [`Self::run_prompt_turn`] when it seeds the
     /// router each turn, so a provider observed `Unavailable` stays `Unavailable`
@@ -568,7 +746,7 @@ impl DaemonRuntime {
             mcp_servers: Vec::new(),
             probe: None,
             turn_counter: AtomicU64::new(0),
-            session_taint: SessionTaint::new(),
+            session_taint: Arc::new(SessionTaint::new()),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         }
@@ -704,7 +882,7 @@ impl DaemonRuntime {
             mcp_servers,
             probe: Some(probe),
             turn_counter: AtomicU64::new(0),
-            session_taint: SessionTaint::new(),
+            session_taint: Arc::new(SessionTaint::new()),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         })
@@ -1354,9 +1532,14 @@ impl DaemonRuntime {
     /// # Errors
     /// Returns a [`RpcError`] when no provider can serve the turn or an
     /// unrecoverable provider failure occurs.
+    // The parameters are the session's own facts, passed individually because
+    // that is how the caller reads them off `session/prompt` — the same shape
+    // `run_one_attempt` already carries below.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_prompt_turn(
         self: &Arc<Self>,
         events: &Arc<EventBus>,
+        sessions: &SessionRegistry,
         session_id: SessionId,
         mode: SessionMode,
         phase: Option<ProtoPhase>,
@@ -1383,6 +1566,20 @@ impl DaemonRuntime {
             self.local_tier_available(),
             &health_snapshot,
         );
+
+        // REQ-561 TASK-062: name the session, at most once for its whole life.
+        // Ahead of the turn rather than after it, for two reasons: the name is
+        // derived from the prompt, which is already in hand, so a client can
+        // label the session the moment the user hits enter rather than a whole
+        // answer later; and this is the one point on the path that every turn
+        // reaches, where the turn's own maze of early returns is still ahead.
+        //
+        // **Started here, not awaited here.** The turn proceeds into
+        // `dispatch_route` on the next line while the naming runs on its own
+        // task; the handle is dropped because nothing below reads a title, and a
+        // session that is not named yet is a session with no title — BR-3's
+        // degraded state. It cannot fail the turn — see `spawn_title_session`.
+        let _ = self.spawn_title_session(events, sessions, &router, &config, &session_id, &prompt);
 
         let core_phase = phase.map(to_core_phase);
         let mut route = self
@@ -1726,6 +1923,25 @@ impl DaemonRuntime {
         // turn on the local tier can digest remotely — the two decisions are not
         // the same decision, which is the whole premise of dispatching on purpose.
         let digest = self.digest_route(router, config, events, session_id, local_engine.as_ref());
+        // REQ-561 TASK-060: and so does `triage`, the duty the `grep` tool owns.
+        // Resolved here beside `digest` because both need the engine slot read
+        // once for the attempt, and independently of it because two categories
+        // are two decisions.
+        let triage = self.triage_route(router, config, events, session_id, local_engine.as_ref());
+        // REQ-561 TASK-061: and so does `shell`, the duty the `shell` tool owns.
+        // It is a `build` duty where `triage` is a `scan` one, which is the point
+        // of resolving them separately: interpreting a failed build is worth a
+        // stronger model than ordering a list of grep hits.
+        let shell = self.shell_route(router, config, events, session_id, local_engine.as_ref());
+        // REQ-561 TASK-063: and `compact`, which belongs to no tool at all — the
+        // thing that knows a conversation no longer fits is the context manager.
+        // Resolved here with the others and passed separately, because
+        // `ToolDuties` is the tools' own struct.
+        let compact = self.compact_route(router, config, events, session_id, local_engine.as_ref());
+        let duties = ToolDuties {
+            triage: &triage,
+            shell: &shell,
+        };
 
         if is_local {
             let Some((engine, format)) = local_engine.as_ref() else {
@@ -1745,6 +1961,8 @@ impl DaemonRuntime {
                 &route.harness,
                 &mut hook,
                 &digest,
+                &compact,
+                &duties,
             )
             .await;
         }
@@ -1815,6 +2033,8 @@ impl DaemonRuntime {
             &route.harness,
             &mut hook,
             &digest,
+            &compact,
+            &duties,
         )
         .await
     }
@@ -1830,26 +2050,21 @@ impl DaemonRuntime {
     ///    the category table is a cost decision, and the two deliberately do not
     ///    compose (LESSON-432). Checked before a category is resolved, so nothing
     ///    here reads a binding on a tainted turn.
-    /// 2. **The resolver**, through [`Router::resolve`] — one table, one
-    ///    precedence, the same one the turn itself went through (BR-6).
+    /// 2. **The resolver** — one table, one precedence, the same one the turn
+    ///    itself went through (BR-6).
     ///
-    /// Every unresolvable outcome carries a **reason**, never a bare `None`: the
-    /// duty guards an invariant, so its caller must be able to say why it fell
-    /// back to mechanical truncation (LESSON-447). Where the sentence exists
-    /// already — the resolver's — it is carried verbatim rather than re-authored
-    /// (BR-6). Note what is *not* here: a credential that will not resolve fails
-    /// the **turn** on the turn path (a config error the user must fix), but only
-    /// the **duty** here — a duty is never fatal, and the failure is reported on
-    /// the summarize outcome instead.
+    /// ## Why this function exists at all (REQ-561 ADR-3)
     ///
-    /// A remotely-bound `digest` builds its provider and transport eagerly, once
-    /// per attempt, whether or not any tool result ends up crossing the
-    /// threshold. That costs a keychain read and an HTTP client per turn against
-    /// a turn whose floor is one model inference, so it is not worth the
-    /// machinery to defer — but it is worth knowing that after REQ-557's
-    /// migration (`default_provider` set to the first remote provider, no
-    /// `[[tiers]]` rows) the unbound `scan` tier inherits that provider, so this
-    /// is the *ordinary* upgraded config and not an exotic one.
+    /// Everything below the two lines that pick a [`Route`](crate::router::Route)
+    /// is shared with every other duty and lives in [`Self::resolve_duty`]. What
+    /// cannot be shared is the line naming the category, because
+    /// [`crate::call_sites`]'s derived-marker test reads the daemon's own source
+    /// looking for a routing call with a `Category::X` literal inside it. Fold
+    /// that literal into a helper taking a category *variable* and the scan finds
+    /// nothing — the `declared, no call site yet` marker would then keep claiming
+    /// `digest` is unreached while it is fully wired, and the test would fail
+    /// pointing at the marker rather than at the receiver. So the shared helper
+    /// sits **behind** the literal, not in front of it.
     fn digest_route(
         &self,
         router: &Router,
@@ -1857,15 +2072,334 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
-    ) -> DigestRoute {
+    ) -> DutyRoute {
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `digest` duty"))
         } else {
             router.resolve(Category::Digest)
         };
+        self.resolve_duty(
+            DIGEST_DUTY,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
+    }
+
+    /// Resolve the `triage` category for this turn (REQ-561 TASK-060).
+    ///
+    /// The same two layers, in the same order, for the same reasons as
+    /// [`Self::digest_route`] — session taint first, then the one resolver — and
+    /// the same reason for existing separately at all: the line naming the
+    /// category is what [`crate::call_sites`]'s derived-marker test reads out of
+    /// the daemon's own source, so it cannot be folded into a helper taking a
+    /// category *variable* without making that scan blind (ADR-3).
+    ///
+    /// `triage` is a `scan` duty, so it inherits whatever `scan` is bound to and
+    /// sends **grep match text** — file content — there. That is the binding
+    /// working as configured; what holds the line is BR-7's scoping at the
+    /// egress choke point, by the provenance of the matched files rather than of
+    /// the turn.
+    fn triage_route(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        let route = if self.session_taint.is_tainted(session_id) {
+            router.resolve_local_pin(taint_pin_reason("the `triage` duty"))
+        } else {
+            router.resolve(Category::Triage)
+        };
+        self.resolve_duty(
+            TRIAGE_DUTY,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
+    }
+
+    /// Resolve the `shell` category for this turn (REQ-561 TASK-061).
+    ///
+    /// The same two layers, in the same order, for the same reasons as
+    /// [`Self::digest_route`] — session taint first, then the one resolver — and
+    /// the same reason for existing separately at all: the line naming the
+    /// category is what [`crate::call_sites`]'s derived-marker test reads out of
+    /// the daemon's own source, so it cannot be folded into a helper taking a
+    /// category *variable* without making that scan blind (ADR-3).
+    ///
+    /// `shell` is a `build` duty, so it inherits whatever `build` is bound to.
+    /// What it sends is **command output**, whose files the daemon cannot know —
+    /// so the choke point fail-closes on it wherever a boundary is configured,
+    /// and a remotely bound `shell` duty simply degrades. That is BR-3 working;
+    /// see [`crate::harness::shell_duty`].
+    fn shell_route(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        let route = if self.session_taint.is_tainted(session_id) {
+            router.resolve_local_pin(taint_pin_reason("the `shell` duty"))
+        } else {
+            router.resolve(Category::Shell)
+        };
+        self.resolve_duty(SHELL_DUTY, &route, config, events, session_id, local_engine)
+    }
+
+    /// Resolve the `title` category for this session (REQ-561 TASK-062).
+    ///
+    /// The same two layers, in the same order, for the same reasons as
+    /// [`Self::digest_route`] — session taint first, then the one resolver — and
+    /// the same reason for existing separately at all: the line naming the
+    /// category is what [`crate::call_sites`]'s derived-marker test reads out of
+    /// the daemon's own source, so it cannot be folded into a helper taking a
+    /// category *variable* without making that scan blind (ADR-3).
+    ///
+    /// `title` is a `reflex` duty, and an unbound `reflex` tier inherits the
+    /// **local** tier and never `default_provider` (REQ-558) — "sub-second, every
+    /// turn, never leaves the machine". So a machine whose turns all go to a
+    /// frontier provider still names its sessions on the local engine, and no
+    /// branch here is what makes that true: it is the resolver's answer, reached
+    /// through the same table every other category reads (LESSON-484). A user who
+    /// binds `reflex` remotely on purpose gets what they asked for, scoped and
+    /// metered by the shared seam like any other duty.
+    fn title_route(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        let route = if self.session_taint.is_tainted(session_id) {
+            router.resolve_local_pin(taint_pin_reason("the `title` duty"))
+        } else {
+            router.resolve(Category::Title)
+        };
+        self.resolve_duty(TITLE_DUTY, &route, config, events, session_id, local_engine)
+    }
+
+    /// Resolve the `compact` category for this turn (REQ-561 TASK-063).
+    ///
+    /// The same two layers, in the same order, for the same reasons as
+    /// [`Self::digest_route`] — session taint first, then the one resolver — and
+    /// the same reason for existing separately at all: the line naming the
+    /// category is what [`crate::call_sites`]'s derived-marker test reads out of
+    /// the daemon's own source, so it cannot be folded into a helper taking a
+    /// category *variable* without making that scan blind (ADR-3).
+    ///
+    /// `compact` is a `scan` duty, so it inherits whatever `scan` is bound to and
+    /// sends the **conversation itself** there — the widest content class of the
+    /// five, and the one BR-11's disclosure exists for. What holds the line is
+    /// BR-7's scoping at the egress choke point: the conversation's own merged
+    /// provenance, so a session that read a `local-only` file compacts locally or
+    /// not at all, while the turn proceeds either way.
+    fn compact_route(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        let route = if self.session_taint.is_tainted(session_id) {
+            router.resolve_local_pin(taint_pin_reason("the `compact` duty"))
+        } else {
+            router.resolve(Category::Compact)
+        };
+        self.resolve_duty(
+            COMPACT_DUTY,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
+    }
+
+    /// Name this session after `prompt`, at most once for its whole life
+    /// (REQ-561 BR-9a, TASK-062).
+    ///
+    /// Unlike `triage` and `shell` this duty is not owned by a tool — a session is
+    /// named because it *is* a session — so it hangs here, on the daemon's own
+    /// prompt-turn entry point, which is the one place that knows a session both
+    /// exists and has now been asked for something.
+    ///
+    /// ## Three gates, in the order that makes each one cheap
+    ///
+    /// 1. **Is there anything to name it after** ([`title::worth_titling`],
+    ///    ADR-11). A session opened with `"hi"` declines *without* spending its
+    ///    one attempt, so the turn that actually asks for something still gets a
+    ///    name. This gate comes first because it costs a length comparison.
+    /// 2. **Has this session already had its attempt**
+    ///    ([`SessionRegistry::claim_title`]). The claim is taken **before** the
+    ///    call, not after it succeeds — see that method for why a guard keyed on
+    ///    `title.is_none()` alone turns a failing duty into a per-turn model call.
+    /// 3. **Did the title land** ([`SessionRegistry::set_title`], BR-9). Only a
+    ///    title that was actually written is announced, so `session_titled`
+    ///    carries at most one naming per session (AC-15).
+    ///
+    /// ## Failure is silence on the wire, never a failed turn (BR-3)
+    ///
+    /// Every way this can fail — an unroutable `reflex` binding, no local engine,
+    /// an engine error, an answer with no title in it — leaves the session with
+    /// **no** title and the turn entirely unaffected. That is not a degraded mode
+    /// to be repaired later: it is the state every session was in before this
+    /// REQ. This function therefore returns nothing; there is no outcome a caller
+    /// could act on that would be better than proceeding with the turn.
+    ///
+    /// The provenance handed to the duty is [`Provenance::empty`]: the content
+    /// being sent is the user's own typed request, which was derived from no file
+    /// (LESSON-432 — the call site is what knows where its content came from).
+    ///
+    /// ## The naming is **detached**; the turn never waits on it (REQ-561 verify)
+    ///
+    /// Gates 1 and 2 are synchronous and stay on the caller's thread — they are a
+    /// length comparison and one uncontended mutex — and so is building the
+    /// route, which needs the `router` and `config` the caller is holding. The
+    /// *model call* is spawned and this function returns immediately.
+    ///
+    /// Awaiting it here made the user wait for a complete local inference before
+    /// their turn even started, on the first substantive prompt of every session.
+    /// The position is still right, and for the reason it always was: the name is
+    /// derived from the prompt, which is already in hand, so a client can label
+    /// the session the moment the user hits enter rather than a whole answer
+    /// later. That benefit never required *blocking* on it.
+    ///
+    /// Nothing on the turn path reads the result, so there is no ordering to
+    /// preserve: [`SessionRegistry::claim_title`] is already exclusive under the
+    /// registry lock, so the detached task cannot race a second turn into a
+    /// second attempt, and [`SessionRegistry::set_title`] is idempotent-by-guard,
+    /// so it cannot overwrite a name that arrived first.
+    ///
+    /// Returns the spawned task so a test can await it. **Production drops it**:
+    /// a title that has not landed yet is a session with no title, which is BR-3's
+    /// degraded state and costs the turn nothing.
+    fn spawn_title_session(
+        &self,
+        events: &Arc<EventBus>,
+        sessions: &SessionRegistry,
+        router: &Router,
+        config: &Config,
+        session_id: &SessionId,
+        prompt: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !crate::harness::title::worth_titling(prompt) {
+            return None;
+        }
+        if !sessions.claim_title(session_id) {
+            return None;
+        }
+        let local_engine = self.engine.get_with_format();
+        let route = self.title_route(router, config, events, session_id, local_engine.as_ref());
+
+        let events = Arc::clone(events);
+        let sessions = sessions.clone();
+        let session_id = session_id.clone();
+        let prompt = prompt.to_owned();
+        Some(tokio::spawn(async move {
+            let Ok(title) =
+                crate::harness::title::name_session(&route, &prompt, &Provenance::empty()).await
+            else {
+                return;
+            };
+            if sessions.set_title(&session_id, &title) {
+                // ADR-6's amendment: `SessionTitled` carries no `session_id` of
+                // its own — `Event` is internally tagged and flattened into the
+                // envelope, which already has one. So the envelope MUST be scoped
+                // here, or the event reaches the wire naming no session and
+                // nobody can attribute it.
+                events.publish(
+                    Some(session_id),
+                    Event::SessionTitled(SessionTitled { title }),
+                );
+            }
+        }))
+    }
+
+    /// Turn a resolved [`Route`](crate::router::Route) into the [`DutyRoute`]
+    /// that serves `duty` — the shared half of every duty resolver (REQ-561 BR-6).
+    ///
+    /// The per-duty resolvers differ only in which category they name; from the
+    /// `Route` onward, locality, provider construction, egress wiring, the cost
+    /// meter and every failure sentence are one implementation. Adding a duty
+    /// adds a four-line resolver, not a copy of this.
+    ///
+    /// ## `route_decided` is *attached* here and *published* on use (BR-2)
+    ///
+    /// This is the one place that holds the `Route`, so this is where the event
+    /// payload is projected off it — but publishing waits until
+    /// [`DutyRoute::perform`] actually runs the duty. `digest_route` is built
+    /// unconditionally once per turn attempt whether or not any tool result
+    /// crosses the summarization threshold, so emitting here would announce a
+    /// routed model call for every turn that never makes one — and would do it
+    /// five times per turn once the remaining four duties are wired. BR-2 exists
+    /// to make an egress path visible; a path that never fires produced no
+    /// egress.
+    ///
+    /// [`Route::route_decided`](crate::router::Route::route_decided) self-guards
+    /// on the other side: it yields nothing when no provider was selected, so an
+    /// unroutable duty carries no announcement at all.
+    ///
+    /// ## Every unresolvable outcome carries a reason
+    ///
+    /// Never a bare `None`: the duty guards an invariant, so its caller must be
+    /// able to say why it fell back to degraded means (LESSON-447). Where the
+    /// sentence exists already — the resolver's — it is carried verbatim rather
+    /// than re-authored (BR-6). Note what is *not* here: a credential that will
+    /// not resolve fails the **turn** on the turn path (a config error the user
+    /// must fix), but only the **duty** here — a duty is never fatal, and the
+    /// failure is reported on the duty's own outcome instead.
+    fn resolve_duty(
+        &self,
+        duty: DutyKind,
+        route: &crate::router::Route,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        self.build_duty_route(duty, route, config, events, session_id, local_engine)
+            .announcing(events, Some(session_id.clone()), route.route_decided())
+    }
+
+    /// Build the [`DutyRoute`] `route` calls for, without announcing anything.
+    ///
+    /// Split from [`Self::resolve_duty`] so the announcement has exactly **one**
+    /// attachment site: this function has five returns, and an
+    /// `.announcing(...)` on each is five chances for the sixth to forget.
+    ///
+    /// A remotely-bound duty builds its provider and transport eagerly, once per
+    /// attempt, whether or not the duty ends up being called. That costs a
+    /// keychain read and an HTTP client per turn against a turn whose floor is one
+    /// model inference, so it is not worth the machinery to defer — but it is
+    /// worth knowing that after REQ-557's migration (`default_provider` set to the
+    /// first remote provider, no `[[tiers]]` rows) an unbound tier inherits that
+    /// provider, so this is the *ordinary* upgraded config and not an exotic one.
+    fn build_duty_route(
+        &self,
+        duty: DutyKind,
+        route: &crate::router::Route,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        // The category's own name, read off the duty rather than spelled again:
+        // two surfaces describing one routing state must not be able to drift.
+        let name = duty.category().as_str();
 
         let Some(provider_id) = route.provider_id.as_ref().map(|p| p.0.clone()) else {
-            return DigestRoute::unresolved(route.reason);
+            return DutyRoute::unresolved(route.reason.clone());
         };
 
         // Locality is decided exactly as the turn path decides it, from the same
@@ -1880,9 +2414,9 @@ impl DaemonRuntime {
 
         if is_local {
             return match local_engine {
-                Some((engine, _format)) => DigestRoute::local(provider_id, Arc::clone(engine)),
-                None => DigestRoute::unresolved(format!(
-                    "The 'digest' category resolves to '{provider_id}', but no local engine is \
+                Some((engine, _format)) => DutyRoute::local(duty, provider_id, Arc::clone(engine)),
+                None => DutyRoute::unresolved(format!(
+                    "The '{name}' category resolves to '{provider_id}', but no local engine is \
                      loaded to serve it yet."
                 )),
             };
@@ -1892,24 +2426,24 @@ impl DaemonRuntime {
         // returning a bare "unavailable" — an unresolvable duty is a
         // configuration fact the user can act on.
         let Some(provider_cfg) = provider_cfg else {
-            return DigestRoute::unresolved(format!(
-                "The 'digest' category resolves to '{provider_id}', which this daemon has no \
+            return DutyRoute::unresolved(format!(
+                "The '{name}' category resolves to '{provider_id}', which this daemon has no \
                  provider entry for, and no local engine is loaded to serve it instead."
             ));
         };
         // REQ-557 BR-1 / BUG-155: no model, no call. A provider id is not a model
         // name and must never stand in for one.
         let Some(model) = route.model.clone() else {
-            return DigestRoute::unresolved(format!(
-                "The 'digest' category resolves to '{provider_id}', which declares no model, so \
+            return DutyRoute::unresolved(format!(
+                "The '{name}' category resolves to '{provider_id}', which declares no model, so \
                  there is nothing to call."
             ));
         };
         let transport = match build_remote_transport(provider_cfg, &self.secret_resolver) {
             Ok(transport) => transport,
             Err(err) => {
-                return DigestRoute::unresolved(format!(
-                    "The 'digest' category resolves to '{provider_id}', whose transport could \
+                return DutyRoute::unresolved(format!(
+                    "The '{name}' category resolves to '{provider_id}', whose transport could \
                      not be built: {err}"
                 ))
             }
@@ -1919,9 +2453,20 @@ impl DaemonRuntime {
         // this daemon's boundaries and this session's cost meter — the same
         // construction the turn path uses, because a duty that egresses through a
         // second, laxer path is the hole BR-1 exists to close.
-        let egress = Egress::new(transport, config.boundaries.clone(), events.clone())
+        //
+        // The sink is the one thing that differs, and it differs because the
+        // *outcome* does: a refused duty is degraded here and never surfaces as
+        // a turn error, so nothing above would ever mark the session. Marking at
+        // the choke point makes the backstop direct rather than dependent on the
+        // refusing content still being in `ctx` when the turn ends.
+        let sink = Arc::new(TaintingPrivacySink {
+            events: events.clone(),
+            taint: Arc::clone(&self.session_taint),
+        });
+        let egress = Egress::new(transport, config.boundaries.clone(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()));
-        DigestRoute::remote(
+        DutyRoute::remote(
+            duty,
             provider_id,
             build_provider(provider_cfg, caps),
             egress,
@@ -3520,7 +4065,7 @@ fn build_provider(provider: &ModelProvider, caps: CapabilityProfile) -> Box<dyn 
 /// merely warming is still a wait, not an error (BUG-152).
 ///
 /// This mirrors what the `digest` duty already does with the same value
-/// (`DigestRoute::unresolved(route.reason)`); before this, the duty path carried
+/// (`DutyRoute::unresolved(route.reason)`); before this, the duty path carried
 /// the resolver's sentence and the *turn* path — the one a user actually reads —
 /// discarded it.
 fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) -> RpcError {
@@ -3575,7 +4120,7 @@ const LOCAL_PROVIDER_ID: &str = "local";
 /// every one of those guarantees resolves to a remote endpoint while its own
 /// sentence says the turn is pinned local: `run_one_attempt` decides locality
 /// from `ProviderKind::Local` and dispatches over HTTP, `digest_route` builds a
-/// `RemoteDigester` for a tainted session, and `resolve(Category::Redact)`
+/// remote duty for a tainted session, and `resolve(Category::Redact)`
 /// hands back a vendor API.
 ///
 /// Two ways the tier can be real, and nothing else counts:
@@ -3866,11 +4411,13 @@ fn tier_route_view(report: &TierReport) -> TierRouteView {
 
 /// One category row of the snapshot, read **off** a [`CategoryResolution`].
 ///
-/// Every field is copied, none is derived: the provider, the tier, which row the
-/// binding came from, and the sentence all belong to the resolver. The one thing
-/// added here is [`CategoryRouteView::reached`], which is a fact about the
-/// daemon's call sites rather than about routing, and comes from
-/// [`crate::call_sites::has_call_site`] (ADR-A).
+/// Every routing field is copied, none is derived: the provider, the tier, which
+/// row the binding came from, and the sentence all belong to the resolver. Two
+/// fields are about the category rather than about its routing:
+/// [`CategoryRouteView::reached`], a fact about the daemon's call sites, from
+/// [`crate::call_sites::has_call_site`] (ADR-A); and
+/// [`CategoryRouteView::content_class`], what the category sends to a model,
+/// from [`ContentClass::for_category`] (REQ-561 BR-11).
 fn category_route_view(resolution: &CategoryResolution) -> CategoryRouteView {
     CategoryRouteView {
         category: to_protocol_category(resolution.category),
@@ -3884,6 +4431,7 @@ fn category_route_view(resolution: &CategoryResolution) -> CategoryRouteView {
             CoreBindingSource::Unbound => BindingSource::Unbound,
         },
         reached: has_call_site(resolution.category),
+        content_class: ContentClass::for_category(to_protocol_category(resolution.category)),
         reason: resolution.reason.clone(),
     }
 }
@@ -4805,7 +5353,7 @@ provider_id = "on-device"
         )));
 
         let out = crate::harness::context::summarize_if_large(
-            &DigestRoute::local("local", Arc::clone(&engine)),
+            &DutyRoute::local(DIGEST_DUTY, "local", Arc::clone(&engine)),
             "read",
             &"word ".repeat(500),
             50,
@@ -4824,6 +5372,100 @@ provider_id = "on-device"
             guard.complete("p", &params, &mut sink).unwrap().text,
             "first reply",
             "the digest consumed a scripted turn"
+        );
+    }
+
+    /// **The same seam, for the `triage` duty** (REQ-561 BR-10, AC-12).
+    ///
+    /// A `grep` returning two or more matches now issues a duty call, and every
+    /// acceptance fixture's `grep` goes through this engine. Without the
+    /// recognition arm that call would eat the next scripted *turn* and shift
+    /// every block after it by one — the failure REQ-558 shipped twice before it
+    /// was caught, which is why the arm lands in the same task as the duty
+    /// rather than in the verification task.
+    ///
+    /// Driven through `rank_matches` rather than against the bare constant,
+    /// because what needs asserting is that the **real duty prompt** is
+    /// recognized after rendering. A prompt edit that left the recognizer
+    /// matching nothing would pass a test written against the constant alone.
+    #[tokio::test]
+    async fn a_triage_duty_is_answered_off_script_and_consumes_no_block() {
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(ScriptedFileEngine::from_script(
+            "m",
+            "first reply\n---\nsecond reply",
+        )));
+
+        let matches = [
+            "src/a.rs:1: let needle = 1;",
+            "src/b.rs:2: let needle = 2;",
+            "src/c.rs:3: let needle = 3;",
+        ];
+        let order = crate::harness::triage::rank_matches(
+            &DutyRoute::local(TRIAGE_DUTY, "local", Arc::clone(&engine)),
+            "find where the needle is defined",
+            "grep for the literal `needle`",
+            &matches,
+            &crate::egress::Provenance::empty(),
+        )
+        .await
+        .expect("the stand-in served the duty");
+
+        // The identity ranking: every match, in the order it was offered. A
+        // stand-in cannot judge relevance, so the one answer it can give without
+        // silently reordering a fixture's `grep` output is "no change".
+        assert_eq!(order, vec![0, 1, 2]);
+
+        // And the turn sequence is untouched: turn 1 still gets block 1.
+        let params = GenParams::default();
+        let mut sink = |_: &str| true;
+        let guard = engine.lock().expect("engine mutex");
+        assert_eq!(
+            guard.complete("p", &params, &mut sink).unwrap().text,
+            "first reply",
+            "the triage consumed a scripted turn"
+        );
+    }
+
+    /// **The same seam, for the `shell` duty** (REQ-561 BR-10, AC-12).
+    ///
+    /// A failing command — or one that overran the 8,000-character cap — now
+    /// issues a duty call, and a failing command is a thing acceptance fixtures
+    /// run *deliberately*: the verify-after-edit path exists to exercise it.
+    /// Without the recognition arm that call would eat the next scripted **turn**
+    /// and shift every block after it by one, which is the failure REQ-558
+    /// shipped twice before it was caught — hence the arm landing in the same
+    /// task as the duty rather than in the verification task.
+    ///
+    /// Driven through `interpret_output` rather than against the bare constant,
+    /// because what needs asserting is that the **real duty prompt** is
+    /// recognized after rendering. A prompt edit that left the recognizer
+    /// matching nothing would pass a test written against the constant alone.
+    #[tokio::test]
+    async fn a_shell_duty_is_answered_off_script_and_consumes_no_block() {
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(ScriptedFileEngine::from_script(
+            "m",
+            "first reply\n---\nsecond reply",
+        )));
+
+        let said = crate::harness::shell_duty::interpret_output(
+            &DutyRoute::local(SHELL_DUTY, "local", Arc::clone(&engine)),
+            "cargo test",
+            "$ cargo test\n(exit 101)\n[stderr] error[E0308]: mismatched types\n",
+            &crate::egress::Provenance::unknown(),
+        )
+        .await
+        .expect("the stand-in served the duty");
+
+        assert_eq!(said, SCRIPTED_SHELL_INTERPRETATION);
+
+        // And the turn sequence is untouched: turn 1 still gets block 1.
+        let params = GenParams::default();
+        let mut sink = |_: &str| true;
+        let guard = engine.lock().expect("engine mutex");
+        assert_eq!(
+            guard.complete("p", &params, &mut sink).unwrap().text,
+            "first reply",
+            "the shell interpretation consumed a scripted turn"
         );
     }
 
@@ -5232,7 +5874,7 @@ provider_id = "on-device"
 
     /// ADR-A + AC-12, on the projection a client actually reads.
     ///
-    /// The snapshot carries one row per category — all eleven — with the five
+    /// The snapshot carries one row per category — all eleven — with the ones
     /// that no model call reaches marked, and the BR-9 judgment default beside
     /// them. Both are things `teton policy show` renders and nothing else
     /// computes.
@@ -5252,7 +5894,7 @@ provider_id = "on-device"
             .collect();
         assert_eq!(
             unreached,
-            vec!["redact", "title", "compact", "triage", "shell"],
+            vec!["redact"],
             "the marker in the projection must agree with `call_sites::has_call_site`"
         );
         for row in &snap.routing {
@@ -5537,7 +6179,7 @@ provider_id = "on-device"
         // engine or the provider entry. The pin sentence it passes to
         // `resolve_local_pin` therefore reaches no user today — worth knowing,
         // and the reason this half is pinned at the helper only. Making it
-        // observable means carrying the reason onto `DigestRoute::Serves`,
+        // observable means carrying the reason onto `DutyRoute::Serves`,
         // which is a change to the type rather than to this test.
     }
 
@@ -6866,7 +7508,56 @@ provider_id = "on-device"
         use super::*;
         use crate::classify::test_support::CountingEngine;
         use teton_core::category::JudgmentCategory;
+        use teton_protocol::events::{Event as ProtoEvent, RouteDecided};
         use teton_protocol::Category as ProtoCategory;
+
+        /// Every `route_decided` this subscription saw, oldest first.
+        ///
+        /// Drained with `try_recv` rather than awaited under a timeout:
+        /// `EventBus::publish` is synchronous, so once the call under test has
+        /// returned, everything it published is already queued (LESSON-450 — a
+        /// wall-clock poll is the assertion shape that goes flaky first).
+        ///
+        /// One helper for all five duties, returning the **whole** event rather
+        /// than a projection of it. A per-duty helper that extracted only the
+        /// category was what let `compact` claim AC-2 while asserting a quarter
+        /// of it: AC-2 asks for the category, the tier, the provider *and* a
+        /// reason, and a helper that cannot see three of the four cannot be
+        /// asked about them.
+        fn announced(sub: &mut crate::broadcast::Subscription) -> Vec<RouteDecided> {
+            std::iter::from_fn(|| sub.try_recv())
+                .filter_map(|env| match env.event {
+                    ProtoEvent::RouteDecided(rd) => Some(rd),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Assert `decided` is the one `route_decided` a performed duty
+        /// announces, and that it names all four things AC-2 asks for.
+        ///
+        /// Shared so that every duty is held to the same four, rather than to
+        /// whichever subset its own test happened to spell out.
+        fn assert_announced_route(
+            decided: &[RouteDecided],
+            category: ProtoCategory,
+            tier: ProtoTier,
+            provider_id: &str,
+        ) {
+            assert_eq!(
+                decided.len(),
+                1,
+                "one performed duty announces exactly one route: {decided:?}"
+            );
+            let rd = &decided[0];
+            assert_eq!(rd.category, Some(category), "{rd:?}");
+            assert_eq!(rd.tier, Some(tier), "{rd:?}");
+            assert_eq!(rd.provider_id.0, provider_id, "{rd:?}");
+            assert!(
+                !rd.reason.is_empty(),
+                "a routing decision with no reason explains nothing: {rd:?}"
+            );
+        }
 
         fn remote(id: &str, model: &str) -> ModelProvider {
             ModelProvider {
@@ -6926,6 +7617,116 @@ provider_id = "on-device"
         fn router_for(runtime: &DaemonRuntime) -> Router {
             let config = runtime.config.lock().expect("config mutex").clone();
             build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+        }
+
+        // -- a refused DUTY marks the session, directly (REQ-544 C-2) --------
+
+        /// **The choke point marks the session it refused, not just the turn.**
+        ///
+        /// A refused duty never becomes a turn error, so
+        /// [`DaemonRuntime::run_prompt_turn`]'s own `is_privacy_blocked` arm
+        /// cannot see it: the seam turns the refusal into a sentence, the call
+        /// site degrades by its own means, and the turn completes. Today the
+        /// session is tainted anyway — but only *incidentally*, because the
+        /// content that got the duty refused is still in `ctx` when the turn
+        /// ends and `context_is_sensitive` reads it there. That cover depends on
+        /// truncation and compaction not having dropped it, which both are
+        /// entitled to do. This makes it direct.
+        ///
+        /// No byte leaves in either leg: the refusal happens before the
+        /// transport is reached, which is the whole point of the choke point.
+        #[tokio::test]
+        async fn a_duty_refused_at_the_choke_point_taints_its_session() {
+            let engine = CountingEngine::answering("Retry the download client");
+            let mut config = config();
+            // `title` is `reflex` and never inherits a tier, so an explicit
+            // category override is the one way a user binds it off the machine —
+            // and it is what makes this route remote enough to be refusable.
+            config.categories.push(CategoryOverride {
+                name: ConfigurableCategory::Title,
+                provider_id: "frontier".to_owned(),
+                fallback_id: None,
+            });
+            config.boundaries = vec![PrivacyBoundary {
+                path_glob: "secrets/**".to_owned(),
+                mode: BoundaryMode::LocalOnly,
+            }];
+            let runtime = runtime(config.clone(), &engine, true);
+            let router = router_for(&runtime);
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+
+            let blocked = SessionId::from("blocked");
+            let bystander = SessionId::from("bystander");
+            let slot = runtime.engine.get_with_format();
+            let route = runtime.title_route(&router, &config, &bus, &blocked, slot.as_ref());
+
+            // Non-vacuity, both halves: the route really is remote — so there
+            // really was a transport a byte could have left through — and the
+            // session really was clean before the duty ran.
+            assert_eq!(
+                route.provider(),
+                Some("frontier"),
+                "a local route has no choke point to be refused at"
+            );
+            assert!(!runtime.session_taint.is_tainted(&blocked));
+
+            let err = route
+                .perform(
+                    "name this",
+                    &crate::egress::Provenance::tainted_by("secrets/prod.env"),
+                )
+                .await
+                .expect_err("boundary content must not be titled remotely");
+            assert!(err.contains("privacy boundary"), "{err}");
+
+            assert!(
+                runtime.session_taint.is_tainted(&blocked),
+                "a duty refused at the choke point left its session unpinned, so the \
+                 next turn is free to reroute remotely"
+            );
+            assert!(
+                !runtime.session_taint.is_tainted(&bystander),
+                "and it taints only the session it happened in"
+            );
+            // The event is still published — marking is in addition to
+            // announcing, never instead of it.
+            assert!(
+                std::iter::from_fn(|| sub.try_recv())
+                    .any(|env| matches!(env.event, Event::PrivacyBlock(_))),
+                "the authoritative `privacy_block` stopped being emitted"
+            );
+        }
+
+        /// The other half of the same rule, stated at the sink because it is the
+        /// one case the wiring test above cannot reach: a block the choke point
+        /// could not attribute to a session pins nothing, rather than pinning
+        /// something arbitrary.
+        #[test]
+        fn an_unattributable_privacy_block_pins_no_session() {
+            let taint = Arc::new(SessionTaint::new());
+            let sink = TaintingPrivacySink {
+                events: Arc::new(EventBus::new()),
+                taint: Arc::clone(&taint),
+            };
+            let block = teton_protocol::events::PrivacyBlock {
+                path: "secrets/prod.env".to_owned(),
+                provider_id: ProviderId::from("frontier"),
+                action: teton_protocol::events::PrivacyAction::ReroutedToLocal,
+            };
+
+            crate::egress::PrivacyEventSink::privacy_block(&sink, None, block.clone());
+            crate::egress::PrivacyEventSink::privacy_block(
+                &sink,
+                Some(SessionId::from("s")),
+                block,
+            );
+
+            assert!(
+                taint.is_tainted(&SessionId::from("s")),
+                "non-vacuity: a scoped block really does pin"
+            );
+            assert!(!taint.is_tainted(&SessionId::from("somebody-else")));
         }
 
         /// **AC-1, the direct regression, end to end through the daemon's own
@@ -7320,7 +8121,7 @@ provider_id = "on-device"
 
             /// The `digest` route the turn path builds, from the same runtime
             /// state and through the same router.
-            fn digest_for(runtime: &DaemonRuntime, session: &SessionId) -> DigestRoute {
+            fn digest_for(runtime: &DaemonRuntime, session: &SessionId) -> DutyRoute {
                 let config = runtime.config.lock().expect("config mutex").clone();
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
@@ -7421,7 +8222,7 @@ provider_id = "on-device"
                 let route = digest_for(&runtime, &SessionId::from("sess"));
 
                 assert_eq!(route.provider(), None);
-                let DigestRoute::Unresolved { reason } = route else {
+                let DutyRoute::Unresolved { reason } = route else {
                     panic!("an unroutable binding must not resolve to a provider");
                 };
                 assert!(reason.contains("digest"), "{reason}");
@@ -7441,7 +8242,7 @@ provider_id = "on-device"
                 let route = digest_for(&runtime, &SessionId::from("sess"));
 
                 assert_eq!(route.provider(), None);
-                let DigestRoute::Unresolved { reason } = route else {
+                let DutyRoute::Unresolved { reason } = route else {
                     panic!("there is nothing to serve the duty");
                 };
                 // Byte-for-byte the resolver's own sentence for this state.
@@ -7451,6 +8252,1346 @@ provider_id = "on-device"
                         .resolve(Category::Digest);
                 assert_eq!(reason, resolved.reason);
                 assert!(reason.contains("'digest' cannot be routed"), "{reason}");
+            }
+
+            // ---------------------------------------------------------------
+            // REQ-561 BR-2: `route_decided` for the duty, and *when* it fires.
+            //
+            // These two are a pair (LESSON-485). The positive alone would pass
+            // against an emitter that announced at resolution time; the negative
+            // alone would pass against an emitter that never announced at all.
+            // Only together do they pin "announced iff the duty actually ran".
+            // ---------------------------------------------------------------
+
+            /// The `digest` route the turn path builds, on a bus the test can
+            /// watch. `config()` leaves `scan` unbound, so `digest` inherits the
+            /// **local** tier — which is what makes performing it in-process
+            /// possible without a network call.
+            fn watched_digest(
+                runtime: &DaemonRuntime,
+                bus: &Arc<EventBus>,
+                session: &SessionId,
+            ) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.digest_route(&router, &config, bus, session, slot.as_ref())
+            }
+
+            /// **REQ-561 BR-2, the positive half.** A `digest` that actually runs
+            /// announces where it went, on the same `route_decided` surface a
+            /// turn uses: the category, the tier it resolved through, the
+            /// provider serving it, and a non-empty reason.
+            ///
+            /// REQ-558 routed the duty and told nobody. That is the one category
+            /// whose whole premise is that it resolves *independently of the
+            /// turn* — so a user watching only the turn's `route_decided` saw a
+            /// frontier `think` provider while their file bodies went to whatever
+            /// `scan` was bound to, with no event saying so.
+            ///
+            /// Deliberately asserted off the **bus**, not off the returned route:
+            /// "the user can see it" is a claim about a published event, and a
+            /// duty that ran correctly while announcing nothing is exactly the
+            /// state this test exists to fail on.
+            #[tokio::test]
+            async fn a_performed_digest_announces_its_route() {
+                let engine = CountingEngine::answering("CONDENSED");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+
+                let route = watched_digest(&runtime, &bus, &SessionId::from("sess"));
+                assert_eq!(
+                    route.provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "the duty must resolve, or this test proves nothing"
+                );
+
+                let out = route
+                    .perform("Summarize this.", &crate::egress::Provenance::empty())
+                    .await;
+                assert_eq!(out.as_deref(), Ok("CONDENSED"), "the duty really ran");
+
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Digest,
+                    ProtoTier::Scan,
+                    LOCAL_PROVIDER_ID,
+                );
+            }
+
+            /// **REQ-561 BR-2, the negative half — and the whole point of it.**
+            ///
+            /// `digest_route` is built unconditionally once per turn attempt,
+            /// whether or not any tool result crosses the summarization
+            /// threshold. Announcing at *resolution* would therefore put a
+            /// `route_decided` on the wire for a routed model call that never
+            /// happened, on every turn — and five of them per turn once the
+            /// remaining four duties are wired. BR-2 exists to make an egress
+            /// path visible, and a path that never fires produced no egress.
+            ///
+            /// This is the assertion that fails if emission moves back to the
+            /// resolver. Its non-vacuity is the test above, which shows this same
+            /// route *does* announce the moment it is performed.
+            #[test]
+            fn a_digest_that_never_runs_announces_nothing() {
+                let engine = CountingEngine::answering("CONDENSED");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+
+                let route = watched_digest(&runtime, &bus, &SessionId::from("sess"));
+
+                // The discriminating state is reachable: this route resolved to a
+                // provider and carries an announcement it is holding back. A
+                // fixture that could not resolve would pass this vacuously.
+                assert_eq!(route.provider(), Some(LOCAL_PROVIDER_ID));
+                assert_eq!(
+                    engine.calls(),
+                    0,
+                    "resolving a duty must not call the model"
+                );
+
+                let decided = announced(&mut sub);
+                assert!(
+                    decided.is_empty(),
+                    "resolving a duty is not performing one; announcing here would \
+                     report a routed model call that never happened: {decided:?}"
+                );
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // The `triage` duty's own dispatch (REQ-561 TASK-060): `triage_route`.
+        //
+        // Same two layers as `digest`, asserted separately because they are two
+        // decisions: a session may well digest locally and triage remotely, and
+        // a shared resolver that quietly collapsed them would pass `digest`'s
+        // tests while breaking this one.
+        // -------------------------------------------------------------------
+        mod triage {
+            use super::*;
+            use teton_core::category::{CategoryOverride, ConfigurableCategory};
+
+            /// `config()` plus a `scan` binding — the tier `triage` inherits.
+            fn scan_bound_to(provider_id: &str) -> Config {
+                let mut config = config();
+                config.tiers.push(TierBinding {
+                    tier: Tier::Scan,
+                    provider_id: provider_id.to_owned(),
+                    fallback_id: None,
+                });
+                config
+            }
+
+            /// The `triage` route the turn path builds, from the same runtime
+            /// state and through the same router.
+            fn triage_for(runtime: &DaemonRuntime, session: &SessionId) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.triage_route(
+                    &router,
+                    &config,
+                    &Arc::new(EventBus::new()),
+                    session,
+                    slot.as_ref(),
+                )
+            }
+
+            /// **BR-1.** `triage` is a `scan` duty, so binding `scan` sends the
+            /// ranking there — grep match text, which is file content, goes to
+            /// whatever that tier names. The configured table is read for this
+            /// call as for any other.
+            #[test]
+            fn triage_inherits_the_scan_tier_binding() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(scan_bound_to("cheap"), &engine, true);
+                assert_eq!(
+                    triage_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some("cheap")
+                );
+            }
+
+            /// A per-category override beats the tier here as everywhere.
+            #[test]
+            fn a_triage_override_beats_the_scan_binding() {
+                let engine = CountingEngine::answering("design");
+                let mut config = scan_bound_to("cheap");
+                config.categories.push(CategoryOverride {
+                    name: ConfigurableCategory::Triage,
+                    provider_id: "frontier".to_owned(),
+                    fallback_id: None,
+                });
+                let runtime = runtime(config, &engine, true);
+                assert_eq!(
+                    triage_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some("frontier")
+                );
+            }
+
+            /// With nothing bound to `scan`, `triage` inherits the local tier —
+            /// so a user who configures nothing gets ranking without egress.
+            #[test]
+            fn an_unbound_scan_tier_triages_locally() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(config(), &engine, true);
+                assert_eq!(
+                    triage_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some(LOCAL_PROVIDER_ID)
+                );
+            }
+
+            /// **BR-5 / LESSON-432.** Session taint overrides the category
+            /// binding. A tainted session with `scan` bound remotely still ranks
+            /// locally — and `triage` is the duty where that matters most
+            /// concretely, because the content it sends is *lines out of the
+            /// files that tainted the session in the first place*.
+            ///
+            /// The mutation-sensitive one: deleting the taint check in
+            /// `triage_route` turns this red on its own, at its own layer.
+            #[test]
+            fn a_tainted_session_triages_on_the_local_tier() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(scan_bound_to("frontier"), &engine, true);
+                let session = SessionId::from("tainted");
+
+                // Non-vacuity: the same config, untainted, genuinely goes remote.
+                assert_eq!(
+                    triage_for(&runtime, &SessionId::from("clean")).provider(),
+                    Some("frontier")
+                );
+
+                runtime.session_taint.mark(&session);
+                assert_eq!(
+                    triage_for(&runtime, &session).provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "a tainted session must rank locally (BR-5)"
+                );
+            }
+
+            /// An unroutable binding is a *reason*, not a silent `None`: the
+            /// caller has to be able to say why the matches came back unranked
+            /// (BR-3, LESSON-447).
+            #[test]
+            fn an_unroutable_scan_binding_leaves_triage_unresolved_with_a_reason() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(scan_bound_to("ghost"), &engine, true);
+
+                let route = triage_for(&runtime, &SessionId::from("sess"));
+
+                assert_eq!(route.provider(), None);
+                let DutyRoute::Unresolved { reason } = route else {
+                    panic!("an unroutable binding must not resolve to a provider");
+                };
+                assert!(reason.contains("triage"), "{reason}");
+                assert!(reason.contains("ghost"), "{reason}");
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // The `shell` duty's own dispatch (REQ-561 TASK-061): `shell_route`.
+        //
+        // `shell` is a **build** duty where `triage` is a `scan` one, so these
+        // are not `triage`'s tests with a word changed: a config that sends
+        // ranking to a cheap model and interpretation to a stronger one is the
+        // ordinary case, and a resolver that quietly collapsed the two would
+        // pass `triage`'s tests while breaking these.
+        // -------------------------------------------------------------------
+        mod shell {
+            use super::*;
+            use teton_core::category::{CategoryOverride, ConfigurableCategory};
+
+            /// The `shell` route the turn path builds, from the same runtime
+            /// state and through the same router.
+            fn shell_for(runtime: &DaemonRuntime, session: &SessionId) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.shell_route(
+                    &router,
+                    &config,
+                    &Arc::new(EventBus::new()),
+                    session,
+                    slot.as_ref(),
+                )
+            }
+
+            /// **BR-1.** `shell` is a `build` duty, so it follows the `build`
+            /// binding — `config()`'s "cheap" — and not `scan`'s. Asserted
+            /// against the tier `triage` uses, so a resolver that named the
+            /// wrong category would be caught rather than look plausible.
+            #[test]
+            fn shell_inherits_the_build_tier_binding() {
+                let engine = CountingEngine::answering("design");
+                let mut config = config();
+                config.tiers.push(TierBinding {
+                    tier: Tier::Scan,
+                    provider_id: "frontier".to_owned(),
+                    fallback_id: None,
+                });
+                let runtime = runtime(config, &engine, true);
+                assert_eq!(
+                    shell_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some("cheap"),
+                    "`shell` must follow `build`, not the `scan` tier beside it"
+                );
+            }
+
+            /// A per-category override beats the tier here as everywhere.
+            #[test]
+            fn a_shell_override_beats_the_build_binding() {
+                let engine = CountingEngine::answering("design");
+                let mut config = config();
+                config.categories.push(CategoryOverride {
+                    name: ConfigurableCategory::Shell,
+                    provider_id: "frontier".to_owned(),
+                    fallback_id: None,
+                });
+                let runtime = runtime(config, &engine, true);
+                assert_eq!(
+                    shell_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some("frontier")
+                );
+            }
+
+            /// **BR-5 / LESSON-432.** Session taint overrides the category
+            /// binding. A tainted session with `build` bound remotely still
+            /// interprets locally.
+            ///
+            /// The mutation-sensitive one: deleting the taint check in
+            /// `shell_route` turns this red on its own, at its own layer. Note
+            /// that the egress choke point would *also* refuse this content —
+            /// `shell` output is unattributable — but a guarantee that only holds
+            /// because a second mechanism happens to catch it is not a guarantee
+            /// stated where the decision is made (LESSON-484).
+            #[test]
+            fn a_tainted_session_interprets_on_the_local_tier() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(config(), &engine, true);
+                let session = SessionId::from("tainted");
+
+                // Non-vacuity: the same config, untainted, genuinely goes remote.
+                assert_eq!(
+                    shell_for(&runtime, &SessionId::from("clean")).provider(),
+                    Some("cheap")
+                );
+
+                runtime.session_taint.mark(&session);
+                assert_eq!(
+                    shell_for(&runtime, &session).provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "a tainted session must interpret locally (BR-5)"
+                );
+            }
+
+            /// An unroutable binding is a *reason*, not a silent `None`: the
+            /// caller has to be able to say why the output came back
+            /// uninterpreted (BR-3, LESSON-447).
+            #[test]
+            fn an_unroutable_build_binding_leaves_shell_unresolved_with_a_reason() {
+                let engine = CountingEngine::answering("design");
+                let mut config = config();
+                config.tiers.retain(|t| t.tier != Tier::Build);
+                config.tiers.push(TierBinding {
+                    tier: Tier::Build,
+                    provider_id: "ghost".to_owned(),
+                    fallback_id: None,
+                });
+                let runtime = runtime(config, &engine, true);
+
+                let route = shell_for(&runtime, &SessionId::from("sess"));
+
+                assert_eq!(route.provider(), None);
+                let DutyRoute::Unresolved { reason } = route else {
+                    panic!("an unroutable binding must not resolve to a provider");
+                };
+                assert!(reason.contains("shell"), "{reason}");
+                assert!(reason.contains("ghost"), "{reason}");
+            }
+
+            // ---------------------------------------------------------------
+            // REQ-561 AC-2 / BR-2: `route_decided` for the duty, and *when* it
+            // fires.
+            //
+            // Missing until now. The seam's publish arm was mutated away and
+            // the whole workspace was run: five tests went red, and not one of
+            // them was `shell`'s — the category's routing was pinned only by
+            // `.provider()` on the resolved route, which says where the duty
+            // *would* go and nothing about what reached the wire. The five
+            // `*_route` resolvers differ by one `Category::` literal, so that
+            // gap is one copy-paste away from a `shell` duty announcing itself
+            // as something else with every test still green.
+            // ---------------------------------------------------------------
+
+            /// The `shell` route the turn path builds, on a bus the test can
+            /// watch. The `build` binding is dropped by the caller so `shell`
+            /// inherits the **local** tier, which is what makes performing it
+            /// in-process possible without a network call.
+            fn watched_shell(
+                runtime: &DaemonRuntime,
+                bus: &Arc<EventBus>,
+                session: &SessionId,
+            ) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.shell_route(&router, &config, bus, session, slot.as_ref())
+            }
+
+            /// `ShellTool::run` then `ShellTool::refine` over `route`, in `root`.
+            ///
+            /// Driven through the real tool rather than a hand-built outcome
+            /// because the negative half's whole claim is that *the call site*
+            /// declined — `worth_interpreting` reading a status and a length off
+            /// a result `run` produced. A fixture that hand-wrote that result
+            /// would be asserting against its author's belief about the trigger.
+            async fn run_and_refine(
+                root: &std::path::Path,
+                command: &str,
+                route: &DutyRoute,
+            ) -> crate::harness::RefinedOutcome {
+                use crate::harness::tools::{ShellTool, Tool, ToolContext};
+                use crate::harness::ToolDuties;
+
+                let args = serde_json::json!({ "command": command });
+                let raw = ShellTool::default().run(&ToolContext::new(root), &args);
+                ShellTool::default()
+                    .refine(
+                        &args,
+                        "make the tests pass",
+                        &ToolDuties {
+                            // `shell` never reaches it.
+                            triage: &DutyRoute::unresolved("no triage route in this test"),
+                            shell: route,
+                        },
+                        raw,
+                    )
+                    .await
+            }
+
+            /// **AC-2 / BR-2 for `shell`, both halves against one route**
+            /// (LESSON-485).
+            ///
+            /// The command's exit status is the only difference between the two
+            /// calls. The failing one reaches the duty, so the route announces;
+            /// the succeeding one — a short, successful command, which is most
+            /// of what a session runs — returns before the duty is touched, so
+            /// it announces nothing. Split apart, the negative half would be
+            /// satisfied by an emitter that never emits and the positive by one
+            /// that emits at resolution; only the pair pins "announced iff
+            /// performed".
+            ///
+            /// The route comes from `shell_route` rather than from a
+            /// hand-assembled announcement, so the four fields asserted below
+            /// are the **resolver's** answers. That is what makes a category
+            /// swap inside `shell_route` fail here rather than only showing up
+            /// as a different provider in a tier-binding test.
+            #[tokio::test]
+            async fn a_shell_duty_announces_its_route_only_when_the_output_needs_reading() {
+                let engine = CountingEngine::answering("The check failed: the file is missing.");
+                // `config()` binds `build` remotely and `shell` is a `build`
+                // duty; dropping the binding leaves it on the local tier, which
+                // is what lets the duty actually run here. Where it routes is
+                // `shell_inherits_the_build_tier_binding`'s claim, not this
+                // one's.
+                let mut config = config();
+                config.tiers.retain(|t| t.tier != Tier::Build);
+                let runtime = runtime(config, &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+
+                let route = watched_shell(&runtime, &bus, &SessionId::from("sess"));
+                assert_eq!(
+                    route.provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "the duty must resolve, or this test proves nothing"
+                );
+
+                let root = scratch_dir("shell-announce");
+
+                // Declined: exit 0, output nowhere near the cap. No duty, and so
+                // no routed model call to announce.
+                let refined = run_and_refine(&root, "echo hi", &route).await;
+                assert_eq!(refined.duty_error, None);
+                assert_eq!(
+                    engine.calls(),
+                    0,
+                    "a short successful command must buy no model call"
+                );
+                assert!(
+                    announced(&mut sub).is_empty(),
+                    "a duty that never ran announces a routed model call that never happened"
+                );
+
+                // Performed: the command failed, so reading it unaided is the
+                // hard part.
+                let refined = run_and_refine(&root, "echo hi; exit 3", &route).await;
+                assert_eq!(refined.duty_error, None, "the fixture must reach the duty");
+                assert_eq!(engine.calls(), 1);
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Shell,
+                    ProtoTier::Build,
+                    LOCAL_PROVIDER_ID,
+                );
+
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // The `title` duty's own dispatch and lifecycle (REQ-561 TASK-062).
+        //
+        // `title` is the odd one of the five: it belongs to no tool, it runs on
+        // the `reflex` tier — which never inherits `default_provider` — and it
+        // is the only duty whose "when" is a fact about the *session* rather
+        // than about a tool result. So these cover both halves: where it routes,
+        // and how many times it is allowed to run.
+        //
+        // They drive `title_session`, which is the exact function
+        // `run_prompt_turn` calls, so "once per session" is a property of the
+        // daemon's own path rather than of a test that only called it once.
+        // -------------------------------------------------------------------
+        mod title {
+            use super::*;
+            use crate::harness::title::{TITLE_MIN_REQUEST_BYTES, TITLE_OUTPUT_CONTRACT};
+            use crate::sessions::SessionRegistry;
+            use teton_core::category::{CategoryOverride, ConfigurableCategory};
+            use teton_protocol::events::Event;
+
+            /// A first prompt long enough to be worth naming a session after.
+            const REQUEST: &str = "Add retry-with-backoff to the download client.";
+
+            /// The `title` route the turn path builds, from the same runtime
+            /// state and through the same router.
+            fn title_for(runtime: &DaemonRuntime, session: &SessionId) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.title_route(
+                    &router,
+                    &config,
+                    &Arc::new(EventBus::new()),
+                    session,
+                    slot.as_ref(),
+                )
+            }
+
+            /// A registry holding one freeform session, and its id.
+            fn one_session(reg: &SessionRegistry) -> SessionId {
+                reg.create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session")
+                    .session_id
+            }
+
+            /// Run the daemon's own titling step for `session`, on `bus`, **to
+            /// completion**.
+            ///
+            /// The step itself is detached (REQ-561 verify M1), so the handle is
+            /// awaited here rather than dropped: these tests are about what the
+            /// naming eventually does, and a test that raced the task it started
+            /// would assert on whichever half won. The one test that is about the
+            /// detachment does not use this helper.
+            async fn run_title(
+                runtime: &DaemonRuntime,
+                bus: &Arc<EventBus>,
+                sessions: &SessionRegistry,
+                session: &SessionId,
+                prompt: &str,
+            ) {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                if let Some(handle) =
+                    runtime.spawn_title_session(bus, sessions, &router, &config, session, prompt)
+                {
+                    handle.await.expect("the titling task must not panic");
+                }
+            }
+
+            /// Every `session_titled` title this subscription saw, with the
+            /// session the envelope scoped it to.
+            ///
+            /// Drained with `try_recv` rather than awaited under a timeout:
+            /// `EventBus::publish` is synchronous, so once the call under test
+            /// has returned, everything it published is already queued
+            /// (LESSON-450).
+            fn titles(
+                sub: &mut crate::broadcast::Subscription,
+            ) -> Vec<(Option<SessionId>, String)> {
+                std::iter::from_fn(|| sub.try_recv())
+                    .filter_map(|env| match env.event {
+                        Event::SessionTitled(t) => Some((env.session_id, t.title)),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            // -- where it routes --------------------------------------------
+
+            /// **BR-5, the `reflex` guarantee.** A machine whose turns all go to
+            /// a remote provider still names its sessions **locally**:
+            /// `default_provider` is the ordinary post-REQ-557 upgrade shape, and
+            /// `reflex` is the one tier that does not inherit it.
+            ///
+            /// Non-vacuity is the second half: the very same
+            /// `default_provider` genuinely carries a `build` category remotely,
+            /// so this is the reflex rule holding rather than a config that
+            /// could not reach a provider.
+            #[test]
+            fn title_stays_local_even_when_a_remote_default_provider_is_set() {
+                let engine = CountingEngine::answering("Retry the download client");
+                let mut config = config();
+                config.default_provider = Some("frontier".to_owned());
+                let runtime = runtime(config, &engine, true);
+
+                assert_eq!(
+                    title_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "`reflex` never inherits `default_provider`, so `title` never leaves \
+                     the machine"
+                );
+                assert_eq!(
+                    runtime
+                        .shell_route(
+                            &router_for(&runtime),
+                            &runtime.config.lock().expect("config mutex").clone(),
+                            &Arc::new(EventBus::new()),
+                            &SessionId::from("sess"),
+                            runtime.engine.get_with_format().as_ref(),
+                        )
+                        .provider(),
+                    Some("cheap"),
+                    "non-vacuity: this config really does route other duties off the machine"
+                );
+            }
+
+            /// **BR-5 / LESSON-432.** Session taint overrides the category
+            /// binding for `title` as for every other duty. The mutation-sensitive
+            /// one: deleting the taint check in `title_route` turns this red on
+            /// its own, at its own layer.
+            ///
+            /// Its non-vacuity pair is a per-category override that genuinely
+            /// sends `title` remotely — the one way a user can bind this category
+            /// off the machine — so the pin is doing work here rather than
+            /// agreeing with a route that was local anyway.
+            #[test]
+            fn a_tainted_session_titles_on_the_local_tier() {
+                let engine = CountingEngine::answering("Retry the download client");
+                let mut config = config();
+                config.categories.push(CategoryOverride {
+                    name: ConfigurableCategory::Title,
+                    provider_id: "frontier".to_owned(),
+                    fallback_id: None,
+                });
+                let runtime = runtime(config, &engine, true);
+                let session = SessionId::from("tainted");
+
+                // Non-vacuity: the same config, untainted, genuinely goes remote.
+                assert_eq!(
+                    title_for(&runtime, &SessionId::from("clean")).provider(),
+                    Some("frontier")
+                );
+
+                runtime.session_taint.mark(&session);
+                let route = title_for(&runtime, &session);
+                assert_eq!(
+                    route.provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "a tainted session must name itself locally (BR-5)"
+                );
+            }
+
+            /// A remote-only machine cannot name its sessions, and says why: the
+            /// resolver's own sentence rides onto the route so nothing has to
+            /// invent one (BR-6, LESSON-447).
+            #[test]
+            fn a_machine_with_no_engine_cannot_title_and_says_so() {
+                let runtime = DaemonRuntime::minimal();
+                *runtime.config.lock().expect("config mutex") = config();
+
+                let route = title_for(&runtime, &SessionId::from("sess"));
+
+                assert_eq!(route.provider(), None);
+                let DutyRoute::Unresolved { reason } = route else {
+                    panic!("there is nothing to serve the duty");
+                };
+                assert!(reason.contains("title"), "{reason}");
+            }
+
+            // -- how often it runs ------------------------------------------
+
+            /// **AC-6, by call count.** Five turns of one session, one model
+            /// call. Asserted on the counter rather than on the stored title,
+            /// because "it was requested once" and "it ended up with one title"
+            /// are different claims and only the first one is about cost.
+            ///
+            /// **AC-15, on captured events.** Exactly one `session_titled`
+            /// reaches the wire, it carries a non-empty title, and — ADR-6's
+            /// amendment — the envelope names the session, because the payload
+            /// no longer does.
+            #[tokio::test]
+            async fn a_multi_turn_session_is_titled_once_and_announced_once() {
+                let engine = CountingEngine::answering("Retry the download client");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let sessions = SessionRegistry::new();
+                let session = one_session(&sessions);
+
+                for turn in 1..=5 {
+                    run_title(
+                        &runtime,
+                        &bus,
+                        &sessions,
+                        &session,
+                        &format!("{REQUEST} (turn {turn})"),
+                    )
+                    .await;
+                }
+
+                assert_eq!(
+                    engine.calls(),
+                    1,
+                    "a session is named once, however many turns it runs"
+                );
+                let announced = titles(&mut sub);
+                assert_eq!(
+                    announced.len(),
+                    1,
+                    "exactly one `session_titled` per session: {announced:?}"
+                );
+                let (scoped_to, title) = &announced[0];
+                assert!(!title.is_empty(), "a titled session gets a real name");
+                assert_eq!(title, "Retry the download client");
+                assert_eq!(
+                    scoped_to.as_ref(),
+                    Some(&session),
+                    "the payload carries no session_id (ADR-6 amendment), so the envelope \
+                     MUST — an unscoped event is one nobody can attribute"
+                );
+                assert_eq!(
+                    sessions
+                        .get(&session)
+                        .expect("the session")
+                        .title
+                        .as_deref(),
+                    Some("Retry the download client"),
+                    "the existing `SessionSummary.title` is the field that gets populated"
+                );
+            }
+
+            /// **AC-6 / AC-15, the zero case.** A session that already carries a
+            /// title requests nothing and announces nothing — the guard is keyed
+            /// on the title being absent (BR-9), so a re-derivation cannot happen
+            /// even when the duty is invoked again.
+            #[tokio::test]
+            async fn a_session_that_already_has_a_title_requests_and_announces_nothing() {
+                let engine = CountingEngine::answering("A completely different name");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let sessions = SessionRegistry::new();
+                let session = one_session(&sessions);
+                assert!(sessions.set_title(&session, "The name it already answers to"));
+
+                run_title(&runtime, &bus, &sessions, &session, REQUEST).await;
+
+                assert_eq!(engine.calls(), 0, "a named session buys no call");
+                assert!(titles(&mut sub).is_empty(), "and announces nothing");
+                assert_eq!(
+                    sessions
+                        .get(&session)
+                        .expect("the session")
+                        .title
+                        .as_deref(),
+                    Some("The name it already answers to"),
+                    "BR-9: an existing title is never overwritten"
+                );
+            }
+
+            /// **The cost trap, end to end.** A duty that *fails* must still spend
+            /// the session's one attempt. Two turns, a duty that answers with
+            /// nothing usable, and exactly **one** call — a guard keyed only on
+            /// `title.is_none()` would make this two, and would keep making it one
+            /// more on every turn for the life of the session.
+            ///
+            /// Non-vacuity is built in: the failure is asserted (no title stored,
+            /// nothing announced), so this cannot pass by the duty having
+            /// quietly succeeded.
+            #[tokio::test]
+            async fn a_failed_title_does_not_retry_on_the_next_turn() {
+                // An answer with no title in it: the duty ran, and produced
+                // nothing that could name a session.
+                let engine = CountingEngine::answering("   ");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let sessions = SessionRegistry::new();
+                let session = one_session(&sessions);
+
+                run_title(&runtime, &bus, &sessions, &session, REQUEST).await;
+                run_title(&runtime, &bus, &sessions, &session, REQUEST).await;
+
+                assert_eq!(
+                    engine.calls(),
+                    1,
+                    "a failed title must not become a per-turn model call"
+                );
+                assert_eq!(
+                    sessions.get(&session).expect("the session").title,
+                    None,
+                    "the failure path leaves the session with no title (BR-3)"
+                );
+                assert!(
+                    titles(&mut sub).is_empty(),
+                    "and puts no `session_titled` on the wire"
+                );
+            }
+
+            /// **ADR-11's zero-call case.** An opener with nothing in it to name a
+            /// session by costs nothing — and, crucially, does **not** spend the
+            /// session's one attempt, so the turn that actually asks for something
+            /// still gets a name.
+            ///
+            /// The second half is what makes the threshold a deferral rather than
+            /// a denial, and it is the part a `return` in the wrong place would
+            /// break silently.
+            #[tokio::test]
+            async fn a_request_too_short_to_name_a_session_by_defers_rather_than_declines() {
+                let engine = CountingEngine::answering("Retry the download client");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let sessions = SessionRegistry::new();
+                let session = one_session(&sessions);
+
+                for opener in ["hi", "ok", "  ", "go on"] {
+                    assert!(opener.trim().len() < TITLE_MIN_REQUEST_BYTES);
+                    run_title(&runtime, &bus, &sessions, &session, opener).await;
+                }
+                assert_eq!(engine.calls(), 0, "a bare opener buys no model call");
+                assert!(titles(&mut sub).is_empty());
+
+                // The attempt was deferred, not spent.
+                run_title(&runtime, &bus, &sessions, &session, REQUEST).await;
+                assert_eq!(engine.calls(), 1, "the first real request still names it");
+                assert_eq!(titles(&mut sub).len(), 1);
+            }
+
+            // -- what reaches the wire (AC-2, ADR-8) -------------------------
+            //
+            // Missing until now, and pinned only by accident: mutating the
+            // seam's publish arm away turned `cli_e2e`'s
+            // `an_escaped_line_and_a_plain_line_both_reach_the_model` red — but
+            // only because that test counts `route [title/reflex]` lines while
+            // proving something else entirely. A `title` announcement is a BR-2
+            // guarantee and deserves a test that says so.
+
+            /// **AC-2 / BR-2 for `title`, both halves against one bus**
+            /// (LESSON-485).
+            ///
+            /// The length of the opener is the only difference between the two
+            /// sessions. The real request reaches the duty, so the route
+            /// announces; the bare opener is refused by ADR-11's threshold
+            /// before the route is even built, so it announces nothing.
+            ///
+            /// **What this pair does not show, stated rather than implied.**
+            /// `title_session` builds its route and performs it on the next
+            /// line — there is no state where a `title` route exists and is not
+            /// about to run — so for this duty an emit-at-resolution design and
+            /// ADR-8's emit-on-perform are indistinguishable. The negative half
+            /// here pins "no spurious announcement", not "not at resolution".
+            /// The duties whose routes are built unconditionally per turn
+            /// (`digest`, `shell`, `compact`) are where that distinction is
+            /// discriminated, and their negatives do it.
+            ///
+            /// Driven through `title_session` — the exact function
+            /// `run_prompt_turn` calls — so the four fields asserted below are
+            /// the **resolver's** answers on the daemon's own path, and a
+            /// category swap inside `title_route` fails here.
+            #[tokio::test]
+            async fn a_title_announces_its_route_only_when_it_names_a_session() {
+                let engine = CountingEngine::answering("Retry the download client");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let sessions = SessionRegistry::new();
+
+                // Declined: an opener with nothing in it to name a session by.
+                let bare = one_session(&sessions);
+                run_title(&runtime, &bus, &sessions, &bare, "hi").await;
+                assert_eq!(engine.calls(), 0, "a bare opener buys no model call");
+                assert!(
+                    announced(&mut sub).is_empty(),
+                    "a duty that never ran announces a routed model call that never happened"
+                );
+
+                // Performed. `reflex` is unbound in `config()` and never
+                // inherits `default_provider`, so this resolves locally — which
+                // is both the guarantee and what lets the duty run in-process.
+                let named = one_session(&sessions);
+                run_title(&runtime, &bus, &sessions, &named, REQUEST).await;
+                assert_eq!(engine.calls(), 1, "the real request names the session");
+                assert_eq!(
+                    sessions.get(&named).expect("the session").title.as_deref(),
+                    Some("Retry the download client"),
+                    "non-vacuity: the duty really produced a name"
+                );
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Title,
+                    ProtoTier::Reflex,
+                    LOCAL_PROVIDER_ID,
+                );
+            }
+
+            /// **BR-10 / AC-12.** The `title` duty is answered by the scripted
+            /// stand-in **off-script**, so it consumes no reply block and every
+            /// fixture's turn sequence means what its author wrote.
+            ///
+            /// `title` is the one that would bite hardest: it fires on the first
+            /// turn of every session, so a missing arm would shift the whole
+            /// suite by one rather than one fixture at a time. Asserted by
+            /// running a duty prompt through the engine and then checking the
+            /// script is still on block one.
+            #[test]
+            fn a_title_duty_consumes_no_scripted_block() {
+                let engine = ScriptedFileEngine::from_script("m", "first reply\n---\nsecond reply");
+                let params = GenParams::default();
+
+                let duty = engine
+                    .complete(
+                        &crate::harness::title::title_prompt(REQUEST),
+                        &params,
+                        &mut |_| true,
+                    )
+                    .expect("the stand-in answers the duty");
+                assert_eq!(duty.text.trim(), SCRIPTED_TITLE);
+                assert!(!duty.text.trim().is_empty(), "and with a usable name");
+
+                // The script has not moved: the next *turn* still gets block one.
+                let turn = engine
+                    .complete("an ordinary turn", &params, &mut |_| true)
+                    .expect("a turn");
+                assert_eq!(turn.text.trim(), "first reply");
+            }
+
+            /// **A conversation that quotes a duty's output contract is still a
+            /// turn** (REQ-561 verify).
+            ///
+            /// Recognition used to be `contains` over the whole rendered prompt,
+            /// so a block echoing a contract sentence — a prior compaction
+            /// summary that carried one, a repository file, a `grep` hit on this
+            /// crate — was answered off-script as a duty. That diverts the turn
+            /// *and* leaves the script where it was, so every later reply in the
+            /// fixture is one behind: the failure mode `ScriptedFileEngine`'s own
+            /// docs record having shipped twice, arriving by a different route.
+            ///
+            /// Both contract positions are quoted, because the two anchors are
+            /// different: the five harness duties are recognized in the prompt's
+            /// instruction prefix, and the classifier — which states its contract
+            /// last on purpose — by the contract terminating the prompt.
+            #[test]
+            fn a_quoted_duty_contract_in_a_conversation_does_not_divert_a_turn() {
+                let engine = ScriptedFileEngine::from_script("m", "first reply\n---\nsecond reply");
+                let params = GenParams::default();
+
+                let quoting_turn = format!(
+                    "{filler}\n\n<tool-result tool=\"read\">\n{triage}\n{classifier}\n\
+                     </tool-result>\nAssistant:",
+                    filler = "You are a coding agent. Available tools: ".repeat(40),
+                    triage = crate::harness::triage::TRIAGE_OUTPUT_CONTRACT,
+                    classifier = crate::classify::CLASSIFIER_OUTPUT_CONTRACT,
+                );
+                // The fixture must quote the contracts *outside* the window a
+                // duty's own instruction occupies, or it tests nothing.
+                assert!(
+                    quoting_turn
+                        .find(crate::harness::triage::TRIAGE_OUTPUT_CONTRACT)
+                        .is_some_and(|at| at > DUTY_CONTRACT_PREFIX_BYTES),
+                    "the quoted contract must fall past the instruction window"
+                );
+
+                let first = engine
+                    .complete(&quoting_turn, &params, &mut |_| true)
+                    .expect("a turn");
+                assert_eq!(
+                    first.text.trim(),
+                    "first reply",
+                    "a conversation quoting a duty contract was answered as a duty"
+                );
+                let second = engine
+                    .complete(&quoting_turn, &params, &mut |_| true)
+                    .expect("a turn");
+                assert_eq!(
+                    second.text.trim(),
+                    "second reply",
+                    "...and it must consume a script block, like every other turn"
+                );
+            }
+
+            /// **Non-vacuity for the anchor**: every duty prompt the harness
+            /// really builds is still recognized, and still consumes no block.
+            ///
+            /// The four with a `pub` prompt builder. `digest`'s is assembled
+            /// inline inside `summarize_if_large` and the classifier's is private
+            /// to [`crate::classify`]; both are covered by their own modules'
+            /// tests and by the dispatch tests above, which would not route at
+            /// all if the classifier arm stopped firing.
+            #[test]
+            fn every_harness_duty_prompt_is_still_answered_off_script() {
+                let engine = ScriptedFileEngine::from_script("m", "first reply");
+                let params = GenParams::default();
+                let matches = ["src/a.rs:1: fn parse()", "src/b.rs:2: fn parse2()"];
+
+                for (label, prompt) in [
+                    (
+                        "triage",
+                        crate::harness::triage::triage_prompt("find it", "grep `parse`", &matches),
+                    ),
+                    (
+                        "shell",
+                        crate::harness::shell_duty::shell_prompt("cargo test", "(exit 101)"),
+                    ),
+                    ("title", crate::harness::title::title_prompt(REQUEST)),
+                    (
+                        "compact",
+                        crate::harness::compact::compact_prompt(&[
+                            crate::harness::context::ContextBlock {
+                                role: crate::harness::context::BlockRole::User,
+                                text: "do the thing".to_owned(),
+                                provenance: crate::harness::context::Provenance::User,
+                            },
+                        ]),
+                    ),
+                ] {
+                    let out = engine
+                        .complete(&prompt, &params, &mut |_| true)
+                        .expect("the stand-in answers the duty");
+                    assert!(
+                        !out.text.trim().is_empty(),
+                        "{label}: the duty must be answered"
+                    );
+                    assert_ne!(
+                        out.text.trim(),
+                        "first reply",
+                        "{label}: the duty ate a scripted turn block"
+                    );
+                }
+            }
+
+            // -- the turn does not wait for it (REQ-561 verify M1) ------------
+
+            /// An [`Engine`] that will not answer until it is released.
+            struct GatedEngine {
+                release: Mutex<std::sync::mpsc::Receiver<()>>,
+                reply: String,
+            }
+
+            impl Engine for GatedEngine {
+                fn model_id(&self) -> &str {
+                    "gated"
+                }
+                fn complete(
+                    &self,
+                    _prompt: &str,
+                    _params: &GenParams,
+                    _on_token: &mut dyn FnMut(&str) -> bool,
+                ) -> Result<Completion, EngineError> {
+                    let _ = self.release.lock().expect("gate poisoned").recv();
+                    Ok(Completion {
+                        text: self.reply.clone(),
+                        prompt_tokens: 0,
+                        completion_tokens: 1,
+                    })
+                }
+            }
+
+            /// **The turn does not wait for the session to be named**
+            /// (REQ-561 verify M1).
+            ///
+            /// `title` is `reflex`-tier and therefore local, and `LocalDuty` runs
+            /// a complete inference on the blocking pool. Awaiting it here put
+            /// that whole inference *ahead of the turn* on the first substantive
+            /// prompt of every session — the user watching nothing happen while a
+            /// model chose a name for the thing they had not seen an answer to
+            /// yet.
+            ///
+            /// The engine below never answers until it is released, and a watcher
+            /// releases it after a beat and records that it did. The call under
+            /// test must return with that flag still false: an implementation
+            /// that awaits the naming cannot, because the only thing that can
+            /// unblock it is the very watcher whose firing the flag reports.
+            ///
+            /// The tail is the non-vacuity, and it does two jobs: the duty really
+            /// was in flight rather than skipped, and the *detached* task still
+            /// writes the name back.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_turn_path_does_not_wait_for_the_session_to_be_named() {
+                let (release, gate) = std::sync::mpsc::channel::<()>();
+                let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(GatedEngine {
+                    release: Mutex::new(gate),
+                    reply: "Retry the download client".to_owned(),
+                }));
+                let runtime = DaemonRuntime::minimal();
+                *runtime.config.lock().expect("config mutex") = config();
+                runtime.engine.install("gated".to_owned(), engine);
+                runtime.local_available.store(true, Ordering::SeqCst);
+
+                let bus = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = one_session(&sessions);
+                let cfg = runtime.config.lock().expect("config mutex").clone();
+                let router = build_router(&cfg, runtime.local_tier_available(), &BTreeMap::new());
+
+                let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                tokio::spawn({
+                    let released = Arc::clone(&released);
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        released.store(true, Ordering::SeqCst);
+                        let _ = release.send(());
+                    }
+                });
+
+                let handle = runtime
+                    .spawn_title_session(&bus, &sessions, &router, &cfg, &session, REQUEST)
+                    .expect("the fixture must claim the title");
+
+                assert!(
+                    !released.load(Ordering::SeqCst),
+                    "the turn path did not return until the naming had answered: every \
+                     session's first substantive prompt waits for a whole local \
+                     inference before its turn begins"
+                );
+                assert!(
+                    sessions.get(&session).expect("the session").title.is_none(),
+                    "non-vacuity: the naming really is still in flight, not skipped"
+                );
+
+                // It finishes on its own task, and still writes the name back.
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+                    .await
+                    .expect("the detached naming must finish once the engine answers")
+                    .expect("the titling task must not panic");
+                assert_eq!(
+                    sessions
+                        .get(&session)
+                        .expect("the session")
+                        .title
+                        .as_deref(),
+                    Some("Retry the download client"),
+                    "a detached naming must still land"
+                );
+            }
+
+            /// The recognition arm keys on the contract the prompt actually
+            /// carries — one constant, both sides, so the stand-in cannot drift
+            /// away from the duty it is meant to answer.
+            #[test]
+            fn the_stand_in_recognizes_the_contract_the_prompt_carries() {
+                assert!(
+                    crate::harness::title::title_prompt(REQUEST).contains(TITLE_OUTPUT_CONTRACT)
+                );
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // The `compact` duty's dispatch (REQ-561 TASK-063).
+        //
+        // The duty itself — what it decides and what it refuses — is tested
+        // against `ContextManager` in `harness::context`, because that is where
+        // it hangs. What is tested here is the half only the daemon owns: where
+        // the category routes, and what reaches the wire when it performs.
+        // -------------------------------------------------------------------
+        mod compact {
+            use super::*;
+            use crate::harness::compact::COMPACT_OUTPUT_CONTRACT;
+            use crate::harness::ContextManager;
+            use teton_core::category::{CategoryOverride, ConfigurableCategory};
+
+            /// The `compact` route the turn path builds, from the same runtime
+            /// state and through the same router, announcing on `bus`.
+            fn compact_for(
+                runtime: &DaemonRuntime,
+                bus: &Arc<EventBus>,
+                session: &SessionId,
+            ) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.compact_route(&router, &config, bus, session, slot.as_ref())
+            }
+
+            /// A conversation over its byte budget, with a decision in it.
+            fn pressured() -> ContextManager {
+                let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(4_000);
+                for i in 0..5 {
+                    ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+                }
+                assert!(ctx.under_compaction_pressure());
+                ctx
+            }
+
+            // -- where it routes --------------------------------------------
+
+            /// **BR-5 / LESSON-432.** Session taint overrides the category
+            /// binding for `compact` as for every other duty — and it matters
+            /// most here, because what this duty sends is the *conversation*.
+            ///
+            /// The mutation-sensitive one: deleting the taint check in
+            /// `compact_route` turns this red on its own, at its own layer. Its
+            /// non-vacuity pair is the same config untainted, which genuinely
+            /// sends the conversation off the machine.
+            #[test]
+            fn a_tainted_session_compacts_on_the_local_tier() {
+                let engine = CountingEngine::answering("FORGET: 1\nSUMMARY: x");
+                let mut config = config();
+                config.categories.push(CategoryOverride {
+                    name: ConfigurableCategory::Compact,
+                    provider_id: "frontier".to_owned(),
+                    fallback_id: None,
+                });
+                let runtime = runtime(config, &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let session = SessionId::from("tainted");
+
+                // Non-vacuity: the same config, untainted, genuinely goes remote.
+                assert_eq!(
+                    compact_for(&runtime, &bus, &SessionId::from("clean")).provider(),
+                    Some("frontier")
+                );
+
+                runtime.session_taint.mark(&session);
+                assert_eq!(
+                    compact_for(&runtime, &bus, &session).provider(),
+                    LOCAL_PROVIDER_ID.into(),
+                    "a tainted session compacts on the machine (BR-5)"
+                );
+            }
+
+            /// A machine with no engine cannot compact, and says why: the
+            /// resolver's own sentence rides onto the route so nothing has to
+            /// invent one (BR-6, LESSON-447). The context is still bounded —
+            /// that is `truncate_to_budget`'s job, not this route's.
+            #[test]
+            fn a_machine_with_no_engine_cannot_compact_and_says_so() {
+                let runtime = DaemonRuntime::minimal();
+                *runtime.config.lock().expect("config mutex") = config();
+
+                let route = compact_for(
+                    &runtime,
+                    &Arc::new(EventBus::new()),
+                    &SessionId::from("sess"),
+                );
+
+                assert_eq!(route.provider(), None);
+                let DutyRoute::Unresolved { reason } = route else {
+                    panic!("there is nothing to serve the duty");
+                };
+                assert!(reason.contains("compact"), "{reason}");
+            }
+
+            // -- what reaches the wire (AC-2, ADR-8) -------------------------
+
+            /// **AC-2 and its ADR-8 pairing.** A compaction that *performs*
+            /// announces its route naming `compact`; a resolved route whose
+            /// context is never pressured announces nothing.
+            ///
+            /// The negative half is what distinguishes emit-on-perform from the
+            /// design it replaced: `compact_route` is built once per turn
+            /// attempt whether or not any conversation ever crosses the
+            /// threshold, so a resolution-time event would fire on every turn in
+            /// the daemon.
+            #[tokio::test]
+            async fn a_performed_compaction_announces_its_route_and_a_declined_one_does_not() {
+                let engine =
+                    CountingEngine::answering("FORGET: 1 2 3\nSUMMARY: the agent looked around.");
+                let runtime = runtime(config(), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let session = SessionId::from("sess");
+
+                // Declined: resolved, never pressured, never performed.
+                let mut roomy = ContextManager::new("sys", 1_000_000).with_budget_bytes(4_000);
+                roomy.push_user("a");
+                roomy.push_user("b");
+                roomy.push_user("c");
+                let out = roomy
+                    .compact_if_pressured(&compact_for(&runtime, &bus, &session))
+                    .await;
+                assert_eq!(out.dropped_blocks, 0);
+                assert_eq!(engine.calls(), 0);
+                assert!(
+                    announced(&mut sub).is_empty(),
+                    "a duty that never ran announces no routing decision"
+                );
+
+                // Performed.
+                let out = pressured()
+                    .compact_if_pressured(&compact_for(&runtime, &bus, &session))
+                    .await;
+                assert_eq!(out.dropped_blocks, 3);
+                // All four of AC-2's fields, not just the category: `compact`
+                // is the duty that sends the *conversation*, so "where did it
+                // go, through which tier, and why" is the whole of what a user
+                // watching this event needs.
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Compact,
+                    ProtoTier::Scan,
+                    LOCAL_PROVIDER_ID,
+                );
+            }
+
+            // -- the stand-in engine (BR-10, AC-12) --------------------------
+
+            /// **BR-10 / AC-12.** The `compact` duty is answered by the scripted
+            /// stand-in **off-script**, so it consumes no reply block and every
+            /// fixture's turn sequence means what its author wrote.
+            #[test]
+            fn a_compact_duty_consumes_no_scripted_block() {
+                let engine = ScriptedFileEngine::from_script("m", "first reply\n---\nsecond reply");
+                let params = GenParams::default();
+                let blocks = pressured().blocks().to_vec();
+
+                let duty = engine
+                    .complete(
+                        &crate::harness::compact::compact_prompt(&blocks),
+                        &params,
+                        &mut |_| true,
+                    )
+                    .expect("the stand-in answers the duty");
+                // And with an answer the parser accepts, rather than one that
+                // would make every pressured fixture report a duty failure.
+                let read = crate::harness::compact::read_compaction(&duty.text, blocks.len() - 1)
+                    .expect("the stand-in's answer is a usable compaction");
+                assert_eq!(read.forget(), [0], "the oldest block, as the gate would");
+
+                // The script has not moved: the next *turn* still gets block one.
+                let turn = engine
+                    .complete("an ordinary turn", &params, &mut |_| true)
+                    .expect("a turn");
+                assert_eq!(turn.text.trim(), "first reply");
+            }
+
+            /// The recognition arm keys on the contract the prompt actually
+            /// carries — one constant, both sides, so the stand-in cannot drift
+            /// away from the duty it is meant to answer.
+            #[test]
+            fn the_stand_in_recognizes_the_contract_the_prompt_carries() {
+                assert!(
+                    crate::harness::compact::compact_prompt(pressured().blocks())
+                        .contains(COMPACT_OUTPUT_CONTRACT)
+                );
             }
         }
     }

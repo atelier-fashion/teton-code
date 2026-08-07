@@ -186,23 +186,39 @@ fn a_tainted_session_stays_local_and_the_pre_taint_turn_proves_it_would_not_have
     // overriding every binding, not a category decision — so its `route_decided`
     // carries no `category` and no `tier`. Minting one would be the second
     // computation ADR-D forbids. Recorded in docs/manual-verification.md too.
-    let pinned = routes_to(&client, "local");
+    //
+    // REQ-561 TASK-062: "names `local`" stopped being the same set as "is the
+    // pin". Harness duties announce on this same `route_decided` surface, and
+    // `title` runs on the local tier on the first turn of **every** session —
+    // here, before this one was tainted — so it contributes a local
+    // announcement that legitimately names its own category. The pin is the
+    // announcement that resolved *no* category, so the claim is stated in two
+    // halves and neither is vacuous: the pin's announcement is really there,
+    // and nothing announces the category the pin overrode.
+    let local_routes = routes_to(&client, "local");
+    let pinned: Vec<_> = local_routes
+        .iter()
+        .filter(|event| event.get("category").is_none())
+        .collect();
     assert!(
         !pinned.is_empty(),
         "the pinned turn must still announce its route: {:?}",
         client.events_named("route_decided")
     );
     for event in &pinned {
-        assert!(
-            event.get("category").is_none(),
-            "the taint pin consults no binding, so it reports no category — a \
-             synthesized one would be a second answer to a question the pin \
-             deliberately did not ask (ADR-D): {event}"
-        );
         assert!(event.get("tier").is_none(), "{event}");
         assert!(
             !event["reason"].as_str().unwrap_or_default().is_empty(),
             "but the reason is still non-empty and still names the pin: {event}"
+        );
+    }
+    for event in &local_routes {
+        assert_ne!(
+            event["category"].as_str(),
+            Some("design"),
+            "the taint pin consults no binding, so nothing may announce the \
+             category it overrode — a synthesized one would be a second answer \
+             to a question the pin deliberately did not ask (ADR-D): {event}"
         );
     }
 

@@ -1,0 +1,83 @@
+{
+  "req": "REQ-561",
+  "branch": "feat/REQ-561-wire-unreached-categories",
+  "startedAt": "2026-08-07T00:00:00Z",
+  "completed": false,
+  "currentPhase": 7,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Worktree + Preflight",
+      "completedAt": "2026-08-07T00:05:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-07T00:20:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-07T00:45:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-07T00:55:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-07T04:00:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (Reflect + Review)",
+      "completedAt": "2026-08-07T09:00:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-08-07T09:15:00Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-561",
+      "branch": "feat/REQ-561-wire-unreached-categories",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/63",
+      "prNumber": 63,
+      "merged": false
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-058",
+      "TASK-059",
+      "TASK-060",
+      "TASK-061",
+      "TASK-062",
+      "TASK-063",
+      "TASK-064",
+      "TASK-065"
+    ],
+    "failedTasks": []
+  }
+}

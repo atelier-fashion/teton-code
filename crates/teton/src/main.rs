@@ -18,9 +18,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSnapshot, ConfigUpdate,
-    CostQueryParams, CostQueryResult, CostReportView, ModelListParams, ModelListResult,
-    ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig, ProviderConfig,
-    SessionCreateParams, TierBindingConfig,
+    ContentClass, CostQueryParams, CostQueryResult, CostReportView, ModelListParams,
+    ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig,
+    ProviderConfig, SessionCreateParams, TierBindingConfig,
 };
 use teton_protocol::{
     BindingSource, ConfigurableCategory, PrivacyMode, ProviderId, ProviderKind, SessionMode, Tier,
@@ -1478,10 +1478,11 @@ fn render_policy(snapshot: &ConfigSnapshot, surface: &mut dyn Surface) {
             surface.line(
                 LineKind::Notice,
                 &format!(
-                    "  {:<category_width$}  {:<6}  unresolved — {}",
+                    "  {:<category_width$}  {:<6}  unresolved — {}{}",
                     row.category.as_str(),
                     row.tier.as_str(),
                     row.reason,
+                    content_disclosure(row.content_class, row.reached, false),
                 ),
             );
             continue;
@@ -1490,20 +1491,15 @@ fn render_policy(snapshot: &ConfigSnapshot, surface: &mut dyn Surface) {
             .fallback_id
             .as_ref()
             .map_or_else(String::new, |f| format!(" (fallback {f})"));
-        // ADR-A: a knob with no call site says so, every time it is printed.
-        let marker = if row.reached {
-            ""
-        } else {
-            "  — declared, no call site yet"
-        };
         surface.line(
             LineKind::Info,
             &format!(
-                "  {:<category_width$}  {:<6}  → {:<provider_width$}  [{}]{fallback}{marker}",
+                "  {:<category_width$}  {:<6}  → {:<provider_width$}  [{}]{fallback}{}",
                 row.category.as_str(),
                 row.tier.as_str(),
                 provider.0,
                 binding_source_label(row.source),
+                content_disclosure(row.content_class, row.reached, true),
             ),
         );
     }
@@ -1530,6 +1526,44 @@ fn tier_origin_label(source: TierBindingSource) -> &'static str {
         TierBindingSource::DefaultProvider => "unbound; inherits default_provider",
         TierBindingSource::LocalTier => "unbound; inherits the local tier",
         TierBindingSource::Unbound => "unbound",
+    }
+}
+
+/// What a category transmits, and whether it transmits anything today (REQ-561
+/// BR-11, AC-16 — OQ-4's resolution).
+///
+/// The disclosure exists because the `scan` tier carries both `triage` (grep
+/// match text — file content) and `compact` (conversation blocks): a user who
+/// binds `scan` remotely for cheap long-context work also moves conversation
+/// history off the machine. Re-splitting that binding is REQ-558's decision and
+/// out of scope, so legibility is the mitigation — which only works if the two
+/// rows visibly disclose *different* things.
+///
+/// **One string rather than two columns, because the two facts are only honest
+/// together.** [`ContentClass`] is what a category is *for*, and it is declared
+/// for all eleven including the ones with no call site — "what would leave this
+/// machine if I bound that tier remotely?" has an answer before the call site
+/// exists, and a blank cell would read as "this one is safe". But a class
+/// printed on its own reads as a live egress path, which for `redact` (REQ-562)
+/// it is not. So the verb carries `reached`: a category with no call site *would*
+/// send, and says in the same breath that nothing calls it yet. ADR-A's marker
+/// stays exactly where a reader needs it — next to the claim it qualifies.
+///
+/// `routable` is the third fact and the reason an unresolved row does not claim
+/// to send: a category whose tier is unbound transmits nothing today either, and
+/// its row's own sentence already says why.
+///
+/// **Disclosure, not a control.** Nothing here refuses anything. BR-7's
+/// per-content egress scoping is the enforcement, and it refuses a `local-only`
+/// source whatever this line says.
+fn content_disclosure(class: ContentClass, reached: bool, routable: bool) -> String {
+    match (reached, routable) {
+        (true, true) => format!("  — sends {}", class.describe()),
+        (true, false) => format!("  — would send {}", class.describe()),
+        (false, _) => format!(
+            "  — would send {}; declared, no call site yet",
+            class.describe()
+        ),
     }
 }
 
@@ -1836,8 +1870,21 @@ mod tests {
     /// A snapshot shaped like the one a REQ-557-migrated install produces:
     /// `default_provider` on a remote provider, so `scan`/`build`/`think`
     /// inherit it and `reflex` does not.
+    ///
+    /// **Its `reached` column mirrors the daemon's `has_call_site` by hand**, and
+    /// nothing in this crate can check that: the CLI is a thin client and holds
+    /// no dependency on `tetond` (that separation is BR-4's, and worth more than
+    /// this convenience). So the fixture can go stale while every test over it
+    /// stays green — which is exactly what happened through TASK-060..063, when
+    /// four categories got call sites and this fixture went on calling them
+    /// unreached (LESSON-485: a rendering test fed an impossible snapshot still
+    /// passes). What the daemon actually reaches is derived and asserted in
+    /// `tetond`'s `the_unreached_marker_matches_the_daemons_actual_call_sites`,
+    /// and the real binary's rendering of it in `cli_e2e`'s
+    /// `policy_show_renders_the_daemons_resolved_table`. This fixture's job is
+    /// narrower: prove the renderer prints whatever it is handed.
     fn migrated_snapshot() -> ConfigSnapshot {
-        use teton_protocol::methods::{CategoryRouteView, TierRouteView};
+        use teton_protocol::methods::{CategoryRouteView, ContentClass, TierRouteView};
         use teton_protocol::Category;
 
         let tier = |t: Tier, provider: &str, source| TierRouteView {
@@ -1854,6 +1901,7 @@ mod tests {
                 fallback_id: None,
                 source,
                 reached,
+                content_class: ContentClass::for_category(category),
                 reason: format!("Routing the '{category}' category to '{provider}'."),
             };
         use BindingSource::{PinnedLocal, TierInheritance as Inherit};
@@ -1874,6 +1922,10 @@ mod tests {
                     PinnedLocal,
                     true,
                 ),
+                // The one category REQ-561 leaves unwired: a model call inside
+                // the egress choke point is REQ-562's subject and its own
+                // adversarial review. Every other row here is `true` because
+                // TASK-060..063 gave the other four call sites.
                 row(
                     Category::Redact,
                     Tier::Reflex,
@@ -1881,12 +1933,12 @@ mod tests {
                     PinnedLocal,
                     false,
                 ),
-                row(Category::Title, Tier::Reflex, "on-device", Inherit, false),
+                row(Category::Title, Tier::Reflex, "on-device", Inherit, true),
                 row(Category::Digest, Tier::Scan, "anthropic", Inherit, true),
-                row(Category::Compact, Tier::Scan, "anthropic", Inherit, false),
-                row(Category::Triage, Tier::Scan, "anthropic", Inherit, false),
+                row(Category::Compact, Tier::Scan, "anthropic", Inherit, true),
+                row(Category::Triage, Tier::Scan, "anthropic", Inherit, true),
                 row(Category::Edit, Tier::Build, "anthropic", Inherit, true),
-                row(Category::Shell, Tier::Build, "anthropic", Inherit, false),
+                row(Category::Shell, Tier::Build, "anthropic", Inherit, true),
                 row(Category::Design, Tier::Think, "anthropic", Inherit, true),
                 row(Category::Debug, Tier::Think, "anthropic", Inherit, true),
                 // One override, on the same tier as `design` and `debug`, so
@@ -1905,29 +1957,48 @@ mod tests {
         }
     }
 
-    /// ADR-A + AC-12: the table a human reads names every category, marks the
-    /// five with no call site, and states the BR-9 default.
+    /// The rendered row whose first word is `category`.
+    ///
+    /// Matched on the row prefix rather than by bare substring, so `route` is not
+    /// satisfied by the word "Routing" inside somebody else's reason. Every name
+    /// is padded to the widest, so a trailing space always follows it.
+    fn category_row<'a>(rendered: &'a str, category: &str) -> &'a str {
+        let prefix = format!("{category} ");
+        rendered
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("no row for {category}:\n{rendered}"))
+    }
+
+    /// AC-1 + ADR-A + AC-12: the table a human reads names every category, marks
+    /// the one with no call site, and states the BR-9 default.
+    ///
+    /// **AC-1 is "the marker becomes accurate", not "delete the marker."** The
+    /// `redact` assertion below is what keeps that distinction load-bearing: a
+    /// renderer that had simply forgotten how to print the marker would satisfy
+    /// every `!contains("no call site")` in this file and fail only there.
     #[test]
     fn policy_show_marks_the_unreached_categories_and_the_judgment_default() {
         let mut surface = RecordingSurface::new();
         render_policy(&migrated_snapshot(), &mut surface);
         let rendered = surface.lines_of(LineKind::Info).join("\n");
 
-        for unreached in ["redact", "title", "compact", "triage", "shell"] {
-            let line = rendered
-                .lines()
-                .find(|l| l.trim_start().starts_with(unreached))
-                .unwrap_or_else(|| panic!("no row for {unreached}: {rendered}"));
-            assert!(
-                line.contains("declared, no call site yet"),
-                "{unreached} has no call site and must say so: {line}"
-            );
-        }
-        for reached in ["route", "digest", "edit", "design", "debug", "review"] {
-            let line = rendered
-                .lines()
-                .find(|l| l.trim_start().starts_with(reached))
-                .unwrap_or_else(|| panic!("no row for {reached}: {rendered}"));
+        // `redact` alone. Egress redaction is regex-based and makes no model
+        // call; giving it one is REQ-562's subject.
+        let unreached = category_row(&rendered, "redact");
+        assert!(
+            unreached.contains("declared, no call site yet"),
+            "`redact` has no call site and must say so: {unreached}"
+        );
+        // The four REQ-561 wired (TASK-060..063) join the six that were already
+        // reached. `triage`, `shell`, `title` and `compact` were on the marked
+        // side of this very assertion until their duties landed.
+        for reached in [
+            "route", "digest", "edit", "design", "debug", "review", "triage", "shell", "title",
+            "compact",
+        ] {
+            let line = category_row(&rendered, reached);
             assert!(
                 !line.contains("no call site"),
                 "{reached} is reached and must not be marked: {line}"
@@ -1950,10 +2021,7 @@ mod tests {
             ("design", "via its tier"),
             ("review", "per-category override"),
         ] {
-            let line = rendered
-                .lines()
-                .find(|l| l.trim_start().starts_with(category))
-                .unwrap_or_else(|| panic!("no row for {category}: {rendered}"));
+            let line = category_row(&rendered, category);
             assert!(
                 line.contains(expected),
                 "{category} must be labelled `{expected}`: {line}"
@@ -1980,6 +2048,163 @@ mod tests {
         assert!(rendered.contains("inherits default_provider"), "{rendered}");
     }
 
+    /// AC-16 / BR-11: every one of the eleven rows names the content class it
+    /// transmits, and `triage` and `compact` name **different** ones despite
+    /// sharing the `scan` tier.
+    ///
+    /// That distinctness is the whole of OQ-4's resolution. Re-splitting the
+    /// tier→category bindings is REQ-558's decision and out of scope, so a user
+    /// who binds `scan` remotely for cheap long-context work is told, in the two
+    /// rows they would compare, that they have moved both file text *and*
+    /// conversation history off the machine. If both rows said the same thing,
+    /// the mitigation would disclose nothing.
+    ///
+    /// Disclosure only: nothing here is a control, and no assertion in this test
+    /// claims one. BR-7's per-content egress scoping is the enforcement.
+    #[test]
+    fn policy_show_discloses_the_content_class_of_every_category() {
+        let snapshot = migrated_snapshot();
+        let mut surface = RecordingSurface::new();
+        render_policy(&snapshot, &mut surface);
+        let rendered = surface.lines_of(LineKind::Info).join("\n");
+
+        assert_eq!(
+            snapshot.routing.len(),
+            11,
+            "AC-16 is about all eleven categories, so the fixture must carry all eleven"
+        );
+        for row in &snapshot.routing {
+            let name = row.category.as_str();
+            let line = category_row(&rendered, name);
+            assert!(
+                line.contains(row.content_class.describe()),
+                "`{name}` must name what it transmits (`{}`): {line}",
+                row.content_class.describe()
+            );
+        }
+
+        // The asymmetry itself, spelled out rather than derived — a change to
+        // either category's class should have to be made here too, in front of a
+        // reviewer, and not slide through a `for_category` round trip.
+        let triage = category_row(&rendered, "triage");
+        let compact = category_row(&rendered, "compact");
+        assert!(
+            triage.contains("file content and your request"),
+            "`triage` ranks grep hits — file text — and is told the request and the search \
+             terms in the same prompt, so its row must name all of it: {triage}"
+        );
+        assert!(
+            compact.contains("conversation history"),
+            "`compact` decides which conversation blocks to forget, so it reads them: {compact}"
+        );
+        assert!(
+            !triage.contains("conversation history"),
+            "`triage` must not disclose `compact`'s class: {triage}"
+        );
+        assert!(
+            !compact.contains("file content"),
+            "`compact` must not disclose `triage`'s class: {compact}"
+        );
+        // The type-level half of this — that the mapping itself answers two
+        // different classes — is pinned in `teton-protocol`'s
+        // `triage_and_compact_disclose_different_content_despite_sharing_a_tier`.
+        // What is asserted here is that the *rendering* keeps them apart, which
+        // is the half a user actually reads.
+    }
+
+    /// The row prints the **daemon's** content class rather than recomputing one.
+    ///
+    /// [`CategoryRouteView`]'s own doc says the daemon answers and the surface
+    /// prints; [`render_policy`]'s says a table that computed its own answer
+    /// would be a second implementation only a human ever compares against the
+    /// first. For the routing columns that is structural — this crate has no
+    /// resolver to recompute them with. For `content_class` it is **not**:
+    /// `ContentClass::for_category` lives in the shared protocol crate and this
+    /// renderer could simply call it, ignoring the wire while passing every
+    /// other assertion in this file, because the two agree by construction.
+    ///
+    /// Found by mutation: swapping `row.content_class` for
+    /// `ContentClass::for_category(row.category)` came back green across the unit
+    /// tests *and* the e2e until this test existed. It matters because REQ-562
+    /// will change what `redact` transmits — and a CLI that answers from its own
+    /// compiled-in copy disagrees with the daemon the moment the two are built
+    /// from different versions, which is the drift ADR-002's TypeScript mirror
+    /// note is about.
+    #[test]
+    fn policy_show_prints_the_daemons_content_class_rather_than_recomputing_it() {
+        use teton_protocol::Category;
+
+        let mut snapshot = migrated_snapshot();
+        // A class no local derivation would produce for `triage`.
+        let wire = ContentClass::CommandOutput;
+        assert_ne!(wire, ContentClass::for_category(Category::Triage));
+        for row in &mut snapshot.routing {
+            if row.category == Category::Triage {
+                row.content_class = wire;
+            }
+        }
+
+        let mut surface = RecordingSurface::new();
+        render_policy(&snapshot, &mut surface);
+        let rendered = surface.lines_of(LineKind::Info).join("\n");
+
+        let triage = category_row(&rendered, "triage");
+        assert!(
+            triage.contains(wire.describe()),
+            "the row must print the class the daemon sent: {triage}"
+        );
+        assert!(
+            !triage.contains(ContentClass::for_category(Category::Triage).describe()),
+            "the class was recomputed from the category instead of read off the wire: {triage}"
+        );
+    }
+
+    /// AC-16's "a category that transmits nothing today says so": the content
+    /// class and the call-site marker render as one adjacent phrase.
+    ///
+    /// TASK-059 shipped no `Nothing` variant on purpose. `content_class` is what
+    /// a category *would* transmit — `redact` will carry the outbound payload the
+    /// moment REQ-562 wires it, so calling it `Nothing` would be a lie with a
+    /// short shelf life — and `reached` is whether anything transmits it today.
+    /// The cost of that (correct) division is that a class printed on its own
+    /// reads as a live egress path. This is the assertion that keeps the two
+    /// facts from drifting apart in the rendering.
+    #[test]
+    fn policy_show_renders_the_content_class_beside_the_call_site_marker() {
+        use teton_protocol::Category;
+
+        let mut surface = RecordingSurface::new();
+        render_policy(&migrated_snapshot(), &mut surface);
+        let rendered = surface.lines_of(LineKind::Info).join("\n");
+
+        // The still-unreached one: class and marker in a single phrase, in that
+        // order, with nothing between them.
+        let redact = category_row(&rendered, "redact");
+        let class = ContentClass::for_category(Category::Redact).describe();
+        assert!(
+            redact.contains(&format!("would send {class}; declared, no call site yet")),
+            "`redact`'s class and its marker must read as one phrase, or the class alone reads \
+             as a live egress path: {redact}"
+        );
+
+        // A wired one, for the other half of the pair: the class is present, the
+        // marker is not, and the verb is the one that says the call is live.
+        let triage = category_row(&rendered, "triage");
+        let wired = ContentClass::for_category(Category::Triage).describe();
+        assert!(
+            triage.contains(&format!("sends {wired}")),
+            "a wired category states its class in the present tense: {triage}"
+        );
+        assert!(
+            !triage.contains("would send"),
+            "`triage` has a call site, so its disclosure is not conditional: {triage}"
+        );
+        assert!(
+            !triage.contains("no call site"),
+            "`triage` is wired (TASK-060) and must not carry the marker: {triage}"
+        );
+    }
+
     /// BR-8: a category that cannot be routed carries the resolver's sentence
     /// rather than a blank column — and it is a notice, not an info line,
     /// because it is the answer to "why did my turn fail".
@@ -2004,6 +2229,21 @@ mod tests {
         assert!(
             notices.contains(&reason),
             "the resolver's sentence must travel verbatim: {notices}"
+        );
+
+        // AC-16 covers every row, and this is the branch that would silently
+        // drop the disclosure: a category that cannot be routed still says what
+        // it would transmit. In the conditional, because it transmits nothing
+        // while its tier is unbound — and without ADR-A's marker, because what
+        // `design` is missing is a binding, not a call site.
+        let line = category_row(&notices, "design");
+        assert!(
+            line.contains("would send the whole turn"),
+            "an unroutable category still discloses its content class: {line}"
+        );
+        assert!(
+            !line.contains("declared, no call site yet"),
+            "`design` has a call site; it is its binding that is missing: {line}"
         );
         // And the rest of the table still renders.
         assert!(surface.any_line_contains(LineKind::Info, "review"));

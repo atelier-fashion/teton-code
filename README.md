@@ -70,6 +70,10 @@ version when the CLI attaches, so a daemon left behind by an upgrade is turned
 away at that point — every command answers with which half is stale and the
 restart command, rather than failing partway through with an internal error.
 
+[`CHANGELOG.md`](CHANGELOG.md) records what an upgrade changes on a machine that
+was already running — in particular any release that changes where your data
+goes without you having changed a setting. Read it before a restart, not after.
+
 ### Uninstalling
 
 ```sh

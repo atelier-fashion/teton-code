@@ -522,6 +522,66 @@ pub enum ClientKind {
 mod tests {
     use super::*;
 
+    /// The layering rule as a test rather than a habit: this crate is the shared
+    /// vocabulary, so no crate above it may become a dependency of it.
+    ///
+    /// The manifest is where the assertion belongs, because the manifest is
+    /// where the rule can actually be broken. A stray `use teton_core::…` does
+    /// not compile; a dependency added "just for one type" compiles fine, and
+    /// then these types stop being mirrorable in TypeScript (ADR-002) because
+    /// the mirror cannot follow a link into the daemon's crates. REQ-561's
+    /// `session_titled` is the occasion for writing it down: its payload is a
+    /// `String` scoped by a `SessionId`, both already here, so the event costs
+    /// this crate no new edge — and that is a property worth being told about if
+    /// it ever stops holding.
+    #[test]
+    fn the_protocol_crate_depends_on_no_other_teton_crate() {
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .expect("teton-protocol's own manifest is readable");
+
+        let mut in_dependencies = false;
+        let mut declared: Vec<String> = Vec::new();
+        for raw in manifest.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                in_dependencies = header.contains("dependencies");
+                // `[dependencies.foo]` and `[target.'cfg(unix)'.dependencies.foo]`
+                // name the crate in the header instead of on a key line.
+                if in_dependencies && !header.ends_with("dependencies") {
+                    if let Some((_, name)) = header.rsplit_once('.') {
+                        declared.push(name.to_owned());
+                    }
+                }
+                continue;
+            }
+            if !in_dependencies || line.is_empty() {
+                continue;
+            }
+            declared.push(
+                line.split(['=', '.'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+            );
+        }
+
+        // Non-vacuity: a scan that read nothing would pass every assertion below
+        // while checking nothing at all (LESSON-485).
+        assert!(
+            declared.iter().any(|d| d == "serde"),
+            "the scan did not find the dependencies it is meant to read: {declared:?}"
+        );
+        for name in &declared {
+            assert!(
+                !name.starts_with("teton"),
+                "teton-protocol must depend on no teton crate; found '{name}' in {declared:?}"
+            );
+        }
+    }
+
     #[test]
     fn version_is_reported() {
         assert!(!version().is_empty());

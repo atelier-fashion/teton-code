@@ -2,7 +2,7 @@
 //!
 //! REQ-558 declares all eleven categories and resolves all eleven, so the config
 //! schema stabilizes once and the remaining call sites can be tagged later
-//! without a second migration. But five of them have **no model call site at
+//! without a second migration. But some of them have **no model call site at
 //! all**, and a knob that silently does nothing invites a user to tune it —
 //! LESSON-481's shape ("a gate that hides a feature from users also hides it
 //! from the test suite"). So `teton policy show` marks them
@@ -16,8 +16,9 @@
 //! the direction the list actually rots in. The test at the bottom of this file
 //! closes that gap: it reads the daemon's own source, finds every routing call
 //! site, works out which categories reach a router through them, and asserts the
-//! result equals this match. Wire up `triage` and the test fails until the
-//! marker follows.
+//! result equals this match. Wire up `redact` and the test fails until the
+//! marker follows — which is exactly how `triage` (REQ-561 TASK-060), `shell`
+//! (TASK-061), `title` (TASK-062) and `compact` (TASK-063) arrived.
 //!
 //! That test is the load-bearing half of ADR-A. This match is just where its
 //! answer is written down.
@@ -44,17 +45,122 @@ pub const fn has_call_site(category: Category) -> bool {
         // what the classifier said (freeform) or what the phase maps to
         // (structured) — so they are reached together or not at all.
         Category::Edit | Category::Design | Category::Debug | Category::Review => true,
+        // The `grep` tool's own duty: `GrepTool::refine` ranks the matches it
+        // just found against the turn's request before they enter context
+        // (REQ-561 TASK-060). Unreached until then — the hits were returned in
+        // whatever order the filesystem walk produced.
+        Category::Triage => true,
+        // The `shell` tool's own duty: `ShellTool::refine` says what a command's
+        // output means, on the two results a weak model cannot read for itself —
+        // a failure, or output the 8,000-character cap truncated (REQ-561
+        // TASK-061). REQ-558's ADR-I deferred this on the reading that `shell`
+        // meant *deciding to run a command*, which indeed cannot be routed ahead
+        // of the model's answer; BR-4b resolved it the other way round — the
+        // category dispatches on **interpreting** the output, which happens after
+        // the command has already run and is routable like any other duty.
+        Category::Shell => true,
+        // The session's own duty, and the only one of the five that belongs to
+        // no tool: `DaemonRuntime::title_session` names a session from its first
+        // substantive prompt, once for the session's whole life, and publishes
+        // `session_titled` (REQ-561 TASK-062). `SessionSummary.title` was on the
+        // wire long before anything populated it.
+        Category::Title => true,
+        // The context's own duty, and the second of the five that belongs to no
+        // tool: `ContextManager::compact_if_pressured` asks which blocks a
+        // pressured conversation may forget, at a soft fraction of the budget
+        // and ahead of the unconditional `truncate_to_budget` (REQ-561 TASK-063,
+        // ADR-4). The deterministic oldest-first drop is still what *enforces*
+        // the budget — the duty only ever improves the choice, which is why
+        // wiring it cannot weaken the gate.
+        Category::Compact => true,
         // Declared, unreached. Egress redaction is regex-based and makes no
-        // model call; nothing names sessions or branches; compaction truncates
-        // mechanically; grep/glob hits are returned unranked; and `shell` is
-        // ADR-I's deliberate deferral — you cannot know a turn will emit a shell
-        // call until the model has already answered, and the interpretation half
-        // has no call site either.
-        Category::Redact
-        | Category::Title
-        | Category::Compact
-        | Category::Triage
-        | Category::Shell => false,
+        // model call; giving it one means putting a model inside the choke
+        // point, which is REQ-562's subject and its own adversarial review.
+        Category::Redact => false,
+    }
+}
+
+/// Reading the daemon's own source as text, for the tests that assert facts
+/// about the code rather than about its behaviour.
+///
+/// Shared rather than copied: the derived-marker test here and the seam
+/// assertions in [`crate::harness::duty`] (REQ-561 AC-8/AC-10) both walk the
+/// daemon's sources and both need the same "production source only" rule. Two
+/// spellings of that rule are two rules that drift, and a drifted one is a scan
+/// that quietly stops seeing a file.
+#[cfg(test)]
+pub(crate) mod scan {
+    use std::path::{Path, PathBuf};
+
+    /// The daemon's own `src/` directory.
+    pub(crate) fn daemon_src() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    pub(crate) fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("readable source dir") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A file's source with its test modules removed.
+    ///
+    /// Every module in this crate puts `#[cfg(test)]` items last, so truncating
+    /// at the first one is exact today and *conservative* if that ever changes:
+    /// it can only shrink what a scan sees, which makes an assertion fail loudly
+    /// rather than pass wrongly.
+    pub(crate) fn production_source(path: &Path) -> String {
+        let text = std::fs::read_to_string(path).expect("readable source file");
+        match text.find("\n#[cfg(test)]") {
+            Some(at) => text[..at].to_owned(),
+            None => text,
+        }
+    }
+
+    /// Every production `.rs` under `src/`, as `(path relative to src/, source)`,
+    /// in sorted order.
+    pub(crate) fn production_sources() -> Vec<(String, String)> {
+        let root = daemon_src();
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        files.sort();
+        files
+            .iter()
+            .map(|path| {
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("a file under src/")
+                    .to_string_lossy()
+                    .into_owned();
+                (rel, production_source(path))
+            })
+            .collect()
+    }
+
+    /// `source` with whole-line comments removed.
+    ///
+    /// The derived-marker scan in this module deliberately reads comments —
+    /// ADR-9 exists because it does. The seam assertions deliberately do not: an
+    /// ADR quoted in a doc comment is not a second implementation. Trailing
+    /// comments are left in place, which can only make a seam assertion
+    /// over-count and fail loudly.
+    pub(crate) fn code_only(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// How many times `needle` occurs in `haystack`.
+    pub(crate) fn count(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
     }
 }
 
@@ -63,10 +169,11 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
 
     use teton_core::category::{category_for_phase, JudgmentCategory};
     use teton_core::Phase;
+
+    use super::scan::{daemon_src, production_source, rust_files};
 
     /// The `Router` methods that answer "where does this category go".
     ///
@@ -98,35 +205,6 @@ mod tests {
 
     /// The three the scan reads a category out of.
     const CATEGORY_BEARING: [&str; 3] = ["resolve", "resolution_for", "resolve_judgment"];
-
-    fn daemon_src() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-    }
-
-    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("readable source dir") {
-            let path = entry.expect("readable dir entry").path();
-            if path.is_dir() {
-                rust_files(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-
-    /// A file's source with its test modules removed.
-    ///
-    /// Every module in this crate puts `#[cfg(test)]` items last, so truncating
-    /// at the first one is exact today and *conservative* if that ever changes:
-    /// it can only shrink the derived set, which makes the assertion below fail
-    /// loudly rather than pass wrongly.
-    fn production_source(path: &Path) -> String {
-        let text = std::fs::read_to_string(path).expect("readable source file");
-        match text.find("\n#[cfg(test)]") {
-            Some(at) => text[..at].to_owned(),
-            None => text,
-        }
-    }
 
     /// The argument text of the call whose `(` is at `open`, paren-balanced.
     fn argument(source: &str, open: usize) -> &str {
@@ -297,19 +375,19 @@ mod tests {
         );
     }
 
-    /// The count is stated once, here, so a reviewer can check it against the
-    /// architecture's table without reading the match.
+    /// The unreached set is stated once, here, so a reviewer can check it
+    /// against the architecture's table without reading the match.
+    ///
+    /// Named for the list rather than its length (REQ-561 shrinks it one
+    /// category per task, and a test whose *name* has to change with each one is
+    /// a rename nobody wants four times).
     #[test]
-    fn five_categories_are_declared_and_unreached() {
+    fn the_declared_unreached_categories_are_stated_once() {
         let unreached: Vec<&str> = Category::ALL
             .into_iter()
             .filter(|c| !has_call_site(*c))
             .map(Category::as_str)
             .collect();
-        assert_eq!(
-            unreached,
-            vec!["redact", "title", "compact", "triage", "shell"],
-            "the unreached set changed"
-        );
+        assert_eq!(unreached, vec!["redact"], "the unreached set changed");
     }
 }
