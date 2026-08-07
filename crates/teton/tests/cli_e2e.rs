@@ -1646,7 +1646,7 @@ fn policy_show_renders_the_daemons_resolved_table() {
     // one that has a call site does not. The marker is derived from the
     // daemon's own call sites, so this also shows the CLI is rendering the
     // daemon's answer rather than a table of its own.
-    let unreached = row(&shown, "triage").expect("a `triage` row");
+    let unreached = row(&shown, "compact").expect("a `compact` row");
     assert!(
         unreached.contains("declared, no call site yet"),
         "an unreached category must be marked; row:\n{unreached}"
@@ -1655,6 +1655,15 @@ fn policy_show_renders_the_daemons_resolved_table() {
     assert!(
         !reached.contains("no call site"),
         "`edit` has a call site and must not carry the marker; row:\n{reached}"
+    );
+    // REQ-561 AC-1, the half this REQ has answered so far: `triage` was on the
+    // marked side of this very assertion until `GrepTool::refine` gave it a call
+    // site. The marker is derived, so the row follows the code — and this is
+    // where a regression that unwired the duty would surface.
+    let triaged = row(&shown, "triage").expect("a `triage` row");
+    assert!(
+        !triaged.contains("no call site"),
+        "`triage` is wired (REQ-561 TASK-060) and must not carry the marker; row:\n{triaged}"
     );
 
     // AC-12: the BR-9 declared default is configuration-visible, and the CLI

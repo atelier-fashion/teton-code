@@ -136,8 +136,8 @@ use crate::harness::context::NoopProvenanceHook;
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
-    PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolRegistry,
-    DIGEST_DUTY,
+    PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolDuties,
+    ToolRegistry, DIGEST_DUTY, TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -204,6 +204,26 @@ fn scripted_classification() -> &'static str {
 /// turns later.
 const SCRIPTED_DIGEST: &str = "[scripted digest of the tool output]";
 
+/// The stand-in's answer to a `triage` duty: **the identity ranking** — every
+/// match offered, in the order it was offered (REQ-561 BR-10).
+///
+/// A stand-in cannot judge relevance. Inventing an order would silently reorder
+/// every fixture's `grep` output and make a fixture's meaning depend on a
+/// judgement no fixture author wrote; answering with nothing usable would make
+/// every scripted session report a `triage` failure. So it keeps every match and
+/// drops none, which is the one answer that is both *valid* (it parses as a
+/// ranking) and *neutral*.
+///
+/// The count is read off the prompt rather than guessed, so a change to the
+/// prompt's numbering shows up here rather than as an unusable answer two
+/// fixtures later.
+fn scripted_triage(prompt: &str) -> String {
+    (1..=crate::harness::triage::offered_match_count(prompt))
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A local [`Engine`] that replays a fixed script of replies, one per turn.
 ///
 /// This is the CI/offline stand-in for a real llama.cpp engine: the daemon ships
@@ -214,14 +234,16 @@ const SCRIPTED_DIGEST: &str = "[scripted digest of the tool output]";
 ///
 /// **A duty is not a turn** (REQ-558). The script is a sequence of *turns*, and
 /// the daemon also issues local *duty* calls on its own behalf: a `route`
-/// classification before every freeform judgment turn (TASK-053), and a `digest`
-/// whenever a tool result crosses the summarization threshold (TASK-054). Serving
-/// those from the script would silently shift every block by one and make a
-/// fixture's meaning depend on how many duties the daemon happens to run — so
-/// each duty is recognized by its own **output contract**
+/// classification before every freeform judgment turn (TASK-053), a `digest`
+/// whenever a tool result crosses the summarization threshold (TASK-054), and a
+/// `triage` whenever a `grep` returns more than one match (REQ-561 TASK-060).
+/// Serving those from the script would silently shift every block by one and
+/// make a fixture's meaning depend on how many duties the daemon happens to run
+/// — so each duty is recognized by its own **output contract**
 /// ([`crate::classify::CLASSIFIER_OUTPUT_CONTRACT`],
-/// [`crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT`]) and answered
-/// off-script, consuming nothing.
+/// [`crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT`],
+/// [`crate::harness::triage::TRIAGE_OUTPUT_CONTRACT`]) and answered off-script,
+/// consuming nothing.
 ///
 /// The `digest` half was latent before this task and is not: `summarize_if_large`
 /// has always called this engine, and it *did* consume a block. It has never
@@ -278,6 +300,8 @@ impl Engine for ScriptedFileEngine {
             scripted_classification().to_owned()
         } else if prompt.contains(crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
             SCRIPTED_DIGEST.to_owned()
+        } else if prompt.contains(crate::harness::triage::TRIAGE_OUTPUT_CONTRACT) {
+            scripted_triage(prompt)
         } else {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
             self.replies
@@ -1727,6 +1751,12 @@ impl DaemonRuntime {
         // turn on the local tier can digest remotely — the two decisions are not
         // the same decision, which is the whole premise of dispatching on purpose.
         let digest = self.digest_route(router, config, events, session_id, local_engine.as_ref());
+        // REQ-561 TASK-060: and so does `triage`, the duty the `grep` tool owns.
+        // Resolved here beside `digest` because both need the engine slot read
+        // once for the attempt, and independently of it because two categories
+        // are two decisions.
+        let triage = self.triage_route(router, config, events, session_id, local_engine.as_ref());
+        let duties = ToolDuties { triage: &triage };
 
         if is_local {
             let Some((engine, format)) = local_engine.as_ref() else {
@@ -1746,6 +1776,7 @@ impl DaemonRuntime {
                 &route.harness,
                 &mut hook,
                 &digest,
+                &duties,
             )
             .await;
         }
@@ -1816,6 +1847,7 @@ impl DaemonRuntime {
             &route.harness,
             &mut hook,
             &digest,
+            &duties,
         )
         .await
     }
@@ -1861,6 +1893,43 @@ impl DaemonRuntime {
         };
         self.resolve_duty(
             DIGEST_DUTY,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
+    }
+
+    /// Resolve the `triage` category for this turn (REQ-561 TASK-060).
+    ///
+    /// The same two layers, in the same order, for the same reasons as
+    /// [`Self::digest_route`] — session taint first, then the one resolver — and
+    /// the same reason for existing separately at all: the line naming the
+    /// category is what [`crate::call_sites`]'s derived-marker test reads out of
+    /// the daemon's own source, so it cannot be folded into a helper taking a
+    /// category *variable* without making that scan blind (ADR-3).
+    ///
+    /// `triage` is a `scan` duty, so it inherits whatever `scan` is bound to and
+    /// sends **grep match text** — file content — there. That is the binding
+    /// working as configured; what holds the line is BR-7's scoping at the
+    /// egress choke point, by the provenance of the matched files rather than of
+    /// the turn.
+    fn triage_route(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+    ) -> DutyRoute {
+        let route = if self.session_taint.is_tainted(session_id) {
+            router.resolve_local_pin(taint_pin_reason("the `triage` duty"))
+        } else {
+            router.resolve(Category::Triage)
+        };
+        self.resolve_duty(
+            TRIAGE_DUTY,
             &route,
             config,
             events,
@@ -4908,6 +4977,57 @@ provider_id = "on-device"
         );
     }
 
+    /// **The same seam, for the `triage` duty** (REQ-561 BR-10, AC-12).
+    ///
+    /// A `grep` returning two or more matches now issues a duty call, and every
+    /// acceptance fixture's `grep` goes through this engine. Without the
+    /// recognition arm that call would eat the next scripted *turn* and shift
+    /// every block after it by one — the failure REQ-558 shipped twice before it
+    /// was caught, which is why the arm lands in the same task as the duty
+    /// rather than in the verification task.
+    ///
+    /// Driven through `rank_matches` rather than against the bare constant,
+    /// because what needs asserting is that the **real duty prompt** is
+    /// recognized after rendering. A prompt edit that left the recognizer
+    /// matching nothing would pass a test written against the constant alone.
+    #[tokio::test]
+    async fn a_triage_duty_is_answered_off_script_and_consumes_no_block() {
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(ScriptedFileEngine::from_script(
+            "m",
+            "first reply\n---\nsecond reply",
+        )));
+
+        let matches = [
+            "src/a.rs:1: let needle = 1;",
+            "src/b.rs:2: let needle = 2;",
+            "src/c.rs:3: let needle = 3;",
+        ];
+        let order = crate::harness::triage::rank_matches(
+            &DutyRoute::local(TRIAGE_DUTY, "local", Arc::clone(&engine)),
+            "find where the needle is defined",
+            "grep for the literal `needle`",
+            &matches,
+            &crate::egress::Provenance::empty(),
+        )
+        .await
+        .expect("the stand-in served the duty");
+
+        // The identity ranking: every match, in the order it was offered. A
+        // stand-in cannot judge relevance, so the one answer it can give without
+        // silently reordering a fixture's `grep` output is "no change".
+        assert_eq!(order, vec![0, 1, 2]);
+
+        // And the turn sequence is untouched: turn 1 still gets block 1.
+        let params = GenParams::default();
+        let mut sink = |_: &str| true;
+        let guard = engine.lock().expect("engine mutex");
+        assert_eq!(
+            guard.complete("p", &params, &mut sink).unwrap().text,
+            "first reply",
+            "the triage consumed a scripted turn"
+        );
+    }
+
     /// And the answer it gives is one the classifier can actually parse — a
     /// stand-in whose reply failed the parse would leave every scripted freeform
     /// turn reporting a classifier failure in `route_decided`.
@@ -5313,7 +5433,7 @@ provider_id = "on-device"
 
     /// ADR-A + AC-12, on the projection a client actually reads.
     ///
-    /// The snapshot carries one row per category — all eleven — with the five
+    /// The snapshot carries one row per category — all eleven — with the ones
     /// that no model call reaches marked, and the BR-9 judgment default beside
     /// them. Both are things `teton policy show` renders and nothing else
     /// computes.
@@ -5333,7 +5453,7 @@ provider_id = "on-device"
             .collect();
         assert_eq!(
             unreached,
-            vec!["redact", "title", "compact", "triage", "shell"],
+            vec!["redact", "title", "compact", "shell"],
             "the marker in the projection must agree with `call_sites::has_call_site`"
         );
         for row in &snap.routing {
@@ -7661,6 +7781,135 @@ provider_id = "on-device"
                     "resolving a duty is not performing one; announcing here would \
                      report a routed model call that never happened: {decided:?}"
                 );
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // The `triage` duty's own dispatch (REQ-561 TASK-060): `triage_route`.
+        //
+        // Same two layers as `digest`, asserted separately because they are two
+        // decisions: a session may well digest locally and triage remotely, and
+        // a shared resolver that quietly collapsed them would pass `digest`'s
+        // tests while breaking this one.
+        // -------------------------------------------------------------------
+        mod triage {
+            use super::*;
+            use teton_core::category::{CategoryOverride, ConfigurableCategory};
+
+            /// `config()` plus a `scan` binding — the tier `triage` inherits.
+            fn scan_bound_to(provider_id: &str) -> Config {
+                let mut config = config();
+                config.tiers.push(TierBinding {
+                    tier: Tier::Scan,
+                    provider_id: provider_id.to_owned(),
+                    fallback_id: None,
+                });
+                config
+            }
+
+            /// The `triage` route the turn path builds, from the same runtime
+            /// state and through the same router.
+            fn triage_for(runtime: &DaemonRuntime, session: &SessionId) -> DutyRoute {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                runtime.triage_route(
+                    &router,
+                    &config,
+                    &Arc::new(EventBus::new()),
+                    session,
+                    slot.as_ref(),
+                )
+            }
+
+            /// **BR-1.** `triage` is a `scan` duty, so binding `scan` sends the
+            /// ranking there — grep match text, which is file content, goes to
+            /// whatever that tier names. The configured table is read for this
+            /// call as for any other.
+            #[test]
+            fn triage_inherits_the_scan_tier_binding() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(scan_bound_to("cheap"), &engine, true);
+                assert_eq!(
+                    triage_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some("cheap")
+                );
+            }
+
+            /// A per-category override beats the tier here as everywhere.
+            #[test]
+            fn a_triage_override_beats_the_scan_binding() {
+                let engine = CountingEngine::answering("design");
+                let mut config = scan_bound_to("cheap");
+                config.categories.push(CategoryOverride {
+                    name: ConfigurableCategory::Triage,
+                    provider_id: "frontier".to_owned(),
+                    fallback_id: None,
+                });
+                let runtime = runtime(config, &engine, true);
+                assert_eq!(
+                    triage_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some("frontier")
+                );
+            }
+
+            /// With nothing bound to `scan`, `triage` inherits the local tier —
+            /// so a user who configures nothing gets ranking without egress.
+            #[test]
+            fn an_unbound_scan_tier_triages_locally() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(config(), &engine, true);
+                assert_eq!(
+                    triage_for(&runtime, &SessionId::from("sess")).provider(),
+                    Some(LOCAL_PROVIDER_ID)
+                );
+            }
+
+            /// **BR-5 / LESSON-432.** Session taint overrides the category
+            /// binding. A tainted session with `scan` bound remotely still ranks
+            /// locally — and `triage` is the duty where that matters most
+            /// concretely, because the content it sends is *lines out of the
+            /// files that tainted the session in the first place*.
+            ///
+            /// The mutation-sensitive one: deleting the taint check in
+            /// `triage_route` turns this red on its own, at its own layer.
+            #[test]
+            fn a_tainted_session_triages_on_the_local_tier() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(scan_bound_to("frontier"), &engine, true);
+                let session = SessionId::from("tainted");
+
+                // Non-vacuity: the same config, untainted, genuinely goes remote.
+                assert_eq!(
+                    triage_for(&runtime, &SessionId::from("clean")).provider(),
+                    Some("frontier")
+                );
+
+                runtime.session_taint.mark(&session);
+                assert_eq!(
+                    triage_for(&runtime, &session).provider(),
+                    Some(LOCAL_PROVIDER_ID),
+                    "a tainted session must rank locally (BR-5)"
+                );
+            }
+
+            /// An unroutable binding is a *reason*, not a silent `None`: the
+            /// caller has to be able to say why the matches came back unranked
+            /// (BR-3, LESSON-447).
+            #[test]
+            fn an_unroutable_scan_binding_leaves_triage_unresolved_with_a_reason() {
+                let engine = CountingEngine::answering("design");
+                let runtime = runtime(scan_bound_to("ghost"), &engine, true);
+
+                let route = triage_for(&runtime, &SessionId::from("sess"));
+
+                assert_eq!(route.provider(), None);
+                let DutyRoute::Unresolved { reason } = route else {
+                    panic!("an unroutable binding must not resolve to a provider");
+                };
+                assert!(reason.contains("triage"), "{reason}");
+                assert!(reason.contains("ghost"), "{reason}");
             }
         }
     }

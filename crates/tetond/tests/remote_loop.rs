@@ -39,7 +39,7 @@ use tetond::egress::Egress;
 use tetond::harness::{
     build_system_prompt, run_session_turn_with_source, ContextManager, DutyRoute, HarnessConfig,
     HarnessError, NoopProvenanceHook, PendingPermissions, PermissionConfig, PermissionGate,
-    RemoteProviderSource, SessionEvents, ToolContext, ToolRegistry,
+    RemoteProviderSource, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
 };
 
 // --------------------------------------------------------------------------
@@ -263,6 +263,12 @@ async fn remote_routed_session_streams_dispatches_tools_and_records_cost() {
         // stay under the summarization threshold, so nothing is served — and an
         // unresolved route bounds mechanically rather than folding raw.
         &DutyRoute::unresolved("no digest route in this test"),
+        // REQ-561: and no tool duty either. `triage` would rank a `grep`
+        // result; these turns run no multi-match `grep`, and an unresolved
+        // route returns the tool's own result unchanged.
+        &ToolDuties {
+            triage: &DutyRoute::unresolved("no triage route in this test"),
+        },
     )
     .await
     .expect("remote turn completes");
@@ -396,6 +402,12 @@ async fn remote_turn_over_boundary_context_is_blocked_and_never_billed() {
         // stay under the summarization threshold, so nothing is served — and an
         // unresolved route bounds mechanically rather than folding raw.
         &DutyRoute::unresolved("no digest route in this test"),
+        // REQ-561: and no tool duty either. `triage` would rank a `grep`
+        // result; these turns run no multi-match `grep`, and an unresolved
+        // route returns the tool's own result unchanged.
+        &ToolDuties {
+            triage: &DutyRoute::unresolved("no triage route in this test"),
+        },
     )
     .await;
 

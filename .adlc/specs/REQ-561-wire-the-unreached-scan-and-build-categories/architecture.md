@@ -268,6 +268,63 @@ a comment. Refer to it descriptively in prose ("resolve the `digest` category")
 and keep the literal spelling to actual call sites only. The next four duty tasks
 all write similar documentation and would each rediscover this.
 
+## ADR-10: Tool-owned duties hang off an async `Tool::refine`, not off `Tool::run`
+
+**Decision.** `Tool` gains an async provided method:
+
+```rust
+async fn refine(&self, args: &Value, request: &str,
+                duties: &ToolDuties<'_>, outcome: ToolOutcome) -> RefinedOutcome
+```
+
+Default is identity. Only the tool that owns a duty overrides it. The turn loop
+calls it for **every** tool result. `ToolDuties` carries the resolved routes down
+from the runtime, one field per tool-owned duty. `RefinedOutcome { outcome,
+duty_error }` puts the degradation on the value, mirroring `SummarizeOutcome`.
+
+**Why — TASK-060 and TASK-061's stated call sites are unreachable as written.**
+Both task files say to call the duty inside `GrepTool::run` / `ShellTool::run`.
+`Tool::run` is **synchronous**, and `ToolRegistry::dispatch` is invoked directly
+from the async turn loop (`turn_loop.rs:525`), so a `block_on` there panics with
+*"Cannot start a runtime from within a runtime"* on the exact path it runs on.
+The MCP tool's `block_in_place` + `Handle::block_on` bridge (`tools/mcp.rs:174`)
+is not an escape either: it parks a runtime worker for the length of an
+inference — precisely what `LocalDuty::perform`'s `spawn_blocking` exists to
+avoid — and it panics outright on the current-thread runtime `#[tokio::test]`
+defaults to.
+
+**Why not `if name == "grep"` in the turn loop.** That is verbatim what BR-1
+forbids ("no tool name may assign one") and what AC-10 asserts against. With
+`refine`, the category is never derived from a name: `ToolRegistry::refine` uses
+the name only for **instance lookup** — the same dispatch that already routes
+`run` — and the `GrepTool` impl reaches `duties.triage`, a route resolved in
+`runtime.rs` from a literal category. Polymorphic dispatch, not a name→category
+map.
+
+**TASK-061 copies this exactly**: `ShellTool` overrides `refine`, `ToolDuties`
+gains a `shell` field. No new parameter on `run_session_turn_with_source`, no new
+route type. TASK-062 (`title`) and TASK-063 (`compact`) are **not** tool-owned
+and do not use this seam — they hang off session creation and the context
+manager respectively.
+
+## ADR-11: A duty may decline to run, and the threshold is a named constant
+
+**Decision.** `triage` introduces `TRIAGE_MIN_MATCHES`: ranking a single match is
+a model call bought for nothing, so below the threshold the duty is not invoked
+at all. The threshold is a **public named constant with a zero-call test**, never
+an inline literal.
+
+**Why record it.** This was not in the spec — it is an addition made during
+TASK-060, and it is disclosed rather than smuggled. It is also the same shape as
+BR-4b's resolved `shell` trigger (fire on failure or oversize, not on every
+result), so the pattern is consistent rather than ad hoc: **a duty that cannot
+add value does not run, and the condition under which it declines is legible and
+testable.** `digest` already had this shape via its size threshold.
+
+The rule for the remaining duties: if a duty declines under some condition, that
+condition is a named constant and a test asserts the zero-call case. A hidden
+threshold is a cost surprise.
+
 ## ADR-7: The four duty tasks are chained, not parallel
 
 **Decision.** TASK-060 → 061 → 062 → 063 run in sequence, not concurrently.

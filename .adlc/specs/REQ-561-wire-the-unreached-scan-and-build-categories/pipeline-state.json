@@ -49,10 +49,11 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-060",
+    "currentTask": "TASK-061",
     "completedTasks": [
       "TASK-058",
-      "TASK-059"
+      "TASK-059",
+      "TASK-060"
     ],
     "failedTasks": []
   }

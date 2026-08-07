@@ -1,7 +1,7 @@
 ---
 id: TASK-060
 title: "The triage duty — rank grep matches before they enter context"
-status: draft
+status: complete
 parent: REQ-561
 created: 2026-08-07
 updated: 2026-08-07

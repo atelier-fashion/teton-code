@@ -2,7 +2,7 @@
 //!
 //! REQ-558 declares all eleven categories and resolves all eleven, so the config
 //! schema stabilizes once and the remaining call sites can be tagged later
-//! without a second migration. But five of them have **no model call site at
+//! without a second migration. But some of them have **no model call site at
 //! all**, and a knob that silently does nothing invites a user to tune it —
 //! LESSON-481's shape ("a gate that hides a feature from users also hides it
 //! from the test suite"). So `teton policy show` marks them
@@ -16,8 +16,8 @@
 //! the direction the list actually rots in. The test at the bottom of this file
 //! closes that gap: it reads the daemon's own source, finds every routing call
 //! site, works out which categories reach a router through them, and asserts the
-//! result equals this match. Wire up `triage` and the test fails until the
-//! marker follows.
+//! result equals this match. Wire up `shell` and the test fails until the
+//! marker follows — which is exactly how `triage` arrived (REQ-561 TASK-060).
 //!
 //! That test is the load-bearing half of ADR-A. This match is just where its
 //! answer is written down.
@@ -44,17 +44,17 @@ pub const fn has_call_site(category: Category) -> bool {
         // what the classifier said (freeform) or what the phase maps to
         // (structured) — so they are reached together or not at all.
         Category::Edit | Category::Design | Category::Debug | Category::Review => true,
+        // The `grep` tool's own duty: `GrepTool::refine` ranks the matches it
+        // just found against the turn's request before they enter context
+        // (REQ-561 TASK-060). Unreached until then — the hits were returned in
+        // whatever order the filesystem walk produced.
+        Category::Triage => true,
         // Declared, unreached. Egress redaction is regex-based and makes no
         // model call; nothing names sessions or branches; compaction truncates
-        // mechanically; grep/glob hits are returned unranked; and `shell` is
-        // ADR-I's deliberate deferral — you cannot know a turn will emit a shell
-        // call until the model has already answered, and the interpretation half
-        // has no call site either.
-        Category::Redact
-        | Category::Title
-        | Category::Compact
-        | Category::Triage
-        | Category::Shell => false,
+        // mechanically; and `shell` is ADR-I's deliberate deferral — you cannot
+        // know a turn will emit a shell call until the model has already
+        // answered, and the interpretation half has no call site either.
+        Category::Redact | Category::Title | Category::Compact | Category::Shell => false,
     }
 }
 
@@ -297,10 +297,14 @@ mod tests {
         );
     }
 
-    /// The count is stated once, here, so a reviewer can check it against the
-    /// architecture's table without reading the match.
+    /// The unreached set is stated once, here, so a reviewer can check it
+    /// against the architecture's table without reading the match.
+    ///
+    /// Named for the list rather than its length (REQ-561 shrinks it one
+    /// category per task, and a test whose *name* has to change with each one is
+    /// a rename nobody wants four times).
     #[test]
-    fn five_categories_are_declared_and_unreached() {
+    fn the_declared_unreached_categories_are_stated_once() {
         let unreached: Vec<&str> = Category::ALL
             .into_iter()
             .filter(|c| !has_call_site(*c))
@@ -308,7 +312,7 @@ mod tests {
             .collect();
         assert_eq!(
             unreached,
-            vec!["redact", "title", "compact", "triage", "shell"],
+            vec!["redact", "title", "compact", "shell"],
             "the unreached set changed"
         );
     }

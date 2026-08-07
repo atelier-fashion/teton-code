@@ -45,12 +45,15 @@ use crate::broadcast::EventBus;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
-use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN};
+use super::context::{
+    summarize_if_large, BlockRole, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN,
+};
 use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
 use super::reply::StreamGate;
-use super::tools::{ToolContext, ToolOutcome, ToolRegistry};
+use super::tools::{RefinedOutcome, ToolContext, ToolDuties, ToolOutcome, ToolRegistry};
+use super::triage::TRIAGE_DUTY;
 
 /// Tools that count as a verification step after an edit.
 const VERIFY_TOOLS: &[&str] = &["shell", "read", "grep"];
@@ -344,6 +347,10 @@ pub async fn run_session_turn(
     // The local tier names itself here, as it does everywhere the tier comes from
     // the engine rather than from a `[[providers]]` entry (REQ-557 ADR-D).
     let digest = DutyRoute::local(DIGEST_DUTY, "local", Arc::clone(engine));
+    // The same engine serves the tools' own duties, for the same reason: this
+    // entry point has no router, and a path whose whole guarantee is "no
+    // transport exists here" is not the place to acquire one.
+    let triage = DutyRoute::local(TRIAGE_DUTY, "local", Arc::clone(engine));
     run_session_turn_with_source(
         &mut source,
         tools,
@@ -354,6 +361,7 @@ pub async fn run_session_turn(
         config,
         hook,
         &digest,
+        &ToolDuties { triage: &triage },
     )
     .await
 }
@@ -380,6 +388,13 @@ pub async fn run_session_turn(
 /// shrink its input. [`DutyRoute::Unresolved`] replaces it, and
 /// [`summarize_if_large`] bounds mechanically instead.
 ///
+/// `duties` carries the duties a **tool** owns rather than the loop — today the
+/// `triage` route a `grep` result is ranked through (REQ-561 TASK-060). It is
+/// one struct rather than one parameter per duty so that wiring the next
+/// category adds a field, not another argument to this signature; and it is
+/// handed to every tool result rather than switched on a tool name, because a
+/// category selected by a string comparison is exactly what BR-1 forbids.
+///
 /// # Errors
 /// [`HarnessError::Engine`] on a local backend failure, or
 /// [`HarnessError::Remote`] on a provider/transport failure (including a privacy
@@ -395,8 +410,13 @@ pub async fn run_session_turn_with_source(
     config: &HarnessConfig,
     hook: &mut dyn ProvenanceHook,
     digest: &DutyRoute,
+    duties: &ToolDuties<'_>,
 ) -> Result<TurnOutcome, HarnessError> {
     let exposed = tools.exposed_names(config.max_tools);
+    // What "relevant" is measured against, read once: the loop appends model
+    // turns and tool results as it runs, never another user block, so the
+    // request cannot change underneath it.
+    let request = latest_request(ctx);
     let mut turns = 0u32;
     let mut edited = false;
     let mut verified = false;
@@ -536,6 +556,32 @@ pub async fn run_session_turn_with_source(
                         // rather than declaring victory off a failed check.
                         if edited && !outcome.is_error && VERIFY_TOOLS.contains(&name.as_str()) {
                             verified = true;
+                        }
+
+                        // The tool's own duty, if it has one (REQ-561 BR-1).
+                        //
+                        // Asked of **every** result, not of a list of tool names:
+                        // the tool that produced this outcome is the thing that
+                        // knows whether a duty applies to it, so no string
+                        // comparison here assigns a category. `grep` ranks its
+                        // matches through `triage`; every other tool answers with
+                        // the result it already had.
+                        //
+                        // A failure is never silent, and never fatal: the tool's
+                        // own unrefined result comes back with the reason on the
+                        // outcome, which is logged here exactly as the `digest`
+                        // duty's failure is below.
+                        let RefinedOutcome {
+                            outcome,
+                            duty_error,
+                        } = tools
+                            .refine(&name, &arguments, &request, duties, outcome)
+                            .await;
+                        if let Some(error) = &duty_error {
+                            eprintln!(
+                                "tetond: the `{name}` tool's duty could not be served \
+                                 ({error}); folded its own unrefined result instead"
+                            );
                         }
 
                         // REQ-544 C-1: the result's egress provenance is the files
@@ -690,6 +736,23 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     s.push_str("\nAvailable tools:\n");
     s.push_str(&tools.docs(config.max_tools));
     s
+}
+
+/// The request this turn is serving: the most recent user block in `ctx`.
+///
+/// This is what a [`Tool::refine`](super::tools::Tool::refine) duty measures
+/// "relevant" against, and it is read from the context rather than threaded down
+/// from the RPC so that every entry point into the loop — the daemon's, the
+/// offline one, a test's — gets the same answer from the same place. A context
+/// with no user block yet (a system-only assembly) yields the empty string,
+/// which a duty prompt carries harmlessly.
+fn latest_request(ctx: &ContextManager) -> String {
+    ctx.blocks()
+        .iter()
+        .rev()
+        .find(|block| block.role == BlockRole::User)
+        .map(|block| block.text.clone())
+        .unwrap_or_default()
 }
 
 /// A short human title for a tool call (drives the `tool_call` event title).
@@ -862,9 +925,20 @@ mod tests {
         // start digesting here, the result would still be bounded rather than
         // folded raw.
         let digest = DutyRoute::unresolved("no digest route in this test");
+        // And no tool runs, so no tool duty is reached either.
+        let triage = DutyRoute::unresolved("no triage route in this test");
 
         run_session_turn_with_source(
-            source, &tools, &tool_ctx, &gate, &events, &mut ctx, &config, &mut hook, &digest,
+            source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &digest,
+            &ToolDuties { triage: &triage },
         )
         .await
         .expect("the turn completes");

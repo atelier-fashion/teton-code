@@ -21,7 +21,8 @@ tool call in a coding session.
 ## Files to Create/Modify
 
 - `crates/tetond/src/harness/shell_duty.rs` — **new**. Prompt builder, `SHELL_OUTPUT_CONTRACT`, `SHELL_OUTPUT_MAX_BYTES`, and the trigger predicate. Named `shell_duty` to avoid colliding with the existing `harness/tools/shell.rs`.
-- `crates/tetond/src/harness/tools/shell.rs` — evaluate the trigger on the **raw** stdout+stderr before `render_output()` truncates (line ~228/241); call the duty when it fires; degrade to today's 8k truncation on failure.
+- `crates/tetond/src/harness/tools/shell.rs` — override **`Tool::refine`** (see ADR-10 — do NOT try to call the duty from `ShellTool::run`); evaluate the trigger on the **raw** stdout+stderr before `render_output()` truncates (line ~228/241); degrade to today's 8k truncation on failure.
+- `crates/tetond/src/harness/tools/mod.rs` — add a `shell` field to `ToolDuties`.
 - `crates/tetond/src/harness/mod.rs` — declare the `shell_duty` module.
 - `crates/tetond/src/runtime.rs` — add `shell_route()` spelling `router.resolve(Category::Shell)` literally.
 - `crates/tetond/src/call_sites.rs` — flip `Category::Shell` to `true`.
@@ -39,6 +40,18 @@ tool call in a coding session.
 - [ ] `cargo test --workspace --no-fail-fast` is green.
 
 ## Technical Notes
+
+**Read ADR-10 before writing anything, and read `GrepTool::refine` (TASK-060) as
+the worked example.** `Tool::run` is **synchronous** and is dispatched directly
+from the async turn loop, so calling a duty from inside `ShellTool::run` panics
+with *"Cannot start a runtime from within a runtime"* on the path it actually
+runs on. TASK-060 hit this and built the `refine` seam; copying it is a small
+change (a `refine` override plus a `ToolDuties.shell` field). Do **not**
+rediscover this, and do **not** put `if name == "shell"` in the turn loop — that
+is exactly what BR-1 forbids and AC-10 asserts against.
+
+Per ADR-11, the BR-4b trigger is a **named constant** with a test asserting the
+zero-call case, not an inline literal.
 
 `MAX_OUTPUT_CHARS = 8_000` at `tools/shell.rs:36`, enforced in `render_output()`
 at `:241-243`. **Capture the raw length before calling `render_output()`** — see

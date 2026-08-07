@@ -26,6 +26,10 @@
 //! - [`digest`] — what is `digest`-specific about the summarization duty
 //!   (REQ-558): its [`digest::DIGEST_DUTY`] descriptor and the tool-result
 //!   provenance bridge. Everything else it used to own now lives in [`duty`].
+//! - [`triage`] — what is `triage`-specific about the grep-ranking duty
+//!   (REQ-561): its [`triage::TRIAGE_DUTY`] descriptor, its output contract, and
+//!   its prompt builder. The call site is [`tools::GrepTool`]'s
+//!   [`Tool::refine`](tools::Tool::refine).
 //! - [`completion`] — the [`completion::CompletionSource`] the loop drives: a
 //!   local-[`Engine`](teton_inference::Engine) impl and a remote-[`Provider`](teton_providers::Provider)
 //!   impl that streams through the egress choke point (BR-1/BR-2). This is what
@@ -49,6 +53,7 @@ pub mod permissions;
 pub(crate) mod render;
 pub(crate) mod reply;
 pub mod tools;
+pub mod triage;
 pub mod turn_loop;
 
 pub use completion::{
@@ -64,7 +69,8 @@ pub use duty::{Duty, DutyKind, DutyRoute};
 pub use permissions::{
     PendingPermissions, PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,
 };
-pub use tools::{Tool, ToolContext, ToolOutcome, ToolRegistry};
+pub use tools::{RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome, ToolRegistry};
+pub use triage::TRIAGE_DUTY;
 pub use turn_loop::{
     build_system_prompt, run_session_turn, run_session_turn_with_source, HarnessConfig,
     HarnessError, SessionEvents, TurnOutcome,

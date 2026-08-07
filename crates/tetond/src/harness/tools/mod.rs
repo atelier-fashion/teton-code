@@ -16,9 +16,11 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::Value;
 
 use super::context::ToolProvenance;
+use super::duty::DutyRoute;
 
 pub mod edit;
 pub mod glob;
@@ -213,8 +215,70 @@ impl ToolError {
     }
 }
 
-/// A built-in agent tool. Synchronous, jailed, and infallible from the loop's
-/// point of view (failures come back as `ToolOutcome { is_error: true }`).
+/// The harness duties a tool may refine its **own** result through, resolved for
+/// this turn (REQ-561).
+///
+/// One field per tool-owned duty, and nothing else: the route type, the trait,
+/// the local and remote implementations, the egress scoping and the output
+/// ceiling all live once on the shared [`duty`](super::duty) seam (BR-6, ADR-1).
+/// This is the wire that carries a resolved route from the runtime — which owns
+/// the router — down to the tool that knows what to do with it.
+///
+/// It exists so a duty is never selected by **matching on a tool name** (BR-1).
+/// The loop hands the same context to every tool and each tool answers for
+/// itself, so no string comparison anywhere assigns a category.
+pub struct ToolDuties<'a> {
+    /// The `triage` category, resolved for this turn (TASK-060). Ranks a `grep`
+    /// result against the request before it enters context.
+    pub triage: &'a DutyRoute,
+}
+
+/// A tool result after its own tool had the chance to refine it through a duty.
+///
+/// The degradation is on the **value**, not only in a log (BR-3): a caller that
+/// wants to surface "the duty could not be served" — a log line, an event, a
+/// test assertion — reads it here rather than inferring it from the text. This
+/// mirrors [`SummarizeOutcome`](super::context::SummarizeOutcome), the duty
+/// outcome the loop already handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefinedOutcome {
+    /// What to fold into context: the refined result, or — on any failure — the
+    /// tool's own result, unchanged.
+    pub outcome: ToolOutcome,
+    /// Why the tool fell back to its own unrefined result, when it did. `None`
+    /// when the duty served, and `None` when the tool has no duty or did not
+    /// need one.
+    pub duty_error: Option<String>,
+}
+
+impl RefinedOutcome {
+    /// `outcome` as it stands: no duty ran, so there is nothing to report.
+    #[must_use]
+    pub fn unrefined(outcome: ToolOutcome) -> Self {
+        Self {
+            outcome,
+            duty_error: None,
+        }
+    }
+
+    /// `outcome` as it stands, because the duty could not be served — carrying
+    /// the reason so the caller can surface it (LESSON-447).
+    #[must_use]
+    pub fn degraded(outcome: ToolOutcome, error: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            duty_error: Some(error.into()),
+        }
+    }
+}
+
+/// A built-in agent tool. Jailed, and infallible from the loop's point of view
+/// (failures come back as `ToolOutcome { is_error: true }`).
+///
+/// [`Tool::run`] is **synchronous**: tool work is filesystem and process I/O,
+/// and the loop dispatches it inline. [`Tool::refine`] is the async half, for
+/// the one thing a tool cannot do synchronously — make a model call.
+#[async_trait]
 pub trait Tool: Send + Sync {
     /// Stable tool name the model calls it by.
     fn name(&self) -> &str;
@@ -227,6 +291,34 @@ pub trait Tool: Send + Sync {
 
     /// Run the tool against `args`, jailed to `ctx`.
     fn run(&self, ctx: &ToolContext, args: &Value) -> ToolOutcome;
+
+    /// Refine this tool's own `outcome` through the harness duty this tool owns,
+    /// given the `request` the turn is serving and the `args` it was called with.
+    ///
+    /// **The default is identity**, and most tools keep it: a tool with no duty
+    /// of its own returns exactly what it produced.
+    ///
+    /// This method is why a duty is never chosen by a name comparison in the
+    /// loop (BR-1). The loop calls it for every tool result; the tool that
+    /// *is* `grep` is the thing that knows a `grep` result wants ranking, so
+    /// nothing has to read a tool name — or the result text — to work that out.
+    ///
+    /// It is separate from [`Tool::run`] because refinement is a **model call**,
+    /// which is async and belongs on the loop's async path: doing it inside
+    /// `run` would mean blocking a runtime worker for the length of an
+    /// inference. Implementations must hold [`Tool::run`]'s contract: an
+    /// implementation that cannot serve returns the outcome it was given,
+    /// unchanged, with the reason on
+    /// [`RefinedOutcome::duty_error`](RefinedOutcome::duty_error).
+    async fn refine(
+        &self,
+        _args: &Value,
+        _request: &str,
+        _duties: &ToolDuties<'_>,
+        outcome: ToolOutcome,
+    ) -> RefinedOutcome {
+        RefinedOutcome::unrefined(outcome)
+    }
 }
 
 /// The set of tools available to a session.
@@ -299,6 +391,29 @@ impl ToolRegistry {
                 "unknown tool `{name}`; available tools: {}",
                 self.names().join(", ")
             )),
+        }
+    }
+
+    /// Give the tool named `name` the chance to refine its own `outcome`
+    /// through its duty (REQ-561).
+    ///
+    /// The name resolves the same tool [`Self::dispatch`] just ran, so this is
+    /// not a category being inferred from a string — it is the same lookup the
+    /// model's own tool call already made, asked a second question. A name that
+    /// resolves to nothing cannot have produced this outcome in the first place;
+    /// it is returned unrefined rather than treated as an error, because
+    /// `dispatch` already reported the unknown tool to the model.
+    pub async fn refine(
+        &self,
+        name: &str,
+        args: &Value,
+        request: &str,
+        duties: &ToolDuties<'_>,
+        outcome: ToolOutcome,
+    ) -> RefinedOutcome {
+        match self.get(name) {
+            Some(tool) => tool.refine(args, request, duties, outcome).await,
+            None => RefinedOutcome::unrefined(outcome),
         }
     }
 
