@@ -67,8 +67,8 @@ No new RPCs.
 
 ## Business Rules
 
-- [ ] BR-1: **`redact` runs on the egress payload, after provenance inspection, and
-      before a byte leaves.** It is a second pass, not a replacement: provenance
+- [ ] BR-1: **When enabled (BR-10), `redact` runs on the egress payload, after
+      provenance inspection, and before a byte leaves.** It is a second pass, not a replacement: provenance
       still blocks first and blocks fail-closed on unknown. A payload that
       provenance already refuses is never sent to the redactor.
 - [ ] BR-2: **`redact` is local, by construction, and this REQ adds no check to make
@@ -107,6 +107,21 @@ No new RPCs.
       REQ-558's classifier (freeform judgment turns only) and REQ-561's duties
       (threshold-triggered), this runs before every remote call. A stated budget and
       a measurement are acceptance criteria, not nice-to-haves.
+
+- [ ] BR-10: **`redact` is off by default and enabled by a switch that is NOT a
+      category binding** (OQ-3). The distinction is load-bearing and easy to get
+      wrong: REQ-558 ADR-B removed `redact` from `ConfigurableCategory` so that
+      *which provider serves it* is unconfigurable. An opt-in switch answers a
+      different question — *whether it runs at all* — and the two are orthogonal.
+
+      Putting the switch in the `[[categories]]` table would reintroduce exactly the
+      surface ADR-B deleted, and would make `redact` deserializable as a
+      configurable category again. It belongs in its own key (e.g. a `[privacy]`
+      table), and `ConfigurableCategory` must still have no `Redact` variant
+      afterwards.
+
+      "Off" means genuinely off: no scan, no model load, no added latency, and no
+      claim in the report that content was scanned.
 
 ## Acceptance Criteria
 
@@ -154,6 +169,14 @@ No new RPCs.
       scanner, not by output text. Redaction is a second pass over content that
       provenance permitted, and a scanner that sees refused payloads is doing work
       on content that was never going anywhere.
+- [ ] AC-13: **Off by default, and off means off** (BR-10, OQ-3): with no
+      `[privacy]` opt-in, a remote turn issues **zero** scanner calls — asserted by
+      call count, not by output — and the egress report does not claim content was
+      scanned. Enabling the switch and repeating the same turn produces a scan.
+- [ ] AC-14: **The switch is not a category binding** (BR-10): after this REQ,
+      `ConfigurableCategory` still has no `Redact` variant, and a `[[categories]]`
+      entry naming `redact` is still rejected at load naming the pin. A test asserts
+      both, so the opt-in cannot quietly reopen the binding surface REQ-558 closed.
 - [ ] AC-12: **Session taint still short-circuits ahead of this** (BR-8): a
       tainted session's payloads never reach the redactor at all, asserted by a
       call count on the scanner. `redact` is a second line for content that was
@@ -191,19 +214,27 @@ No new RPCs.
 
 - [ ] OQ-1: **BR-3's posture — block or proceed-and-report when the redactor cannot
       run?** Fail-closed is the safer default and matches REQ-544 C-1's treatment of
-      unknown provenance. But it makes a remote-only machine, or one whose weights
-      are still downloading, unable to make any remote call at all — which REQ-547
-      and BUG-152 both went to some length to avoid. This is the central decision of
-      the REQ.
+      unknown provenance. Its cost was that a remote-only machine, or one whose
+      weights are still downloading, could make no remote call at all — which
+      REQ-547 and BUG-152 both went to some length to avoid.
+
+      **OQ-3's resolution largely settles this.** With `redact` opt-in, a user who
+      turns it on has accepted that it gates remote calls, and the first-run
+      regression disappears — nobody who has not opted in is affected. The
+      recommendation is therefore **fail closed**: if the scan cannot run, the
+      payload does not go. Left formally open only because it is the REQ's central
+      safety posture and deserves an explicit yes rather than an inherited one.
 - [ ] OQ-2: Model-only, or model plus a deterministic pattern pass (the
       `sk-`/`AKIA`/`ghp_` shapes already used in the delegate redaction chain)?
       Patterns are fast, precise, and catch the common case; the model catches
       paraphrase. Running both costs one model call plus a regex sweep and makes
       recall explainable.
-- [ ] OQ-3: Is `redact` opt-in in v1? An always-on scan on every remote call is a
-      large behaviour and latency change for a guarantee users have not asked for
-      yet. Opt-in ships the capability and measures it; always-on is the honest
-      reading of BR-1's promise.
+- [x] OQ-3: **RESOLVED 2026-08-07 — `redact` is opt-in in v1.** An always-on scan
+      on every remote call is a large behaviour and latency change for a guarantee
+      users have not asked for yet, and BR-9 puts it on the critical path of every
+      remote turn. Opt-in ships the capability and lets its recall be measured
+      before anything depends on it. See BR-10 for the switch, and note what the
+      switch must **not** be.
 - [ ] OQ-4: What does a user *do* with a block? A blocked turn with "a credential
       was detected at bytes 1400–1436" and no way to proceed is a dead end. An
       override needs a permission model — which is REQ-560's subject, so this may
