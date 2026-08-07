@@ -112,104 +112,14 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
-    use futures::stream;
     use teton_core::entities::{BoundaryMode, PrivacyBoundary};
     use teton_inference::{Engine, MockEngine};
     use teton_protocol::events::RouteDecided;
     use teton_protocol::{ProviderId, SessionId, Tier};
-    use teton_providers::transport::{
-        HttpMethod, TransportError, TransportRequest, TransportResponse,
-    };
-    use teton_providers::{
-        CapabilityProfile, Provider, ProviderError, StopReason, TokenUsage, Transport,
-        TurnCompletion, TurnEvent, TurnRequest, TurnStream,
-    };
 
-    use crate::egress::{Egress, NoopSink};
     use crate::harness::context::{summarize_if_large, SummarizeOutcome};
+    use crate::harness::duty::testing::{remote_duty_route, wire, Sent};
     use crate::harness::duty::DutyRoute;
-
-    /// A transport that records every request body it is asked to send.
-    ///
-    /// This is the instrument the boundary claim is made against: "no boundary
-    /// content left the machine" is a statement about bytes on a wire, not about
-    /// a return value, so it is asserted here rather than on the outcome.
-    #[derive(Default, Clone)]
-    struct CaptureTransport {
-        sent: Arc<Mutex<Vec<Vec<u8>>>>,
-    }
-
-    #[async_trait]
-    impl Transport for CaptureTransport {
-        async fn execute(
-            &self,
-            request: TransportRequest,
-        ) -> Result<TransportResponse, TransportError> {
-            self.sent
-                .lock()
-                .expect("capture poisoned")
-                .push(request.body);
-            Ok(TransportResponse {
-                status: 200,
-                body: Box::pin(stream::empty()),
-            })
-        }
-    }
-
-    /// A provider that actually puts its request on the wire before answering.
-    ///
-    /// The smallest adapter that can *leak*: it serializes the prompt into the
-    /// transport it was handed. A test that bypassed egress would therefore show
-    /// the prompt in the capture, which is what makes the boundary assertion
-    /// non-vacuous.
-    struct WireProvider {
-        reply: String,
-        /// How many times the reply delta is streamed. `1` is an ordinary
-        /// provider; anything larger is one ignoring its token budget.
-        repeat: usize,
-    }
-
-    #[async_trait]
-    impl Provider for WireProvider {
-        fn id(&self) -> &str {
-            "wire"
-        }
-        fn capabilities(&self) -> CapabilityProfile {
-            CapabilityProfile::default()
-        }
-        async fn stream_turn(
-            &self,
-            request: TurnRequest,
-            transport: &dyn Transport,
-        ) -> Result<TurnStream, ProviderError> {
-            let body =
-                serde_json::to_vec(&request).map_err(|e| ProviderError::Build(e.to_string()))?;
-            transport
-                .execute(TransportRequest {
-                    method: HttpMethod::Post,
-                    url: "https://api.example.com/v1/chat/completions".to_owned(),
-                    headers: Vec::new(),
-                    body,
-                })
-                .await
-                .map_err(|err| match err {
-                    TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
-                    _ => ProviderError::Transport,
-                })?;
-            // `repeat` models a provider that ignores `max_tokens`: the same
-            // delta over and over, which is what an unbounded accumulator would
-            // happily grow on.
-            let mut events: Vec<Result<TurnEvent, ProviderError>> = (0..self.repeat)
-                .map(|_| Ok(TurnEvent::TextDelta(self.reply.clone())))
-                .collect();
-            events.push(Ok(TurnEvent::Completed(TurnCompletion {
-                usage: TokenUsage::default(),
-                stop_reason: StopReason::EndTurn,
-            })));
-            Ok(Box::pin(stream::iter(events)))
-        }
-    }
 
     fn boundaries() -> Vec<PrivacyBoundary> {
         vec![PrivacyBoundary {
@@ -220,34 +130,12 @@ mod tests {
 
     /// A remote `digest` route over a capturing transport, with `boundaries`
     /// enforced at the choke point.
-    fn remote_route(
-        boundaries: Vec<PrivacyBoundary>,
-        reply: &str,
-    ) -> (DutyRoute, Arc<Mutex<Vec<Vec<u8>>>>) {
-        let transport = CaptureTransport::default();
-        let sent = Arc::clone(&transport.sent);
-        let egress = Egress::new(transport, boundaries, Arc::new(NoopSink));
-        let route = DutyRoute::remote(
-            DIGEST_DUTY,
-            "frontier",
-            Box::new(WireProvider {
-                reply: reply.to_owned(),
-                repeat: 1,
-            }),
-            egress,
-            "claude-opus-4",
-            "sess-1",
-        );
-        (route, sent)
-    }
-
-    /// Everything the capturing transport was asked to send, as one string.
-    fn wire(sent: &Arc<Mutex<Vec<Vec<u8>>>>) -> String {
-        sent.lock()
-            .expect("capture poisoned")
-            .iter()
-            .map(|body| String::from_utf8_lossy(body).into_owned())
-            .collect()
+    ///
+    /// The only one of the five that fixes `repeat` at 1: `digest`'s ceiling test
+    /// below drives the accumulator through a long single reply rather than
+    /// through a provider ignoring its budget.
+    fn remote_route(boundaries: Vec<PrivacyBoundary>, reply: &str) -> (DutyRoute, Sent) {
+        remote_duty_route(DIGEST_DUTY, boundaries, reply, 1)
     }
 
     /// **A provider that ignores `max_tokens` cannot grow the digest buffer
@@ -264,21 +152,12 @@ mod tests {
     /// nothing legitimate.
     #[tokio::test]
     async fn a_remote_digest_is_bounded_however_much_the_provider_streams() {
-        // 4 KiB per delta × 64 deltas = 256 KiB offered, 16 KiB accepted.
+        // 4 KiB per delta × 64 deltas = 256 KiB offered, 16 KiB accepted. The one
+        // `digest` fixture that does *not* take `remote_route`'s fixed `repeat`
+        // of 1: a provider ignoring its budget is exactly what this test is
+        // about.
         let chunk = "x".repeat(4096);
-        let transport = CaptureTransport::default();
-        let egress = Egress::new(transport, Vec::new(), Arc::new(NoopSink));
-        let route = DutyRoute::remote(
-            DIGEST_DUTY,
-            "frontier",
-            Box::new(WireProvider {
-                reply: chunk.clone(),
-                repeat: 64,
-            }),
-            egress,
-            "claude-opus-4",
-            "sess-1",
-        );
+        let (route, _sent) = remote_duty_route(DIGEST_DUTY, Vec::new(), &chunk, 64);
 
         let out =
             summarize_if_large(&route, "read", &oversized(), 50, &ToolProvenance::none()).await;

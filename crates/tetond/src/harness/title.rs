@@ -228,8 +228,18 @@ pub async fn name_session(
 /// in a session list, and an embedded newline there is a rendering bug in every
 /// client at once. Bounded already by the seam's ceiling; this is about shape,
 /// not size.
+///
+/// [`strip_terminal_controls`] runs first and is the *other* half of "one line".
+/// `split_whitespace` covers `\n`, `\r`, `\t` and the vertical-tab/form-feed
+/// pair, because Rust's `char::is_whitespace` follows the Unicode `White_Space`
+/// property — but `\x1b` is not whitespace, and neither is the rest of C0 or
+/// DEL. A title reaches clients over `session_titled` and is rendered into a
+/// session **list**, i.e. straight into a terminal on at least one of them, so an
+/// escape sequence that survived here would repaint or reposition somebody's
+/// screen from a string a model wrote and a record that is never revised
+/// (REQ-561 verify).
 fn read_title(answer: &str) -> String {
-    answer
+    strip_terminal_controls(answer)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -239,25 +249,72 @@ fn read_title(answer: &str) -> String {
         .to_owned()
 }
 
+/// `text` with ANSI escape sequences and stray control characters removed,
+/// leaving the whitespace [`read_title`] then collapses.
+///
+/// Whole sequences rather than the `\x1b` alone: dropping only the escape byte
+/// would leave `[31m` behind as literal text, which is not dangerous but is not
+/// a title either. Three shapes, which is all a title has to survive:
+///
+/// - **CSI** (`ESC [`) — parameter bytes `0x30–0x3F`, intermediates
+///   `0x20–0x2F`, one final byte `0x40–0x7E`. Colour, cursor movement, erase.
+/// - **OSC** (`ESC ]`) — runs until `BEL` or the `ESC \` string terminator.
+///   This is the one that sets a terminal's window title.
+/// - any other `ESC x` two-character escape.
+///
+/// Everything else `char::is_control` says is a control — the rest of C0, DEL,
+/// and the C1 block a multi-byte answer could carry — is dropped on sight,
+/// **except** the whitespace controls, which are kept so the collapse above
+/// still sees word boundaries where the model put them.
+fn strip_terminal_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            if !c.is_control() || c.is_whitespace() {
+                out.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // Parameters and intermediates, then exactly one final byte.
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if matches!(next, '\u{40}'..='\u{7e}') {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // BEL-terminated, or ST (`ESC \`) — consume the terminator too.
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // A two-character escape: the escape and its one following byte.
+            Some(_) | None => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
-    use futures::stream;
     use teton_core::entities::{BoundaryMode, PrivacyBoundary};
     use teton_inference::{Engine, MockEngine};
-    use teton_providers::transport::{
-        HttpMethod, TransportError, TransportRequest, TransportResponse,
-    };
-    use teton_providers::{
-        CapabilityProfile, Provider, ProviderError, StopReason, TokenUsage, Transport,
-        TurnCompletion, TurnEvent, TurnRequest, TurnStream,
-    };
 
-    use crate::egress::{Egress, NoopSink};
+    use super::super::duty::testing::{remote_duty_route, wire, Sent};
 
     const REQUEST: &str = "Add retry-with-backoff to the download client and cover it with tests.";
 
@@ -396,6 +453,65 @@ mod tests {
         }
     }
 
+    /// **A model-written title cannot repaint a terminal** (REQ-561 verify).
+    ///
+    /// `split_whitespace` is the load-bearing defence for newlines and it works,
+    /// but it follows Unicode `White_Space` — and `\x1b` is not whitespace, nor
+    /// is the rest of C0, nor DEL, nor the C1 block. The title reaches clients
+    /// over `session_titled` and is rendered into a session **list**, i.e.
+    /// straight into a terminal on at least one of them, out of a record BR-9
+    /// says is never revised.
+    ///
+    /// Every row is a real escape a terminal acts on: erase-display,
+    /// cursor-home, a window-title OSC, and a bare NUL.
+    #[tokio::test]
+    async fn terminal_control_sequences_never_reach_a_session_title() {
+        for (label, answer, expected) in [
+            (
+                "CSI erase display and cursor home",
+                "\u{1b}[2J\u{1b}[HRetry the client",
+                "Retry the client",
+            ),
+            (
+                "OSC window title, BEL-terminated",
+                "\u{1b}]0;pwned\u{7}Retry the client",
+                "Retry the client",
+            ),
+            (
+                "OSC window title, ST-terminated",
+                "\u{1b}]0;pwned\u{1b}\\Retry the client",
+                "Retry the client",
+            ),
+            (
+                "a bare C0 control",
+                "Retry\u{0} the client",
+                "Retry the client",
+            ),
+            ("DEL", "Retry the client\u{7f}", "Retry the client"),
+        ] {
+            let named = name_session(&local_route(answer), REQUEST, &user_text())
+                .await
+                .unwrap_or_else(|e| panic!("{label}: the duty answers: {e}"));
+            assert_eq!(named, expected, "{label}");
+            assert!(
+                !named.chars().any(char::is_control),
+                "{label}: a control character reached the wire: {named:?}"
+            );
+        }
+    }
+
+    /// An answer made only of control sequences names nothing, and is a failure
+    /// rather than a session named with an invisible string (LESSON-447).
+    #[tokio::test]
+    async fn an_answer_that_is_only_control_sequences_is_a_failure() {
+        for hidden in ["\u{1b}[2J\u{1b}[H", "\u{1b}]0;pwned\u{7}", "\u{0}\u{7f}"] {
+            let err = name_session(&local_route(hidden), REQUEST, &user_text())
+                .await
+                .expect_err("an invisible answer must not pass as a title");
+            assert!(err.contains("nothing to name the session"), "{err}");
+        }
+    }
+
     // -- the local leg: the harness-owned ceiling (BR-8, AC-11) --------------
 
     /// **AC-11, BR-8, on the leg `title` actually runs on.** An engine that runs
@@ -463,74 +579,6 @@ mod tests {
 
     // -- the remote leg: the harness-owned ceiling (BR-8, AC-11) -------------
 
-    /// A transport that records every request body it is asked to send.
-    #[derive(Default, Clone)]
-    struct CaptureTransport {
-        sent: Arc<Mutex<Vec<Vec<u8>>>>,
-    }
-
-    #[async_trait]
-    impl Transport for CaptureTransport {
-        async fn execute(
-            &self,
-            request: TransportRequest,
-        ) -> Result<TransportResponse, TransportError> {
-            self.sent
-                .lock()
-                .expect("capture poisoned")
-                .push(request.body);
-            Ok(TransportResponse {
-                status: 200,
-                body: Box::pin(stream::empty()),
-            })
-        }
-    }
-
-    /// A provider that puts its request on the wire before answering, and can be
-    /// told to stream its reply `repeat` times — i.e. to ignore `max_tokens`.
-    struct WireProvider {
-        reply: String,
-        repeat: usize,
-    }
-
-    #[async_trait]
-    impl Provider for WireProvider {
-        fn id(&self) -> &str {
-            "wire"
-        }
-        fn capabilities(&self) -> CapabilityProfile {
-            CapabilityProfile::default()
-        }
-        async fn stream_turn(
-            &self,
-            request: TurnRequest,
-            transport: &dyn Transport,
-        ) -> Result<TurnStream, ProviderError> {
-            let body =
-                serde_json::to_vec(&request).map_err(|e| ProviderError::Build(e.to_string()))?;
-            transport
-                .execute(TransportRequest {
-                    method: HttpMethod::Post,
-                    url: "https://api.example.com/v1/chat/completions".to_owned(),
-                    headers: Vec::new(),
-                    body,
-                })
-                .await
-                .map_err(|err| match err {
-                    TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
-                    _ => ProviderError::Transport,
-                })?;
-            let mut events: Vec<Result<TurnEvent, ProviderError>> = (0..self.repeat)
-                .map(|_| Ok(TurnEvent::TextDelta(self.reply.clone())))
-                .collect();
-            events.push(Ok(TurnEvent::Completed(TurnCompletion {
-                usage: TokenUsage::default(),
-                stop_reason: StopReason::EndTurn,
-            })));
-            Ok(Box::pin(stream::iter(events)))
-        }
-    }
-
     /// A remote `title` route over a capturing transport, with `boundaries`
     /// enforced at the choke point.
     ///
@@ -541,30 +589,8 @@ mod tests {
         boundaries: Vec<PrivacyBoundary>,
         reply: &str,
         repeat: usize,
-    ) -> (DutyRoute, Arc<Mutex<Vec<Vec<u8>>>>) {
-        let transport = CaptureTransport::default();
-        let sent = Arc::clone(&transport.sent);
-        let egress = Egress::new(transport, boundaries, Arc::new(NoopSink));
-        let route = DutyRoute::remote(
-            TITLE_DUTY,
-            "frontier",
-            Box::new(WireProvider {
-                reply: reply.to_owned(),
-                repeat,
-            }),
-            egress,
-            "claude-opus-4",
-            "sess-1",
-        );
-        (route, sent)
-    }
-
-    fn wire(sent: &Arc<Mutex<Vec<Vec<u8>>>>) -> String {
-        sent.lock()
-            .expect("capture poisoned")
-            .iter()
-            .map(|body| String::from_utf8_lossy(body).into_owned())
-            .collect()
+    ) -> (DutyRoute, Sent) {
+        remote_duty_route(TITLE_DUTY, boundaries, reply, repeat)
     }
 
     /// **AC-11, BR-8.** A provider ignoring `max_tokens` cannot grow the title

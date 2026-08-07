@@ -1280,6 +1280,38 @@ jobs:
 
           notes="$(mktemp)"
 
+          # REQ-548 OQ-3 — "release notes generated from the commit log, or
+          # hand-written highlights?" — is answered here, and the answer is
+          # BOTH. Everything else in this body is generated from what the run
+          # itself did (platforms, the smoke gate, the checksums it computed);
+          # the "Upgrade notes" section below is the hand-written half, lifted
+          # from the topmost section of CHANGELOG.md. Neither half can say what
+          # the other says: a generated line cannot know that a routing change
+          # widened what leaves a user's machine, and a hand-written one cannot
+          # know which digests this run produced.
+          #
+          # THE MISSING-CHANGELOG CASE IS NOT A FAILURE. Exit 75 from the
+          # script means "no changelog, or no section in it" — the release goes
+          # out with no Upgrade notes section and nothing else changes. A
+          # release must never be blocked because somebody did not write a
+          # changelog entry. Any OTHER non-zero status is the script itself
+          # being broken or absent, which is the release tooling in an unknown
+          # state, and that does stop the run: those two outcomes have separate
+          # exit codes precisely so this step can treat them differently.
+          upgrade_notes=""
+          notes_status=0
+          upgrade_notes="$(bash tools/release/changelog-section.sh)" || notes_status=$?
+          case "$notes_status" in
+            0) ;;
+            75)
+              echo "::notice title=No upgrade notes::CHANGELOG.md has no version section to publish, so this release body carries no Upgrade notes section. Everything else in it is unaffected."
+              ;;
+            *)
+              echo "::error title=Upgrade notes could not be read::tools/release/changelog-section.sh exited $notes_status, which is neither 'a section was found' (0) nor 'there is nothing to publish' (75). That is the release tooling failing, not a missing changelog entry, so this run stops rather than publishing a body whose hand-written half silently vanished."
+              exit "$notes_status"
+              ;;
+          esac
+
           # The backticks below are markdown — code fences and inline code in
           # the release body — so the format strings are single-quoted on
           # purpose and every value is passed as a printf argument.
@@ -1313,6 +1345,15 @@ jobs:
             # nothing else in this workflow.
             printf -- '- macOS binaries (`teton` and `teton-code`) are signed with an Apple Developer ID Application certificate (Team `545BU9G9D6`); the release gate verified that signature against these exact tarballs. Linux binaries are **unsigned** in v1.\n\n'
             printf 'Every artifact passed the release smoke gate: `teton` and `teton-code` both report %s, the release build refuses `TETON_TEST_SEAMS=1` rather than honouring the test seams, and `teton doctor` completed a live handshake against a freshly started daemon.\n\n' "$VERSION"
+            # Here rather than at the end: what an upgrade DOES to a machine
+            # that is already running is the thing a reader needs before they
+            # decide to take it, and the checksums are what they need after.
+            # The section is printed verbatim — `%s`, one argument — so nothing
+            # in this pipeline can reword a disclosure on its way to the page.
+            if [ -n "$upgrade_notes" ]; then
+              printf '### Upgrade notes\n\n'
+              printf '%s\n\n' "$upgrade_notes"
+            fi
             printf '### Checksums (sha256)\n\n```\n'
             cat staging/checksums.txt
             printf '```\n'

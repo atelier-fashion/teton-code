@@ -337,6 +337,46 @@ impl ScriptedFileEngine {
     }
 }
 
+/// How far into a prompt a duty's output contract may start and still be the
+/// **harness's own instruction** rather than material that quotes it.
+///
+/// Every one of the five harness duty prompts is built the same way: a fixed
+/// instruction, then the contract that closes it, then the material. The longest
+/// of those instructions is a few hundred bytes, so a kilobyte is roomy for all
+/// five and for the chat template `render_duty` may wrap them in — while a turn
+/// prompt opens with the system prompt, which is itself several kilobytes of
+/// tool documentation before any conversation block is reached. Nothing a
+/// conversation can say lands inside this window.
+const DUTY_CONTRACT_PREFIX_BYTES: usize = 1_024;
+
+/// Whether `prompt` is a duty prompt built around `contract` — i.e. the contract
+/// appears where a *builder* puts it, in the instruction the prompt opens with.
+///
+/// The `contains` this replaces read the whole rendered prompt, so a conversation
+/// block that quoted a contract sentence — a compaction summary that echoed one,
+/// a repository file carrying one, a `grep` result over this repository —
+/// diverted an ordinary turn into a canned duty answer *without consuming a
+/// script block*, which then shifts every later reply in the fixture by one. That
+/// is the failure mode [`ScriptedFileEngine`]'s own docs describe having shipped
+/// twice, arriving by a different route (REQ-561 verify).
+fn instructs(prompt: &str, contract: &str) -> bool {
+    prompt
+        .find(contract)
+        .is_some_and(|at| at < DUTY_CONTRACT_PREFIX_BYTES)
+}
+
+/// Whether `prompt` ends with `contract` — the classifier's shape, and only the
+/// classifier's.
+///
+/// [`crate::classify`] deliberately states its contract **last**, "because it is
+/// the instruction the model should be holding when it starts generating", so
+/// the prefix anchor above does not describe it. Its material is embedded
+/// upstream between `---` fences, so nothing untrusted can occupy the position
+/// this checks.
+fn concludes(prompt: &str, contract: &str) -> bool {
+    prompt.trim_end().ends_with(contract)
+}
+
 impl Engine for ScriptedFileEngine {
     fn model_id(&self) -> &str {
         &self.model_id
@@ -350,18 +390,28 @@ impl Engine for ScriptedFileEngine {
     ) -> Result<Completion, EngineError> {
         // A duty, not a turn: answered off-script so the block sequence keeps
         // meaning what the fixture author wrote (see the type's docs).
-        let text = if prompt.contains(crate::classify::CLASSIFIER_OUTPUT_CONTRACT) {
-            scripted_classification().to_owned()
-        } else if prompt.contains(crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
+        //
+        // The five harness duties are recognized by their contract appearing in
+        // the prompt's **instruction prefix** and the classifier by its contract
+        // *terminating* the prompt — never by a bare `contains` over the whole
+        // rendered text. See `instructs` and `concludes`.
+        //
+        // The prefix-anchored arms come first so that a duty prompt whose
+        // embedded material happens to end with the classifier's contract — a
+        // `grep` hit on this very file, say — is still recognized as the duty it
+        // is.
+        let text = if instructs(prompt, crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
             SCRIPTED_DIGEST.to_owned()
-        } else if prompt.contains(crate::harness::triage::TRIAGE_OUTPUT_CONTRACT) {
+        } else if instructs(prompt, crate::harness::triage::TRIAGE_OUTPUT_CONTRACT) {
             scripted_triage(prompt)
-        } else if prompt.contains(crate::harness::shell_duty::SHELL_OUTPUT_CONTRACT) {
+        } else if instructs(prompt, crate::harness::shell_duty::SHELL_OUTPUT_CONTRACT) {
             SCRIPTED_SHELL_INTERPRETATION.to_owned()
-        } else if prompt.contains(crate::harness::title::TITLE_OUTPUT_CONTRACT) {
+        } else if instructs(prompt, crate::harness::title::TITLE_OUTPUT_CONTRACT) {
             SCRIPTED_TITLE.to_owned()
-        } else if prompt.contains(crate::harness::compact::COMPACT_OUTPUT_CONTRACT) {
+        } else if instructs(prompt, crate::harness::compact::COMPACT_OUTPUT_CONTRACT) {
             SCRIPTED_COMPACTION.to_owned()
+        } else if concludes(prompt, crate::classify::CLASSIFIER_OUTPUT_CONTRACT) {
+            scripted_classification().to_owned()
         } else {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
             self.replies
@@ -1522,10 +1572,14 @@ impl DaemonRuntime {
         // derived from the prompt, which is already in hand, so a client can
         // label the session the moment the user hits enter rather than a whole
         // answer later; and this is the one point on the path that every turn
-        // reaches, where the turn's own maze of early returns is still ahead. It
-        // cannot fail the turn — see `title_session`.
-        self.title_session(events, sessions, &router, &config, &session_id, &prompt)
-            .await;
+        // reaches, where the turn's own maze of early returns is still ahead.
+        //
+        // **Started here, not awaited here.** The turn proceeds into
+        // `dispatch_route` on the next line while the naming runs on its own
+        // task; the handle is dropped because nothing below reads a title, and a
+        // session that is not named yet is a session with no title — BR-3's
+        // degraded state. It cannot fail the turn — see `spawn_title_session`.
+        let _ = self.spawn_title_session(events, sessions, &router, &config, &session_id, &prompt);
 
         let core_phase = phase.map(to_core_phase);
         let mut route = self
@@ -2206,7 +2260,31 @@ impl DaemonRuntime {
     /// The provenance handed to the duty is [`Provenance::empty`]: the content
     /// being sent is the user's own typed request, which was derived from no file
     /// (LESSON-432 — the call site is what knows where its content came from).
-    async fn title_session(
+    ///
+    /// ## The naming is **detached**; the turn never waits on it (REQ-561 verify)
+    ///
+    /// Gates 1 and 2 are synchronous and stay on the caller's thread — they are a
+    /// length comparison and one uncontended mutex — and so is building the
+    /// route, which needs the `router` and `config` the caller is holding. The
+    /// *model call* is spawned and this function returns immediately.
+    ///
+    /// Awaiting it here made the user wait for a complete local inference before
+    /// their turn even started, on the first substantive prompt of every session.
+    /// The position is still right, and for the reason it always was: the name is
+    /// derived from the prompt, which is already in hand, so a client can label
+    /// the session the moment the user hits enter rather than a whole answer
+    /// later. That benefit never required *blocking* on it.
+    ///
+    /// Nothing on the turn path reads the result, so there is no ordering to
+    /// preserve: [`SessionRegistry::claim_title`] is already exclusive under the
+    /// registry lock, so the detached task cannot race a second turn into a
+    /// second attempt, and [`SessionRegistry::set_title`] is idempotent-by-guard,
+    /// so it cannot overwrite a name that arrived first.
+    ///
+    /// Returns the spawned task so a test can await it. **Production drops it**:
+    /// a title that has not landed yet is a session with no title, which is BR-3's
+    /// degraded state and costs the turn nothing.
+    fn spawn_title_session(
         &self,
         events: &Arc<EventBus>,
         sessions: &SessionRegistry,
@@ -2214,31 +2292,38 @@ impl DaemonRuntime {
         config: &Config,
         session_id: &SessionId,
         prompt: &str,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if !crate::harness::title::worth_titling(prompt) {
-            return;
+            return None;
         }
         if !sessions.claim_title(session_id) {
-            return;
+            return None;
         }
         let local_engine = self.engine.get_with_format();
         let route = self.title_route(router, config, events, session_id, local_engine.as_ref());
-        let Ok(title) =
-            crate::harness::title::name_session(&route, prompt, &Provenance::empty()).await
-        else {
-            return;
-        };
-        if sessions.set_title(session_id, &title) {
-            // ADR-6's amendment: `SessionTitled` carries no `session_id` of its
-            // own — `Event` is internally tagged and flattened into the envelope,
-            // which already has one. So the envelope MUST be scoped here, or the
-            // event reaches the wire naming no session and nobody can attribute
-            // it.
-            events.publish(
-                Some(session_id.clone()),
-                Event::SessionTitled(SessionTitled { title }),
-            );
-        }
+
+        let events = Arc::clone(events);
+        let sessions = sessions.clone();
+        let session_id = session_id.clone();
+        let prompt = prompt.to_owned();
+        Some(tokio::spawn(async move {
+            let Ok(title) =
+                crate::harness::title::name_session(&route, &prompt, &Provenance::empty()).await
+            else {
+                return;
+            };
+            if sessions.set_title(&session_id, &title) {
+                // ADR-6's amendment: `SessionTitled` carries no `session_id` of
+                // its own — `Event` is internally tagged and flattened into the
+                // envelope, which already has one. So the envelope MUST be scoped
+                // here, or the event reaches the wire naming no session and
+                // nobody can attribute it.
+                events.publish(
+                    Some(session_id),
+                    Event::SessionTitled(SessionTitled { title }),
+                );
+            }
+        }))
     }
 
     /// Turn a resolved [`Route`](crate::router::Route) into the [`DutyRoute`]
@@ -8705,7 +8790,14 @@ provider_id = "on-device"
                     .session_id
             }
 
-            /// Run the daemon's own titling step for `session`, on `bus`.
+            /// Run the daemon's own titling step for `session`, on `bus`, **to
+            /// completion**.
+            ///
+            /// The step itself is detached (REQ-561 verify M1), so the handle is
+            /// awaited here rather than dropped: these tests are about what the
+            /// naming eventually does, and a test that raced the task it started
+            /// would assert on whichever half won. The one test that is about the
+            /// detachment does not use this helper.
             async fn run_title(
                 runtime: &DaemonRuntime,
                 bus: &Arc<EventBus>,
@@ -8716,9 +8808,11 @@ provider_id = "on-device"
                 let config = runtime.config.lock().expect("config mutex").clone();
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
-                runtime
-                    .title_session(bus, sessions, &router, &config, session, prompt)
-                    .await;
+                if let Some(handle) =
+                    runtime.spawn_title_session(bus, sessions, &router, &config, session, prompt)
+                {
+                    handle.await.expect("the titling task must not panic");
+                }
             }
 
             /// Every `session_titled` title this subscription saw, with the
@@ -9087,6 +9181,215 @@ provider_id = "on-device"
                     .complete("an ordinary turn", &params, &mut |_| true)
                     .expect("a turn");
                 assert_eq!(turn.text.trim(), "first reply");
+            }
+
+            /// **A conversation that quotes a duty's output contract is still a
+            /// turn** (REQ-561 verify).
+            ///
+            /// Recognition used to be `contains` over the whole rendered prompt,
+            /// so a block echoing a contract sentence — a prior compaction
+            /// summary that carried one, a repository file, a `grep` hit on this
+            /// crate — was answered off-script as a duty. That diverts the turn
+            /// *and* leaves the script where it was, so every later reply in the
+            /// fixture is one behind: the failure mode `ScriptedFileEngine`'s own
+            /// docs record having shipped twice, arriving by a different route.
+            ///
+            /// Both contract positions are quoted, because the two anchors are
+            /// different: the five harness duties are recognized in the prompt's
+            /// instruction prefix, and the classifier — which states its contract
+            /// last on purpose — by the contract terminating the prompt.
+            #[test]
+            fn a_quoted_duty_contract_in_a_conversation_does_not_divert_a_turn() {
+                let engine = ScriptedFileEngine::from_script("m", "first reply\n---\nsecond reply");
+                let params = GenParams::default();
+
+                let quoting_turn = format!(
+                    "{filler}\n\n<tool-result tool=\"read\">\n{triage}\n{classifier}\n\
+                     </tool-result>\nAssistant:",
+                    filler = "You are a coding agent. Available tools: ".repeat(40),
+                    triage = crate::harness::triage::TRIAGE_OUTPUT_CONTRACT,
+                    classifier = crate::classify::CLASSIFIER_OUTPUT_CONTRACT,
+                );
+                // The fixture must quote the contracts *outside* the window a
+                // duty's own instruction occupies, or it tests nothing.
+                assert!(
+                    quoting_turn
+                        .find(crate::harness::triage::TRIAGE_OUTPUT_CONTRACT)
+                        .is_some_and(|at| at > DUTY_CONTRACT_PREFIX_BYTES),
+                    "the quoted contract must fall past the instruction window"
+                );
+
+                let first = engine
+                    .complete(&quoting_turn, &params, &mut |_| true)
+                    .expect("a turn");
+                assert_eq!(
+                    first.text.trim(),
+                    "first reply",
+                    "a conversation quoting a duty contract was answered as a duty"
+                );
+                let second = engine
+                    .complete(&quoting_turn, &params, &mut |_| true)
+                    .expect("a turn");
+                assert_eq!(
+                    second.text.trim(),
+                    "second reply",
+                    "...and it must consume a script block, like every other turn"
+                );
+            }
+
+            /// **Non-vacuity for the anchor**: every duty prompt the harness
+            /// really builds is still recognized, and still consumes no block.
+            ///
+            /// The four with a `pub` prompt builder. `digest`'s is assembled
+            /// inline inside `summarize_if_large` and the classifier's is private
+            /// to [`crate::classify`]; both are covered by their own modules'
+            /// tests and by the dispatch tests above, which would not route at
+            /// all if the classifier arm stopped firing.
+            #[test]
+            fn every_harness_duty_prompt_is_still_answered_off_script() {
+                let engine = ScriptedFileEngine::from_script("m", "first reply");
+                let params = GenParams::default();
+                let matches = ["src/a.rs:1: fn parse()", "src/b.rs:2: fn parse2()"];
+
+                for (label, prompt) in [
+                    (
+                        "triage",
+                        crate::harness::triage::triage_prompt("find it", "grep `parse`", &matches),
+                    ),
+                    (
+                        "shell",
+                        crate::harness::shell_duty::shell_prompt("cargo test", "(exit 101)"),
+                    ),
+                    ("title", crate::harness::title::title_prompt(REQUEST)),
+                    (
+                        "compact",
+                        crate::harness::compact::compact_prompt(&[
+                            crate::harness::context::ContextBlock {
+                                role: crate::harness::context::BlockRole::User,
+                                text: "do the thing".to_owned(),
+                                provenance: crate::harness::context::Provenance::User,
+                            },
+                        ]),
+                    ),
+                ] {
+                    let out = engine
+                        .complete(&prompt, &params, &mut |_| true)
+                        .expect("the stand-in answers the duty");
+                    assert!(
+                        !out.text.trim().is_empty(),
+                        "{label}: the duty must be answered"
+                    );
+                    assert_ne!(
+                        out.text.trim(),
+                        "first reply",
+                        "{label}: the duty ate a scripted turn block"
+                    );
+                }
+            }
+
+            // -- the turn does not wait for it (REQ-561 verify M1) ------------
+
+            /// An [`Engine`] that will not answer until it is released.
+            struct GatedEngine {
+                release: Mutex<std::sync::mpsc::Receiver<()>>,
+                reply: String,
+            }
+
+            impl Engine for GatedEngine {
+                fn model_id(&self) -> &str {
+                    "gated"
+                }
+                fn complete(
+                    &self,
+                    _prompt: &str,
+                    _params: &GenParams,
+                    _on_token: &mut dyn FnMut(&str) -> bool,
+                ) -> Result<Completion, EngineError> {
+                    let _ = self.release.lock().expect("gate poisoned").recv();
+                    Ok(Completion {
+                        text: self.reply.clone(),
+                        prompt_tokens: 0,
+                        completion_tokens: 1,
+                    })
+                }
+            }
+
+            /// **The turn does not wait for the session to be named**
+            /// (REQ-561 verify M1).
+            ///
+            /// `title` is `reflex`-tier and therefore local, and `LocalDuty` runs
+            /// a complete inference on the blocking pool. Awaiting it here put
+            /// that whole inference *ahead of the turn* on the first substantive
+            /// prompt of every session — the user watching nothing happen while a
+            /// model chose a name for the thing they had not seen an answer to
+            /// yet.
+            ///
+            /// The engine below never answers until it is released, and a watcher
+            /// releases it after a beat and records that it did. The call under
+            /// test must return with that flag still false: an implementation
+            /// that awaits the naming cannot, because the only thing that can
+            /// unblock it is the very watcher whose firing the flag reports.
+            ///
+            /// The tail is the non-vacuity, and it does two jobs: the duty really
+            /// was in flight rather than skipped, and the *detached* task still
+            /// writes the name back.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_turn_path_does_not_wait_for_the_session_to_be_named() {
+                let (release, gate) = std::sync::mpsc::channel::<()>();
+                let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(GatedEngine {
+                    release: Mutex::new(gate),
+                    reply: "Retry the download client".to_owned(),
+                }));
+                let runtime = DaemonRuntime::minimal();
+                *runtime.config.lock().expect("config mutex") = config();
+                runtime.engine.install("gated".to_owned(), engine);
+                runtime.local_available.store(true, Ordering::SeqCst);
+
+                let bus = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = one_session(&sessions);
+                let cfg = runtime.config.lock().expect("config mutex").clone();
+                let router = build_router(&cfg, runtime.local_tier_available(), &BTreeMap::new());
+
+                let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                tokio::spawn({
+                    let released = Arc::clone(&released);
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        released.store(true, Ordering::SeqCst);
+                        let _ = release.send(());
+                    }
+                });
+
+                let handle = runtime
+                    .spawn_title_session(&bus, &sessions, &router, &cfg, &session, REQUEST)
+                    .expect("the fixture must claim the title");
+
+                assert!(
+                    !released.load(Ordering::SeqCst),
+                    "the turn path did not return until the naming had answered: every \
+                     session's first substantive prompt waits for a whole local \
+                     inference before its turn begins"
+                );
+                assert!(
+                    sessions.get(&session).expect("the session").title.is_none(),
+                    "non-vacuity: the naming really is still in flight, not skipped"
+                );
+
+                // It finishes on its own task, and still writes the name back.
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+                    .await
+                    .expect("the detached naming must finish once the engine answers")
+                    .expect("the titling task must not panic");
+                assert_eq!(
+                    sessions
+                        .get(&session)
+                        .expect("the session")
+                        .title
+                        .as_deref(),
+                    Some("Retry the download client"),
+                    "a detached naming must still land"
+                );
             }
 
             /// The recognition arm keys on the contract the prompt actually

@@ -235,6 +235,9 @@ pub struct ContextManager {
     budget_bytes: usize,
     truncated: bool,
     compaction: CompactionGate,
+    /// The request this manager's turn is serving — see
+    /// [`ContextManager::request`].
+    request: String,
 }
 
 /// What this manager has already spent on `compact`, and what that buys the rest
@@ -365,7 +368,29 @@ impl ContextManager {
             budget_bytes: budget_tokens.saturating_mul(APPROX_BYTES_PER_TOKEN),
             truncated: false,
             compaction: CompactionGate::default(),
+            request: String::new(),
         }
+    }
+
+    /// The request this manager's turn is serving — what a duty measures
+    /// "relevant" against (REQ-561 verify).
+    ///
+    /// Retained here, **beside** the droppable block list rather than inside it,
+    /// because both of the things that shrink a conversation can take the user
+    /// block away: [`ContextManager::compact_if_pressured`] replaces forgotten
+    /// blocks with a single `Tool`-role summary, and
+    /// [`ContextManager::truncate_to_budget`] drops oldest-first — and the user
+    /// block is the oldest. Reading the request back out of `blocks` was correct
+    /// on a first attempt and empty on a retry, because a retry re-enters the
+    /// loop against the same, by-then-shrunk manager. A `triage` ranking made
+    /// against an empty request is a model call spent on nothing.
+    ///
+    /// The manager's life is one turn (the daemon builds one per prompt), so
+    /// "the request" is unambiguous; a manager assembled with no user block at
+    /// all yields the empty string, which a duty prompt carries harmlessly.
+    #[must_use]
+    pub fn request(&self) -> &str {
+        &self.request
     }
 
     /// Set the byte budget for the assembled context (engine-window currency).
@@ -376,10 +401,15 @@ impl ContextManager {
     }
 
     /// Append a user turn.
+    ///
+    /// Also records it as [`ContextManager::request`], which survives compaction
+    /// and truncation — the block itself does not.
     pub fn push_user(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.request.clone_from(&text);
         self.blocks.push(ContextBlock {
             role: BlockRole::User,
-            text: text.into(),
+            text,
             provenance: Provenance::User,
         });
     }

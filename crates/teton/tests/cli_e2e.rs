@@ -185,6 +185,16 @@ impl TestDaemon {
         daemon
     }
 
+    /// The daemon's own stderr so far.
+    ///
+    /// The other half of the story in any assertion about what the daemon
+    /// published: the CLI's stdout says what arrived, and only this says what
+    /// was sent. Quoted into the assertions that turn on an event, because a
+    /// failure that shows one side is a failure nobody can act on.
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.root.join("tetond.log")).unwrap_or_default()
+    }
+
     fn wait_for_socket(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -330,6 +340,27 @@ impl Drop for TestDaemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // **Keep the evidence when the test is failing.**
+        //
+        // This used to delete the root unconditionally, panicking or not — and
+        // the root holds `tetond.log`, the daemon's whole stderr. So the one run
+        // that could say what the daemon actually did was also the run that
+        // destroyed the record of it. `an_escaped_line_and_a_plain_line_both_reach_the_model`
+        // failed once, on a cold build, with a routing notice missing; the CLI's
+        // stdout was quoted in the panic and the daemon's side was already gone,
+        // which is why that failure could not be diagnosed after the fact.
+        //
+        // `panicking()` rather than an env switch: a passing run still cleans up
+        // after itself, so nothing accumulates in `/tmp` in the normal case.
+        if std::thread::panicking() {
+            eprintln!(
+                "cli_e2e: test failed — keeping the daemon's working directory at {} \
+                 (its stderr is {}/tetond.log)",
+                self.root.display(),
+                self.root.display()
+            );
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -1164,10 +1195,32 @@ fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
         2,
         "exactly two turns should have been routed; output:\n{session}"
     );
+    // **On the one observed flake here, and what it was not** (REQ-561 verify).
+    //
+    // This assertion failed once on a cold-build run — `left: 0, right: 1`, the
+    // `route [title/reflex]` line absent while both `route [edit/build]` lines
+    // were present — and did not reproduce in isolation or under repetition. The
+    // obvious suspect was a subscription race, since `title` is the first event
+    // of a session's life and `wait_for_socket` only proves the daemon is
+    // listening. It is not one: the daemon registers the connection on the event
+    // bus *inside* the handshake handler and queues the handshake response
+    // afterwards, synchronously and on the same connection, and the CLI blocks on
+    // that response before it can send `session/create` or `session/prompt`. The
+    // window is closed by construction. Nor was it a lagged subscription: an
+    // overflowing subscriber is evicted from the bus outright, which is terminal,
+    // so the two later routing notices could not have survived it.
+    //
+    // No code path was found that drops this event while keeping those, so the
+    // cause is recorded as **undiagnosed** rather than guessed at. What is fixed
+    // is the reason it could not be diagnosed: the daemon's stderr is now kept
+    // when a test panics (see `Drop`) and quoted here, so a recurrence says which
+    // side lost the event instead of only that the count was wrong.
     assert_eq!(
         session.matches("route [title/reflex]").count(),
         1,
-        "the session is named once, by a duty rather than by a turn; output:\n{session}"
+        "the session is named once, by a duty rather than by a turn.\n\
+         --- CLI output ---\n{session}\n--- daemon stderr ---\n{}",
+        daemon.log()
     );
 
     // And neither was treated as a command: no dispatch, no rejection.

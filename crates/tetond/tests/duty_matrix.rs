@@ -460,7 +460,13 @@ async fn exercise(duty: Duty, route: &DutyRoute, tainted: bool) -> Observed {
             } else {
                 vec!["src/a.rs".to_owned(), "src/b.rs".to_owned()]
             };
-            let outcome = ToolOutcome::ok(&content).with_paths(paths);
+            // `measuring` is how `run` tells `refine` how many matches it
+            // found — a fact that no longer travels in the rendered text
+            // (REQ-561 verify M3). A hand-built outcome has to supply it, and an
+            // outcome that supplies nothing is one the duty correctly declines.
+            let outcome = ToolOutcome::ok(&content)
+                .with_paths(paths)
+                .measuring(lines.len());
             let refined = refine("grep", json!({ "pattern": "parse" }), route, outcome).await;
             Observed {
                 invariant: lines.iter().all(|m| refined.outcome.content.contains(m)),
@@ -473,7 +479,14 @@ async fn exercise(duty: Duty, route: &DutyRoute, tainted: bool) -> Observed {
 
         // -- `ShellTool::refine`: the model still sees the command's output ----
         Duty::Shell => {
-            let outcome = ToolOutcome::error(FAILED_COMMAND).with_unknown_provenance();
+            // `measuring` is how `run` says a command actually ran: the duty is
+            // for command output, and a call that never spawned one has none to
+            // interpret (REQ-561 verify). The length is the failed command's own
+            // output, which is well under the cap — the `is_error` arm is what
+            // fires here.
+            let outcome = ToolOutcome::error(FAILED_COMMAND)
+                .with_unknown_provenance()
+                .measuring(FAILED_COMMAND.chars().count());
             let refined =
                 refine("shell", json!({ "command": "cargo build" }), route, outcome).await;
             Observed {

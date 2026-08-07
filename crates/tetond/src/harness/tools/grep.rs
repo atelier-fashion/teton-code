@@ -110,16 +110,26 @@ impl Tool for GrepTool {
         );
 
         if hits.is_empty() {
-            return ToolOutcome::ok(format!("no matches for `{pattern}`"));
+            // REQ-561 verify M3: `measuring(0)` is what tells `refine` this is
+            // prose rather than a match list. `pattern` is model-supplied and may
+            // contain a newline — and a newline-bearing pattern can NEVER match,
+            // since `search` compares against `contents.lines()`, so this branch
+            // is exactly where such a pattern always lands. Counting the lines of
+            // the sentence below read that as two "matches" and bought a `triage`
+            // call which then rebuilt the message out of its own chosen subset.
+            return ToolOutcome::ok(format!("no matches for `{pattern}`")).measuring(0);
         }
-        let truncated = hits.len() > MAX_MATCHES;
+        let found = hits.len();
+        let truncated = found > MAX_MATCHES;
         hits.truncate(MAX_MATCHES);
         let mut out = hits.join("\n");
         if truncated {
             out.push('\n');
             out.push_str(&cap_notice());
         }
-        ToolOutcome::ok(out).with_paths(matched_files)
+        ToolOutcome::ok(out)
+            .with_paths(matched_files)
+            .measuring(found)
     }
 
     /// Rank this search's matches against the turn's `request` through the
@@ -136,17 +146,30 @@ impl Tool for GrepTool {
         duties: &ToolDuties<'_>,
         outcome: ToolOutcome,
     ) -> RefinedOutcome {
-        // A failed search has no matches to rank, and neither does a search that
-        // found none — `run` answers that one in prose, not in `path:line:` form.
+        // A failed search has no matches to rank.
         if outcome.is_error {
             return RefinedOutcome::unrefined(outcome);
         }
-        let (matches, capped) = split_cap_notice(&outcome.content);
-        if !triage::worth_ranking(matches.len()) {
-            // A single match is already first. No model call, and nothing to
-            // report: a duty not worth making is not a duty that failed.
+        // **How many matches there are is a fact `run` measured**, handed over on
+        // the outcome rather than recovered from the words `run` rendered
+        // (REQ-561 verify M3). A search that found none answers in prose, and
+        // that prose is not a one-line shape: `pattern` is model-supplied and may
+        // contain a newline, so counting the rendered lines reported 2+ "matches"
+        // for a result that had none — bought a `triage` call for a sentence and
+        // then replaced the sentence with the duty's chosen subset of it.
+        //
+        // A `grep` outcome that measured nothing is not a search result at all,
+        // so there is nothing here to rank either.
+        let Some(found) = outcome.measured else {
+            return RefinedOutcome::unrefined(outcome);
+        };
+        if !triage::worth_ranking(found) {
+            // Zero matches, or a single match that is already first. No model
+            // call, and nothing to report: a duty not worth making is not a duty
+            // that failed.
             return RefinedOutcome::unrefined(outcome);
         }
+        let (matches, capped) = split_cap_notice(&outcome.content);
         // BR-7 / LESSON-432: the egress provenance of the **matched files**, as
         // this tool itself reported them on the outcome — narrower than the
         // turn's context, and never read off an argument's name. A match inside a
@@ -203,24 +226,72 @@ fn describe_search(args: &Value) -> String {
     }
 }
 
-/// The ranked matches, in the duty's order, under this tool's own cap.
+/// The matches in the duty's order, **with the ones it left out below them**.
+///
+/// ## The duty reorders; it never removes (REQ-561 verify)
+///
+/// [`triage`]'s "answer with numbers" shape already makes *fabrication*
+/// unreachable — an invented line has nowhere to land, so the result is always
+/// drawn from what `grep` really found. What that shape does not bound is
+/// **omission**, and omission is the sharper edge here: the ranked content is
+/// repository text, an attacker may control a file in the repository, and a
+/// ranking of `"1"` reduces a 200-hit search to one line. A `grep` for a
+/// backdoor pattern could then be steered to return the single benign hit, and
+/// the model would have no way to know the other 199 existed. BR-3 speaks only
+/// to a duty that *fails*; a duty that succeeds and answers narrowly is not a
+/// failure, so nothing there applied.
+///
+/// So the remainder is appended in file order under a marker of its own, and the
+/// duty's authority is reduced to what it is actually good at: saying what to
+/// read first.
+///
+/// **Why this rather than a minimum-coverage floor.** A floor ("refuse a ranking
+/// covering less than a named fraction") bounds the suppression without removing
+/// it: at any honest fraction, a 200-hit search still lets 150 hits be dropped,
+/// and the one hit that mattered can be among them. It also has to pick a
+/// number that trades the attack against the duty's usefulness, and there is no
+/// principled place to put it. Appending costs nothing that was not already
+/// being spent: `run` had already decided to put up to [`MAX_MATCHES`] lines
+/// into context, that is exactly what the BR-3 fallback folds, and the ceiling
+/// on this result is therefore unchanged. What is given up is context *savings*
+/// the caller never budgeted for — and what is bought is that this function's
+/// output is a permutation of its input, which is a property a reader can check.
 ///
 /// [`MAX_MATCHES`] is applied **after** ranking as well as before it: the duty
-/// may reorder and it may drop, but a ranking is resolved against the list it
-/// was given, so it can never hand back more lines than `run` found — and the
-/// cap here says so at the one place a future change could break it.
+/// may reorder, but a ranking is resolved against the list it was given, so it
+/// can never hand back more lines than `run` found — and the cap here says so at
+/// the one place a future change could break it.
 fn render_ranked(matches: &[&str], order: &[usize], capped: bool) -> String {
-    let body: Vec<&str> = order
+    let ranked: Vec<&str> = order
         .iter()
         .take(MAX_MATCHES)
         .map(|&i| matches[i])
         .collect();
+    let mut chosen = vec![false; matches.len()];
+    for &i in order.iter().take(MAX_MATCHES) {
+        chosen[i] = true;
+    }
+    let rest: Vec<&str> = matches
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !chosen[*i])
+        .map(|(_, line)| *line)
+        .collect();
+
     let mut out = format!(
         "[triage: {} of {} matches, most useful first]\n{}",
-        body.len(),
+        ranked.len(),
         matches.len(),
-        body.join("\n")
+        ranked.join("\n")
     );
+    if !rest.is_empty() {
+        out.push('\n');
+        out.push_str(&format!(
+            "[triage: the other {} matches, unranked, in file order]\n{}",
+            rest.len(),
+            rest.join("\n")
+        ));
+    }
     if capped {
         out.push('\n');
         out.push_str(&cap_notice());
@@ -479,9 +550,9 @@ mod tests {
     }
 
     /// The happy path: the duty's order is the order the model sees, and the
-    /// matches it left out are gone.
+    /// matches it left out follow underneath rather than disappearing.
     #[tokio::test]
-    async fn a_ranked_grep_result_is_reordered_and_filtered_by_the_duty() {
+    async fn a_ranked_grep_result_is_reordered_by_the_duty() {
         let root = repo_with_matches("rank", 3, 1);
         let args = json!({ "pattern": "needle" });
         let route = local_route("3 1");
@@ -494,7 +565,9 @@ mod tests {
         // Asserted as a permutation of the *observed* first-200 result rather
         // than against hard-coded filenames: `read_dir` order is not a promise,
         // and a test that depended on it would be flaky rather than wrong.
-        assert_eq!(after, vec![before[2], before[0]]);
+        //
+        // The duty chose 3 then 1; 2 was left out, so it comes last.
+        assert_eq!(after, vec![before[2], before[0], before[1]]);
         assert!(
             refined
                 .outcome
@@ -503,10 +576,111 @@ mod tests {
             "{}",
             refined.outcome.content
         );
+        assert!(
+            refined
+                .outcome
+                .content
+                .contains("[triage: the other 1 matches, unranked, in file order]"),
+            "the unranked remainder must be labelled as such: {}",
+            refined.outcome.content
+        );
         assert_eq!(refined.duty_error, None);
         // The matched-files provenance survives ranking: it is what a later
         // remote turn is judged against (REQ-544 C-1).
         assert_eq!(refined.outcome.provenance, raw.provenance);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A duty cannot make a match disappear** (REQ-561 verify).
+    ///
+    /// The numbers-only answer already makes fabrication unreachable — an
+    /// invented line has nowhere to land. Omission is the direction it does not
+    /// bound, and the ranked content is repository text somebody may have
+    /// written on purpose: a ranking of `"1"` would otherwise reduce a search
+    /// for a backdoor pattern to whichever single hit the duty was steered to
+    /// name, with the model given no sign that the others existed.
+    ///
+    /// Asserted as **set equality against the tool's own unranked result**, in
+    /// both directions, so this stays true of any ranking rather than of the one
+    /// this fixture happens to produce.
+    #[tokio::test]
+    async fn a_ranking_that_names_one_match_still_delivers_all_of_them() {
+        let root = repo_with_matches("suppress", 6, 1);
+        let args = json!({ "pattern": "needle" });
+        // The narrowest ranking a duty can give: one match, out of six.
+        let route = local_route("2");
+
+        let (raw, refined) = run_and_refine(&root, &args, &route).await;
+
+        assert_eq!(refined.duty_error, None, "the fixture must reach the duty");
+        let before = match_lines(&raw.content);
+        let after = match_lines(&refined.outcome.content);
+        assert_eq!(before.len(), 6, "the fixture must offer a real ranking");
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "a one-match ranking suppressed {} of {} matches",
+            before.len() - after.len(),
+            before.len()
+        );
+        assert_eq!(
+            after.iter().collect::<BTreeSet<_>>(),
+            before.iter().collect::<BTreeSet<_>>(),
+            "the ranked result must be a permutation of what `grep` found"
+        );
+        // Non-vacuity: the duty really did rank, and its choice really is first
+        // — so this is the omission being repaired, not the duty being ignored.
+        assert_eq!(after[0], before[1], "the duty's choice must lead");
+        assert!(refined
+            .outcome
+            .content
+            .starts_with("[triage: 1 of 6 matches"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A pattern containing a newline can never match, and must not buy a
+    /// model call** (REQ-561 verify M3).
+    ///
+    /// `search` compares against `contents.lines()`, so a newline-bearing
+    /// pattern always lands on the zero-hit branch — and that branch answers in
+    /// prose that *embeds the pattern*, so counting the rendered lines reported
+    /// two "matches" for a search that found none. `worth_ranking` then passed,
+    /// a `triage` call was bought for a sentence, and `render_ranked` rebuilt
+    /// that sentence out of the duty's chosen subset of its own words:
+    /// ``[triage: 1 of 2 matches, most useful first]\nb` `` where a plain "no
+    /// matches" line belongs.
+    ///
+    /// Both halves are asserted, because a fix that merely stopped the model
+    /// call would still leave the count wrong for anything else that reads it.
+    #[tokio::test]
+    async fn a_newline_bearing_pattern_is_a_no_match_result_not_a_two_match_one() {
+        let root = repo_with_matches("newline-pattern", 2, 1);
+        let args = json!({ "pattern": "needle\nb" });
+        let (route, calls) = counting_route("1 2");
+
+        let (raw, refined) = run_and_refine(&root, &args, &route).await;
+
+        // The fixture really is in the state the name claims: a result whose
+        // rendered text spans two lines and whose match count is zero.
+        assert!(raw.content.contains("no matches for"), "{}", raw.content);
+        assert_eq!(
+            raw.content.lines().count(),
+            2,
+            "the fixture must render as more than one line, or it tests nothing: {:?}",
+            raw.content
+        );
+        assert_eq!(raw.measured, Some(0));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a search that found nothing bought a ranking"
+        );
+        assert_eq!(
+            refined.outcome, raw,
+            "the tool's own `no matches` answer must come back untouched"
+        );
+        assert_eq!(refined.duty_error, None);
         std::fs::remove_dir_all(&root).ok();
     }
 

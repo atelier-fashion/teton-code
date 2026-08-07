@@ -713,6 +713,165 @@ impl<T: Transport> Duty for RemoteDuty<T> {
     }
 }
 
+/// Shared fixtures for the five duty modules' unit tests (REQ-561 verify).
+///
+/// The remote leg of every duty is exercised the same way — a transport that
+/// records the bytes it was asked to send, a provider that actually puts its
+/// request on that transport before answering, and a route wiring the two
+/// through [`Egress`] — and each of `digest`, `triage`, `shell_duty`, `title`
+/// and `compact` had grown its own byte-identical copy of all three.
+///
+/// That is precisely the "five parallel implementations of one concern" shape
+/// BR-6 and ADR-1 exist to remove, left standing in the test code that proves
+/// they were removed. AC-8's boundary is scoped to production source, so nothing
+/// failed; five copies of a leak detector is still five places for one of them
+/// to quietly stop detecting leaks.
+///
+/// It lives here, on the seam, because the thing being faked — a duty reaching a
+/// network only through a provenance-scoped transport — is the seam's, not any
+/// one category's. What stays per-module is the [`DutyKind`] each passes in and
+/// the assertions each makes.
+///
+/// **Scoped deliberately to the five.** The same trio appears in this crate's
+/// `tests/` integration targets and in [`crate::egress`]; those predate REQ-561,
+/// are separate compilation units (a `#[cfg(test)]` lib module is not visible to
+/// an integration test), and are left alone.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use futures::stream;
+    use teton_core::entities::PrivacyBoundary;
+    use teton_providers::transport::{
+        HttpMethod, TransportError, TransportRequest, TransportResponse,
+    };
+    use teton_providers::{
+        CapabilityProfile, Provider, ProviderError, StopReason, TokenUsage, Transport,
+        TurnCompletion, TurnEvent, TurnRequest, TurnStream,
+    };
+
+    use super::{DutyKind, DutyRoute};
+    use crate::egress::{Egress, NoopSink};
+
+    /// The request bodies a [`CaptureTransport`] was handed, newest last.
+    ///
+    /// Read through [`wire`]. This is the instrument every boundary claim in the
+    /// five modules is made against: "no boundary content left the machine" is a
+    /// statement about bytes on a wire, not about a return value.
+    pub(crate) type Sent = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    /// A transport that records every request body it is asked to send.
+    #[derive(Default, Clone)]
+    struct CaptureTransport {
+        sent: Sent,
+    }
+
+    #[async_trait]
+    impl Transport for CaptureTransport {
+        async fn execute(
+            &self,
+            request: TransportRequest,
+        ) -> Result<TransportResponse, TransportError> {
+            self.sent
+                .lock()
+                .expect("capture poisoned")
+                .push(request.body);
+            Ok(TransportResponse {
+                status: 200,
+                body: Box::pin(stream::empty()),
+            })
+        }
+    }
+
+    /// A provider that puts its request on the wire before answering, and can be
+    /// told to stream its reply `repeat` times — i.e. to ignore `max_tokens`.
+    ///
+    /// The smallest adapter that can *leak*: it serializes the prompt into the
+    /// transport it was handed, so a route that bypassed egress would show the
+    /// prompt in the capture. That is what makes the boundary assertions
+    /// non-vacuous rather than satisfied by a fixture that could never send.
+    struct WireProvider {
+        reply: String,
+        repeat: usize,
+    }
+
+    #[async_trait]
+    impl Provider for WireProvider {
+        fn id(&self) -> &str {
+            "wire"
+        }
+        fn capabilities(&self) -> CapabilityProfile {
+            CapabilityProfile::default()
+        }
+        async fn stream_turn(
+            &self,
+            request: TurnRequest,
+            transport: &dyn Transport,
+        ) -> Result<TurnStream, ProviderError> {
+            let body =
+                serde_json::to_vec(&request).map_err(|e| ProviderError::Build(e.to_string()))?;
+            transport
+                .execute(TransportRequest {
+                    method: HttpMethod::Post,
+                    url: "https://api.example.com/v1/chat/completions".to_owned(),
+                    headers: Vec::new(),
+                    body,
+                })
+                .await
+                .map_err(|err| match err {
+                    TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
+                    _ => ProviderError::Transport,
+                })?;
+            // `repeat` models a provider that ignores `max_tokens`: the same
+            // delta over and over, which is what an unbounded accumulator would
+            // happily grow on.
+            let mut events: Vec<Result<TurnEvent, ProviderError>> = (0..self.repeat)
+                .map(|_| Ok(TurnEvent::TextDelta(self.reply.clone())))
+                .collect();
+            events.push(Ok(TurnEvent::Completed(TurnCompletion {
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
+            })));
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    /// A remote route for `kind` over a capturing transport, with `boundaries`
+    /// enforced at the choke point.
+    pub(crate) fn remote_duty_route(
+        kind: DutyKind,
+        boundaries: Vec<PrivacyBoundary>,
+        reply: &str,
+        repeat: usize,
+    ) -> (DutyRoute, Sent) {
+        let transport = CaptureTransport::default();
+        let sent = Arc::clone(&transport.sent);
+        let egress = Egress::new(transport, boundaries, Arc::new(NoopSink));
+        let route = DutyRoute::remote(
+            kind,
+            "frontier",
+            Box::new(WireProvider {
+                reply: reply.to_owned(),
+                repeat,
+            }),
+            egress,
+            "claude-opus-4",
+            "sess-1",
+        );
+        (route, sent)
+    }
+
+    /// Everything the capturing transport was asked to send, as one string.
+    pub(crate) fn wire(sent: &Sent) -> String {
+        sent.lock()
+            .expect("capture poisoned")
+            .iter()
+            .map(|body| String::from_utf8_lossy(body).into_owned())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

@@ -23,6 +23,10 @@
 #   site/render     the same, against an isolated copy of the tree, so a case
 #                   that deliberately renders a broken page cannot touch the
 #                   real site/dist.
+#   changelog       changelog-section.sh — the topmost changelog section and
+#                   ONLY it, the several shapes that must publish nothing
+#                   without failing a release, and the release.yml wiring that
+#                   turns it into the body's "Upgrade notes" section.
 #   smoke           smoke.sh TESTED AS A TESTER. Nothing had ever verified that
 #                   its assertions are capable of failing, and one of them was
 #                   not: an empty version made `grep -qF -- ""` match any
@@ -91,6 +95,7 @@ SMOKE="$script_dir/smoke.sh"
 VERIFY_SIGNATURE="$script_dir/verify-signature.sh"
 VERIFY_ATTESTATION="$script_dir/verify-attestation.sh"
 VERIFY_BATCH="$script_dir/verify-attestations-batch.sh"
+CHANGELOG_SECTION="$script_dir/changelog-section.sh"
 SITE_RENDER="$repo_root/site/render.sh"
 SITE_TEMPLATE="$repo_root/site/index.html"
 FORMULA_TEMPLATE="$repo_root/packaging/homebrew/teton.rb.tmpl"
@@ -106,7 +111,8 @@ RELEASE_WORKFLOW="$repo_root/.github/workflows/release.yml"
 # loop that already skips a missing one by name.
 for required in "$LIB" "$VERIFY" "$PACKAGE" "$RENDER_FORMULA" "$SMOKE" \
     "$VERIFY_SIGNATURE" "$VERIFY_ATTESTATION" "$VERIFY_BATCH" \
-    "$SITE_RENDER" "$SITE_TEMPLATE" "$FORMULA_TEMPLATE" "$RELEASE_WORKFLOW"; do
+    "$CHANGELOG_SECTION" "$SITE_RENDER" "$SITE_TEMPLATE" "$FORMULA_TEMPLATE" \
+    "$RELEASE_WORKFLOW"; do
     if [ ! -f "$required" ]; then
         echo "selftest: $required is missing — nothing was tested." >&2
         exit "$EXIT_UNCHECKED"
@@ -276,7 +282,7 @@ skip() {
 group "syntax (bash -n)"
 for s in "$LIB" "$VERIFY" "$PACKAGE" "$RENDER_FORMULA" "$SMOKE" \
     "$VERIFY_SIGNATURE" "$VERIFY_ATTESTATION" "$VERIFY_BATCH" \
-    "$SITE_RENDER" "${BASH_SOURCE[0]}"; do
+    "$CHANGELOG_SECTION" "$SITE_RENDER" "${BASH_SOURCE[0]}"; do
     expect_exit 0 "bash -n $(basename "$s")" bash -n "$s"
 done
 
@@ -3427,6 +3433,246 @@ expect_if_predicate "the early keychain destroy runs on the darwin legs and only
 # TWICE — once by its own step and once by a darwin step whose predicate drifted.
 expect_if_predicate "the Linux one-shot step runs on everything that is NOT darwin" \
     "- name: Build and package (Linux, unsigned)" "$IF_NOT_DARWIN"
+
+# --- changelog-section.sh, and the Upgrade notes it feeds ------------------
+#
+# The release body used to be generated in full and read no file, so the
+# CHANGELOG was a document with no reader: a disclosure could be written,
+# reviewed and merged, and never reach the page where an upgrading user would
+# look for it. release.yml now lifts the topmost changelog section into the
+# body, which makes this script part of the release path and gives it the same
+# obligation as everything else in this directory — to be exercised somewhere
+# other than the release that needs it.
+#
+# Two things are graded here, and they are different questions:
+#
+#   the SCRIPT   given a changelog, does it print the newest section and only
+#                that section — and given the several shapes of "there is
+#                nothing to publish", does it print nothing and say so without
+#                failing? The 75 cases are the load-bearing ones. A release
+#                that dies because nobody wrote a changelog entry is a worse
+#                outcome than a release with no notes, and the only thing
+#                standing between the two is that this script distinguishes
+#                "no section" from "I broke".
+#
+#   the WIRING   does release.yml actually call it, does the section land
+#                between the platforms and the checksums, and is the extracted
+#                text passed as a printf ARGUMENT rather than spliced into a
+#                format string? A changelog full of backticks, `%s` and `\n`
+#                rendered through a format string is a mangled disclosure at
+#                best and a broken body at worst.
+#
+# Both halves matter on their own: a perfect extractor nothing calls publishes
+# nothing, and a call to a broken extractor publishes garbage.
+
+group "changelog-section.sh (the hand-written half of a release body)"
+
+cs="$work/changelog"
+mkdir -p "$cs"
+
+# Stdout and stderr are kept APART. "It printed nothing" is a claim about
+# stdout alone, and expect_exit folds stderr into it — so a case asserting
+# silence would be satisfied by the very message the script prints to explain
+# the silence. Both streams land in files the follow-up assertions read.
+run_changelog_section() {
+    bash "$CHANGELOG_SECTION" "$@" >"$cs/out" 2>"$cs/err"
+}
+
+cat >"$cs/normal.md" <<'CHANGELOG_EOF'
+# Changelog
+
+Preamble prose that belongs to no section.
+
+## [Unreleased]
+
+### Changed
+
+- The newest thing.
+
+## [0.1.9] - 2026-08-01
+
+### Fixed
+
+- The older thing.
+CHANGELOG_EOF
+
+expect_exit 0 "a changelog with a topmost section -> 0" \
+    run_changelog_section "$cs/normal.md"
+assert "  ... and prints that section's body" \
+    grep -Fq -- "- The newest thing." "$cs/out"
+refute "  ... and not the section under it" \
+    grep -Fq -- "- The older thing." "$cs/out"
+refute "  ... and not the preamble over it" \
+    grep -Fq -- "Preamble prose" "$cs/out"
+# The heading is deliberately NOT printed: the top section is `## [Unreleased]`
+# until a release PR renames it, and a release page reading "Unreleased" under
+# a tagged version is the failure this omission prevents.
+refute "  ... and not the version heading, which would say 'Unreleased' on a tagged release" \
+    grep -Fq -- "[Unreleased]" "$cs/out"
+assert "  ... and starts at content, not at the blank line under the heading" \
+    [ -n "$(head -n 1 "$cs/out")" ]
+
+# --- the shapes that must publish NOTHING and still not fail a release -----
+
+expect_exit 75 "no changelog at that path -> 75, which is not a failed release" \
+    run_changelog_section "$cs/does-not-exist.md"
+assert "  ... and stdout is empty, so the body gains no section" [ ! -s "$cs/out" ]
+assert "  ... and the reason is on stderr" grep -Fq -- "nothing to print" "$cs/err"
+
+: >"$cs/empty.md"
+expect_exit 75 "an empty changelog -> 75" run_changelog_section "$cs/empty.md"
+assert "  ... and stdout is empty" [ ! -s "$cs/out" ]
+
+printf '# Changelog\n\nNo version sections in here yet.\n' >"$cs/no-section.md"
+expect_exit 75 "a changelog with no '## ' section at all -> 75" \
+    run_changelog_section "$cs/no-section.md"
+assert "  ... and stdout is empty" [ ! -s "$cs/out" ]
+# The two 75s have separate sentences on purpose: "there is no file" and "the
+# file says nothing" send whoever reads the release log to different places.
+assert "  ... and names the absent section, not an absent file" \
+    grep -Fq -- "has no '## ' section" "$cs/err"
+
+printf '# Changelog\n\n## [Unreleased]\n\n## [0.1.9]\n\n### Fixed\n\n- The older thing.\n' \
+    >"$cs/empty-section.md"
+expect_exit 75 "a topmost section with no body -> 75" \
+    run_changelog_section "$cs/empty-section.md"
+assert "  ... and stdout is empty" [ ! -s "$cs/out" ]
+# The one that would be a real incident: an empty newest section must not fall
+# through to the previous release's notes. Publishing v0.1.9's changes as
+# v0.1.10's upgrade notes is not a missing disclosure, it is a false one.
+refute "  ... and the PREVIOUS release's section was not promoted into its place" \
+    grep -Fq -- "- The older thing." "$cs/out"
+
+# --- code fences are not section boundaries --------------------------------
+#
+# A ``` block can contain a line starting with `## `. Read as a heading, it
+# ends the section early and publishes HALF of it — and a privacy disclosure
+# truncated mid-sentence renders green and reads as complete.
+
+cat >"$cs/fenced.md" <<'CHANGELOG_EOF'
+# Changelog
+
+## [Unreleased]
+
+Before the fence.
+
+```md
+## This line is inside a fence and is not a section boundary.
+```
+
+After the fence.
+
+## [0.1.9]
+
+- The older thing.
+CHANGELOG_EOF
+
+expect_exit 0 "a '## ' inside a code fence does not end the section" \
+    run_changelog_section "$cs/fenced.md"
+assert "  ... so the prose after the fence is still published" \
+    grep -Fq -- "After the fence." "$cs/out"
+refute "  ... and the genuine next section is still excluded" \
+    grep -Fq -- "- The older thing." "$cs/out"
+
+cat >"$cs/indented-fence.md" <<'CHANGELOG_EOF'
+# Changelog
+
+## [Unreleased]
+
+- A bullet whose fence is indented, the way this repo's changelog writes them:
+
+  ```sh
+  ## still not a heading
+  ```
+
+- The last bullet.
+
+## [0.1.9]
+
+- The older thing.
+CHANGELOG_EOF
+
+expect_exit 0 "an INDENTED fence is a fence too (this repo's changelog indents them)" \
+    run_changelog_section "$cs/indented-fence.md"
+assert "  ... so the bullet after it survives" \
+    grep -Fq -- "- The last bullet." "$cs/out"
+refute "  ... and the genuine next section is still excluded" \
+    grep -Fq -- "- The older thing." "$cs/out"
+
+# The real file, because every case above is a fixture this suite wrote to be
+# parseable. Whether the changelog THIS repo actually ships parses is a
+# different claim, and it is the one that decides what the next release page
+# says. Not in the `required` list at the top: a checkout without a changelog
+# is a legal state that publishes no notes, and this suite says so by skipping
+# rather than by aborting.
+CHANGELOG_FILE="$repo_root/CHANGELOG.md"
+if [ -f "$CHANGELOG_FILE" ]; then
+    expect_exit 0 "this repo's own CHANGELOG.md yields a section" \
+        run_changelog_section "$CHANGELOG_FILE"
+    assert "  ... with a body the release body can carry" [ -s "$cs/out" ]
+else
+    skip "this repo's own CHANGELOG.md (the file is not in this checkout)"
+fi
+
+# --- the wiring in release.yml ---------------------------------------------
+
+# Single-quoted: `$(...)` and `$upgrade_notes` are release.yml's text, not this
+# script's variables.
+# shellcheck disable=SC2016  # deliberate: these are the workflow's bytes
+CS_ANCHOR_CALL='upgrade_notes="$(bash tools/release/changelog-section.sh)"'
+CS_ANCHOR_UPGRADE="printf '### Upgrade notes"
+CS_ANCHOR_PLATFORMS="printf '### Platforms"
+CS_ANCHOR_CHECKSUMS="printf '### Checksums (sha256)"
+# `%s` with the section as an ARGUMENT. The changelog is prose full of
+# backticks, percent signs and backslashes; the day it reaches a printf FORMAT
+# string is the day a release body renders as garbage — or silently drops the
+# half of a disclosure that followed a stray `%`.
+CS_ANCHOR_PRINT="printf '%s\\n\\n' \"\$upgrade_notes\""
+# The 75 branch, pinned by its user-visible title. What this really guards is
+# the shape it replaced: a `|| true`, which would turn a BROKEN extractor into
+# a silently note-less release.
+CS_ANCHOR_NOTICE="title=No upgrade notes"
+
+assert "release.yml calls changelog-section.sh for the release body" \
+    grep -Fq -- "$CS_ANCHOR_CALL" "$RELEASE_WORKFLOW"
+assert "release.yml renders an 'Upgrade notes' heading" \
+    grep -Fq -- "$CS_ANCHOR_UPGRADE" "$RELEASE_WORKFLOW"
+assert "the section is passed as a printf ARGUMENT, never as part of a format string" \
+    grep -Fq -- "$CS_ANCHOR_PRINT" "$RELEASE_WORKFLOW"
+assert "a changelog with no section is a notice, not a failed release" \
+    grep -Fq -- "$CS_ANCHOR_NOTICE" "$RELEASE_WORKFLOW"
+# The dry-run branch renders the same `$notes` file the publish uploads, so the
+# Upgrade notes section is visible from a workflow_dispatch without burning a
+# tag — the property the rest of this workflow is built to preserve.
+# shellcheck disable=SC2016  # deliberate: the workflow's bytes
+assert "the dry-run branch prints the rendered notes, Upgrade notes included" \
+    grep -Fq -- 'cat "$notes"' "$RELEASE_WORKFLOW"
+
+cs_line_platforms="$(workflow_line_of "$RELEASE_WORKFLOW" "$CS_ANCHOR_PLATFORMS")"
+cs_line_upgrade="$(workflow_line_of "$RELEASE_WORKFLOW" "$CS_ANCHOR_UPGRADE")"
+cs_line_checksums="$(workflow_line_of "$RELEASE_WORKFLOW" "$CS_ANCHOR_CHECKSUMS")"
+cs_anchors_ok=1
+for cs_got in "$cs_line_platforms" "$cs_line_upgrade" "$cs_line_checksums"; do
+    case "$cs_got" in
+        '' | ambiguous:*) cs_anchors_ok=0 ;;
+    esac
+done
+if [ "$cs_anchors_ok" -eq 1 ]; then
+    # Upgrade notes belong where a reader meets them BEFORE deciding to take
+    # the release. The checksums are what they need afterwards.
+    assert "the Upgrade notes section renders after the Platforms block" \
+        [ "$cs_line_platforms" -lt "$cs_line_upgrade" ]
+    assert "  ... and before the checksums" \
+        [ "$cs_line_upgrade" -lt "$cs_line_checksums" ]
+else
+    # Named, never a quiet pass — the same rule the ordering group above
+    # follows. An assertion satisfied by deleting what it reads is not one.
+    report_fail "the Upgrade notes section's position in release.yml" \
+        "one of the three anchors is missing or ambiguous:
+  platforms=${cs_line_platforms:-<none>}
+  upgrade=${cs_line_upgrade:-<none>}
+  checksums=${cs_line_checksums:-<none>}"
+fi
 
 # --- summary ---------------------------------------------------------------
 

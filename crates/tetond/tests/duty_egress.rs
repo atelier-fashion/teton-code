@@ -282,7 +282,11 @@ async fn a_triage_of_clean_matches_sends_inside_a_boundary_bearing_turn() {
             &json!({ "pattern": "parse" }),
             "find the parser",
             &duties,
-            ToolOutcome::ok(content).with_paths(["src/a.rs", "src/b.rs"]),
+            // The match count travels on the outcome, not in the text
+            // (REQ-561 verify M3): two matches, so the ranking is worth making.
+            ToolOutcome::ok(content)
+                .with_paths(["src/a.rs", "src/b.rs"])
+                .measuring(2),
         )
         .await;
 
@@ -452,7 +456,11 @@ async fn a_shell_duty_sends_only_on_a_machine_with_no_boundary_configured() {
                 &json!({ "command": "cargo build" }),
                 "fix the build",
                 &duties,
-                ToolOutcome::error(FAILED).with_unknown_provenance(),
+                // `measuring` says a command really ran: the `shell` duty fires
+                // only on results a spawned command produced (REQ-561 verify).
+                ToolOutcome::error(FAILED)
+                    .with_unknown_provenance()
+                    .measuring(FAILED.chars().count()),
             )
             .await
     }

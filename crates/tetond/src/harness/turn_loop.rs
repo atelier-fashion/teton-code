@@ -46,9 +46,7 @@ use super::compact::COMPACT_DUTY;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
-use super::context::{
-    summarize_if_large, BlockRole, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN,
-};
+use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN};
 use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
@@ -604,10 +602,14 @@ pub async fn run_session_turn_with_source(
                         // REQ-544 C-1: the result's egress provenance is the files
                         // the tool actually touched (or UNKNOWN for `shell`), as
                         // the tool reported — never a literal `path` argument.
+                        // `measured` is the tool's own trigger input and was
+                        // already consumed by `refine` above; nothing downstream
+                        // of the fold reads it.
                         let ToolOutcome {
                             content,
                             is_error,
                             provenance,
+                            measured: _,
                         } = outcome;
                         let folded = if is_error {
                             format!("ERROR: {content}")
@@ -777,21 +779,22 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     s
 }
 
-/// The request this turn is serving: the most recent user block in `ctx`.
+/// The request this turn is serving.
 ///
 /// This is what a [`Tool::refine`](super::tools::Tool::refine) duty measures
 /// "relevant" against, and it is read from the context rather than threaded down
 /// from the RPC so that every entry point into the loop — the daemon's, the
-/// offline one, a test's — gets the same answer from the same place. A context
-/// with no user block yet (a system-only assembly) yields the empty string,
-/// which a duty prompt carries harmlessly.
+/// offline one, a test's — gets the same answer from the same place.
+///
+/// It reads [`ContextManager::request`] and **not** the newest `User` block.
+/// Those two agree on a first attempt and diverge on a retry: `run_one_attempt`
+/// re-enters this loop against the same accumulated manager, by which point
+/// `compact_if_pressured` may have replaced the user block with a `Tool`-role
+/// summary or `truncate_to_budget` may have dropped it as the oldest thing
+/// present. Scanning the blocks then returned `""`, and a duty ranked against an
+/// empty request while still spending the model call (REQ-561 verify).
 fn latest_request(ctx: &ContextManager) -> String {
-    ctx.blocks()
-        .iter()
-        .rev()
-        .find(|block| block.role == BlockRole::User)
-        .map(|block| block.text.clone())
-        .unwrap_or_default()
+    ctx.request().to_owned()
 }
 
 /// A short human title for a tool call (drives the `tool_call` event title).
@@ -1285,5 +1288,61 @@ mod tests {
                 "the tool-call format is missing:\n{system}"
             );
         }
+    }
+
+    /// **The request a duty is measured against survives a retry**
+    /// (REQ-561 verify).
+    ///
+    /// `run_one_attempt` re-enters this loop against the same accumulated
+    /// manager on every retry and every fallback. By then the user block may be
+    /// gone: `compact_if_pressured` replaces forgotten blocks with a `Tool`-role
+    /// summary, and `truncate_to_budget` drops oldest-first — and the user block
+    /// is the oldest thing there is. Reading the request back out of `blocks`
+    /// therefore returned `""` on the second attempt, and `triage` ranked
+    /// against an empty request while still spending the model call.
+    ///
+    /// The fixture drops the block through the deterministic path, then asserts
+    /// both halves: the block really is gone (so this is not a manager that
+    /// still had it), and the request is still there.
+    #[test]
+    fn the_turns_request_outlives_the_block_that_carried_it() {
+        const REQUEST: &str = "find where the retry budget is decided";
+
+        let mut ctx = ContextManager::new("system", 64).with_budget_bytes(512);
+        ctx.push_user(REQUEST);
+        for i in 0..40 {
+            ctx.push_model(format!(
+                "step {i}: reading yet another file to fill the budget"
+            ));
+        }
+        ctx.truncate_to_budget();
+
+        assert!(
+            !ctx.blocks()
+                .iter()
+                .any(|b| b.role == crate::harness::context::BlockRole::User),
+            "the fixture must actually drop the user block, or it tests nothing"
+        );
+        assert_eq!(
+            latest_request(&ctx),
+            REQUEST,
+            "a retry ranked its matches against an empty request"
+        );
+    }
+
+    /// And it is the *latest* request, not the first one a manager ever saw —
+    /// the name means what it says.
+    #[test]
+    fn the_turns_request_is_the_most_recent_one_pushed() {
+        let mut ctx = ContextManager::new("system", 4_096);
+        assert_eq!(
+            latest_request(&ctx),
+            "",
+            "a system-only assembly asks nothing"
+        );
+        ctx.push_user("first");
+        ctx.push_model("...");
+        ctx.push_user("second");
+        assert_eq!(latest_request(&ctx), "second");
     }
 }

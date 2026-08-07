@@ -65,6 +65,10 @@ the `teton-code` already running is still the old one until something restarts i
 and `teton doctor` names the running daemon's version so you can tell which one
 answered.
 
+[`CHANGELOG.md`](CHANGELOG.md) records what an upgrade changes on a machine that
+was already running — in particular any release that changes where your data
+goes without you having changed a setting. Read it before a restart, not after.
+
 ### Uninstalling
 
 ```sh

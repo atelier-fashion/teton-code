@@ -435,20 +435,12 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
-    use futures::stream;
     use teton_core::entities::{BoundaryMode, PrivacyBoundary};
     use teton_inference::{Engine, MockEngine};
-    use teton_providers::transport::{
-        HttpMethod, TransportError, TransportRequest, TransportResponse,
-    };
-    use teton_providers::{
-        CapabilityProfile, Provider, ProviderError, StopReason, TokenUsage, Transport,
-        TurnCompletion, TurnEvent, TurnRequest, TurnStream,
-    };
 
-    use crate::egress::{Egress, NoopSink, Provenance as EgressProvenance};
+    use crate::egress::Provenance as EgressProvenance;
     use crate::harness::context::{BlockRole, ContextManager, ToolProvenance};
+    use crate::harness::duty::testing::{remote_duty_route, wire, Sent};
     use crate::harness::duty::DutyRoute;
 
     fn conversation() -> Vec<ContextBlock> {
@@ -738,104 +730,14 @@ mod tests {
 
     // -- the remote leg: the harness-owned ceiling (BR-8, AC-11) -------------
 
-    /// A transport that records every request body it is asked to send.
-    #[derive(Default, Clone)]
-    struct CaptureTransport {
-        sent: Arc<Mutex<Vec<Vec<u8>>>>,
-    }
-
-    #[async_trait]
-    impl Transport for CaptureTransport {
-        async fn execute(
-            &self,
-            request: TransportRequest,
-        ) -> Result<TransportResponse, TransportError> {
-            self.sent
-                .lock()
-                .expect("capture poisoned")
-                .push(request.body);
-            Ok(TransportResponse {
-                status: 200,
-                body: Box::pin(stream::empty()),
-            })
-        }
-    }
-
-    /// A provider that puts its request on the wire before answering, and can be
-    /// told to stream its reply `repeat` times — i.e. to ignore `max_tokens`.
-    struct WireProvider {
-        reply: String,
-        repeat: usize,
-    }
-
-    #[async_trait]
-    impl Provider for WireProvider {
-        fn id(&self) -> &str {
-            "wire"
-        }
-        fn capabilities(&self) -> CapabilityProfile {
-            CapabilityProfile::default()
-        }
-        async fn stream_turn(
-            &self,
-            request: TurnRequest,
-            transport: &dyn Transport,
-        ) -> Result<TurnStream, ProviderError> {
-            let body =
-                serde_json::to_vec(&request).map_err(|e| ProviderError::Build(e.to_string()))?;
-            transport
-                .execute(TransportRequest {
-                    method: HttpMethod::Post,
-                    url: "https://api.example.com/v1/chat/completions".to_owned(),
-                    headers: Vec::new(),
-                    body,
-                })
-                .await
-                .map_err(|err| match err {
-                    TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
-                    _ => ProviderError::Transport,
-                })?;
-            let mut events: Vec<Result<TurnEvent, ProviderError>> = (0..self.repeat)
-                .map(|_| Ok(TurnEvent::TextDelta(self.reply.clone())))
-                .collect();
-            events.push(Ok(TurnEvent::Completed(TurnCompletion {
-                usage: TokenUsage::default(),
-                stop_reason: StopReason::EndTurn,
-            })));
-            Ok(Box::pin(stream::iter(events)))
-        }
-    }
-
     /// A remote `compact` route over a capturing transport, with `boundaries`
     /// enforced at the choke point.
     fn remote_route(
         boundaries: Vec<PrivacyBoundary>,
         reply: &str,
         repeat: usize,
-    ) -> (DutyRoute, Arc<Mutex<Vec<Vec<u8>>>>) {
-        let transport = CaptureTransport::default();
-        let sent = Arc::clone(&transport.sent);
-        let egress = Egress::new(transport, boundaries, Arc::new(NoopSink));
-        let route = DutyRoute::remote(
-            COMPACT_DUTY,
-            "frontier",
-            Box::new(WireProvider {
-                reply: reply.to_owned(),
-                repeat,
-            }),
-            egress,
-            "claude-opus-4",
-            "sess-1",
-        );
-        (route, sent)
-    }
-
-    fn wire(sent: &Arc<Mutex<Vec<Vec<u8>>>>) -> String {
-        sent.lock()
-            .expect("capture poisoned")
-            .iter()
-            .map(|body| String::from_utf8_lossy(body).into_owned())
-            .collect()
+    ) -> (DutyRoute, Sent) {
+        remote_duty_route(COMPACT_DUTY, boundaries, reply, repeat)
     }
 
     /// **AC-11, BR-8.** A provider ignoring `max_tokens` cannot grow the compact

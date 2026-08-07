@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use teton_protocol::methods::SessionSummary;
 use teton_protocol::{Phase, SessionId, SessionMode};
@@ -37,9 +37,18 @@ struct SessionRecord {
 }
 
 /// A thread-safe registry of live sessions, newest tracked last.
+///
+/// **`Clone` yields another handle to the *same* registry**, not a copy of it —
+/// the state is behind an `Arc`, in the shape a `tokio::sync` primitive or a
+/// `reqwest::Client` uses. That exists so work which outlives a request handler
+/// can still write back: the `title` duty (REQ-561 TASK-062) is detached from
+/// the turn that triggers it precisely so the turn does not wait on it, and a
+/// detached task needs an owned `'static` handle rather than a borrow of the
+/// daemon's field.
+#[derive(Clone)]
 pub struct SessionRegistry {
-    sessions: Mutex<Vec<SessionRecord>>,
-    counter: AtomicU64,
+    sessions: Arc<Mutex<Vec<SessionRecord>>>,
+    counter: Arc<AtomicU64>,
 }
 
 impl SessionRegistry {
@@ -47,8 +56,8 @@ impl SessionRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sessions: Mutex::new(Vec::new()),
-            counter: AtomicU64::new(0),
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            counter: Arc::new(AtomicU64::new(0)),
         }
     }
 

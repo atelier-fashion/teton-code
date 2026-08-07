@@ -131,15 +131,37 @@ pub struct ToolOutcome {
     /// The files this result was derived from (or `Unknown`). Defaults to no
     /// provenance for tools that surface no repo-file content.
     pub provenance: ToolProvenance,
+    /// **How much this call found, measured before the tool's own cap** — the
+    /// one number [`Tool::refine`]'s duty trigger is decided on, carried beside
+    /// `content` rather than re-derived from it (REQ-561 verify M3).
+    ///
+    /// The unit is the measuring tool's own and only that tool's `refine` reads
+    /// it: `grep` counts matching lines (before the 200-match cap), `shell`
+    /// counts characters of stdout+stderr (before the 8,000-character cap).
+    /// `None` means **nothing was measured** — the call did not get far enough
+    /// to produce a result of the kind this number describes, which for `shell`
+    /// is exactly "no command ran".
+    ///
+    /// It is a field and not a line in `content` because `content` is
+    /// *model-visible text*, and every tool that recovered this number by
+    /// parsing its own rendered prose got it wrong in the same way. `grep`
+    /// answers a zero-hit search in prose, so a pattern containing a newline —
+    /// which can never match, since the search compares against
+    /// `contents.lines()` — read back as two "matches" and bought a `triage`
+    /// call that then rebuilt the message out of its own words. `shell` read a
+    /// length off its last line, which command output can forge. Neither is
+    /// reachable through a number the tool hands over directly.
+    pub measured: Option<usize>,
 }
 
 impl ToolOutcome {
-    /// A successful outcome with no file provenance.
+    /// A successful outcome with no file provenance and nothing measured.
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: false,
             provenance: ToolProvenance::none(),
+            measured: None,
         }
     }
 
@@ -149,7 +171,16 @@ impl ToolOutcome {
             content: content.into(),
             is_error: true,
             provenance: ToolProvenance::none(),
+            measured: None,
         }
+    }
+
+    /// Record what this call found, in the measuring tool's own unit — see
+    /// [`ToolOutcome::measured`].
+    #[must_use]
+    pub fn measuring(mut self, measured: usize) -> Self {
+        self.measured = Some(measured);
+        self
     }
 
     /// Tag this outcome with the [`ToolProvenance`] of the files it touched.

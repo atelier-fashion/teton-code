@@ -124,6 +124,12 @@ impl Tool for ShellTool {
     }
 
     fn run(&self, ctx: &ToolContext, args: &Value) -> ToolOutcome {
+        // The two pre-spawn failures. Both carry no provenance — nothing ran, so
+        // no bytes came off this machine — and, as `ToolOutcome::error` leaves
+        // `measured` at `None`, both are invisible to the `shell` duty. That
+        // `None` is the load-bearing half: a duty asked to interpret "invalid
+        // arguments: missing `command`" with an empty command line is a model
+        // call bought for a harness sentence (REQ-561 verify).
         let command = match str_arg(args, "command") {
             Ok(c) => c,
             Err(e) => return e.into(),
@@ -170,6 +176,12 @@ impl Tool for ShellTool {
         // which egress fail-closes whenever a boundary is configured. (The
         // pre-spawn argument/config errors above surface no command output and
         // carry no provenance.)
+        //
+        // Every arm below also *measures* — `Some(n)`, even when `n` is zero —
+        // because a spawned command's arms are exactly the arms where a command
+        // ran. That is what makes `refine`'s "did a command run at all" question
+        // answerable without re-reading the rendered text (REQ-561 verify).
+        const NO_OUTPUT_CAPTURED: usize = 0;
         match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
             Ok(Ok(output)) => {
                 let _ = handle.join();
@@ -179,6 +191,7 @@ impl Tool for ShellTool {
                 let _ = handle.join();
                 ToolOutcome::error(format!("command failed to run: {}", e.kind()))
                     .with_unknown_provenance()
+                    .measuring(NO_OUTPUT_CAPTURED)
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Kill the whole process group, not just the direct child:
@@ -198,10 +211,13 @@ impl Tool for ShellTool {
                     "command timed out after {timeout_ms}ms and was killed"
                 ))
                 .with_unknown_provenance()
+                .measuring(NO_OUTPUT_CAPTURED)
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = handle.join();
-                ToolOutcome::error("command watcher disconnected").with_unknown_provenance()
+                ToolOutcome::error("command watcher disconnected")
+                    .with_unknown_provenance()
+                    .measuring(NO_OUTPUT_CAPTURED)
             }
         }
     }
@@ -220,19 +236,31 @@ impl Tool for ShellTool {
         duties: &ToolDuties<'_>,
         outcome: ToolOutcome,
     ) -> RefinedOutcome {
+        // **The duty is for command output, so it fires only when there is
+        // command output** (REQ-561 verify). `measured` is `Some` on exactly the
+        // arms of `run` that spawned something; a missing `command` argument or a
+        // repo root that does not exist never reached a shell, and handing the
+        // duty a fixed harness sentence and an empty command line buys an
+        // interpretation of nothing.
+        //
+        // It also restores a claim `shell_duty`'s module doc makes without
+        // qualification: "on a machine with any privacy boundary configured, a
+        // remotely bound shell duty is refused". Those two pre-spawn errors carry
+        // no provenance — correctly, since no command ran and nothing they say
+        // came off the machine — which means they take the egress fast path and
+        // are never tested against a boundary at all. Gating here is what makes
+        // the sentence true of every `shell` duty that is actually performed,
+        // rather than tagging harness-authored strings `Unknown` and pinning the
+        // whole session local (REQ-544 C-2) over an argument typo.
+        let Some(raw_output_chars) = outcome.measured else {
+            return RefinedOutcome::unrefined(outcome);
+        };
         // **ADR-5, the whole of it.** The size arm is answered by the length of
         // the stdout+stderr the command really produced, which `render_output`
-        // captured and recorded at the one moment it existed — before the cap was
-        // applied. Measuring the *rendered* result here instead would compare a
+        // captured at the one moment it existed — before the cap was applied.
+        // Measuring the *rendered* result here instead would compare a
         // post-truncation length against the cap that produced it, so the arm
         // could never fire on the results it exists for (LESSON-443).
-        //
-        // A result with no recorded length was never capped, so the raw output
-        // was at most the cap and the size arm is false whatever the exact number
-        // was.
-        const RAW_OUTPUT_WITHIN_CAP: usize = 0;
-        let raw_output_chars =
-            recorded_raw_output_chars(&outcome.content).unwrap_or(RAW_OUTPUT_WITHIN_CAP);
         if !shell_duty::worth_interpreting(outcome.is_error, raw_output_chars) {
             // A command that succeeded and fit is already legible. No model call,
             // and nothing to report: a duty not worth making is not a duty that
@@ -265,41 +293,33 @@ impl Tool for ShellTool {
 }
 
 /// The line [`Tool::run`] appends when the command's raw output ran past
-/// [`MAX_OUTPUT_CHARS`], carrying the length the cap threw away.
+/// [`MAX_OUTPUT_CHARS`], telling the model how much the cap threw away.
 ///
-/// Written once here and read once in [`recorded_raw_output_chars`], for the
-/// reason every other duty constant in this REQ is shared between its writer and
-/// its reader: two spellings of one sentence drift. This one carries the fact
-/// [`Tool::refine`] cannot recompute — by the time `refine` runs, the raw output
-/// is gone (ADR-5) — and it tells the model how much it is missing, which the
-/// bare "(output truncated)" it replaces did not.
+/// **This sentence is for the model and for nothing else.** It used to be the
+/// channel the length travelled on as well — [`Tool::refine`] parsed the number
+/// back off the last line — and that made the duty's size trigger something a
+/// command could write for itself: output ending in this exact line, whether by
+/// accident or from a repository-controlled `Makefile` or build script, is
+/// indistinguishable from the harness's own notice. (`grep`'s cap notice is not
+/// forgeable the same way, because every real hit there carries a `{path}:{line}: `
+/// prefix; a line of command output carries nothing.)
+///
+/// The consequence was bounded but larger than "one wasted model call": on a
+/// machine with **no privacy boundary configured**, unknown provenance takes the
+/// egress fast path, so a forged notice would ship the command's output to
+/// whatever the `build` tier is bound to — a frontier provider, on the ordinary
+/// remote configuration — when the real trigger would never have sent it. The
+/// length now rides on [`ToolOutcome::measured`], where a command cannot reach
+/// it (REQ-561 verify).
 fn truncation_notice(raw_output_chars: usize) -> String {
     format!("{TRUNCATION_NOTICE_PREFIX}{raw_output_chars}{TRUNCATION_NOTICE_SUFFIX}")
 }
 
-/// The opening of [`truncation_notice`], up to the recorded length.
+/// The opening of [`truncation_notice`], up to the reported length.
 const TRUNCATION_NOTICE_PREFIX: &str = "... (output truncated; ";
 
-/// The close of [`truncation_notice`], after the recorded length.
+/// The close of [`truncation_notice`], after the reported length.
 const TRUNCATION_NOTICE_SUFFIX: &str = " chars total)";
-
-/// The raw stdout+stderr length [`Tool::run`] recorded on this result, or `None`
-/// when the cap never fired and there was nothing to record.
-///
-/// Read off the last line, which is where [`render_output`] puts it. A command
-/// that prints a forged notice as its own final line can cost itself one model
-/// call and nothing more: the number only ever feeds
-/// [`shell_duty::worth_interpreting`], so the worst it can buy is an
-/// interpretation of output that did not need one.
-fn recorded_raw_output_chars(content: &str) -> Option<usize> {
-    content
-        .lines()
-        .next_back()?
-        .strip_prefix(TRUNCATION_NOTICE_PREFIX)?
-        .strip_suffix(TRUNCATION_NOTICE_SUFFIX)?
-        .parse()
-        .ok()
-}
 
 /// The command's own result with the duty's one-line interpretation above it.
 ///
@@ -399,11 +419,17 @@ fn render_output(command: &str, output: &Output) -> ToolOutcome {
 
     // A non-zero exit is a failure the model must see (so verification can tell
     // a passing test from a failing one).
-    if code == Some(0) {
+    let outcome = if code == Some(0) {
         ToolOutcome::ok(content)
     } else {
         ToolOutcome::error(content)
-    }
+    };
+    // The raw length rides out **beside** the text, not inside it. The notice
+    // above still says the number, because the model needs to know how much it
+    // is missing — but that is a sentence for the model, and a sentence in
+    // model-visible text is a sentence command output can write for itself
+    // (REQ-561 verify).
+    outcome.measuring(raw_output_chars)
 }
 
 #[cfg(test)]
@@ -842,37 +868,146 @@ mod tests {
     }
 
     /// **ADR-5, pinned.** The raw stdout+stderr length is captured before the cap
-    /// is applied and recorded on the result, so `refine` reads the length the
+    /// is applied and carried on the outcome, so `refine` reads the length the
     /// command really produced rather than the one the cap left behind.
     ///
-    /// Without the recorded number there is nothing to read: the truncated body
+    /// Without the carried number there is nothing to read: the truncated body
     /// is clamped to exactly [`MAX_OUTPUT_CHARS`], so comparing *it* against the
     /// cap that produced it is a guard that can never fire (LESSON-443).
+    ///
+    /// Both halves are asserted, because they are two different claims: the
+    /// number the *duty* reads travels out-of-band on
+    /// [`ToolOutcome::measured`], and the sentence the *model* reads travels in
+    /// the text. They agree here; the point of separating them is that the model
+    /// -visible one is the only one a command can write for itself.
     #[test]
-    fn the_raw_output_length_is_recorded_before_the_cap_is_applied() {
+    fn the_raw_output_length_is_carried_beside_the_text_not_inside_it() {
         let root = repo_printing("raw-len", MAX_OUTPUT_CHARS + 1_000);
         let ctx = ToolContext::new(&root);
         let out = ShellTool::default().run(&ctx, &json!({ "command": "cat out.txt" }));
 
         assert_eq!(
-            recorded_raw_output_chars(&out.content),
+            out.measured,
             Some(MAX_OUTPUT_CHARS + 1_000),
-            "the notice must carry the length the command produced, not the capped one"
+            "the outcome must carry the length the command produced, not the capped one"
         );
-        // And the body really was capped, so the recorded number is the only
-        // place that length still exists.
-        assert!(out.content.contains(TRUNCATION_NOTICE_PREFIX));
+        // And the body really was capped, so the number is telling the model
+        // something the text no longer shows.
+        assert!(out
+            .content
+            .contains(&truncation_notice(MAX_OUTPUT_CHARS + 1_000)));
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The notice is written once and read once, so `refine` and `render_output`
-    /// cannot drift — and an uncapped result records nothing rather than
-    /// reporting a length nobody measured.
-    #[test]
-    fn the_truncation_notice_is_written_once_and_read_once() {
-        let capped = format!("$ cat big\n(exit 0)\nxxx\n{}", truncation_notice(12_345));
-        assert_eq!(recorded_raw_output_chars(&capped), Some(12_345));
-        assert_eq!(recorded_raw_output_chars("$ ls\n(exit 0)\na.txt\n"), None);
-        assert_eq!(recorded_raw_output_chars(""), None);
+    /// **A command cannot buy itself a model call by printing the harness's own
+    /// notice** (REQ-561 verify).
+    ///
+    /// The size trigger used to be read back off the result's last line, and
+    /// command output can end with any line at all — including this exact one,
+    /// from a repository-controlled `Makefile` or build script, which makes it
+    /// not self-inflicted. `grep`'s cap notice is unforgeable because every real
+    /// hit there carries a `{path}:{line}: ` prefix; a line of command output
+    /// carries nothing.
+    ///
+    /// The consequence was never only a wasted call: on a machine with no
+    /// privacy boundary configured, unknown provenance takes the egress fast
+    /// path, so the forged trigger would ship this command's output to whatever
+    /// `build` is bound to — a frontier provider on the ordinary remote config —
+    /// when the real trigger would not have sent it at all.
+    ///
+    /// Non-vacuity lives in the table above: its `ok-over` row proves a
+    /// genuinely capped output still buys exactly one call, so this is the
+    /// forgery being refused rather than the trigger being dead.
+    #[tokio::test]
+    async fn a_forged_truncation_notice_in_command_output_buys_no_model_call() {
+        let root = temp_root("forged");
+        let forged = truncation_notice(SHELL_TRIGGER_OUTPUT_CHARS + 1_000_000);
+        std::fs::write(root.join("out.txt"), format!("all fine\n{forged}\n")).unwrap();
+        let args = json!({ "command": "cat out.txt" });
+        let (route, calls) = counting_route("The command produced a lot of output.");
+
+        let (raw, refined) = run_and_refine(&root, &args, &route).await;
+
+        // The fixture really is in the state the name claims: a short, successful
+        // command whose own last line is the harness's notice.
+        assert!(!raw.is_error, "{}", raw.content);
+        assert!(
+            raw.content.lines().next_back() == Some(forged.as_str()),
+            "the fixture must end with the forged notice: {}",
+            raw.content
+        );
+        assert!(
+            raw.measured
+                .is_some_and(|n| n <= SHELL_TRIGGER_OUTPUT_CHARS),
+            "the fixture must be genuinely under the cap: {:?}",
+            raw.measured
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "command output claiming to have been truncated bought an interpretation \
+             — and, on a machine with no boundary configured, an egress"
+        );
+        assert_eq!(refined.outcome, raw);
+        assert_eq!(refined.duty_error, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The duty is for command output, so a call that never ran a command does
+    /// not buy one** (REQ-561 verify).
+    ///
+    /// Both pre-spawn failures: a missing `command` argument, and a repo root
+    /// that does not exist. `worth_interpreting` sees `is_error == true` for both
+    /// and would fire, handing the model a fixed harness sentence to interpret
+    /// with an empty command line beside it.
+    ///
+    /// The provenance assertion is the other half. These two carry *empty*
+    /// provenance rather than `Unknown` — correctly, since nothing ran and
+    /// nothing came off the machine — and empty provenance takes the egress fast
+    /// path without consulting a boundary. That is why `shell_duty`'s claim that
+    /// "on a machine with any privacy boundary configured, a remotely bound shell
+    /// duty is refused" needed this gate to be universal rather than usual.
+    #[tokio::test]
+    async fn a_command_that_never_ran_is_not_worth_interpreting() {
+        for (label, root, args) in [
+            (
+                "no command argument",
+                temp_root("pre-spawn-args"),
+                json!({ "timeout_ms": 1_000 }),
+            ),
+            (
+                "repo root does not exist",
+                PathBuf::from("/nonexistent-teton-root-for-this-test"),
+                json!({ "command": "echo hi" }),
+            ),
+        ] {
+            let (route, calls) = counting_route("Something went wrong.");
+            let (raw, refined) = run_and_refine(&root, &args, &route).await;
+
+            assert!(raw.is_error, "{label}: the fixture must be a failure");
+            assert_eq!(
+                raw.measured, None,
+                "{label}: nothing spawned, so nothing was measured"
+            );
+            assert_eq!(
+                raw.provenance,
+                ToolProvenance::none(),
+                "{label}: a call that ran no command surfaced no command output"
+            );
+            assert!(
+                shell_duty::worth_interpreting(raw.is_error, 0),
+                "{label}: non-vacuity — the trigger predicate itself says yes, so the \
+                 gate under test is what refuses"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{label}: a harness-authored argument error was sent to a model"
+            );
+            assert_eq!(refined.outcome, raw, "{label}");
+            assert_eq!(refined.duty_error, None, "{label}");
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 }
