@@ -2,8 +2,8 @@
   "req": "REQ-561",
   "branch": "feat/REQ-561-wire-unreached-categories",
   "startedAt": "2026-08-07T00:00:00Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -49,6 +51,16 @@
       "phase": 6,
       "name": "Create Pull Request",
       "completedAt": "2026-08-07T09:15:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-07T21:20:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-07T21:45:00Z"
     }
   ],
   "repos": {
@@ -60,7 +72,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/63",
       "prNumber": 63,
-      "merged": false
+      "merged": true
     }
   },
   "mergeOrder": [
