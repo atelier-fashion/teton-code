@@ -59,7 +59,7 @@ rows already exist and already validate (REQ-558 TASK-049).
 |-------|---------|---------|
 | route_decided | **now also emitted for duties** | gains nothing; the duty emits the same payload the turn does, with its own category |
 | cost_recorded | unchanged | already carries `category` (REQ-558) |
-| session_titled | **new**; the `title` duty resolved a title (OQ-2, resolved) | `session_id`, `title`. Emitted once per session. The daemon owns the value; rendering it is REQ-560's status line, not this REQ. |
+| session_titled | **new**; the `title` duty resolved a title (OQ-2, resolved) | `session_id`, `title`. Emitted once per session. New `Event` variant + payload in `teton-protocol` (no such type exists today). The daemon owns the value; this REQ ships it to the wire and no further — see BR-9a on why no renderer is promised. |
 
 ## Business Rules
 
