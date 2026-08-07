@@ -1044,9 +1044,13 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
                     ),
                 }
             }
+            // The commonest cause is a daemon left running across an upgrade,
+            // and `handshake` has already turned that into a sentence with the
+            // restart command in it — doctor adds the context that the daemon
+            // is up, which is the part its other arms establish.
             Err(err) => surface.line(
                 LineKind::Error,
-                &format!("daemon: reachable but handshake failed: {err}"),
+                &format!("daemon: reachable, but it rejected this CLI — {err}"),
             ),
         },
         Err(_) => surface.line(

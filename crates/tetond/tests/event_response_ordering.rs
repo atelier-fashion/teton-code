@@ -31,6 +31,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
+use teton_protocol::{PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
 use tetond::{server, Daemon};
 
 /// Iterations per test. The pre-fence race hit ~1 in 10 turns, so a regression
@@ -88,8 +89,8 @@ impl TestClient {
                 "client_kind": "cli",
                 "client_name": "ordering-test",
                 "client_version": "0.1.0",
-                "protocol_min": 1,
-                "protocol_max": 1,
+                "protocol_min": PROTOCOL_VERSION_MIN,
+                "protocol_max": PROTOCOL_VERSION_MAX,
             }),
         )
         .await;
