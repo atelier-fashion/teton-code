@@ -3,10 +3,12 @@
   "branch": "feat/REQ-563-opt-in-web-lookup",
   "startedAt": "2026-08-08T22:15:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 4,
   "completedPhases": [
     0,
-    1
+    1,
+    2,
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -21,6 +23,18 @@
       "name": "Validate Requirement Spec",
       "completedAt": "2026-08-08T22:25:00Z",
       "note": "APPROVED \u2014 user-invoked /validate this session found+fixed 3 wording inconsistencies; committed artifact is the fixed version; status flipped to approved"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-08T22:50:00Z",
+      "note": "9 decisions (D-1..D-9); 7 tasks TASK-072..078 in 5 tiers; footprint published to PR #74; single-repo \u2014 no worktree pruning needed"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-08T23:00:00Z",
+      "note": "PASS after 1 fix loop: DAG valid (5 tiers, max 2 deps/task), all 13 ACs covered by >=1 task, 2 ownership gaps fixed (protocol method types; UserUrls ingestion wiring)"
     }
   ],
   "repos": {
