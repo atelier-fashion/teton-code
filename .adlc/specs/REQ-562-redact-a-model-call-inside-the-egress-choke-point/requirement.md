@@ -1,10 +1,10 @@
 ---
 id: REQ-562
 title: "redact: a model-based secret and PII scan inside the egress choke point"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-07
-updated: 2026-08-07
+updated: 2026-08-08
 component: "daemon/egress"
 domain: "privacy"
 stack: ["rust", "daemon"]
