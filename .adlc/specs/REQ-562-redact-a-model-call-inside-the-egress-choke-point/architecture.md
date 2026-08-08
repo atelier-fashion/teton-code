@@ -123,8 +123,39 @@ Unlike the other duties, an over-cap payload is **never truncated-and-scanned**
 — a partial scan claiming completeness is the lie BR-7 forbids; the pattern
 pass MAY still run first on an over-cap payload so a real finding can outrank
 "too large" as the reported reason, but the terminal outcome for over-cap is
-Block either way. The block's cause says the scan **could not run**, never that
-it found something — those are different problems with different fixes.
+Block either way.
+
+**What the block's cause may say (revised 2026-08-08, on review evidence).**
+The rule was "the cause says the scan **could not run**, never that it found
+something". That is right when nothing looked at the payload, and wrong when
+something did: the deterministic pattern pass has no window, sweeps the payload
+in one piece, and completes *before* the model pass — so an engine error on a
+chunk of a payload the pattern pass already flagged left a completed,
+deterministic High finding on the floor and reported "could not run" about a
+payload in which a credential *had* been found. Worse, `ScanUnavailable` is the
+one cause that does **not** pin the session (ADR-7 / REQ-544 C-2), so a
+transient stall silently unmade a pin the pattern pass had earned.
+
+The rule is now:
+
+| verdict | cause | pins the session |
+|---|---|---|
+| `Findings` with a High finding | `Redaction { kind, span }` | yes |
+| `Unavailable` **with** High pattern evidence | `Redaction { kind, span }` | yes |
+| `Unavailable` with no evidence | `ScanUnavailable` | no |
+
+The evidence rides in its own field on `RedactionVerdict`
+(`unavailable_with_evidence` / `evidence()`), *not* in `findings` — the
+non-empty-iff-`Findings` invariant and `scanned: false` both stand, so nothing
+here claims the scan finished, and `decide` is unchanged (`Unavailable` still
+Blocks). Only the reported cause moves, and it moves toward the deterministic
+fact and the more conservative session consequence.
+
+Two `Unavailable`s stay bare, and the asymmetry is the point: an **over-cap**
+payload never had a pattern pass (the cap refusal is `pattern_verdict`'s own),
+and an **unresolved route** means no scanner is loaded — there every payload
+blocks alike and the configuration is the actionable fact, so naming one
+payload's credential would bury the reason all of them are failing.
 
 **Two caps, and only one of them is the engine window** (round 3). The window
 bounds *one model call*; the scan is bounded by a multiple of it, because the
@@ -209,12 +240,16 @@ chunking at any length. What a too-small overlap can cost is a
 
 **Fail-closed composition.** `scanned: true` requires the pattern pass *and*
 **every** chunk's model call to have completed. Any chunk `Unavailable` makes
-the whole verdict `Unavailable` — including when the pattern pass already found
-something and including when every other chunk came back clean. The loop
-returns on the first failure rather than continuing: there is no verdict left to
-build, and continuing would buy model calls for an answer already decided.
-Treating a failed chunk as one to skip would compose `Clean` from "clean" and
-"nothing looked", which is the truncate-and-scan lie in different clothes.
+the whole verdict `Unavailable` — including when every other chunk came back
+clean. The loop returns on the first failure rather than continuing: there is no
+verdict left to build, and continuing would buy model calls for an answer
+already decided. Treating a failed chunk as one to skip would compose `Clean`
+from "clean" and "nothing looked", which is the truncate-and-scan lie in
+different clothes.
+
+What the failure does **not** compose away is the pattern pass's own result:
+those findings ride the `Unavailable` as `evidence` and name the block's cause
+(ADR-6's revised table). The outcome is unchanged; only the sentence is.
 
 *(The per-call cap was originally stated as a flat 64 KiB "≈32k tokens at the
 duty seam's 2-bytes/token convention". That was wrong by construction:

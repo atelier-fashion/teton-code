@@ -237,8 +237,41 @@ fn privacy_blocked_sentence(
 /// The **first** high finding is the one reported. A payload can carry several;
 /// naming one is enough to act on, and enumerating them would turn a block
 /// notice into a map of where the secrets are.
+///
+/// ## An `Unavailable` verdict may still name what was found (2026-08-08)
+///
+/// The deterministic pattern pass has no window and sweeps the whole payload in
+/// one piece, so it can complete on a payload whose *model* pass then fails on
+/// some chunk. [`RedactionVerdict::evidence`] carries what it established, and
+/// this function reads it exactly like a finding: `Unavailable` **with** High
+/// evidence is `Redaction`, `Unavailable` without it is `ScanUnavailable`.
+///
+/// That is the truthful reading, not a lenient one. "The scan found a credential
+/// at bytes 40-66" is a claim about a pass that ran to completion over every
+/// byte; "the scan could not run" would be a claim about the *model* pass wearing
+/// the whole scan's name, and it sends the user to debug an engine instead of to
+/// the credential they are about to send. It is also strictly more conservative
+/// downstream: `Redaction` pins the session where `ScanUnavailable` does not
+/// ([`crate::runtime`]'s cause gate), so the evidence restores a pin the
+/// deterministic pass had earned and a transient stall used to erase.
+///
+/// The direction here was **reversed on review evidence**: until 2026-08-08 the
+/// pattern findings were discarded outright at the point the scan failed, and
+/// `a_credential_in_a_scanned_chunk_does_not_outrank_a_chunk_that_failed` pinned
+/// that. Its successor
+/// (`harness::redact::tests::a_credential_the_pattern_pass_established_survives_a_failed_chunk`)
+/// pins this.
 fn block_cause(verdict: &RedactionVerdict) -> BlockCause {
-    if let Some(finding) = verdict.findings().iter().find(|f| f.is_high()) {
+    // Findings first, evidence second: on a completed scan there is no evidence
+    // to consider, and on a failed one there are no findings — so the chain is
+    // a single ordered read rather than a branch on outcome that could drift
+    // from `decide`'s.
+    let high = verdict
+        .findings()
+        .iter()
+        .chain(verdict.evidence())
+        .find(|f| f.is_high());
+    if let Some(finding) = high {
         let span = finding.span();
         return BlockCause::Redaction {
             kind: wire_kind(finding.kind()),
@@ -1381,6 +1414,89 @@ mod tests {
         assert_eq!(
             block_cause(&RedactionVerdict::unavailable()),
             BlockCause::ScanUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_verdict_names_a_credential_only_when_the_pattern_pass_found_one() {
+        // The 2026-08-08 reversal, and its discriminator, at the layer that
+        // decides the cause. Both verdicts are `Unavailable` → Block; what
+        // separates them is whether the deterministic pass had established
+        // anything before the model pass failed.
+        //
+        // The consequence rides the cause rather than being decided again:
+        // `Redaction` pins the session and `ScanUnavailable` does not
+        // (`runtime::cause_taints_the_session`, held to its `BlockDetail` twin
+        // by `the_two_taint_gates_agree_cause_for_cause`), so the row below is
+        // also the row that restores a pin a transient stall used to erase.
+        let established =
+            RedactionVerdict::unavailable_with_evidence(vec![redact::Finding::pattern(
+                redact::FindingKind::Credential,
+                40..66,
+            )]);
+        assert_eq!(
+            block_cause(&established),
+            BlockCause::Redaction {
+                kind: WireFindingKind::Credential,
+                span: ByteSpan { start: 40, end: 66 },
+            },
+            "the pattern pass completed over the whole payload and found this; \
+             reporting `could not run` throws away the only fact anyone \
+             established"
+        );
+        assert_eq!(
+            block_cause(&RedactionVerdict::unavailable()),
+            BlockCause::ScanUnavailable,
+            "and with nothing established there is nothing to name"
+        );
+
+        // A low finding cannot reach the cause through this door either: BR-4's
+        // rule that a low-confidence finding never blocks is not routed around
+        // by handing it to the evidence constructor.
+        assert_eq!(
+            block_cause(&RedactionVerdict::unavailable_with_evidence(vec![
+                redact::Finding::model(redact::FindingKind::Pii, 10..22),
+            ])),
+            BlockCause::ScanUnavailable
+        );
+
+        // And the whole way through the choke point: the event a real send
+        // emits carries the named cause, and the sentence names the credential
+        // rather than telling the user to go debug an engine.
+        let sink = Arc::new(CapturingSink::default());
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), sink.clone())
+            .with_redaction_gate(CountingGate::new(established));
+
+        let err = egress
+            .send(
+                a_request("a prompt with a credential in it"),
+                &Provenance::empty(),
+                &EgressContext::new("anthropic").with_session("sess-1"),
+            )
+            .await
+            .expect_err("an unavailable verdict still blocks");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the bytes are still dropped"
+        );
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].cause,
+            BlockCause::Redaction {
+                kind: WireFindingKind::Credential,
+                span: ByteSpan { start: 40, end: 66 },
+            }
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("a credential"), "{rendered}");
+        assert!(rendered.contains("40-66"), "{rendered}");
+        assert!(
+            !rendered.contains("credential in it"),
+            "no payload content may reach the sentence: {rendered}"
         );
     }
 

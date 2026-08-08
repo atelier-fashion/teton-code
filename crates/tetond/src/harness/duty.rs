@@ -228,7 +228,7 @@
 //! | # | Mutation (exact diff) | Turns red |
 //! |---|---|---|
 //! | **(f)** the overlap is removed — `chunk_ranges`: `start = end - REDACT_CHUNK_OVERLAP_BYTES;` → `start = end;` | **5 lib.** `harness::redact::tests::{a_secret_straddling_a_chunk_boundary_is_still_found_whole_in_the_overlap, a_secret_inside_the_overlap_is_reported_once_not_once_per_chunk, the_chunker_covers_the_payload_with_overlapping_windows_on_char_boundaries, the_chunker_never_cuts_more_chunks_than_the_derived_ceiling, an_over_cap_payload_is_unavailable_before_any_model_call}` (727 passed / 5 failed). The straddling fixture is the discriminator: its secret has **no pattern shape**, so with abutting chunks neither half locates it and the finding vanishes. A `sk-…` fixture here would stay green, because the pattern pass never chunked |
-//! | **(g)** a chunk that could not run is skipped instead of failing the scan — `scan`: both `else { return RedactionVerdict::unavailable(); }` arms in the chunk loop → `else { continue; }` | **5 lib.** `harness::redact::tests::{a_chunk_that_could_not_run_makes_the_whole_verdict_unavailable, a_credential_in_a_scanned_chunk_does_not_outrank_a_chunk_that_failed, an_engine_failure_is_unavailable_not_clean, an_unreadable_answer_blocks_rather_than_passing_as_clean, a_scan_that_overruns_the_deadline_is_unavailable}` (728 passed / 5 failed). This is the permissive direction with a new door: the composed verdict reads `Clean` → **Forward** for a payload part of which no model saw — a truncate-and-scan in different clothes (BR-7, LESSON-447). The single-chunk fixtures turn red too, and that is the point: with one chunk, "skip the chunk" *is* "skip the scan" |
+//! | **(g)** a chunk that could not run is skipped instead of failing the scan — `scan`: both `else { return RedactionVerdict::unavailable_with_evidence(established()); }` arms in the chunk loop → `else { continue; }` | **5 lib.** `harness::redact::tests::{a_chunk_that_could_not_run_makes_the_whole_verdict_unavailable, a_credential_the_pattern_pass_established_survives_a_failed_chunk, an_engine_failure_is_unavailable_not_clean, an_unreadable_answer_blocks_rather_than_passing_as_clean, a_scan_that_overruns_the_deadline_is_unavailable}` (728 passed / 5 failed). This is the permissive direction with a new door: the composed verdict reads `Clean` → **Forward** for a payload part of which no model saw — a truncate-and-scan in different clothes (BR-7, LESSON-447). The single-chunk fixtures turn red too, and that is the point: with one chunk, "skip the chunk" *is* "skip the scan". (The second fixture was named `…does_not_outrank_a_chunk_that_failed` when this row was recorded; it was renamed with the round-4 reversal below, and the mutation still reddens it for the same reason — the outcome, not the cause, is what it asserts here) |
 //! | **(h)** the chunk-relative span is not translated — `read_findings`: `locate(chunk, quoted).map(\|span\| span.start + offset..span.end + offset)` → `locate(chunk, quoted)` | **3 lib.** `harness::redact::tests::{a_model_finding_from_the_second_chunk_carries_a_payload_absolute_span, a_secret_straddling_a_chunk_boundary_is_still_found_whole_in_the_overlap, a_secret_inside_the_overlap_is_reported_once_not_once_per_chunk}` (730 passed / 3 failed). The span still *looks* well formed — right length, inside the payload — and points thousands of bytes early, at filler the model never mentioned. The assertion that catches it is on the bytes the span selects (`&payload[span] == ADDRESS`), never on the numbers |
 //! | **(i)** the render guard is hoisted out of the chunk loop and applied to the whole payload | **10 lib + 1 integration.** Every chunked fixture, plus `tests/redact_egress.rs::a_context_budget_full_payload_is_scanned_across_windows_and_forwards` (723 passed / 10 failed; 9 passed / 1 failed). A payload of several windows renders past a single window by construction, so a hoisted guard refuses every multi-chunk scan — the old collision, restored one layer in. Its subtler sibling (hoist it but measure only the first chunk) is red on `…::a_second_chunk_that_renders_past_the_window_is_refused_before_its_own_call`, whose call count is `1` precisely because neither `0` nor `2` is reachable with a per-chunk guard |
 //!
@@ -243,6 +243,28 @@
 //! pins the count in both directions (one chunk → one, two chunks → two, a scan
 //! that never reaches a call → none), so a later "deduplicate the announcement"
 //! change has to argue with a test rather than slip past one.
+//!
+//! ### REQ-562 round 4 — a failed chunk no longer erases what the pattern pass found
+//!
+//! Round 3's composition rule was right about the *outcome* and wrong about the
+//! *cause*. The deterministic pass has no window and completes over the whole
+//! payload before the chunk loop starts, so a chunk failure would discard a
+//! finished High finding and report `ScanUnavailable` — which (correctly) does
+//! not pin the session. Net effect: one transient engine stall both mis-told the
+//! user "the scan could not run" about a payload where a credential *was* found,
+//! and unmade a session pin the deterministic pass had earned.
+//!
+//! The fix keeps the outcome (`Unavailable`, `scanned: false`, Block) and moves
+//! only what the block may say: the pattern pass's High findings ride the verdict
+//! as `RedactionVerdict::evidence`, and `egress::block_cause` reads them.
+//! Both mutations were applied to a **freshly built workspace** (LESSON-489),
+//! run with `--no-fail-fast`, and reverted.
+//!
+//! | # | Mutation (exact diff) | Turns red |
+//! |---|---|---|
+//! | **(j)** the cause ignores the evidence — `egress::block_cause`: `verdict.findings().iter().chain(verdict.evidence())` → `verdict.findings().iter()` | **1 lib.** `egress::tests::an_unavailable_verdict_names_a_credential_only_when_the_pattern_pass_found_one` (734 passed / 1 failed). This is the pre-fix behaviour restored exactly: the verdict still carries the finding, and the block still reports "could not run" — and with it goes the `Redaction` cause that is the *only* thing pinning the session, so the mutation is silently permissive one layer downstream |
+//! | **(k)** the scan mints no evidence — `scan`: all three `RedactionVerdict::unavailable_with_evidence(established())` in the chunk loop → `RedactionVerdict::unavailable()` | **1 lib.** `harness::redact::tests::a_credential_the_pattern_pass_established_survives_a_failed_chunk` (734 passed / 1 failed). The pair to (j) at the other end of the seam: (j) breaks the reading, (k) breaks the writing, and each is caught by the test on its own side. Its twin `a_clean_payload_whose_chunk_failed_still_reports_only_that_it_could_not_run` stays **green** under both, which is what makes it the discriminator rather than a second copy |
+//!
 //! ## What draining past the ceiling buys, and why it is still done
 //!
 //! Past the ceiling [`RemoteDuty::perform`] stops *accumulating* but keeps

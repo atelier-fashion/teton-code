@@ -459,9 +459,9 @@ pub enum Outcome {
 /// The result of a redaction scan, with its invariants enforced by construction.
 ///
 /// The spec's two invariants are not maintained by discipline — the fields are
-/// private and the only three constructors ([`RedactionVerdict::clean`],
-/// [`RedactionVerdict::from_findings`], [`RedactionVerdict::unavailable`]) each
-/// establish both:
+/// private and the only four constructors ([`RedactionVerdict::clean`],
+/// [`RedactionVerdict::from_findings`], [`RedactionVerdict::unavailable`],
+/// [`RedactionVerdict::unavailable_with_evidence`]) each establish both:
 ///
 /// - `findings` is non-empty **iff** the outcome is [`Outcome::Findings`];
 /// - `scanned` is `false` **iff** the outcome is [`Outcome::Unavailable`].
@@ -470,11 +470,36 @@ pub enum Outcome {
 /// claim "no scan happened here", so a completed scan can never carry it and an
 /// aborted one can never omit it. That is what makes AC-3's "no configuration
 /// makes the scan appear to have run when it did not" checkable.
+///
+/// ## Why `evidence` is a third field rather than more findings
+///
+/// The deterministic pattern pass sweeps the **whole** payload in one piece and
+/// has no window to be cut by, so it can complete on a payload whose *model*
+/// pass then fails. That leaves a real, deterministically-earned High finding on
+/// the floor of an `Unavailable` verdict — and until 2026-08-08 it was dropped
+/// outright: a transient engine stall erased the finding and reported "the scan
+/// could not run" for a payload in which a credential *had* been found.
+///
+/// Putting it back into `findings` is not available: that would break the
+/// non-empty-iff-`Findings` invariant above, and it would make `scanned: false`
+/// ride beside a populated finding list — the two claims AC-3 is about. So it
+/// rides in its own field, which the invariants say nothing about and
+/// [`RedactionVerdict::evidence`] reads. `findings()` still means "what the
+/// completed scan found"; `evidence()` means "what the deterministic pass had
+/// already established when the scan stopped".
+///
+/// It is empty for every constructor but
+/// [`RedactionVerdict::unavailable_with_evidence`], and always
+/// [`Confidence::High`] — see that constructor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactionVerdict {
     outcome: Outcome,
     findings: Vec<Finding>,
     scanned: bool,
+    /// What the deterministic pass established before the scan failed. Empty on
+    /// every outcome but [`Outcome::Unavailable`], and empty there too unless
+    /// the pattern pass had actually completed.
+    evidence: Vec<Finding>,
 }
 
 impl RedactionVerdict {
@@ -485,6 +510,7 @@ impl RedactionVerdict {
             outcome: Outcome::Clean,
             findings: Vec::new(),
             scanned: true,
+            evidence: Vec::new(),
         }
     }
 
@@ -505,17 +531,54 @@ impl RedactionVerdict {
             outcome: Outcome::Findings,
             findings,
             scanned: true,
+            evidence: Vec::new(),
         }
     }
 
-    /// The scan could not run. Carries no findings and `scanned: false`, and
+    /// The scan could not run, and nothing was established about the payload
+    /// first. Carries no findings, no evidence, and `scanned: false`, and
     /// [`decide`] blocks on it (ADR-6, BR-3).
+    ///
+    /// This is the constructor for the failures that happen *before* the
+    /// deterministic pass has swept the payload or before a model pass exists to
+    /// fail: an over-cap payload (the pattern pass never ran) and an unresolved
+    /// route (no local tier, so the actionable fact is the configuration, not
+    /// the content). Use [`RedactionVerdict::unavailable_with_evidence`] for a
+    /// model pass that failed on a payload the pattern pass had already swept.
     #[must_use]
     pub fn unavailable() -> Self {
         Self {
             outcome: Outcome::Unavailable,
             findings: Vec::new(),
             scanned: false,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// The **model** pass could not run to completion on a payload the
+    /// deterministic pass had already swept whole — carrying what that pass
+    /// established (2026-08-08, on review evidence).
+    ///
+    /// Same outcome, same `scanned: false`, same `Block` from [`decide`] as
+    /// [`RedactionVerdict::unavailable`]: what changes is what the block is
+    /// allowed to *say*. A payload whose pattern pass found `sk-…` and whose
+    /// second chunk hit a stalled engine is a payload in which a credential was
+    /// found, by a pass that completed, over every byte. Reporting that as "the
+    /// scan could not run" throws away the one deterministic fact anyone
+    /// established and tells the user to go debug their engine.
+    ///
+    /// `established` is filtered to [`Confidence::High`] here rather than
+    /// trusted: evidence is the thing a block sentence and a **session taint**
+    /// are derived from (see `egress::block_cause`), and BR-4's rule that a
+    /// low-confidence finding never blocks must not be reachable through a side
+    /// door. A caller that passes low findings gets them dropped, not honoured.
+    #[must_use]
+    pub fn unavailable_with_evidence(established: Vec<Finding>) -> Self {
+        Self {
+            outcome: Outcome::Unavailable,
+            findings: Vec::new(),
+            scanned: false,
+            evidence: established.into_iter().filter(Finding::is_high).collect(),
         }
     }
 
@@ -529,6 +592,19 @@ impl RedactionVerdict {
     #[must_use]
     pub fn findings(&self) -> &[Finding] {
         &self.findings
+    }
+
+    /// What the deterministic pass had established when the scan stopped —
+    /// empty except on an [`RedactionVerdict::unavailable_with_evidence`]
+    /// verdict, and always [`Confidence::High`] there.
+    ///
+    /// It is **not** `findings()`: these are not the result of a completed scan
+    /// and nothing here makes `scanned()` true. They are the reason a blocking
+    /// `Unavailable` may still name what was found rather than only that it
+    /// stopped (`egress::block_cause`).
+    #[must_use]
+    pub fn evidence(&self) -> &[Finding] {
+        &self.evidence
     }
 
     /// Whether a scan actually ran. `false` **only** for

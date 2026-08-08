@@ -62,14 +62,22 @@
 //! the model pass both ran — and the model pass ran when *every* chunk's call
 //! completed. If any chunk cannot run — route unresolved, engine error,
 //! deadline, unreadable reply, a rendered prompt past the engine's budget — the
-//! whole verdict is `Unavailable`, *even when the pattern pass already found
-//! something* and *even when every other chunk came back clean*. Both outcomes
-//! block, so nothing leaks either way; what differs is the claim. Reporting
-//! `Findings` would carry `scanned: true` and assert a completed scan of a
-//! payload part of which the model never saw — the truncate-and-scan lie with
-//! extra steps, and the block's cause would say the scan found something rather
-//! than that it could not run — different problems with different fixes
-//! (BR-3).
+//! whole verdict is `Unavailable`, *even when every other chunk came back
+//! clean*. Both outcomes block, so nothing leaks either way; what differs is the
+//! claim. Reporting `Findings` would carry `scanned: true` and assert a completed
+//! scan of a payload part of which the model never saw — the truncate-and-scan
+//! lie with extra steps (BR-3).
+//!
+//! **But the deterministic pass's High findings survive it** (2026-08-08). That
+//! pass has no window and sweeps the payload whole, so its result is a completed
+//! fact whatever the engine then did: an `Unavailable` minted inside the chunk
+//! loop carries those findings as
+//! [`RedactionVerdict::evidence`](crate::egress::redact::RedactionVerdict::evidence),
+//! and the block reports `Redaction` — naming the credential — rather than
+//! `ScanUnavailable`. The outcome and `scanned: false` do not move; only what the
+//! block is permitted to say does. Discarding them meant a transient stall both
+//! erased a session pin the pattern pass had earned and told the user "the scan
+//! could not run" about a payload where a credential *was* found.
 //!
 //! ## Why the recognition arm goes first in [`ScriptedFileEngine`]
 //!
@@ -492,12 +500,36 @@ fn chunk_ranges(payload: &str) -> Vec<Range<usize>> {
 ///    every chunk is in.
 ///
 /// Failure of any of those, on **any** chunk, is [`Outcome::Unavailable`], never
-/// [`Outcome::Clean`] — including when the pattern pass already found something,
-/// and including when every other chunk came back clean. See the module docs:
-/// both block, but only one of them is honest about why. The loop returns on the
-/// first failure rather than carrying on, which is not an optimization: there is
-/// no verdict left to build, and continuing would buy model calls for an answer
-/// already decided.
+/// [`Outcome::Clean`] — including when every other chunk came back clean. See
+/// the module docs: both block, but only one of them is honest about why. The
+/// loop returns on the first failure rather than carrying on, which is not an
+/// optimization: there is no verdict left to build, and continuing would buy
+/// model calls for an answer already decided.
+///
+/// ## What the pattern pass established is **not** discarded (2026-08-08)
+///
+/// The one thing that failure does not erase is the deterministic pass. It ran
+/// before the loop, over the whole payload, with no window to be cut by — so a
+/// High finding it produced is a completed fact about these bytes whatever the
+/// engine then did. Every `Unavailable` minted inside the loop therefore carries
+/// it as [`RedactionVerdict::evidence`], and
+/// [`block_cause`](crate::egress) reports `Redaction` rather than
+/// `ScanUnavailable` when it is there.
+///
+/// This reverses the earlier rule, on review evidence: discarding it meant a
+/// transient engine stall erased a deterministically-earned session pin *and*
+/// told the user "the scan could not run" about a payload in which a credential
+/// had, in fact, been found. The verdict is still `Unavailable` and still
+/// `scanned: false` — nothing here claims the scan finished — and `decide` is
+/// untouched, so the payload blocks exactly as before. What changed is only what
+/// the block is allowed to say.
+///
+/// The two `Unavailable`s **above** the loop stay bare, and the asymmetry is
+/// deliberate: an over-cap payload had no deterministic pass at all (the cap
+/// refusal is `pattern_verdict`'s own), and an unresolved route means no scanner
+/// is loaded — there the configuration is the actionable fact and every payload
+/// blocks alike, so naming one payload's credential would bury the reason all of
+/// them are failing.
 ///
 /// **Spans are the payload's, never a chunk's.** `read_findings` takes the
 /// chunk's offset and applies it where the span is minted, so a chunk-relative
@@ -534,6 +566,17 @@ pub async fn scan(route: &DutyRoute, payload: &str) -> RedactionVerdict {
     if matches!(route, DutyRoute::Unresolved { .. }) {
         return RedactionVerdict::unavailable();
     }
+    // What the deterministic pass established over the WHOLE payload, ready to
+    // ride an `Unavailable` the model pass produces below. Computed as a closure
+    // rather than eagerly because the ordinary path never needs it.
+    let established = || -> Vec<Finding> {
+        pattern
+            .findings()
+            .iter()
+            .filter(|finding| finding.is_high())
+            .cloned()
+            .collect()
+    };
     let mut model = Vec::new();
     for chunk in chunk_ranges(payload) {
         let text = &payload[chunk.clone()];
@@ -543,16 +586,16 @@ pub async fn scan(route: &DutyRoute, payload: &str) -> RedactionVerdict {
         // so it costs nothing and — more to the point — so it is one failure
         // with one cause instead of an engine error wearing the wrong reason.
         if rendered_prompt_bytes(&prompt) > REDACT_PROMPT_BUDGET_BYTES {
-            return RedactionVerdict::unavailable();
+            return RedactionVerdict::unavailable_with_evidence(established());
         }
         let Ok(answer) = route.perform(&prompt, &Provenance::empty()).await else {
-            return RedactionVerdict::unavailable();
+            return RedactionVerdict::unavailable_with_evidence(established());
         };
         // The reply is consumed here and nowhere else. What comes back out is a
         // list of spans in the PAYLOAD's coordinates; what goes in is never
         // returned, never logged, and never carried by the error (ADR-5, BR-6).
         let Ok(found) = read_findings(&answer, text, chunk.start) else {
-            return RedactionVerdict::unavailable();
+            return RedactionVerdict::unavailable_with_evidence(established());
         };
         model.extend(found);
     }
@@ -2348,21 +2391,113 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    /// **A failed chunk outranks the other chunks' findings** — the ADR-6 row
-    /// one layer along.
+    /// **A failed chunk does not erase what the pattern pass established** —
+    /// the ADR-6 row one layer along.
     ///
     /// A pattern credential in the first chunk *and* a failed second chunk is
-    /// still `Unavailable`, not `Findings`. Both block, so no bytes leave
-    /// either way; what differs is what the block says, and `Findings` would
-    /// ride with `scanned: true` and claim a completed scan of a payload half
-    /// of which nothing looked at.
+    /// still `Unavailable` with `scanned: false`: no bytes leave, and nothing
+    /// claims the scan finished. What the verdict keeps is the deterministic
+    /// pass's High finding, in [`RedactionVerdict::evidence`] — from which
+    /// `egress::block_cause` reports `Redaction` (naming the credential) rather
+    /// than `ScanUnavailable`, and from which the session taint follows.
+    ///
+    /// ## The direction here was reversed on review evidence, 2026-08-08
+    ///
+    /// This test previously pinned the opposite — `verdict.findings().is_empty()`
+    /// read as "an unavailable verdict carries nothing the pattern pass saw" —
+    /// under the name
+    /// `a_credential_in_a_scanned_chunk_does_not_outrank_a_chunk_that_failed`.
+    /// The review's counter-example is
+    /// **transient-failure-erases-earned-pin**: the pattern pass runs over the
+    /// *whole* payload with no window, so its finding is a completed fact; but
+    /// discarding it made a one-off engine stall (a) report "the scan could not
+    /// run" for a payload in which a credential *had* been found, and (b) drop
+    /// the `Redaction` cause, which is the only one that pins the session local
+    /// — so the stall silently unmade a pin the deterministic pass had earned.
+    ///
+    /// The old name's claim survives where it was right, and its test is
+    /// [`a_chunk_that_could_not_run_makes_the_whole_verdict_unavailable`]: the
+    /// *outcome* is still not outranked, `Findings`/`scanned: true` are still
+    /// unreachable. Only the reported cause moved.
+    ///
+    /// Its discriminating twin is
+    /// [`a_clean_payload_whose_chunk_failed_still_reports_only_that_it_could_not_run`]:
+    /// same failure, nothing established, no evidence.
     #[tokio::test]
-    async fn a_credential_in_a_scanned_chunk_does_not_outrank_a_chunk_that_failed() {
+    async fn a_credential_the_pattern_pass_established_survives_a_failed_chunk() {
         let payload = format!("{CREDENTIAL} then {}", filler(OVER_ONE_WINDOW));
+        let at = span_of(&payload, CREDENTIAL);
         assert!(
             !pattern_verdict(&payload).findings().is_empty(),
-            "the fixture's credential must really be detected, or the row below \
-             is not about outranking anything"
+            "the fixture's credential must really be detected, or the rows below \
+             are not about surviving anything"
+        );
+        assert_eq!(chunk_ranges(&payload).len(), 2);
+
+        let (route, _) = per_call_route(vec![Ok(NOTHING_FOUND), Err("no weights installed")]);
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Unavailable);
+        assert!(
+            !verdict.scanned(),
+            "evidence must not make an unfinished scan claim it ran"
+        );
+        assert!(
+            verdict.findings().is_empty(),
+            "evidence is not findings: the non-empty-iff-Findings invariant holds"
+        );
+        assert_eq!(
+            verdict.evidence().len(),
+            1,
+            "the deterministic pass swept the whole payload and found this; a \
+             failed chunk is not a reason to forget it: {:?}",
+            verdict.evidence()
+        );
+        assert_eq!(*verdict.evidence()[0].span(), at);
+        assert_eq!(verdict.evidence()[0].confidence(), Confidence::High);
+        assert_eq!(
+            decide(&verdict),
+            EgressDecision::Block,
+            "unchanged: an unavailable verdict blocks whether or not it carries \
+             evidence"
+        );
+
+        // The twin: the same payload, both chunks answered, and the credential
+        // is reported as the High finding it is — through `findings`, with no
+        // evidence field in play at all.
+        let (route, _) = per_call_route(vec![Ok(NOTHING_FOUND), Ok(NOTHING_FOUND)]);
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Findings);
+        assert!(verdict.scanned());
+        assert_eq!(verdict.findings()[0].confidence(), Confidence::High);
+        assert!(
+            verdict.evidence().is_empty(),
+            "a completed scan reports through findings; evidence is the failed \
+             scan's channel only"
+        );
+    }
+
+    /// **The discriminator: a chunk failure on a payload nothing was
+    /// established about still reports only that the scan could not run.**
+    ///
+    /// The pair for
+    /// [`a_credential_the_pattern_pass_established_survives_a_failed_chunk`],
+    /// one fixture-byte apart: the identical two-chunk failure over a payload
+    /// with no credential in it. Empty evidence is what keeps the reversal above
+    /// from becoming "a failed chunk always reads as a redaction block" — which
+    /// would tell every user of a stalled engine that a secret was found, and
+    /// pin every one of their sessions to the local tier on the strength of
+    /// nothing.
+    ///
+    /// The cause and the taint that follow from these two verdicts are pinned
+    /// where they are decided:
+    /// `egress::tests::an_unavailable_verdict_names_a_credential_only_when_the_pattern_pass_found_one`
+    /// and `runtime::tests::the_two_taint_gates_agree_cause_for_cause`.
+    #[tokio::test]
+    async fn a_clean_payload_whose_chunk_failed_still_reports_only_that_it_could_not_run() {
+        let payload = filler(OVER_ONE_WINDOW);
+        assert!(
+            pattern_verdict(&payload).findings().is_empty(),
+            "the fixture must be pattern-clean, or it is the other test"
         );
         assert_eq!(chunk_ranges(&payload).len(), 2);
 
@@ -2370,20 +2505,14 @@ mod tests {
         let verdict = scan(&route, &payload).await;
         assert_eq!(verdict.outcome(), Outcome::Unavailable);
         assert!(!verdict.scanned());
+        assert!(verdict.findings().is_empty());
         assert!(
-            verdict.findings().is_empty(),
-            "an unavailable verdict carries no findings, whatever the pattern \
-             pass saw: {:?}",
-            verdict.findings()
+            verdict.evidence().is_empty(),
+            "nothing was established about this payload, so nothing may be \
+             reported about it: {:?}",
+            verdict.evidence()
         );
-
-        // The twin: the same payload, both chunks answered, and the credential
-        // is reported as the High finding it is.
-        let (route, _) = per_call_route(vec![Ok(NOTHING_FOUND), Ok(NOTHING_FOUND)]);
-        let verdict = scan(&route, &payload).await;
-        assert_eq!(verdict.outcome(), Outcome::Findings);
-        assert!(verdict.scanned());
-        assert_eq!(verdict.findings()[0].confidence(), Confidence::High);
+        assert_eq!(decide(&verdict), EgressDecision::Block);
     }
 
     /// **N chunks are N routed model calls, and they announce N times.**
