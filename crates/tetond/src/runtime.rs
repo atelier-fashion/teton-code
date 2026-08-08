@@ -1998,9 +1998,44 @@ impl DaemonRuntime {
     /// drive a capture transport through this exact construction, so the
     /// deletion now turns a test red.
     ///
-    /// The sink is `events` rather than a `TaintingPrivacySink`: an MCP block
-    /// is reported but does not pin the session, which is REQ-544's behaviour
-    /// here and not something this REQ changes.
+    /// ## The sink is `events`, not a [`TaintingPrivacySink`] — recorded, not
+    /// resolved (REQ-562)
+    ///
+    /// An MCP block is reported but does **not** pin the session. That is
+    /// REQ-544's behaviour here, and this REQ deliberately leaves it alone —
+    /// but leaving it alone is now a *deviation* rather than a non-event, so it
+    /// is written down.
+    ///
+    /// The turn path's rule (see [`cause_taints_the_session`]) is that a
+    /// `Boundary` block and a `Redaction` block each establish that content
+    /// crossed a line, and therefore pin the session local; only
+    /// `ScanUnavailable` does not, because nothing looked at the payload. This
+    /// REQ added the redaction causes, so the obvious reading is that a
+    /// redaction block through MCP should pin too. It does not, and the reason
+    /// is that the two paths dispose of a block differently:
+    ///
+    /// - on the **turn** path a block is a typed error the runtime handles, the
+    ///   turn is re-routed to the local tier, and the pin is what makes that
+    ///   decision stick for the rest of the session;
+    /// - on the **MCP** path a block folds back into the loop as an ordinary
+    ///   in-context tool error (REQ-544, ADR-003) and the turn carries on. The
+    ///   model retries something else, or finishes. Pinning there would convert
+    ///   one refused tool call into a session-wide re-route of every subsequent
+    ///   turn — a much larger consequence than the one REQ-544 chose for this
+    ///   surface, and one whose blast radius includes turns that never touch
+    ///   MCP at all.
+    ///
+    /// Whether that is right is a question about REQ-544's MCP boundary
+    /// behaviour, not about redaction: it has the same answer for a `Boundary`
+    /// block, which predates this REQ entirely. Changing it here would silently
+    /// re-decide an earlier REQ's rule inside a fix for a different one.
+    ///
+    /// TODO(follow-up REQ): decide whether an MCP privacy block should pin its
+    /// session, for **all** blocking causes rather than for the redaction ones
+    /// alone. The decision belongs with REQ-544's owner of the MCP boundary
+    /// posture; the two candidate answers are "an MCP block is an in-context
+    /// tool error and the loop's business" (today) and "any established
+    /// crossing pins, wherever it happened" (the turn path's rule, generalized).
     fn mcp_egress<T: Transport>(
         &self,
         transport: T,

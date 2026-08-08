@@ -245,6 +245,36 @@ fairness policy on the engine slot, a cancellable engine call — is **deliberat
 follow-up**, not an oversight. Both are opt-in-only exposure (BR-10/OQ-3) and
 both fail in the direction of slowness rather than of leakage.
 
+**A third residual, added in round 2: a redaction block through MCP does not
+pin its session.** The turn path's rule is that a `Boundary` or a `Redaction`
+block establishes that content crossed a line and therefore pins the session
+local (`cause_taints_the_session`); `ScanUnavailable` does not, because nothing
+looked at the payload. `DaemonRuntime::mcp_egress` passes the plain `EventBus`
+rather than a `TaintingPrivacySink`, so **no** MCP block pins — including the
+redaction ones this REQ introduced.
+
+That is REQ-544's behaviour for this surface and it is left unchanged
+deliberately. The two paths dispose of a block differently: a blocked *turn* is
+a typed error the runtime re-routes, and the pin is what makes the re-route
+stick; a blocked *MCP call* folds back as an ordinary in-context tool error and
+the turn carries on, so pinning would convert one refused tool call into a
+session-wide re-route of every later turn — including turns that never touch
+MCP. Whether that trade is right is a question about REQ-544's MCP boundary
+posture, with the same answer for a `Boundary` block, which predates this REQ;
+re-deciding it inside a redaction fix would silently change an earlier REQ's
+rule. It is recorded here, in `mcp_egress`'s docstring, and as a
+`TODO(follow-up REQ)` beside the construction, and the follow-up owes an answer
+for **all** blocking causes rather than for the redaction ones alone.
+
+**A fourth, closed rather than accepted, and worth the record.** The MCP error
+arm handed the model the *cause-distinct* privacy sentence. Three sentences on
+an input the model controls is a three-way oracle — vary an argument, read which
+one comes back, map the gate's edges from inside the loop. The audiences are now
+split at `harness::tools::mcp::tool_error_sentence`: the model gets one sentence
+for all three causes, naming no cause, kind or span; the `privacy_block` event
+and the typed `McpError` keep the precise one, and neither is something the
+model reads.
+
 ### ADR-10: The scan prompt's frame is defused against the payload (context ADR-009)
 
 The redact prompt writes a frame — a flush-left `Payload:` line — and then
