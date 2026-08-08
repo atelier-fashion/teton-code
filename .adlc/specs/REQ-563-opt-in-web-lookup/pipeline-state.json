@@ -1,12 +1,28 @@
 {
   "req": "REQ-563",
   "branch": "feat/REQ-563-opt-in-web-lookup",
-  "startedAt": "2026-08-08T00:00:00Z",
+  "startedAt": "2026-08-08T22:15:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
   "integrationBranch": "main",
-  "phaseHistory": [],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Worktree + Preflight",
+      "completedAt": "2026-08-08T22:21:00Z",
+      "note": "single-repo; spec committed on branch (uncommitted in session worktree at invocation); draft PR #74 opened at Step 0 (REQ-483)"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-08T22:25:00Z",
+      "note": "APPROVED \u2014 user-invoked /validate this session found+fixed 3 wording inconsistencies; committed artifact is the fixed version; status flipped to approved"
+    }
+  ],
   "repos": {
     "teton-code": {
       "primary": true,
@@ -14,14 +30,17 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-563",
       "branch": "feat/REQ-563-opt-in-web-lookup",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/74",
+      "prNumber": 74,
       "merged": false,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "prCreatedAt": "2026-08-08T22:20:33Z"
     }
   },
-  "mergeOrder": ["teton-code"],
+  "mergeOrder": [
+    "teton-code"
+  ],
   "phase4": {
     "currentTask": null,
     "completedTasks": [],
