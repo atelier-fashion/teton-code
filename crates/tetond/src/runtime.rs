@@ -4297,13 +4297,14 @@ fn fake_engine_loader(
 /// ## Not feature-gated, because a second consumer derives from it
 ///
 /// `LlamaEngine::load` is the only *caller*, and it exists only under
-/// `--features tetond/llama`. But [`REDACT_INPUT_MAX_BYTES`](crate::egress::redact::REDACT_INPUT_MAX_BYTES)
+/// `--features tetond/llama`. But [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES)
 /// is **derived** from this number in every build (REQ-562, LESSON-446): the
-/// scan's input cap and this window are two descriptions of one budget, and
-/// they were picked independently — 64 KiB against a window that refuses
-/// anything over 30,720 bytes — so payloads in the ~30–64 KiB band passed the
-/// cap and then failed as an opaque engine error, blocking with the wrong
-/// reason. One number, one place.
+/// scan's per-chunk cap and this window are two descriptions of one budget,
+/// and they were once picked independently — 64 KiB against a window that
+/// refuses anything over 30,720 bytes — so payloads in the ~30–64 KiB band
+/// passed the cap and then failed as an opaque engine error, blocking with
+/// the wrong reason. One number, one place; the scan's total cap
+/// (`REDACT_INPUT_MAX_BYTES`) is in turn a stated multiple of the chunk cap.
 pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 16_384;
 
 /// The real weights loader: llama.cpp behind the [`Engine`] trait (AC-2).
