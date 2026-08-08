@@ -72,13 +72,70 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 
-/// The largest payload the redactor will scan, in bytes (ADR-6).
+use crate::harness::redact::{REDACT_DUTY, REDACT_PROMPT_OVERHEAD_BYTES};
+use crate::runtime::LOCAL_ENGINE_N_CTX;
+
+/// Bytes the duty seam assumes per BPE token, sizing a prompt against a context
+/// window.
 ///
-/// 64 KiB — roughly 32k tokens at the duty seam's 2-bytes-per-token convention,
-/// which is about the most a mid-tier local model can actually scan in one call.
+/// The same convention `DutyKind::max_tokens` uses on the output side, and
+/// conservative in the direction that matters here: real BPE averages nearer
+/// four bytes per token on prose and code, so estimating the *input* at two
+/// over-counts its tokens and the cap lands under the window rather than over
+/// it.
+const DUTY_BYTES_PER_TOKEN: usize = 2;
+
+/// The prompt budget in bytes: what the local engine will accept **after** the
+/// duty's own generation reservation.
+///
+/// `LlamaEngine::complete` refuses — with a typed error, before llama.cpp's
+/// `GGML_ASSERT` can abort the daemon — any prompt whose token count exceeds
+/// `n_ctx - max_tokens`. That refusal is an engine error, which the scan turns
+/// into `Unavailable`, which blocks. Correct, but with the *wrong reason*: the
+/// user is told the scan could not run when what actually happened is that the
+/// payload was too large, and the fix for those is not the same.
+const REDACT_PROMPT_BUDGET_BYTES: usize =
+    (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize) * DUTY_BYTES_PER_TOKEN;
+
+/// The largest payload the redactor will scan, in bytes (ADR-6, BR-7).
+///
+/// **Derived from the engine window, not picked beside it** (LESSON-446). The
+/// cap and the window are two descriptions of one budget, and they used to be
+/// two independently chosen numbers:
+///
+/// ```text
+///   engine window            16,384 tokens   (LOCAL_ENGINE_N_CTX)
+///   − the duty's generation   1,024 tokens   (REDACT_DUTY.max_tokens())
+///   = prompt budget          15,360 tokens
+///   × 2 bytes/token          30,720 bytes    (the seam's convention)
+///   − prompt overhead            586 bytes   (REDACT_PROMPT_OVERHEAD_BYTES:
+///                                             318 instruction + 257 contract
+///                                             + 11 header)
+///   = REDACT_INPUT_MAX_BYTES  30,134 bytes
+/// ```
+///
+/// The overhead is *measured*, not stated: the three numbers above are what the
+/// constants happen to be today, and editing the instruction moves the cap
+/// rather than eating into the window.
+///
+/// The old value was a flat 64 KiB, which is **more than twice** the prompt
+/// budget. Every payload between roughly 30 KiB and 64 KiB therefore passed the
+/// cap, was rendered into a prompt, and was refused by the engine as
+/// over-window — reported as "the redaction scan could not run" when the true
+/// reason was "this payload is too large to scan", which is BR-3's distinction
+/// collapsed by arithmetic rather than by wording.
+///
 /// A payload above this is [`Outcome::Unavailable`] (→ Block), never truncated
 /// and scanned (BR-7).
-pub const REDACT_INPUT_MAX_BYTES: usize = 64 * 1024;
+///
+/// ## Why this module reaches upward for three constants
+///
+/// It is otherwise the pure foundation the duty and the choke point consume,
+/// and the imports below run the other way. That is the price of there being
+/// **one** number: the cap belongs to the engine that has to hold the prompt
+/// and to the prompt that has to fit in it, and a copy of either input here
+/// would be the second number LESSON-446 is about.
+pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_PROMPT_BUDGET_BYTES - REDACT_PROMPT_OVERHEAD_BYTES;
 
 /// How much the pipeline trusts a finding — **derived, never self-reported**
 /// (BR-4, ADR-4).
@@ -1093,9 +1150,53 @@ mod tests {
     // The input cap (BR-7, ADR-6).
     // -----------------------------------------------------------------------
 
+    /// **The cap and the engine window are one budget** (LESSON-446).
+    ///
+    /// The claim that matters is the inequality, not the number: a prompt built
+    /// from a payload **at** the cap must still fit inside what the local engine
+    /// will accept, which is `(n_ctx - max_tokens)` tokens, read at the seam's
+    /// two-bytes-per-token convention.
+    ///
+    /// Before this derivation the cap was a flat 64 KiB against a 30,720-byte
+    /// prompt budget, so every payload from ~30 KiB to 64 KiB passed the cap and
+    /// was then refused by the engine as over-window — a block that said "the
+    /// scan could not run" when the true reason was "this payload is too large".
+    /// Setting `REDACT_INPUT_MAX_BYTES` back to `64 * 1024` turns this red.
     #[test]
-    fn the_input_cap_is_sixty_four_kibibytes() {
-        assert_eq!(REDACT_INPUT_MAX_BYTES, 65_536);
+    fn a_payload_at_the_cap_still_fits_the_engines_window() {
+        let budget = (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize)
+            * DUTY_BYTES_PER_TOKEN;
+        assert_eq!(
+            REDACT_PROMPT_BUDGET_BYTES, budget,
+            "the budget is n_ctx minus the duty's generation reservation"
+        );
+        assert!(
+            REDACT_INPUT_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES <= budget,
+            "a payload at the cap plus the prompt's own {REDACT_PROMPT_OVERHEAD_BYTES} \
+             bytes must fit in the engine's {budget}-byte prompt budget; cap is \
+             {REDACT_INPUT_MAX_BYTES}"
+        );
+
+        // And the real builder agrees with the arithmetic: the prompt for a
+        // payload at the cap is exactly cap + overhead, so the inequality above
+        // is about the thing that is actually sent (LESSON-485).
+        let at_cap = "x".repeat(REDACT_INPUT_MAX_BYTES);
+        let prompt = crate::harness::redact::redact_prompt(&at_cap);
+        assert_eq!(
+            prompt.len(),
+            REDACT_INPUT_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES
+        );
+        assert!(prompt.len() <= budget, "prompt is {} bytes", prompt.len());
+
+        // Non-vacuity: the cap is a real bound, not zero and not the window.
+        // Read through a binding so this is a runtime comparison rather than a
+        // constant one clippy would (correctly) call out as always-true.
+        let cap = REDACT_INPUT_MAX_BYTES;
+        assert!(cap > 16 * 1024, "the cap is usable: {cap}");
+        assert!(
+            cap < 64 * 1024,
+            "the flat 64 KiB the cap used to be does not fit this window: {cap}"
+        );
     }
 
     #[test]

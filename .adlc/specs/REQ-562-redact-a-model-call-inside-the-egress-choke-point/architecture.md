@@ -102,9 +102,27 @@ pass MAY still run first on an over-cap payload so a real finding can outrank
 "too large" as the reported reason, but the terminal outcome for over-cap is
 Block either way. The block's cause says the scan **could not run**, never that
 it found something — those are different problems with different fixes.
-`REDACT_INPUT_MAX_BYTES = 64 KiB` (≈32k tokens at the duty seam's
-2-bytes/token convention — the most a mid-tier local model can actually scan in
-one call).
+`REDACT_INPUT_MAX_BYTES` is **derived from the engine window**, not chosen
+beside it (LESSON-446 — the cap and the window are two descriptions of one
+budget):
+
+```
+  LOCAL_ENGINE_N_CTX          16,384 tokens
+  − REDACT_DUTY.max_tokens()   1,024 tokens   (the duty's generation reservation)
+  = prompt budget             15,360 tokens
+  × 2 bytes/token             30,720 bytes    (the duty seam's convention)
+  − REDACT_PROMPT_OVERHEAD_BYTES 586 bytes    (instruction + contract + header,
+                                               measured from the constants)
+  = REDACT_INPUT_MAX_BYTES    30,134 bytes
+```
+
+*(Originally stated as a flat 64 KiB "≈32k tokens at the duty seam's
+2-bytes/token convention". That was wrong by construction: `LlamaEngine`
+refuses any prompt over `n_ctx - max_tokens` tokens, so every payload from
+~30 KiB to 64 KiB passed the cap, was rendered into a prompt, and came back as
+an engine error — blocking with `ScanUnavailable` when the true reason was
+"too large to scan". BR-3's distinction, collapsed by arithmetic instead of by
+wording.)*
 
 ### ADR-7: `privacy_block` gains an additive `cause`; the shape otherwise holds
 
