@@ -77,6 +77,7 @@
 //! degrading the guarantee.
 
 pub mod inspector;
+pub mod lookup;
 pub mod provenance;
 pub mod redact;
 
@@ -100,6 +101,10 @@ use crate::broadcast::EventBus;
 use crate::cost::{CostAttribution, CostMeter};
 
 pub use inspector::{inspect, Inspection, Violation};
+pub use lookup::{
+    to_protocol_web_tier, Authorship, LookupContext, LookupDetail, LookupKind, LookupOutcome,
+    LookupRecord, LookupRecorder, LookupRequest, NoopLookupRecorder, TaintView,
+};
 pub use provenance::{assembled_provenance, ContextBlock, Provenance};
 pub use redact::{RedactionGate, RedactionVerdict};
 
@@ -423,6 +428,18 @@ pub struct Egress<T: Transport> {
     /// (ADR-2). `None` is the off state in full: no branch inside the hot path,
     /// no scanner call, nothing that could claim a scan ran.
     redaction: Option<Arc<dyn RedactionGate>>,
+    /// The REQ-563 **search** scanner, present iff the configured web tier is
+    /// `search` (architecture D-6). A separate slot from `redaction` rather than
+    /// a second reader of it, because the two are governed by different switches
+    /// and answering to one flag would make the coupling BR-14 requires
+    /// bypassable by turning `[privacy] redact` off.
+    ///
+    /// Absent, a `Search` lookup is **refused**, not sent unscanned — see
+    /// [`Egress::lookup`].
+    search_redaction: Option<Arc<dyn RedactionGate>>,
+    /// Where a completed lookup attempt is recorded (BR-7) and announced (D-8).
+    /// Absent means neither happens; it never changes a decision.
+    lookup_recorder: Option<Arc<dyn lookup::LookupRecorder>>,
 }
 
 impl<T: Transport> Egress<T> {
@@ -440,6 +457,8 @@ impl<T: Transport> Egress<T> {
             sink,
             cost: None,
             redaction: None,
+            search_redaction: None,
+            lookup_recorder: None,
         }
     }
 
@@ -465,10 +484,61 @@ impl<T: Transport> Egress<T> {
         self
     }
 
+    /// Install the **search** redaction scanner (REQ-563 D-6, BR-14).
+    ///
+    /// The same composite gate [`Self::with_redaction_gate`] takes, installed
+    /// from a different switch: the daemon calls this whenever the configured
+    /// web tier is `search`, **independently of `[privacy] redact`**. The two
+    /// scans answer different promises — the provider one is the user's opt-in
+    /// to being watched over, the search one is the condition on which the
+    /// search tier exists at all — so they are two slots and not one flag read
+    /// twice.
+    ///
+    /// Unlike every other slot on this choke point, leaving this one empty is
+    /// not "off": [`Egress::lookup`] refuses a `Search` with no gate rather than
+    /// sending the query unscanned (LESSON-492).
+    #[must_use]
+    pub fn with_search_redaction_gate(mut self, gate: Arc<dyn RedactionGate>) -> Self {
+        self.search_redaction = Some(gate);
+        self
+    }
+
+    /// Install the web-lookup recorder (REQ-563 BR-7, D-7/D-8): every lookup
+    /// attempt, whatever its ending, becomes one `web_lookups` row and one
+    /// `web_lookup` event.
+    ///
+    /// Additive like [`Self::with_cost_meter`] — a choke point without one
+    /// performs identical lookups and records none of them.
+    #[must_use]
+    pub fn with_lookup_recorder(mut self, recorder: Arc<dyn lookup::LookupRecorder>) -> Self {
+        self.lookup_recorder = Some(recorder);
+        self
+    }
+
     /// The configured boundaries (read-only).
     #[must_use]
     pub fn boundaries(&self) -> &[PrivacyBoundary] {
         &self.boundaries
+    }
+
+    /// Which optional collaborators this choke point was built with.
+    ///
+    /// Test-only, and deliberately so: nothing in production should branch on
+    /// whether a gate is installed — "off" is the absence of the collaborator,
+    /// not a flag to consult (ADR-2). What a *test* needs is different: the
+    /// daemon's wiring claims "the search gate is on the choke point exactly
+    /// when the tier is `search`", and confirming that by performing a network
+    /// lookup to see what happens would be a worse test of a worse property.
+    ///
+    /// Returns `(provider gate, search gate, lookup recorder)`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn installed(&self) -> (bool, bool, bool) {
+        (
+            self.redaction.is_some(),
+            self.search_redaction.is_some(),
+            self.lookup_recorder.is_some(),
+        )
     }
 
     /// Dispatch `request` for the context assembled with `provenance`.
@@ -796,24 +866,47 @@ impl Transport for HttpTransport {
     ) -> Result<TransportResponse, TransportError> {
         let method = match request.method {
             HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Get => reqwest::Method::GET,
         };
         let mut builder = self.client.request(method, &request.url);
         for (name, value) in self.outbound_headers(&request.url, &request.headers) {
             builder = builder.header(name.as_str(), value.as_str());
         }
+        // A GET sends no body. Attaching an empty one would set
+        // `content-length: 0` on a retrieval request, which some origins answer
+        // with a 411/400 — and a GET body has no meaning to any destination
+        // this daemon reaches, so there is nothing to preserve by sending it.
+        if request.method != HttpMethod::Get {
+            builder = builder.body(request.body);
+        }
         let response = builder
-            .body(request.body)
             .send()
             .await
             .map_err(|e| classify_reqwest_error(&e))?;
 
         let status = response.status().as_u16();
+        // The one response header this seam reports (REQ-563). The client is
+        // built with `Policy::none()`, so a 3xx arrives here intact and the
+        // caller — the bounded, host-checked fetch loop — needs to know where
+        // it points. A header that is not valid ASCII is `None`: a redirect
+        // target that cannot be read is one that cannot be followed, and
+        // guessing at the bytes is how a host check gets pointed at the wrong
+        // string.
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let body: ByteStream = Box::pin(response.bytes_stream().map(|chunk| {
             chunk
                 .map(|b| b.to_vec())
                 .map_err(|e| classify_reqwest_error(&e))
         }));
-        Ok(TransportResponse { status, body })
+        Ok(TransportResponse {
+            status,
+            location,
+            body,
+        })
     }
 }
 
@@ -853,6 +946,7 @@ mod tests {
         ) -> Result<TransportResponse, TransportError> {
             self.sent.lock().unwrap().push(request);
             Ok(TransportResponse {
+                location: None,
                 status: 200,
                 body: Box::pin(futures::stream::empty()),
             })

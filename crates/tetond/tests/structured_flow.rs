@@ -86,6 +86,7 @@ impl Transport for RecordingTransport {
             .pop_front()
             .unwrap_or_else(|| "data: [DONE]\n\n".to_owned());
         Ok(TransportResponse {
+            location: None,
             status: 200,
             body: Box::pin(futures::stream::once(async move { Ok(body.into_bytes()) })),
         })

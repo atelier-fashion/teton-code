@@ -91,6 +91,7 @@ impl Transport for CaptureTransport {
             .expect("capture poisoned")
             .push(request.body);
         Ok(TransportResponse {
+            location: None,
             status: 200,
             body: Box::pin(stream::empty()),
         })

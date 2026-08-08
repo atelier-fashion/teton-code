@@ -164,6 +164,22 @@ pub enum WebTier {
 }
 
 impl WebTier {
+    /// Every tier, lowest first.
+    ///
+    /// Exists so a sweep over the ladder — "which tiers does this ceiling
+    /// permit", a renderer's match, the daemon's mirror test against the wire
+    /// twin — cannot miss one a later REQ adds. A hand-kept list at each of
+    /// those sites is a list that goes stale at a different time in each of
+    /// them; the wire twin (`teton_protocol::events::WebTier::ALL`) carries the
+    /// same constant for the same reason, and the daemon's conversion test
+    /// sweeps both so the two ladders cannot drift in length either.
+    pub const ALL: [WebTier; 4] = [
+        WebTier::Off,
+        WebTier::FetchUserUrl,
+        WebTier::FetchAnyUrl,
+        WebTier::Search,
+    ];
+
     /// Whether this ceiling permits a lookup that needs `needed` — BR-3's
     /// each-tier-includes-the-ones-below rule, as one predicate rather than a
     /// comparison every caller re-derives.

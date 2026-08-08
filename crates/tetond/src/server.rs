@@ -43,7 +43,7 @@ use teton_protocol::methods::{
     ModelConfirmParams, ModelListParams, ModelSetParams, ModelStatusParams,
     PermissionRespondParams, PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod,
     SessionAttachParams, SessionAttachResult, SessionCreateParams, SessionCreateResult,
-    SessionListParams, SessionListResult,
+    SessionListParams, SessionListResult, WebOverrideParams,
 };
 
 use crate::auth;
@@ -477,12 +477,30 @@ fn dispatch(daemon: &Daemon, id: Id, method: &str, params: Value) -> Option<Stri
         ConfigGetParams::METHOD => Some(handle_config_get(daemon, id)),
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, id)),
+        WebOverrideParams::METHOD => Some(handle_web_override(daemon, id, params)),
         _ => Some(error_string(
             id,
             error_code::METHOD_NOT_FOUND,
             "method not found",
         )),
     }
+}
+
+/// Lift a session's web taint restriction (`web/override`, REQ-563 AC-12).
+///
+/// **This function is the entire path to that flag.** The setter behind
+/// [`DaemonRuntime::web_override`] is private to the runtime module, and tool
+/// dispatch holds a `ToolContext` rather than a `DaemonRuntime` — so a model
+/// that emits a tool call named `web/override` reaches the tool registry, finds
+/// no such tool, and is told so. The requirement's "the override is rejected
+/// when issued by the model" is a fact about which channel this code hangs off,
+/// not a check that could be omitted.
+fn handle_web_override(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: WebOverrideParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    ok_string(id, &daemon.runtime.web_override(&params, &daemon.events))
 }
 
 /// Deliver a client's `permission/respond` to the waiting harness gate. Always

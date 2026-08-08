@@ -20,6 +20,16 @@ use std::pin::Pin;
 pub enum HttpMethod {
     /// HTTP POST.
     Post,
+    /// HTTP GET — a request that retrieves a document and sends no body.
+    ///
+    /// No provider adapter uses it: every chat/completions call is a `POST`.
+    /// It exists for REQ-563's web lookup, which retrieves a page or queries a
+    /// search endpoint **through this same seam** rather than opening a client
+    /// of its own — the whole point of the single choke point (BR-2 of that
+    /// REQ). A `TransportRequest` carrying `Get` is expected to have an empty
+    /// `body`; a transport is free to ignore one rather than send it, because a
+    /// GET body is meaningless to the destinations this daemon reaches.
+    Get,
 }
 
 /// A fully-formed request for the transport to execute. The adapter fills in the
@@ -47,6 +57,24 @@ pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, TransportError>>
 pub struct TransportResponse {
     /// HTTP status code.
     pub status: u16,
+    /// The `Location` header, when the response carried one.
+    ///
+    /// ## Why one named header and not a header map (REQ-563)
+    ///
+    /// A transport here **never follows a redirect** (ADR-004: `reqwest` strips
+    /// `Authorization` across hosts but not a custom `x-api-key`, so following
+    /// one could carry a provider secret to an attacker-influenced host). The
+    /// 3xx therefore comes back to the caller, and the one caller that has to
+    /// act on it — REQ-563's bounded, host-checked fetch loop — cannot take a
+    /// single hop without knowing where the redirect points.
+    ///
+    /// So exactly that is surfaced, and nothing else. A general header bag would
+    /// hand every adapter `set-cookie`, `www-authenticate` and the rest for a
+    /// need nothing in this workspace has, and response headers are precisely
+    /// the surface a later "just read one more header" grows on. `None` is both
+    /// "the response had no `Location`" and "this transport does not report
+    /// one" — a redirect loop treats the two the same way, by stopping.
+    pub location: Option<String>,
     /// Streaming response body.
     pub body: ByteStream,
 }
@@ -55,6 +83,7 @@ impl std::fmt::Debug for TransportResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransportResponse")
             .field("status", &self.status)
+            .field("location", &self.location)
             .field("body", &"<stream>")
             .finish()
     }

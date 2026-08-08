@@ -462,6 +462,10 @@ impl CostMeter for CostLedger {
         };
         TransportResponse {
             status: response.status,
+            // Carried through rather than dropped: the meter wraps the *body*,
+            // and a wrapper that quietly erased a response field would make
+            // metering change what the caller can see about the response.
+            location: response.location,
             body: Box::pin(metered),
         }
     }
@@ -1413,7 +1417,11 @@ CREATE TRIGGER cost_records_no_delete
             "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":1200,\"output_tokens\":1}}}\n\n",
             "event: message_delta\ndata: {\"usage\":{\"output_tokens\":340}}\n\n",
         ]);
-        let response = TransportResponse { status: 200, body };
+        let response = TransportResponse {
+            status: 200,
+            location: None,
+            body,
+        };
         let metered = CostMeter::meter_response(
             ledger.as_ref(),
             response,
@@ -1444,7 +1452,11 @@ CREATE TRIGGER cost_records_no_delete
             "kens\":4",
             "2}}\n\ndata: [DONE]\n\n",
         ]);
-        let response = TransportResponse { status: 200, body };
+        let response = TransportResponse {
+            status: 200,
+            location: None,
+            body,
+        };
         let metered = CostMeter::meter_response(
             ledger.as_ref(),
             response,
@@ -1466,7 +1478,11 @@ CREATE TRIGGER cost_records_no_delete
         let body = body_from(vec![
             "data: {\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
         ]);
-        let response = TransportResponse { status: 200, body };
+        let response = TransportResponse {
+            status: 200,
+            location: None,
+            body,
+        };
         let metered = CostMeter::meter_response(
             ledger.as_ref(),
             response,
@@ -1509,7 +1525,11 @@ CREATE TRIGGER cost_records_no_delete
         let body = stalling_body_from(vec![
             "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":1200,\"output_tokens\":1}}}\n\n",
         ]);
-        let response = TransportResponse { status: 200, body };
+        let response = TransportResponse {
+            status: 200,
+            location: None,
+            body,
+        };
         let metered = CostMeter::meter_response(
             ledger.as_ref(),
             response,
@@ -1557,7 +1577,11 @@ CREATE TRIGGER cost_records_no_delete
         let (ledger, sink) = ledger();
         let ledger = Arc::new(ledger);
         let body = body_from(vec!["{\"error\":{\"type\":\"rate_limit_error\"}}"]);
-        let response = TransportResponse { status: 429, body };
+        let response = TransportResponse {
+            status: 429,
+            location: None,
+            body,
+        };
         let metered = CostMeter::meter_response(
             ledger.as_ref(),
             response,
@@ -1586,7 +1610,11 @@ CREATE TRIGGER cost_records_no_delete
         let body = body_from(vec![
             "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
         ]);
-        let response = TransportResponse { status: 200, body };
+        let response = TransportResponse {
+            status: 200,
+            location: None,
+            body,
+        };
         let metered = CostMeter::meter_response(
             ledger.as_ref(),
             response,

@@ -158,6 +158,7 @@ impl Transport for CaptureTransport {
     ) -> Result<TransportResponse, TransportError> {
         self.sent.lock().expect("capture poisoned").push(request);
         Ok(TransportResponse {
+            location: None,
             status: 200,
             body: Box::pin(stream::once(async { Ok(b"{\"ok\":true}".to_vec()) })),
         })

@@ -94,7 +94,7 @@ use teton_core::category::{
     category_for_phase, BindingSource as CoreBindingSource, Category, CategoryOverride,
     CategoryResolution, CategoryTable, ConfigurableCategory, Tier, TierBinding,
 };
-use teton_core::config::{Config, LocalModelConfig, RoutingMigration};
+use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebTier};
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
 };
@@ -108,13 +108,14 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 
 use teton_protocol::events::{
     BlockCause, Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction, SessionTitled,
+    WebLookup, WebTaintOverridden,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
-    TierRouteView,
+    TierRouteView, WebOverrideParams, WebOverrideResult,
 };
 use teton_protocol::{
     BindingSource, ConfigurableCategory as ProtoConfigurableCategory, Phase as ProtoPhase,
@@ -131,10 +132,11 @@ use teton_providers::{
 use crate::broadcast::EventBus;
 use crate::call_sites::has_call_site;
 use crate::classify::Classification;
-use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
+use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable, WebLookupRow};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
 use crate::egress::{
-    inspect, origin_of, Egress, HttpTransport, Provenance, RedactionGate, RedactionVerdict,
+    inspect, origin_of, to_protocol_web_tier, Egress, EgressError, HttpTransport, LookupRecord,
+    LookupRecorder, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
@@ -557,6 +559,140 @@ impl SessionTaint {
     }
 }
 
+/// Per-session lift of the BR-13 restriction on **model-composed** web lookups
+/// (REQ-563, architecture D-4).
+///
+/// A sibling of [`SessionTaint`] and deliberately not a field on it: taint is a
+/// privacy fact the daemon establishes about a session, and this is a decision
+/// the *user* made about that fact. Folding the second into the first would let
+/// anything that can mark taint also unmark its consequence.
+///
+/// ## The setter is private, which is the whole of AC-12
+///
+/// [`Self::lift`] carries no `pub`, so it is reachable from this module and its
+/// children and from nowhere else in the crate — in particular not from
+/// `crate::harness::tools`, where a model's tool call lands. The single caller
+/// is [`DaemonRuntime::web_override`], which is only reached from the
+/// `web/override` client RPC. "The override is rejected when issued by the
+/// model" is therefore not a runtime check that could be forgotten; a
+/// model-issued override does not compile.
+///
+/// Session-scoped and never persisted (BR-13): a fresh session starts
+/// restricted-on-taint again, because this lives in a process-lifetime set with
+/// no writer to config.
+#[derive(Debug, Default)]
+pub struct WebTaintOverride {
+    lifted: Mutex<HashSet<SessionId>>,
+}
+
+impl WebTaintOverride {
+    /// An empty set — nothing lifted.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lift the restriction for `session`, returning whether this call was the
+    /// restricted→lifted transition.
+    ///
+    /// Idempotent, and the returned transition is what keeps the announcement
+    /// honest the way [`SessionTaint::mark`]'s does: a second override of an
+    /// already-lifted session is not a second lifting.
+    ///
+    /// **Intentionally not `pub`** — see the type docs.
+    fn lift(&self, session: &SessionId) -> bool {
+        self.lifted
+            .lock()
+            .expect("web override mutex poisoned")
+            .insert(session.clone())
+    }
+
+    /// Whether the user has lifted the restriction for `session`.
+    #[must_use]
+    pub fn is_lifted(&self, session: &SessionId) -> bool {
+        self.lifted
+            .lock()
+            .expect("web override mutex poisoned")
+            .contains(session)
+    }
+}
+
+/// The lookup seam's read of the two session flags (REQ-563 BR-13).
+///
+/// The choke point takes a [`TaintView`] rather than these two handles so it
+/// does not depend on the daemon runtime — the same inversion
+/// [`PrivacyEventSink`](crate::egress::PrivacyEventSink) uses. This is the
+/// production implementation, and it only ever *reads*: the lookup gate has no
+/// path to `mark` or to `lift`.
+pub struct SessionTaintView {
+    taint: Arc<SessionTaint>,
+    overridden: Arc<WebTaintOverride>,
+}
+
+impl TaintView for SessionTaintView {
+    fn is_tainted(&self, session: &SessionId) -> bool {
+        self.taint.is_tainted(session)
+    }
+
+    fn is_overridden(&self, session: &SessionId) -> bool {
+        self.overridden.is_lifted(session)
+    }
+}
+
+/// Writes one `web_lookups` row and publishes one `web_lookup` event per lookup
+/// attempt (REQ-563 BR-7, D-7/D-8).
+///
+/// Both obligations behind one call, because "exactly one row and exactly one
+/// event per attempt" is one invariant: two separately-installable hooks could
+/// be wired independently and then disagree about how many lookups a session
+/// performed, which is precisely the question the ledger exists to answer.
+///
+/// ## No `privacy_block`, deliberately
+///
+/// A web block is announced here as a `web_lookup` carrying
+/// `blocked_redact`, and **not** as a `privacy_block`. That is not an omission:
+/// `privacy_block` is the event [`TaintingPrivacySink`] turns into a session-wide
+/// local-tier pin, and a query the daemon refused to send establishes nothing
+/// about the context this session is holding. Taint semantics stay owned by that
+/// sink's rules (REQ-544 C-2, REQ-562's cause gate); the lookup path observes
+/// them and never writes them.
+struct WebLookupRecorder {
+    ledger: CostLedger,
+    events: Arc<EventBus>,
+}
+
+impl LookupRecorder for WebLookupRecorder {
+    fn web_lookup(&self, session_id: &SessionId, record: &LookupRecord) {
+        // `Some(0)`: every lookup this build performs is genuinely free, and a
+        // measured zero is not the guess REQ-557 BR-9 forbids. A metered search
+        // backend arrives as a price, not as a schema change (D-7).
+        let row = WebLookupRow {
+            session_id: session_id.to_string(),
+            kind: record.kind,
+            host: record.host.clone(),
+            bytes_in: record.bytes_in,
+            duration_ms: record.duration_ms,
+            outcome: record.outcome,
+            usd_micros: Some(0),
+        };
+        if let Err(err) = self.ledger.record_web_lookup(&row) {
+            // The lookup already happened; a ledger that could not be written is
+            // an accounting failure, not a reason to fail the turn (BR-9). The
+            // line names the failure class and no part of the destination.
+            eprintln!("teton: a web lookup could not be recorded in the cost ledger ({err})");
+        }
+        self.events.publish(
+            Some(session_id.clone()),
+            Event::WebLookup(WebLookup {
+                kind: record.kind,
+                host: record.host.clone(),
+                outcome: record.outcome,
+                bytes_in: record.bytes_in,
+            }),
+        );
+    }
+}
+
 /// A [`PrivacyEventSink`] that publishes the block **and** taints the session it
 /// happened in (REQ-544 C-2, extended to the duty path by REQ-561).
 ///
@@ -945,6 +1081,11 @@ pub struct DaemonRuntime {
     /// path's own `is_privacy_blocked` arm cannot cover it (see
     /// [`TaintingPrivacySink`]).
     session_taint: Arc<SessionTaint>,
+    /// Per-session lifts of the BR-13 web restriction (REQ-563). Behind an `Arc`
+    /// because the lookup seam reads it through a [`TaintView`] on whatever task
+    /// the turn is running on, while the `web/override` RPC writes it from the
+    /// server's reader loop.
+    web_override: Arc<WebTaintOverride>,
     /// Daemon-wide provider health, persisted across turns (REQ-544 M-5). Updated
     /// by turn outcomes and READ by [`Self::run_prompt_turn`] when it seeds the
     /// router each turn, so a provider observed `Unavailable` stays `Unavailable`
@@ -1003,6 +1144,7 @@ impl DaemonRuntime {
             probe: None,
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
+            web_override: Arc::new(WebTaintOverride::new()),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         }
@@ -1139,6 +1281,7 @@ impl DaemonRuntime {
             probe: Some(probe),
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
+            web_override: Arc::new(WebTaintOverride::new()),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         })
@@ -2597,6 +2740,203 @@ impl DaemonRuntime {
             session_id: session_id.clone(),
             engine: Arc::clone(&self.engine),
         }))
+    }
+
+    /// The scanner the **search** half of the lookup seam carries, or `None`
+    /// when the configured tier does not reach search (REQ-563 BR-14, D-6).
+    ///
+    /// The same composite gate [`Self::redaction_gate`] builds — same router,
+    /// same engine slot, same `redact` category, same caps — installed from a
+    /// different switch. `[privacy] redact` is deliberately *not* read here:
+    /// BR-14 makes the scan the condition on which the search tier exists, so a
+    /// user who turned provider-payload scanning off has not thereby turned off
+    /// the thing that makes search offerable. Reading both flags would make the
+    /// coupling bypassable by the wrong one.
+    ///
+    /// The `⇔` runs both ways. Above `search` there is no tier, and below it a
+    /// lookup is a fetch, which this gate does not scan (BR-2's parity clause) —
+    /// so anything but `search` builds nothing, and the seam then refuses a
+    /// search outright rather than sending it unscanned.
+    fn search_redaction_gate(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> Option<Arc<dyn RedactionGate>> {
+        if config.web.tier != WebTier::Search {
+            return None;
+        }
+        Some(Arc::new(RedactionGateImpl {
+            router: router.clone(),
+            events: Arc::clone(events),
+            session_id: session_id.clone(),
+            engine: Arc::clone(&self.engine),
+        }))
+    }
+
+    /// The two session flags the lookup taint gate reads (REQ-563 BR-13).
+    ///
+    /// Handed to the choke point as a `&dyn TaintView` so it can decide without
+    /// depending on this runtime — and, just as importantly, so what it holds is
+    /// a *read* interface: there is no `mark` and no `lift` on the other side of
+    /// this seam.
+    #[must_use]
+    pub fn web_taint_view(&self) -> Arc<SessionTaintView> {
+        Arc::new(SessionTaintView {
+            taint: Arc::clone(&self.session_taint),
+            overridden: Arc::clone(&self.web_override),
+        })
+    }
+
+    /// The recorder that turns each lookup attempt into one ledger row and one
+    /// `web_lookup` event (REQ-563 BR-7).
+    #[must_use]
+    pub fn lookup_recorder(&self, events: &Arc<EventBus>) -> Arc<dyn LookupRecorder> {
+        Arc::new(WebLookupRecorder {
+            ledger: self.ledger.clone(),
+            events: Arc::clone(events),
+        })
+    }
+
+    /// Build the lookup-capable choke point for this session (REQ-563 D-2).
+    ///
+    /// ## Credential-free for fetch, endpoint-bound for search (BR-7)
+    ///
+    /// The transport carries **no provider credential**: a page fetch must never
+    /// have an `x-api-key` on it, and the way to guarantee that is to build the
+    /// client without one, exactly as the MCP path does. When a search endpoint
+    /// *and* a resolvable `search_key_ref` are configured, the resolved key is
+    /// attached by [`HttpTransport::with_endpoint_auth`] and **bound to that
+    /// endpoint's origin**, so it rides the search request and can travel
+    /// nowhere else — the same machinery, and the same guarantee, a provider's
+    /// key gets (REQ-544 M-3). The lookup module itself never holds the secret.
+    ///
+    /// ## Resolved here, which is why this is built per lookup
+    ///
+    /// The keychain read happens as this function runs (ADR-007: the daemon is
+    /// the resolver, at call time). A caller that cached the returned choke
+    /// point for the daemon's life would be holding a key resolved when it was
+    /// built, so callers build one per lookup — or per turn — rather than once.
+    ///
+    /// A `search_key_ref` that will not resolve is **not** fatal: an
+    /// unauthenticated endpoint is a legitimate configuration (see
+    /// [`teton_core::config::WebConfig::search_key_ref`]), so the failure is
+    /// reported by reference name — never by value — and the choke point is
+    /// built credential-free. The backend answers 401 and the lookup ends as an
+    /// HTTP-status ending, which is a truthful thing for the user to be told.
+    ///
+    /// # Errors
+    /// [`EgressError::ClientInit`] if the HTTP client cannot be constructed.
+    pub fn web_lookup_egress(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> Result<Egress<HttpTransport>, EgressError> {
+        let transport = match self.search_auth(config) {
+            Some((endpoint, headers)) => HttpTransport::with_endpoint_auth(&endpoint, headers)?,
+            None => HttpTransport::new()?,
+        };
+        // The privacy sink is the plain event bus, not `TaintingPrivacySink`:
+        // this choke point is used through `lookup()`, which publishes no
+        // `privacy_block` at all, and a sink that taints would be a loaded gun
+        // pointed at the rule the lookup path is built to keep.
+        let sink: Arc<dyn crate::egress::PrivacyEventSink> = events.clone();
+        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
+            .with_lookup_recorder(self.lookup_recorder(events));
+        if let Some(gate) = self.search_redaction_gate(router, config, events, session_id) {
+            egress = egress.with_search_redaction_gate(gate);
+        }
+        Ok(egress)
+    }
+
+    /// The search endpoint and its resolved credential header, or `None` when
+    /// there is no endpoint, no key reference, or the reference does not resolve.
+    ///
+    /// A bearer token, matching what `provider_auth_headers` sends to an
+    /// OpenAI-compatible or custom endpoint: there is no blessed search backend
+    /// (BR-8), and `Authorization: Bearer` is what an unblessed one is most
+    /// likely to accept. The secret exists only inside the returned header and
+    /// is dropped once the endpoint-bound transport is built — it reaches no
+    /// log, no event, and no ledger row.
+    fn search_auth(&self, config: &Config) -> Option<(String, Vec<(String, String)>)> {
+        let endpoint = config.web.search_endpoint.clone()?;
+        let key_ref = config.web.search_key_ref.as_deref()?;
+        if origin_of(&endpoint).is_none() {
+            // The same fail-closed check `build_remote_transport` makes: a
+            // credential bound to nothing is a credential silently dropped.
+            eprintln!(
+                "teton: [web] search_endpoint does not parse to a network origin, so \
+                 search_key_ref cannot be bound to it; searching without a credential."
+            );
+            return None;
+        }
+        match self.secret_resolver.resolve(key_ref) {
+            Ok(secret) => Some((
+                endpoint,
+                vec![("authorization".to_owned(), format!("Bearer {secret}"))],
+            )),
+            Err(err) => {
+                // Names the reference (config, safe) and never the value.
+                eprintln!("teton: [web] search_key_ref could not be resolved ({err})");
+                None
+            }
+        }
+    }
+
+    /// Lift this session's BR-13 web restriction (`web/override`, REQ-563 AC-12).
+    ///
+    /// The **only** caller of [`WebTaintOverride::lift`], and reachable only from
+    /// the client RPC dispatch: tool dispatch holds a `ToolContext`, never a
+    /// `DaemonRuntime`, and `lift` is private to this module besides. A
+    /// model-issued override is unrepresentable rather than rejected.
+    ///
+    /// ## What it restores, and what it does not
+    ///
+    /// It restores *model-composed lookups*; it grants no tier (BR-13). Consent
+    /// still runs per lookup, and the configured ceiling still bounds everything
+    /// — so `tiers_restored` is read from that ceiling: the tiers at or below it,
+    /// ascending, `off` excluded because "restored to nothing" is an empty list.
+    ///
+    /// `was_restricted` is the *taint* question and not the override question: a
+    /// session that was never tainted restores nothing, and the client says
+    /// "nothing was restricted" rather than confirming a lift that did not
+    /// happen.
+    ///
+    /// The event is published only on the restricted→lifted transition, so a
+    /// second override of an already-lifted session is acknowledged without
+    /// announcing a lifting twice ([`SessionTaint::mark`]'s rule).
+    pub fn web_override(
+        &self,
+        params: &WebOverrideParams,
+        events: &Arc<EventBus>,
+    ) -> WebOverrideResult {
+        let was_restricted = self.session_taint.is_tainted(&params.session_id);
+        let tiers_restored = if was_restricted {
+            let ceiling = self.config.lock().expect("config mutex poisoned").web.tier;
+            WebTier::ALL
+                .into_iter()
+                .filter(|tier| ceiling.allows(*tier))
+                .map(to_protocol_web_tier)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let transitioned = self.web_override.lift(&params.session_id);
+        if was_restricted && transitioned {
+            events.publish(
+                Some(params.session_id.clone()),
+                Event::WebTaintOverridden(WebTaintOverridden {
+                    tiers_restored: tiers_restored.clone(),
+                }),
+            );
+        }
+        WebOverrideResult {
+            was_restricted,
+            tiers_restored,
+        }
     }
 
     /// Name this session after `prompt`, at most once for its whole life
@@ -10949,6 +11289,7 @@ provider_id = "on-device"
                     )
                     .expect("serialize");
                     Ok(teton_providers::transport::TransportResponse {
+                        location: None,
                         status: 200,
                         body: Box::pin(futures::stream::once(async move { Ok(body) })),
                     })
@@ -11660,6 +12001,371 @@ provider_id = "on-device"
                     "a payload the scan found a credential in must pin the session, \
                      or the next turn is free to send the model's paraphrase of it \
                      to the same provider"
+                );
+            }
+        }
+    }
+
+    /// REQ-563 TASK-075 — the daemon half of the lookup seam: which switch
+    /// installs the search scanner, who may lift the taint restriction, and what
+    /// one lookup leaves behind.
+    mod web_lookup_seam {
+        use super::*;
+        use crate::egress::{LookupRecord, TaintView};
+        use teton_core::config::WebTier;
+        use teton_protocol::events::{WebLookupKind, WebLookupOutcome, WebTier as WireWebTier};
+        use teton_protocol::methods::WebOverrideParams;
+
+        fn runtime_with(web_tier: WebTier, redact: bool) -> DaemonRuntime {
+            let runtime = DaemonRuntime::minimal();
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = web_tier;
+                config.web.search_endpoint = Some("https://search.example/api".to_owned());
+                config.privacy.redact = redact;
+            }
+            runtime
+        }
+
+        fn router_for(runtime: &DaemonRuntime) -> Router {
+            let config = runtime.config.lock().expect("config mutex").clone();
+            build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+        }
+
+        // -- the search gate's switch (BR-14, D-6) -------------------------
+
+        /// **`⇔ tier == search`, and `[privacy] redact` is not part of it.**
+        ///
+        /// Both halves matter and the sweep asserts both at once. A gate keyed
+        /// on `redact` as well would let a user who declined provider-payload
+        /// scanning send search queries unscanned, which is the coupling BR-14
+        /// exists to prevent; a gate installed below `search` would scan a
+        /// capability that cannot search.
+        #[test]
+        fn the_search_gate_is_installed_exactly_when_the_tier_is_search() {
+            for tier in WebTier::ALL {
+                for redact in [false, true] {
+                    let runtime = runtime_with(tier, redact);
+                    let config = runtime.config.lock().expect("config mutex").clone();
+                    let router = router_for(&runtime);
+                    let events = Arc::new(EventBus::new());
+                    let gate = runtime.search_redaction_gate(
+                        &router,
+                        &config,
+                        &events,
+                        &SessionId::from("s"),
+                    );
+                    assert_eq!(
+                        gate.is_some(),
+                        tier == WebTier::Search,
+                        "tier {tier:?} with redact={redact} installed the wrong thing"
+                    );
+                }
+            }
+        }
+
+        /// The provider gate still answers to its own switch — otherwise the
+        /// test above would pass on an implementation that had merged the two.
+        #[test]
+        fn the_provider_gate_still_answers_to_the_privacy_switch() {
+            for redact in [false, true] {
+                let runtime = runtime_with(WebTier::Search, redact);
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router = router_for(&runtime);
+                let events = Arc::new(EventBus::new());
+                let gate = runtime.redaction_gate(&router, &config, &events, &SessionId::from("s"));
+                assert_eq!(gate.is_some(), redact);
+            }
+        }
+
+        /// **The search gate is REQ-562's composite scanner, not a new one.**
+        ///
+        /// This is what makes LESSON-491 inherited rather than re-derived: the
+        /// caps that matter — the total input cap, the chunk ceiling, and above
+        /// all the *rendered-prompt* budget — live in `harness::redact::scan`,
+        /// and the search gate is worth nothing if it does not go through it.
+        ///
+        /// The observable that pins it, on a runtime with no engine, is that a
+        /// scan comes back `Unavailable` with `scanned() == false`: that verdict
+        /// is minted by `harness::redact::scan`'s unresolved-route arm, so a
+        /// gate returning it is a gate that ran that function. A hand-rolled
+        /// scanner with its own caps would have to reproduce the failure mode to
+        /// pass, and if it did it would be the same code.
+        ///
+        /// It pins the practical half of BR-14 too: on a machine with no local
+        /// tier, every search query blocks (LESSON-492), which is why the search
+        /// tier is not offered there at all.
+        #[tokio::test]
+        async fn the_search_gate_is_the_same_scanner_the_provider_gate_uses() {
+            let runtime = runtime_with(WebTier::Search, true);
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let router = router_for(&runtime);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("s");
+
+            let search = runtime
+                .search_redaction_gate(&router, &config, &events, &session)
+                .expect("tier is search");
+            let provider = runtime
+                .redaction_gate(&router, &config, &events, &session)
+                .expect("redact is on");
+
+            let by_search = search.scan("a query").await;
+            let by_provider = provider.scan("a query").await;
+            assert_eq!(by_search.outcome(), by_provider.outcome());
+            assert_eq!(
+                by_search.outcome(),
+                crate::egress::redact::Outcome::Unavailable,
+                "no engine is loaded, so the shared scan fails closed"
+            );
+            assert!(!by_search.scanned());
+        }
+
+        // -- the override (BR-13, AC-12) ------------------------------------
+
+        #[test]
+        fn the_override_lifts_the_restriction_the_lookup_gate_reads() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(16);
+            let session = SessionId::from("sess-1");
+            runtime.session_taint.mark(&session);
+
+            // Non-vacuity: the gate really is restricted before the RPC.
+            let view = runtime.web_taint_view();
+            assert!(view.is_tainted(&session));
+            assert!(!view.is_overridden(&session));
+
+            let result = runtime.web_override(
+                &WebOverrideParams {
+                    session_id: session.clone(),
+                },
+                &events,
+            );
+
+            assert!(result.was_restricted);
+            assert_eq!(
+                result.tiers_restored,
+                vec![
+                    WireWebTier::FetchUserUrl,
+                    WireWebTier::FetchAnyUrl,
+                    WireWebTier::Search
+                ],
+                "ascending, and `off` is never a restored tier"
+            );
+            assert!(
+                runtime.web_taint_view().is_overridden(&session),
+                "the flag the choke point reads is the flag the RPC set"
+            );
+
+            let envelope = sub.try_recv().expect("one web_taint_overridden");
+            assert_eq!(envelope.session_id, Some(session));
+            match envelope.event {
+                Event::WebTaintOverridden(e) => assert_eq!(e.tiers_restored.len(), 3),
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(sub.try_recv().is_none(), "exactly one");
+        }
+
+        /// The ceiling bounds what is restored: an override never grants a tier
+        /// the machine was not configured for (BR-13's "grants no new tiers").
+        #[test]
+        fn the_override_restores_nothing_above_the_configured_ceiling() {
+            let runtime = runtime_with(WebTier::FetchUserUrl, false);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("sess-1");
+            runtime.session_taint.mark(&session);
+
+            let result = runtime.web_override(
+                &WebOverrideParams {
+                    session_id: session,
+                },
+                &events,
+            );
+            assert_eq!(result.tiers_restored, vec![WireWebTier::FetchUserUrl]);
+        }
+
+        /// A session that was never restricted gets an honest "nothing was" —
+        /// not a confirmation of a lift that did not happen.
+        #[test]
+        fn overriding_an_unrestricted_session_confirms_nothing_and_announces_nothing() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(16);
+
+            let result = runtime.web_override(
+                &WebOverrideParams {
+                    session_id: SessionId::from("clean"),
+                },
+                &events,
+            );
+            assert!(!result.was_restricted);
+            assert!(result.tiers_restored.is_empty());
+            assert!(sub.try_recv().is_none());
+        }
+
+        #[test]
+        fn a_second_override_is_acknowledged_without_announcing_a_second_lifting() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(16);
+            let session = SessionId::from("sess-1");
+            runtime.session_taint.mark(&session);
+            let params = WebOverrideParams {
+                session_id: session,
+            };
+
+            let first = runtime.web_override(&params, &events);
+            let second = runtime.web_override(&params, &events);
+            assert!(first.was_restricted && second.was_restricted);
+            assert!(sub.try_recv().is_some());
+            assert!(
+                sub.try_recv().is_none(),
+                "a re-override is not a second lifting"
+            );
+        }
+
+        /// **The override is unreachable from tool dispatch — by construction.**
+        ///
+        /// `WebTaintOverride::lift` carries no `pub`, so nothing outside
+        /// `runtime.rs` can call it, and this reads the daemon's own source to
+        /// pin the second half: inside `runtime.rs` there is exactly one call
+        /// site, and it is the `web/override` RPC handler. The source scan
+        /// follows [`crate::call_sites`]'s precedent — a marker nobody derives
+        /// is a marker that rots — and it fails in both directions: add a
+        /// second caller and it fires, delete the one there is and it fires
+        /// too.
+        #[test]
+        fn the_taint_override_flag_has_exactly_one_setter_call_site() {
+            // The needle is assembled at run time from fragments, so this
+            // function's own source does not contain the string it searches for
+            // — otherwise the scan finds itself and the test can only ever
+            // measure its own text.
+            let needle = format!("self.web_{}.{}(", "override", "lift");
+            let lines: Vec<&str> = include_str!("runtime.rs").lines().collect();
+            let sites: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.contains(&needle))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                sites.len(),
+                1,
+                "the taint-override setter must have exactly ONE call site. A second \
+                 one is a second channel to a user-only decision (AC-12); zero means \
+                 the RPC handler no longer sets it."
+            );
+
+            // …and that one call site is the client-RPC handler, not some other
+            // function that happens to hold a runtime.
+            let enclosing = lines[..sites[0]]
+                .iter()
+                .rev()
+                .map(|line| line.trim_start())
+                .find(|line| line.starts_with("fn ") || line.starts_with("pub fn "))
+                .expect("the call site is inside some function");
+            assert!(
+                enclosing.starts_with("pub fn web_override("),
+                "the only setter call site must be the `web/override` RPC handler, \
+                 but it is in `{enclosing}`"
+            );
+        }
+
+        // -- the recorder (BR-7, D-7/D-8) -----------------------------------
+
+        #[test]
+        fn one_lookup_writes_one_row_and_publishes_one_event_naming_only_the_host() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(16);
+            let session = SessionId::from("sess-1");
+            let recorder = runtime.lookup_recorder(&events);
+
+            recorder.web_lookup(
+                &session,
+                &LookupRecord {
+                    kind: WebLookupKind::Search,
+                    host: "search.example".to_owned(),
+                    outcome: WebLookupOutcome::Completed,
+                    bytes_in: 4_096,
+                    duration_ms: 12,
+                },
+            );
+
+            let rows = runtime.ledger.all_web_lookups().expect("read the ledger");
+            assert_eq!(rows.len(), 1, "exactly one row");
+            assert_eq!(rows[0].host, "search.example");
+            assert_eq!(rows[0].outcome, WebLookupOutcome::Completed);
+            assert_eq!(rows[0].bytes_in, 4_096);
+            assert_eq!(
+                rows[0].usd_micros,
+                Some(0),
+                "free is a measured zero here, never an unpriced guess"
+            );
+
+            let envelope = sub.try_recv().expect("exactly one web_lookup");
+            assert_eq!(envelope.session_id, Some(session));
+            match envelope.event {
+                Event::WebLookup(lookup) => {
+                    assert_eq!(lookup.host, "search.example");
+                    assert_eq!(lookup.outcome, WebLookupOutcome::Completed);
+                    assert_eq!(lookup.bytes_in, 4_096);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(sub.try_recv().is_none(), "and exactly one event");
+        }
+
+        /// Every refusal is recorded too (BR-7: the free ones as well), and the
+        /// row count is the attempt count.
+        #[test]
+        fn every_outcome_is_recorded_including_the_ones_that_sent_nothing() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let recorder = runtime.lookup_recorder(&events);
+            let session = SessionId::from("sess-1");
+
+            for outcome in WebLookupOutcome::ALL {
+                recorder.web_lookup(
+                    &session,
+                    &LookupRecord {
+                        kind: WebLookupKind::Fetch,
+                        host: "docs.rs".to_owned(),
+                        outcome,
+                        bytes_in: 0,
+                        duration_ms: 1,
+                    },
+                );
+            }
+
+            let rows = runtime.ledger.all_web_lookups().expect("read the ledger");
+            assert_eq!(rows.len(), WebLookupOutcome::ALL.len());
+            for (row, outcome) in rows.iter().zip(WebLookupOutcome::ALL) {
+                assert_eq!(row.outcome, outcome);
+            }
+        }
+
+        // -- assembly --------------------------------------------------------
+
+        /// The lookup choke point builds, carries a recorder, and carries the
+        /// search gate exactly when the tier says so.
+        #[test]
+        fn the_lookup_choke_point_carries_the_recorder_and_the_tier_s_gate() {
+            for tier in WebTier::ALL {
+                let runtime = runtime_with(tier, false);
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router = router_for(&runtime);
+                let events = Arc::new(EventBus::new());
+                let egress = runtime
+                    .web_lookup_egress(&router, &config, &events, &SessionId::from("s"))
+                    .expect("the lookup choke point must build");
+                let (provider_gate, search_gate, recorder) = egress.installed();
+                assert!(recorder, "every lookup has to be accountable (BR-7)");
+                assert_eq!(search_gate, tier == WebTier::Search);
+                assert!(
+                    !provider_gate,
+                    "the provider gate has no business on the lookup path"
                 );
             }
         }

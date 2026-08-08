@@ -958,6 +958,7 @@ pub(crate) mod testing {
                 .expect("capture poisoned")
                 .push(request.body);
             Ok(TransportResponse {
+                location: None,
                 status: 200,
                 body: Box::pin(stream::empty()),
             })
@@ -1442,7 +1443,11 @@ mod tests {
                 let first: Result<Vec<u8>, TransportError> = Ok(b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":900,\"output_tokens\":1}}}\n\n".to_vec());
                 let body: ByteStream =
                     Box::pin(futures::stream::iter(vec![first]).chain(futures::stream::pending()));
-                Ok(TransportResponse { status: 200, body })
+                Ok(TransportResponse {
+                    status: 200,
+                    location: None,
+                    body,
+                })
             }
         }
 
