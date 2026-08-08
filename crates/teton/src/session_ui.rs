@@ -617,8 +617,13 @@ mod tests {
                     phase,
                     provider_id: ProviderId::from("local"),
                     model: Some("qwen2.5-coder-7b".to_owned()),
-                    reason: "session previously touched local-only content; pinned to the \
-                             local tier (BR-1 backstop)"
+                    // The daemon's own `taint_pin_reason` sentence, verbatim. It
+                    // names no specific cause since REQ-562 — the pin has three
+                    // sources and only one of them is boundary content — and
+                    // this renderer keys on the absent category/tier rather than
+                    // on the wording, which is what the assertions below check.
+                    reason: "an earlier privacy decision in this session; this turn is \
+                             pinned to the local tier (BR-1 backstop)"
                         .to_owned(),
                 })),
                 &mut surface,

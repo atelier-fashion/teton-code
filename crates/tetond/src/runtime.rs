@@ -107,7 +107,7 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction, SessionTitled,
+    BlockCause, Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction, SessionTitled,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -563,6 +563,18 @@ impl SessionTaint {
 /// at the end of the turn, which compaction and truncation are both entitled to
 /// change — and it is exactly the almost-true invariant a later change builds
 /// on.
+///
+/// ## Not every block establishes anything about the content (REQ-562)
+///
+/// The marking is gated on the cause. A boundary block and a redaction finding
+/// each mean *this content crossed a line*, which is exactly what REQ-544 C-2's
+/// pin is for. A [`BlockCause::ScanUnavailable`] means the scanner was busy,
+/// stalled, or not loaded — it says **nothing** about the payload, because
+/// nothing looked at it. Pinning on it would let one 120-second engine stall
+/// permanently route the rest of a session to the local tier, on the strength
+/// of a fact nobody established. The payload itself is still refused, which is
+/// BR-3's fail-closed posture; what does not follow is the session-wide
+/// consequence.
 struct TaintingPrivacySink {
     events: Arc<EventBus>,
     taint: Arc<SessionTaint>,
@@ -575,9 +587,49 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
         block: teton_protocol::events::PrivacyBlock,
     ) {
         if let Some(session_id) = &session_id {
-            self.taint.mark(session_id);
+            if cause_taints_the_session(&block.cause) {
+                self.taint.mark(session_id);
+            }
         }
         self.events.privacy_block(session_id, block);
+    }
+}
+
+/// Whether a block at the choke point establishes that content crossed a
+/// privacy line, and therefore pins the session local (REQ-544 C-2, REQ-562).
+///
+/// Two of the three do. `Boundary` is C-2's original case: the turn's content
+/// came from a `local-only` source, so a later paraphrase of it must not leave
+/// either. `Redaction` is the same shape one layer in — the scan *found*
+/// something in the outbound payload, and the model that produced it can
+/// restate it next turn.
+///
+/// `ScanUnavailable` does not, and the asymmetry is the point. It means no scan
+/// happened: no local tier, an over-cap payload, an engine error, a deadline.
+/// "The scanner was busy" establishes nothing whatever about the content, and a
+/// taint is a **durable, session-wide** consequence — a transient stall would
+/// permanently pin every remaining turn to the local tier and there is no way
+/// for the user to undo it short of a new session. The payload is still
+/// blocked; that is the fail-closed part, and it is per-payload.
+fn cause_taints_the_session(cause: &BlockCause) -> bool {
+    match cause {
+        BlockCause::Boundary | BlockCause::Redaction { .. } => true,
+        BlockCause::ScanUnavailable => false,
+    }
+}
+
+/// The same rule as [`cause_taints_the_session`], in the vocabulary the turn
+/// path has.
+///
+/// The turn path never sees a [`BlockCause`] — the cause reaches it as a
+/// [`BlockDetail`] through the `teton-providers` seam — so the rule is stated
+/// twice in two type systems and `the_two_taint_gates_agree_cause_for_cause`
+/// pins them to each other. One spelling would mean a `BlockCause` dependency
+/// in `teton-providers`, which is the edge that crate exists without.
+fn taints_the_session(detail: BlockDetail) -> bool {
+    match detail {
+        BlockDetail::Boundary | BlockDetail::Redaction => true,
+        BlockDetail::ScanUnavailable => false,
     }
 }
 
@@ -1704,7 +1756,9 @@ impl DaemonRuntime {
                 // Read as one value rather than asked twice — a block with no
                 // detail is not a block (see `HarnessError::privacy_block_detail`).
                 if let Some(detail) = err.privacy_block_detail() {
-                    self.session_taint.mark(&session_id);
+                    if taints_the_session(detail) {
+                        self.session_taint.mark(&session_id);
+                    }
                     if !self.engine.present() {
                         return Err(RpcError::new(
                             error_code::PRIVACY_BLOCKED,
@@ -4360,9 +4414,27 @@ fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) ->
 /// `what` is a noun phrase naming the thing being pinned. It is prose, not an
 /// identifier: the sentence is read by a person deciding whether the daemon did
 /// something surprising.
+///
+/// ## Why the cause is generic (REQ-562)
+///
+/// It used to read *"session previously touched local-only content"*, which was
+/// true when [`SessionTaint`] had one source. It now has three: a turn whose
+/// context intersects a boundary ([`context_is_sensitive`]), a turn refused at
+/// the choke point, and a **duty** refused there
+/// ([`TaintingPrivacySink`]) — and the last two include REQ-562's redaction
+/// blocks, where no boundary was touched and no local-only file was read. A
+/// user told they touched local-only content goes looking for a `local-only`
+/// glob that does not exist.
+///
+/// So the clause names what is actually common to every source — an earlier
+/// privacy decision in this session — rather than the one source it originally
+/// had. The alternative, threading the cause through `SessionTaint` so the
+/// sentence could name it exactly, is a per-session reason store bought for one
+/// clause; this is the smaller honest change, and the block that caused the
+/// taint already reported itself precisely on its own surfaces.
 fn taint_pin_reason(what: &str) -> String {
     format!(
-        "session previously touched local-only content; {what} is pinned to the local tier \
+        "an earlier privacy decision in this session; {what} is pinned to the local tier \
          (BR-1 backstop)"
     )
 }
@@ -6466,7 +6538,7 @@ provider_id = "on-device"
         // The shared half: the cause, and the rule it comes from.
         for sentence in [&turn, &duty] {
             assert!(
-                sentence.contains("previously touched local-only content"),
+                sentence.contains("an earlier privacy decision in this session"),
                 "the sentence must name the CAUSE: {sentence}"
             );
             assert!(
@@ -6474,6 +6546,16 @@ provider_id = "on-device"
                 "and what was done about it: {sentence}"
             );
             assert!(sentence.contains("BR-1 backstop"), "{sentence}");
+            // **REQ-562: and it must not name a cause it cannot know.** The pin
+            // is now reachable from a redaction block, where no `local-only`
+            // file was read and no boundary was crossed. The wording this
+            // replaced said "session previously touched local-only content",
+            // which sent that user hunting for a glob that does not exist.
+            assert!(
+                !sentence.contains("local-only"),
+                "the pin has three sources and only one of them is boundary \
+                 content; the sentence may not claim that one: {sentence}"
+            );
         }
 
         // The differing half: each names its own subject, so a user reading the
@@ -8079,6 +8161,109 @@ provider_id = "on-device"
                 "non-vacuity: a scoped block really does pin"
             );
             assert!(!taint.is_tainted(&SessionId::from("somebody-else")));
+        }
+
+        // -- which causes pin, and which do not (REQ-562) --------------------
+
+        /// **A scan that could not run establishes nothing, so it pins
+        /// nothing** (REQ-544 C-2 × REQ-562 BR-3).
+        ///
+        /// The taint is a *durable, session-wide* consequence: every remaining
+        /// turn goes to the local tier and the user has no way to undo it short
+        /// of a new session. C-2's justification for that is that content
+        /// **crossed a boundary** and the model may restate it later. A
+        /// `ScanUnavailable` block carries no such fact — no local tier, an
+        /// over-cap payload, an engine error, a 120-second deadline — nothing
+        /// looked at the payload, so nothing is known about it. Pinning on it
+        /// lets one transient stall silently downgrade the rest of a session.
+        ///
+        /// The payload is still refused either way; that is BR-3's fail-closed
+        /// posture and it is per-payload.
+        ///
+        /// All three causes are driven through the same sink, in the same test,
+        /// so the two that pin are the discrimination for the one that does not
+        /// (LESSON-485).
+        #[test]
+        fn a_scan_unavailable_block_refuses_the_payload_without_pinning_the_session() {
+            fn pinned_by(cause: BlockCause) -> bool {
+                let taint = Arc::new(SessionTaint::new());
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let sink = TaintingPrivacySink {
+                    events: bus,
+                    taint: Arc::clone(&taint),
+                };
+                let session = SessionId::from("s");
+                crate::egress::PrivacyEventSink::privacy_block(
+                    &sink,
+                    Some(session.clone()),
+                    teton_protocol::events::PrivacyBlock {
+                        path: "the outbound payload".to_owned(),
+                        provider_id: ProviderId::from("frontier"),
+                        action: teton_protocol::events::PrivacyAction::ReroutedToLocal,
+                        cause,
+                    },
+                );
+                // Whatever the cause, the block is still announced — the pin is
+                // a *consequence* of a report, never a replacement for one.
+                assert!(
+                    std::iter::from_fn(|| sub.try_recv())
+                        .any(|env| matches!(env.event, Event::PrivacyBlock(_))),
+                    "{cause:?}: the authoritative privacy_block must still fire"
+                );
+                taint.is_tainted(&session)
+            }
+
+            assert!(
+                pinned_by(BlockCause::Boundary),
+                "content came from a local-only source: C-2's original case"
+            );
+            assert!(
+                pinned_by(BlockCause::Redaction {
+                    kind: teton_protocol::events::FindingKind::Credential,
+                    span: teton_protocol::events::ByteSpan { start: 10, end: 30 },
+                }),
+                "the scan FOUND something, and the model can restate it next turn"
+            );
+            assert!(
+                !pinned_by(BlockCause::ScanUnavailable),
+                "a scan that never ran established nothing about the payload, so it \
+                 must not pin the whole session to the local tier"
+            );
+        }
+
+        /// The turn path's taint gate and the sink's are the same rule written
+        /// in two type systems, and they must agree cause for cause.
+        ///
+        /// The turn path never sees a [`BlockCause`] — the cause reaches it as a
+        /// [`BlockDetail`] across the `teton-providers` seam, which declares no
+        /// protocol dependency by design. So the rule exists twice, and this is
+        /// what stops the two copies drifting into a session that a *duty*
+        /// pinned and a *turn* did not.
+        #[test]
+        fn the_two_taint_gates_agree_cause_for_cause() {
+            let rows = [
+                (BlockCause::Boundary, BlockDetail::Boundary),
+                (
+                    BlockCause::Redaction {
+                        kind: teton_protocol::events::FindingKind::Pii,
+                        span: teton_protocol::events::ByteSpan { start: 0, end: 4 },
+                    },
+                    BlockDetail::Redaction,
+                ),
+                (BlockCause::ScanUnavailable, BlockDetail::ScanUnavailable),
+            ];
+            for (cause, detail) in rows {
+                assert_eq!(
+                    cause_taints_the_session(&cause),
+                    taints_the_session(detail),
+                    "the duty path and the turn path disagree about {cause:?}"
+                );
+            }
+            // Non-vacuity: the rule is not constant, so agreeing about
+            // everything is not agreeing about nothing.
+            assert!(taints_the_session(BlockDetail::Boundary));
+            assert!(!taints_the_session(BlockDetail::ScanUnavailable));
         }
 
         /// **AC-1, the direct regression, end to end through the daemon's own
@@ -10743,6 +10928,117 @@ provider_id = "on-device"
                     !err.message.contains("redaction scan"),
                     "an un-opted-in machine must not mention a scan: {}",
                     err.message
+                );
+            }
+
+            // -- what a block does to the SESSION (REQ-544 C-2 × BR-3) -------
+
+            /// **A scan that could not run refuses the payload and leaves the
+            /// session alone.**
+            ///
+            /// This is the turn path's half of the rule the sink test states
+            /// (`a_scan_unavailable_block_refuses_the_payload_without_pinning_the_session`),
+            /// driven through `run_prompt_turn` so the gate really is the thing
+            /// deciding.
+            ///
+            /// Why it matters here specifically: with `redact = true` and no
+            /// local tier, **every** remote turn is `ScanUnavailable`. If that
+            /// pinned the session, a machine in the configuration this daemon
+            /// most expects — remote-only, switch on — would taint itself on its
+            /// first turn and stay tainted, and a user whose engine finished
+            /// downloading thirty seconds later would still be routed local for
+            /// the rest of the session. The block is per-payload; the taint is
+            /// forever.
+            #[tokio::test]
+            async fn a_scan_unavailable_turn_does_not_pin_the_session() {
+                let runtime = Arc::new(runtime_without_an_engine(offline_endpoints(opted_in(
+                    config(),
+                ))));
+                runtime.local_available.store(false, Ordering::SeqCst);
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let err = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        "please summarize src/main.rs for me".to_owned(),
+                    )
+                    .await
+                    .expect_err("a scan that cannot run must fail the turn closed");
+
+                // Non-vacuity: this really was the scan-unavailable block and
+                // not some other failure that never reached the taint arm.
+                assert_eq!(err.code, error_code::PRIVACY_BLOCKED);
+                assert!(
+                    err.message.contains("the redaction scan could not run"),
+                    "{}",
+                    err.message
+                );
+                assert!(
+                    !runtime.session_taint.is_tainted(&session.session_id),
+                    "a transient scanner outage must not permanently pin the \
+                     session to the local tier"
+                );
+            }
+
+            /// The discriminating twin: a scan that **found** something does
+            /// pin, because that is C-2's case one layer in — the payload
+            /// carried a credential, and the model that wrote it can restate it
+            /// next turn.
+            ///
+            /// Same runtime shape as the test above, same entry point; what
+            /// changes is that an engine is loaded (so the scan runs) and the
+            /// prompt carries a pattern-shaped credential (so it finds one).
+            /// The config declares no boundaries, so `context_is_sensitive`
+            /// cannot be what marked it.
+            #[tokio::test]
+            async fn a_redaction_block_does_pin_the_session() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = Arc::new(runtime(
+                    offline_endpoints(opted_in(config())),
+                    &engine,
+                    true,
+                ));
+                assert!(
+                    runtime
+                        .config
+                        .lock()
+                        .expect("config mutex")
+                        .boundaries
+                        .is_empty(),
+                    "no boundaries, so `context_is_sensitive` cannot be what pins"
+                );
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let _ = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        "please summarize sk-ABCDEFGHIJKLMNOPQRSTUVWX for me".to_owned(),
+                    )
+                    .await;
+
+                assert!(
+                    runtime.session_taint.is_tainted(&session.session_id),
+                    "a payload the scan found a credential in must pin the session, \
+                     or the next turn is free to send the model's paraphrase of it \
+                     to the same provider"
                 );
             }
         }

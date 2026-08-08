@@ -143,6 +143,7 @@
 //! | `mcp_egress` stops installing the gate on the MCP choke point | `runtime::tests::dispatch::redact::an_mcp_tool_call_crosses_the_gate_when_redact_is_on`. **This was GREEN before that fixture existed** — the attachment lived inside `build_tools`, reachable only through `HttpTransport::new()` and a real socket, so deleting it left the whole suite passing. The transport is a parameter of `mcp_egress` now precisely so the construction is drivable from a test |
 //! | the forward path rebuilds the request from the scanned text instead of passing it through | `egress::tests::a_low_only_or_clean_verdict_forwards_the_exact_bytes`, `…::the_gate_reads_the_exact_bytes_that_would_go_on_the_wire` (AC-9) |
 //! | the gate hook is placed after `inner.execute`, or metering moves ahead of it | `egress::tests::a_blocked_send_bills_nothing_while_an_allowed_one_still_bills` |
+//! | either taint gate pins the session on `ScanUnavailable` (`=> true`) | `runtime::tests::dispatch::{a_scan_unavailable_block_refuses_the_payload_without_pinning_the_session, the_two_taint_gates_agree_cause_for_cause}` and `…::redact::a_scan_unavailable_turn_does_not_pin_the_session` — applied to a freshly built workspace, 694 passed / 3 failed, reverted. **The gates were added by TASK-072**: before them both sites pinned unconditionally, so a 120-second engine stall permanently routed the rest of the session local on the strength of a fact nobody established |
 //!
 //! ### REQ-562 AC-8 — the mutations, applied and observed (TASK-071, TASK-072)
 //!
