@@ -553,3 +553,98 @@ teton policy set-category redact deepseek           # must fail, naming the pin 
 ```
 
 **Status: NOT RUN.**
+
+---
+
+## REQ-562 — `redact`, a model call inside the egress choke point
+
+Everything REQ-562 claims is covered by automated tests except the leg below,
+which is the one the REQ's own BR-9 calls an acceptance criterion rather than a
+nice-to-have: **latency**.
+
+### Not automated: the redaction scan's latency on real weights (AC-7, BR-9, ADR-8)
+
+**What is uncovered.** The wall clock. `redact` is unlike every other duty in
+this daemon: REQ-558's classifier runs on freeform *judgment* turns only, and
+REQ-561's five duties are threshold-triggered, but this one is on the
+**synchronous send path of every remote call** once `[privacy] redact = true`.
+Every outbound request now waits for a complete local inference over the whole
+outbound body before a byte leaves. The spec says so in as many words — *"a
+stated budget and a measurement are acceptance criteria, not nice-to-haves"* —
+and its own Assumptions section names user tolerance for that latency as one of
+the three things most likely to be wrong.
+
+**The stated budget (ADR-8).** On real mid-tier weights, a scan of a payload at
+`REDACT_INPUT_MAX_BYTES` (64 KiB) completes in **p50 ≤ 2 s, p95 ≤ 5 s**. The
+duty seam's `DUTY_DEADLINE` (120 s) is the hard stop, and an overrun is
+`Unavailable` → **Block** (ADR-6) — a timed-out guard does not become a guard
+that passes everything, so a machine that misses the budget badly enough
+degrades into blocked turns rather than into unscanned ones. That is the failure
+mode a measurement is looking for.
+
+**Why there is no harness.** The same reason REQ-558's classifier gap has none,
+and more so. CI ships no weights: `tetond` is built without
+`--features tetond/llama`, and every automated fixture's local tier is a
+`ScriptedFileEngine` or a canned mock, which answers a 64 KiB scan from a string
+table in microseconds. A stand-in can prove the *call count*, the *cap*, and the
+*decision* — it does, exhaustively — but a wall-clock number measured against a
+string table would be a fabricated one.
+
+**The budget's provenance, stated so nobody mistakes it for an observation.**
+2 s / 5 s is a **design target**. It was sized from the input cap (64 KiB ≈ 32k
+tokens at the duty seam's 2-bytes-per-token convention) against a 3B model on
+Metal, and the output side is tiny (`REDACT_OUTPUT_MAX_BYTES` = 2 KiB, a
+sixteen-line contract). **Nobody has run it.**
+
+**What IS covered automatically, and how far it goes:**
+
+| Leg | Where | Strength |
+|---|---|---|
+| An over-cap payload costs **zero** model calls and blocks | `harness::redact::tests::an_over_cap_payload_is_unavailable_before_any_model_call`, `tests/redact_egress.rs::a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` | Full — by model-call count, not by elapsed time |
+| A deadline overrun is `Unavailable` → Block | `harness::redact::tests::a_scan_that_overruns_the_deadline_is_unavailable` | Full, on a **paused clock**. It pins the wiring, and says nothing about how long a real scan takes |
+| Off costs nothing at all — no gate, no call, no latency | `runtime::tests::dispatch::redact::off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine`, `egress::tests::off_means_zero_scanner_calls_and_on_means_exactly_one` | Full — by call count. This is what bounds the blast radius of the unmeasured budget: nobody who has not opted in pays it (OQ-3) |
+| The scan runs once per outbound payload, not more | `tests/redact_egress.rs::a_clean_payload_forwards_and_the_scan_provably_ran` | Full at the count; says nothing about elapsed time |
+
+**To close it by hand** (macOS/Apple Silicon, ~10 min, after a REQ-547 AC-13
+install has already put weights on disk):
+
+```sh
+cargo build --workspace --release --features tetond/llama
+# opt in — the switch is its own table, NOT a [[categories]] row (BR-10).
+# The daemon reads $TETON_CONFIG, else <base>/config.toml, where <base> is
+# $XDG_RUNTIME_DIR/teton or, on macOS, ~/Library/Application Support/teton.
+cat >> ~/"Library/Application Support/teton/config.toml" <<'EOF'
+[privacy]
+redact = true
+EOF
+./target/release/teton-code &
+./target/release/teton
+# in the session, with /verbose on, run TWENTY remote turns of two shapes:
+#   (1) a short prompt      — the everyday case
+#   (2) a prompt whose assembled context is at the 64 KiB cap — read several
+#       large files first, then ask a question; `/verbose` shows the context size
+```
+
+Record, for **each** shape: the wall-clock gap between submitting the prompt and
+the first token of the answer, over 20 runs, as p50 and p95. Then repeat the
+identical 20 runs with `redact = false` as the control. **The scan's cost is the
+difference**, not the absolute number — the remote call is in both.
+
+Check the result against ADR-8: p50 ≤ 2 s and p95 ≤ 5 s **at the cap**. Also
+record how often the scan came back `Unavailable` (a `privacy_block` with cause
+`scan_unavailable`, or a turn failing with *"the redaction scan could not
+run"*): at the cap on slow weights that is the deadline firing, and a
+fail-closed timeout is a worse user outcome than a slow one. A miss is a finding
+to record here, not a number to re-run until it looks acceptable — and the
+honest response to a miss is a smaller cap or a faster tier, never a partial
+scan that reports itself complete (BR-7).
+
+**Also worth recording while the weights are loaded** (it is the assumption the
+REQ says is most likely to be wrong, and this is the only place it can be
+observed): of the payloads the scan flagged, **how many did the model catch that
+the pattern pass did not** — the `Confidence::Low` findings. That question, not
+raw recall, is what tells you whether the model call earns its latency (OQ-2's
+recorded counter-argument). Plant a handful of paraphrased credentials that no
+pattern shape matches and see whether they are reported at all.
+
+**Status: NOT RUN.** No sign-off block below, because nobody has executed it.

@@ -126,9 +126,10 @@
 //!
 //! `redact` reaches this seam from the egress choke point rather than from the
 //! harness (ADR-1), so its rows are about the *wiring*, not about a call site
-//! inside a turn. The rows below are TASK-070's; the AC-8 mutation runs those
-//! rows are the documentation of belong to TASK-071, which owns the e2e matrix
-//! and applies them (this table is where it records what it observed).
+//! inside a turn. The rows immediately below are TASK-070's, written from the
+//! wiring as it was built; the four AC-8 mutations were **applied and observed**
+//! by TASK-071 and are recorded in their own table after them, one of them
+//! green.
 //!
 //! | Mutation | Fails |
 //! |---|---|
@@ -142,6 +143,50 @@
 //! | `build_duty_route` stops installing the gate on a remotely bound duty's choke point | [`tests::a_remote_duty_send_is_scanned_by_the_choke_points_gate`] (at the seam) |
 //! | the forward path rebuilds the request from the scanned text instead of passing it through | `egress::tests::a_low_only_or_clean_verdict_forwards_the_exact_bytes`, `…::the_gate_reads_the_exact_bytes_that_would_go_on_the_wire` (AC-9) |
 //! | the gate hook is placed after `inner.execute`, or metering moves ahead of it | `egress::tests::a_blocked_send_bills_nothing_while_an_allowed_one_still_bills` |
+//!
+//! ### REQ-562 AC-8 — the four mutations, applied and observed (TASK-071)
+//!
+//! Each was applied to a freshly built workspace (`cargo build --workspace`
+//! first — LESSON-489's sibling trap), run, and reverted. The diffs are recorded
+//! exactly, because a mutation nobody can reproduce is a claim rather than a
+//! check.
+//!
+//! | # | Mutation (exact diff) | Turns red |
+//! |---|---|---|
+//! | **(a)** permissive unavailable | `egress/redact.rs`, `decide`: `Outcome::Unavailable => EgressDecision::Block` → `=> EgressDecision::Forward` | **12 lib + 4 integration.** `egress::redact::tests::{confidence_drives_the_egress_decision, an_over_cap_payload_is_unavailable_and_blocks_never_forwards, an_over_cap_payload_carrying_a_credential_still_reports_could_not_scan}`, `egress::tests::an_unavailable_scan_blocks_the_send_and_says_it_could_not_run`, `harness::redact::tests::{an_unresolved_route_is_unavailable_not_clean, an_engine_failure_is_unavailable_not_clean, an_unreadable_answer_blocks_rather_than_passing_as_clean, an_over_cap_payload_is_unavailable_before_any_model_call, a_scan_that_overruns_the_deadline_is_unavailable}`, `runtime::tests::dispatch::redact::{a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan, a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote, a_scan_that_could_not_run_fails_the_turn_saying_so_not_blaming_a_boundary}`, and `tests/redact_egress.rs::{with_no_local_tier_the_payload_is_blocked_unscanned_and_nothing_claims_otherwise, a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call, a_remote_provider_squatting_the_local_id_never_receives_the_scan, an_engine_backed_local_tier_under_another_id_still_serves_the_scan}` |
+//! | **(b)** unbounded scan input (BR-7) | `egress/redact.rs`, `pattern_verdict`: delete the `if text.len() > REDACT_INPUT_MAX_BYTES { return RedactionVerdict::unavailable(); }` guard | **4 lib + 1 integration.** `egress::redact::tests::{an_over_cap_payload_is_unavailable_and_blocks_never_forwards, an_over_cap_payload_carrying_a_credential_still_reports_could_not_scan}`, `harness::redact::tests::{an_over_cap_payload_is_unavailable_before_any_model_call, an_over_cap_payload_carrying_a_credential_still_says_the_scan_could_not_run}`, `tests/redact_egress.rs::a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` |
+//! | **(c)** a finding carries its matched text, threaded to the event | `egress/redact.rs`: `Finding` gains `text: String` (both constructors init `String::new()`) plus `fn carrying(self, &str) -> Self` and `fn text(&self) -> &str`; `pattern_pass` maps `Finding::pattern(..).carrying(&text[span])`; `harness/redact.rs`'s `read_findings` maps `Finding::model(..).carrying(&payload[span])`; `egress/mod.rs`'s gate arm builds `path` as `format!("{} ({})", redaction_locus(cause), finding.text())` | **2 lib + 2 integration.** `egress::redact::tests::a_finding_never_carries_the_matched_text` (the derived `Debug` starts rendering the secret), `egress::tests::a_high_confidence_finding_blocks_with_its_kind_span_and_locus`, `tests/redact_egress.rs::{no_emitted_surface_carries_the_sentinel, a_planted_credential_with_clean_provenance_is_blocked_and_the_event_names_redaction}`. **`teton_protocol::events::tests::a_redaction_cause_carries_only_a_kind_and_a_span` stays green** and it is right to: that test guards `BlockCause::Redaction`'s key set, and this variant of the mutation rides the text on `PrivacyBlock.path`, which is a `String` either way. The wire-key-set test covers the *other* variant (a new field on the cause); the sentinel sweep covers this one. Both are needed. |
+//! | **(d)** an id-based locality assertion, restored (BR-2) | two placements, see below | **one red, one GREEN** |
+//!
+//! **(d) is the interesting one, and half of it came back green.** The mutation
+//! has two plausible homes and they are not equally covered:
+//!
+//! - **In `harness::redact::scan`** — `if route.provider() != Some("local") {
+//!   return RedactionVerdict::unavailable(); }` after the unresolved check.
+//!   **RED**: `tests/redact_egress.rs::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`
+//!   and `harness::redact::tests::a_scan_that_overruns_the_deadline_is_unavailable`.
+//! - **In `runtime::RedactionGateImpl::redact_route`** — the same comparison
+//!   between the resolve and the engine-slot read. **GREEN. Nothing turns red.**
+//!   Reported rather than fixed (LESSON-485): see the note below.
+//!
+//! ## The green mutation: no fixture drives `redact_route` off the canonical id
+//!
+//! `local_tier_id` returns the id of any provider declaring `kind = "local"`,
+//! which is very often *not* the string `local` — a user who writes
+//! `id = "on-device"` has a genuinely engine-backed tier under another name. An
+//! id comparison inside `RedactionGateImpl::redact_route` would fail that
+//! machine's scan closed, and every one of its remote turns with it, and the
+//! suite would not notice: every `runtime::tests::dispatch::redact` fixture
+//! builds its router from a config whose local tier is the canonical id, so the
+//! guard can never fire in a test.
+//!
+//! `tests/redact_egress.rs::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`
+//! covers the same property one layer down — it resolves `Category::Redact`
+//! through a real `Router` whose `local_provider_id` is `on-device` and drives
+//! the real `scan` — but `RedactionGateImpl` is private to this crate, so an
+//! integration test cannot reach the daemon's own copy of the resolver. Closing
+//! it needs a `runtime.rs` fixture with a non-canonical local tier; it is left
+//! open and named here on purpose, because the finding *is* the fixture.
 //!
 //! ## What draining past the ceiling buys, and why it is still done
 //!
