@@ -10205,6 +10205,107 @@ provider_id = "on-device"
                 assert_eq!(engine.calls(), 1);
             }
 
+            /// **AC-4's "no locality guard was added" leg, at the daemon's own
+            /// resolver** (BR-2, LESSON-484, LESSON-443).
+            ///
+            /// The squat test above is the same coin's other face. There, a
+            /// *remote* provider holding the canonical id `local` leaves the pin
+            /// with nothing to name. Here, a genuinely engine-backed tier holds
+            /// an id that is **not** `local` — `[[providers]] id = "on-device",
+            /// kind = "local"` is an ordinary thing for a user to write — and
+            /// the pin must resolve to it and serve.
+            ///
+            /// An id comparison anywhere on this path
+            /// (`if provider_id != LOCAL_PROVIDER_ID { … }`) would fail this
+            /// machine's scan closed, and with the gate on the synchronous send
+            /// path, every one of its remote turns with it. So this test's
+            /// *success* is the discriminating evidence that no such guard
+            /// exists (LESSON-485), asserted behaviourally rather than by
+            /// grepping the source for a comparison (LESSON-489/BUG-159).
+            ///
+            /// ## Why it exists: a mutation that came back green
+            ///
+            /// TASK-071's AC-8 run applied exactly that guard to
+            /// `RedactionGateImpl`'s resolver and **nothing turned red** — every
+            /// fixture in this module built its router from a config whose local
+            /// tier carried the canonical id, so the guard could never fire. The
+            /// integration suite covered the property one layer down
+            /// (`tests/redact_egress.rs::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`,
+            /// over a real `Router` and the real `scan`) but could not reach this
+            /// crate-private resolver. This is the fixture that closes it; the
+            /// green observation is kept in `harness::duty`'s mutation table
+            /// because it is the reason the fixture is here.
+            #[tokio::test]
+            async fn an_engine_backed_local_tier_under_another_id_still_serves_the_scan() {
+                /// A `[[providers]]` entry that is genuinely the on-device tier.
+                fn declared_local(id: &str) -> ModelProvider {
+                    ModelProvider {
+                        id: id.to_owned(),
+                        kind: ProviderKind::Local,
+                        endpoint: None,
+                        model: None,
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities::default(),
+                    }
+                }
+
+                const NON_CANONICAL: &str = "on-device";
+                assert_ne!(
+                    NON_CANONICAL, LOCAL_PROVIDER_ID,
+                    "the fixture's whole point is a local tier under some other name"
+                );
+
+                let engine = CountingEngine::answering("NONE");
+                let mut config = opted_in(config());
+                config.providers.push(declared_local(NON_CANONICAL));
+                let runtime = runtime(config, &engine, true);
+                let session = SessionId::from("sess");
+
+                // The premise: `local_tier_id` names the declared tier, so the
+                // pin resolves to an id that is not the canonical one.
+                assert_eq!(
+                    router_for(&runtime)
+                        .resolve(Category::Redact)
+                        .provider_id
+                        .as_ref()
+                        .map(|p| p.0.as_str()),
+                    Some(NON_CANONICAL),
+                    "the pin must name the declared tier, or this fixture is not \
+                     the one the AC asks for"
+                );
+
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let verdict = gate_on(&runtime, &bus, &session)
+                    .expect("the privacy switch is on")
+                    .scan("ordinary prose")
+                    .await;
+
+                // The claim: it served. Not `Unavailable`, which is what an id
+                // comparison would have produced.
+                assert_eq!(
+                    verdict.outcome(),
+                    Outcome::Clean,
+                    "a local tier under a non-canonical id must still serve the scan"
+                );
+                assert!(verdict.scanned(), "and it really did scan");
+                assert_eq!(decide(&verdict), EgressDecision::Forward);
+                assert_eq!(
+                    engine.calls(),
+                    1,
+                    "on this machine's own engine, exactly once"
+                );
+
+                // And it announced the route under that tier's own name, so the
+                // provider the scan ran on is observable rather than inferred.
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Redact,
+                    ProtoTier::Reflex,
+                    NON_CANONICAL,
+                );
+            }
+
             // -- what it finds -----------------------------------------------
 
             /// The gate end to end: a planted credential blocks, and the *same*

@@ -143,7 +143,7 @@ No new RPCs.
 - [x] AC-3: With no local tier, the BR-3 posture chosen in OQ-1 holds, asserted by
       captured bytes **and** by `scanned: false` in the report. No configuration
       makes the scan appear to have run when it did not.
-- [ ] AC-4: `redact` cannot be bound by any path — config file, `policy
+- [x] AC-4: `redact` cannot be bound by any path — config file, `policy
       set-category`, `config/set` RPC, tier inheritance, or migration (BR-2).
       Inherited from REQ-558; re-asserted here because this REQ is the one that
       gives the pin consequences. A test also asserts **no locality guard was

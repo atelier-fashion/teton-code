@@ -31,7 +31,7 @@ latency procedure in docs/manual-verification.md.
 - [x] AC-3: `[privacy] redact = true` with no local tier (llama feature absent / engine unavailable): blocked, captured bytes show nothing sent, cause is ScanUnavailable, and no surface claims `scanned: true`.
 - [x] AC-5: a remote-kind provider registered under the id `local` with redact enabled — the scan never dispatches over HTTP: captured transport records zero scan-originated requests (asserted by capture, not id comparison).
 - [x] AC-12: a tainted session's turn produces zero scanner calls (call count), because the turn never reaches remote egress.
-- [ ] AC-4's "no locality guard was added" leg, asserted behaviorally (NOT by a src-text grep — LESSON-489): with a genuinely engine-backed local provider registered under a NON-`local` id, the redact scan still runs and serves. An id-comparison guard would wrongly refuse this fixture; its success is the discriminating evidence the guard does not exist (LESSON-485).
+- [x] AC-4's "no locality guard was added" leg, asserted behaviorally (NOT by a src-text grep — LESSON-489): with a genuinely engine-backed local provider registered under a NON-`local` id, the redact scan still runs and serves. An id-comparison guard would wrongly refuse this fixture; its success is the discriminating evidence the guard does not exist (LESSON-485).
 - [x] AC-6: a distinctive sentinel (e.g. `AKIA_SENTINEL_562_…` shaped to trip the pattern pass) planted; serialize every captured event, daemon log output, and returned error from the run; grep finds zero occurrences of the sentinel outside the payload itself.
 - [x] AC-9: for both Clean-forward and Low-only-forward, captured outbound bytes are byte-for-byte identical to the assembled request.
 - [x] AC-8 mutations, each run with the workspace freshly built (LESSON-489): (a) `decide`'s Unavailable arm → Forward; (b) input cap removed; (c) a text field added to `Finding` and threaded to the event; (d) an id-based locality assertion replacing the capture assertion in AC-5's test. Each names the test that goes red in the duty.rs mutation table; a green mutation is REPORTED in the task completion note, not quietly fixed.
@@ -76,7 +76,7 @@ requirement.md ticks.
 | AC-3 (no local tier) | `with_no_local_tier_the_payload_is_blocked_unscanned_and_nothing_claims_otherwise` |
 | AC-3 (BR-7's cap) | `a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` |
 | AC-5 | `a_remote_provider_squatting_the_local_id_never_receives_the_scan` |
-| AC-4 (no-guard leg, partial — see below) | `an_engine_backed_local_tier_under_another_id_still_serves_the_scan` |
+| AC-4 (no-guard leg) | `an_engine_backed_local_tier_under_another_id_still_serves_the_scan`, paired with the same-named fixture in `runtime::tests::dispatch::redact` for the daemon's own resolver |
 | AC-12 | `a_turn_pinned_to_the_local_tier_costs_zero_scanner_calls` |
 | AC-6 | `no_emitted_surface_carries_the_sentinel` |
 
@@ -89,8 +89,10 @@ unresolved). Everything downstream of `local_provider_id` is real. What sits
 value from a config — which is pinned by
 `runtime::tests::the_local_tier_id_is_never_a_registered_remote_providers_id` and
 `…dispatch::redact::a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote`.
-That boundary is what makes the green mutation below possible, and it is stated
-in the file's module docs rather than left for a reader to discover.
+That boundary is what made the green mutation below possible, and it is stated in
+the file's module docs rather than left for a reader to discover. The daemon's
+own resolver now has its own fixture in `runtime::tests::dispatch::redact`, so
+the two layers are covered by two tests rather than by one test and a copy.
 
 ### AC-8 — the four mutations, applied and observed
 
@@ -103,7 +105,7 @@ freshly built workspace (LESSON-489).
 | (a) | `decide`: `Unavailable => Block` → `=> Forward` | **RED** — 12 lib tests + 4 in `redact_egress.rs` |
 | (b) | `pattern_verdict`: the `REDACT_INPUT_MAX_BYTES` guard deleted | **RED** — 4 lib tests + 1 in `redact_egress.rs` |
 | (c) | `Finding` gains `text: String`, populated by both passes and threaded onto the emitted `PrivacyBlock.path` | **RED** — `egress::redact::tests::a_finding_never_carries_the_matched_text`, `egress::tests::a_high_confidence_finding_blocks_with_its_kind_span_and_locus`, and 2 in `redact_egress.rs` including the sentinel sweep |
-| (d) | an id-based locality assertion, restored | **one RED, one GREEN** — see below |
+| (d) | an id-based locality assertion, restored | **RED at both layers** — green at the runtime layer on the first run, then closed by a fixture; see below |
 
 **Mutation (c)'s coverage boundary, stated because it matters.** The TASK-068
 wire-key-set test (`teton_protocol::events::tests::a_redaction_cause_carries_only_a_kind_and_a_span`)
@@ -113,9 +115,16 @@ is a `String` either way. The wire-key-set test catches the *other* spelling of
 (c) (a new field on the cause); the AC-6 sentinel sweep catches this one. Neither
 subsumes the other.
 
-### GREEN MUTATION — reported, not fixed (LESSON-485)
+### A GREEN MUTATION, reported first and then closed by a fixture
 
-**(d), placed in `runtime::RedactionGateImpl::redact_route`, turns nothing red.**
+**Status: closed.** Reported at the end of the first pass, then closed in a
+follow-up commit by the fixture it identified — in that order, and the green
+observation is kept here and in `harness/duty.rs` rather than deleted, because a
+mutation table that only records reds cannot show which of its rows were ever
+load-bearing.
+
+**What was observed (first pass).** (d), placed in
+`runtime::RedactionGateImpl::redact_route`, turned **nothing** red.
 
 ```rust
 // between the resolve and the engine-slot read:
@@ -146,11 +155,25 @@ whose `local_provider_id` is `on-device` and the real `scan` — but not against
 the daemon's own private copy of the resolver, which an integration test cannot
 reach.
 
-**AC-4 is therefore left UNTICKED** in requirement.md and in this task's own AC
-list. Closing it needs a `runtime.rs` fixture with a non-canonical local tier
-(one config, one assertion). It is deliberately not added here: the finding is
-the fixture, and a quietly-closed hole teaches nobody that the daemon resolver
-had no non-canonical fixture at all.
+**How it was closed.**
+`runtime::tests::dispatch::redact::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`
+— one config (`[[providers]] id = "on-device", kind = "local"`, pushed onto the
+opted-in fixture config) and the assertions that the pin resolves to that id,
+that the scan **serves** (`Outcome::Clean`, `scanned: true`, `decide → Forward`),
+that it ran on this machine's own engine exactly once, and that its
+`route_decided` names `on-device`. It sits beside
+`a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote`, which is the
+same coin's other face: a remote provider under the canonical id resolves to
+nothing; a genuine local tier under any id resolves and serves.
+
+**Re-run after the fixture landed** (freshly built workspace, identical diff):
+**RED** — `left: Unavailable, right: Clean` at the outcome assertion,
+`crates/tetond/src/runtime.rs:10292`. 684 passed / 1 failed, and that one is the
+new fixture. Reverted; the suite is green again.
+
+**AC-4 is therefore ticked.** Both placements of (d) are now covered: the
+integration suite for the `harness::redact::scan` layer, this fixture for the
+daemon's own resolver.
 
 ### AC-1's prose contradicts AC-10, and the architecture already adjudicated it
 
