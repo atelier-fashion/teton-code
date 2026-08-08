@@ -389,16 +389,31 @@ fn read_findings(answer: &str, payload: &str) -> Result<Vec<Finding>, &'static s
         // finding whatever it opens with, so a leading `NONE` cannot swallow
         // it — the recall bug an "is it the sentinel?" test in front of this
         // one produces.
-        let Some((kind, quoted)) = read_finding_line(line) else {
+        let Some((kind, quoted, anchored)) = read_finding_line(line) else {
             if says_nothing_found(line) {
                 readable = true;
             }
             continue;
         };
-        readable = true;
         // A string the model reported but the payload does not contain is a
         // fabrication, and a fabrication with no span is not a finding.
-        if let Some(span) = locate(payload, quoted) {
+        let span = locate(payload, quoted);
+        // **What counts as "this parser understood the answer".** An anchored
+        // head — the kind word behind nothing but list decoration — is the
+        // contract's shape, and it is readable whether or not the quote turns
+        // out to be invented: the model answered in the form it was asked for.
+        //
+        // A *trailing* kind word is not. `analysis of the pii: none obvious` is
+        // prose that happens to contain a kind word and a colon, and reading it
+        // as a finding line flips a chatty no-finding answer from
+        // Unavailable → Block to Clean → **Forward** — the permissive direction
+        // BR-3 and LESSON-447 forbid. So a loose head has to earn it: the
+        // string it quoted must actually be in the payload, which is the one
+        // thing prose cannot fake.
+        if anchored || span.is_some() {
+            readable = true;
+        }
+        if let Some(span) = span {
             located.push(Finding::model(kind, span));
         }
     }
@@ -426,29 +441,66 @@ fn read_findings(answer: &str, payload: &str) -> Result<Vec<Finding>, &'static s
 /// forwards on the strength of an answer nobody understood, which is exactly
 /// what BR-3 and LESSON-447 forbid.
 ///
-/// So the line must carry no colon after the sentinel word. The contract uses
-/// `:` to introduce content, and an answer that found nothing has no content to
+/// So the line must carry **no colon at all**. The contract uses `:` to
+/// introduce content, and an answer that found nothing has no content to
 /// introduce; a line that does have some is an answer this parser could not
 /// read, which is `Unavailable` → Block, not `Clean`. Every decoration form the
 /// contract tolerates survives it, because none of them contains a colon.
+///
+/// The whole line, **including the sentinel token itself**. Checking only the
+/// words *after* the first one leaves `NONE: sk-…` invisible — the colon is
+/// glued to the sentinel, the token that carries it has already been consumed
+/// as the sentinel, and what remains looks like harmless decoration. That reads
+/// a colon-introduced list of secrets as a clean bill of health, which is the
+/// same permissive failure as the paragraph above with one space removed.
 fn says_nothing_found(line: &str) -> bool {
-    let mut words = line.split_whitespace();
-    let is_sentinel = words
+    let is_sentinel = line
+        .split_whitespace()
         .next()
         .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
         .is_some_and(|word| word.eq_ignore_ascii_case(NOTHING_FOUND));
-    is_sentinel && !words.any(|word| word.contains(':'))
+    is_sentinel && !line.contains(':')
 }
 
-/// Split one answer line into the kind it claims and the string it quoted.
+/// Split one answer line into the kind it claims, the string it quoted, and
+/// whether the kind word was **anchored** — i.e. whether everything in front of
+/// it was list decoration rather than prose ([`kind_is_anchored`]).
 ///
 /// `None` for any line that is not in the contract's shape — which is most of
 /// what a chatty model adds, and all of what a preamble looks like. A URL or a
 /// timestamp inside a quoted string cannot confuse the split: it happens at the
 /// **first** colon, and everything after it is the quote.
-fn read_finding_line(line: &str) -> Option<(FindingKind, &str)> {
+fn read_finding_line(line: &str) -> Option<(FindingKind, &str, bool)> {
     let (head, quoted) = line.split_once(':')?;
-    Some((read_kind(head)?, quoted))
+    Some((read_kind(head)?, quoted, kind_is_anchored(head)))
+}
+
+/// The markers a small model puts in front of a list item: digits and the
+/// punctuation it numbers or bullets with.
+///
+/// Deliberately a *closed* set of non-word bytes rather than "anything
+/// non-alphanumeric": the question [`kind_is_anchored`] answers is whether the
+/// head is decoration or **prose**, and a word is prose whatever punctuation
+/// surrounds it.
+fn is_list_decoration(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'(' | b')' | b'-' | b'*' | b'#'))
+}
+
+/// Whether the kind word [`read_kind`] found is the head's subject rather than
+/// its last word by accident.
+///
+/// `1. credential`, `- pii`, `* **PII**` and a bare `credential` are anchored:
+/// everything before the kind word is list decoration. `analysis of the pii` is
+/// not — the kind word is the tail of a sentence, and [`read_findings`] makes a
+/// line like that earn its readability by locating what it quoted.
+fn kind_is_anchored(head: &str) -> bool {
+    let words = head.split_whitespace().count();
+    head.split_whitespace()
+        .take(words.saturating_sub(1))
+        .all(is_list_decoration)
 }
 
 /// The [`FindingKind`] `head` names, ignoring case and the bullets, backticks,
@@ -461,10 +513,19 @@ fn read_finding_line(line: &str) -> Option<(FindingKind, &str)> {
 /// in it. Taking the **last** whitespace-separated word first handles `1.`,
 /// `(2)` and `- ` alike without a marker vocabulary to keep in step.
 ///
-/// Leniency here is cheap in the direction it errs: a head this reads too
-/// generously costs at most one `Confidence::Low` report on a string that must
-/// still be *found in the payload* (ADR-5), and a Low finding never blocks
-/// (BR-4).
+/// ## Leniency here is not free, which is why [`kind_is_anchored`] exists
+///
+/// Reading the *last* word widened this past list decoration and into prose:
+/// `analysis of the pii: none obvious` now names a kind. On its own that costs
+/// at most one `Confidence::Low` report on a string that must still be found in
+/// the payload (ADR-5), and a Low finding never blocks (BR-4). What it also did
+/// — and this is the part that mattered — was mark the whole answer *readable*,
+/// turning a chatty answer nobody could parse from `Unavailable` → Block into
+/// `Clean` → **Forward**.
+///
+/// So the generosity is kept and its cost is paid at the other end:
+/// [`read_findings`] counts a loose head toward readability only when the
+/// quoted string is really in the payload.
 fn read_kind(head: &str) -> Option<FindingKind> {
     let word = head
         .split_whitespace()
@@ -508,12 +569,20 @@ const MIN_QUOTE_BYTES: usize = 4;
 /// The offsets are `str::find`'s, so they are always char boundaries — a span
 /// derived here can slice the payload it came from, however multi-byte its
 /// content.
+///
+/// ## The sentinel is not a quote
+///
+/// `credential: none` is the model saying there is no credential, in the one
+/// word the contract gave it for exactly that. Located as a quote it would mint
+/// a span over whatever `none` a payload happens to contain — a report pointing
+/// at a word in the user's prose and calling it a credential. It is dropped
+/// like a fabrication, which leaves the line's kind read but its finding gone.
 fn locate(payload: &str, quoted: &str) -> Option<Range<usize>> {
     let quoted = quoted
         .trim()
         .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
         .trim();
-    if quoted.len() < MIN_QUOTE_BYTES {
+    if quoted.len() < MIN_QUOTE_BYTES || quoted.eq_ignore_ascii_case(NOTHING_FOUND) {
         return None;
     }
     let at = payload.find(quoted)?;
@@ -902,6 +971,93 @@ mod tests {
         for clean in ["NONE", "None.", "**NONE**", "NONE - nothing sensitive"] {
             assert_eq!(read_findings(clean, PAYLOAD), Ok(Vec::new()), "{clean:?}");
         }
+    }
+
+    /// **A colon glued to the sentinel is still a colon** — the round-1 hole in
+    /// the rule above.
+    ///
+    /// `NONE: sk-…` was invisible: the token carrying the colon *was* the
+    /// sentinel token, so a check that looked only at the words after it saw
+    /// nothing. The answer then read as a completed clean scan and the payload
+    /// forwarded — BR-3's direction, inverted by one space.
+    ///
+    /// Paired with its twin: the same sentinel with the same decoration and no
+    /// colon still reads clean, so this is the colon discriminating.
+    #[test]
+    fn a_sentinel_with_a_colon_glued_to_it_is_unreadable_not_clean() {
+        for glued in [
+            "NONE: sk-abcdefghijklmnopqrst",
+            "NONE:jane.doe@example.com",
+            "**NONE**: but see below",
+            "none: nothing except the key",
+        ] {
+            assert!(
+                read_findings(glued, PAYLOAD).is_err(),
+                "{glued:?} was read as a completed clean scan"
+            );
+        }
+        // The twin, one character apart: no colon, still the sentinel.
+        for clean in ["NONE", "**NONE**", "NONE - nothing sensitive"] {
+            assert_eq!(read_findings(clean, PAYLOAD), Ok(Vec::new()), "{clean:?}");
+        }
+    }
+
+    /// **Prose that happens to end in a kind word is not a finding line.**
+    ///
+    /// Reading the head's *last* word widened the parser past list decoration
+    /// and into sentences: `analysis of the pii: none obvious` names a kind, so
+    /// the whole answer was marked readable and a chatty no-finding reply
+    /// flipped from `Unavailable` → Block to `Clean` → **Forward**.
+    ///
+    /// A loose head now has to locate what it quoted. Three rows, and the
+    /// discrimination is in the last one: the same loose head, quoting a string
+    /// that really is in the payload, is a finding and is readable.
+    #[test]
+    fn a_kind_word_buried_in_prose_does_not_make_an_answer_readable() {
+        for chatty in [
+            "analysis of the pii: none obvious",
+            "my assessment of the credential: nothing conclusive",
+            "I checked for a secret: could not tell",
+        ] {
+            assert!(
+                read_findings(chatty, PAYLOAD).is_err(),
+                "{chatty:?} was read as a completed scan"
+            );
+        }
+
+        // The twin: the same shape of head, but the quote is really there.
+        let located = read_findings(&format!("my reading of the pii: {ADDRESS}"), PAYLOAD)
+            .expect("a loose head that locates its quote is a finding line");
+        assert_eq!(located.len(), 1, "{located:?}");
+        assert_eq!(*located[0].span(), span_of(PAYLOAD, ADDRESS));
+
+        // And an ANCHORED head is readable without locating anything, because
+        // answering in the contract's shape is itself the evidence the model
+        // understood the question.
+        assert_eq!(
+            read_findings("credential: hunter2-not-in-the-payload", PAYLOAD),
+            Ok(Vec::new())
+        );
+        assert!(kind_is_anchored("credential"));
+        assert!(kind_is_anchored("1. credential"));
+        assert!(!kind_is_anchored("analysis of the pii"));
+    }
+
+    /// **The sentinel word is not a quote to locate** — `credential: none` says
+    /// there is no credential, and locating `none` would mint a span over a
+    /// word in the user's own prose and call it one.
+    #[test]
+    fn the_sentinel_word_quoted_as_a_finding_mints_no_span() {
+        const PROSE: &str = "there is none of that in this file, it just calls the retry helper";
+        assert!(PROSE.contains("none"), "the fixture must contain the word");
+        assert_eq!(locate(PROSE, "none"), None);
+        assert_eq!(locate(PROSE, " \"NONE\" "), None);
+        // The twin: an ordinary four-byte quote in the same payload still
+        // locates, so this is the sentinel being refused and not the floor.
+        let at = PROSE.find("file").expect("the fixture contains it");
+        assert_eq!(locate(PROSE, "file"), Some(at..at + 4));
+        // Through the parser: the line is read, and reports nothing.
+        assert_eq!(read_findings("credential: none", PROSE), Ok(Vec::new()));
     }
 
     /// **A line that carries a finding is a finding, whatever it opens with.**
