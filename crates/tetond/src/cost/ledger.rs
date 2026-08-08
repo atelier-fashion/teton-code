@@ -5,13 +5,24 @@
 //! installs triggers that abort any `UPDATE` or `DELETE`, so the billing history
 //! is immutable by construction, and the only write path is [`CostLedger::record`].
 //!
+//! ## Two tables, one file (REQ-563 D-7)
+//!
+//! `cost_records` holds provider calls. `web_lookups` holds web lookups, in a
+//! **sibling** table rather than as overloaded provider rows: a lookup has no
+//! model, no token counts, and no provider id, and the columns it does have
+//! (host, bytes, duration, outcome) mean nothing on a model call. Folding the
+//! two would leave every row half-null and force every reader to know which half
+//! applied. They share the file, the append-only triggers, and the `/cost`
+//! aggregation.
+//!
 //! ## Privacy (BR-7)
 //!
 //! Every column is a token count or a piece of routing metadata — session id,
-//! phase, provider id, model name, input/output token counts, computed cost.
-//! There is deliberately **no column** that could carry prompt text, tool
-//! arguments, or a credential. A ledger row is safe to read, export, or ship in
-//! a report.
+//! phase, provider id, model name, input/output token counts, computed cost —
+//! or, on the lookup side, the destination **host** and the size of what came
+//! back. There is deliberately **no column** that could carry prompt text, tool
+//! arguments, a full URL, a search query, or a credential. A ledger row is safe
+//! to read, export, or ship in a report.
 //!
 //! ## Streamed-usage recording
 //!
@@ -39,7 +50,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures::Stream;
 use rusqlite::Connection;
 
-use teton_protocol::events::CostRecord;
+use teton_protocol::events::{CostRecord, WebLookupKind, WebLookupOutcome};
 use teton_protocol::{Category, Phase, ProviderId, SessionId};
 use teton_providers::transport::{ByteStream, TransportError, TransportResponse};
 
@@ -68,6 +79,24 @@ CREATE TRIGGER IF NOT EXISTS cost_records_no_update
 CREATE TRIGGER IF NOT EXISTS cost_records_no_delete
     BEFORE DELETE ON cost_records
     BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS web_lookups (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at_ms INTEGER NOT NULL,
+    session_id     TEXT    NOT NULL,
+    kind           TEXT    NOT NULL,
+    host           TEXT    NOT NULL,
+    bytes_in       INTEGER NOT NULL,
+    duration_ms    INTEGER NOT NULL,
+    outcome        TEXT    NOT NULL,
+    usd_micros     INTEGER
+);
+CREATE TRIGGER IF NOT EXISTS web_lookups_no_update
+    BEFORE UPDATE ON web_lookups
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS web_lookups_no_delete
+    BEFORE DELETE ON web_lookups
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
 ";
 
 /// Columns [`SCHEMA`] creates on a fresh ledger but an older build's file does
@@ -80,6 +109,11 @@ CREATE TRIGGER IF NOT EXISTS cost_records_no_delete
 /// and invent an attribution nobody recorded. Rows written before a column
 /// existed read back as `None`, which is the truth about them — they predate the
 /// concept.
+///
+/// A new *table* needs no entry here: `CREATE TABLE IF NOT EXISTS` in [`SCHEMA`]
+/// does reach an existing file, which is how REQ-563's `web_lookups` arrives on
+/// a `cost.db` written before it existed. Only a new column on a table that is
+/// already there is invisible to the schema batch.
 const ADDITIVE_COLUMNS: [(&str, &str); 1] = [(
     // REQ-558: the routing category the call was made for.
     "category",
@@ -152,6 +186,43 @@ impl LedgerRow {
             usd_micros: self.usd_micros.unwrap_or(0),
         }
     }
+}
+
+/// One row of the `web_lookups` table — a destination host and sizes, never an
+/// utterance (REQ-563 BR-7).
+///
+/// Recorded for **every** lookup attempt, whatever the outcome: BR-7 asks for
+/// the free ones too, and a ledger that held only the lookups that succeeded
+/// could not answer "what did this session try to reach". The blocked, refused
+/// and cache-hit endings are [`WebLookupOutcome`] values on the same row shape
+/// (architecture D-8), so the count of rows is the count of attempts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebLookupRow {
+    /// Session that performed the lookup.
+    pub session_id: String,
+    /// Fetch or search.
+    pub kind: WebLookupKind,
+    /// The destination **host** — never the scheme, path, query string, or a
+    /// credential. There is no column that could hold one.
+    pub host: String,
+    /// Bytes of content the lookup brought back; `0` for an ending that
+    /// transferred nothing.
+    pub bytes_in: u64,
+    /// Wall-clock duration of the attempt in milliseconds — including a refusal,
+    /// which is cheap and should look it.
+    pub duration_ms: u64,
+    /// How the lookup ended.
+    pub outcome: WebLookupOutcome,
+    /// Cost in integer micro-USD, or `None` when the backend is **unpriced**.
+    ///
+    /// Every lookup this build performs is genuinely free, so it records
+    /// `Some(0)`: zero is a measured fact here, not the guess REQ-557 BR-9
+    /// forbids. The column is nullable anyway so a later metered search backend
+    /// whose price is *unknown* has the same honest "no price" value the
+    /// provider table already uses — the distinction between free and unpriced
+    /// is one this ledger has learned to keep, and adding the column now means
+    /// no migration then (D-7).
+    pub usd_micros: Option<i64>,
 }
 
 /// The append-only cost ledger: a bundled-SQLite store plus the price table used
@@ -280,12 +351,87 @@ impl CostLedger {
         Ok(rows)
     }
 
+    /// Append one web-lookup row (REQ-563 BR-7).
+    ///
+    /// Storage only: unlike [`CostLedger::record`] this broadcasts nothing. The
+    /// `web_lookup` event is published by the lookup seam, which is the layer
+    /// that knows the session scope and has already decided the outcome; making
+    /// the store emit it would mean growing [`CostEventSink`] a method for an
+    /// event the store cannot fully describe, and would put one event on two
+    /// emitters.
+    ///
+    /// # Errors
+    /// [`LedgerError`] if the insert fails or the mutex is poisoned.
+    pub fn record_web_lookup(&self, row: &WebLookupRow) -> Result<(), LedgerError> {
+        let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
+        guard.execute(
+            "INSERT INTO web_lookups
+               (recorded_at_ms, session_id, kind, host, bytes_in, duration_ms,
+                outcome, usd_micros)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                now_ms(),
+                row.session_id,
+                web_kind_to_wire(row.kind),
+                row.host,
+                to_i64(row.bytes_in),
+                to_i64(row.duration_ms),
+                web_outcome_to_wire(row.outcome),
+                row.usd_micros,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every recorded web lookup, in insertion order.
+    ///
+    /// A row whose `kind` or `outcome` this build does not recognize is skipped
+    /// rather than guessed at — the same posture [`category_from_wire`] takes.
+    /// It cannot happen from a *newer* daemon writing the file (they share the
+    /// vocabulary), only from a hand-edited store, and inventing an outcome for
+    /// one would misreport what a session did.
+    ///
+    /// # Errors
+    /// [`LedgerError`] if the query fails or the mutex is poisoned.
+    pub fn all_web_lookups(&self) -> Result<Vec<WebLookupRow>, LedgerError> {
+        let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
+        let mut stmt = guard.prepare(
+            "SELECT session_id, kind, host, bytes_in, duration_ms, outcome, usd_micros
+             FROM web_lookups ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let kind: String = r.get(1)?;
+                let outcome: String = r.get(5)?;
+                Ok(
+                    match (web_kind_from_wire(&kind), web_outcome_from_wire(&outcome)) {
+                        (Some(kind), Some(outcome)) => Some(WebLookupRow {
+                            session_id: r.get(0)?,
+                            kind,
+                            host: r.get(2)?,
+                            bytes_in: to_u64(r.get::<_, i64>(3)?),
+                            duration_ms: to_u64(r.get::<_, i64>(4)?),
+                            outcome,
+                            usd_micros: r.get(6)?,
+                        }),
+                        _ => None,
+                    },
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().flatten().collect())
+    }
+
     /// Aggregate the whole ledger into an AC-4 [`CostReport`](super::CostReport).
     ///
     /// # Errors
     /// [`LedgerError`] if reading the rows fails.
     pub fn report(&self) -> Result<super::CostReport, LedgerError> {
-        Ok(super::report::aggregate(&self.all_records()?, &self.prices))
+        Ok(super::report::aggregate(
+            &self.all_records()?,
+            &self.all_web_lookups()?,
+            &self.prices,
+        ))
     }
 }
 
@@ -697,6 +843,59 @@ fn category_from_wire(s: &str) -> Option<Category> {
     })
 }
 
+/// The stored form of a lookup kind.
+///
+/// Hand-written rather than derived from serde for the reason the category pair
+/// above is: the column is a *storage* format that must stay readable by every
+/// future build, and a serde rename made for the wire would silently rewrite it.
+/// The two happen to agree today, and the sweep in the tests is what keeps them
+/// agreeing on purpose rather than by luck.
+fn web_kind_to_wire(kind: WebLookupKind) -> &'static str {
+    match kind {
+        WebLookupKind::Fetch => "fetch",
+        WebLookupKind::Search => "search",
+    }
+}
+
+/// Parse a lookup kind back from its stored form; unknown strings become `None`.
+fn web_kind_from_wire(s: &str) -> Option<WebLookupKind> {
+    Some(match s {
+        "fetch" => WebLookupKind::Fetch,
+        "search" => WebLookupKind::Search,
+        _ => return None,
+    })
+}
+
+/// The stored form of a lookup outcome (see [`web_kind_to_wire`]).
+fn web_outcome_to_wire(outcome: WebLookupOutcome) -> &'static str {
+    match outcome {
+        WebLookupOutcome::Completed => "completed",
+        WebLookupOutcome::CacheHit => "cache_hit",
+        WebLookupOutcome::BlockedPrivacy => "blocked_privacy",
+        WebLookupOutcome::BlockedRedact => "blocked_redact",
+        WebLookupOutcome::RefusedDomain => "refused_domain",
+        WebLookupOutcome::RefusedTier => "refused_tier",
+        WebLookupOutcome::TaintRestricted => "taint_restricted",
+        WebLookupOutcome::Offline => "offline",
+    }
+}
+
+/// Parse a lookup outcome back from its stored form; unknown strings become
+/// `None`.
+fn web_outcome_from_wire(s: &str) -> Option<WebLookupOutcome> {
+    Some(match s {
+        "completed" => WebLookupOutcome::Completed,
+        "cache_hit" => WebLookupOutcome::CacheHit,
+        "blocked_privacy" => WebLookupOutcome::BlockedPrivacy,
+        "blocked_redact" => WebLookupOutcome::BlockedRedact,
+        "refused_domain" => WebLookupOutcome::RefusedDomain,
+        "refused_tier" => WebLookupOutcome::RefusedTier,
+        "taint_restricted" => WebLookupOutcome::TaintRestricted,
+        "offline" => WebLookupOutcome::Offline,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,6 +1132,48 @@ CREATE TRIGGER cost_records_no_delete
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A `cost.db` written before `web_lookups` existed gains the table on the
+    /// next open, with its provider rows untouched.
+    ///
+    /// The additive-column machinery does not apply here and does not need to:
+    /// `CREATE TABLE IF NOT EXISTS` in [`SCHEMA`] *does* reach an existing file.
+    /// This pins that, because the alternative — a missing table discovered at
+    /// the first lookup, in a `/cost` query — is a failure a user meets rather
+    /// than a test does.
+    #[test]
+    fn a_ledger_written_before_web_lookups_gains_the_table_on_open() {
+        let path = scratch_db("pre-web");
+        let _ = std::fs::remove_file(&path);
+        {
+            let old = Connection::open(&path).expect("create pre-REQ-563 ledger");
+            old.execute_batch(PRE_REQ_SCHEMA).expect("pre-REQ schema");
+            old.execute(
+                "INSERT INTO cost_records
+                   (recorded_at_ms, session_id, phase, provider_id, model,
+                    input_tokens, output_tokens, usd_micros)
+                 VALUES (1, 'old-session', 'review', 'anthropic', 'claude-opus-4', 900, 100, 42)",
+                [],
+            )
+            .expect("historical row");
+        }
+
+        let sink = Arc::new(CapturingSink::default());
+        let ledger =
+            CostLedger::open(&path, PriceTable::bundled(), sink).expect("open pre-REQ-563 file");
+        assert!(
+            ledger.all_web_lookups().expect("read").is_empty(),
+            "a file that predates the table has no lookups, and that is not an error"
+        );
+        ledger
+            .record_web_lookup(&web_row("new-session", WebLookupOutcome::Completed, 512))
+            .expect("the new table accepts rows");
+        assert_eq!(ledger.all_web_lookups().expect("read").len(), 1);
+        // The historical provider row is untouched by the new table's arrival.
+        assert_eq!(ledger.all_records().expect("read").len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// REQ-558 ADR-G: `Phase::Freeform` is retired, so a historical row storing
     /// the literal `"freeform"` reads back as **no phase** and rolls up into the
     /// `none` bucket. That reattribution is a decision, so it is pinned by a
@@ -978,6 +1219,163 @@ CREATE TRIGGER cost_records_no_delete
         assert_eq!(rows.len(), 1, "the row is kept, not dropped");
         assert_eq!(rows[0].phase, None);
         assert_eq!(rows[0].usd_micros, Some(7), "its cost is still attributed");
+    }
+
+    /// A representative lookup row.
+    fn web_row(session: &str, outcome: WebLookupOutcome, bytes_in: u64) -> WebLookupRow {
+        WebLookupRow {
+            session_id: session.to_owned(),
+            kind: WebLookupKind::Fetch,
+            host: "docs.rs".to_owned(),
+            bytes_in,
+            duration_ms: 120,
+            outcome,
+            usd_micros: Some(0),
+        }
+    }
+
+    #[test]
+    fn a_web_lookup_records_and_reads_back_round_trips() {
+        let (ledger, sink) = ledger();
+        let row = web_row("sess-web", WebLookupOutcome::Completed, 4096);
+        ledger.record_web_lookup(&row).expect("record lookup");
+        assert_eq!(ledger.all_web_lookups().expect("read"), vec![row]);
+        // A lookup is not a model call: it lands in its own table and does not
+        // appear as a `cost_records` row or a `cost_recorded` event.
+        assert!(ledger.all_records().expect("read").is_empty());
+        assert!(sink.records.lock().unwrap().is_empty());
+    }
+
+    /// Every outcome survives the store → read-back round trip, swept from
+    /// [`WebLookupOutcome::ALL`] rather than a hand-kept list — an outcome added
+    /// to the protocol enum reaches this test without anyone remembering to
+    /// extend it (the `Category::ALL` sweep above sets the pattern).
+    #[test]
+    fn every_lookup_kind_and_outcome_round_trips_through_the_stored_wire_form() {
+        for kind in WebLookupKind::ALL {
+            let stored = web_kind_to_wire(kind);
+            assert_eq!(web_kind_from_wire(stored), Some(kind), "kind '{stored}'");
+        }
+        for outcome in WebLookupOutcome::ALL {
+            let stored = web_outcome_to_wire(outcome);
+            assert_eq!(
+                web_outcome_from_wire(stored),
+                Some(outcome),
+                "{outcome:?} does not survive the ledger round trip as '{stored}'"
+            );
+        }
+        // A column value this build does not recognize reads as absent rather
+        // than as some other outcome.
+        assert_eq!(web_outcome_from_wire("blocked"), None);
+        assert_eq!(web_kind_from_wire("crawl"), None);
+    }
+
+    /// A stored row this build cannot read is skipped, not guessed at: reporting
+    /// an unknown outcome as `completed` would claim a lookup succeeded when
+    /// nothing here knows that it did.
+    #[test]
+    fn a_lookup_row_with_an_unreadable_outcome_is_skipped_not_guessed() {
+        let (ledger, _sink) = ledger();
+        ledger
+            .record_web_lookup(&web_row("s", WebLookupOutcome::Completed, 10))
+            .expect("record");
+        {
+            let guard = ledger.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO web_lookups
+                       (recorded_at_ms, session_id, kind, host, bytes_in, duration_ms,
+                        outcome, usd_micros)
+                     VALUES (1, 's', 'fetch', 'docs.rs', 5, 5, 'from-the-future', 0)",
+                    [],
+                )
+                .expect("a row this build cannot read");
+        }
+        let rows = ledger.all_web_lookups().expect("read");
+        assert_eq!(rows.len(), 1, "the unreadable row is skipped");
+        assert_eq!(rows[0].outcome, WebLookupOutcome::Completed);
+    }
+
+    /// REQ-563 BR-7 in the schema: there is no column a full URL, a search
+    /// query, or a credential could ride in. Asserted against the live table
+    /// definition rather than the `WebLookupRow` struct, because the storage is
+    /// what outlives this build — a column added here would persist utterances
+    /// on disk long after whatever wrote them.
+    #[test]
+    fn the_web_lookups_table_has_no_column_that_could_hold_an_utterance() {
+        let (ledger, _sink) = ledger();
+        let guard = ledger.conn.lock().unwrap();
+        let mut stmt = guard
+            .prepare("SELECT name FROM pragma_table_info('web_lookups') ORDER BY name")
+            .expect("pragma");
+        let columns: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        assert_eq!(
+            columns,
+            vec![
+                "bytes_in",
+                "duration_ms",
+                "host",
+                "id",
+                "kind",
+                "outcome",
+                "recorded_at_ms",
+                "session_id",
+                "usd_micros",
+            ],
+            "the lookup schema gained a column: {columns:?}"
+        );
+    }
+
+    /// AC-6: `/cost` answers how many lookups a session made and how many bytes
+    /// came back, end to end from the store rather than from hand-built rows.
+    #[test]
+    fn the_cost_report_counts_a_sessions_lookups_and_bytes() {
+        let (ledger, _sink) = ledger();
+        ledger
+            .record_web_lookup(&web_row("sess-web", WebLookupOutcome::Completed, 4096))
+            .expect("record");
+        ledger
+            .record_web_lookup(&web_row("sess-web", WebLookupOutcome::CacheHit, 4096))
+            .expect("record");
+        // Refused: still a lookup (BR-7), still no bytes.
+        ledger
+            .record_web_lookup(&web_row("sess-web", WebLookupOutcome::RefusedTier, 0))
+            .expect("record");
+
+        let report = ledger.report().expect("report");
+        let web = report
+            .web_per_session
+            .iter()
+            .find(|w| w.key == "sess-web")
+            .expect("the session's lookups are reported");
+        assert_eq!(web.lookups, 3);
+        assert_eq!(web.bytes_in, 8192);
+        assert_eq!(report.total.calls, 0, "no model calls were made");
+    }
+
+    /// Trigger parity with the provider table: the lookup history is immutable
+    /// by construction, not by API discipline.
+    #[test]
+    fn the_web_lookups_table_is_append_only() {
+        let (ledger, _sink) = ledger();
+        ledger
+            .record_web_lookup(&web_row("s", WebLookupOutcome::Completed, 1))
+            .expect("record");
+        let guard = ledger.conn.lock().unwrap();
+        assert!(
+            guard
+                .execute("UPDATE web_lookups SET host = 'evil.example'", [])
+                .is_err(),
+            "UPDATE must be rejected by the append-only trigger"
+        );
+        assert!(
+            guard.execute("DELETE FROM web_lookups", []).is_err(),
+            "DELETE must be rejected by the append-only trigger"
+        );
     }
 
     #[test]

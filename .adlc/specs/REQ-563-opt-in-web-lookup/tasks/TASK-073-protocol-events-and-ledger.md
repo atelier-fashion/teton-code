@@ -1,7 +1,7 @@
 ---
 id: TASK-073
 title: "Protocol web events + append-only web_lookups ledger table"
-status: draft
+status: complete
 parent: REQ-563
 created: 2026-08-08
 updated: 2026-08-08

@@ -14,7 +14,10 @@
 //! `model_selection_proposed`/`model_selection_decided`, the consent round-trip
 //! that gates the local tier before any weights are fetched. REQ-561 adds
 //! `session_titled` (BR-9a), which announces the title the `title` category
-//! produced for a session.
+//! produced for a session. REQ-563 adds the opt-in web-lookup family —
+//! `web_lookup`, `web_consent_decided`, `web_taint_overridden` — where its
+//! spec's ten-row Events table is deliberately folded onto three variants
+//! (architecture D-8; the fold is spelled out above [`WebLookupOutcome`]).
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -103,6 +106,15 @@ pub enum Event {
     PhaseTransition(PhaseTransition),
     /// A client attached to the daemon (spec: `daemon_client_attach`).
     DaemonClientAttach(DaemonClientAttach),
+    /// A web lookup reached a terminal outcome (REQ-563 BR-7). Every way a
+    /// lookup can end — including the ones the spec names as separate events —
+    /// is a [`WebLookupOutcome`] on this one variant.
+    WebLookup(WebLookup),
+    /// A web-lookup consent decision was recorded (REQ-563 BR-4). The *prompt*
+    /// that preceded it is a [`PermissionRequest`], not an event of its own.
+    WebConsentDecided(WebConsentDecided),
+    /// The user lifted this session's web taint restriction (REQ-563 BR-13).
+    WebTaintOverridden(WebTaintOverridden),
 }
 
 impl Event {
@@ -122,6 +134,9 @@ impl Event {
             Event::PermissionRequest(_) => "permission_request",
             Event::PhaseTransition(_) => "phase_transition",
             Event::DaemonClientAttach(_) => "daemon_client_attach",
+            Event::WebLookup(_) => "web_lookup",
+            Event::WebConsentDecided(_) => "web_consent_decided",
+            Event::WebTaintOverridden(_) => "web_taint_overridden",
         }
     }
 }
@@ -929,6 +944,238 @@ pub struct DaemonClientAttach {
     pub protocol_version: ProtocolVersion,
 }
 
+// ---------------------------------------------------------------------------
+// web_lookup / web_consent_decided / web_taint_overridden (REQ-563)
+// ---------------------------------------------------------------------------
+//
+// The opt-in web-lookup vocabulary. REQ-563's Events table names ten events;
+// architecture D-8 realizes them with three variants, and the fold is written
+// down here rather than left to be rediscovered from a diff:
+//
+//   * every way a lookup can *end* — completed, served from cache, refused by
+//     either inspection, refused by the allowlist or by the tier ceiling,
+//     restricted by session taint, or unreachable — is one `web_lookup` event
+//     carrying a [`WebLookupOutcome`]. They share a subject (which kind, which
+//     host, how many bytes came back) and differ only in the ending, which is a
+//     field, not a type.
+//   * the consent *prompt* gets no event: the web tool authorizes through the
+//     existing [`PermissionRequest`] like every other tool (architecture D-5),
+//     so only the *decision* needs a name of its own.
+//   * `web_lookup_requested` has no wire event at all. A request is observable
+//     at Ask-time (as a `permission_request`) or at its outcome; an event
+//     between the two would announce an intention the very next inspection may
+//     refuse, and a client rendering it would show a lookup that never happened.
+//
+// Every payload here names the destination **host** and nothing finer (BR-7 of
+// this REQ, BR-7 of the charter). No full URL, no path, no query text, no
+// credential — the same constraint that keeps [`BlockCause::Redaction`] from
+// echoing what it found, applied to the one event family whose entire subject
+// is an outgoing utterance.
+
+/// The graded web-lookup capability a grant or a decision concerns (BR-3).
+///
+/// Mirrors `teton_core::config::WebTier` variant-for-variant — the precedent
+/// [`crate::Tier`] and [`SelectionSource`] set — so the daemon's configured
+/// ceiling and this wire form cannot drift apart.
+///
+/// Ordered lowest-to-highest, and the ordering is the rule rather than a
+/// presentation detail: each tier includes the ones below it (BR-3), so
+/// `granted >= requested` is the whole of the tier check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebTier {
+    /// No web lookup at all. The default, and the *only* disabled state —
+    /// architecture D-9 drops the spec's separate `enabled` flag precisely so
+    /// nothing can disagree with this value.
+    Off,
+    /// Fetch a URL that appeared verbatim in a user message of this session.
+    FetchUserUrl,
+    /// Fetch a URL the model composed.
+    FetchAnyUrl,
+    /// Free-text search against the user's configured endpoint.
+    Search,
+}
+
+impl WebTier {
+    /// Every tier, lowest first — so a sweep over the ladder cannot miss one a
+    /// later REQ adds.
+    pub const ALL: [WebTier; 4] = [
+        WebTier::Off,
+        WebTier::FetchUserUrl,
+        WebTier::FetchAnyUrl,
+        WebTier::Search,
+    ];
+}
+
+/// What a lookup was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebLookupKind {
+    /// A single-URL fetch of static content.
+    Fetch,
+    /// A free-text search against the configured endpoint.
+    Search,
+}
+
+impl WebLookupKind {
+    /// Both kinds, for sweeps.
+    pub const ALL: [WebLookupKind; 2] = [WebLookupKind::Fetch, WebLookupKind::Search];
+}
+
+/// How a lookup ended — the fold of the spec's separate outcome events (D-8).
+///
+/// Every variant names the Events-table row it realizes, so the fold stays
+/// checkable against the requirement instead of becoming folklore. A variant
+/// added here without that sentence is a wire value no reader can trace back to
+/// a promise.
+///
+/// Deliberately **not** split into "ok" and "error" families: a refusal is a
+/// normal, expected ending for a capability whose whole design is refusing
+/// (BR-9 — a lookup failure never fails the turn), so the endings live on one
+/// axis and a consumer decides for itself which ones it draws as a problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebLookupOutcome {
+    /// The lookup went out and came back (spec: `web_lookup_completed`).
+    Completed,
+    /// Served from the local cache, so **no egress occurred** (spec:
+    /// `web_cache_hit`). Recorded like any other lookup: BR-7 asks for every
+    /// lookup in the ledger, including the free ones.
+    CacheHit,
+    /// The provenance gate refused the outgoing text: it derived from
+    /// privacy-boundary content (spec: `web_lookup_blocked`, reason
+    /// `privacy_block`). The paired [`PrivacyBlock`] event carries the detail;
+    /// this outcome is what makes the *lookup* accountable in the ledger.
+    BlockedPrivacy,
+    /// The redaction scan refused the outgoing text — including the case where
+    /// the scan could not run, which is a block and not a skip (spec:
+    /// `web_lookup_blocked`, reason `redact_finding`; BR-14, LESSON-492).
+    BlockedRedact,
+    /// A model-chosen destination fell outside the configured allowlist (spec:
+    /// `web_lookup_refused_domain`). Never reached by a user-pasted URL, which
+    /// BR-11 exempts.
+    RefusedDomain,
+    /// The lookup needed a tier above the granted ceiling and was refused
+    /// before any prompt (AC-4).
+    ///
+    /// The spec's table names no event for this one. A refusal that never
+    /// reaches consent is invisible everywhere else — there is no
+    /// `permission_request` to observe and no packet to capture — so the fold
+    /// gives it a value rather than leaving AC-4's refusal unobservable.
+    RefusedTier,
+    /// A model-composed lookup was refused because this session has touched
+    /// boundary content (spec: `web_taint_restricted`; BR-13). A user-pasted
+    /// URL in the same session is unaffected.
+    TaintRestricted,
+    /// The destination was unreachable — a settled, transient-shaped failure,
+    /// never a turn error (BR-9, BUG-152's taxonomy).
+    ///
+    /// The spec's table names no event for it because it is the failure sibling
+    /// of `web_lookup_completed` and belongs on the same row: the same lookup,
+    /// the same host, a different ending.
+    Offline,
+}
+
+impl WebLookupOutcome {
+    /// Every outcome, so a sweep (tests, a renderer's match) cannot miss one a
+    /// later REQ adds.
+    pub const ALL: [WebLookupOutcome; 8] = [
+        WebLookupOutcome::Completed,
+        WebLookupOutcome::CacheHit,
+        WebLookupOutcome::BlockedPrivacy,
+        WebLookupOutcome::BlockedRedact,
+        WebLookupOutcome::RefusedDomain,
+        WebLookupOutcome::RefusedTier,
+        WebLookupOutcome::TaintRestricted,
+        WebLookupOutcome::Offline,
+    ];
+}
+
+/// A web lookup reached a terminal outcome (spec: the `web_lookup_*` family).
+///
+/// One event per lookup attempt, whatever the ending, so the ledger and the
+/// stream agree on how many lookups a session performed. The session is named
+/// by [`EventEnvelope::session_id`], as for every other session-scoped event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebLookup {
+    /// Fetch or search.
+    pub kind: WebLookupKind,
+    /// The destination **host**, e.g. `docs.rs` — never the scheme, the path,
+    /// the query string, or a credential (BR-7).
+    ///
+    /// A host is what makes a lookup accountable ("this session talked to
+    /// `docs.rs`") without reproducing the utterance. For a
+    /// [`WebLookupOutcome::CacheHit`] it is still the host the cached document
+    /// came from, so a session's destinations read the same whether or not the
+    /// bytes were already on disk.
+    pub host: String,
+    /// How it ended.
+    pub outcome: WebLookupOutcome,
+    /// Bytes of content the lookup brought back. `0` for every outcome that
+    /// transferred nothing — a refusal, a block, or an unreachable host.
+    pub bytes_in: u64,
+}
+
+/// How long a consent decision holds (spec BR-4's offered scopes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebConsentScope {
+    /// This one lookup.
+    Once,
+    /// The rest of this session. Never written to config; resets with the
+    /// session (BR-4).
+    Session,
+    /// Written to config — the only scope that outlives the daemon (BR-4), and
+    /// therefore the only one that is a configuration change rather than a
+    /// session fact.
+    Persistent,
+}
+
+/// A web-lookup consent decision was recorded (spec: `web_consent_granted` and
+/// `web_consent_denied`, folded).
+///
+/// One event with a `granted` flag rather than two events: both spec rows carry
+/// the same subject — which tier, at which scope — and differ only in the
+/// answer, so a client handling both has a boolean either way. The prompt that
+/// preceded this is a [`PermissionRequest`] (architecture D-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebConsentDecided {
+    /// The scope the decision applies to.
+    ///
+    /// A refusal is recorded at the scope it refuses, so "declined for this
+    /// session" and "declined this once" stay distinguishable — the difference
+    /// decides whether the user is asked again on the next lookup.
+    pub scope: WebConsentScope,
+    /// The tier the decision concerns. Never [`WebTier::Off`]: a decision is
+    /// always about a capability someone asked for.
+    pub tier: WebTier,
+    /// Whether the tier was granted at that scope.
+    pub granted: bool,
+}
+
+/// The user lifted this session's taint restriction (spec:
+/// `web_taint_overridden`).
+///
+/// User-only by construction rather than by check: the override arrives as a
+/// client RPC ([`crate::methods::WebOverrideParams`]) and tool dispatch has no
+/// path to a client RPC, so a model-issued override is not *rejected* at
+/// runtime — it is unrepresentable (architecture D-4, AC-12).
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the same shape
+/// [`SessionTitled`] documents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebTaintOverridden {
+    /// The tiers model-composed lookups resume at: exactly the tiers this
+    /// session had already been granted, ascending.
+    ///
+    /// The override *restores*; it never grants (BR-13), so a tier absent from
+    /// this list stays absent, and [`WebTier::Off`] never appears here —
+    /// "restored to nothing" is an empty list.
+    pub tiers_restored: Vec<WebTier>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1365,29 @@ mod tests {
                     source: SelectionSource::Probe,
                 }),
                 "model_selection_decided",
+            ),
+            (
+                Event::WebLookup(WebLookup {
+                    kind: WebLookupKind::Fetch,
+                    host: "docs.rs".to_owned(),
+                    outcome: WebLookupOutcome::Completed,
+                    bytes_in: 4096,
+                }),
+                "web_lookup",
+            ),
+            (
+                Event::WebConsentDecided(WebConsentDecided {
+                    scope: WebConsentScope::Session,
+                    tier: WebTier::FetchAnyUrl,
+                    granted: true,
+                }),
+                "web_consent_decided",
+            ),
+            (
+                Event::WebTaintOverridden(WebTaintOverridden {
+                    tiers_restored: vec![WebTier::FetchUserUrl, WebTier::FetchAnyUrl],
+                }),
+                "web_taint_overridden",
             ),
         ];
 
@@ -1792,6 +2062,250 @@ mod tests {
                     p.proposed.expect("proposal present").entry.name,
                     "qwen2.5-coder-7b"
                 );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// The sorted key set of a payload's wire object.
+    fn wire_keys(value: &impl Serialize) -> Vec<String> {
+        let wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(value).unwrap()).unwrap();
+        let mut keys: Vec<String> = wire
+            .as_object()
+            .expect("payload is an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Every folded outcome survives the wire on both kinds of lookup, swept
+    /// from [`WebLookupOutcome::ALL`] rather than a hand-kept list — an outcome
+    /// added by a later REQ reaches this test without anyone remembering to
+    /// extend it (the `Category::ALL` sweep in the ledger sets the precedent).
+    #[test]
+    fn every_web_lookup_outcome_round_trips_on_every_kind() {
+        for kind in WebLookupKind::ALL {
+            for outcome in WebLookupOutcome::ALL {
+                let lookup = WebLookup {
+                    kind,
+                    host: "docs.rs".to_owned(),
+                    outcome,
+                    // Only a completed transfer carries bytes; the rest are the
+                    // endings that moved nothing.
+                    bytes_in: match outcome {
+                        WebLookupOutcome::Completed | WebLookupOutcome::CacheHit => 4096,
+                        _ => 0,
+                    },
+                };
+                round_trip(&lookup);
+                let wire = envelope_wire(Event::WebLookup(lookup));
+                assert_eq!(wire["event"], "web_lookup");
+                assert_eq!(wire["session_id"], "s1");
+                assert_eq!(wire["host"], "docs.rs");
+            }
+        }
+    }
+
+    /// The wire names are the contract with every client, so they are pinned
+    /// literally rather than derived from the variant spelling.
+    #[test]
+    fn the_web_vocabulary_uses_its_architecture_wire_names() {
+        for (outcome, expected) in [
+            (WebLookupOutcome::Completed, "completed"),
+            (WebLookupOutcome::CacheHit, "cache_hit"),
+            (WebLookupOutcome::BlockedPrivacy, "blocked_privacy"),
+            (WebLookupOutcome::BlockedRedact, "blocked_redact"),
+            (WebLookupOutcome::RefusedDomain, "refused_domain"),
+            (WebLookupOutcome::RefusedTier, "refused_tier"),
+            (WebLookupOutcome::TaintRestricted, "taint_restricted"),
+            (WebLookupOutcome::Offline, "offline"),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), expected);
+        }
+        // Non-vacuity for the sweep above: the list here and `ALL` are the same
+        // eight values, so neither can quietly fall behind the other.
+        assert_eq!(WebLookupOutcome::ALL.len(), 8);
+
+        for (kind, expected) in [
+            (WebLookupKind::Fetch, "fetch"),
+            (WebLookupKind::Search, "search"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), expected);
+        }
+        for (tier, expected) in [
+            (WebTier::Off, "off"),
+            (WebTier::FetchUserUrl, "fetch_user_url"),
+            (WebTier::FetchAnyUrl, "fetch_any_url"),
+            (WebTier::Search, "search"),
+        ] {
+            assert_eq!(serde_json::to_value(tier).unwrap(), expected);
+        }
+        for (scope, expected) in [
+            (WebConsentScope::Once, "once"),
+            (WebConsentScope::Session, "session"),
+            (WebConsentScope::Persistent, "persistent"),
+        ] {
+            assert_eq!(serde_json::to_value(scope).unwrap(), expected);
+        }
+    }
+
+    /// BR-3's ladder as an ordering: each tier includes the ones below it, so a
+    /// tier check is a comparison and never a table someone has to keep in sync.
+    #[test]
+    fn web_tiers_are_ordered_lowest_first() {
+        let mut sorted = WebTier::ALL;
+        sorted.sort_unstable();
+        assert_eq!(sorted, WebTier::ALL, "ALL must already be in tier order");
+        assert!(WebTier::Off < WebTier::FetchUserUrl);
+        assert!(WebTier::FetchUserUrl < WebTier::FetchAnyUrl);
+        assert!(WebTier::FetchAnyUrl < WebTier::Search);
+    }
+
+    /// **BR-7 at the protocol layer: a lookup event names a host and nothing
+    /// finer.**
+    ///
+    /// The leak surface is whatever rides the outbound structure, so it is
+    /// constrained at the payload definition rather than at each emitter — the
+    /// technique [`BlockCause::Redaction`] uses against the text it found and
+    /// [`CatalogEntryView`] uses against a catalog URL. The key sets are
+    /// asserted **exhaustively**, so a field later added that could hold the
+    /// full URL, the query the model composed, or the search key turns this red
+    /// instead of shipping quietly.
+    #[test]
+    fn the_web_event_family_carries_a_host_and_never_a_url_query_or_credential() {
+        assert_eq!(
+            wire_keys(&WebLookup {
+                kind: WebLookupKind::Search,
+                host: "search.example.com".to_owned(),
+                outcome: WebLookupOutcome::Completed,
+                bytes_in: 2048,
+            }),
+            ["bytes_in", "host", "kind", "outcome"]
+        );
+        assert_eq!(
+            wire_keys(&WebConsentDecided {
+                scope: WebConsentScope::Once,
+                tier: WebTier::Search,
+                granted: true,
+            }),
+            ["granted", "scope", "tier"]
+        );
+        assert_eq!(
+            wire_keys(&WebTaintOverridden {
+                tiers_restored: vec![WebTier::FetchUserUrl],
+            }),
+            ["tiers_restored"]
+        );
+
+        // And the values, not only the field names: a search — the kind whose
+        // spec row carried the "verbatim query" — serializes with nothing that
+        // could be one. Scanned on the `web_lookup` payload alone because the
+        // tier *names* legitimately contain `url` (`fetch_any_url` is a
+        // capability, not a destination), and a substring sweep cannot tell the
+        // two apart.
+        let json = serde_json::to_string(&WebLookup {
+            kind: WebLookupKind::Search,
+            host: "search.example.com".to_owned(),
+            outcome: WebLookupOutcome::Completed,
+            bytes_in: 2048,
+        })
+        .unwrap();
+        for forbidden in ["://", "url", "query", "token", "secret", "auth", "key", "?"] {
+            assert!(
+                !json.contains(forbidden),
+                "a lookup event leaked `{forbidden}`: {json}"
+            );
+        }
+    }
+
+    /// The consent decision is one event with an answer, not two events (D-8).
+    /// Both answers must survive the wire, and a denial must stay a denial —
+    /// `granted` has no `default`, so a payload that omits it is an error
+    /// rather than a silent "no".
+    #[test]
+    fn a_web_consent_decision_round_trips_both_answers_at_every_scope() {
+        for scope in [
+            WebConsentScope::Once,
+            WebConsentScope::Session,
+            WebConsentScope::Persistent,
+        ] {
+            for granted in [true, false] {
+                round_trip(&WebConsentDecided {
+                    scope,
+                    tier: WebTier::FetchAnyUrl,
+                    granted,
+                });
+            }
+        }
+
+        let wire = envelope_wire(Event::WebConsentDecided(WebConsentDecided {
+            scope: WebConsentScope::Persistent,
+            tier: WebTier::Search,
+            granted: false,
+        }));
+        assert_eq!(wire["event"], "web_consent_decided");
+        assert_eq!(wire["scope"], "persistent");
+        assert_eq!(wire["tier"], "search");
+        assert_eq!(wire["granted"], false);
+
+        assert!(
+            serde_json::from_str::<WebConsentDecided>(r#"{"scope":"once","tier":"search"}"#)
+                .is_err(),
+            "an answer this build cannot read must fail loudly, never default to one"
+        );
+    }
+
+    /// AC-12's wire half: the override names the tiers it restored and the
+    /// session it restored them for — the session through the envelope, like
+    /// every other session-scoped event. Re-adding `session_id` to the payload
+    /// fails here on the duplicate key rather than reaching a client.
+    #[test]
+    fn web_taint_overridden_names_its_tiers_and_its_session() {
+        let overridden = WebTaintOverridden {
+            tiers_restored: vec![WebTier::FetchUserUrl, WebTier::FetchAnyUrl],
+        };
+        round_trip(&overridden);
+
+        let wire = envelope_wire(Event::WebTaintOverridden(overridden));
+        assert_eq!(wire["event"], "web_taint_overridden");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["tiers_restored"][0], "fetch_user_url");
+        assert_eq!(wire["tiers_restored"][1], "fetch_any_url");
+
+        // BR-13: an override that restores nothing says so with an empty list,
+        // not with `off` — "no tiers" is not a tier.
+        let none_restored = WebTaintOverridden {
+            tiers_restored: vec![],
+        };
+        round_trip(&none_restored);
+        let wire = envelope_wire(Event::WebTaintOverridden(none_restored));
+        assert_eq!(wire["tiers_restored"].as_array().unwrap().len(), 0);
+    }
+
+    /// Forward compatibility for the web family specifically: a newer daemon
+    /// that adds a field to a lookup event must not break a client built
+    /// against this shape (the posture that keeps `PROTOCOL_VERSION` still).
+    #[test]
+    fn unknown_fields_in_a_web_lookup_are_tolerated() {
+        let json = r#"{
+            "session_id": "s1",
+            "seq": 11,
+            "event": "web_lookup",
+            "kind": "fetch",
+            "host": "docs.rs",
+            "outcome": "cache_hit",
+            "bytes_in": 4096,
+            "future_field": {"age_secs": 12}
+        }"#;
+        let env: EventEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.event_name(), "web_lookup");
+        match env.event {
+            Event::WebLookup(lookup) => {
+                assert_eq!(lookup.outcome, WebLookupOutcome::CacheHit);
+                assert_eq!(lookup.host, "docs.rs");
             }
             other => panic!("unexpected event: {other:?}"),
         }

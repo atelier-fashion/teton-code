@@ -200,6 +200,20 @@ pub fn render_event(
             surface.line(LineKind::Notice, &firstrun::format_decided(decided));
             EventOutcome::Rendered
         }
+        // REQ-563 ships the web-lookup vocabulary before anything emits it: the
+        // protocol variants and the ledger table land first so the egress seam
+        // and the tool have something to speak. Nothing in this build publishes
+        // one, so these arms consume the event rather than draw a surface this
+        // REQ's CLI task has not designed yet (TASK-077 owns the Notice lines,
+        // the status-row field, and the verbose per-lookup line).
+        //
+        // Consuming arms rather than a `_` catch-all, deliberately: the match is
+        // exhaustive so that a *future* event cannot be added without a decision
+        // being made here, which is exactly the discipline that would be lost by
+        // widening it once.
+        Event::WebLookup(_) | Event::WebConsentDecided(_) | Event::WebTaintOverridden(_) => {
+            EventOutcome::Rendered
+        }
     }
 }
 

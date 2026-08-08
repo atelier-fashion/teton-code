@@ -25,6 +25,14 @@
 //! prompt text, no tool arguments, no credential, ever. The schema has no column
 //! that could carry content; see [`ledger`].
 //!
+//! ## Web lookups (REQ-563 BR-7)
+//!
+//! The same store also holds one [`WebLookupRow`] per web lookup, in the sibling
+//! `web_lookups` table (architecture D-7) — every lookup, including the free and
+//! the refused ones, so `/cost` can say what a session reached out to. The same
+//! privacy rule applies and binds harder there: a lookup row names the
+//! destination **host** and never a full URL, a search query, or a key.
+//!
 //! ## Module map
 //! - [`ledger`] — the append-only SQLite store, the [`CostMeter`] implementation,
 //!   and the streamed-usage extractor.
@@ -43,9 +51,9 @@ use teton_providers::transport::TransportResponse;
 
 use crate::broadcast::EventBus;
 
-pub use ledger::{CostLedger, LedgerError, LedgerRow};
+pub use ledger::{CostLedger, LedgerError, LedgerRow, WebLookupRow};
 pub use prices::{ModelPrice, PriceTable};
-pub use report::{CostReport, GroupTotals, SavingsEstimate, UnpricedTotals};
+pub use report::{CostReport, GroupTotals, SavingsEstimate, UnpricedTotals, WebTotals};
 
 /// The billing attribution a caller pins to a remote call *at call time*.
 ///
