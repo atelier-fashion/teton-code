@@ -18,7 +18,20 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
-## [Unreleased]
+## [0.1.12] - 2026-08-08
+
+### Fixed
+
+- **Asking Teton how to hook up external models now answers directly**
+  (BUG-160). The agent's system prompt bundles Teton's own provider-setup
+  instructions — `teton provider add`, `teton policy set-tier`, where
+  `config.toml` lives, and the keychain rule — so a setup question is answered
+  from them instead of triggering a search of your repository for
+  documentation that was never there. Nothing about this changes where data
+  goes: the bundled text is part of the local prompt frame. The README gained
+  a matching "Hooking up an external model" section.
+
+## [0.1.11] - 2026-08-08
 
 ### Changed
 
