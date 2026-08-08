@@ -249,7 +249,7 @@ pub enum Confidence {
 impl Confidence {
     /// A stable, content-free name for reports.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Confidence::High => "high-confidence",
             Confidence::Low => "low-confidence",
@@ -281,7 +281,7 @@ impl FindingKind {
     /// Safe to render anywhere: it names the *class* of thing found, never the
     /// thing itself (BR-6).
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             FindingKind::Secret => "secret",
             FindingKind::Credential => "credential",
@@ -855,21 +855,37 @@ fn is_shape_space(b: u8) -> bool {
 /// match — the shape requires a qualified name) and right over the separator and
 /// the value.
 ///
-/// ## The left extension is memoized, and that is a bound rather than a tidy-up
+/// ## The left extension is memoized, and it is defence in depth rather than a
+/// live exposure
 ///
 /// Every byte of the suffix is a name byte, so a suffix occurrence always lies
 /// inside a maximal `[A-Z_]+` run — and every occurrence *in the same run*
 /// extends left to the same place. Re-walking the run per occurrence is
-/// quadratic on the input this scan is most likely to meet adversarially: 27 KiB
-/// of `_TOKEN_TOKEN_TOKEN…` is one run with thousands of occurrences, and the
-/// scan measured **123 ms** on a 64 KiB version of it — on the synchronous send
-/// path of every remote call, from a payload an attacker chooses.
+/// quadratic: `_TOKEN_TOKEN_TOKEN…` is one run with thousands of occurrences,
+/// and the scan measured **123 ms** on a 64 KiB version of it.
 ///
-/// So the run containing the current position is computed once and cached.
-/// `i` never decreases, and runs are maximal and therefore disjoint, so each run
-/// is walked at most once in each direction: the whole scan is amortized linear.
-/// Behaviour is byte-for-byte what it was — the cache answers the same question,
-/// it just stops asking it repeatedly.
+/// **In production that 64 KiB input never arrives here.**
+/// [`pattern_verdict`] refuses anything over [`REDACT_INPUT_MAX_BYTES`] —
+/// 27,070 bytes — before this function is called, so the reachable worst case
+/// is the cap, not an unbounded body an attacker sizes. Calling this "a
+/// quadratic scan on the send path from a payload an attacker chooses"
+/// overstated it: the cap is what bounds the payload, and it is checked first.
+///
+/// What remains, and is worth keeping, is the **complexity class**. A bound
+/// that holds because a *different* constant happens to be small is a bound
+/// that moves when that constant does — and this cap is derived from an engine
+/// window, so it is exactly the kind of number a later REQ raises. The
+/// memoization makes the scan amortized linear in its own right: the run
+/// containing the current position is computed once and cached, `i` never
+/// decreases, and runs are maximal and therefore disjoint, so each run is
+/// walked at most once in each direction. Behaviour is byte-for-byte what it
+/// was — the cache answers the same question, it just stops asking it
+/// repeatedly.
+///
+/// `the_assignment_scans_left_extension_does_not_go_quadratic` therefore feeds
+/// it half a mebibyte **deliberately past the cap**, calling `pattern_pass`
+/// rather than `pattern_verdict`: it is measuring the class, not simulating a
+/// reachable production input.
 fn scan_env_assignment(bytes: &[u8], out: &mut Vec<Range<usize>>) {
     for suffix in ENV_SUFFIXES {
         let slen = suffix.len();
@@ -1472,11 +1488,18 @@ mod tests {
     /// one enormous `[A-Z_]+` run full of suffix occurrences does not cost
     /// quadratic time.
     ///
-    /// The fixture is the adversarial one: a single unbroken name run of
-    /// `_TOKEN` repeated, which is what an attacker who wants the scan to be
-    /// slow writes, on the synchronous send path of every remote call. Half a
+    /// The fixture is a single unbroken name run of `_TOKEN` repeated. Half a
     /// mebibyte of it is ~87,000 suffix occurrences in **one** run: linear it is
     /// milliseconds, quadratic it is on the order of 10^10 byte comparisons.
+    ///
+    /// **It is deliberately past the input cap, and calls `pattern_pass` rather
+    /// than `pattern_verdict` to get there.** In production a payload this size
+    /// is refused by [`REDACT_INPUT_MAX_BYTES`] before this scan runs at all, so
+    /// this is not a reachable input — which is the point. The claim under test
+    /// is the *complexity class* of the scan itself, which has to hold on its
+    /// own rather than because a cap derived from an engine window happens to
+    /// be small today. A later REQ that raises the cap must not silently
+    /// reintroduce a quadratic scan.
     ///
     /// The wall-clock bound is a complexity-class discriminator, not a
     /// performance target. Measured, debug build: **0.04 s memoized, 52.9 s
@@ -1488,6 +1511,11 @@ mod tests {
     fn the_assignment_scans_left_extension_does_not_go_quadratic() {
         let adversarial = "A".to_owned() + &"_TOKEN".repeat(87_000);
         assert!(adversarial.len() > 500 * 1024, "{}", adversarial.len());
+        assert!(
+            adversarial.len() > REDACT_INPUT_MAX_BYTES,
+            "the fixture bypasses the cap on purpose: this measures the scan's \
+             complexity class, not a payload production can deliver"
+        );
         assert!(
             adversarial.bytes().all(is_name_byte),
             "the fixture must be ONE unbroken name run, or it bounds nothing"
@@ -1865,6 +1893,18 @@ mod tests {
         assert!(
             lines[0].contains("1400-1436"),
             "the span, so the user can find it: {}",
+            lines[0]
+        );
+        // **The documented grep target, as a literal.** `docs/manual-verification.md`
+        // tells a dogfooder to run `grep 'redact — low-confidence' tetond.log`,
+        // which is the only way the model half of this feature is observable at
+        // all (OQ-2). The words are asserted individually above; this pins them
+        // as one contiguous substring, because a reworded line that still
+        // contains both words separately would leave that procedure finding
+        // nothing and reporting it as "the model caught nothing".
+        assert!(
+            lines[0].contains("redact — low-confidence"),
+            "the documented grep target must survive verbatim: {}",
             lines[0]
         );
 

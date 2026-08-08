@@ -337,8 +337,8 @@ pub(crate) fn rendered_prompt_bytes(prompt: &str) -> usize {
 ///    from its outcome rather than re-tested here, so there is one cap and one
 ///    place to change it.
 /// 2. **An unresolved route next**, before the prompt is built: a payload at
-///    the cap rendered into a prompt no model will ever see is 27 KiB of work
-///    done for a call that cannot happen (`name_session`'s precedent).
+///    the cap rendered into a prompt no model will ever see is 27,070 bytes of
+///    work done for a call that cannot happen (`name_session`'s precedent).
 /// 3. **Then the rendered prompt is measured** against the engine's own budget
 ///    ([`rendered_prompt_bytes`], LESSON-488). The input cap is arithmetic over
 ///    the payload; the thing that has to fit is the *rendered* prompt, and two
@@ -860,6 +860,35 @@ mod tests {
                 "a {}-byte payload grew by {grown}, past the bound {}",
                 worst.len(),
                 worst.len() / REDACT_DEFUSE_GROWTH_DIVISOR + 1
+            );
+        }
+
+        // **The equality case**, which every row above misses by one. A payload
+        // of `k` label lines WITH a trailing newline is `9k` bytes and grows by
+        // `k`, against a bound of `k + 1` — a byte of slack, so those rows
+        // cannot tell a tight bound from a bound that is one too generous.
+        //
+        // Drop the trailing newline and the length is `9k - 1`, which is
+        // `≡ 8 (mod 9)`: the bound is `(9k - 1)/9 + 1 = k`, and the growth is
+        // `k`. Exactly equal. This is the row that turns red if the `+ 1`
+        // constant term is ever removed from the derivation the cap is built
+        // through.
+        for k in [1usize, 2, 7, 128, 1_001] {
+            let mut tight = "Payload:\n".repeat(k);
+            tight.pop();
+            assert_eq!(tight.len(), 9 * k - 1, "the fixture must sit at 8 mod 9");
+            let grown = neutralize_payload_frame(&tight).len() - tight.len();
+            let bound = tight.len() / REDACT_DEFUSE_GROWTH_DIVISOR + 1;
+            assert_eq!(
+                grown, k,
+                "every one of the {k} label lines is defused: {tight:?}"
+            );
+            assert_eq!(
+                grown,
+                bound,
+                "the bound must be TIGHT here, not merely satisfied: a \
+                 {}-byte payload grew by {grown} against a bound of {bound}",
+                tight.len()
             );
         }
     }

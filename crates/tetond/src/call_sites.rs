@@ -157,6 +157,18 @@ pub(crate) mod scan {
     /// (`.expect("this module is a production source")`), so a module that was
     /// renamed or deleted fails by name. What is skipped is only a file nobody
     /// asked for by name — and the skip is announced rather than silent.
+    ///
+    /// ## "Vanished" is re-checked, because several callers are set-based
+    ///
+    /// A `NotFound` on its own does not establish that a file is gone: the
+    /// commonest cause is an editor's atomic-rename save, where the path is
+    /// missing for microseconds and then back. Skipping on the first `NotFound`
+    /// would therefore drop a file that *exists* — and the callers that sweep
+    /// **every** production source for a property (the seam assertions, the
+    /// no-printers checks) pass a little more vacuously for each file they did
+    /// not see, silently. So the directory is re-listed: if the path is still
+    /// there the read is retried and a second failure is fatal, and only a path
+    /// that is genuinely absent from a fresh listing is skipped.
     pub(crate) fn production_sources() -> Vec<(String, String)> {
         let root = daemon_src();
         let mut files = Vec::new();
@@ -168,12 +180,25 @@ pub(crate) mod scan {
                 let text = match std::fs::read_to_string(path) {
                     Ok(text) => text,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        eprintln!(
-                            "call_sites::scan: {} vanished between the directory listing and \
-                             the read; skipped",
-                            path.display()
-                        );
-                        return None;
+                        let mut current = Vec::new();
+                        rust_files(&root, &mut current);
+                        if !current.contains(path) {
+                            eprintln!(
+                                "call_sites::scan: {} vanished between the directory listing \
+                                 and the read, and is gone from a fresh listing; skipped",
+                                path.display()
+                            );
+                            return None;
+                        }
+                        // Still there — the window was a rename, not a deletion.
+                        // The tolerance is for a file that is gone, not for one
+                        // this process could not read.
+                        std::fs::read_to_string(path).unwrap_or_else(|err| {
+                            panic!(
+                                "source file {} is listed but unreadable: {err}",
+                                path.display()
+                            )
+                        })
                     }
                     Err(err) => panic!("unreadable source file {}: {err}", path.display()),
                 };

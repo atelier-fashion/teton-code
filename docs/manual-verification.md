@@ -601,16 +601,21 @@ against a control.
 **Why there is no harness.** The same reason REQ-558's classifier gap has none,
 and more so. CI ships no weights: `tetond` is built without
 `--features tetond/llama`, and every automated fixture's local tier is a
-`ScriptedFileEngine` or a canned mock, which answers a 64 KiB scan from a string
-table in microseconds. A stand-in can prove the *call count*, the *cap*, and the
+`ScriptedFileEngine` or a canned mock, which answers a scan of a payload at the
+27,070-byte cap from a string table in microseconds. A stand-in can prove the *call count*, the *cap*, and the
 *decision* — it does, exhaustively — but a wall-clock number measured against a
 string table would be a fabricated one.
 
 **The budget's provenance, stated so nobody mistakes it for an observation.**
-2 s / 5 s is a **design target**. It was sized from the input cap (64 KiB ≈ 32k
-tokens at the duty seam's 2-bytes-per-token convention) against a 3B model on
-Metal, and the output side is tiny (`REDACT_OUTPUT_MAX_BYTES` = 2 KiB, a
-sixteen-line contract). **Nobody has run it.**
+2 s / 5 s is a **design target**. It was sized against a 3B model on Metal from
+an input cap of 64 KiB — which is **not the cap any more**: the cap is now
+derived from the engine window and is **27,070 bytes** (≈13.5k tokens at the
+duty seam's 2-bytes-per-token convention), less than half what the target was
+sized for. The output side is tiny either way (`REDACT_OUTPUT_MAX_BYTES` =
+2 KiB, a sixteen-line contract). So the target is if anything *pessimistic*
+now — but it is still a target, and **nobody has run it**. The measurement is
+what settles it; do not re-derive the number from the smaller cap and call that
+a result.
 
 **What IS covered automatically, and how far it goes:**
 

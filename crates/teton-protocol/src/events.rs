@@ -380,7 +380,7 @@ impl FindingKind {
     /// *class* of thing found is exactly what [`FindingKind`] is, and it can
     /// never name the thing itself (BR-6) because the type carries no text.
     #[must_use]
-    pub fn user_label(self) -> &'static str {
+    pub const fn user_label(self) -> &'static str {
         match self {
             FindingKind::Secret => "a secret",
             FindingKind::Credential => "a credential",

@@ -1233,6 +1233,16 @@ mod tests {
     /// verdict), and this pins the *call* — delete the loop in `send` and this
     /// turns red. The same instrument the duty seam uses for
     /// `bound_to_ceiling`.
+    ///
+    /// ## The needle covers the loop **body**, not just its header
+    ///
+    /// Matching only `forwarded_findings_report(&verdict)` accepts a loop that
+    /// calls the report and then does nothing with the lines — "call kept,
+    /// effect dropped", which is precisely the state this test exists to
+    /// forbid: findings computed and discarded are indistinguishable from
+    /// findings never made. So the whole statement is the needle, `eprintln!`
+    /// included. Whitespace is normalized first because `rustfmt`'s indentation
+    /// is not the thing under test.
     #[test]
     fn the_gate_arm_reports_a_forwarded_findings_verdict() {
         let source = crate::call_sites::scan::production_sources()
@@ -1240,10 +1250,14 @@ mod tests {
             .find(|(rel, _)| rel == "egress/mod.rs")
             .map(|(_, src)| crate::call_sites::scan::code_only(&src))
             .expect("this module is a production source");
+        let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            source.contains("redact::forwarded_findings_report(&verdict)"),
-            "the gate arm must report a forwarded verdict's findings; a finding computed \
-             and then dropped is indistinguishable from one never made (BR-4, ADR-4)"
+            normalized.contains(
+                "for line in redact::forwarded_findings_report(&verdict) { eprintln!(\"{line}\"); }"
+            ),
+            "the gate arm must report a forwarded verdict's findings AND emit them; a \
+             finding computed and then dropped is indistinguishable from one never made \
+             (BR-4, ADR-4)"
         );
         assert_eq!(
             crate::call_sites::scan::count(&source, "forwarded_findings_report"),
