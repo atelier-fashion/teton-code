@@ -699,7 +699,7 @@ pub async fn scan(route: &DutyRoute, payload: &str) -> RedactionVerdict {
     let Ok(Some(model)) = scanned else {
         return RedactionVerdict::unavailable_with_evidence(established());
     };
-    RedactionVerdict::from_findings(merge(pattern.findings().to_vec(), model))
+    RedactionVerdict::from_findings(merge(payload, pattern.findings().to_vec(), model))
 }
 
 /// Read the model's answer into located findings, or fail the scan (ADR-5).
@@ -970,12 +970,39 @@ fn locate(payload: &str, quoted: &str) -> Option<Range<usize>> {
 /// reason — a model that lists the same string twice, or once whole and once in
 /// part, is repeating itself. The first one wins, which is the leftmost after
 /// the sort below.
-fn merge(pattern: Vec<Finding>, model: Vec<Finding>) -> Vec<Finding> {
+///
+/// ## And the same string found in two different places is one report line
+///
+/// Overlap catches a repeat *at the same offsets*, which is what the chunk
+/// overlap produces. It does not catch the other repeat chunking makes possible:
+/// a payload that mentions the same address in chunk 1 and again in chunk 4.
+/// Each chunk's model sees a genuinely different occurrence, both locate, and
+/// the report grows one line per mention of a secret the user has to fix in one
+/// place. So a model finding whose payload bytes equal an already-kept model
+/// finding's is dropped too.
+///
+/// **Model findings only**, and against model findings only. A pattern hit is
+/// never dropped and never dedupes anything: the deterministic pass sweeps the
+/// whole payload, so a second occurrence of a string it matched is a second
+/// pattern finding — already handled, and by the overlap rule above rather than
+/// by this one.
+///
+/// **BR-6 survives it.** The comparison needs the bytes, so `payload` is
+/// borrowed here; the slices live inside this function and reach nothing it
+/// returns. A [`Finding`] still has no text field, so nothing downstream gained
+/// a way to quote the payload.
+fn merge(payload: &str, pattern: Vec<Finding>, model: Vec<Finding>) -> Vec<Finding> {
     let mut kept = pattern;
+    let mut quoted: Vec<&str> = Vec::new();
     for finding in model {
         if kept.iter().any(|k| overlap(k.span(), finding.span())) {
             continue;
         }
+        let bytes = &payload[finding.span().clone()];
+        if quoted.contains(&bytes) {
+            continue;
+        }
+        quoted.push(bytes);
         kept.push(finding);
     }
     kept.sort_by_key(|finding| (finding.span().start, finding.span().end));
@@ -2328,6 +2355,26 @@ mod tests {
             "the ceiling must be reached at the cap, or it is a loose bound and \
              the latency arithmetic it feeds is pessimistic by an unknown amount"
         );
+
+        // A multi-byte row **at the cap**, which the ASCII sweep above cannot
+        // reach: every char-boundary walk-back shortens a chunk, so a payload of
+        // 4-byte chars pays for the rounding on every window at once. If that
+        // rounding could push the count past the ceiling this is where it would
+        // show, and the guard `scan` now carries would start refusing maximal
+        // payloads of ordinary emoji or CJK text rather than scanning them.
+        let four_byte = "😀".repeat(REDACT_INPUT_MAX_BYTES / 4);
+        assert_eq!(
+            four_byte.len(),
+            REDACT_INPUT_MAX_BYTES,
+            "the cap must be a whole number of 4-byte chars, or this row is not \
+             at the cap"
+        );
+        let cut = chunk_ranges(&four_byte).len();
+        assert!(
+            cut <= REDACT_MAX_CHUNKS,
+            "a cap-sized payload of 4-byte chars cut into {cut} chunks, past the \
+             derived ceiling of {REDACT_MAX_CHUNKS}"
+        );
     }
 
     /// **The headline: a payload past one engine window is scanned, not
@@ -2557,6 +2604,70 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "and both chunks were asked"
+        );
+    }
+
+    /// **The same string found in two *different* places is one report line.**
+    ///
+    /// The pair for the overlap case above, and the one span-overlap cannot
+    /// reach: the address occurs twice, far apart, once in each chunk. Both
+    /// occurrences are real and both locate — at genuinely different offsets —
+    /// so nothing here is a duplicate *span*. What it is is one secret the user
+    /// fixes in one place, reported once per mention, and a payload that names
+    /// the same address in six paragraphs would spend six of the report's
+    /// sixteen lines saying so.
+    ///
+    /// The assertion is on both the finding count and the **report** line count,
+    /// because the report is where a user meets the difference and
+    /// `forwarded_findings_report` is one line per finding by construction.
+    #[tokio::test]
+    async fn the_same_quote_located_in_two_chunks_is_one_finding_and_one_report_line() {
+        let (route, calls) = counting_route(&format!("pii: {ADDRESS}"));
+        let payload = format!(
+            "{}{ADDRESS}{}{ADDRESS}{}",
+            filler(2_048),
+            filler(REDACT_CHUNK_MAX_BYTES),
+            filler(2_048)
+        );
+        let first = payload.find(ADDRESS).expect("the fixture plants two");
+        let second = payload[first + ADDRESS.len()..]
+            .find(ADDRESS)
+            .map(|at| at + first + ADDRESS.len())
+            .expect("the fixture plants two");
+
+        let chunks = chunk_ranges(&payload);
+        assert_eq!(chunks.len(), 2);
+        // The discriminating geometry: one occurrence per chunk, and neither
+        // chunk holds both — so the two findings are at different spans and the
+        // existing span-overlap rule has nothing to collapse.
+        assert!(
+            payload[chunks[0].clone()].contains(ADDRESS)
+                && payload[chunks[1].clone()].contains(ADDRESS)
+                && !chunks[0].contains(&second)
+                && !chunks[1].contains(&first),
+            "the fixture must put one occurrence in each chunk and neither in \
+             both, or it is the overlap test again"
+        );
+
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Findings);
+        assert_eq!(
+            verdict.findings().len(),
+            1,
+            "one string quoted from two chunks is one finding: {:?}",
+            verdict.findings()
+        );
+        assert_eq!(*verdict.findings()[0].span(), first..first + ADDRESS.len());
+        assert_eq!(
+            crate::egress::redact::forwarded_findings_report(&verdict).len(),
+            1,
+            "and one line in the report the operator reads"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "non-vacuity: both chunks were asked, and both answered with the \
+             address — so this is the dedupe rather than a chunk that never ran"
         );
     }
 

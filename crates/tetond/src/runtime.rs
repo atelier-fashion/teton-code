@@ -525,11 +525,25 @@ impl SessionTaint {
 
     /// Mark `session` tainted — pinned to the local tier for all later turns
     /// (idempotent).
-    pub fn mark(&self, session: &SessionId) {
+    ///
+    /// Returns **whether this call was the clean→tainted transition**, which is
+    /// what makes the pin announceable exactly once per session: the pin is a
+    /// durable, session-wide consequence with no in-session undo, and a
+    /// consequence that durable that nothing says out loud is one the user
+    /// discovers as "why is this suddenly slower". Every production call site
+    /// pairs a `true` with one [`taint_pin_line`] on stderr; a `false` is a
+    /// re-mark and owes nothing, so a session pinned by a boundary read and then
+    /// again by a redaction block still gets one line.
+    ///
+    /// Not `#[must_use]`: the several test call sites that only want the set
+    /// mutated would each have to say so, and the announcement is a call-site
+    /// concern (`template_fallback_line`'s shape) rather than something this
+    /// type performs.
+    pub fn mark(&self, session: &SessionId) -> bool {
         self.tainted
             .lock()
             .expect("taint mutex poisoned")
-            .insert(session.clone());
+            .insert(session.clone())
     }
 
     /// Whether `session` is pinned to the local tier by a prior boundary/unknown
@@ -623,8 +637,9 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
         block: teton_protocol::events::PrivacyBlock,
     ) {
         if let Some(session_id) = &session_id {
-            if (self.taints)(&block.cause) {
-                self.taint.mark(session_id);
+            // One line per session, on the transition only — `mark` reports it.
+            if (self.taints)(&block.cause) && self.taint.mark(session_id) {
+                eprintln!("{}", taint_pin_line(taint_cause_word(&block.cause)));
             }
         }
         self.events.privacy_block(session_id, block);
@@ -716,6 +731,62 @@ fn taints_the_session(detail: BlockDetail) -> bool {
     match detail {
         BlockDetail::Boundary | BlockDetail::Redaction => true,
         BlockDetail::ScanUnavailable => false,
+    }
+}
+
+/// A `local-only` boundary was crossed — REQ-544 C-2's original cause.
+const TAINT_BY_BOUNDARY: &str = "a `local-only` privacy boundary was crossed";
+/// The redaction scan found something in an outbound payload (REQ-562).
+const TAINT_BY_REDACTION: &str =
+    "the redaction scan found sensitive content in an outbound payload";
+/// This turn's assembled context carried boundary or unknown-provenance content.
+const TAINT_BY_CONTEXT: &str = "this turn read boundary or unknown-provenance content";
+/// Unreachable: [`cause_taints_the_session`] and [`mcp_cause_taints_the_session`]
+/// both answer `false` for `ScanUnavailable`, so no announcement is ever minted
+/// for it. Present so the maps below are total, and worded so that a future
+/// change which *does* pin on it produces a puzzling line rather than a panic in
+/// the daemon.
+const TAINT_BY_UNSTATED_CAUSE: &str = "a blocked outbound payload";
+
+/// The one line a session's clean→tainted transition owes the operator
+/// (REQ-562).
+///
+/// A pin is the most durable consequence this daemon takes on its own: every
+/// later turn in the session is forced local, and there is no in-session undo —
+/// the user's only remedy is a new session. Announcing it once is what keeps
+/// that from being discovered as "why did this get slower", and it is what the
+/// spec's *no new RPCs* leaves available: the daemon's own stderr, which is
+/// `tetond.log`.
+///
+/// A pure function for the same reason
+/// [`template_fallback_line`] is one — the shape is pinned by a unit test rather
+/// than by reading the emitting branch — and it takes `&'static str` for the
+/// reason `read_findings`' error type does: a compile-time literal cannot carry
+/// a runtime value, so no path, session id, or payload byte can reach this line
+/// even by accident. The cause is a *class*, never an instance.
+fn taint_pin_line(cause: &'static str) -> String {
+    format!(
+        "tetond: privacy — this session is pinned to the local tier for the rest of its life \
+         ({cause}); remote providers will not be used in it again."
+    )
+}
+
+/// The class word a [`BlockCause`] announces its pin with.
+fn taint_cause_word(cause: &BlockCause) -> &'static str {
+    match cause {
+        BlockCause::Boundary => TAINT_BY_BOUNDARY,
+        BlockCause::Redaction { .. } => TAINT_BY_REDACTION,
+        BlockCause::ScanUnavailable => TAINT_BY_UNSTATED_CAUSE,
+    }
+}
+
+/// The same word, from the turn path's [`BlockDetail`] vocabulary — the second
+/// spelling [`taints_the_session`] already exists in, for the same reason.
+fn taint_detail_word(detail: BlockDetail) -> &'static str {
+    match detail {
+        BlockDetail::Boundary => TAINT_BY_BOUNDARY,
+        BlockDetail::Redaction => TAINT_BY_REDACTION,
+        BlockDetail::ScanUnavailable => TAINT_BY_UNSTATED_CAUSE,
     }
 }
 
@@ -1842,8 +1913,8 @@ impl DaemonRuntime {
                 // Read as one value rather than asked twice — a block with no
                 // detail is not a block (see `HarnessError::privacy_block_detail`).
                 if let Some(detail) = err.privacy_block_detail() {
-                    if taints_the_session(detail) {
-                        self.session_taint.mark(&session_id);
+                    if taints_the_session(detail) && self.session_taint.mark(&session_id) {
+                        eprintln!("{}", taint_pin_line(taint_detail_word(detail)));
                     }
                     if !self.engine.present() {
                         return Err(RpcError::new(
@@ -1878,8 +1949,10 @@ impl DaemonRuntime {
                     // boundary or carries unknown provenance, pin the session to
                     // the local tier for every subsequent turn (the backstop for
                     // a later model paraphrase of what it read here).
-                    if context_is_sensitive(&ctx, &config.boundaries) {
-                        self.session_taint.mark(&session_id);
+                    if context_is_sensitive(&ctx, &config.boundaries)
+                        && self.session_taint.mark(&session_id)
+                    {
+                        eprintln!("{}", taint_pin_line(TAINT_BY_CONTEXT));
                     }
                     return Ok(PromptTurnResult {
                         turn_id,
@@ -7370,6 +7443,66 @@ provider_id = "on-device"
         taint.mark(&s); // idempotent
         assert!(taint.is_tainted(&s));
         assert!(!taint.is_tainted(&SessionId::from("other")));
+    }
+
+    /// **The pin is announced once per session, on the transition** (REQ-562).
+    ///
+    /// A taint forces every later turn in the session local with no in-session
+    /// undo, so it is announced — and announced *once*, because a session pinned
+    /// by a boundary read and then again by a redaction block is one pin. The
+    /// idempotent `mark` is what carries that: it reports the transition, and
+    /// every production call site emits its line only on a `true`.
+    ///
+    /// The line itself is checked separately because it is a pure function
+    /// (`template_fallback_line`'s shape): the emitting branches sit on the turn
+    /// path and behind the choke point, and a test that had to reach them to
+    /// check the wording would be testing the wrong thing.
+    ///
+    /// **The gap this leaves, stated rather than papered over.** What is pinned
+    /// is `mark`'s transition report and the line's wording. What is *not* is
+    /// that each call site actually gates on the former — a site rewritten to
+    /// announce on every block would print one line per blocked payload and no
+    /// test here would notice, because nothing in this suite captures the
+    /// daemon's stderr. `template_fallback_line` has the identical limit, and
+    /// closing it means a stderr-capture harness rather than another assertion.
+    #[test]
+    fn a_session_announces_its_pin_once_and_the_line_names_the_cause_only() {
+        let taint = SessionTaint::new();
+        let s = SessionId::from("s1");
+        assert!(taint.mark(&s), "the first mark is the transition");
+        assert!(
+            !taint.mark(&s),
+            "a re-mark owes no second line: one pin, one announcement"
+        );
+        assert!(
+            taint.mark(&SessionId::from("other")),
+            "and the announcement is per session, not per daemon"
+        );
+
+        for cause in [TAINT_BY_BOUNDARY, TAINT_BY_REDACTION, TAINT_BY_CONTEXT] {
+            let line = taint_pin_line(cause);
+            assert!(line.starts_with("tetond: "), "{line}");
+            assert!(line.contains("pinned to the local tier"), "{line}");
+            assert!(line.contains(cause), "{line}");
+            // A class, never an instance: no session id, no path, no payload.
+            assert!(!line.contains("s1"), "{line}");
+            assert!(!line.contains('/'), "{line}");
+        }
+
+        // Both cause vocabularies map onto the same words, so the line does not
+        // depend on which side of the `teton-providers` seam the block arrived
+        // through.
+        assert_eq!(
+            taint_cause_word(&BlockCause::Boundary),
+            taint_detail_word(BlockDetail::Boundary)
+        );
+        assert_eq!(
+            taint_cause_word(&BlockCause::Redaction {
+                kind: teton_protocol::events::FindingKind::Credential,
+                span: teton_protocol::events::ByteSpan { start: 0, end: 4 },
+            }),
+            taint_detail_word(BlockDetail::Redaction)
+        );
     }
 
     #[test]

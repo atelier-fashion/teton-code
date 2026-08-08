@@ -844,9 +844,17 @@ pub struct ConfigSnapshot {
     /// ## Additive with a default, like every field added to this wire since
     ///
     /// A snapshot from a daemon predating this field carries no key, and reads
-    /// `false` — the historical fact rather than a filler value, since no such
-    /// daemon ran the scan. A client predating the field ignores a key it does
-    /// not know. So the addition moves neither [`crate::PROTOCOL_VERSION`] nor
+    /// `false` — the historical fact rather than a filler value, since no
+    /// **released** daemon predating it ran the scan. (The claim is narrowed to
+    /// released builds on purpose: within REQ-562's own branch there were
+    /// intermediate builds that ran the scan before the field was added to this
+    /// wire, so "no such daemon ran the scan" is false of them. They shipped to
+    /// nobody, no client will ever read a snapshot one of them wrote, and the
+    /// default is the safe direction anyway — but a claim that is true of the
+    /// world and false of the repository's own history is the kind that gets
+    /// quoted back at a later reader.) A client predating the field ignores a
+    /// key it does not know. So the addition moves neither
+    /// [`crate::PROTOCOL_VERSION`] nor
     /// [`crate::PROTOCOL_VERSION_MIN`], exactly as `PrivacyBlock::cause` did
     /// not (REQ-562 ADR-7); both directions are asserted against literal JSON
     /// in this module's tests rather than left as a claim.

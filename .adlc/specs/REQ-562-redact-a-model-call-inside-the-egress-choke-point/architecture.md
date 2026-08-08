@@ -452,6 +452,26 @@ half runs all three causes through the production wiring in
 `an_mcp_redaction_block_pins_the_session_so_the_next_turn_resolves_local` pins
 the consequence rather than the flag. The round-2 `TODO(follow-up REQ)` is gone.
 
+**The pin is now announced, and un-pinning it is REQ-560-adjacent follow-up
+(round 4).** A taint is the most durable consequence the daemon takes on its
+own — every later turn in the session forced local, no in-session undo — and
+until now nothing said so out loud: the user met it as "why did this get
+slower". Within the *no new RPCs* constraint, the answer is the daemon's own
+stderr, which is `tetond.log`: `runtime::taint_pin_line` mints one line naming
+the pin and the cause **class** (never a path, session id, or payload byte),
+`SessionTaint::mark` reports the clean→tainted transition, and every production
+call site emits on that transition only. One pin, one line, whatever pins it
+and however many times.
+
+What is *not* here is a way to undo it. The remedy is still "start a new
+session", which is the right default — a pin that a user can clear on request
+is a pin an exfiltration path can ask them to clear — but it belongs with the
+permission surface rather than with the redactor: **REQ-560** owns the
+permission levels and the status line, so an operator-visible pin indicator and
+a deliberate, explicit un-pin are that REQ's shape to design (a new RPC, a
+status-line affordance, or both). Recorded here so the follow-up is owed to a
+named REQ rather than to "someone".
+
 **A fourth, closed rather than accepted, and worth the record.** The MCP error
 arm handed the model the *cause-distinct* privacy sentence. Three sentences on
 an input the model controls is a three-way oracle — vary an argument, read which
