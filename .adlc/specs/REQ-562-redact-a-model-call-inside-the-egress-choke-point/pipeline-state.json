@@ -3,14 +3,16 @@
   "branch": "feat/REQ-562-redact-egress-scan",
   "startedAt": "2026-08-07T00:00:00Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -49,6 +51,18 @@
       "name": "Verify (Reflect + Review)",
       "completedAt": "2026-08-08T00:00:00Z",
       "note": "6-agent panel + delegate pre-pass; 3 fix rounds (8+5+3 commits); user decisions: AC-1 adjudication accepted, no-taint-on-ScanUnavailable ratified, chunked scanning (blocker), MCP redaction taint + policy-show visibility added to scope; 1438 tests green"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-08-08T00:00:00Z",
+      "note": "PR #69 flipped to ready; body set preserving footprint; [WIP] dropped; requirement marked complete"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-08T00:00:00Z",
+      "note": "sanity sweep clean (sentinels only, no live TODOs, no bare println); all 6 CI checks green"
     }
   ],
   "repos": {
