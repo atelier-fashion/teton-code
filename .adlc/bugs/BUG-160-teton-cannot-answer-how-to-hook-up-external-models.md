@@ -1,7 +1,7 @@
 ---
 id: BUG-160
 title: "Asked how to hook up external models, the agent searches the user's repo — Teton's own setup instructions are not bundled"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-08
 updated: 2026-08-08
@@ -96,6 +96,11 @@ repo the model's only legal move.
   answers directly with the correct commands and **zero** tool calls, while
   "What version is this crate? Check Cargo.toml." still calls `read` and
   answers correctly — the tool path is unchanged.
+
+## Deployment
+
+n/a — OSS repo, no staging/production pipeline; the fix ships in the next
+tagged release (post-0.1.11). PR #72, CI green on both platforms.
 
 ## Files Changed
 
