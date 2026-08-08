@@ -116,7 +116,8 @@ type, not a discipline.
 ### ADR-6: One `Unavailable` state, fail closed, with a legible reason
 
 Enabled ∧ (route unresolved — no engine-backed local tier — ∨ payload exceeds
-`REDACT_INPUT_MAX_BYTES` ∨ engine error ∨ deadline) collapse into
+`REDACT_INPUT_MAX_BYTES` ∨ **any chunk's** engine error ∨ deadline ∨ unreadable
+reply ∨ a rendered chunk prompt over budget) collapse into
 `RedactionVerdict { outcome: Unavailable, scanned: false }` → Block (OQ-1/BR-3).
 Unlike the other duties, an over-cap payload is **never truncated-and-scanned**
 — a partial scan claiming completeness is the lie BR-7 forbids; the pattern
@@ -124,9 +125,14 @@ pass MAY still run first on an over-cap payload so a real finding can outrank
 "too large" as the reported reason, but the terminal outcome for over-cap is
 Block either way. The block's cause says the scan **could not run**, never that
 it found something — those are different problems with different fixes.
-`REDACT_INPUT_MAX_BYTES` is **derived from the engine window**, not chosen
-beside it (LESSON-446 — the cap and the window are two descriptions of one
-budget):
+
+**Two caps, and only one of them is the engine window** (round 3). The window
+bounds *one model call*; the scan is bounded by a multiple of it, because the
+model pass is chunked.
+
+`REDACT_CHUNK_MAX_BYTES` — the per-call window — is **derived from the engine
+window**, not chosen beside it (LESSON-446 — the window and the per-call cap
+are two descriptions of one budget):
 
 ```
   LOCAL_ENGINE_N_CTX          16,384 tokens
@@ -147,49 +153,123 @@ budget):
   × 9/10                      30,078 → 27,070 (ADR-10's insertion: at most one
                                                byte per 9 of payload —
                                                REDACT_DEFUSE_GROWTH_DIVISOR)
-  = REDACT_INPUT_MAX_BYTES    27,070 bytes
+  = REDACT_CHUNK_MAX_BYTES    27,070 bytes
 ```
 
-*(Originally stated as a flat 64 KiB "≈32k tokens at the duty seam's
-2-bytes/token convention". That was wrong by construction: `LlamaEngine`
-refuses any prompt over `n_ctx - max_tokens` tokens, so every payload from
-~30 KiB to 64 KiB passed the cap, was rendered into a prompt, and came back as
-an engine error — blocking with `ScanUnavailable` when the true reason was
-"too large to scan". BR-3's distinction, collapsed by arithmetic instead of by
-wording.)*
+`REDACT_INPUT_MAX_BYTES` — the bound on the scan as a whole — is a **stated
+multiple** of it. BR-7 asks for a bound, not for a window, and the multiple is
+chosen from the two things that actually constrain it: the body it has to hold,
+and the number of model calls it buys.
 
-**The cap is the filter; the bound is measured** (LESSON-488). Two terms are
-deliberately *not* in the arithmetic above, and they are why
-`harness::redact::scan` renders the prompt with the real `render_duty` and
-returns `Unavailable` — before the model call, at zero model cost — when the
-rendered size exceeds the prompt budget:
+```
+  HarnessConfig::context_budget_bytes   32,768 bytes  (turn_loop.rs:173)
+  + assumed body overhead                8,192 bytes  (system prompt with every
+                                                       tool's description, JSON
+                                                       envelope, escaping — the
+                                                       assumption, checked in
+                                                       `the_total_cap_clears_the_
+                                                       harness_context_budget_
+                                                       with_margin` against the
+                                                       real build_system_prompt)
+  = the largest ordinary body           40,960 bytes
+  × 2 (margin — a cap that only just clears the body it holds is one
+       context-budget bump from being the collision again)
+  = 81,920 bytes to clear
+  ÷ REDACT_CHUNK_MAX_BYTES              81,920 / 27,070 = 3.03
+  → the next whole chunk up                          4
+  = REDACT_INPUT_MAX_BYTES             108,280 bytes  (3.3× the context budget,
+                                                       2.6× a full body)
+```
+
+The **chunk count** is the other half of the choice, because every chunk is a
+model call and ADR-8's budget is per call. With a 256-byte overlap
+(`REDACT_CHUNK_OVERLAP_BYTES`) the stride is 26,814 bytes, so a payload at the
+total cap is at most **five** chunks — `REDACT_MAX_CHUNKS`, derived from the
+same constants and asserted against the real chunker rather than restated.
+Five is the number that has to stay small: the seam's deadline is per call, so
+the worst-case *wait* is `chunks × DUTY_DEADLINE`, and a cap twice this size
+would double it. See ADR-8.
+
+**The overlap, and what it is sized from.** Consecutive chunks overlap by 256
+bytes so that anything shorter appears whole in at least one chunk. 256 covers
+the longest thing this scan can detect with slack: the pattern shapes'
+realistic maxima (`AKIA…` is 20 bytes, `ghp_…` 40; the largest real instance of
+the open-ended ones is a three-segment RS256 bearer JWT at roughly 200) and the
+longest string the model is plausibly asked to quote (a postal address, well
+under 128). The slack is cheap rather than free: it shrinks the stride by under
+1% (26,814 instead of 27,070), which at the small counts this cap allows rounds
+to at most **one extra model call** — a payload at the total cap is five chunks
+with the overlap and would be four without, and nothing below ~81 KiB changes.
+It bounds what a boundary can cost rather than proving nothing is
+missed: a credential *longer* than 256 bytes that straddles a boundary is seen
+in halves by the model pass, but the **pattern pass has no window and is not
+chunked at all**, so every finding that blocks (BR-4's `High`) is unaffected by
+chunking at any length. What a too-small overlap can cost is a
+`Confidence::Low` report.
+
+**Fail-closed composition.** `scanned: true` requires the pattern pass *and*
+**every** chunk's model call to have completed. Any chunk `Unavailable` makes
+the whole verdict `Unavailable` — including when the pattern pass already found
+something and including when every other chunk came back clean. The loop
+returns on the first failure rather than continuing: there is no verdict left to
+build, and continuing would buy model calls for an answer already decided.
+Treating a failed chunk as one to skip would compose `Clean` from "clean" and
+"nothing looked", which is the truncate-and-scan lie in different clothes.
+
+*(The per-call cap was originally stated as a flat 64 KiB "≈32k tokens at the
+duty seam's 2-bytes/token convention". That was wrong by construction:
+`LlamaEngine` refuses any prompt over `n_ctx - max_tokens` tokens, so every
+payload from ~30 KiB to 64 KiB passed the cap, was rendered into a prompt, and
+came back as an engine error — blocking with `ScanUnavailable` when the true
+reason was "too large to scan". BR-3's distinction, collapsed by arithmetic
+instead of by wording.)*
+
+**The cap is the filter; the bound is measured** (LESSON-488), and it is
+measured **per chunk**. Two terms are deliberately *not* in the per-call
+arithmetic above, and they are why `harness::redact::scan` renders each chunk's
+prompt with the real `render_duty` and returns `Unavailable` — before that
+chunk's model call, at zero further model cost — when the rendered size exceeds
+the prompt budget:
 
 1. **Control-token neutralization.** `render_duty` defuses every `<|…|>` run on
    both arms, insertion-only, worst-cased at **one byte per two** of payload: a
-   payload of `<|`-runs closed by a `|>` inside the renderer's 64-byte span
+   chunk of `<|`-runs closed by a `|>` inside the renderer's 64-byte span
    window renders ~48% larger. Folding a `× 2/3` term into the constant would
-   drop the cap to ~18 KiB — below a single large file — for every user, to
-   pre-reject a payload the render guard rejects for nothing. So the term is
-   stated here and enforced there.
+   drop the window to ~18 KiB — below a single large file, and 50% more chunks
+   for everyone — to pre-reject a chunk the render guard rejects for nothing. So
+   the term is stated here and enforced there.
 2. **`2 bytes/token` is an estimate, not a bound.** Base64 and CJK content can
    tokenize under two bytes per token, and no byte arithmetic fixes that. The
    engine's typed over-window refusal stays as the last backstop, as for every
    other duty.
 
-**The cap collides with the harness's own context budget, and this REQ does not
-resolve it.** `HarnessConfig::context_budget_bytes` is **32,768**
-(`turn_loop.rs:173`) — *larger* than the 27,070-byte cap. A turn that fills its
-context budget therefore assembles a body this scan refuses, so with
-`[privacy] redact = true` a context-budget-full remote turn **blocks**, reported
-as `ScanUnavailable`. That is fail-closed and honest about its reason, and it is
-a real usability cost: the ceiling on "how much context can a remote turn carry
-while redaction is on" is set by the redactor's window, not by the harness's
-budget. Reconciling them — chunked scanning with a composed verdict, or a
-context budget derived from the cap — is **deliberate follow-up**; changing
-`context_budget_bytes` inside this REQ would move a budget five other subsystems
-are sized against. What this REQ owes instead is *measurement*: the AC-7
-procedure records the **over-cap block rate** as a first-class number, so the
-size of the collision is observed rather than argued about.
+The guard is inside the chunk loop, not in front of it. Hoisted, it would either
+refuse every multi-chunk payload (a payload of several windows renders past one
+window by construction — the collision restored one layer in) or measure only
+the first chunk and hand a dense later one to the engine anyway.
+
+**The collision with the harness's context budget is RESOLVED, not deferred.**
+Round 2 recorded it as a real usability cost and deliberate follow-up:
+`context_budget_bytes` is 32,768 and the per-call window is 27,070, so a turn
+that filled its context budget assembled a body the scan refused, and with
+`[privacy] redact = true` every context-budget-full remote turn blocked as
+`ScanUnavailable`. Fail-closed and honest about its reason, and unusable on any
+repository where long turns are normal — which is what made it a blocker rather
+than a rough edge.
+
+Chunking closes it from the redactor's side, which was the choice between the
+two options that paragraph named. The other — deriving `context_budget_bytes`
+from the scan's cap — would have moved a budget five other subsystems are sized
+against, and would have shrunk the harness to fit its scanner. The relationship
+now runs the other way: the harness's budget is an **input** to the scan's total
+cap (via the ×2 margin above), so the scan is sized to hold what the harness can
+assemble, with room for the budget to grow. `REDACT_CHUNK_MAX_BYTES` is still
+under `context_budget_bytes`, and that is now unremarkable: one engine window is
+not expected to hold a whole turn, and a payload larger than one window is
+scanned in several calls rather than refused. What a later `context_budget_bytes`
+bump has to respect is the margin, and
+`the_total_cap_clears_the_harness_context_budget_with_margin` is what fails if it
+stops holding.
 
 ### ADR-7: `privacy_block` gains an additive `cause`; the shape otherwise holds
 
@@ -203,10 +283,10 @@ string ("outbound payload, bytes 1400–1436"); kind + span give OQ-4's
 actionable report without echoing content. The CLI renders the three causes
 distinctly and renders **no matched text** (there is none to render — ADR-5).
 
-### ADR-8: Latency budget (BR-9): p50 ≤ 2s, p95 ≤ 5s at the input cap
+### ADR-8: Latency budget (BR-9): p50 ≤ 2s, p95 ≤ 5s **per chunk**
 
-Stated budget: on real mid-tier weights, a scan of a payload at
-`REDACT_INPUT_MAX_BYTES` completes in **p50 ≤ 2s, p95 ≤ 5s**; the duty seam's
+Stated budget: on real mid-tier weights, a model call over a chunk at
+`REDACT_CHUNK_MAX_BYTES` completes in **p50 ≤ 2s, p95 ≤ 5s**; the duty seam's
 existing deadline is the hard stop, and a deadline overrun is `Unavailable`
 (→ Block, per ADR-6 — a timed-out guard does not pass). CI has no real
 weights, so the measurement is a `docs/manual-verification.md` procedure
@@ -214,13 +294,55 @@ recorded as **NOT RUN** until dogfooding executes it (REQ-557/558 standard).
 The redactor is local — no `MeteredBody` rides the scan — so LESSON-488's
 drop-billing hazard does not attach to the scan itself.
 
+**The budget is per chunk; a scan is one or more chunks** (round 3). The
+per-call number is unchanged — it was always a number about one engine window,
+and the window is what a chunk is — but it is no longer the same thing as "a
+scan", and the two must not be conflated when the procedure is read:
+
+| Payload | Chunks | p50 at the budget | p95 |
+|---|---|---|---|
+| A short prompt | 1 | ≤ 2 s | ≤ 5 s |
+| **A context-budget-full turn** (~41 KiB body) | **2** | ≤ 4 s | ≤ 10 s |
+| A payload at `REDACT_INPUT_MAX_BYTES` | 5 (`REDACT_MAX_CHUNKS`) | ≤ 10 s | ≤ 25 s |
+
+The context-budget-full row is the one that matters, because it is the shape
+the harness produces on ordinary context-heavy work and the shape that used to
+**block** rather than take four seconds. Two chunks is the expected steady
+state; five is the ceiling, not the common case.
+
+**A residual chunking introduces, stated rather than discovered later: the
+deadline is per call, so the worst-case *wait* is `chunks × DUTY_DEADLINE`.** A
+maximal payload whose every chunk answers just under the 120-second deadline
+waits up to 600 seconds, where before it waited 120. Three things bound how bad
+that is, and none of them removes it: the first chunk that *overruns* ends the
+scan (fail-closed short-circuit — the 600 s case needs four chunks each
+answering at 119 s and succeeding, which is a degenerate engine rather than a
+slow one); the total cap is what bounds the multiplier, and it was chosen with
+this in mind (ADR-6); and the failure direction is slowness, not leakage. A
+scan-wide deadline — one budget across all chunks rather than one per call —
+is the fix, and it belongs at the seam where `DUTY_DEADLINE` lives rather than
+inside this duty, which is why it is **deliberate follow-up** and not part of
+this change. Adding a second spelling of "the scan ran out of time" inside
+`harness::redact` is exactly the two-spellings hazard the `RedactionGate`
+trait's docstring refuses for errors.
+
+**`route_decided` fires once per chunk, and that is correct rather than
+tolerated.** `DutyRoute::perform` announces on every invocation and
+deliberately does not deduplicate ("two oversized tool results are two routed
+model calls"); a chunked scan is several invocations, so a client watching a
+two-chunk send sees two `route_decided` events for one payload. The events
+describe *model calls*, and the scan really made two. Collapsing them would
+under-report exactly the sends that cost the most, which is the seam's own
+stated reason for not deduplicating in the first place.
+
 **The budget is per scan; a turn is many scans.** The gate is in
 `Egress::send`, so it runs once per **remote call**, and one user turn is up to
 `HarnessConfig::max_turns` agent iterations (12 weak-model, 40 strong-model)
 plus any remotely-bound duty sends plus any remote MCP `tools/call`. A 2 s p50
-per scan is therefore up to ~80 s added to one long tool-looping turn. The AC-7
-procedure measures the **turn** against a `redact = false` control for this
-reason; the per-scan number alone is not a number any user experiences.
+per chunk is therefore up to ~80 s added to one long tool-looping turn of short
+payloads, and more when those payloads are context-heavy enough to chunk. The
+AC-7 procedure measures the **turn** against a `redact = false` control for this
+reason; the per-chunk number alone is not a number any user experiences.
 
 **Two known residuals, recorded as accepted rather than fixed:**
 
@@ -231,7 +353,13 @@ reason; the per-scan number alone is not a number any user experiences.
    every remote call, and a long local turn in one session delays every remote
    turn in another. Nothing in CI can observe this (every fixture answers from a
    string table), so the AC-7 procedure's concurrent-sessions step is the only
-   instrument.
+   instrument. **Chunking multiplies this rather than changing it**: a two-chunk
+   scan takes and releases the lock twice, so a context-heavy send holds the
+   engine for roughly twice as long in total. It also releases it between
+   chunks, so another session can interleave — better for fairness, worse for
+   any one scan's wall clock. Which of those dominates is exactly what the
+   concurrent-sessions step measures, and it is now a step with two shapes of
+   payload rather than one.
 2. **A timed-out scan is not cancelled.** The seam's `DUTY_DEADLINE` is a
    `tokio::time::timeout` around `perform`, which drops the future — but the
    work runs in `spawn_blocking`, and dropping a `JoinHandle` does not abort a
@@ -295,8 +423,8 @@ inspect was empty, and here is my clean answer".
 payload, by the same insertion-only, order-independent interposition
 (`_Payload:`) `render::neutralize_frame_labels` uses — sharing the mechanism
 (`defuse_at_line_starts`) while each layer keeps its own alphabet, which is
-ADR-009 rule 2. The insertion is why `REDACT_INPUT_MAX_BYTES` carries a growth
-term (ADR-6): a cap sized against the raw payload would let an all-labels
+ADR-009 rule 2. The insertion is why `REDACT_CHUNK_MAX_BYTES` carries a growth
+term (ADR-6): a window sized against the raw payload would let an all-labels
 payload push the prompt back over the engine window.
 
 **The residual, stated rather than implied.** This closes the byte-perfect

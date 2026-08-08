@@ -79,7 +79,8 @@ use teton_providers::{
 
 use tetond::egress::provenance::{assembled_provenance, ContextBlock};
 use tetond::egress::redact::{
-    decide, EgressDecision, Outcome, RedactionGate, RedactionVerdict, REDACT_INPUT_MAX_BYTES,
+    decide, EgressDecision, Outcome, RedactionGate, RedactionVerdict, REDACT_CHUNK_MAX_BYTES,
+    REDACT_INPUT_MAX_BYTES,
 };
 use tetond::egress::{Egress, EgressContext, EgressError, NoopSink, PrivacyEventSink, Provenance};
 use tetond::harness::redact::{scan, REDACTION_OUTPUT_CONTRACT};
@@ -900,6 +901,105 @@ async fn a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call()
         engine.redact_calls(),
         1,
         "that one really did reach a model"
+    );
+}
+
+/// **The blocker this change exists for, end to end.** A context-heavy remote
+/// send crosses the gate and reaches the wire.
+///
+/// 40 KiB is the shape of an ordinary context-budget-full turn:
+/// `HarnessConfig::context_budget_bytes` is 32,768 and the system prompt, the
+/// JSON envelope and the escaping ride on top of it. That is *over* one engine
+/// window ([`REDACT_CHUNK_MAX_BYTES`], 27,070) and *under* the total cap, and
+/// before chunked scanning it was refused: `ScanUnavailable`, fail-closed, and
+/// every such turn dead with `[privacy] redact = true`.
+///
+/// Three assertions, and the third is what makes it chunking rather than a
+/// bigger number: the send **forwards** the exact bytes, the verdict claims the
+/// scan **ran**, and it cost **more than one** model call — one per window.
+///
+/// The twin underneath is the discrimination: the same size of payload with a
+/// credential planted past the first window still blocks, so this is a scan
+/// that looked at all of it rather than a gate that stopped looking.
+#[tokio::test]
+async fn a_context_budget_full_payload_is_scanned_across_windows_and_forwards() {
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let engine = engine_pair("NONE");
+    let gate = Arc::new(
+        TestGate::new(router_with_local_tier(Some(CANONICAL_LOCAL_ID)))
+            .serving(Arc::clone(&engine.engine)),
+    );
+    let egress = choke_point(&capture, &sink, Arc::clone(&gate));
+
+    let big = "the retry helper reads the manifest and writes one report line. ".repeat(640);
+    assert!(
+        big.len() > REDACT_CHUNK_MAX_BYTES && big.len() < REDACT_INPUT_MAX_BYTES,
+        "the fixture must be over one engine window and under the total cap: {}",
+        big.len()
+    );
+    let (request, provenance) = clean_provenance_payload(&big);
+    let body = request.body.clone();
+
+    egress
+        .send(request, &provenance, &ctx())
+        .await
+        .expect("a context-budget-full payload must reach the wire, not block");
+
+    assert_eq!(
+        capture.captured().len(),
+        1,
+        "the send must have reached the transport"
+    );
+    assert_eq!(
+        capture.captured()[0].body,
+        body,
+        "and byte-for-byte: v1 detects, it never substitutes (BR-5, AC-9)"
+    );
+    let verdict = gate.only_verdict();
+    assert_eq!(verdict.outcome(), Outcome::Clean);
+    assert!(
+        verdict.scanned(),
+        "a forward on this path must be a scan that ran, not one that could not"
+    );
+    assert!(
+        engine.redact_calls() > 1,
+        "a payload larger than one engine window is scanned in several calls; \
+         {} is what a raised cap would look like",
+        engine.redact_calls()
+    );
+
+    // The discrimination: the same size, a credential past the first window,
+    // and it still blocks — so the scan really did look at the whole thing.
+    let planted = format!(
+        "{} {} at the end.",
+        "the retry helper reads the manifest and writes one report line. ".repeat(640),
+        PATTERN_SENTINEL
+    );
+    let at = planted.find(PATTERN_SENTINEL).expect("fixture");
+    assert!(
+        at > REDACT_CHUNK_MAX_BYTES,
+        "the planted credential must sit past the first window"
+    );
+    let (request, provenance) = clean_provenance_payload(&planted);
+    let err = egress
+        .send(request, &provenance, &ctx())
+        .await
+        .expect_err("a credential past the first window must still block");
+    assert!(
+        matches!(
+            err,
+            EgressError::PrivacyBlocked {
+                cause: BlockCause::Redaction { .. },
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        capture.captured().len(),
+        1,
+        "and nothing more reached the wire"
     );
 }
 

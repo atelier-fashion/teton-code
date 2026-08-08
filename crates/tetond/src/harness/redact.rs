@@ -28,32 +28,47 @@
 //! **dropped**: a finding with no span is not a finding, and the alternative is
 //! reporting a span the model invented.
 //!
-//! ## This is the one duty prompt that does not bound its material
+//! ## This is the one duty prompt that does not truncate its material
 //!
 //! Every other duty truncates what it embeds (`truncate_middle`) because a
 //! bounded prompt is cheaper and the answer resolves against a list rather than
 //! against the text. Here truncation would be a **lie**: a scan of the first
 //! half of a payload that reports `Clean` claims the whole payload was looked
-//! at (BR-7). So the payload goes in whole, and the bound is a *refusal* above
-//! [`REDACT_INPUT_MAX_BYTES`](crate::egress::redact::REDACT_INPUT_MAX_BYTES) —
-//! [`scan`] returns `Unavailable` (→ Block) and never asks the model at all.
+//! at (BR-7).
 //!
-//! That cap is **derived from the local engine's context window minus this
-//! duty's generation reservation, minus [`REDACT_PROMPT_OVERHEAD_BYTES`]**
+//! What bounds the prompt instead is the engine's window, and what an engine
+//! window bounds is **one call**. A payload larger than
+//! [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES) is
+//! cut into overlapping chunks ([`chunk_ranges`]) and scanned in several calls,
+//! each chunk whole in its own prompt, with every finding mapped back into the
+//! payload's own byte offsets. Nothing is dropped, so nothing is claimed that
+//! was not looked at.
+//!
+//! That per-chunk cap is **derived from the local engine's context window minus
+//! this duty's generation reservation, minus [`REDACT_PROMPT_OVERHEAD_BYTES`]**
 //! (LESSON-446). It has to be: the prompt this module builds is what has to fit,
-//! and a cap chosen independently of the window turns "too large to scan" into
-//! an engine error reported as "the scan could not run".
+//! and a window chosen independently of the engine's turns "too large for one
+//! call" into an engine error reported as "the scan could not run".
 //!
-//! ## A completed scan means **both** passes completed (ADR-6)
+//! The scan is still **bounded** — BR-7 asks for a bound, not for a window — by
+//! [`REDACT_INPUT_MAX_BYTES`](crate::egress::redact::REDACT_INPUT_MAX_BYTES), a
+//! stated multiple of the per-chunk cap. Above it [`scan`] returns
+//! `Unavailable` (to Block) and never asks the model at all. Chunking spreads a
+//! scan across calls; it does not make one unbounded.
+//!
+//! ## A completed scan means both passes completed, on **every** chunk (ADR-6)
 //!
 //! [`scan`] reports `scanned: true` only when the deterministic pattern pass and
-//! the model pass both ran. If the model pass cannot run — route unresolved,
-//! engine error, deadline, payload over the cap — the verdict is `Unavailable`
-//! *even when the pattern pass already found something*. Both outcomes block, so
-//! nothing leaks either way; what differs is the claim. Reporting `Findings`
-//! would carry `scanned: true` and assert a completed scan of a payload the
-//! model never saw, and the block's cause would say the scan found something
-//! rather than that it could not run — different problems with different fixes
+//! the model pass both ran — and the model pass ran when *every* chunk's call
+//! completed. If any chunk cannot run — route unresolved, engine error,
+//! deadline, unreadable reply, a rendered prompt past the engine's budget — the
+//! whole verdict is `Unavailable`, *even when the pattern pass already found
+//! something* and *even when every other chunk came back clean*. Both outcomes
+//! block, so nothing leaks either way; what differs is the claim. Reporting
+//! `Findings` would carry `scanned: true` and assert a completed scan of a
+//! payload part of which the model never saw — the truncate-and-scan lie with
+//! extra steps, and the block's cause would say the scan found something rather
+//! than that it could not run — different problems with different fixes
 //! (BR-3).
 //!
 //! ## Why the recognition arm goes first in [`ScriptedFileEngine`]
@@ -83,7 +98,8 @@ use teton_inference::ChatFormat;
 use teton_protocol::Category;
 
 use crate::egress::redact::{
-    pattern_verdict, Finding, FindingKind, Outcome, RedactionVerdict, REDACT_PROMPT_BUDGET_BYTES,
+    pattern_verdict, Finding, FindingKind, Outcome, RedactionVerdict, REDACT_CHUNK_MAX_BYTES,
+    REDACT_INPUT_MAX_BYTES, REDACT_PROMPT_BUDGET_BYTES,
 };
 use crate::egress::Provenance;
 
@@ -183,9 +199,10 @@ fn starts_with_payload_label(line: &str) -> bool {
 /// newline that put it at a line start, so `k` insertions need at least
 /// `k * (len(PAYLOAD_LABEL) + 1) - 1` bytes of payload.
 ///
-/// It is public because [`REDACT_INPUT_MAX_BYTES`](crate::egress::redact::REDACT_INPUT_MAX_BYTES)
-/// is derived through it: the cap has to be the size at which the **neutralized**
-/// prompt still fits the engine's window, not the raw one (LESSON-446).
+/// It is public because [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES)
+/// is derived through it: the per-call window has to be the size at which the
+/// **neutralized** prompt still fits the engine's window, not the raw one
+/// (LESSON-446).
 pub const REDACT_DEFUSE_GROWTH_DIVISOR: usize = PAYLOAD_LABEL.len() + 1;
 
 /// Defuse line-anchored [`PAYLOAD_LABEL`]s inside a payload (ADR-009).
@@ -318,6 +335,126 @@ pub(crate) fn rendered_prompt_bytes(prompt: &str) -> usize {
     render_duty(ChatFormat::ChatMl, prompt).len()
 }
 
+/// The overlap between consecutive model-pass chunks, in bytes.
+///
+/// ## What it buys
+///
+/// A chunk boundary is a place a credential can be cut in half, and half a
+/// credential is a string the model cannot quote — and one [`locate`] would
+/// drop as a fabrication if it did. So consecutive chunks overlap, and anything
+/// no longer than this appears **whole** in at least one of them: a string that
+/// starts inside chunk *k*'s window and runs past its end starts within
+/// `REDACT_CHUNK_OVERLAP_BYTES` of that end, and chunk *k+1* begins exactly
+/// there.
+///
+/// ## Why 256
+///
+/// Sized from the longest thing this scan can detect, with slack:
+///
+/// - **the pattern shapes' realistic maxima.** `AKIA…` is exactly 20 bytes and
+///   `ghp_…` 40. The three open-ended ones are `sk-…`, `Bearer <token>` and
+///   `[A-Z_]+_(API_KEY|TOKEN)=<value>`; the largest real instance of any of them
+///   is a bearer JWT, and a three-segment RS256 JWT with a small claim set runs
+///   to roughly 200 bytes.
+/// - **what the model is asked to quote** — "that string copied exactly as it
+///   appears". Its longest plausible answer is not a key but a line of personal
+///   information: a full postal address is comfortably under 128 bytes.
+///
+/// The slack is cheap but not free, and the honest arithmetic is worth writing
+/// down. 256 bytes shrinks the stride by under 1% — 26,814 instead of 27,070 —
+/// so a payload needs under 1% more window to cover. At the small counts this
+/// cap allows, that rounds to **at most one extra model call**: a payload at
+/// [`REDACT_INPUT_MAX_BYTES`] is five chunks with the overlap and would be four
+/// without it. One call is what a boundary-safe scan costs at the very top of
+/// the range, and nothing at all below ~81 KiB.
+///
+/// ## What it does *not* claim
+///
+/// It is a bound on what a boundary can cost, not a proof that nothing is
+/// missed. A credential **longer** than this that lands across a boundary is
+/// seen only in halves by the model pass. Two things bound that: the
+/// deterministic pattern pass sweeps the whole payload in one piece and has no
+/// boundary to be cut by — so every finding that *blocks* (BR-4's `High`) is
+/// unaffected by chunking at any length — and what the model pass can lose is a
+/// `Confidence::Low` report, the same currency every other approximation in this
+/// module is paid in.
+pub const REDACT_CHUNK_OVERLAP_BYTES: usize = 256;
+
+/// The distance between the starts of two consecutive chunks.
+///
+/// Derived rather than stated: the stride *is* the window minus the overlap,
+/// and writing it down beside them is the second number LESSON-446 is about.
+const REDACT_CHUNK_STRIDE_BYTES: usize = REDACT_CHUNK_MAX_BYTES - REDACT_CHUNK_OVERLAP_BYTES;
+
+/// The most chunks a payload can be cut into — equivalently, the most model
+/// calls one send can buy (BR-7, ADR-8).
+///
+/// Five, at today's constants: a payload at [`REDACT_INPUT_MAX_BYTES`]
+/// (108,280 bytes) covered by 27,070-byte windows striding 26,814 bytes needs
+/// `ceil((108,280 − 27,070) / 26,814) + 1 = 5` of them.
+///
+/// It is the number ADR-8's budget is multiplied by — p50 ≤ 2 s per chunk means
+/// p50 ≤ 10 s for a maximal payload — and the number the seam's per-call
+/// deadline is multiplied by in the worst case. Derived here rather than
+/// declared so that raising the total cap moves it, and
+/// [`tests::the_chunker_never_cuts_more_chunks_than_the_derived_ceiling`] checks
+/// the derivation against the real chunker instead of trusting the arithmetic.
+pub const REDACT_MAX_CHUNKS: usize =
+    (REDACT_INPUT_MAX_BYTES - REDACT_CHUNK_MAX_BYTES).div_ceil(REDACT_CHUNK_STRIDE_BYTES) + 1;
+
+/// Cut `payload` into the overlapping windows the model pass scans, as byte
+/// ranges into `payload` itself.
+///
+/// One range covering everything when the payload fits a single window, which
+/// is the ordinary case and the one every pre-chunking test exercises.
+///
+/// Three properties, each of which something downstream depends on:
+///
+/// 1. **Every range is at most [`REDACT_CHUNK_MAX_BYTES`] long**, so each one
+///    builds a prompt the engine's window can hold.
+/// 2. **Consecutive ranges overlap by at least
+///    [`REDACT_CHUNK_OVERLAP_BYTES`]**, so a short string cannot be cut by
+///    every chunk that contains part of it.
+/// 3. **Every boundary is a char boundary.** The ranges slice a `&str`, so a
+///    cut inside a multi-byte sequence would panic rather than degrade — and
+///    the walk is always *backwards*, which shortens a chunk and lengthens an
+///    overlap, so rounding can never violate (1) or (2).
+///
+/// The ranges also union to the whole payload: consecutive windows overlap
+/// rather than abut, so there is no gap for a byte to fall into. That is what
+/// makes "the model looked at all of it" true, which is what `scanned: true`
+/// claims (BR-7).
+fn chunk_ranges(payload: &str) -> Vec<Range<usize>> {
+    let len = payload.len();
+    let mut ranges = Vec::new();
+    if len <= REDACT_CHUNK_MAX_BYTES {
+        // Pushed rather than written as `vec![0..len]`, which clippy reads as a
+        // mistyped `(0..len).collect()` — a plausible enough mistake that the
+        // lint is right to ask, and cheaper to answer in code than in an
+        // `allow`.
+        ranges.push(0..len);
+        return ranges;
+    }
+    let mut start = 0usize;
+    loop {
+        let mut end = (start + REDACT_CHUNK_MAX_BYTES).min(len);
+        // Backwards, so the chunk shrinks rather than overruns the window.
+        while end < len && !payload.is_char_boundary(end) {
+            end -= 1;
+        }
+        ranges.push(start..end);
+        if end == len {
+            return ranges;
+        }
+        // Backwards again, so the overlap grows rather than shrinks below the
+        // length it is sized to cover.
+        start = end - REDACT_CHUNK_OVERLAP_BYTES;
+        while !payload.is_char_boundary(start) {
+            start -= 1;
+        }
+    }
+}
+
 /// Scan `payload` with both passes and return the verdict the choke point acts
 /// on — **the entry point the gate calls** (ADR-4, ADR-6).
 ///
@@ -331,29 +468,42 @@ pub(crate) fn rendered_prompt_bytes(prompt: &str) -> usize {
 ///
 /// The order is load-bearing:
 ///
-/// 1. **The input cap first**, so an over-cap payload costs no model call at all
+/// 1. **The total cap first**, so an over-cap payload costs no model call at all
 ///    (BR-7). The cap lives in
 ///    [`pattern_verdict`](crate::egress::redact::pattern_verdict) and is read
 ///    from its outcome rather than re-tested here, so there is one cap and one
 ///    place to change it.
-/// 2. **An unresolved route next**, before the prompt is built: a payload at
-///    the cap rendered into a prompt no model will ever see is 27,070 bytes of
-///    work done for a call that cannot happen (`name_session`'s precedent).
-/// 3. **Then the rendered prompt is measured** against the engine's own budget
-///    ([`rendered_prompt_bytes`], LESSON-488). The input cap is arithmetic over
-///    the payload; the thing that has to fit is the *rendered* prompt, and two
-///    transforms run after the cap check — the frame defusing this module does
-///    and the control-token neutralization plus ChatML envelope `render_duty`
-///    does. A payload at the cap built of `<|`-runs renders ~48% larger than
-///    the arithmetic allows for, and without this it reached the engine, came
-///    back as an over-window error, and blocked saying "the scan could not
-///    run" when the truth is "this payload is too large to scan". The cap stays
-///    as the cheap first filter; this is the bound.
-/// 4. Then the model pass, then the merge.
+/// 2. **An unresolved route next**, before any prompt is built: a payload at
+///    the cap rendered into five prompts no model will ever see is a lot of work
+///    done for calls that cannot happen (`name_session`'s precedent).
+/// 3. **Then, per chunk, the rendered prompt is measured** against the engine's
+///    own budget ([`rendered_prompt_bytes`], LESSON-488). The per-chunk cap is
+///    arithmetic over the payload; the thing that has to fit is the *rendered*
+///    prompt, and two transforms run after the chunk is cut — the frame defusing
+///    this module does and the control-token neutralization plus ChatML envelope
+///    `render_duty` does. A chunk at the window built of `<|`-runs renders ~48%
+///    larger than the arithmetic allows for, and without this it reached the
+///    engine, came back as an over-window error, and blocked saying "the scan
+///    could not run" when the truth is "this chunk is too dense to render". The
+///    per-chunk cap stays as the cheap first filter; this is the bound. It is
+///    checked **per chunk**, because it is the chunk that becomes a prompt.
+/// 4. Then that chunk's model call, then its findings mapped from chunk-relative
+///    offsets into the payload's own, then the next chunk — and the merge once
+///    every chunk is in.
 ///
-/// Failure of any of those is [`Outcome::Unavailable`], never [`Outcome::Clean`]
-/// — including when the pattern pass already found something. See the module
-/// docs: both block, but only one of them is honest about why.
+/// Failure of any of those, on **any** chunk, is [`Outcome::Unavailable`], never
+/// [`Outcome::Clean`] — including when the pattern pass already found something,
+/// and including when every other chunk came back clean. See the module docs:
+/// both block, but only one of them is honest about why. The loop returns on the
+/// first failure rather than carrying on, which is not an optimization: there is
+/// no verdict left to build, and continuing would buy model calls for an answer
+/// already decided.
+///
+/// **Spans are the payload's, never a chunk's.** `read_findings` takes the
+/// chunk's offset and applies it where the span is minted, so a chunk-relative
+/// range never exists outside that function — there is no later step that could
+/// forget to translate one, and a finding reported at a chunk-relative offset
+/// would point the user at the wrong bytes of the request they sent.
 ///
 /// `Provenance::empty()` is what this duty sends with, and it is not an
 /// oversight. The provenance argument exists so a *remote* duty can be refused
@@ -365,6 +515,16 @@ pub(crate) fn rendered_prompt_bytes(prompt: &str) -> usize {
 /// provenance would add nothing either: the gate runs *after* the provenance
 /// inspection already allowed these bytes to leave (ADR-1), so scoping by it
 /// could refuse nothing.
+///
+/// ## One `route_decided` per chunk, and that is the honest count
+///
+/// [`DutyRoute::perform`] publishes its announcement once per invocation and
+/// deliberately does not deduplicate — "two oversized tool results are two
+/// routed model calls". A chunked scan is N invocations, so a client watching a
+/// multi-chunk send sees N `route_decided` events for one payload. Collapsing
+/// them would under-report exactly the sends that cost the most, which is the
+/// seam's own stated rule; the count is what a `redact` scan actually spent.
+/// [`tests::a_multi_chunk_scan_announces_its_route_once_per_chunk`] pins it.
 #[must_use]
 pub async fn scan(route: &DutyRoute, payload: &str) -> RedactionVerdict {
     let pattern = pattern_verdict(payload);
@@ -374,23 +534,28 @@ pub async fn scan(route: &DutyRoute, payload: &str) -> RedactionVerdict {
     if matches!(route, DutyRoute::Unresolved { .. }) {
         return RedactionVerdict::unavailable();
     }
-    let prompt = redact_prompt(payload);
-    // The bound, measured rather than estimated (LESSON-488). A prompt the
-    // engine would refuse as over-window is refused HERE, before the call, so
-    // it costs nothing and — more to the point — so it is one failure with one
-    // cause instead of an engine error wearing the wrong reason.
-    if rendered_prompt_bytes(&prompt) > REDACT_PROMPT_BUDGET_BYTES {
-        return RedactionVerdict::unavailable();
+    let mut model = Vec::new();
+    for chunk in chunk_ranges(payload) {
+        let text = &payload[chunk.clone()];
+        let prompt = redact_prompt(text);
+        // The bound, measured rather than estimated (LESSON-488). A prompt the
+        // engine would refuse as over-window is refused HERE, before the call,
+        // so it costs nothing and — more to the point — so it is one failure
+        // with one cause instead of an engine error wearing the wrong reason.
+        if rendered_prompt_bytes(&prompt) > REDACT_PROMPT_BUDGET_BYTES {
+            return RedactionVerdict::unavailable();
+        }
+        let Ok(answer) = route.perform(&prompt, &Provenance::empty()).await else {
+            return RedactionVerdict::unavailable();
+        };
+        // The reply is consumed here and nowhere else. What comes back out is a
+        // list of spans in the PAYLOAD's coordinates; what goes in is never
+        // returned, never logged, and never carried by the error (ADR-5, BR-6).
+        let Ok(found) = read_findings(&answer, text, chunk.start) else {
+            return RedactionVerdict::unavailable();
+        };
+        model.extend(found);
     }
-    let Ok(answer) = route.perform(&prompt, &Provenance::empty()).await else {
-        return RedactionVerdict::unavailable();
-    };
-    // The reply is consumed here and nowhere else. What comes back out is a list
-    // of spans; what goes in is never returned, never logged, and never carried
-    // by the error (ADR-5, BR-6).
-    let Ok(model) = read_findings(&answer, payload) else {
-        return RedactionVerdict::unavailable();
-    };
     RedactionVerdict::from_findings(merge(pattern.findings().to_vec(), model))
 }
 
@@ -416,10 +581,26 @@ pub async fn scan(route: &DutyRoute, payload: &str) -> RedactionVerdict {
 /// result could not be read, and calling that `Clean` is the permissive failure
 /// BR-3 and LESSON-447 forbid.
 ///
+/// ## `chunk` is what the model saw; `offset` is where it sat
+///
+/// The model was shown one chunk of the payload, so [`locate`] searches that
+/// chunk and the span it returns is chunk-relative. `offset` is the chunk's
+/// start in the payload, and it is applied **here**, at the one place a span is
+/// minted, so no chunk-relative range ever escapes this function. A single-chunk
+/// scan passes `0` and nothing changes; a multi-chunk scan gets spans that
+/// address the request the user actually sent, which is the only coordinate
+/// system the report, the `privacy_block` locus and the user's own text editor
+/// agree on.
+///
+/// Locating against the chunk rather than against the whole payload is not an
+/// optimization either: a string the model quoted from chunk 2 might also occur
+/// in chunk 1, and searching the payload would report the first occurrence —
+/// a span pointing at bytes this call never looked at.
+///
 /// # Errors
 /// A static sentence saying the answer could not be read. It names nothing the
 /// model wrote.
-fn read_findings(answer: &str, payload: &str) -> Result<Vec<Finding>, &'static str> {
+fn read_findings(answer: &str, chunk: &str, offset: usize) -> Result<Vec<Finding>, &'static str> {
     let mut located = Vec::new();
     let mut readable = false;
     for line in answer.lines() {
@@ -437,9 +618,11 @@ fn read_findings(answer: &str, payload: &str) -> Result<Vec<Finding>, &'static s
             }
             continue;
         };
-        // A string the model reported but the payload does not contain is a
-        // fabrication, and a fabrication with no span is not a finding.
-        let span = locate(payload, quoted);
+        // A string the model reported but the chunk it was shown does not
+        // contain is a fabrication, and a fabrication with no span is not a
+        // finding. The span is translated into the payload's coordinates the
+        // moment it exists — see this function's docs.
+        let span = locate(chunk, quoted).map(|span| span.start + offset..span.end + offset);
         // **What counts as "this parser understood the answer".** An anchored
         // head — the kind word behind nothing but list decoration — is the
         // contract's shape, and it is readable whether or not the quote turns
@@ -734,21 +917,27 @@ mod tests {
     /// truncate its material (BR-7).
     ///
     /// A truncating builder would still pass a "the prompt contains the payload"
-    /// assertion for a short fixture, so the fixture here is a payload just under
-    /// the input cap: several times any per-duty display bound in this harness,
-    /// and the size at which every other duty's builder would have cut.
+    /// assertion for a short fixture, so the fixture here is a chunk at the
+    /// per-call window: several times any per-duty display bound in this
+    /// harness, and the size at which every other duty's builder would have cut.
+    ///
+    /// The window rather than the total cap, because this is about the *prompt*
+    /// and a prompt is built from one chunk. What stops a larger payload being
+    /// cut short is the chunker, which is
+    /// [`tests::the_chunker_covers_the_payload_with_overlapping_windows_on_char_boundaries`]'s
+    /// claim that the ranges reach the end of the payload.
     #[test]
     fn the_payload_is_embedded_whole_and_never_truncated() {
         let head = "the head of a large request ";
         let tail = " and its tail";
         let big = format!(
             "{head}{}{tail}",
-            "x".repeat(REDACT_INPUT_MAX_BYTES - head.len() - tail.len())
+            "x".repeat(REDACT_CHUNK_MAX_BYTES - head.len() - tail.len())
         );
         assert_eq!(
             big.len(),
-            REDACT_INPUT_MAX_BYTES,
-            "the fixture is at the cap"
+            REDACT_CHUNK_MAX_BYTES,
+            "the fixture is at the per-call window"
         );
 
         let prompt = redact_prompt(&big);
@@ -920,7 +1109,7 @@ mod tests {
     /// finding carries no text, because the type has nowhere to put any.
     #[test]
     fn a_quoted_string_present_in_the_payload_becomes_a_located_low_finding() {
-        let found = read_findings(&format!("pii: {ADDRESS}"), PAYLOAD)
+        let found = read_findings(&format!("pii: {ADDRESS}"), PAYLOAD, 0)
             .expect("a contract-shaped answer is readable");
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(*found[0].span(), span_of(PAYLOAD, ADDRESS));
@@ -943,7 +1132,7 @@ mod tests {
     /// discriminating rather than the parser failing to read the line.
     #[test]
     fn a_quoted_string_absent_from_the_payload_is_dropped_not_reported() {
-        let invented = read_findings("credential: hunter2-not-in-the-payload", PAYLOAD)
+        let invented = read_findings("credential: hunter2-not-in-the-payload", PAYLOAD, 0)
             .expect("a readable answer, even when everything in it was invented");
         assert!(
             invented.is_empty(),
@@ -953,6 +1142,7 @@ mod tests {
         let real = read_findings(
             "credential: hunter2-not-in-the-payload\npii: jane.doe@example.com",
             PAYLOAD,
+            0,
         )
         .expect("readable");
         assert_eq!(
@@ -969,7 +1159,7 @@ mod tests {
     #[test]
     fn a_chatty_answer_is_still_read() {
         let answer = format!("Here is what I found:\n- **PII**: \"{ADDRESS}\"\nHope that helps!");
-        let found = read_findings(&answer, PAYLOAD).expect("readable");
+        let found = read_findings(&answer, PAYLOAD, 0).expect("readable");
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(*found[0].span(), span_of(PAYLOAD, ADDRESS));
     }
@@ -993,7 +1183,7 @@ mod tests {
             "1. an email address",
         ] {
             assert!(
-                read_findings(unreadable, PAYLOAD).is_err(),
+                read_findings(unreadable, PAYLOAD, 0).is_err(),
                 "{unreadable:?} must not read as a completed scan"
             );
         }
@@ -1007,7 +1197,7 @@ mod tests {
             "NONE - nothing sensitive",
         ] {
             assert_eq!(
-                read_findings(clean, PAYLOAD),
+                read_findings(clean, PAYLOAD, 0),
                 Ok(Vec::new()),
                 "{clean:?} must read as a completed scan that found nothing"
             );
@@ -1034,13 +1224,17 @@ mod tests {
             "NONE. Details: the payload has a key in it",
         ] {
             assert!(
-                read_findings(permissive, PAYLOAD).is_err(),
+                read_findings(permissive, PAYLOAD, 0).is_err(),
                 "{permissive:?} was read as a completed clean scan"
             );
         }
         // The twin: decoration with no content after it is still the sentinel.
         for clean in ["NONE", "None.", "**NONE**", "NONE - nothing sensitive"] {
-            assert_eq!(read_findings(clean, PAYLOAD), Ok(Vec::new()), "{clean:?}");
+            assert_eq!(
+                read_findings(clean, PAYLOAD, 0),
+                Ok(Vec::new()),
+                "{clean:?}"
+            );
         }
     }
 
@@ -1063,13 +1257,17 @@ mod tests {
             "none: nothing except the key",
         ] {
             assert!(
-                read_findings(glued, PAYLOAD).is_err(),
+                read_findings(glued, PAYLOAD, 0).is_err(),
                 "{glued:?} was read as a completed clean scan"
             );
         }
         // The twin, one character apart: no colon, still the sentinel.
         for clean in ["NONE", "**NONE**", "NONE - nothing sensitive"] {
-            assert_eq!(read_findings(clean, PAYLOAD), Ok(Vec::new()), "{clean:?}");
+            assert_eq!(
+                read_findings(clean, PAYLOAD, 0),
+                Ok(Vec::new()),
+                "{clean:?}"
+            );
         }
     }
 
@@ -1091,13 +1289,13 @@ mod tests {
             "I checked for a secret: could not tell",
         ] {
             assert!(
-                read_findings(chatty, PAYLOAD).is_err(),
+                read_findings(chatty, PAYLOAD, 0).is_err(),
                 "{chatty:?} was read as a completed scan"
             );
         }
 
         // The twin: the same shape of head, but the quote is really there.
-        let located = read_findings(&format!("my reading of the pii: {ADDRESS}"), PAYLOAD)
+        let located = read_findings(&format!("my reading of the pii: {ADDRESS}"), PAYLOAD, 0)
             .expect("a loose head that locates its quote is a finding line");
         assert_eq!(located.len(), 1, "{located:?}");
         assert_eq!(*located[0].span(), span_of(PAYLOAD, ADDRESS));
@@ -1106,7 +1304,7 @@ mod tests {
         // answering in the contract's shape is itself the evidence the model
         // understood the question.
         assert_eq!(
-            read_findings("credential: hunter2-not-in-the-payload", PAYLOAD),
+            read_findings("credential: hunter2-not-in-the-payload", PAYLOAD, 0),
             Ok(Vec::new())
         );
         assert!(kind_is_anchored("credential"));
@@ -1128,7 +1326,7 @@ mod tests {
         let at = PROSE.find("file").expect("the fixture contains it");
         assert_eq!(locate(PROSE, "file"), Some(at..at + 4));
         // Through the parser: the line is read, and reports nothing.
-        assert_eq!(read_findings("credential: none", PROSE), Ok(Vec::new()));
+        assert_eq!(read_findings("credential: none", PROSE, 0), Ok(Vec::new()));
     }
 
     /// **A line that carries a finding is a finding, whatever it opens with.**
@@ -1138,7 +1336,7 @@ mod tests {
     /// finding shape is tried first now.
     #[test]
     fn a_line_opening_with_the_sentinel_word_still_yields_its_finding() {
-        let found = read_findings(&format!("none — pii: {ADDRESS}"), PAYLOAD).expect("readable");
+        let found = read_findings(&format!("none — pii: {ADDRESS}"), PAYLOAD, 0).expect("readable");
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(*found[0].span(), span_of(PAYLOAD, ADDRESS));
     }
@@ -1150,7 +1348,7 @@ mod tests {
     #[test]
     fn a_numbered_list_is_read_like_any_other_decoration() {
         let answer = format!("1. credential: {CREDENTIAL}\n2. pii: {ADDRESS}");
-        let found = read_findings(&answer, PAYLOAD).expect("readable");
+        let found = read_findings(&answer, PAYLOAD, 0).expect("readable");
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].kind(), FindingKind::Credential);
         assert_eq!(found[1].kind(), FindingKind::Pii);
@@ -1191,7 +1389,7 @@ mod tests {
 
         // Through the parser, which is where it matters: a garbled line reports
         // nothing rather than a meaningless span.
-        assert_eq!(read_findings("pii: e", PAYLOAD), Ok(Vec::new()));
+        assert_eq!(read_findings("pii: e", PAYLOAD, 0), Ok(Vec::new()));
     }
 
     /// **The same secret twice in one payload is one finding, at the first
@@ -1212,7 +1410,7 @@ mod tests {
             Some(first..first + CREDENTIAL.len())
         );
         let found =
-            read_findings(&format!("credential: {CREDENTIAL}"), &payload).expect("readable");
+            read_findings(&format!("credential: {CREDENTIAL}"), &payload, 0).expect("readable");
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(*found[0].span(), first..first + CREDENTIAL.len());
     }
@@ -1258,7 +1456,8 @@ mod tests {
 
         // Readable, and every reported string invented: the sentinel is in the
         // answer and in nothing else.
-        let found = read_findings(&format!("credential: {SENTINEL}"), PAYLOAD).expect("readable");
+        let found =
+            read_findings(&format!("credential: {SENTINEL}"), PAYLOAD, 0).expect("readable");
         let rendered = format!("{found:?}");
         assert!(
             !rendered.contains("QUUXSENTINEL"),
@@ -1269,6 +1468,7 @@ mod tests {
         let err = read_findings(
             &format!("I refuse. But here is {SENTINEL} anyway."),
             PAYLOAD,
+            0,
         )
         .expect_err("an answer with no contract-shaped line is unreadable");
         assert!(
@@ -1416,7 +1616,9 @@ mod tests {
     ///
     /// The payload is deliberately clean, which is the discriminating state: a
     /// clean payload is the one case that would forward if the bound were
-    /// removed. The twin at the cap proves the route really does scan.
+    /// removed. The twin at the cap proves the route really does scan — and
+    /// **how many calls that costs**, which is the number the total cap was
+    /// chosen to bound.
     #[tokio::test]
     async fn an_over_cap_payload_is_unavailable_before_any_model_call() {
         let (route, calls) = counting_route(NOTHING_FOUND);
@@ -1432,26 +1634,38 @@ mod tests {
             "an over-cap payload bought a model call"
         );
 
+        // The twin, at the total cap: it really is scanned, in exactly the
+        // number of calls the ceiling is derived for. A payload this size is
+        // several engine windows, so "1" would mean the model saw one window
+        // of it and the verdict claimed the rest.
         let at_cap = "x".repeat(REDACT_INPUT_MAX_BYTES);
         let verdict = scan(&route, &at_cap).await;
         assert_eq!(verdict.outcome(), Outcome::Clean);
         assert!(verdict.scanned());
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
-            "non-vacuity: the same route really does call a model under the cap"
+            REDACT_MAX_CHUNKS,
+            "non-vacuity: the same route really does call a model under the cap, \
+             once per chunk"
+        );
+        assert_eq!(
+            chunk_ranges(&at_cap).len(),
+            REDACT_MAX_CHUNKS,
+            "and the derived ceiling is the real chunker's count, not an \
+             arithmetic guess beside it"
         );
     }
 
-    /// **The cap is the filter; the rendered size is the bound** (LESSON-488).
+    /// **The per-chunk cap is the filter; the rendered size is the bound**
+    /// (LESSON-488).
     ///
-    /// `render_duty` runs *after* the input cap has been checked and after this
-    /// module's own frame defusing: it neutralizes every control-token spelling
-    /// (one inserted byte per two of a `<|`-run) and wraps the result in a
-    /// ChatML envelope. A payload **under** the cap can therefore be handed to
-    /// the engine **over** its window, which comes back as an engine error and
-    /// blocks saying "the scan could not run" — when the truth is "this payload
-    /// is too large to scan". Different problems, different fixes (BR-3).
+    /// `render_duty` runs *after* the chunk has been cut and after this module's
+    /// own frame defusing: it neutralizes every control-token spelling (one
+    /// inserted byte per two of a `<|`-run) and wraps the result in a ChatML
+    /// envelope. A chunk **at** the window can therefore be handed to the engine
+    /// **over** it, which comes back as an engine error and blocks saying "the
+    /// scan could not run" — when the truth is "this text is too dense to
+    /// render". Different problems, different fixes (BR-3).
     ///
     /// So the guard measures the rendered form and refuses before the call. The
     /// model-call count is the assertion that matters: an engine error would
@@ -1467,12 +1681,12 @@ mod tests {
         // 31 `<|` pairs closed by a `|>` inside the renderer's 64-byte span
         // window: every one is defused, which is the densest growth possible.
         let block = "<|".repeat(31) + "|>";
-        let mut adversarial = block.repeat(REDACT_INPUT_MAX_BYTES / 64);
-        adversarial.push_str(&"z".repeat(REDACT_INPUT_MAX_BYTES - adversarial.len()));
+        let mut adversarial = block.repeat(REDACT_CHUNK_MAX_BYTES / 64);
+        adversarial.push_str(&"z".repeat(REDACT_CHUNK_MAX_BYTES - adversarial.len()));
         assert_eq!(
             adversarial.len(),
-            REDACT_INPUT_MAX_BYTES,
-            "the fixture is AT the cap, so the cheap filter passes it"
+            REDACT_CHUNK_MAX_BYTES,
+            "the fixture is AT the per-chunk cap, so the cheap filter passes it"
         );
 
         let verdict = scan(&route, &adversarial).await;
@@ -1489,11 +1703,51 @@ mod tests {
 
         // The twin: the same length, no control-token spellings, and the same
         // route really does scan it.
-        let plain = "z".repeat(REDACT_INPUT_MAX_BYTES);
+        let plain = "z".repeat(REDACT_CHUNK_MAX_BYTES);
         let verdict = scan(&route, &plain).await;
         assert_eq!(verdict.outcome(), Outcome::Clean);
         assert!(verdict.scanned());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// **The render guard runs per chunk, not once per payload.**
+    ///
+    /// The pair for the test above, one chunk along: a payload whose *first*
+    /// chunk is ordinary text and whose *second* is dense `<|`-runs. The first
+    /// chunk renders inside the window and is scanned; the second does not, and
+    /// the whole verdict is `Unavailable`.
+    ///
+    /// The call count is the discrimination, and it is `1` rather than `0` or
+    /// `2`: a guard hoisted out of the loop and applied to the payload as a
+    /// whole would either refuse before any call (`0`) or — measuring only the
+    /// first chunk — pass the dense one straight to the engine (`2`, with the
+    /// engine's own over-window error carrying the wrong reason).
+    #[tokio::test]
+    async fn a_second_chunk_that_renders_past_the_window_is_refused_before_its_own_call() {
+        let (route, calls) = counting_route(NOTHING_FOUND);
+
+        let block = "<|".repeat(31) + "|>";
+        let mut payload = "z".repeat(REDACT_CHUNK_MAX_BYTES);
+        // Enough dense content to render the second chunk past the window, and
+        // little enough that the payload is two chunks rather than three.
+        payload.push_str(&block.repeat(24_000 / 64));
+        assert_eq!(
+            chunk_ranges(&payload).len(),
+            2,
+            "the fixture must be exactly two chunks, or it tests something else"
+        );
+
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Unavailable);
+        assert!(!verdict.scanned());
+        assert_eq!(decide(&verdict), EgressDecision::Block);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the first chunk was scanned and the second was refused before its \
+             own call: a guard applied to the payload rather than to each chunk \
+             gives 0 or 2, never 1"
+        );
     }
 
     /// **ADR-6, the "found something but could not finish" row.** An over-cap
@@ -1620,6 +1874,584 @@ mod tests {
         );
     }
 
+    // -- chunked scanning: the model pass across several windows -------------
+
+    /// Clean filler of exactly `bytes` bytes, with no credential shape and no
+    /// flush-left frame label in it.
+    ///
+    /// It has to be clean in both senses: the pattern pass must find nothing
+    /// (or a chunking fixture would be testing the pattern pass) and the frame
+    /// defusing must have nothing to do (or the fixture's length would stop
+    /// being the length that reaches the model).
+    fn filler(bytes: usize) -> String {
+        const LINE: &str = "the retry helper reads the manifest and writes one report line. ";
+        let mut out = String::with_capacity(bytes + LINE.len());
+        while out.len() < bytes {
+            out.push_str(LINE);
+        }
+        out.truncate(bytes);
+        out
+    }
+
+    /// A payload comfortably over one engine window and comfortably under the
+    /// total cap — the size the harness's own context budget makes ordinary,
+    /// and the size that used to block.
+    const OVER_ONE_WINDOW: usize = 40 * 1024;
+
+    /// An engine with one scripted answer per call, so a fixture can say what
+    /// the *second* chunk comes back with.
+    ///
+    /// `Err` is an engine failure, which is the shape of every way a chunk's
+    /// call can fail from this module's point of view (ADR-6 collapses them).
+    struct PerCallEngine {
+        calls: Arc<AtomicUsize>,
+        replies: Vec<Result<String, String>>,
+    }
+
+    impl Engine for PerCallEngine {
+        fn model_id(&self) -> &str {
+            "per-call"
+        }
+        fn complete(
+            &self,
+            _prompt: &str,
+            _params: &GenParams,
+            _on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<Completion, EngineError> {
+            let nth = self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.replies.get(nth) {
+                Some(Ok(text)) => Ok(Completion {
+                    text: text.clone(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                }),
+                Some(Err(reason)) => Err(EngineError::unavailable(reason.clone())),
+                None => Err(EngineError::Backend(format!(
+                    "the fixture scripted {} calls and this is call {}",
+                    self.replies.len(),
+                    nth + 1
+                ))),
+            }
+        }
+    }
+
+    fn per_call_route(replies: Vec<Result<&str, &str>>) -> (DutyRoute, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(PerCallEngine {
+            calls: Arc::clone(&calls),
+            replies: replies
+                .into_iter()
+                .map(|reply| reply.map(str::to_owned).map_err(str::to_owned))
+                .collect(),
+        }));
+        (DutyRoute::local(REDACT_DUTY, "local", engine), calls)
+    }
+
+    /// **The chunker's three invariants**, on the sizes that exercise them.
+    ///
+    /// Each one is depended on somewhere else: (1) is what makes every chunk a
+    /// prompt the engine's window can hold, (2) is what stops a boundary
+    /// hiding a credential from both sides of it, and (3) is what keeps the
+    /// ranges sliceable — a cut inside a multi-byte sequence panics rather than
+    /// degrading.
+    ///
+    /// The last row is three-byte characters, chosen so the arithmetic boundary
+    /// lands *inside* one: `REDACT_CHUNK_MAX_BYTES` is 27,070 and 27,069 is the
+    /// nearest multiple of three below it, so a chunker that did not walk back
+    /// to a char boundary panics on this row rather than merely mis-sizing.
+    #[test]
+    fn the_chunker_covers_the_payload_with_overlapping_windows_on_char_boundaries() {
+        let three_byte_chars = "€".repeat(20_000);
+        assert_eq!(three_byte_chars.len(), 60_000);
+        let payloads = [
+            String::new(),
+            filler(1),
+            filler(REDACT_CHUNK_MAX_BYTES - 1),
+            filler(REDACT_CHUNK_MAX_BYTES),
+            filler(REDACT_CHUNK_MAX_BYTES + 1),
+            filler(OVER_ONE_WINDOW),
+            filler(REDACT_INPUT_MAX_BYTES),
+            three_byte_chars,
+        ];
+
+        for payload in payloads {
+            let ranges = chunk_ranges(&payload);
+            assert!(
+                !ranges.is_empty(),
+                "{} bytes yielded no chunk",
+                payload.len()
+            );
+            assert_eq!(ranges[0].start, 0, "the first chunk must start at the top");
+            assert_eq!(
+                ranges[ranges.len() - 1].end,
+                payload.len(),
+                "the last chunk must reach the end: {} bytes",
+                payload.len()
+            );
+
+            for (i, range) in ranges.iter().enumerate() {
+                assert!(
+                    range.end - range.start <= REDACT_CHUNK_MAX_BYTES,
+                    "chunk {i} of a {}-byte payload is {} bytes, past the window",
+                    payload.len(),
+                    range.end - range.start
+                );
+                // (3): it slices, which is the only test that matters.
+                let _: &str = &payload[range.clone()];
+                if i == 0 {
+                    continue;
+                }
+                let previous = &ranges[i - 1];
+                assert!(
+                    previous.end >= range.start + REDACT_CHUNK_OVERLAP_BYTES,
+                    "chunks {} and {i} of a {}-byte payload overlap by only {}",
+                    i - 1,
+                    payload.len(),
+                    previous.end.saturating_sub(range.start)
+                );
+                assert!(
+                    range.start > previous.start,
+                    "the chunker must make progress"
+                );
+            }
+        }
+    }
+
+    /// **The derived ceiling is the real chunker's count**, not arithmetic
+    /// beside it (BR-7, ADR-8).
+    ///
+    /// [`REDACT_MAX_CHUNKS`] is what ADR-8's per-chunk latency budget is
+    /// multiplied by and what the total cap was chosen to bound, so a
+    /// derivation that drifted from the chunker would misstate both. The sweep
+    /// is over sizes up to the cap; the equality row at the cap is what makes
+    /// the ceiling *tight* rather than merely satisfied.
+    #[test]
+    fn the_chunker_never_cuts_more_chunks_than_the_derived_ceiling() {
+        for bytes in [
+            0,
+            1,
+            REDACT_CHUNK_MAX_BYTES,
+            REDACT_CHUNK_MAX_BYTES + 1,
+            OVER_ONE_WINDOW,
+            2 * REDACT_CHUNK_MAX_BYTES,
+            REDACT_INPUT_MAX_BYTES - 1,
+            REDACT_INPUT_MAX_BYTES,
+        ] {
+            let cut = chunk_ranges(&filler(bytes)).len();
+            assert!(
+                cut <= REDACT_MAX_CHUNKS,
+                "a {bytes}-byte payload cut into {cut} chunks, past the derived \
+                 ceiling of {REDACT_MAX_CHUNKS}"
+            );
+        }
+        assert_eq!(
+            chunk_ranges(&filler(REDACT_INPUT_MAX_BYTES)).len(),
+            REDACT_MAX_CHUNKS,
+            "the ceiling must be reached at the cap, or it is a loose bound and \
+             the latency arithmetic it feeds is pessimistic by an unknown amount"
+        );
+    }
+
+    /// **The headline: a payload past one engine window is scanned, not
+    /// refused.**
+    ///
+    /// 40 KiB is over `REDACT_CHUNK_MAX_BYTES` (27,070) and well over the
+    /// harness's own `context_budget_bytes` (32,768) once a system prompt and
+    /// JSON escaping ride along — which is to say it is the shape of an
+    /// ordinary context-heavy remote turn. Before chunking this was
+    /// `Unavailable` → **Block**: the scan refused it, and the turn failed
+    /// saying the scan could not run.
+    ///
+    /// Three assertions, and the third is the one that makes it a chunked scan
+    /// rather than a raised cap: `Clean`, `scanned: true`, and **more than one
+    /// model call**. A cap simply raised past the window would satisfy the
+    /// first two and hand the engine a prompt it cannot hold.
+    #[tokio::test]
+    async fn a_payload_larger_than_one_window_is_scanned_in_several_calls_and_forwards() {
+        let (route, calls) = counting_route(NOTHING_FOUND);
+        let payload = filler(OVER_ONE_WINDOW);
+        assert!(
+            payload.len() > REDACT_CHUNK_MAX_BYTES && payload.len() < REDACT_INPUT_MAX_BYTES,
+            "the fixture must be over one window and under the total cap"
+        );
+
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Clean);
+        assert!(
+            verdict.scanned(),
+            "a scan whose every chunk completed must claim it ran"
+        );
+        assert_eq!(decide(&verdict), EgressDecision::Forward);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a payload of this size is two windows, and each window is a call"
+        );
+        assert_eq!(chunk_ranges(&payload).len(), 2);
+    }
+
+    /// **A pattern credential past the first window still blocks, at its
+    /// absolute span.**
+    ///
+    /// The pattern pass never chunked and still does not, so this is really two
+    /// claims: chunking did not cost the deterministic pass its reach, and the
+    /// span it reports addresses the *payload* — the coordinate system the
+    /// user's own request is in, and the one `privacy_block`'s locus renders.
+    #[tokio::test]
+    async fn a_pattern_credential_past_the_first_window_blocks_with_its_absolute_span() {
+        let (route, calls) = counting_route(NOTHING_FOUND);
+        // The space in front of the credential is load-bearing: the pattern
+        // pass requires a left word boundary, and `filler` truncates mid-word.
+        let payload = format!(
+            "{} {CREDENTIAL} is read from the environment.{}",
+            filler(REDACT_CHUNK_MAX_BYTES + 4_096),
+            filler(2_048)
+        );
+        let at = payload.find(CREDENTIAL).expect("the fixture plants it");
+        assert!(
+            at > chunk_ranges(&payload)[0].end,
+            "the fixture must put the credential past the first chunk entirely, \
+             or the second chunk is doing no work"
+        );
+
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Findings);
+        assert!(verdict.scanned());
+        assert_eq!(decide(&verdict), EgressDecision::Block);
+        assert_eq!(verdict.findings().len(), 1, "{:?}", verdict.findings());
+        assert_eq!(verdict.findings()[0].confidence(), Confidence::High);
+        assert_eq!(*verdict.findings()[0].span(), at..at + CREDENTIAL.len());
+        assert_eq!(
+            &payload[verdict.findings()[0].span().clone()],
+            CREDENTIAL,
+            "the span must address the payload's own bytes"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// **The offset arithmetic, pinned.** A model finding reported from the
+    /// *second* chunk carries a payload-absolute span.
+    ///
+    /// [`locate`] runs against the chunk the model was shown, so the span it
+    /// mints is chunk-relative; `read_findings` adds the chunk's start where the
+    /// span is created. Drop that term and the reported range still *looks*
+    /// plausible — same length, inside the payload — while pointing thousands of
+    /// bytes early, at filler the model never mentioned.
+    ///
+    /// So the assertion is on the bytes the span selects, not on the numbers:
+    /// `&payload[span] == ADDRESS` is false for every offset but the right one.
+    #[tokio::test]
+    async fn a_model_finding_from_the_second_chunk_carries_a_payload_absolute_span() {
+        let (route, calls) = counting_route(&format!("pii: {ADDRESS}"));
+        let payload = format!(
+            "{}please write to {ADDRESS} when it fails.{}",
+            filler(REDACT_CHUNK_MAX_BYTES + 4_096),
+            filler(2_048)
+        );
+        let at = payload.find(ADDRESS).expect("the fixture plants it");
+        let chunks = chunk_ranges(&payload);
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            at > chunks[0].end,
+            "the fixture must put the address past the first chunk, or the \
+             offset it is testing is zero"
+        );
+        assert!(
+            chunks[1].start > 0,
+            "and the second chunk must start somewhere other than the top, or \
+             there is no offset to get wrong"
+        );
+
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Findings);
+        assert!(verdict.scanned());
+        assert_eq!(verdict.findings().len(), 1, "{:?}", verdict.findings());
+        assert_eq!(verdict.findings()[0].confidence(), Confidence::Low);
+        assert_eq!(*verdict.findings()[0].span(), at..at + ADDRESS.len());
+        assert_eq!(
+            &payload[verdict.findings()[0].span().clone()],
+            ADDRESS,
+            "a chunk-relative span points at filler the model never saw"
+        );
+        // And a low-only verdict still forwards (BR-4) — chunking changed where
+        // the finding came from, not what it means.
+        assert_eq!(decide(&verdict), EgressDecision::Forward);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A secret with **no pattern shape**, so only the model pass can find it —
+    /// which is what makes the straddling fixture below a test of the overlap
+    /// rather than of the deterministic pass.
+    const STRADDLER: &str = "the-deploy-password-is-correct-horse-battery-staple";
+
+    /// **The overlap, discriminated.** A secret lying across the first chunk's
+    /// end is found whole, because the second chunk begins before that end.
+    ///
+    /// The fixture places it so that it appears whole in **exactly one** chunk
+    /// and only because of the overlap: ten bytes of it sit inside chunk one and
+    /// the remaining forty-one past it, so chunk one holds a fragment and chunk
+    /// two — which starts [`REDACT_CHUNK_OVERLAP_BYTES`] earlier — holds all of
+    /// it. Both halves are asserted before the scan runs, so a fixture that
+    /// stopped straddling would fail loudly rather than pass vacuously.
+    ///
+    /// Delete the overlap (make the stride the whole window) and the second
+    /// chunk starts *at* the boundary: neither chunk contains the secret, the
+    /// model's quote locates in neither, and the finding disappears. That is
+    /// AC-8 mutation (i).
+    ///
+    /// It is deliberately a shapeless secret. A `sk-…` string here would be
+    /// caught by the pattern pass whatever the chunker did, and the test would
+    /// stay green with the overlap deleted.
+    #[tokio::test]
+    async fn a_secret_straddling_a_chunk_boundary_is_still_found_whole_in_the_overlap() {
+        let (route, calls) = counting_route(&format!("secret: {STRADDLER}"));
+        let payload = format!(
+            "{}{STRADDLER}{}",
+            filler(REDACT_CHUNK_MAX_BYTES - 10),
+            filler(4_096)
+        );
+        let at = payload.find(STRADDLER).expect("the fixture plants it");
+        let chunks = chunk_ranges(&payload);
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            at < chunks[0].end && at + STRADDLER.len() > chunks[0].end,
+            "the fixture must straddle the first chunk's end, or it tests nothing"
+        );
+        assert!(
+            !payload[chunks[0].clone()].contains(STRADDLER),
+            "the first chunk must hold only a fragment"
+        );
+        assert!(
+            payload[chunks[1].clone()].contains(STRADDLER),
+            "and only the overlap can put it whole in the second"
+        );
+
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Findings);
+        assert!(verdict.scanned());
+        assert_eq!(
+            verdict.findings().len(),
+            1,
+            "a secret cut by a boundary must be reported once, whole: {:?}",
+            verdict.findings()
+        );
+        assert_eq!(*verdict.findings()[0].span(), at..at + STRADDLER.len());
+        assert_eq!(&payload[verdict.findings()[0].span().clone()], STRADDLER);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// **A string in the overlap is reported once, not once per chunk.**
+    ///
+    /// The overlap means some bytes are shown to the model twice, so a secret
+    /// sitting in one is quoted back twice and locates twice — at the *same*
+    /// absolute span, because both spans are the payload's. `merge`'s existing
+    /// span-overlap rule is what collapses them, and this is the case that
+    /// makes that rule load-bearing rather than defensive.
+    #[tokio::test]
+    async fn a_secret_inside_the_overlap_is_reported_once_not_once_per_chunk() {
+        let (route, calls) = counting_route(&format!("secret: {STRADDLER}"));
+        // Fully inside the overlap: after the second chunk starts, before the
+        // first one ends.
+        let payload = format!(
+            "{}{STRADDLER}{}",
+            filler(REDACT_CHUNK_MAX_BYTES - 128),
+            filler(4_096)
+        );
+        let at = payload.find(STRADDLER).expect("the fixture plants it");
+        let chunks = chunk_ranges(&payload);
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            payload[chunks[0].clone()].contains(STRADDLER)
+                && payload[chunks[1].clone()].contains(STRADDLER),
+            "the fixture must sit whole in BOTH chunks, or nothing is deduped"
+        );
+
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Findings);
+        assert_eq!(
+            verdict.findings().len(),
+            1,
+            "one secret seen by two chunks is one finding: {:?}",
+            verdict.findings()
+        );
+        assert_eq!(*verdict.findings()[0].span(), at..at + STRADDLER.len());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "and both chunks were asked"
+        );
+    }
+
+    /// **Fail-closed composition: any chunk that could not run makes the scan
+    /// one that could not run** (ADR-6, BR-3).
+    ///
+    /// The payload is deliberately **clean** and the first chunk answers the
+    /// sentinel, so the permissive mutation has every excuse: a loop that
+    /// skipped the failed chunk would compose "clean" from "clean" and nothing,
+    /// report `Clean` with `scanned: true`, and **forward** a payload half of
+    /// which no model ever looked at. That is a truncate-and-scan wearing a
+    /// different shape, and it is the direction BR-7 and LESSON-447 forbid.
+    ///
+    /// Three rows, because a chunk can stop being a completed scan in three
+    /// ways, and all three must compose the same: an engine failure, a reply
+    /// the parser cannot read, and a chunk that never runs at all because an
+    /// earlier one failed.
+    #[tokio::test]
+    async fn a_chunk_that_could_not_run_makes_the_whole_verdict_unavailable() {
+        let payload = filler(OVER_ONE_WINDOW);
+        assert_eq!(chunk_ranges(&payload).len(), 2, "the fixture is two chunks");
+
+        // (1) the second chunk's engine call fails.
+        let (route, calls) = per_call_route(vec![Ok(NOTHING_FOUND), Err("no weights installed")]);
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(
+            verdict.outcome(),
+            Outcome::Unavailable,
+            "a clean first chunk and a failed second is a scan that did not finish"
+        );
+        assert!(!verdict.scanned());
+        assert!(verdict.findings().is_empty());
+        assert_eq!(decide(&verdict), EgressDecision::Block);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "non-vacuity: the first chunk really was scanned, so this is the \
+             composition failing closed rather than the whole scan never starting"
+        );
+
+        // (2) the second chunk answers something the parser cannot read.
+        let (route, calls) = per_call_route(vec![Ok(NOTHING_FOUND), Ok("I am not sure, sorry.")]);
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Unavailable);
+        assert!(!verdict.scanned());
+        assert_eq!(decide(&verdict), EgressDecision::Block);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // (3) the FIRST chunk fails: the second is never asked, because there
+        // is no verdict left to build.
+        let (route, calls) = per_call_route(vec![Err("no weights installed"), Ok(NOTHING_FOUND)]);
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Unavailable);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a decided scan must not keep buying model calls"
+        );
+
+        // The twin, one scripted answer apart: every chunk completes, and the
+        // same payload on the same shape of route is Clean and forwards.
+        let (route, calls) = per_call_route(vec![Ok(NOTHING_FOUND), Ok(NOTHING_FOUND)]);
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Clean);
+        assert!(verdict.scanned());
+        assert_eq!(decide(&verdict), EgressDecision::Forward);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// **A failed chunk outranks the other chunks' findings** — the ADR-6 row
+    /// one layer along.
+    ///
+    /// A pattern credential in the first chunk *and* a failed second chunk is
+    /// still `Unavailable`, not `Findings`. Both block, so no bytes leave
+    /// either way; what differs is what the block says, and `Findings` would
+    /// ride with `scanned: true` and claim a completed scan of a payload half
+    /// of which nothing looked at.
+    #[tokio::test]
+    async fn a_credential_in_a_scanned_chunk_does_not_outrank_a_chunk_that_failed() {
+        let payload = format!("{CREDENTIAL} then {}", filler(OVER_ONE_WINDOW));
+        assert!(
+            !pattern_verdict(&payload).findings().is_empty(),
+            "the fixture's credential must really be detected, or the row below \
+             is not about outranking anything"
+        );
+        assert_eq!(chunk_ranges(&payload).len(), 2);
+
+        let (route, _) = per_call_route(vec![Ok(NOTHING_FOUND), Err("no weights installed")]);
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Unavailable);
+        assert!(!verdict.scanned());
+        assert!(
+            verdict.findings().is_empty(),
+            "an unavailable verdict carries no findings, whatever the pattern \
+             pass saw: {:?}",
+            verdict.findings()
+        );
+
+        // The twin: the same payload, both chunks answered, and the credential
+        // is reported as the High finding it is.
+        let (route, _) = per_call_route(vec![Ok(NOTHING_FOUND), Ok(NOTHING_FOUND)]);
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Findings);
+        assert!(verdict.scanned());
+        assert_eq!(verdict.findings()[0].confidence(), Confidence::High);
+    }
+
+    /// **N chunks are N routed model calls, and they announce N times.**
+    ///
+    /// [`DutyRoute::perform`] publishes its `route_decided` once per invocation
+    /// and deliberately does not deduplicate — the seam's own rule, written for
+    /// two oversized tool results and inherited here. So a two-chunk scan puts
+    /// two `route_decided` events on the bus for one outbound payload.
+    ///
+    /// That is recorded as correct rather than tolerated: the events describe
+    /// *model calls*, a chunked scan really is several, and collapsing them
+    /// would under-report exactly the sends that cost the most. The pair with
+    /// the single-chunk leg is what makes it a count rather than a coincidence.
+    #[tokio::test]
+    async fn a_multi_chunk_scan_announces_its_route_once_per_chunk() {
+        use teton_protocol::events::{Event, RouteDecided};
+        use teton_protocol::{ProviderId, Tier};
+
+        use crate::broadcast::EventBus;
+
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(64);
+        let announce = || {
+            Some(RouteDecided {
+                category: Some(Category::Redact),
+                tier: Some(Tier::Scan),
+                phase: None,
+                provider_id: ProviderId::from("local"),
+                model: None,
+                reason: "Routing the 'redact' category to the local tier.".to_owned(),
+            })
+        };
+        let drain = |sub: &mut crate::broadcast::Subscription| -> usize {
+            std::iter::from_fn(|| sub.try_recv())
+                .filter(|env| matches!(env.event, Event::RouteDecided(_)))
+                .count()
+        };
+
+        let route = local_route(NOTHING_FOUND).announcing(
+            &bus,
+            Some(teton_protocol::SessionId::from("sess")),
+            announce(),
+        );
+
+        // One chunk, one announcement — the shape every pre-chunking fixture
+        // has.
+        let verdict = scan(&route, &filler(1_024)).await;
+        assert_eq!(verdict.outcome(), Outcome::Clean);
+        assert_eq!(drain(&mut sub), 1);
+
+        // Two chunks, two announcements: honest, because it really was two
+        // calls on the one engine.
+        let payload = filler(OVER_ONE_WINDOW);
+        assert_eq!(chunk_ranges(&payload).len(), 2);
+        let verdict = scan(&route, &payload).await;
+        assert_eq!(verdict.outcome(), Outcome::Clean);
+        assert_eq!(
+            drain(&mut sub),
+            2,
+            "a chunked scan announces once per model call, because that is what \
+             a route_decided describes"
+        );
+
+        // And a scan that never reaches a call announces nothing.
+        let verdict = scan(&route, &filler(REDACT_INPUT_MAX_BYTES + 1)).await;
+        assert_eq!(verdict.outcome(), Outcome::Unavailable);
+        assert_eq!(drain(&mut sub), 0);
+    }
     // -- the stand-in engine's recognition arm (REQ-561 BR-10) ---------------
 
     /// **A redact duty is answered off-script**, and its answer is a *valid*
@@ -1633,7 +2465,7 @@ mod tests {
             .complete(&redact_prompt(PAYLOAD), &params, &mut |_| true)
             .expect("the stand-in answers the duty");
         assert_eq!(
-            read_findings(&duty.text, PAYLOAD),
+            read_findings(&duty.text, PAYLOAD, 0),
             Ok(Vec::new()),
             "the stand-in's answer must parse as a completed scan that found nothing; a \
              stand-in cannot judge sensitivity, and the deterministic pattern pass is what \
@@ -1676,7 +2508,7 @@ mod tests {
             .complete(&redact_prompt(&payload), &params, &mut |_| true)
             .expect("the stand-in answers");
         assert_eq!(
-            read_findings(&scanned.text, &payload),
+            read_findings(&scanned.text, &payload, 0),
             Ok(Vec::new()),
             "a scan of a title prompt was answered as a title"
         );
@@ -1685,7 +2517,7 @@ mod tests {
             .complete(&payload, &params, &mut |_| true)
             .expect("the stand-in answers");
         assert!(
-            read_findings(&titled.text, &payload).is_err(),
+            read_findings(&titled.text, &payload, 0).is_err(),
             "non-vacuity: the bare title prompt really is answered as a title, so the two \
              arms are distinguishable"
         );

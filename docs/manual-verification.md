@@ -574,8 +574,12 @@ stated budget and a measurement are acceptance criteria, not nice-to-haves"* —
 and its own Assumptions section names user tolerance for that latency as one of
 the three things most likely to be wrong.
 
-**The stated budget (ADR-8).** On real mid-tier weights, a scan of a payload at
-`REDACT_INPUT_MAX_BYTES` completes in **p50 ≤ 2 s, p95 ≤ 5 s**. The duty seam's
+**The stated budget (ADR-8).** On real mid-tier weights, a model call over a
+chunk at `REDACT_CHUNK_MAX_BYTES` completes in **p50 ≤ 2 s, p95 ≤ 5 s**. The
+budget is **per chunk**: the model pass scans a payload larger than one engine
+window in several overlapping calls, so a context-budget-full turn (~41 KiB
+body) is two chunks and ~4 s at p50, and a payload at the total cap is five
+chunks and ~10 s. The duty seam's
 `DUTY_DEADLINE` (120 s) is the hard stop, and an overrun is `Unavailable` →
 **Block** (ADR-6) — a timed-out guard does not become a guard that passes
 everything, so a machine that misses the budget badly enough degrades into
@@ -601,27 +605,31 @@ against a control.
 **Why there is no harness.** The same reason REQ-558's classifier gap has none,
 and more so. CI ships no weights: `tetond` is built without
 `--features tetond/llama`, and every automated fixture's local tier is a
-`ScriptedFileEngine` or a canned mock, which answers a scan of a payload at the
-27,070-byte cap from a string table in microseconds. A stand-in can prove the *call count*, the *cap*, and the
-*decision* — it does, exhaustively — but a wall-clock number measured against a
-string table would be a fabricated one.
+`ScriptedFileEngine` or a canned mock, which answers a scan of a chunk at the
+27,070-byte window from a string table in microseconds. A stand-in can prove the
+*call count* (including the **chunk** count, which is the same number), the
+*caps*, and the *decision* — it does, exhaustively — but a wall-clock number
+measured against a string table would be a fabricated one.
 
 **The budget's provenance, stated so nobody mistakes it for an observation.**
 2 s / 5 s is a **design target**. It was sized against a 3B model on Metal from
-an input cap of 64 KiB — which is **not the cap any more**: the cap is now
-derived from the engine window and is **27,070 bytes** (≈13.5k tokens at the
-duty seam's 2-bytes-per-token convention), less than half what the target was
-sized for. The output side is tiny either way (`REDACT_OUTPUT_MAX_BYTES` =
-2 KiB, a sixteen-line contract). So the target is if anything *pessimistic*
-now — but it is still a target, and **nobody has run it**. The measurement is
-what settles it; do not re-derive the number from the smaller cap and call that
-a result.
+an input cap of 64 KiB — which is **not what a model call sees any more**: a
+call sees one chunk, `REDACT_CHUNK_MAX_BYTES`, derived from the engine window at
+**27,070 bytes** (≈13.5k tokens at the duty seam's 2-bytes-per-token
+convention), less than half what the target was sized for. The output side is
+tiny either way (`REDACT_OUTPUT_MAX_BYTES` = 2 KiB, a sixteen-line contract). So
+the per-chunk target is if anything *pessimistic* now — but a chunked scan makes
+**several** such calls, which is the direction that cuts the other way, and
+**nobody has run either number**. The measurement is what settles it; do not
+re-derive it from the window and call that a result.
 
 **What IS covered automatically, and how far it goes:**
 
 | Leg | Where | Strength |
 |---|---|---|
-| An over-cap payload costs **zero** model calls and blocks | `harness::redact::tests::an_over_cap_payload_is_unavailable_before_any_model_call`, `tests/redact_egress.rs::a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` | Full — by model-call count, not by elapsed time |
+| A payload past the **total** cap costs **zero** model calls and blocks | `harness::redact::tests::an_over_cap_payload_is_unavailable_before_any_model_call`, `tests/redact_egress.rs::a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` | Full — by model-call count, not by elapsed time |
+| A payload past one engine **window** is scanned in several calls, not refused | `harness::redact::tests::a_payload_larger_than_one_window_is_scanned_in_several_calls_and_forwards`, `tests/redact_egress.rs::a_context_budget_full_payload_is_scanned_across_windows_and_forwards` | Full at the count — the number of model calls is what tells chunking from a raised cap. Says nothing about what those calls cost, which is step 4 |
+| The chunk count is bounded, and every chunk fits the window | `harness::redact::tests::{the_chunker_never_cuts_more_chunks_than_the_derived_ceiling, the_chunker_covers_the_payload_with_overlapping_windows_on_char_boundaries}` | Full. This is what makes "p50 × chunks" a bounded number rather than an open one |
 | A deadline overrun is `Unavailable` → Block | `harness::redact::tests::a_scan_that_overruns_the_deadline_is_unavailable` | Full, on a **paused clock**. It pins the wiring, and says nothing about how long a real scan takes |
 | Off costs nothing at all — no gate, no call, no latency | `runtime::tests::dispatch::redact::off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine`, `egress::tests::off_means_zero_scanner_calls_and_on_means_exactly_one` | Full — by call count. This is what bounds the blast radius of the unmeasured budget: nobody who has not opted in pays it (OQ-3) |
 | The scan runs once per outbound payload, not more | `tests/redact_egress.rs::a_clean_payload_forwards_and_the_scan_provably_ran` | Full at the count; says nothing about elapsed time — and "once per payload" is many times per *turn*, which is what step 2 measures |
@@ -693,42 +701,53 @@ timeout, and it means B's turn was *blocked* by A's unrelated work.
 redaction scan could not run"*): at the cap on slow weights that is the deadline
 firing, and a fail-closed timeout is a worse user outcome than a slow one.
 
-**Step 4 — the over-cap block rate (the cap-vs-context-budget collision).**
+**Step 4 — the chunk-count distribution and the per-chunk latency (what
+replaced the over-cap block rate).**
 
-This one is not about latency at all, and it is the number most likely to decide
-whether the feature is usable. `REDACT_INPUT_MAX_BYTES` is **27,070 bytes** —
-derived from the local engine's window (ADR-6) — while
-`HarnessConfig::context_budget_bytes` is **32,768** (`turn_loop.rs:173`). The
-harness is allowed to assemble a turn about 20% larger than the redactor can
-scan, so a **context-budget-full remote turn blocks** when the switch is on. Not
-silently: it is `ScanUnavailable`, fail-closed, and says the scan could not run.
-But a user whose repository makes long turns normal would experience redaction
-as "remote turns stopped working", and no automated fixture can tell us how
-often that happens because none of them assembles a realistic context.
+Round 2 of this REQ measured a *block rate*: `REDACT_INPUT_MAX_BYTES` was
+27,070 bytes against a `context_budget_bytes` of 32,768, so a
+context-budget-full remote turn assembled a body the scan refused and blocked
+with `ScanUnavailable`. That collision is **closed** — the model pass chunks
+now (ADR-6), the total cap is 108,280 bytes, and a context-heavy turn is
+scanned in two model calls instead of refused. There is nothing left to measure
+a rate of, and a step that kept counting a number that should now be zero would
+be measuring nothing.
 
-So measure it, as a rate rather than as an anecdote. Over the twenty turns of
-step 1 and the ten of step 2 (sixty scans in total across both halves of the
-control):
+What replaced it is the number the cost actually moved to: **how many chunks a
+real turn's payload is cut into, and what each chunk costs.** Chunking did not
+delete the latency; it converted a fail-closed block into a multiple of the
+per-chunk budget, and whether that trade is a good one is exactly what a
+measurement can tell you and an argument cannot.
+
+Over the twenty turns of step 1 and the ten of step 2:
 
 | Record | How |
 |---|---|
-| **Over-cap block rate** | count turns that failed with *"the redaction scan could not run"* whose `/verbose` context size was at or near the 32,768-byte budget, over total turns with `redact = true` |
-| The context size at which it starts | `/verbose` reports the assembled context size per turn; note the smallest one that blocked |
-| Whether the control turn succeeded | the same prompt with `redact = false` — if it succeeded, the block is the cap and not the prompt |
+| **Chunk-count distribution** | count `route_decided` events with `category: redact` per outbound payload — a chunked scan announces **once per chunk** (ADR-8), so the count per send *is* the chunk count. Report the histogram: how many sends were 1 chunk, 2, 3+ |
+| **Per-chunk latency** | for multi-chunk sends, the send's total scan time divided by its chunk count. Check against ADR-8: p50 ≤ 2 s, p95 ≤ 5 s **per chunk** — the budget is per chunk, not per send |
+| **The context-budget-full send specifically** | force one deliberately (below) and record its chunk count and total scan time. ADR-8 expects **2 chunks, ≤ 4 s p50**. Anything much over two chunks at that size means the body carries more overhead than the cap's arithmetic assumes |
+| **Any `ScanUnavailable` at all** | it should no longer come from size. If one appears, record the payload size and whether the daemon log shows an engine error — a block from a payload under 108,280 bytes is now a **finding**, not the expected fail-closed path |
 
-Force the state deliberately at least once: read four or five large files in one
-turn until `/verbose` shows the context near budget, then ask a question. That
-turn should block with the scan-unavailable sentence.
+Force the multi-chunk state deliberately at least once: read four or five large
+files in one turn until `/verbose` shows the context near budget, then ask a
+question. That turn should **succeed**, in two chunks. Before this change it
+blocked; if it still blocks, the change did not land and that is the single most
+important line to write in this document.
 
-**Any non-zero rate on ordinary work is a finding**, and the fix is *not* a
-bigger cap against the same window — that is the arithmetic this REQ removed. It
-is chunked scanning with a composed verdict, or a context budget derived from
-the cap. Both are follow-up REQs; this step is what sizes them.
+**A turn whose scan takes more than 10 s is a finding**, whatever the per-chunk
+number said — that is the `REDACT_MAX_CHUNKS` ceiling (5) at ADR-8's p50, and a
+payload that reaches it is at the total cap.
+
+**Also record the worst-case wait.** The seam's `DUTY_DEADLINE` is per model
+call, so a five-chunk scan can in principle wait `5 × 120 s` before failing
+closed (ADR-8's stated residual). Note any send whose scan took longer than 120
+seconds without failing — that is the residual becoming real rather than
+theoretical, and it is the evidence a scan-wide deadline needs.
 
 A miss anywhere is a finding to record here, not a number to re-run until it
-looks acceptable — and the honest response to a miss is a smaller cap, a faster
-tier, or a scan that does not run on every call, never a partial scan that
-reports itself complete (BR-7).
+looks acceptable — and the honest response to a miss is a smaller total cap, a
+faster tier, or a scan that does not run on every call, never a partial scan
+that reports itself complete (BR-7).
 
 **Also worth recording while the weights are loaded** (it is the assumption the
 REQ says is most likely to be wrong, and this is the only place it can be

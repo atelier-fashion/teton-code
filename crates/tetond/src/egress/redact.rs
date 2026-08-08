@@ -59,6 +59,12 @@
 //! `Findings` (which carries `scanned: true`) would claim a completed scan of a
 //! payload the model pass never saw.
 //!
+//! **Over-cap is not the same event as over-window.** The model pass is chunked
+//! ([`REDACT_CHUNK_MAX_BYTES`], `harness::redact::scan`), so a payload larger
+//! than one engine window is scanned in several calls rather than refused. What
+//! [`REDACT_INPUT_MAX_BYTES`] bounds is how many calls one send may buy —
+//! chunking spreads a scan, it does not make it unbounded (BR-7).
+//!
 //! ## No regex crate
 //!
 //! The REQ forbids new crates and `regex` is not a declared dependency of any
@@ -127,11 +133,12 @@ const DUTY_BYTES_PER_TOKEN: usize = DUTY_REQUEST_BYTES_PER_TOKEN;
 pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
     (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize) * DUTY_BYTES_PER_TOKEN;
 
-/// The largest payload the redactor will scan, in bytes (ADR-6, BR-7).
+/// The largest payload the redactor will hand to a **single** model call, in
+/// bytes (ADR-6, BR-7).
 ///
 /// **Derived from the engine window, not picked beside it** (LESSON-446). The
-/// cap and the window are two descriptions of one budget, and they used to be
-/// two independently chosen numbers:
+/// per-call cap and the window are two descriptions of one budget, and they used
+/// to be two independently chosen numbers:
 ///
 /// ```text
 ///   engine window            16,384 tokens   (LOCAL_ENGINE_N_CTX)
@@ -152,7 +159,7 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 ///   × 9/10                   30,078 → 27,070 (ADR-009 frame defusing inserts at
 ///                                             most one byte per 9 bytes of
 ///                                             payload — REDACT_DEFUSE_GROWTH_DIVISOR)
-///   = REDACT_INPUT_MAX_BYTES  27,070 bytes
+///   = REDACT_CHUNK_MAX_BYTES  27,070 bytes
 /// ```
 ///
 /// Every term is *measured*, not stated: the numbers above are what the
@@ -188,8 +195,8 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 ///    over-window refusal remains the last backstop, as it is for every other
 ///    duty.
 ///
-/// So: this constant is the **cheap first filter** — it is what an over-cap
-/// payload is refused by, before a prompt is built, at zero model cost — and
+/// So: this constant is the **cheap first filter** on each chunk — it is what
+/// sizes the window handed to one model call, before a prompt is built — and
 /// the render guard is what makes "the prompt fits the window" true rather
 /// than estimated.
 ///
@@ -200,21 +207,24 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// reason was "this payload is too large to scan", which is BR-3's distinction
 /// collapsed by arithmetic rather than by wording.
 ///
-/// A payload above this is [`Outcome::Unavailable`] (→ Block), never truncated
-/// and scanned (BR-7).
+/// ## It is a *per-call* cap now, not the bound on what can be scanned
 ///
-/// ## It is smaller than the harness's own context budget, and that collides
+/// It used to be both, and being both is what collided with the harness's own
+/// context budget: `HarnessConfig::context_budget_bytes` is **32,768** —
+/// *larger* than this number — so a turn that filled its context budget
+/// assembled a body the scan refused outright, and with `[privacy] redact =
+/// true` every such remote turn blocked as `ScanUnavailable`. Fail-closed and
+/// honest about its reason, and unusable on any repository where long turns are
+/// normal.
 ///
-/// `HarnessConfig::context_budget_bytes` is **32,768** — larger than this cap.
-/// A turn that fills its context budget therefore builds a body this scan
-/// refuses, so with `[privacy] redact = true` a context-budget-full remote turn
-/// **blocks**, reported as `ScanUnavailable`. That is fail-closed and honest
-/// about its reason, and it is a real usability cost rather than a hypothetical
-/// one. Reconciling the two budgets — chunked scanning, or a context budget
-/// derived from this cap — is deliberate follow-up, not part of this REQ; the
-/// over-cap block rate is a first-class measured number in the
-/// `docs/manual-verification.md` procedure so the size of the problem is
-/// observed rather than argued about.
+/// [`crate::harness::redact::scan`] therefore **chunks** the model pass: a
+/// payload longer than this is scanned in overlapping windows of at most this
+/// size, one model call each, and the verdict claims a completed scan only when
+/// *every* chunk's call completed. The pattern pass is unchanged — it has no
+/// window and still sweeps the whole payload in one go.
+///
+/// What bounds the scan as a whole is [`REDACT_INPUT_MAX_BYTES`], which is a
+/// stated multiple of this.
 ///
 /// ## Why this module reaches upward for four constants
 ///
@@ -223,10 +233,85 @@ pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// **one** number: the cap belongs to the engine that has to hold the prompt
 /// and to the prompt that has to fit in it, and a copy of any of its inputs
 /// here would be the second number LESSON-446 is about.
-pub const REDACT_INPUT_MAX_BYTES: usize =
+pub const REDACT_CHUNK_MAX_BYTES: usize =
     (REDACT_PROMPT_BUDGET_BYTES - CHATML_DUTY_ENVELOPE_BYTES - REDACT_PROMPT_OVERHEAD_BYTES - 1)
         * REDACT_DEFUSE_GROWTH_DIVISOR
         / (REDACT_DEFUSE_GROWTH_DIVISOR + 1);
+
+/// Bytes a remote request body carries **beyond** the harness's assembled
+/// context: the system prompt (tool descriptions included), the JSON envelope,
+/// and the escaping of the context itself.
+///
+/// It exists so that [`REDACT_INPUT_MAX_BYTES`]'s "with room to spare" is a
+/// number a test can check rather than a claim in prose — which is why it is
+/// test-only: nothing in the send path needs it, and a production constant
+/// nothing reads is a number that drifts unnoticed. It is an **assumption**
+/// about the outbound body, and
+/// `the_total_cap_clears_the_harness_context_budget_with_margin` checks the half
+/// of it that is measurable: the real
+/// [`build_system_prompt`](crate::harness::turn_loop::build_system_prompt) with
+/// every builtin tool registered, plus a tenth of the context budget for JSON
+/// escaping, must fit inside it. If a later REQ adds enough tools to overflow
+/// that, the assumption turns red instead of silently eating the margin.
+#[cfg(test)]
+const REDACT_BODY_OVERHEAD_BYTES: usize = 8 * 1024;
+
+/// How many per-chunk windows the total cap is worth — the multiple that turns
+/// [`REDACT_CHUNK_MAX_BYTES`] into [`REDACT_INPUT_MAX_BYTES`].
+///
+/// **Four, and the arithmetic is the reason** (the ADR-6 derivation's shape:
+/// state the terms, do not pick the answer):
+///
+/// ```text
+///   HarnessConfig::context_budget_bytes   32,768 bytes  (turn_loop.rs)
+///   + `REDACT_BODY_OVERHEAD_BYTES`         8,192 bytes  (system prompt, tool
+///                                                        descriptions, JSON
+///                                                        envelope + escaping —
+///                                                        the assumption, and
+///                                                        the test below checks
+///                                                        it against the real
+///                                                        system prompt)
+///   = the largest ordinary outbound body  40,960 bytes
+///   × 2 (the margin — a cap that only just clears the body it has to hold is
+///        one context-budget bump away from being the old collision again)
+///   = 81,920 bytes to clear
+///   ÷ REDACT_CHUNK_MAX_BYTES              81,920 / 27,070 = 3.03
+///   → the next whole chunk up                        4
+/// ```
+///
+/// The other half of the choice is the chunk **count**, because every chunk is
+/// a model call and ADR-8's budget is per call. With the
+/// [`REDACT_CHUNK_OVERLAP_BYTES`](crate::harness::redact::REDACT_CHUNK_OVERLAP_BYTES)
+/// overlap the stride is 26,814 bytes, so a payload at the total cap is at most
+/// **five** chunks
+/// ([`REDACT_MAX_CHUNKS`](crate::harness::redact::REDACT_MAX_CHUNKS), asserted
+/// against the real chunker rather than restated) — p50 ≤ 10 s and p95 ≤ 25 s at
+/// ADR-8's per-chunk budget, against a context-budget-full turn's expected
+/// **two**. Five is the number that has to stay small: the seam's deadline is
+/// per call, so the worst-case *wait* is `chunks × DUTY_DEADLINE`, and a cap
+/// twice this size would double it.
+const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
+
+/// The largest payload the redactor will scan **at all**, in bytes (BR-7,
+/// ADR-6).
+///
+/// A payload above this is [`Outcome::Unavailable`] (→ Block), never truncated
+/// and scanned, and it costs **zero** model calls — the refusal is
+/// [`pattern_verdict`]'s, before any chunk is cut.
+///
+/// The bound still exists for the reason BR-7 gives — a scan has to be bounded
+/// or "scanned" means nothing — but it is no longer the engine window wearing a
+/// second hat. The window bounds one *call*
+/// ([`REDACT_CHUNK_MAX_BYTES`]); this bounds how many calls one send may buy,
+/// and [`REDACT_TOTAL_CAP_CHUNKS`] carries the arithmetic that picked it.
+///
+/// **This is the number that used to sit under the harness's context budget**
+/// (32,768) and block every context-budget-full remote turn. It is now
+/// **108,280** — 3.3× that budget, 2.6× a full body with the system prompt and
+/// JSON overhead on top of it. The collision is closed rather than measured;
+/// what `docs/manual-verification.md` now records is the *chunk-count
+/// distribution*, which is where the cost went.
+pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK_MAX_BYTES;
 
 /// How much the pipeline trusts a finding — **derived, never self-reported**
 /// (BR-4, ADR-4).
@@ -611,6 +696,13 @@ pub fn pattern_pass(text: &str) -> Vec<Finding> {
 /// and does not report a partial result as a complete one. Everything at or
 /// under the cap is scanned, and the resulting verdict carries `scanned: true`
 /// whether or not anything was found.
+///
+/// **This pass is never chunked**, and that is the asymmetry worth stating: the
+/// model pass is windowed because an engine has a context window, and this one
+/// is a byte scan with no window at all. Chunking it would buy nothing and cost
+/// the one thing chunking has to be careful about — a credential lying across a
+/// boundary. So the total cap is the only bound it needs, and it is the cap the
+/// whole scan is refused by.
 #[must_use]
 pub fn pattern_verdict(text: &str) -> RedactionVerdict {
     if text.len() > REDACT_INPUT_MAX_BYTES {
@@ -866,7 +958,7 @@ fn is_shape_space(b: u8) -> bool {
 ///
 /// **In production that 64 KiB input never arrives here.**
 /// [`pattern_verdict`] refuses anything over [`REDACT_INPUT_MAX_BYTES`] —
-/// 27,070 bytes — before this function is called, so the reachable worst case
+/// 108,280 bytes — before this function is called, so the reachable worst case
 /// is the cap, not an unbounded body an attacker sizes. Calling this "a
 /// quadratic scan on the send path from a payload an attacker chooses"
 /// overstated it: the cap is what bounds the payload, and it is checked first.
@@ -1570,13 +1662,16 @@ mod tests {
     // The input cap (BR-7, ADR-6).
     // -----------------------------------------------------------------------
 
-    /// **The cap and the engine window are one budget** (LESSON-446), and the
-    /// thing measured against it is what the engine is **handed** (LESSON-488).
+    /// **The per-chunk cap and the engine window are one budget**
+    /// (LESSON-446), and the thing measured against it is what the engine is
+    /// **handed** (LESSON-488).
     ///
-    /// The claim that matters is the inequality, not the number: a payload
-    /// **at** the cap must still fit inside what the local engine will accept,
-    /// which is `(n_ctx - max_tokens)` tokens, read at the seam's
-    /// two-bytes-per-token convention.
+    /// The claim that matters is the inequality, not the number: a chunk **at**
+    /// [`REDACT_CHUNK_MAX_BYTES`] must still fit inside what the local engine
+    /// will accept, which is `(n_ctx - max_tokens)` tokens, read at the seam's
+    /// two-bytes-per-token convention. That is what makes the chunker's window
+    /// the right size rather than a number beside the right one — every chunk
+    /// the model pass cuts is one of these.
     ///
     /// Every assertion below is on the **rendered** string
     /// ([`rendered_prompt_bytes`](crate::harness::redact::rendered_prompt_bytes)),
@@ -1590,9 +1685,9 @@ mod tests {
     /// prompt budget, so every payload from ~30 KiB to 64 KiB passed the cap and
     /// was then refused by the engine as over-window — a block that said "the
     /// scan could not run" when the true reason was "this payload is too large".
-    /// Setting `REDACT_INPUT_MAX_BYTES` back to `64 * 1024` turns this red.
+    /// Setting `REDACT_CHUNK_MAX_BYTES` back to `64 * 1024` turns this red.
     #[test]
-    fn a_payload_at_the_cap_still_fits_the_engines_window() {
+    fn a_chunk_at_the_per_chunk_cap_still_fits_the_engines_window() {
         use crate::harness::redact::{redact_prompt, rendered_prompt_bytes};
 
         let budget = (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize)
@@ -1605,9 +1700,9 @@ mod tests {
         // builder defuses line-anchored frame labels inside the payload
         // (ADR-009), which is an insertion, and the renderer adds a fixed
         // envelope. Both are terms in the cap's derivation.
-        let worst_case_growth = REDACT_INPUT_MAX_BYTES / REDACT_DEFUSE_GROWTH_DIVISOR + 1;
+        let worst_case_growth = REDACT_CHUNK_MAX_BYTES / REDACT_DEFUSE_GROWTH_DIVISOR + 1;
         assert!(
-            REDACT_INPUT_MAX_BYTES
+            REDACT_CHUNK_MAX_BYTES
                 + worst_case_growth
                 + REDACT_PROMPT_OVERHEAD_BYTES
                 + CHATML_DUTY_ENVELOPE_BYTES
@@ -1615,18 +1710,18 @@ mod tests {
             "a payload at the cap, worst-case defused, plus the prompt's own \
              {REDACT_PROMPT_OVERHEAD_BYTES} bytes and the renderer's \
              {CHATML_DUTY_ENVELOPE_BYTES} must fit in the engine's {budget}-byte \
-             prompt budget; cap is {REDACT_INPUT_MAX_BYTES}"
+             prompt budget; cap is {REDACT_CHUNK_MAX_BYTES}"
         );
 
         // And the real builder and the real renderer agree with the arithmetic,
         // on both an ordinary payload and the adversarial one the growth term is
         // sized for, so the inequality above is about the thing that is actually
         // sent (LESSON-485).
-        let ordinary = "x".repeat(REDACT_INPUT_MAX_BYTES);
+        let ordinary = "x".repeat(REDACT_CHUNK_MAX_BYTES);
         let prompt = redact_prompt(&ordinary);
         assert_eq!(
             prompt.len(),
-            REDACT_INPUT_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES,
+            REDACT_CHUNK_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES,
             "a payload with no frame label in it is embedded byte-identical"
         );
         let rendered = rendered_prompt_bytes(&prompt);
@@ -1638,9 +1733,9 @@ mod tests {
         );
         assert!(rendered <= budget, "rendered prompt is {rendered} bytes");
 
-        let mut adversarial = "Payload:\n".repeat(REDACT_INPUT_MAX_BYTES / 9);
-        adversarial.push_str(&"y".repeat(REDACT_INPUT_MAX_BYTES - adversarial.len()));
-        assert_eq!(adversarial.len(), REDACT_INPUT_MAX_BYTES);
+        let mut adversarial = "Payload:\n".repeat(REDACT_CHUNK_MAX_BYTES / 9);
+        adversarial.push_str(&"y".repeat(REDACT_CHUNK_MAX_BYTES - adversarial.len()));
+        assert_eq!(adversarial.len(), REDACT_CHUNK_MAX_BYTES);
         let prompt = redact_prompt(&adversarial);
         let rendered = rendered_prompt_bytes(&prompt);
         assert!(
@@ -1651,14 +1746,14 @@ mod tests {
         // Non-vacuity: the adversarial fixture really did grow, so the bound is
         // being exercised rather than trivially satisfied.
         assert!(
-            prompt.len() > REDACT_INPUT_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES,
+            prompt.len() > REDACT_CHUNK_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES,
             "the fixture must actually trip the defusing"
         );
 
         // Non-vacuity: the cap is a real bound, not zero and not the window.
         // Read through a binding so this is a runtime comparison rather than a
         // constant one clippy would (correctly) call out as always-true.
-        let cap = REDACT_INPUT_MAX_BYTES;
+        let cap = REDACT_CHUNK_MAX_BYTES;
         assert!(cap > 16 * 1024, "the cap is usable: {cap}");
         assert!(
             cap < 64 * 1024,
@@ -1668,18 +1763,19 @@ mod tests {
 
     /// **The term the arithmetic does not cover, and the guard that does.**
     ///
-    /// A payload at the cap made of `<|`-runs renders ~48% larger than the
-    /// derivation allows for — control-token neutralization inserts one byte
-    /// per two — so it is *under* the cap and *over* the window. This is the
-    /// state that produced a misleading "the scan could not run" from an engine
-    /// error, and the fixture exists so the number is measured rather than
-    /// argued about.
+    /// A chunk at [`REDACT_CHUNK_MAX_BYTES`] made of `<|`-runs renders ~48%
+    /// larger than the derivation allows for — control-token neutralization
+    /// inserts one byte per two — so it is *under* the per-chunk cap and *over*
+    /// the window. This is the state that produced a misleading "the scan could
+    /// not run" from an engine error, and the fixture exists so the number is
+    /// measured rather than argued about.
     ///
-    /// What blocks it is the render guard in `harness::redact::scan`, which
-    /// this asserts the precondition of; the zero-model-call half is
+    /// What blocks it is the render guard in `harness::redact::scan`, which now
+    /// runs **per chunk** — this asserts its precondition; the zero-model-call
+    /// half is
     /// `harness::redact::tests::a_payload_that_renders_past_the_window_is_unavailable_before_any_model_call`.
     #[test]
-    fn a_payload_at_the_cap_can_still_render_past_the_window() {
+    fn a_chunk_at_the_per_chunk_cap_can_still_render_past_the_window() {
         use crate::harness::redact::{redact_prompt, rendered_prompt_bytes};
 
         // 31 `<|` pairs closed by a `|>` inside the renderer's 64-byte span
@@ -1687,9 +1783,9 @@ mod tests {
         // transform admits.
         let block = "<|".repeat(31) + "|>";
         assert_eq!(block.len(), 64);
-        let mut adversarial = block.repeat(REDACT_INPUT_MAX_BYTES / 64);
-        adversarial.push_str(&"z".repeat(REDACT_INPUT_MAX_BYTES - adversarial.len()));
-        assert_eq!(adversarial.len(), REDACT_INPUT_MAX_BYTES);
+        let mut adversarial = block.repeat(REDACT_CHUNK_MAX_BYTES / 64);
+        adversarial.push_str(&"z".repeat(REDACT_CHUNK_MAX_BYTES - adversarial.len()));
+        assert_eq!(adversarial.len(), REDACT_CHUNK_MAX_BYTES);
 
         // Under the cap — so the cheap first filter passes it.
         assert_eq!(
@@ -1703,6 +1799,71 @@ mod tests {
             rendered > REDACT_PROMPT_BUDGET_BYTES,
             "the fixture must really render past the {REDACT_PROMPT_BUDGET_BYTES}-byte \
              budget, or the guard behind it is untested; it rendered to {rendered}"
+        );
+    }
+
+    /// **The total cap clears the harness's own context budget with room to
+    /// spare** — the collision ADR-6 recorded as deliberate follow-up, closed
+    /// rather than measured.
+    ///
+    /// `HarnessConfig::context_budget_bytes` bounds the *context* a turn
+    /// assembles; the body that reaches the wire is that plus the system prompt
+    /// (which carries every exposed tool's description) plus the JSON envelope
+    /// and the escaping of the context itself. The cap has to clear all of it,
+    /// and clear it by enough that a later bump to the context budget does not
+    /// quietly restore the old failure.
+    ///
+    /// Two claims, and the first is the one that can rot:
+    ///
+    /// 1. [`REDACT_BODY_OVERHEAD_BYTES`] really does cover the non-context part
+    ///    — measured from the real
+    ///    [`build_system_prompt`](crate::harness::turn_loop::build_system_prompt)
+    ///    with every builtin registered and the tool cap lifted, plus a tenth of
+    ///    the budget for escaping. An assumption nobody checks is a number that
+    ///    drifts.
+    /// 2. The total cap is at least **twice** that whole body.
+    #[test]
+    fn the_total_cap_clears_the_harness_context_budget_with_margin() {
+        use crate::harness::tools::ToolRegistry;
+        use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
+
+        // The strong-model shape (`max_tools: None`), so every builtin's
+        // description is in the prompt: the larger of the two harness configs
+        // is the one the overhead has to cover.
+        let config = HarnessConfig::for_strong_model();
+        let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+        let budget = config.context_budget_bytes;
+        let escaping = budget / 10;
+        assert!(
+            system.len() + escaping <= REDACT_BODY_OVERHEAD_BYTES,
+            "the assumed body overhead no longer covers what a body carries: a \
+             {}-byte system prompt plus {escaping} bytes of escaping against an \
+             assumed {REDACT_BODY_OVERHEAD_BYTES}",
+            system.len()
+        );
+
+        let body = budget + REDACT_BODY_OVERHEAD_BYTES;
+        assert!(
+            REDACT_INPUT_MAX_BYTES >= 2 * body,
+            "the total cap ({REDACT_INPUT_MAX_BYTES}) must clear a full outbound \
+             body ({body}) twice over; it used to sit UNDER it, which is what \
+             blocked every context-budget-full remote turn"
+        );
+
+        // And the shape of the fix, asserted rather than described: the cap
+        // that is still *under* the budget is the per-chunk one, which is fine
+        // precisely because a payload larger than one chunk is now scanned in
+        // several.
+        assert!(
+            REDACT_CHUNK_MAX_BYTES < budget,
+            "the collision was real: one engine window does not hold a \
+             context-budget-full turn"
+        );
+        assert_eq!(
+            REDACT_INPUT_MAX_BYTES,
+            REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK_MAX_BYTES,
+            "the total cap is a stated multiple of the per-chunk cap, not a \
+             number chosen beside it"
         );
     }
 
