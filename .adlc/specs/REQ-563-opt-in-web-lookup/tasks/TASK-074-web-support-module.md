@@ -1,7 +1,7 @@
 ---
 id: TASK-074
 title: "tetond web module: cache, deterministic reduction, user-URL set, allowlist matcher"
-status: draft
+status: complete
 parent: REQ-563
 created: 2026-08-08
 updated: 2026-08-08
@@ -25,11 +25,11 @@ allowlist matcher.
 
 ## Acceptance Criteria
 
-- [ ] Cache: fresh hit returns content without touching the network layer (pure function of the store); stale/absent returns None; `evict` removes; `cache_ttl_secs = 0` disables persistence entirely; entry files are 0600.
-- [ ] `reduce`: script/style content NEVER appears in output; tags stripped; entities decoded; output ≤ cap and cuts on a char boundary (multi-byte UTF-8 test); deterministic (same input → same output).
-- [ ] `UserUrls`: URL pasted in a user prompt is found verbatim after normalization; a URL differing in host, path, or query is NOT found (spec BR-3's "not one the model composed").
-- [ ] `DomainAllowlist`: exact and wildcard matches pass; sibling-domain and suffix-trick hosts (`evil-example.com` vs `example.com`, `example.com.evil.net`) fail.
-- [ ] Unit tests for every bullet above, including the suffix-trick negative cases.
+- [x] Cache: fresh hit returns content without touching the network layer (pure function of the store); stale/absent returns None; `evict` removes; `cache_ttl_secs = 0` disables persistence entirely; entry files are 0600.
+- [x] `reduce`: script/style content NEVER appears in output; tags stripped; entities decoded; output ≤ cap and cuts on a char boundary (multi-byte UTF-8 test); deterministic (same input → same output).
+- [x] `UserUrls`: URL pasted in a user prompt is found verbatim after normalization; a URL differing in host, path, or query is NOT found (spec BR-3's "not one the model composed").
+- [x] `DomainAllowlist`: exact and wildcard matches pass; sibling-domain and suffix-trick hosts (`evil-example.com` vs `example.com`, `example.com.evil.net`) fail.
+- [x] Unit tests for every bullet above, including the suffix-trick negative cases.
 
 ## Technical Notes
 

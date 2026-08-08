@@ -44,6 +44,11 @@
 //!   which is what makes "a decision is not re-litigated" a state read.
 //! - [`mcp`] — user-registered MCP servers as egress-gated tool providers
 //!   (ADR-003): the protocol client, the server registry, and the tool bridge.
+//! - [`web`] — opt-in web lookup's local, pure support pieces (REQ-563): the
+//!   on-machine document cache, the dependency-free HTML→text reducer, the
+//!   per-session user-pasted-URL set, and the domain allowlist. Nothing here
+//!   opens a socket and nothing here decides whether a lookup is allowed —
+//!   egress belongs to [`egress`], the gates beside it.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
 //!
 //! Socket and lock path resolution lives in the shared
@@ -69,6 +74,7 @@ pub mod server;
 pub mod sessions;
 pub mod single_instance;
 pub mod structured;
+pub mod web;
 
 pub use server::{bind_listener, serve, Daemon};
 
