@@ -568,6 +568,9 @@ pub fn pattern_verdict(text: &str) -> RedactionVerdict {
 
 /// A credential shape anchored on a literal prefix followed by a run of body
 /// bytes — four of the five shapes have this form.
+///
+/// There is no per-shape left-boundary alphabet: [`is_left_boundary`] is one
+/// predicate for all four, for the reason recorded there.
 struct PrefixShape {
     /// The literal prefix that anchors the match.
     prefix: &'static [u8],
@@ -578,15 +581,6 @@ struct PrefixShape {
     body_cap: Option<usize>,
     /// Which bytes may appear in the body.
     is_body: fn(u8) -> bool,
-    /// Which byte **immediately left of the prefix** means the prefix is the
-    /// tail of a longer word rather than the start of a credential — the left
-    /// word boundary (see [`scan_prefix_shape`]).
-    ///
-    /// Ordinarily the body alphabet: `sk-` inside `disk-encryption` is preceded
-    /// by a body byte, and a real `sk-…` never is. `Bearer ` is the exception —
-    /// its body alphabet includes `.`, `_` and `-`, none of which can end the
-    /// word `Bearer` belongs to — so it uses plain alphanumeric.
-    is_word_left: fn(u8) -> bool,
 }
 
 /// `sk-[A-Za-z0-9_-]{20,}` — OpenAI/Anthropic-style secret keys.
@@ -616,30 +610,122 @@ const PREFIX_SHAPES: &[PrefixShape] = &[
         min_body: 20,
         body_cap: None,
         is_body: is_sk_body,
-        is_word_left: is_sk_body,
     },
     PrefixShape {
         prefix: b"AKIA",
         min_body: 16,
         body_cap: Some(16),
         is_body: is_upper_alnum,
-        is_word_left: is_upper_alnum,
     },
     PrefixShape {
         prefix: b"ghp_",
         min_body: 36,
         body_cap: None,
         is_body: is_alnum,
-        is_word_left: is_alnum,
     },
     PrefixShape {
         prefix: b"Bearer ",
         min_body: 20,
         body_cap: None,
         is_body: is_bearer_body,
-        is_word_left: is_alnum,
     },
 ];
+
+/// Whether a credential prefix starting at `at` begins a word — the left word
+/// boundary every prefix shape requires (see [`scan_prefix_shape`]).
+///
+/// ## One predicate for every shape, and it is "alphanumeric"
+///
+/// It used to be the shape's *own body alphabet*, which is not a word boundary
+/// but a statement about the alphabet, and the two came apart in both
+/// directions:
+///
+/// - `sk-`'s body alphabet includes `-` and `_`, so a unified-diff removal line
+///   (`-sk-…`) and an underscore-prefixed key (`_sk-…`) were **skipped**. Both
+///   are real credentials at a real word start.
+/// - `AKIA`'s body alphabet is upper-alnum, so `prefixAKIA…` — the prefix
+///   glued to the tail of a lowercase word — still **matched**.
+///
+/// A real credential is never preceded by a letter or a digit, and `disk-` /
+/// `risk-` are rejected by exactly that: the byte before the prefix is a
+/// letter. So the predicate is `is_ascii_alphanumeric` for all four shapes,
+/// which is what "starts a word" actually means.
+///
+/// ## The JSON-escape exception, and why it is not optional
+///
+/// This scan runs on the **serialized** outbound body (`Egress::send` scans
+/// `request.body`), where a newline inside message content is not byte `0x0a`
+/// but the two bytes `\` `n` — and `n` is a letter. Every credential written at
+/// the start of a content line was therefore preceded by a "word byte" and
+/// skipped: a JSON body with four line-start credentials in it detected only
+/// the `AKIA` one, whose lowercase-`n` predecessor its old upper-alnum
+/// alphabet happened to reject. That is the whole feature failing on the exact
+/// shape of the payload it is installed to scan.
+///
+/// So a preceding byte that is the last byte of a **string escape** counts as a
+/// boundary: `\n`, `\t`, `\r`, `\b`, `\f`, and `\uXXXX` when what it decodes to
+/// is not itself alphanumeric — the escape for a newline is a boundary, the
+/// escape for `A` is not, so an escaped `A` before `sk-…` stays mid-word and
+/// stays rejected. "Escape" means an
+/// **odd** run of backslashes before it — `\\nsk-…` is a literal backslash then
+/// the letter `n`, which is mid-word, and this says so.
+///
+/// `disk-` is untouched by all of it: `i` is not one of the escape letters.
+fn is_left_boundary(bytes: &[u8], at: usize) -> bool {
+    if at == 0 {
+        return true;
+    }
+    let prev = bytes[at - 1];
+    if !prev.is_ascii_alphanumeric() {
+        return true;
+    }
+    ends_a_string_escape(bytes, at - 1)
+}
+
+/// Whether the byte at `at` is the final byte of a string escape whose decoded
+/// character is not alphanumeric (see [`is_left_boundary`]).
+fn ends_a_string_escape(bytes: &[u8], at: usize) -> bool {
+    // `\n` `\t` `\r` `\b` `\f` — two bytes, the second a letter.
+    if matches!(bytes[at], b'n' | b't' | b'r' | b'b' | b'f') && is_escaped(bytes, at) {
+        return true;
+    }
+    // `\uXXXX` — six bytes, `at` being the last hex digit.
+    if at >= 5 && bytes[at - 4] == b'u' && is_escaped(bytes, at - 4) {
+        if let Some(code) = hex4(&bytes[at - 3..=at]) {
+            // Only what it *decodes to* decides: an escape standing for a
+            // letter or a digit is a word byte like any other.
+            return !(code < 128 && (code as u8).is_ascii_alphanumeric());
+        }
+    }
+    false
+}
+
+/// Whether the byte at `at` is escaped — preceded by an **odd** run of
+/// backslashes.
+///
+/// The walk is bounded in aggregate rather than per call: a caller only reaches
+/// it when a literal prefix matched at `at + 1`, and the backslash runs behind
+/// two distinct prefix occurrences cannot overlap (the escape letter and the
+/// prefix itself sit between them), so every byte of the payload is walked at
+/// most once across the whole scan.
+fn is_escaped(bytes: &[u8], at: usize) -> bool {
+    let mut backslashes = 0usize;
+    let mut i = at;
+    while i > 0 && bytes[i - 1] == b'\\' {
+        backslashes += 1;
+        i -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+/// The value of exactly four hex digits, or `None` if they are not all hex.
+fn hex4(digits: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    for &byte in digits {
+        value = value * 16 + char::from(byte).to_digit(16)?;
+    }
+    Some(value)
+}
 
 /// Collect every non-overlapping, leftmost-longest match of `shape` in `bytes`.
 ///
@@ -652,11 +738,11 @@ const PREFIX_SHAPES: &[PrefixShape] = &[
 /// **blocked the turn** — a pattern pass whose precision was supposed to be the
 /// thing that keeps this feature usable (BR-4, OQ-2) refusing ordinary English.
 ///
-/// So a match at `i` is accepted only when `i == 0` or `bytes[i - 1]` is not a
-/// word byte for that shape. **No true positive is lost**: a real credential is
-/// preceded by a quote, an `=`, a `:`, whitespace, or the start of the payload —
-/// never by another body byte, because a body byte there would be part of the
-/// credential.
+/// So a match at `i` is accepted only when [`is_left_boundary`] holds there.
+/// **No true positive is lost**: a real credential is preceded by a quote, an
+/// `=`, a `:`, whitespace, a diff marker, an escape, or the start of the payload
+/// — never by a letter or a digit, because those would be part of the word the
+/// prefix belongs to.
 fn scan_prefix_shape(bytes: &[u8], shape: &PrefixShape, out: &mut Vec<Range<usize>>) {
     let plen = shape.prefix.len();
     let mut i = 0usize;
@@ -667,7 +753,7 @@ fn scan_prefix_shape(bytes: &[u8], shape: &PrefixShape, out: &mut Vec<Range<usiz
         }
         // The left word boundary: a prefix in the middle of a longer word is
         // that word, not a credential.
-        if i > 0 && (shape.is_word_left)(bytes[i - 1]) {
+        if !is_left_boundary(bytes, i) {
             i += 1;
             continue;
         }
@@ -1007,11 +1093,30 @@ mod tests {
         },
         // The positive twin, and the reason the boundary check loses no true
         // positive: a real key is preceded by a quote, an `=`, a `:` or
-        // whitespace — never by a body byte.
+        // whitespace — never by a letter or a digit.
         ShapeCase {
             name: "sk- after an equals and a quote still matches",
             text: "let key = \"sk-ABCDEFGHIJKLMNOPQRSTUVWX\";",
             expect: Some("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        },
+        // The rows the *alphabet-relative* boundary got wrong in both
+        // directions. `-` and `_` are `sk-` body bytes, so a unified-diff
+        // removal line and an underscore-prefixed name were skipped; and
+        // `AKIA`'s upper-alnum alphabet let a lowercase word's tail through.
+        ShapeCase {
+            name: "a diff removal line's `-` is a boundary, not a body byte",
+            text: "-sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+            expect: Some("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        },
+        ShapeCase {
+            name: "an underscore before the prefix is a boundary too",
+            text: "_sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+            expect: Some("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        },
+        ShapeCase {
+            name: "AKIA glued to a lowercase word is that word's tail",
+            text: "prefixAKIAIOSFODNN7EXAMPLE",
+            expect: None,
         },
     ];
 
@@ -1114,6 +1219,118 @@ mod tests {
                 .expect("the fixture is malformed");
             assert_eq!(*found[0].span(), start..start + case.expect.len());
         }
+    }
+
+    /// **The boundary survives JSON escaping** — the shape this scan actually
+    /// meets in production.
+    ///
+    /// `Egress::send` scans `request.body`, which is a *serialized* request: a
+    /// newline inside message content is not byte `0x0a` but the two bytes
+    /// backslash + `n`, and `n`/`t`/`r`/`b`/`f` are all letters. Under the old
+    /// alphabet-relative boundary every credential written at the start of a
+    /// content line was preceded by a "word byte" and skipped — this body
+    /// carries four and only the `AKIA` one was found, because its upper-alnum
+    /// alphabet happened to reject a lowercase `n`.
+    ///
+    /// So the fixture is serialized with `serde_json` rather than hand-written:
+    /// what is scanned is the encoding an adapter really produces.
+    #[test]
+    fn a_credential_at_the_start_of_a_json_encoded_line_is_still_found() {
+        const CONTENT: &str = "here is the deploy config:\n\
+                               sk-ABCDEFGHIJKLMNOPQRSTUVWX\n\
+                               AKIAIOSFODNN7EXAMPLE\n\
+                               ghp_abcdefghijklmnopqrstuvwxyz0123456789\n\
+                               Bearer eyJhbGciOiJIUzI1NiJ9.abcdefghij\n";
+        let body = serde_json::json!({
+            "model": "claude-opus-4",
+            "messages": [{ "role": "user", "content": CONTENT }],
+        });
+        let serialized = serde_json::to_string(&body).expect("a serializable body");
+
+        // Non-vacuity: the fixture really is the escaped shape. If serialization
+        // ever stopped escaping newlines, the rows below would be testing the
+        // raw-text case that already worked.
+        assert!(
+            !serialized.contains('\n'),
+            "a serialized body is one line; its content newlines are escapes"
+        );
+        assert!(
+            serialized.contains(r"\nsk-"),
+            "the fixture must put a credential immediately after an escape: {serialized}"
+        );
+
+        let expected = [
+            "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "Bearer eyJhbGciOiJIUzI1NiJ9.abcdefghij",
+        ];
+        let findings = pattern_pass(&serialized);
+        assert_eq!(
+            findings.len(),
+            expected.len(),
+            "every shape at a JSON line start must be found: {findings:?}"
+        );
+        for (finding, needle) in findings.iter().zip(expected) {
+            let at = serialized.find(needle).expect("the fixture carries it");
+            assert_eq!(
+                *finding.span(),
+                at..at + needle.len(),
+                "{needle}: the span must cover exactly the credential"
+            );
+        }
+    }
+
+    /// The escape exception is about what the escape **decodes to**, and about
+    /// the backslash really being an escape rather than a literal.
+    ///
+    /// Each row is the same prefix and the same body run; only the two bytes in
+    /// front of it change. That is what keeps the exception from being "a
+    /// backslash anywhere nearby makes it a credential".
+    #[test]
+    fn only_an_escape_that_decodes_to_a_non_word_character_is_a_boundary() {
+        const KEY: &str = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+
+        for escape in ["n", "t", "r", "b", "f"] {
+            let text = format!("word\\{escape}{KEY}");
+            assert_eq!(
+                pattern_pass(&text).len(),
+                1,
+                "an escaped whitespace byte is a line start, not a word: {text}"
+            );
+        }
+        // An EVEN run of backslashes is a literal backslash followed by the
+        // letter `n` — mid-word, and the credential shape does not start there.
+        let literal = format!("word\\\\n{KEY}");
+        assert!(
+            pattern_pass(&literal).is_empty(),
+            "a literal backslash then `n` is a word byte: {literal}"
+        );
+        // And an odd run is an escape again, however long.
+        let odd = format!("word\\\\\\n{KEY}");
+        assert_eq!(pattern_pass(&odd).len(), 1, "{odd}");
+
+        // The six-byte escape. Written through `format!` so the four hex digits
+        // are the only thing that varies between the rows.
+        let hex_escape = |hex: &str| format!("word\\u{hex}{KEY}");
+        assert_eq!(
+            pattern_pass(&hex_escape("000a")).len(),
+            1,
+            "the escape for a newline is a boundary"
+        );
+        assert_eq!(
+            pattern_pass(&hex_escape("2014")).len(),
+            1,
+            "the escape for an em dash is a boundary"
+        );
+        assert!(
+            pattern_pass(&hex_escape("0041")).is_empty(),
+            "the escape for `A` decodes to a word byte, so this is mid-word"
+        );
+        assert!(
+            pattern_pass(&hex_escape("zzzz")).is_empty(),
+            "four non-hex bytes are not an escape at all"
+        );
     }
 
     #[test]

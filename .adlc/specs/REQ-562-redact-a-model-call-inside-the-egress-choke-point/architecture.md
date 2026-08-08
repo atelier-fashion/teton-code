@@ -62,13 +62,35 @@ Two passes (OQ-2 = BOTH):
   (`sk-[A-Za-z0-9_-]{20,}`, `AKIA[A-Z0-9]{16}`, `ghp_[A-Za-z0-9]{36,}`,
   `Bearer [A-Za-z0-9._-]{20,}`, `[A-Z_]+_(API_KEY|TOKEN)\s*[=:]\s*\S+`). A hit
   is `confidence: High` **by construction**. Each prefix shape additionally
-  requires a **left word boundary** (`\b`-equivalent: start of payload, or a
-  preceding byte outside the shape's own alphabet). Without it `sk-` matches
-  inside `disk-encryption-configuration`, which is a High finding and therefore
-  a blocked turn — the pattern pass's near-perfect precision is the entire
+  requires a **left word boundary**. Without it `sk-` matches inside
+  `disk-encryption-configuration`, which is a High finding and therefore a
+  blocked turn — the pattern pass's near-perfect precision is the entire
   argument for blocking on it (OQ-2), so an unanchored prefix is not a cosmetic
-  defect. No true positive is lost: a real credential is preceded by a quote,
-  `=`, `:`, whitespace, or nothing.
+  defect.
+
+  **The predicate is one rule for all four shapes, and it is not the shape's own
+  alphabet.** A prefix begins a word when the byte before it is not
+  `[A-Za-z0-9]` — that is what "starts a word" means, and it is what rejects
+  `disk-`/`risk-` (the preceding byte is a letter). Deriving the boundary from
+  each shape's *body* alphabet instead, as the first implementation did, is a
+  statement about the alphabet rather than about words, and it came apart in
+  both directions: `sk-`'s body alphabet contains `-` and `_`, so a unified-diff
+  removal line (`-sk-…`) and `_sk-…` were skipped; `AKIA`'s is upper-alnum, so
+  `prefixAKIA…` still matched.
+
+  **With one exception, which is load-bearing rather than a nicety.** The scan
+  runs on the request body as it is *serialized* (ADR-1), where a newline inside
+  message content is not `0x0a` but the two bytes backslash + `n` — and
+  `n`/`t`/`r`/`b`/`f` are letters. Under the plain rule, a credential written at
+  the start of a content line is preceded by a "word byte" and skipped: a JSON
+  body carrying four line-start credentials detected exactly one. So the last
+  byte of a **string escape** counts as a boundary — the short escapes, and
+  `\uXXXX` when what it decodes to is not itself alphanumeric — where "escape"
+  means an *odd* preceding run of backslashes, so a literal backslash followed
+  by the letter `n` stays mid-word.
+
+  No true positive is lost: a real credential is preceded by a quote, `=`, `:`,
+  whitespace, a diff marker, an escape, or nothing.
 - **Model pass** — the duty's local-model call. A model-only hit is
   `confidence: Low` by construction. The model's self-reported certainty is
   never consulted.

@@ -3,14 +3,15 @@
   "branch": "feat/REQ-562-redact-egress-scan",
   "startedAt": "2026-08-07T00:00:00Z",
   "completed": false,
-  "currentPhase": 4,
-  "completedPhases": [0, 1, 2, 3],
+  "currentPhase": 5,
+  "completedPhases": [0, 1, 2, 3, 4],
   "integrationBranch": "main",
   "phaseHistory": [
     { "phase": 0, "name": "Resolve Repos + Worktree + Preflight", "completedAt": "2026-08-07T00:10:00Z", "note": "draft PR deferred to Phase 6 fallback (LESSON-004: no commits yet)" },
     { "phase": 1, "name": "Validate Requirement Spec", "completedAt": "2026-08-07T00:20:00Z", "note": "APPROVED; OQ-4 checkbox synced to recorded resolution; BR-9 latency budget carried to Phase 2 as an architecture obligation" },
     { "phase": 2, "name": "Architect & Break Into Tasks", "completedAt": "2026-08-07T00:50:00Z", "note": "8 ADRs; 6 tasks TASK-066..071 in 4 tiers; draft PR #69 opened (Step-0 retry) and footprint published" },
-    { "phase": 3, "name": "Validate Architecture & Tasks", "completedAt": "2026-08-07T01:00:00Z", "note": "PASS after closing the AC-4 ownership gap (TASK-067 RPC/CLI legs, TASK-071 behavioral no-guard leg)" }
+    { "phase": 3, "name": "Validate Architecture & Tasks", "completedAt": "2026-08-07T01:00:00Z", "note": "PASS after closing the AC-4 ownership gap (TASK-067 RPC/CLI legs, TASK-071 behavioral no-guard leg)" },
+    { "phase": 4, "name": "Implement", "completedAt": "2026-08-08T00:00:00Z", "note": "6 tasks + 3 follow-on fixes; green mutation (d) reported then closed by fixture; AC-1 adjudicated per ADR-4; workspace green at a88326c" }
   ],
   "repos": {
     "teton-code": {
@@ -28,9 +29,9 @@
   },
   "mergeOrder": ["teton-code"],
   "phase4": {
-    "currentTask": "TASK-071",
-    "completedTasks": ["TASK-066", "TASK-067", "TASK-068", "TASK-069", "TASK-070"],
+    "currentTask": null,
+    "completedTasks": ["TASK-066", "TASK-067", "TASK-068", "TASK-069", "TASK-070", "TASK-071"],
     "failedTasks": [],
-    "note": "tier 3 done (27d1de8 + BR-3 sentence fix 15ed1ce); tier 4 = TASK-071"
+    "note": "all tiers done; head a88326c"
   }
 }
