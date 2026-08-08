@@ -1,7 +1,7 @@
 ---
 id: TASK-072
 title: "WebConfig: [web] section with tier, endpoint, allowlist, cache TTL"
-status: draft
+status: complete
 parent: REQ-563
 created: 2026-08-08
 updated: 2026-08-08
@@ -21,10 +21,10 @@ optional constraint on model-chosen destinations.
 
 ## Acceptance Criteria
 
-- [ ] `WebTier` is ordered (`Off < FetchUserUrl < FetchAnyUrl < Search`) and `tier.allows(WebTier::X)` expresses the each-tier-includes-lower rule (spec BR-3).
-- [ ] Default config deserializes with `tier = Off`; a config file with no `[web]` table round-trips without emitting one.
-- [ ] `validate()`: `tier = search` without `search_endpoint` is a config error naming the missing field (spec BR-8/AC-7); `search_key_ref` must look like a keychain reference and never a raw credential (reuse the existing `auth_ref` validation shape and its no-echo rule — config.rs:8-17); `allowed_domains` entries are charset-checked (`[A-Za-z0-9.*-]`, no scheme, no path, no `..`).
-- [ ] Unit tests cover: tier ordering, default-off, search-without-endpoint error, credential-shaped `search_key_ref` rejected without echoing the value, allowlist charset rejection.
+- [x] `WebTier` is ordered (`Off < FetchUserUrl < FetchAnyUrl < Search`) and `tier.allows(WebTier::X)` expresses the each-tier-includes-lower rule (spec BR-3).
+- [x] Default config deserializes with `tier = Off`; a config file with no `[web]` table round-trips without emitting one.
+- [x] `validate()`: `tier = search` without `search_endpoint` is a config error naming the missing field (spec BR-8/AC-7); `search_key_ref` must look like a keychain reference and never a raw credential (reuse the existing `auth_ref` validation shape and its no-echo rule — config.rs:8-17); `allowed_domains` entries are charset-checked (`[A-Za-z0-9.*-]`, no scheme, no path, no `..`).
+- [x] Unit tests cover: tier ordering, default-off, search-without-endpoint error, credential-shaped `search_key_ref` rejected without echoing the value, allowlist charset rejection.
 
 ## Technical Notes
 
