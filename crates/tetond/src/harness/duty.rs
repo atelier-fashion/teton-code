@@ -140,6 +140,7 @@
 //! | `redact_route` falls through to the squatting provider when `local_tier_id` yields nothing | `runtime::tests::dispatch::redact::a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote` |
 //! | `redact_route` treats an unresolved route as clean instead of unresolved | `runtime::tests::dispatch::redact::a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan` |
 //! | `build_duty_route` stops installing the gate on a remotely bound duty's choke point | [`tests::a_remote_duty_send_is_scanned_by_the_choke_points_gate`] (at the seam) |
+//! | `mcp_egress` stops installing the gate on the MCP choke point | `runtime::tests::dispatch::redact::an_mcp_tool_call_crosses_the_gate_when_redact_is_on`. **This was GREEN before that fixture existed** — the attachment lived inside `build_tools`, reachable only through `HttpTransport::new()` and a real socket, so deleting it left the whole suite passing. The transport is a parameter of `mcp_egress` now precisely so the construction is drivable from a test |
 //! | the forward path rebuilds the request from the scanned text instead of passing it through | `egress::tests::a_low_only_or_clean_verdict_forwards_the_exact_bytes`, `…::the_gate_reads_the_exact_bytes_that_would_go_on_the_wire` (AC-9) |
 //! | the gate hook is placed after `inner.execute`, or metering moves ahead of it | `egress::tests::a_blocked_send_bills_nothing_while_an_allowed_one_still_bills` |
 //!

@@ -35,7 +35,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
 use teton_protocol::{ProviderId, SessionId};
-use teton_providers::transport::{ByteStream, HttpMethod, TransportRequest, TransportResponse};
+use teton_providers::transport::{
+    BlockDetail, ByteStream, HttpMethod, TransportRequest, TransportResponse,
+};
 
 use crate::egress::{Egress, EgressContext, EgressError, Provenance};
 use teton_providers::transport::Transport;
@@ -83,15 +85,61 @@ pub enum McpError {
         /// JSON-RPC error code.
         code: i64,
     },
-    /// A `tools/call` to a remote server was refused at the egress choke point
-    /// because its provenance intersected a `local-only` boundary (BR-1).
-    #[error("privacy boundary blocked an MCP call touching `{path}` to server `{server_id}`")]
+    /// A call to a remote server was refused at the egress choke point — by the
+    /// provenance inspection (BR-1) or by the REQ-562 redaction scan.
+    ///
+    /// `detail` is which of the two, and for the scan, which way it went. An MCP
+    /// tool call is remote egress like any other (ADR-003), so all three of the
+    /// choke point's refusals reach here — and a redaction block reported as
+    /// "privacy boundary blocked …" sends the user hunting for a `local-only`
+    /// glob that does not exist. Worse still is telling someone whose scan
+    /// *could not run* that something was found: those are different problems
+    /// with different fixes, which is the rule REQ-562 BR-3 exists to keep.
+    #[error("{}", mcp_block_sentence(*.detail, .path, .server_id))]
     PrivacyBlocked {
-        /// Repo-relative boundary path that would have leaked.
+        /// Repo-relative boundary path that would have leaked, or — for a
+        /// redaction block — the non-secret locus naming the outbound payload.
         path: String,
         /// The remote MCP server the content would have reached.
         server_id: String,
+        /// Which inspection refused it (REQ-562 BR-3). [`BlockDetail`] is the
+        /// vocabulary that crosses the `teton-providers` seam: enough to choose
+        /// the right sentence, and structurally unable to carry payload content
+        /// — it has no fields.
+        detail: BlockDetail,
     },
+}
+
+/// The sentence [`McpError::PrivacyBlocked`] renders, one per cause
+/// (REQ-562 BR-3).
+///
+/// Three refusals, three sentences — the same posture as the daemon's
+/// `refusal_clause` and the choke point's own `privacy_blocked_sentence`, and
+/// for the same reason: a noun swapped inside one sentence drifts into claiming
+/// the scan found something when it never ran.
+///
+/// The boundary wording is REQ-544's, preserved verbatim — it is the sentence
+/// already in every log and every existing test.
+///
+/// Nothing here can interpolate payload content. `path` is a config-authored
+/// glob target or the fixed locus phrase, and [`BlockDetail`] has no fields at
+/// all, so BR-6 holds by the shape of the inputs rather than by care here.
+fn mcp_block_sentence(detail: BlockDetail, path: &str, server_id: &str) -> String {
+    match detail {
+        BlockDetail::Boundary => {
+            format!(
+                "privacy boundary blocked an MCP call touching `{path}` to server `{server_id}`"
+            )
+        }
+        BlockDetail::Redaction => format!(
+            "the redaction scan found sensitive content in an MCP call to server \
+             `{server_id}` ({path}), so it was refused"
+        ),
+        BlockDetail::ScanUnavailable => format!(
+            "the redaction scan could not run on an MCP call to server `{server_id}` \
+             ({path}), so it was refused unscanned"
+        ),
+    }
 }
 
 impl McpError {
@@ -520,11 +568,28 @@ impl HttpConnection {
         collect_body(response.body).await
     }
 
+    /// Project an [`EgressError`] onto this module's vocabulary.
+    ///
+    /// The cause is carried across as a [`BlockDetail`] — the same projection
+    /// [`EgressError::into_transport_error`] performs, and the same three
+    /// values, because the alternative is this seam reporting every refusal as
+    /// a boundary block (REQ-562 BR-3). The finding's kind and span stop here:
+    /// the `privacy_block` event already carries them straight from the choke
+    /// point, and a byte range has no business travelling through a tool result.
     fn map_egress_error(&self, err: EgressError) -> McpError {
         match err {
-            EgressError::PrivacyBlocked { path, .. } => McpError::PrivacyBlocked {
-                path,
+            EgressError::PrivacyBlocked { ref path, .. } => McpError::PrivacyBlocked {
+                path: path.clone(),
                 server_id: self.server_id.clone(),
+                detail: match err.into_transport_error() {
+                    teton_providers::transport::TransportError::PrivacyBlocked(detail) => detail,
+                    // Unreachable: `into_transport_error` maps every
+                    // `PrivacyBlocked` to a `PrivacyBlocked`. Named rather than
+                    // `unreachable!` so a future re-mapping degrades to the
+                    // *stricter* reading — a scan that could not run — instead
+                    // of panicking the daemon on a tool call.
+                    _ => BlockDetail::ScanUnavailable,
+                },
             },
             other => McpError::Transport(other.to_string()),
         }
@@ -840,6 +905,74 @@ fn rpc_result(response: &Value, server_id: &str) -> Result<Value, McpError> {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    // ---- the block sentence (REQ-562 BR-3) ----
+
+    /// **Three refusals, three sentences.** An MCP call crosses the same choke
+    /// point a turn does, so all three of its refusals reach this seam — and
+    /// the failure this replaced was not a wrong sentence but **one** sentence
+    /// for every cause, which sent a user whose scan could not run hunting for
+    /// a `local-only` glob that does not exist.
+    ///
+    /// The `unique.len()` assertion is what makes a collapsed clause fail; the
+    /// per-row assertions are what keep the scan-unavailable wording from
+    /// drifting into claiming a finding.
+    #[test]
+    fn the_three_block_causes_produce_three_distinct_mcp_sentences() {
+        use std::collections::BTreeSet;
+
+        let rendered: Vec<String> = [
+            BlockDetail::Boundary,
+            BlockDetail::Redaction,
+            BlockDetail::ScanUnavailable,
+        ]
+        .into_iter()
+        .map(|detail| {
+            McpError::PrivacyBlocked {
+                path: "secrets/prod.env".to_owned(),
+                server_id: "kb".to_owned(),
+                detail,
+            }
+            .to_string()
+        })
+        .collect();
+
+        let unique: BTreeSet<&String> = rendered.iter().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "the three causes must not share a sentence: {rendered:?}"
+        );
+
+        // REQ-544's wording, preserved: it is what is already in every log.
+        assert!(
+            rendered[0].contains("privacy boundary blocked an MCP call"),
+            "{}",
+            rendered[0]
+        );
+        assert!(
+            rendered[1].contains("found sensitive content"),
+            "{}",
+            rendered[1]
+        );
+        // The rule BR-3 is about: a scan that never ran cannot have found
+        // anything, and is not a boundary block either.
+        assert!(rendered[2].contains("could not run"), "{}", rendered[2]);
+        assert!(
+            !rendered[2].contains("found"),
+            "a scan that never ran claimed a finding: {}",
+            rendered[2]
+        );
+        assert!(
+            !rendered[2].contains("privacy boundary"),
+            "a scan-unavailable block is not a boundary block: {}",
+            rendered[2]
+        );
+        // Every sentence names the server, so an operator knows which one.
+        for line in &rendered {
+            assert!(line.contains("`kb`"), "{line}");
+        }
+    }
 
     // ---- namespacing ----
 

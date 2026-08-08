@@ -34,7 +34,8 @@ use teton_protocol::events::{Event, PermissionRequest, PrivacyAction, PrivacyBlo
 use teton_protocol::methods::PermissionOutcome;
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
-    ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
+    BlockDetail, ByteStream, HttpMethod, Transport, TransportError, TransportRequest,
+    TransportResponse,
 };
 
 use tetond::broadcast::EventBus;
@@ -322,9 +323,17 @@ async fn a_remote_mcp_call_touching_a_boundary_path_is_blocked_at_egress() {
         )
         .await;
     match blocked {
-        Err(McpError::PrivacyBlocked { path, server_id }) => {
+        Err(McpError::PrivacyBlocked {
+            path,
+            server_id,
+            detail,
+        }) => {
             assert_eq!(path, "secrets/prod.env");
             assert_eq!(server_id, "remote");
+            // REQ-562 BR-3: the error names *which* inspection refused it, and
+            // this leg is the boundary one — the sentence must not drift into
+            // claiming a redaction scan found something.
+            assert_eq!(detail, BlockDetail::Boundary);
         }
         other => panic!("expected a privacy block, got {other:?}"),
     }

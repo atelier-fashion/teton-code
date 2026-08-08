@@ -122,6 +122,7 @@ use teton_protocol::{
     Tier as ProtoTier, TierBindingSource,
 };
 
+use teton_providers::transport::Transport;
 use teton_providers::{
     classify, AnthropicAdapter, BlockDetail, CapabilityProfile, FailureAction, FailureClass,
     OpenAiCompatAdapter, OpenAiCompatConfig, Provider,
@@ -1906,17 +1907,9 @@ impl DaemonRuntime {
         let mut tools = ToolRegistry::with_builtins();
         if !self.mcp_servers.is_empty() {
             let config = self.config.lock().expect("config mutex poisoned").clone();
-            let boundaries = config.boundaries.clone();
             if let Ok(transport) = HttpTransport::new() {
-                let mut egress = Egress::new(transport, boundaries, events.clone())
-                    .with_cost_meter(Arc::new(self.ledger.clone()));
-                // ADR-003 makes an MCP call remote egress, so REQ-562 ADR-1's
-                // "every remote path" includes it: a tool argument carrying a
-                // credential is scanned exactly like a prompt carrying one.
-                if let Some(gate) = self.redaction_gate(router, &config, events, session_id) {
-                    egress = egress.with_redaction_gate(gate);
-                }
-                let egress = Arc::new(egress);
+                let egress =
+                    Arc::new(self.mcp_egress(transport, router, &config, events, session_id));
                 let registry = Arc::new(McpRegistry::with_egress(
                     egress as Arc<dyn crate::mcp::EgressGate>,
                     Some(session_id.clone()),
@@ -1931,6 +1924,43 @@ impl DaemonRuntime {
             }
         }
         tools
+    }
+
+    /// The choke point an MCP `tools/call` crosses (ADR-003, REQ-562 ADR-1).
+    ///
+    /// ADR-003 makes an MCP call remote egress, so ADR-1's "every remote path"
+    /// includes it: a tool argument carrying a credential is scanned exactly
+    /// like a prompt carrying one, and the same boundaries and the same cost
+    /// meter apply.
+    ///
+    /// ## Generic over the transport so the wiring is reachable from a test
+    ///
+    /// [`Self::build_tools`] passes a real [`HttpTransport`], which means the
+    /// gate attachment could only ever be exercised by a test willing to open a
+    /// socket — and so it was not exercised at all: deleting
+    /// `.with_redaction_gate(…)` from `build_tools` left the whole suite green.
+    /// Taking the transport as a parameter lets
+    /// `tests::dispatch::redact::an_mcp_tool_call_crosses_the_gate_when_redact_is_on`
+    /// drive a capture transport through this exact construction, so the
+    /// deletion now turns a test red.
+    ///
+    /// The sink is `events` rather than a `TaintingPrivacySink`: an MCP block
+    /// is reported but does not pin the session, which is REQ-544's behaviour
+    /// here and not something this REQ changes.
+    fn mcp_egress<T: Transport>(
+        &self,
+        transport: T,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> Egress<T> {
+        let mut egress = Egress::new(transport, config.boundaries.clone(), events.clone())
+            .with_cost_meter(Arc::new(self.ledger.clone()));
+        if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
+            egress = egress.with_redaction_gate(gate);
+        }
+        egress
     }
 
     /// Run one turn attempt against the route's provider (local or remote).
@@ -10329,6 +10359,196 @@ provider_id = "on-device"
                 assert_eq!(decide(&clean), EgressDecision::Forward);
 
                 assert_eq!(engine.calls(), 2, "both payloads were really scanned");
+            }
+
+            // -- the MCP path (ADR-003 × ADR-1) ------------------------------
+
+            /// A `Transport` that answers JSON-RPC by method and records every
+            /// body it was handed — the wire, for a remote MCP server.
+            #[derive(Default, Clone)]
+            struct McpWire {
+                sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+            }
+
+            impl McpWire {
+                fn bodies(&self) -> Vec<String> {
+                    self.sent
+                        .lock()
+                        .expect("wire poisoned")
+                        .iter()
+                        .map(|b| String::from_utf8_lossy(b).into_owned())
+                        .collect()
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl Transport for McpWire {
+                async fn execute(
+                    &self,
+                    request: teton_providers::transport::TransportRequest,
+                ) -> Result<
+                    teton_providers::transport::TransportResponse,
+                    teton_providers::transport::TransportError,
+                > {
+                    let method = serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .ok()
+                        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_owned))
+                        .unwrap_or_default();
+                    self.sent
+                        .lock()
+                        .expect("wire poisoned")
+                        .push(request.body.clone());
+                    let result = match method.as_str() {
+                        "initialize" => {
+                            serde_json::json!({"serverInfo":{"name":"kb","version":"1"}})
+                        }
+                        "tools/list" => serde_json::json!({"tools":[{
+                            "name": "lookup",
+                            "description": "look something up",
+                            "inputSchema": {"type":"object"}
+                        }]}),
+                        _ => serde_json::json!({
+                            "content":[{"type":"text","text":"ok"}],
+                            "isError": false
+                        }),
+                    };
+                    let body = serde_json::to_vec(
+                        &serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}),
+                    )
+                    .expect("serialize");
+                    Ok(teton_providers::transport::TransportResponse {
+                        status: 200,
+                        body: Box::pin(futures::stream::once(async move { Ok(body) })),
+                    })
+                }
+            }
+
+            /// A remote MCP server, the only kind that egresses.
+            fn http_server(id: &str) -> McpServerConfig {
+                McpServerConfig {
+                    id: id.to_owned(),
+                    transport: crate::mcp::McpTransport::Http {
+                        endpoint: "https://mcp.example.com/rpc".to_owned(),
+                    },
+                    trusted: false,
+                }
+            }
+
+            /// **The MCP choke point carries the gate** (ADR-003, ADR-1).
+            ///
+            /// ## Why this test exists
+            ///
+            /// `build_tools` attached the gate to the MCP egress and **nothing
+            /// covered it**: deleting `.with_redaction_gate(…)` from that
+            /// function left the entire suite green, because the only path to it
+            /// ran through `HttpTransport::new()` and a real socket. An MCP tool
+            /// argument is exactly the payload the feature is for — a credential
+            /// pasted into a `query` field is off the machine the moment the
+            /// call goes out, and provenance cannot see it because the argument
+            /// came from the model, not from a file.
+            ///
+            /// ## What is real here, and what is not
+            ///
+            /// Real: the runtime, its config switch, its router, its engine slot,
+            /// [`DaemonRuntime::mcp_egress`] (the exact construction
+            /// `build_tools` calls), the real [`McpRegistry`] over it, the real
+            /// [`crate::mcp::HttpConnection`], the real handshake, the real
+            /// `tools/call`, the real two-pass scan, and the wire captured.
+            ///
+            /// Not real, and the whole of what remains uncovered: the
+            /// `HttpTransport::new()` line that supplies the transport in
+            /// production, and `register_mcp_tools`, which turns the registry
+            /// into `ToolRegistry` entries and is orthogonal to egress. Both are
+            /// above the gate, not between it and the wire.
+            ///
+            /// ## The discrimination
+            ///
+            /// The same runtime, the same server, the same tool arguments, twice
+            /// — and the only difference is the `[privacy]` switch. On: the call
+            /// is refused, the error names **redaction** (not a boundary), and
+            /// the credential is absent from every captured body. Off: the same
+            /// call succeeds, the engine is never asked, and the credential is on
+            /// the wire — which is what proves the on-leg's absence is the gate
+            /// and not the fixture (LESSON-485).
+            #[tokio::test]
+            async fn an_mcp_tool_call_crosses_the_gate_when_redact_is_on() {
+                /// Pattern-shaped, so the deterministic pass alone blocks it and
+                /// the stand-in engine's "NONE" cannot rescue the payload.
+                const CREDENTIAL: &str = "AKIAMCPWIRESENTINEL0";
+
+                async fn call_lookup(
+                    runtime: &DaemonRuntime,
+                    wire: &McpWire,
+                ) -> Result<crate::mcp::McpToolResult, crate::mcp::McpError> {
+                    let config = runtime.config.lock().expect("config mutex").clone();
+                    let events = Arc::new(EventBus::new());
+                    let router =
+                        build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                    let session = SessionId::from("sess-mcp");
+                    let egress = Arc::new(runtime.mcp_egress(
+                        wire.clone(),
+                        &router,
+                        &config,
+                        &events,
+                        &session,
+                    ));
+                    let registry = McpRegistry::with_egress(
+                        egress as Arc<dyn crate::mcp::EgressGate>,
+                        Some(session),
+                        vec![http_server("kb")],
+                    );
+                    registry
+                        .call_tool(
+                            "mcp__kb__lookup",
+                            serde_json::json!({ "q": format!("what does {CREDENTIAL} unlock?") }),
+                        )
+                        .await
+                }
+
+                // -- on ------------------------------------------------------
+                let engine = CountingEngine::answering("NONE");
+                let on_runtime = runtime(opted_in(config()), &engine, true);
+                let wire = McpWire::default();
+                let blocked = call_lookup(&on_runtime, &wire).await;
+
+                match blocked {
+                    Err(crate::mcp::McpError::PrivacyBlocked { detail, .. }) => assert_eq!(
+                        detail,
+                        BlockDetail::Redaction,
+                        "an MCP block must name which inspection refused it"
+                    ),
+                    other => panic!("expected a redaction block, got {other:?}"),
+                }
+                assert!(
+                    engine.calls() > 0,
+                    "the scan must actually have run on the MCP path"
+                );
+                for body in wire.bodies() {
+                    assert!(
+                        !body.contains(CREDENTIAL) && !body.contains("MCPWIRESENTINEL"),
+                        "the credential reached a remote MCP server: {body}"
+                    );
+                }
+
+                // -- off -----------------------------------------------------
+                let off_engine = CountingEngine::answering("NONE");
+                let off_runtime = runtime(config(), &off_engine, true);
+                let off_wire = McpWire::default();
+                let allowed = call_lookup(&off_runtime, &off_wire).await;
+                assert!(
+                    allowed.is_ok(),
+                    "with the switch off the same call must go through: {allowed:?}"
+                );
+                assert_eq!(
+                    off_engine.calls(),
+                    0,
+                    "off means no gate at all — zero scanner calls (AC-13)"
+                );
+                assert!(
+                    off_wire.bodies().iter().any(|b| b.contains(CREDENTIAL)),
+                    "non-vacuity: with no gate the credential really does reach \
+                     the wire, so the on-leg's absence is the gate"
+                );
             }
 
             // -- the turn-failure sentence (BR-3) ----------------------------
