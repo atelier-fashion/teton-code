@@ -1,0 +1,30 @@
+{
+  "req": "REQ-563",
+  "branch": "feat/REQ-563-opt-in-web-lookup",
+  "startedAt": "2026-08-08T00:00:00Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "integrationBranch": "main",
+  "phaseHistory": [],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-563",
+      "branch": "feat/REQ-563-opt-in-web-lookup",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
