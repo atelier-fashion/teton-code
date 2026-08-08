@@ -822,6 +822,40 @@ pub struct ConfigSnapshot {
     pub judgment_default: Option<Category>,
     /// Privacy boundaries.
     pub privacy: Vec<PrivacyBoundaryConfig>,
+    /// Whether the REQ-562 redaction scan runs inside the egress choke point —
+    /// the `[privacy] redact` opt-in, on the wire so a client can *report* it.
+    ///
+    /// ## Why it is not called `privacy`
+    ///
+    /// That name is taken, by the boundary list directly above, and the two are
+    /// different things: a set of path globs, and a single switch over outbound
+    /// payloads. Folding the switch into the boundary table's name is the
+    /// collision REQ-562 TASK-067 recorded when it deliberately left the opt-in
+    /// off the wire; this is that note being acted on rather than re-discovered.
+    ///
+    /// ## Visibility, not control
+    ///
+    /// There is no [`ConfigUpdate`] variant for it and none is coming from this
+    /// REQ (the spec's *"no new RPCs"*): the switch is set in the config file
+    /// and merely read here. `teton policy show` renders it, because a `redact`
+    /// row that says what the category *would* send leaves a user with no way
+    /// to tell whether anything is scanning today.
+    ///
+    /// ## Additive with a default, like every field added to this wire since
+    ///
+    /// A snapshot from a daemon predating this field carries no key, and reads
+    /// `false` — the historical fact rather than a filler value, since no such
+    /// daemon ran the scan. A client predating the field ignores a key it does
+    /// not know. So the addition moves neither [`crate::PROTOCOL_VERSION`] nor
+    /// [`crate::PROTOCOL_VERSION_MIN`], exactly as `PrivacyBlock::cause` did
+    /// not (REQ-562 ADR-7); both directions are asserted against literal JSON
+    /// in this module's tests rather than left as a claim.
+    ///
+    /// `false` is also the only safe direction for an absent answer to fall in:
+    /// a reader that assumed *enabled* from a daemon's silence would tell a
+    /// user their outbound payloads are scanned when nothing is scanning them.
+    #[serde(default)]
+    pub redact_enabled: bool,
 }
 
 /// Result of [`ConfigGetParams`].
@@ -1429,8 +1463,84 @@ mod tests {
                     path_glob: "secrets/**".to_owned(),
                     mode: PrivacyMode::LocalOnly,
                 }],
+                redact_enabled: true,
             },
         });
+    }
+
+    /// A snapshot from a daemon that predates `redact_enabled` reads as **off**
+    /// (REQ-562), which is the historical fact about such a daemon rather than
+    /// a filler value: none of them ran the scan.
+    ///
+    /// The fixture is a v2-shaped snapshot, because v2 is the oldest shape this
+    /// build can read at all — a genuine v1 body fails on `routing` long before
+    /// reaching this key, which the neighbouring
+    /// `the_last_releases_snapshot_is_unreadable_which_is_why_the_version_is_pinned`
+    /// pins and this test must not be read as contradicting. What is asserted
+    /// here is the *field's* compatibility posture: a daemon inside the
+    /// supported handshake range that has simply never heard of the key.
+    #[test]
+    fn a_snapshot_with_no_redact_enabled_key_reads_as_off() {
+        let without_the_key = serde_json::json!({
+            "providers": [],
+            "tiers": [],
+            "routing": [],
+            "privacy": [{"path_glob": "secrets/**", "mode": "local_only"}]
+        });
+        let snapshot: ConfigSnapshot = serde_json::from_value(without_the_key.clone()).unwrap();
+        assert!(
+            !snapshot.redact_enabled,
+            "an absent answer must never read as `the scan is running`"
+        );
+        // The rest of the snapshot still arrives — the default is a default,
+        // not a fallback for a body that failed to parse.
+        assert_eq!(snapshot.privacy.len(), 1);
+
+        // Non-vacuity: the default is not swallowing a key that *is* present,
+        // in either state (LESSON-485 — one leg alone would pass against a
+        // field hard-wired to `false`).
+        for stated in [true, false] {
+            let mut wire = without_the_key.clone();
+            wire["redact_enabled"] = serde_json::Value::Bool(stated);
+            let snapshot: ConfigSnapshot = serde_json::from_value(wire).unwrap();
+            assert_eq!(snapshot.redact_enabled, stated);
+        }
+    }
+
+    /// The other direction of the same claim: a client that predates the field
+    /// still reads a snapshot that carries it.
+    ///
+    /// Serde ignores unknown fields by default and no type here opts out, but
+    /// this posture is what keeps [`crate::PROTOCOL_VERSION`] still across the
+    /// addition, so it is asserted rather than assumed — modelled by the
+    /// pre-REQ-562 shape of the reader, exactly as `PrivacyBlock::cause`'s
+    /// skew test does.
+    #[test]
+    fn a_client_predating_redact_enabled_still_reads_a_snapshot_that_carries_it() {
+        #[derive(Deserialize)]
+        struct PreSwitchSnapshot {
+            privacy: Vec<PrivacyBoundaryConfig>,
+            judgment_default: Option<Category>,
+        }
+
+        let wire = serde_json::to_string(&ConfigSnapshot {
+            privacy: vec![PrivacyBoundaryConfig {
+                path_glob: "secrets/**".to_owned(),
+                mode: PrivacyMode::LocalOnly,
+            }],
+            judgment_default: Some(Category::Edit),
+            redact_enabled: true,
+            ..ConfigSnapshot::default()
+        })
+        .unwrap();
+        assert!(
+            wire.contains("\"redact_enabled\":true"),
+            "the fixture must actually carry the new key: {wire}"
+        );
+
+        let old: PreSwitchSnapshot = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.privacy.len(), 1, "the old reader still gets its fields");
+        assert_eq!(old.judgment_default, Some(Category::Edit));
     }
 
     /// The eleven categories, spelled out rather than iterated, so a twelfth

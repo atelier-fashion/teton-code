@@ -4928,6 +4928,11 @@ fn snapshot_from_config(config: &Config, router: &Router) -> ConfigSnapshot {
                 mode: to_proto_mode(b.mode),
             })
             .collect(),
+        // REQ-562: the `[privacy] redact` opt-in, projected so `policy show`
+        // can *report* it. Read from the config rather than from the presence
+        // of a gate, because this is the same question `redaction_gate` asks —
+        // one switch, one reader, no second answer to drift from the first.
+        redact_enabled: config.privacy.redact,
     }
 }
 
@@ -6144,6 +6149,45 @@ provider_id = "on-device"
         assert_eq!(snap.providers.len(), 1);
         assert_eq!(snap.providers[0].kind, ProtoProviderKind::OpenaiCompatible);
         assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
+    }
+
+    /// **The snapshot reports whether the redaction scan is enabled** (REQ-562;
+    /// user decision, 2026-08-08) — the daemon half of making the `[privacy]`
+    /// switch visible.
+    ///
+    /// Both states from one projection, so each is the other's discrimination
+    /// (LESSON-485): a field wired to a constant, or one projected from
+    /// something that merely correlates with the switch, fails a leg. The
+    /// absent-table leg is the one that matters most, because it is what almost
+    /// every machine sends: no `[privacy]` table at all must reach a client as
+    /// `false` rather than as a missing answer a renderer has to guess at.
+    ///
+    /// It reads `config.privacy.redact` — the same field `redaction_gate`
+    /// consults before installing the gate — so `policy show` and the gate
+    /// cannot disagree about whether anything is scanning. Asserted here rather
+    /// than at the wire, because the projection is the step that could drop it.
+    #[test]
+    fn the_snapshot_reports_whether_the_redaction_scan_is_enabled() {
+        // The overwhelmingly common config: no `[privacy]` table written at all.
+        let absent = Config::default();
+        assert!(
+            !absent.privacy.redact,
+            "the fixture must model the default, or the `false` leg proves nothing"
+        );
+        assert!(
+            !snapshot_from_config(&absent, &router_for_config(&absent)).redact_enabled,
+            "an un-opted-in daemon must report the scan as off"
+        );
+
+        // And the opt-in, on the same projection.
+        let opted_in = Config {
+            privacy: teton_core::config::PrivacyConfig { redact: true },
+            ..Config::default()
+        };
+        assert!(
+            snapshot_from_config(&opted_in, &router_for_config(&opted_in)).redact_enabled,
+            "`[privacy] redact = true` must reach the client that asked for the config"
+        );
     }
 
     /// A router over `config` with a healthy local tier — what `config/get`

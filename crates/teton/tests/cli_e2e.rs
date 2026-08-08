@@ -1828,14 +1828,34 @@ fn policy_show_renders_the_daemons_resolved_table() {
     // `redact` used to transmit nothing, and its row read "would send outbound
     // payloads; declared, no call site yet" — the conditional verb and the
     // marker in one phrase, so a class printed alone could not read as a live
-    // egress path. It *is* a live path now: the gate scans every outbound
-    // payload, so the row states it in the present tense with no marker. The
-    // conditional-plus-marker rendering itself is unit-covered against a
-    // synthetic row (`main::tests::policy_show_renders_the_content_class_beside_the_call_site_marker`).
+    // egress path. TASK-070 gave it a call site, so the marker is gone (asserted
+    // for every row above).
+    //
+    // **The verb stays conditional on this daemon, and that is the assertion
+    // rather than a regression** (REQ-562 report honesty; user decision,
+    // 2026-08-08). `[privacy] redact` is off by default (BR-10/OQ-3) and this
+    // fixture never sets it, so no gate is installed, nothing is scanned, and
+    // the present-tense "sends outbound payloads" this test used to require was
+    // a claim about work the daemon was not doing — the exact untruth AC-13
+    // forbids on the other surfaces. The row is now conditional *and* says
+    // which state it is in, so the two readings a user could otherwise not tell
+    // apart — "the switch is off" and "the binding is missing" — are distinct.
+    //
+    // The enabled leg is unit-covered rather than added here: flipping the
+    // switch means a second daemon boot with a different config, and it would
+    // put a real scan in front of every remote call in this suite. Both states
+    // render from one fixture in
+    // `main::tests::policy_show_reports_whether_the_redaction_scan_runs`.
     assert!(
-        redact_row.contains("— sends outbound payloads"),
-        "`redact` is wired (REQ-562 TASK-070), so its disclosure is no longer \
-         conditional; row:\n{redact_row}"
+        redact_row.contains("would send outbound payloads"),
+        "with the scan off, `redact`'s row must not claim the present tense; \
+         row:\n{redact_row}"
+    );
+    assert!(
+        redact_row
+            .contains("content scan: disabled (default — enable with `[privacy] redact = true`)"),
+        "the row must say the scan is off and name the key that turns it on; \
+         row:\n{redact_row}"
     );
 
     // AC-12: the BR-9 declared default is configuration-visible, and the CLI

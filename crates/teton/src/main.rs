@@ -23,8 +23,8 @@ use teton_protocol::methods::{
     ProviderConfig, SessionCreateParams, TierBindingConfig,
 };
 use teton_protocol::{
-    BindingSource, ConfigurableCategory, PrivacyMode, ProviderId, ProviderKind, SessionMode, Tier,
-    TierBindingSource,
+    BindingSource, Category, ConfigurableCategory, PrivacyMode, ProviderId, ProviderKind,
+    SessionMode, Tier, TierBindingSource,
 };
 
 mod banner;
@@ -1471,6 +1471,12 @@ fn render_policy(snapshot: &ConfigSnapshot, surface: &mut dyn Surface) {
         .max()
         .unwrap_or(0);
     for row in &snapshot.routing {
+        // REQ-562: `redact` is the one category whose call site can be live and
+        // which still transmits nothing — what decides is the `[privacy]`
+        // switch, not its binding. So its verb follows the switch (never
+        // "sends" while nothing scans) and its row states the switch outright.
+        let transmits_today = row.category != Category::Redact || snapshot.redact_enabled;
+        let switch = redact_switch_note(row.category, snapshot.redact_enabled);
         // An unresolvable category carries the resolver's sentence instead of a
         // blank column: BR-8 requires it to name itself and its unset binding,
         // and the sentence that does so already exists.
@@ -1478,7 +1484,7 @@ fn render_policy(snapshot: &ConfigSnapshot, surface: &mut dyn Surface) {
             surface.line(
                 LineKind::Notice,
                 &format!(
-                    "  {:<category_width$}  {:<6}  unresolved — {}{}",
+                    "  {:<category_width$}  {:<6}  unresolved — {}{}{switch}",
                     row.category.as_str(),
                     row.tier.as_str(),
                     row.reason,
@@ -1494,12 +1500,12 @@ fn render_policy(snapshot: &ConfigSnapshot, surface: &mut dyn Surface) {
         surface.line(
             LineKind::Info,
             &format!(
-                "  {:<category_width$}  {:<6}  → {:<provider_width$}  [{}]{fallback}{}",
+                "  {:<category_width$}  {:<6}  → {:<provider_width$}  [{}]{fallback}{}{switch}",
                 row.category.as_str(),
                 row.tier.as_str(),
                 provider.0,
                 binding_source_label(row.source),
-                content_disclosure(row.content_class, row.reached, true),
+                content_disclosure(row.content_class, row.reached, transmits_today),
             ),
         );
     }
@@ -1552,21 +1558,55 @@ fn tier_origin_label(source: TierBindingSource) -> &'static str {
 /// the `reached: false` arm is for the next category to land declared before it
 /// is called.)
 ///
-/// `routable` is the third fact and the reason an unresolved row does not claim
-/// to send: a category whose tier is unbound transmits nothing today either, and
-/// its row's own sentence already says why.
+/// `transmits_today` is the third fact and the reason an unresolved row does not
+/// claim to send: a category whose tier is unbound transmits nothing today
+/// either, and its row's own sentence already says why. **`redact` is the second
+/// way it can be false** (REQ-562): its call site is live and its binding
+/// resolves, and it still scans nothing while `[privacy] redact` is off — so the
+/// present tense would be a claim the daemon is doing something it is not, which
+/// is exactly the report-honesty AC-13 asks for on the other surfaces.
+/// [`redact_switch_note`] says which state the row is in, because the verb alone
+/// cannot distinguish "the switch is off" from "the binding is missing".
 ///
 /// **Disclosure, not a control.** Nothing here refuses anything. BR-7's
 /// per-content egress scoping is the enforcement, and it refuses a `local-only`
 /// source whatever this line says.
-fn content_disclosure(class: ContentClass, reached: bool, routable: bool) -> String {
-    match (reached, routable) {
+fn content_disclosure(class: ContentClass, reached: bool, transmits_today: bool) -> String {
+    match (reached, transmits_today) {
         (true, true) => format!("  — sends {}", class.describe()),
         (true, false) => format!("  — would send {}", class.describe()),
         (false, _) => format!(
             "  — would send {}; declared, no call site yet",
             class.describe()
         ),
+    }
+}
+
+/// Whether the redaction scan runs, for the one row it is about (REQ-562).
+///
+/// Empty for every other category — this is a fact about `redact` and nothing
+/// else, and a column repeating "n/a" ten times would be noise on the surface a
+/// user reads to answer one question.
+///
+/// **Why the row states it at all.** Every other category's row answers "where
+/// does this go?", and for `redact` the prior question is whether it goes
+/// anywhere: the switch defaults to off (BR-10/OQ-3), off means the gate is
+/// never installed rather than installed-and-permissive (ADR-2), and a row that
+/// named a provider and a class while nothing scanned would read as a live
+/// scan. So the disabled wording names the default *and* the key that changes
+/// it — a user who wanted the scan and does not have it is one line away from
+/// the fix, without leaving the surface that told them.
+///
+/// Read off the wire, like every other fact in this table: the daemon answers,
+/// this function chooses the English (see [`render_policy`]).
+fn redact_switch_note(category: Category, enabled: bool) -> &'static str {
+    if category != Category::Redact {
+        return "";
+    }
+    if enabled {
+        "; content scan: enabled"
+    } else {
+        "; content scan: disabled (default — enable with `[privacy] redact = true`)"
     }
 }
 
@@ -1957,6 +1997,9 @@ mod tests {
             ],
             judgment_default: Some(Category::Edit),
             privacy: Vec::new(),
+            // The default posture (BR-10/OQ-3). The tests that care about the
+            // switch set it explicitly, in both states.
+            redact_enabled: false,
         }
     }
 
@@ -2218,6 +2261,87 @@ mod tests {
             !triage.contains("no call site"),
             "`triage` is wired (TASK-060) and must not carry the marker: {triage}"
         );
+    }
+
+    /// **The `[privacy]` switch is reported, in both states** (REQ-562; user
+    /// decision, 2026-08-08).
+    ///
+    /// One fixture, one field flipped, two renderings compared — so each claim
+    /// is discriminated by its opposite rather than by a lone `contains`
+    /// (LESSON-485). A renderer that printed the disabled hint unconditionally,
+    /// or that ignored the wire and hard-coded either state, fails one leg.
+    ///
+    /// Three things are asserted per state, because they fail independently:
+    ///
+    /// 1. the switch is **named**, and the disabled wording names the key that
+    ///    turns it on — a user who wanted the scan is one line from the fix;
+    /// 2. the **verb** follows the switch. With the scan off nothing is
+    ///    scanned, so "sends the outbound payload" would claim work the daemon
+    ///    is not doing (AC-13's report honesty, extended to this surface);
+    /// 3. the **pin sentence is intact** in both states. The switch decides
+    ///    whether the scan runs, never where it runs — `redact` is pinned local
+    ///    and not configurable either way, and a row that lost that while
+    ///    gaining a status line would have traded one disclosure for another.
+    #[test]
+    fn policy_show_reports_whether_the_redaction_scan_runs() {
+        use teton_protocol::Category;
+
+        /// The `redact` row as rendered with the switch in `enabled`, from a
+        /// fixture whose `redact` row is otherwise **wired** — the live
+        /// daemon's shape, and the only one in which the present tense is even
+        /// a possibility.
+        fn redact_row_with(enabled: bool) -> String {
+            let mut snapshot = migrated_snapshot();
+            snapshot.redact_enabled = enabled;
+            for row in &mut snapshot.routing {
+                if row.category == Category::Redact {
+                    row.reached = true;
+                }
+            }
+            let mut surface = RecordingSurface::new();
+            render_policy(&snapshot, &mut surface);
+            let rendered = surface.lines_of(LineKind::Info).join("\n");
+            category_row(&rendered, "redact").to_owned()
+        }
+
+        let on = redact_row_with(true);
+        let off = redact_row_with(false);
+        let class = ContentClass::for_category(Category::Redact).describe();
+
+        // 1. The switch, and the way out of the off state.
+        assert!(
+            on.contains("content scan: enabled") && !on.contains("disabled"),
+            "the enabled row must say so, once: {on}"
+        );
+        assert!(
+            off.contains(
+                "content scan: disabled (default — enable with `[privacy] redact = true`)"
+            ),
+            "the disabled row must name the default and the key that changes it: {off}"
+        );
+
+        // 2. The verb, which is the honesty half: `sends` iff something scans.
+        assert!(
+            on.contains(&format!("sends {class}")) && !on.contains("would send"),
+            "with the scan on, the row states its class in the present tense: {on}"
+        );
+        assert!(
+            off.contains(&format!("would send {class}")),
+            "with the scan off nothing is scanned, so the row must not claim to send: {off}"
+        );
+        assert!(
+            !off.contains("no call site"),
+            "the switch being off is not the same fact as having no call site, and \
+             the row must not conflate them: {off}"
+        );
+
+        // 3. The pin, unchanged by either state.
+        for (label, row) in [("on", &on), ("off", &off)] {
+            assert!(
+                row.contains("pinned local, not configurable"),
+                "{label}: the pin sentence must survive the status line: {row}"
+            );
+        }
     }
 
     /// BR-8: a category that cannot be routed carries the resolver's sentence
