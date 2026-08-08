@@ -696,6 +696,30 @@ async fn a_credential_the_model_paraphrased_is_located_and_reported_without_bloc
         "a scan that found something and forwarded anyway must not have touched \
          the bytes (BR-5)"
     );
+
+    // **AC-1's "reported" half, on the real verdict.** A finding that forwards
+    // is still a finding, and it reaches the daemon's log as kind + span. The
+    // lines are built here from the same verdict `Egress::send` reports from —
+    // `send` writes them to stderr, which is `tetond.log` and which no in-process
+    // test can capture; the call itself is pinned by
+    // `egress::tests::the_gate_arm_reports_a_forwarded_findings_verdict`.
+    let report = tetond::egress::redact::forwarded_findings_report(&verdict);
+    assert_eq!(report.len(), 1, "one located finding, one line: {report:?}");
+    assert!(
+        report[0].contains("low-confidence") && report[0].contains("credential"),
+        "the line must carry the confidence and the kind: {}",
+        report[0]
+    );
+    assert!(
+        report[0].contains(&format!("{}-{}", finding.span().start, finding.span().end)),
+        "and the span, which is the only thing that says where to look: {}",
+        report[0]
+    );
+    assert!(
+        !report[0].contains(PARAPHRASED_SENTINEL) && !report[0].contains("orange-walrus"),
+        "BR-6 VIOLATION — the matched text reached the daemon log: {}",
+        report[0]
+    );
 }
 
 // ===========================================================================
@@ -1222,5 +1246,62 @@ async fn no_emitted_surface_carries_the_sentinel() {
         engine.redact_calls(),
         1,
         "the model really was asked, so its reply really did carry the sentinel"
+    );
+
+    // -----------------------------------------------------------------------
+    // The forwarding leg — the surface a *blocked* payload never reaches.
+    // -----------------------------------------------------------------------
+    //
+    // A Low-only verdict forwards, and its findings are reported to the daemon
+    // log instead of to `privacy_block`. That report is an emitted surface like
+    // any other, and the sweep above cannot see it: on a blocked payload
+    // `forwarded_findings_report` is empty by construction, so this leg needs a
+    // payload that really does forward with a really located finding.
+    //
+    // The wire is deliberately NOT swept here. These bytes are being forwarded
+    // on purpose — the sentinel is in them because the user's payload contains
+    // it, which is BR-4's whole point. What must stay clean is what the daemon
+    // *says* about them.
+    let forward_capture = CaptureTransport::default();
+    let forward_sink = Arc::new(CapturingSink::default());
+    let forward_engine = engine_pair(&model_reports("credential", PARAPHRASED_SENTINEL));
+    let forward_gate = Arc::new(
+        TestGate::new(router_with_local_tier(Some(CANONICAL_LOCAL_ID)))
+            .serving(Arc::clone(&forward_engine.engine)),
+    );
+    let forward_egress = choke_point(&forward_capture, &forward_sink, Arc::clone(&forward_gate));
+    let (request, provenance) = clean_provenance_payload(&format!(
+        "Here is the runbook. Note that {PARAPHRASED_SENTINEL}, so be careful."
+    ));
+    forward_egress
+        .send(request, &provenance, &ctx())
+        .await
+        .expect("a low-confidence finding forwards (BR-4)");
+
+    let verdict = forward_gate.only_verdict();
+    let report = tetond::egress::redact::forwarded_findings_report(&verdict);
+    // Non-vacuity: there really is a report line, and it really describes a
+    // finding located in the sentinel-bearing payload.
+    assert_eq!(report.len(), 1, "{report:?}");
+    assert!(report[0].contains("credential"), "{}", report[0]);
+
+    let mut forward_surfaces: Vec<(&str, String)> = vec![
+        ("verdict Debug", format!("{verdict:?}")),
+        ("forwarded-findings report", report.join("\n")),
+    ];
+    forward_surfaces.push((
+        "privacy_block events",
+        format!("{:?}", forward_sink.events()),
+    ));
+    for (name, text) in &forward_surfaces {
+        assert!(
+            !text.contains(PARAPHRASED_SENTINEL) && !text.contains("orange-walrus"),
+            "BR-6 VIOLATION — the matched text reached the {name}: {text}"
+        );
+    }
+    assert_eq!(
+        forward_engine.redact_calls(),
+        1,
+        "the model really was asked here too, so its reply carried the sentinel"
     );
 }

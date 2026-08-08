@@ -98,6 +98,17 @@ pub enum Confidence {
     Low,
 }
 
+impl Confidence {
+    /// A stable, content-free name for reports.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::High => "high-confidence",
+            Confidence::Low => "low-confidence",
+        }
+    }
+}
+
 /// What kind of sensitive content a finding identifies.
 ///
 /// The deterministic pattern pass only ever emits [`FindingKind::Credential`] —
@@ -337,6 +348,57 @@ pub fn decide(verdict: &RedactionVerdict) -> EgressDecision {
             }
         }
     }
+}
+
+/// The daemon-log lines a **forwarded** payload's findings owe (BR-4, ADR-4).
+///
+/// ## Why this exists
+///
+/// [`decide`] forwards a `Findings` verdict whose findings are all
+/// [`Confidence::Low`] — that is BR-4's rule, and AC-10 requires it. But a
+/// finding that is computed and then dropped on the floor is indistinguishable
+/// from a finding that was never made: nothing tells the user, nothing tells
+/// the operator, and OQ-2's *"what did the model catch that patterns did
+/// not?"* — the question that decides whether the model call earns its latency
+/// — has no observable answer at all. ADR-4's wiring line says these are
+/// "logged as kind+span only", and this is what produces those lines.
+///
+/// ## What a line may say, and what it structurally cannot
+///
+/// Kind, confidence, byte span, and the non-secret locus. Never the matched
+/// text — a [`Finding`] has no text field to draw it from (BR-6), so this is
+/// not a rule the formatter keeps but a fact about its inputs.
+///
+/// The confidence word is read off the finding rather than written as a
+/// literal. Every finding on a forwarded verdict is `Low` today, by
+/// construction; a literal would quietly become a lie the day that changes.
+///
+/// ## Total, and empty for everything else
+///
+/// A blocked verdict reports through `privacy_block` and the turn-failure
+/// sentence — this returns nothing for it, so the two reporting paths cannot
+/// double-report one payload. `Clean` and `Unavailable` carry no findings and
+/// so produce no lines. One line per finding: a payload with two located
+/// low-confidence strings has two places to look.
+#[must_use]
+pub fn forwarded_findings_report(verdict: &RedactionVerdict) -> Vec<String> {
+    if decide(verdict) != EgressDecision::Forward {
+        return Vec::new();
+    }
+    verdict
+        .findings()
+        .iter()
+        .map(|finding| {
+            format!(
+                "tetond: redact — {} {} at bytes {}-{} of the outbound payload; forwarded \
+                 (a low-confidence finding is reported, not blocked — BR-4).",
+                finding.confidence().as_str(),
+                finding.kind().as_str(),
+                finding.span().start,
+                finding.span().end,
+            )
+        })
+        .collect()
 }
 
 /// Something that can scan an outbound payload and return a verdict (ADR-1,
@@ -1195,6 +1257,100 @@ mod tests {
         assert!(DECISION_CASES
             .iter()
             .any(|c| c.expected == EgressDecision::Forward));
+    }
+
+    // -----------------------------------------------------------------------
+    // The forwarded-findings report (BR-4, ADR-4's "logged as kind+span only").
+    // -----------------------------------------------------------------------
+
+    /// **The discrimination.** A Low-only forward reports exactly one line per
+    /// finding, carrying its kind and its span; a Clean forward — the same
+    /// entry point, the same decision, one finding fewer — reports none.
+    ///
+    /// Without the pair this would pass for a function that always returned
+    /// nothing (LESSON-485): "no line" is only meaningful beside "a line".
+    #[test]
+    fn a_low_only_forward_is_reported_and_a_clean_forward_is_not() {
+        let low =
+            RedactionVerdict::from_findings(vec![Finding::model(FindingKind::Pii, 1_400..1_436)]);
+        assert_eq!(decide(&low), EgressDecision::Forward);
+        let lines = forwarded_findings_report(&low);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("pii"), "the kind: {}", lines[0]);
+        assert!(
+            lines[0].contains("low-confidence"),
+            "the confidence: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("1400-1436"),
+            "the span, so the user can find it: {}",
+            lines[0]
+        );
+
+        let clean = RedactionVerdict::clean();
+        assert_eq!(decide(&clean), EgressDecision::Forward);
+        assert!(
+            forwarded_findings_report(&clean).is_empty(),
+            "a clean scan has nothing to report"
+        );
+    }
+
+    /// A blocked payload is reported by `privacy_block` and the turn-failure
+    /// sentence, so this path stays silent for it — one payload, one report.
+    #[test]
+    fn a_blocked_verdict_produces_no_forward_report() {
+        for verdict in [
+            RedactionVerdict::unavailable(),
+            findings_of(&[Confidence::High]),
+            findings_of(&[Confidence::High, Confidence::Low]),
+        ] {
+            assert_eq!(decide(&verdict), EgressDecision::Block);
+            assert!(
+                forwarded_findings_report(&verdict).is_empty(),
+                "a blocked verdict must not also report as forwarded: {verdict:?}"
+            );
+        }
+    }
+
+    /// One line per finding, each naming its own span — a payload with two
+    /// located strings gives the user two places to look.
+    #[test]
+    fn each_forwarded_finding_gets_its_own_line() {
+        let verdict = findings_of(&[Confidence::Low, Confidence::Low, Confidence::Low]);
+        let lines = forwarded_findings_report(&verdict);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for (line, finding) in lines.iter().zip(verdict.findings()) {
+            assert!(
+                line.contains(&format!("{}-{}", finding.span().start, finding.span().end)),
+                "{line}"
+            );
+        }
+    }
+
+    /// **BR-6 at the new surface.** The report is built from a `Finding`, which
+    /// has no text field — so the sentinel cannot reach a log line even when the
+    /// payload it was located in is right there.
+    #[test]
+    fn the_forward_report_never_carries_the_matched_text() {
+        const SENTINEL: &str = "orange-walrus-9-QUUXSENTINEL";
+        let payload = format!("the deploy password is {SENTINEL} — please rotate it");
+        let at = payload.find(SENTINEL).expect("the fixture contains it");
+        let verdict = RedactionVerdict::from_findings(vec![Finding::model(
+            FindingKind::Secret,
+            at..at + SENTINEL.len(),
+        )]);
+        let lines = forwarded_findings_report(&verdict);
+        // Non-vacuity: there really is a line, and it really does describe this
+        // finding.
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("secret"));
+        for line in &lines {
+            assert!(
+                !line.contains("QUUXSENTINEL") && !line.contains(SENTINEL),
+                "BR-6 VIOLATION — the matched text reached the daemon log: {line}"
+            );
+        }
     }
 
     #[test]

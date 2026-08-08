@@ -144,8 +144,17 @@ Egress::send(request, provenance, ctx):
         decide(verdict):
           Block(Findings)     → privacy_block(cause: Redaction{kind, span}), Err  (AC-1)
           Block(Unavailable)  → privacy_block(cause: ScanUnavailable), Err        (AC-3)
+          Forward(Findings)   → daemon log: one "redact — low-confidence <kind>
+                                at bytes a-b" line per finding, then forward     (BR-4)
           Forward             → inner.execute(request)  [bytes untouched — AC-9]
 ```
+
+A Low-only forward reports to the **daemon log** (`eprintln!` → `tetond.log`,
+the daemon's only logging surface) and deliberately not to `privacy_block`:
+that event means the payload was refused, its sink taints the session
+(REQ-544 C-2), and emitting it for a payload that was sent would both lie and
+pin the rest of the session local. `forwarded_findings_report` returns nothing
+for a blocking verdict, so one payload can never be reported twice.
 
 New/changed surfaces per crate:
 

@@ -143,6 +143,14 @@ No new RPCs.
       a credential the model paraphrased into prose is **located, reported at
       Low — span and kind, never text — and forwards** per BR-4
       (`a_credential_the_model_paraphrased_is_located_and_reported_without_blocking`).
+      "Reported" names a surface: a forwarding verdict's findings are written to
+      the daemon log as one `redact — low-confidence <kind> at bytes <a>-<b>`
+      line each (`egress::redact::forwarded_findings_report`, emitted from the
+      gate arm of `Egress::send`). It is deliberately not `privacy_block` — that
+      event means the payload was refused, and emitting it for a forward would
+      taint the session and misreport what happened. The AC-7 procedure in
+      `docs/manual-verification.md` reads OQ-2's "what did the model catch that
+      patterns did not" off exactly this surface.
       The capability the REQ exists for — content-based detection that
       provenance structurally cannot do — holds on both legs; whether Low
       should ever escalate to a block is BR-4's stated rule to revisit, not this

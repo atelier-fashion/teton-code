@@ -644,7 +644,28 @@ REQ says is most likely to be wrong, and this is the only place it can be
 observed): of the payloads the scan flagged, **how many did the model catch that
 the pattern pass did not** — the `Confidence::Low` findings. That question, not
 raw recall, is what tells you whether the model call earns its latency (OQ-2's
-recorded counter-argument). Plant a handful of paraphrased credentials that no
-pattern shape matches and see whether they are reported at all.
+recorded counter-argument).
+
+**Where to read it.** A low-confidence finding forwards (BR-4), so it produces
+no `privacy_block` and nothing in the CLI. It writes one line per finding to the
+daemon's log — `tetond`'s stderr, i.e. `<base>/tetond.log`:
+
+```sh
+grep 'redact — low-confidence' ~/"Library/Application Support/teton/tetond.log"
+# tetond: redact — low-confidence credential at bytes 1402-1440 of the outbound
+# payload; forwarded (a low-confidence finding is reported, not blocked — BR-4).
+```
+
+Kind and byte span, never the matched text (BR-6) — the span is what lets you
+find the string yourself in the payload you sent.
+
+Procedure: plant a handful of paraphrased credentials that no pattern shape
+matches (`the deploy password is <something>`, a connection string described in
+prose, an address), run one remote turn each, and count the lines. **Zero lines
+across the whole set is the finding**: it means the model half caught nothing
+the pattern pass could not, and OQ-2's recorded counter-argument — that the
+pattern pass makes the feature *look* like it works — has come true. Record the
+count either way; a number here is the only evidence the model call earns its
+latency.
 
 **Status: NOT RUN.** No sign-off block below, because nobody has executed it.

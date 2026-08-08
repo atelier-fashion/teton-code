@@ -469,7 +469,13 @@ impl<T: Transport> Egress<T> {
     /// content that was never allowed to leave in the first place.
     ///
     /// Either refusal emits a `privacy_block` event and returns
-    /// [`EgressError::PrivacyBlocked`]. The `request` — whose body may contain
+    /// [`EgressError::PrivacyBlocked`]. A verdict that **forwards** with
+    /// low-confidence findings writes one daemon-log line per finding
+    /// ([`redact::forwarded_findings_report`]) — kind, confidence and span, no
+    /// payload text — because a finding computed and then discarded is
+    /// indistinguishable from one never made (BR-4, ADR-4).
+    ///
+    /// The `request` — whose body may contain
     /// the offending bytes — is dropped, never forwarded, never logged. A payload
     /// both inspections allow reaches the inner transport **byte-identical**:
     /// v1 detects, it never substitutes (BR-5, AC-9).
@@ -543,6 +549,20 @@ impl<T: Transport> Egress<T> {
                     action: ctx.block_action,
                     cause,
                 });
+            }
+            // The forwarded half of ADR-4's decision table. A `Findings` verdict
+            // that forwards is Low-only (BR-4), and a low-confidence finding
+            // that is computed and then dropped is indistinguishable from one
+            // that was never made — nothing tells the operator, and OQ-2's
+            // "what did the model catch that patterns did not?" has no
+            // observable answer. So it goes to the daemon's log, which is this
+            // process's stderr and therefore `tetond.log`.
+            //
+            // Kind, confidence and span only. `Finding` has no text field, so
+            // "the report never quotes the payload" (BR-6) is a property of the
+            // input rather than of this loop.
+            for line in redact::forwarded_findings_report(&verdict) {
+                eprintln!("{line}");
             }
         }
 
@@ -1194,6 +1214,40 @@ mod tests {
                 "{name}: a forward emits no privacy_block"
             );
         }
+    }
+
+    /// **The forwarded-findings report is actually wired into `send`** (BR-4,
+    /// ADR-4).
+    ///
+    /// Asserted against this module's own source rather than against captured
+    /// output, and the reason is a limitation worth naming: the report goes to
+    /// the daemon's log, which is this process's **stderr** — the one output
+    /// stream `libtest` does not capture, and a process-global file descriptor
+    /// no test may redirect without racing every other test in the binary.
+    ///
+    /// So the split is: [`redact::forwarded_findings_report`] owns the *content*
+    /// and is pinned by four unit tests beside it (kind, span, one line per
+    /// finding, no matched text, and nothing at all for a clean or blocked
+    /// verdict), and this pins the *call* — delete the loop in `send` and this
+    /// turns red. The same instrument the duty seam uses for
+    /// `bound_to_ceiling`.
+    #[test]
+    fn the_gate_arm_reports_a_forwarded_findings_verdict() {
+        let source = crate::call_sites::scan::production_sources()
+            .into_iter()
+            .find(|(rel, _)| rel == "egress/mod.rs")
+            .map(|(_, src)| crate::call_sites::scan::code_only(&src))
+            .expect("this module is a production source");
+        assert!(
+            source.contains("redact::forwarded_findings_report(&verdict)"),
+            "the gate arm must report a forwarded verdict's findings; a finding computed \
+             and then dropped is indistinguishable from one never made (BR-4, ADR-4)"
+        );
+        assert_eq!(
+            crate::call_sites::scan::count(&source, "forwarded_findings_report"),
+            1,
+            "exactly one report site, so one payload cannot be reported twice"
+        );
     }
 
     #[tokio::test]
