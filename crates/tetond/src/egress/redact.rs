@@ -253,8 +253,17 @@ pub const REDACT_CHUNK_MAX_BYTES: usize =
 /// every builtin tool registered, plus a tenth of the context budget for JSON
 /// escaping, must fit inside it. If a later REQ adds enough tools to overflow
 /// that, the assumption turns red instead of silently eating the margin.
+///
+/// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
+/// be built from here: with `[web] tier` above `off` the system prompt carries
+/// the web tool's docs instead of REQ-563's BR-6 opt-in clause, and building
+/// that tool needs a permission gate and a choke-point seam. Its half of the
+/// assertion lives beside the tool
+/// (`harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`);
+/// this is the number both of them measure against, so the two shapes cannot
+/// come to disagree about the budget.
 #[cfg(test)]
-const REDACT_BODY_OVERHEAD_BYTES: usize = 8 * 1024;
+pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 8 * 1024;
 
 /// How many per-chunk windows the total cap is worth — the multiple that turns
 /// [`REDACT_CHUNK_MAX_BYTES`] into [`REDACT_INPUT_MAX_BYTES`].
@@ -1908,6 +1917,12 @@ mod tests {
         // The strong-model shape (`max_tools: None`), so every builtin's
         // description is in the prompt: the larger of the two harness configs
         // is the one the overhead has to cover.
+        //
+        // This registry is the **opted-out** shape (REQ-563 D-1): no web tool,
+        // and therefore the BR-6 opt-in clause in its place. The opted-in shape
+        // — web tool docs, no clause — is measured against this same constant
+        // beside the tool, because building one needs a permission gate and a
+        // choke-point seam that do not belong in this module.
         let config = HarnessConfig::for_strong_model();
         let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
         let budget = config.context_budget_bytes;

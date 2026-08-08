@@ -28,6 +28,7 @@ pub mod grep;
 pub mod mcp;
 pub mod read;
 pub mod shell;
+pub mod web;
 
 pub use edit::EditTool;
 pub use glob::GlobTool;
@@ -35,6 +36,7 @@ pub use grep::GrepTool;
 pub use mcp::{register_mcp_tools, McpToolHandle};
 pub use read::ReadTool;
 pub use shell::ShellTool;
+pub use web::{register_web_tool, WebTool, WEB_TOOL_NAME};
 
 /// Shared execution context for every tool: the repo-root jail.
 ///
@@ -338,6 +340,35 @@ pub trait Tool: Send + Sync {
     /// Run the tool against `args`, jailed to `ctx`.
     fn run(&self, ctx: &ToolContext, args: &Value) -> ToolOutcome;
 
+    /// Whether this tool raises its **own** permission prompt inside
+    /// [`Tool::run`], so the loop must not raise one on its behalf.
+    ///
+    /// **The default is `false`, and that is the safe answer**: a tool that says
+    /// nothing is authorized by the loop, by name, before it runs — which is
+    /// what every built-in and every MCP tool wants, because for them the tool
+    /// name *is* the whole consent question.
+    ///
+    /// It is asked of the tool rather than decided from a list of names for the
+    /// same reason [`Tool::refine`] is (BR-1): the thing that knows how a call
+    /// is authorized is the thing that performs it. Today exactly one tool
+    /// answers `true` — [`web`](web::WebTool) — and only because its consent
+    /// question is **finer than its name and is not always asked**:
+    ///
+    /// - fetching a URL and searching the web are separately consented
+    ///   capabilities (REQ-563 BR-3), so one session grant on a fetch must not
+    ///   silently grant a search;
+    /// - a lookup above the configured ceiling is refused *before* any prompt
+    ///   (AC-4), and a lookup already in the local cache performs no egress and
+    ///   must not prompt at all (BR-12).
+    ///
+    /// Both of those are facts only the tool holds, and both are decided inside
+    /// the same `run` that would perform the lookup — which is what keeps the
+    /// "no egress without consent" pairing atomic instead of split across two
+    /// calls that could come to disagree.
+    fn gates_itself(&self) -> bool {
+        false
+    }
+
     /// Refine this tool's own `outcome` through the harness duty this tool owns,
     /// given the `request` the turn is serving and the `args` it was called with.
     ///
@@ -385,6 +416,15 @@ impl ToolRegistry {
 
     /// A registry with the full built-in tool set, in weak-model priority order:
     /// read, edit, grep, glob, shell.
+    ///
+    /// The **opt-in** `web` tool is deliberately not here (REQ-563 D-1): it
+    /// exists only on a machine whose `[web] tier` is above `off`, which is a
+    /// config fact this constructor does not have and should not acquire — a
+    /// registry that always held the tool and hid it behind a flag would make
+    /// "absent by construction" a claim about a code path rather than about the
+    /// tool set. Its caller adds it with [`register_web_tool`](web::register_web_tool),
+    /// **last** — after the built-ins *and* after any MCP tools — so a degraded
+    /// provider's `max_tools` cap cuts the opt-in capability first (BR-6).
     #[must_use]
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();

@@ -135,11 +135,13 @@ use crate::classify::Classification;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable, WebLookupRow};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
 use crate::egress::{
-    inspect, origin_of, to_protocol_web_tier, Egress, EgressError, HttpTransport, LookupRecord,
-    LookupRecorder, Provenance, RedactionGate, RedactionVerdict, TaintView,
+    inspect, origin_of, to_protocol_web_tier, Egress, EgressError, HttpTransport, LookupContext,
+    LookupOutcome, LookupRecord, LookupRecorder, LookupRequest, Provenance, RedactionGate,
+    RedactionVerdict, TaintView,
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
+use crate::harness::tools::web::{register_web_tool, SeamError, WebLookupSeam};
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
@@ -158,6 +160,7 @@ use crate::router::{
 };
 use crate::selection_store::SelectionStore;
 use crate::sessions::SessionRegistry;
+use crate::web::{UserUrls, WebCache};
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
 const SCRIPT_SEPARATOR: &str = "---";
@@ -693,6 +696,62 @@ impl LookupRecorder for WebLookupRecorder {
     }
 }
 
+/// The daemon's implementation of the harness web tool's egress seam
+/// (REQ-563 D-2/D-5).
+///
+/// It exists so the tool depends on a **trait** rather than on this runtime:
+/// the harness must not reach for the router, the config or the keychain, and a
+/// test of the tool's gate order must be able to say "this lookup reached
+/// nothing" without standing a daemon up. Everything privileged lives on this
+/// side of the seam.
+///
+/// One field per thing [`DaemonRuntime::web_lookup_egress`] needs, snapshotted
+/// for the turn the tools were built for — which is the same lifetime
+/// `run_one_attempt` gives its own `config`, because the registry is rebuilt on
+/// every prompt turn. The *credential* is not snapshotted: it is resolved
+/// inside `web_lookup_egress` as the choke point is built, per lookup (ADR-007).
+struct RuntimeLookupSeam {
+    runtime: Arc<DaemonRuntime>,
+    router: Router,
+    config: Config,
+    events: Arc<EventBus>,
+    session_id: SessionId,
+}
+
+#[async_trait::async_trait]
+impl WebLookupSeam for RuntimeLookupSeam {
+    async fn lookup(
+        &self,
+        request: &LookupRequest,
+        hop_allowed: &(dyn for<'h> Fn(&'h str) -> bool + Send + Sync),
+    ) -> Result<LookupOutcome, SeamError> {
+        // Built here and dropped at the end of this call. A choke point cached
+        // for the daemon's life would be holding a search key resolved when it
+        // was built, which is exactly the staleness ADR-007 removed.
+        let egress = self
+            .runtime
+            .web_lookup_egress(&self.router, &self.config, &self.events, &self.session_id)
+            .map_err(|err| SeamError::Unavailable(err.to_string()))?;
+        let taint = self.runtime.web_taint_view();
+        let mut ctx = LookupContext::new(self.session_id.clone(), &*taint, hop_allowed);
+        // The endpoint, and only the endpoint. The key rides the transport,
+        // bound to this origin, and this module never sees it (BR-7).
+        if let Some(endpoint) = self.config.web.search_endpoint.as_deref() {
+            ctx = ctx.with_search_endpoint(endpoint);
+        }
+        Ok(egress.lookup(request, &ctx).await)
+    }
+
+    fn record_without_egress(&self, record: &LookupRecord) {
+        // The same recorder the choke point uses, so a cache hit and a wire
+        // lookup land in one table through one writer — "how many lookups did
+        // this session perform" has one answer (BR-7).
+        self.runtime
+            .lookup_recorder(&self.events)
+            .web_lookup(&self.session_id, record);
+    }
+}
+
 /// A [`PrivacyEventSink`] that publishes the block **and** taints the session it
 /// happened in (REQ-544 C-2, extended to the duty path by REQ-561).
 ///
@@ -1086,6 +1145,19 @@ pub struct DaemonRuntime {
     /// the turn is running on, while the `web/override` RPC writes it from the
     /// server's reader loop.
     web_override: Arc<WebTaintOverride>,
+    /// Per-session sets of the URLs the **user** pasted (REQ-563 BR-3).
+    ///
+    /// Session-scoped and in memory only, like the permission grants and the
+    /// taint flag beside it: this is evidence about one conversation, and
+    /// persisting it would turn a per-session authorization into a standing one.
+    session_user_urls: Mutex<HashMap<SessionId, Arc<Mutex<UserUrls>>>>,
+    /// The daemon's per-user state directory — where `cost.db` lives, and where
+    /// the web document cache sits beside it (REQ-563 BR-12).
+    ///
+    /// Held rather than re-derived so the two stores cannot end up in different
+    /// places: there is exactly one resolution of the data dir and it is
+    /// [`Self::from_env`]'s caller's.
+    data_dir: PathBuf,
     /// Daemon-wide provider health, persisted across turns (REQ-544 M-5). Updated
     /// by turn outcomes and READ by [`Self::run_prompt_turn`] when it seeds the
     /// router each turn, so a provider observed `Unavailable` stays `Unavailable`
@@ -1145,6 +1217,12 @@ impl DaemonRuntime {
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
             web_override: Arc::new(WebTaintOverride::new()),
+            session_user_urls: Mutex::new(HashMap::new()),
+            // A minimal runtime has no state directory. It also has an empty
+            // config, so `[web] tier` is `off` and no web tool is ever built to
+            // ask this for a cache path — the temp dir is a total answer to a
+            // question this runtime does not get asked.
+            data_dir: std::env::temp_dir(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         }
@@ -1282,6 +1360,8 @@ impl DaemonRuntime {
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
             web_override: Arc::new(WebTaintOverride::new()),
+            session_user_urls: Mutex::new(HashMap::new()),
+            data_dir: base_dir.to_path_buf(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         })
@@ -2002,18 +2082,27 @@ impl DaemonRuntime {
         // snapshot itself is cheap when that decision is made.
         // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
         // semantics are decided.
-        let tools = self.build_tools(&router, events, &session_id).await;
+        // REQ-563 BR-3: every URL in this prompt joins the session's user-pasted
+        // set **before** the turn runs, so a message that pastes a link and asks
+        // about it in one breath classifies as `UserPasted` — the ordinary
+        // shape of the request. This is the one ingestion point, and the text it
+        // reads is the user's own (see `record_user_prompt_urls`).
+        self.record_user_prompt_urls(&session_id, &prompt);
+        // Built before the tools, because the web tool holds it: that tool
+        // raises its own per-tier prompt inside its run rather than being
+        // authorized by name at dispatch (REQ-563 BR-3/BR-12).
+        let gate = Arc::new(PermissionGate::new(
+            session_id.clone(),
+            self.permission_config.clone(),
+            events.clone(),
+            self.pending.clone(),
+        ));
+        let tools = self.build_tools(&router, events, &session_id, &gate).await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
         // not send one — under launchd it is `/`, which is what had every tool
         // call running against the filesystem root.
         let tool_ctx = ToolContext::new(session_cwd.as_deref().unwrap_or(&self.repo_root));
-        let gate = PermissionGate::new(
-            session_id.clone(),
-            self.permission_config.clone(),
-            events.clone(),
-            self.pending.clone(),
-        );
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
         let system = build_system_prompt(&tools, &route.harness);
@@ -2252,17 +2341,25 @@ impl DaemonRuntime {
         crate::classify::run(plan, prompt, router.judgment_default()).await
     }
 
-    /// Build the tool registry for a turn: the built-ins plus any registered MCP
-    /// server tools (ADR-003), namespaced and egress-gated.
+    /// Build the tool registry for a turn: the built-ins, any registered MCP
+    /// server tools (ADR-003, namespaced and egress-gated), and — **only** on a
+    /// machine that opted in — the web tool (REQ-563 D-1).
+    ///
+    /// The web tool goes on **last**, after the MCP tools, and that ordering is
+    /// the BR-6 charter rule expressed as insertion order rather than as a
+    /// special case: [`ToolRegistry::exposed_names`] caps from the front, so a
+    /// degraded provider's `max_tools` cuts the opt-in capability before it cuts
+    /// a server the user configured.
     async fn build_tools(
-        &self,
+        self: &Arc<Self>,
         router: &Router,
         events: &Arc<EventBus>,
         session_id: &SessionId,
+        gate: &Arc<PermissionGate>,
     ) -> ToolRegistry {
         let mut tools = ToolRegistry::with_builtins();
+        let config = self.config.lock().expect("config mutex poisoned").clone();
         if !self.mcp_servers.is_empty() {
-            let config = self.config.lock().expect("config mutex poisoned").clone();
             if let Ok(transport) = HttpTransport::new() {
                 let egress =
                     Arc::new(self.mcp_egress(transport, router, &config, events, session_id));
@@ -2279,7 +2376,56 @@ impl DaemonRuntime {
                 .await;
             }
         }
+        // REQ-563 BR-1: `register_web_tool` is the one place the "tier is above
+        // off" condition is expressed, so a machine that never opted in has no
+        // web tool rather than a web tool behind a flag.
+        let web = config.web.clone();
+        register_web_tool(
+            &mut tools,
+            &web,
+            WebCache::from_config(&self.data_dir, &web),
+            self.user_urls_for(session_id),
+            Arc::clone(gate),
+            Arc::new(RuntimeLookupSeam {
+                runtime: Arc::clone(self),
+                router: router.clone(),
+                config,
+                events: Arc::clone(events),
+                session_id: session_id.clone(),
+            }),
+            tokio::runtime::Handle::current(),
+        );
         tools
+    }
+
+    /// This session's set of user-pasted URLs, created on first use (BR-3).
+    fn user_urls_for(&self, session_id: &SessionId) -> Arc<Mutex<UserUrls>> {
+        Arc::clone(
+            self.session_user_urls
+                .lock()
+                .expect("session user url mutex poisoned")
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(UserUrls::new()))),
+        )
+    }
+
+    /// Record every URL in one **user-authored** prompt as user-pasted (BR-3).
+    ///
+    /// Called at prompt ingestion, before the turn runs, so a message that
+    /// pastes a URL *and* asks about it in one breath classifies as
+    /// `UserPasted` — the ordinary shape of the request, and one that would
+    /// otherwise need two turns to be granted at the floor tier.
+    ///
+    /// The "user-authored" qualifier is the whole safety argument: feeding this
+    /// a model turn, a tool result or a fetched page would let the model author
+    /// its own authorization by writing a URL into content this set then
+    /// trusts. There is exactly one caller, and it holds the `session/prompt`
+    /// text.
+    fn record_user_prompt_urls(&self, session_id: &SessionId, prompt: &str) {
+        self.user_urls_for(session_id)
+            .lock()
+            .expect("user url set mutex poisoned")
+            .record_user_message(prompt);
     }
 
     /// The choke point an MCP `tools/call` crosses (ADR-003, REQ-562 ADR-1).
@@ -12368,6 +12514,105 @@ provider_id = "on-device"
                     "the provider gate has no business on the lookup path"
                 );
             }
+        }
+    }
+
+    /// REQ-563 TASK-076 — the daemon's half of the harness web tool: whether it
+    /// is registered at all, where in the order, and what feeds its BR-3
+    /// authorship question.
+    ///
+    /// The tool's own gate order is pinned where the tool lives
+    /// (`harness::tools::web`). What can only be pinned *here* is the wiring:
+    /// deleting the `register_web_tool` call, or the URL ingestion beside
+    /// `ctx.push_user`, turns exactly these red and nothing there (LESSON-483 —
+    /// the link that calls the link needs its own mutation).
+    mod web_tool_wiring {
+        use super::*;
+        use crate::harness::tools::WEB_TOOL_NAME;
+        use teton_core::config::WebTier;
+
+        fn runtime_at(tier: WebTier) -> Arc<DaemonRuntime> {
+            let runtime = DaemonRuntime::minimal();
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = tier;
+                config.web.search_endpoint = Some("https://search.example/api".to_owned());
+            }
+            Arc::new(runtime)
+        }
+
+        /// **BR-1 / AC-1's structural half, through the real registry builder.**
+        ///
+        /// `off` is not a tool behind a flag: the registry does not hold one, so
+        /// there is nothing for a later change to accidentally expose.
+        #[tokio::test]
+        async fn the_web_tool_is_registered_exactly_when_the_tier_is_above_off() {
+            for tier in WebTier::ALL {
+                let runtime = runtime_at(tier);
+                let router = {
+                    let config = runtime.config.lock().expect("config mutex").clone();
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+                };
+                let events = Arc::new(EventBus::new());
+                let session = SessionId::from("s");
+                let gate = Arc::new(PermissionGate::new(
+                    session.clone(),
+                    runtime.permission_config.clone(),
+                    Arc::clone(&events),
+                    Arc::clone(&runtime.pending),
+                ));
+
+                let tools = runtime.build_tools(&router, &events, &session, &gate).await;
+
+                assert_eq!(
+                    tools.get(WEB_TOOL_NAME).is_some(),
+                    tier != WebTier::Off,
+                    "tier {tier:?} registered the wrong tool set"
+                );
+                if tier != WebTier::Off {
+                    // BR-6 of the charter: registered last, so `max_tools` cuts
+                    // the opt-in capability before it cuts anything else.
+                    assert_eq!(tools.names().last().copied(), Some(WEB_TOOL_NAME));
+                    // ...which on the weak-model default means it is not
+                    // exposed at all, and that is deliberate, not a bug.
+                    assert!(!tools.exposed_names(Some(5)).contains(&WEB_TOOL_NAME));
+                }
+            }
+        }
+
+        /// **BR-3's ingestion.** A message that pastes a URL and asks about it
+        /// in one breath must classify as user-pasted on *that* turn, not the
+        /// next one — otherwise the floor tier grants nothing until the user
+        /// repeats themselves.
+        #[test]
+        fn a_prompt_that_pastes_a_url_records_it_for_the_session_before_the_turn() {
+            let runtime = DaemonRuntime::minimal();
+            let session = SessionId::from("paste");
+            runtime.record_user_prompt_urls(
+                &session,
+                "what does https://docs.rs/tokio/latest say about spawn_blocking?",
+            );
+
+            let urls = runtime.user_urls_for(&session);
+            let urls = urls.lock().expect("user url mutex");
+            assert!(
+                urls.contains("https://docs.rs/tokio/latest"),
+                "the pasted URL is not in the session's set"
+            );
+            // Scheme and host case, and a fragment, do not change the answer —
+            // and nothing the user did not type is in there.
+            assert!(urls.contains("HTTPS://Docs.RS/tokio/latest#top"));
+            assert!(!urls.contains("https://docs.rs/other"));
+        }
+
+        /// The set is per session, so one conversation's paste never authorizes
+        /// another's fetch.
+        #[test]
+        fn user_pasted_urls_do_not_leak_between_sessions() {
+            let runtime = DaemonRuntime::minimal();
+            runtime.record_user_prompt_urls(&SessionId::from("a"), "see https://docs.rs/tokio");
+            let other = runtime.user_urls_for(&SessionId::from("b"));
+            assert!(other.lock().expect("user url mutex").is_empty());
         }
     }
 }

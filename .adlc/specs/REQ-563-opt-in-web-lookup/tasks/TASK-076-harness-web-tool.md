@@ -1,7 +1,7 @@
 ---
 id: TASK-076
 title: "Harness web tool: conditional registration, tier/allowlist/cache logic, prompt text"
-status: draft
+status: complete
 parent: REQ-563
 created: 2026-08-08
 updated: 2026-08-08
@@ -26,13 +26,13 @@ case.
 
 ## Acceptance Criteria
 
-- [ ] tier = Off → tool NOT registered: `ToolRegistry::exposed_names()` excludes it, system prompt names the opt-in, and dispatch of "web" errors as unknown tool (AC-1 structural half).
-- [ ] Tier ceiling: with FetchUserUrl only, a ModelComposed fetch is refused naming the missing tier and makes zero egress calls; with FetchAnyUrl, search refused likewise (AC-4).
-- [ ] Allowlist: configured allowlist refuses out-of-list ModelComposed fetches (naming the allowlist), exempts UserPasted URLs (AC-9); no allowlist → tier grant alone governs.
-- [ ] Cache: fresh entry → result served with zero egress AND no permission prompt; `PermissionGate` not consulted (BR-12); stale → normal flow.
-- [ ] Ask flow: the permission description contains the verbatim query/URL and destination host (AC-2's visibility half); results are framed `<tool-result trust="untrusted">` via the existing builtin framing — NO new envelope spelling, ADR-009 marker tests untouched (AC-5 posture).
-- [ ] Provenance: `ToolOutcome` carries empty Sources — a session that only did web lookups does not fail-close provider egress (test: lookup then provider send with a boundary configured succeeds absent other taint).
-- [ ] Prompt budget: the new clause + tool docs clear the existing budget-headroom test with margin (LESSON-493/BUG-160 pattern — assert against the real rendered prompt).
+- [x] tier = Off → tool NOT registered: `ToolRegistry::exposed_names()` excludes it, system prompt names the opt-in, and dispatch of "web" errors as unknown tool (AC-1 structural half).
+- [x] Tier ceiling: with FetchUserUrl only, a ModelComposed fetch is refused naming the missing tier and makes zero egress calls; with FetchAnyUrl, search refused likewise (AC-4).
+- [x] Allowlist: configured allowlist refuses out-of-list ModelComposed fetches (naming the allowlist), exempts UserPasted URLs (AC-9); no allowlist → tier grant alone governs.
+- [x] Cache: fresh entry → result served with zero egress AND no permission prompt; `PermissionGate` not consulted (BR-12); stale → normal flow.
+- [x] Ask flow: the permission description contains the verbatim query/URL and destination host (AC-2's visibility half); results are framed `<tool-result trust="untrusted">` via the existing builtin framing — NO new envelope spelling, ADR-009 marker tests untouched (AC-5 posture).
+- [x] Provenance: `ToolOutcome` carries empty Sources — a session that only did web lookups does not fail-close provider egress (test: lookup then provider send with a boundary configured succeeds absent other taint).
+- [x] Prompt budget: the new clause + tool docs clear the existing budget-headroom test with margin (LESSON-493/BUG-160 pattern — assert against the real rendered prompt).
 
 ## Technical Notes
 
