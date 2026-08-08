@@ -147,6 +147,37 @@ recorded as **NOT RUN** until dogfooding executes it (REQ-557/558 standard).
 The redactor is local — no `MeteredBody` rides the scan — so LESSON-488's
 drop-billing hazard does not attach to the scan itself.
 
+**The budget is per scan; a turn is many scans.** The gate is in
+`Egress::send`, so it runs once per **remote call**, and one user turn is up to
+`HarnessConfig::max_turns` agent iterations (12 weak-model, 40 strong-model)
+plus any remotely-bound duty sends plus any remote MCP `tools/call`. A 2 s p50
+per scan is therefore up to ~80 s added to one long tool-looping turn. The AC-7
+procedure measures the **turn** against a `redact = false` control for this
+reason; the per-scan number alone is not a number any user experiences.
+
+**Two known residuals, recorded as accepted rather than fixed:**
+
+1. **The scan serializes on the single engine mutex, on every remote call.**
+   `LocalDuty::perform` takes the engine lock for the whole completion, and
+   `redact` is the first duty that runs *unconditionally* rather than on a
+   threshold or a judgment turn. Two concurrent sessions therefore contend on
+   every remote call, and a long local turn in one session delays every remote
+   turn in another. Nothing in CI can observe this (every fixture answers from a
+   string table), so the AC-7 procedure's concurrent-sessions step is the only
+   instrument.
+2. **A timed-out scan is not cancelled.** The seam's `DUTY_DEADLINE` is a
+   `tokio::time::timeout` around `perform`, which drops the future — but the
+   work runs in `spawn_blocking`, and dropping a `JoinHandle` does not abort a
+   blocking task. A scan that overruns the deadline keeps running and **keeps
+   holding the engine mutex**, so the deadline bounds the *caller's* wait and
+   not the machine's. Combined with (1) this is the amplification path: one
+   pathological scan can stall unrelated sessions for its full duration.
+
+Tuning either — a redact-specific deadline shorter than the shared 120 s, a
+fairness policy on the engine slot, a cancellable engine call — is **deliberate
+follow-up**, not an oversight. Both are opt-in-only exposure (BR-10/OQ-3) and
+both fail in the direction of slowness rather than of leakage.
+
 ### ADR-10: The scan prompt's frame is defused against the payload (context ADR-009)
 
 The redact prompt writes a frame — a flush-left `Payload:` line — and then

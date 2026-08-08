@@ -575,12 +575,28 @@ and its own Assumptions section names user tolerance for that latency as one of
 the three things most likely to be wrong.
 
 **The stated budget (ADR-8).** On real mid-tier weights, a scan of a payload at
-`REDACT_INPUT_MAX_BYTES` (64 KiB) completes in **p50 ≤ 2 s, p95 ≤ 5 s**. The
-duty seam's `DUTY_DEADLINE` (120 s) is the hard stop, and an overrun is
-`Unavailable` → **Block** (ADR-6) — a timed-out guard does not become a guard
-that passes everything, so a machine that misses the budget badly enough
-degrades into blocked turns rather than into unscanned ones. That is the failure
-mode a measurement is looking for.
+`REDACT_INPUT_MAX_BYTES` completes in **p50 ≤ 2 s, p95 ≤ 5 s**. The duty seam's
+`DUTY_DEADLINE` (120 s) is the hard stop, and an overrun is `Unavailable` →
+**Block** (ADR-6) — a timed-out guard does not become a guard that passes
+everything, so a machine that misses the budget badly enough degrades into
+blocked turns rather than into unscanned ones. That is the failure mode a
+measurement is looking for.
+
+**The budget is per *scan*, and a turn is not one scan.** This is the thing the
+procedure has to measure and the earlier version of it did not. The gate sits in
+`Egress::send`, so it runs **once per remote call**, and one user turn is many
+remote calls:
+
+| Multiplier | Where it comes from | Count |
+|---|---|---|
+| Tool-call iterations | `HarnessConfig::max_turns` — the agent loop calls the provider once per iteration | up to **12** (weak-model default) or **40** (`for_strong_model`) |
+| Remotely-bound duties | every `RemoteDuty` send crosses the same choke point | 0–2 per turn typically (`title` once per session, `compact` under pressure) |
+| Remote MCP calls | ADR-003 makes a `tools/call` remote egress | 1 per remote MCP tool use |
+
+So a 2-second p50 per scan is **up to 80 seconds added to one long tool-looping
+turn** on a strong-model route. A procedure that times the first scan of a turn
+measures a number nobody experiences. Measure the **turn**, and measure it
+against a control.
 
 **Why there is no harness.** The same reason REQ-558's classifier gap has none,
 and more so. CI ships no weights: `tetond` is built without
@@ -603,7 +619,8 @@ sixteen-line contract). **Nobody has run it.**
 | An over-cap payload costs **zero** model calls and blocks | `harness::redact::tests::an_over_cap_payload_is_unavailable_before_any_model_call`, `tests/redact_egress.rs::a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` | Full — by model-call count, not by elapsed time |
 | A deadline overrun is `Unavailable` → Block | `harness::redact::tests::a_scan_that_overruns_the_deadline_is_unavailable` | Full, on a **paused clock**. It pins the wiring, and says nothing about how long a real scan takes |
 | Off costs nothing at all — no gate, no call, no latency | `runtime::tests::dispatch::redact::off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine`, `egress::tests::off_means_zero_scanner_calls_and_on_means_exactly_one` | Full — by call count. This is what bounds the blast radius of the unmeasured budget: nobody who has not opted in pays it (OQ-3) |
-| The scan runs once per outbound payload, not more | `tests/redact_egress.rs::a_clean_payload_forwards_and_the_scan_provably_ran` | Full at the count; says nothing about elapsed time |
+| The scan runs once per outbound payload, not more | `tests/redact_egress.rs::a_clean_payload_forwards_and_the_scan_provably_ran` | Full at the count; says nothing about elapsed time — and "once per payload" is many times per *turn*, which is what step 2 measures |
+| Engine-mutex contention between sessions | — | **Nothing.** Every automated fixture answers from a string table in microseconds, so no fixture can hold the mutex long enough for a second session to notice. Step 3 is the only instrument |
 
 **To close it by hand** (macOS/Apple Silicon, ~10 min, after a REQ-547 AC-13
 install has already put weights on disk):
@@ -619,25 +636,62 @@ redact = true
 EOF
 ./target/release/teton-code &
 ./target/release/teton
-# in the session, with /verbose on, run TWENTY remote turns of two shapes:
-#   (1) a short prompt      — the everyday case
-#   (2) a prompt whose assembled context is at the 64 KiB cap — read several
-#       large files first, then ask a question; `/verbose` shows the context size
 ```
 
-Record, for **each** shape: the wall-clock gap between submitting the prompt and
-the first token of the answer, over 20 runs, as p50 and p95. Then repeat the
-identical 20 runs with `redact = false` as the control. **The scan's cost is the
-difference**, not the absolute number — the remote call is in both.
+Every step below is run **twice**: once as written, and once with
+`redact = false` as the control. **The scan's cost is the difference**, not the
+absolute number — the remote call is in both. Record p50 and p95 over the stated
+run count for each half, and record the difference.
 
-Check the result against ADR-8: p50 ≤ 2 s and p95 ≤ 5 s **at the cap**. Also
-record how often the scan came back `Unavailable` (a `privacy_block` with cause
-`scan_unavailable`, or a turn failing with *"the redaction scan could not
-run"*): at the cap on slow weights that is the deadline firing, and a
-fail-closed timeout is a worse user outcome than a slow one. A miss is a finding
-to record here, not a number to re-run until it looks acceptable — and the
-honest response to a miss is a smaller cap or a faster tier, never a partial
-scan that reports itself complete (BR-7).
+**Step 1 — the single scan (ADR-8's stated budget).** With `/verbose` on, run
+TWENTY remote turns of two shapes, each answered without a tool call:
+
+- a short prompt — the everyday case;
+- a prompt whose assembled context is **at the input cap** — read several large
+  files first, then ask a question; `/verbose` shows the context size.
+
+Measure the gap between submitting the prompt and the first token of the answer.
+Check against ADR-8: p50 ≤ 2 s, p95 ≤ 5 s **at the cap**.
+
+**Step 2 — the whole turn (the number a user actually feels).** Run TEN turns
+that force the agent loop to iterate: *"read every file under `crates/teton-core/src/`
+and list the public types in each"* is one shape that reliably produces a
+double-digit tool loop. Measure **total wall-clock from submit to the turn
+ending**, and record alongside it the **number of remote calls the turn made**
+(`/verbose` shows each `route_decided`; count them, and add any `tools/call` to a
+remote MCP server).
+
+Then check the arithmetic: `turn_delta ≈ remote_calls × step_1_p50`. If it does
+not, say so — either the scan is faster on the short intermediate payloads (good,
+and worth recording as the real shape of the cost) or something else is serial
+that this document has not accounted for. **A turn that takes more than 30 s
+longer with the switch on is a finding**, whatever the per-scan number said.
+
+**Step 3 — two sessions at once (contention on the one engine).** The scan holds
+the **single local engine mutex** for its whole completion, and it is the first
+duty that runs unconditionally, so two sessions contend on every remote call. In
+two terminals against the same daemon:
+
+1. In session A, start a long **local** turn — a prompt routed to the local tier
+   (a tainted session, or `teton policy set-tier build local`) over a large
+   context, so the engine mutex is held for many seconds.
+2. Immediately, in session B, submit an ordinary **remote** turn.
+
+Record session B's time to first token. With `redact = false` it does not touch
+the engine at all and should be unaffected; with the switch on it cannot start
+its scan until A's completion releases the mutex. **Record the difference and
+whether B ever hit the 120-second `DUTY_DEADLINE`** — that is the fail-closed
+timeout, and it means B's turn was *blocked* by A's unrelated work.
+
+**Also record, in every step, how often the scan came back `Unavailable`** (a
+`privacy_block` with cause `scan_unavailable`, or a turn failing with *"the
+redaction scan could not run"*): at the cap on slow weights that is the deadline
+firing, and a fail-closed timeout is a worse user outcome than a slow one.
+
+A miss anywhere is a finding to record here, not a number to re-run until it
+looks acceptable — and the honest response to a miss is a smaller cap, a faster
+tier, or a scan that does not run on every call, never a partial scan that
+reports itself complete (BR-7).
 
 **Also worth recording while the weights are loaded** (it is the assumption the
 REQ says is most likely to be wrong, and this is the only place it can be
