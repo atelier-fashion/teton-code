@@ -72,7 +72,9 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 
-use crate::harness::redact::{REDACT_DUTY, REDACT_PROMPT_OVERHEAD_BYTES};
+use crate::harness::redact::{
+    REDACT_DEFUSE_GROWTH_DIVISOR, REDACT_DUTY, REDACT_PROMPT_OVERHEAD_BYTES,
+};
 use crate::runtime::LOCAL_ENGINE_N_CTX;
 
 /// Bytes the duty seam assumes per BPE token, sizing a prompt against a context
@@ -111,12 +113,27 @@ const REDACT_PROMPT_BUDGET_BYTES: usize =
 ///   − prompt overhead            586 bytes   (REDACT_PROMPT_OVERHEAD_BYTES:
 ///                                             318 instruction + 257 contract
 ///                                             + 11 header)
-///   = REDACT_INPUT_MAX_BYTES  30,134 bytes
+///   − 1 byte                                 (the frame-defusing bound's
+///                                             constant term)
+///   = 30,133 bytes for payload + its worst-case defusing
+///   × 9/10                   30,133 → 27,119 (ADR-009 frame defusing inserts at
+///                                             most one byte per 9 bytes of
+///                                             payload — REDACT_DEFUSE_GROWTH_DIVISOR)
+///   = REDACT_INPUT_MAX_BYTES  27,119 bytes
 /// ```
 ///
-/// The overhead is *measured*, not stated: the three numbers above are what the
-/// constants happen to be today, and editing the instruction moves the cap
-/// rather than eating into the window.
+/// Every term is *measured*, not stated: the numbers above are what the
+/// constants happen to be today, and editing the instruction — or the frame
+/// label the defusing looks for — moves the cap rather than eating into the
+/// window.
+///
+/// The `× 9/10` is the ADR-009 term. [`redact_prompt`](crate::harness::redact::redact_prompt)
+/// defuses line-anchored `Payload:` labels inside the payload before embedding
+/// it, and an insertion-only transform makes the prompt longer than the
+/// payload. A cap sized against the *raw* payload would let a payload built
+/// entirely of `Payload:\n` lines push the prompt back over the window — the
+/// same failure this derivation exists to remove, reintroduced by the fix for a
+/// different one.
 ///
 /// The old value was a flat 64 KiB, which is **more than twice** the prompt
 /// budget. Every payload between roughly 30 KiB and 64 KiB therefore passed the
@@ -135,7 +152,9 @@ const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// **one** number: the cap belongs to the engine that has to hold the prompt
 /// and to the prompt that has to fit in it, and a copy of either input here
 /// would be the second number LESSON-446 is about.
-pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_PROMPT_BUDGET_BYTES - REDACT_PROMPT_OVERHEAD_BYTES;
+pub const REDACT_INPUT_MAX_BYTES: usize =
+    (REDACT_PROMPT_BUDGET_BYTES - REDACT_PROMPT_OVERHEAD_BYTES - 1) * REDACT_DEFUSE_GROWTH_DIVISOR
+        / (REDACT_DEFUSE_GROWTH_DIVISOR + 1);
 
 /// How much the pipeline trusts a finding — **derived, never self-reported**
 /// (BR-4, ADR-4).
@@ -1170,23 +1189,46 @@ mod tests {
             REDACT_PROMPT_BUDGET_BYTES, budget,
             "the budget is n_ctx minus the duty's generation reservation"
         );
+        // The worst case, not the typical one: the prompt builder defuses
+        // line-anchored frame labels inside the payload (ADR-009), which is an
+        // insertion, so a payload made entirely of them is the largest prompt a
+        // payload at the cap can produce.
+        let worst_case_growth = REDACT_INPUT_MAX_BYTES / REDACT_DEFUSE_GROWTH_DIVISOR + 1;
         assert!(
-            REDACT_INPUT_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES <= budget,
-            "a payload at the cap plus the prompt's own {REDACT_PROMPT_OVERHEAD_BYTES} \
-             bytes must fit in the engine's {budget}-byte prompt budget; cap is \
-             {REDACT_INPUT_MAX_BYTES}"
+            REDACT_INPUT_MAX_BYTES + worst_case_growth + REDACT_PROMPT_OVERHEAD_BYTES <= budget,
+            "a payload at the cap, worst-case defused, plus the prompt's own \
+             {REDACT_PROMPT_OVERHEAD_BYTES} bytes must fit in the engine's \
+             {budget}-byte prompt budget; cap is {REDACT_INPUT_MAX_BYTES}"
         );
 
-        // And the real builder agrees with the arithmetic: the prompt for a
-        // payload at the cap is exactly cap + overhead, so the inequality above
-        // is about the thing that is actually sent (LESSON-485).
-        let at_cap = "x".repeat(REDACT_INPUT_MAX_BYTES);
-        let prompt = crate::harness::redact::redact_prompt(&at_cap);
+        // And the real builder agrees with the arithmetic, on both an ordinary
+        // payload and the adversarial one the growth term is sized for, so the
+        // inequality above is about the thing that is actually sent
+        // (LESSON-485).
+        let ordinary = "x".repeat(REDACT_INPUT_MAX_BYTES);
+        let prompt = crate::harness::redact::redact_prompt(&ordinary);
         assert_eq!(
             prompt.len(),
-            REDACT_INPUT_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES
+            REDACT_INPUT_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES,
+            "a payload with no frame label in it is embedded byte-identical"
         );
         assert!(prompt.len() <= budget, "prompt is {} bytes", prompt.len());
+
+        let mut adversarial = "Payload:\n".repeat(REDACT_INPUT_MAX_BYTES / 9);
+        adversarial.push_str(&"y".repeat(REDACT_INPUT_MAX_BYTES - adversarial.len()));
+        assert_eq!(adversarial.len(), REDACT_INPUT_MAX_BYTES);
+        let prompt = crate::harness::redact::redact_prompt(&adversarial);
+        assert!(
+            prompt.len() <= budget,
+            "the worst-case defused prompt is {} bytes against a {budget}-byte budget",
+            prompt.len()
+        );
+        // Non-vacuity: the adversarial fixture really did grow, so the bound is
+        // being exercised rather than trivially satisfied.
+        assert!(
+            prompt.len() > REDACT_INPUT_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES,
+            "the fixture must actually trip the defusing"
+        );
 
         // Non-vacuity: the cap is a real bound, not zero and not the window.
         // Read through a binding so this is a runtime comparison rather than a

@@ -244,7 +244,7 @@ const UNTRUSTED_ENVELOPE_TAGS: &[&str] = &[
 /// an insertion-only transform cannot mint a label out of its neighbours — the
 /// same property that makes [`neutralize_control_tokens`] order-independent.
 /// `_` is not a prefix of any label, so no rewrite can create a new one.
-const FRAME_LABEL_DEFUSE: char = '_';
+pub(crate) const FRAME_LABEL_DEFUSE: char = '_';
 
 /// Defuse line-anchored **frame labels** in untrusted block content (BUG-148).
 ///
@@ -320,7 +320,16 @@ pub(crate) fn neutralize_envelope_tags(text: &str) -> std::borrow::Cow<'_, str> 
 }
 
 /// Insert [`FRAME_LABEL_DEFUSE`] at every line start where `is_frame` holds.
-fn defuse_at_line_starts(text: &str, is_frame: fn(&str) -> bool) -> std::borrow::Cow<'_, str> {
+///
+/// `pub(crate)` because the redaction duty authors a frame of its own — the
+/// `Payload:` label its prompt writes around an outbound request body — and
+/// ADR-009 rule 2 puts the defusing at the code that authors the frame, not in
+/// a shared pass over a flattened string. Sharing the *mechanism* while each
+/// layer keeps its own alphabet is what that rule asks for.
+pub(crate) fn defuse_at_line_starts(
+    text: &str,
+    is_frame: fn(&str) -> bool,
+) -> std::borrow::Cow<'_, str> {
     let mut out: Option<String> = None;
     let mut copied = 0usize;
     // Invariant: `cursor` is always at a line start — offset 0, or just past a
