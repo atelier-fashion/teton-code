@@ -77,6 +77,54 @@ impl LocalModelConfig {
     }
 }
 
+/// Privacy behaviour the user opts into (the `[privacy]` table).
+///
+/// # Why this is not a `[[categories]]` row (REQ-562 BR-10)
+///
+/// Two different questions live one keystroke apart here, and conflating them
+/// would undo REQ-558 ADR-B:
+///
+/// - *Which provider serves `redact`?* — **unanswerable by configuration.**
+///   [`ConfigurableCategory`] has no `Redact` variant, so the binding is
+///   unrepresentable rather than rejected.
+/// - *Does the scan run at all?* — this table.
+///
+/// Putting the opt-in in `[[categories]]` would have made `redact`
+/// deserializable as a configurable category again, reopening exactly the
+/// surface ADR-B deleted. So the switch lives in its own table, and that table
+/// deliberately carries **no provider, model, or tier key** — there is nothing
+/// here for a binding to hide in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PrivacyConfig {
+    /// Run the REQ-562 redaction scan inside the egress choke point.
+    ///
+    /// **Defaults to `false`** (OQ-3), and "off" means the scan does not exist
+    /// rather than that it runs and permits: the daemon installs the gate only
+    /// when this is true (ADR-2), so an un-opted-in machine makes zero scanner
+    /// calls, loads no weights, and pays no latency.
+    ///
+    /// The default is load-bearing for a second reason. With the scan enabled, a
+    /// redactor that *cannot* run blocks the payload (BR-3, fail-closed) — a
+    /// posture that is only affordable because nobody who has not opted in is
+    /// affected by it.
+    ///
+    /// Serialized unconditionally within the table (no `skip_serializing_if`),
+    /// like [`LocalModelConfig::auto_accept`]: a config that names `[privacy]`
+    /// at all states its posture rather than leaving it to be inferred.
+    #[serde(default)]
+    pub redact: bool,
+}
+
+impl PrivacyConfig {
+    /// Whether every field still holds its default, used to keep the
+    /// `[privacy]` table out of a config that never opted in — the same
+    /// treatment [`LocalModelConfig::is_unset`] gives `[local_model]`.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Top-level configuration document.
 ///
 /// Field order matters for TOML serialization: the scalar `pinned_local_model`
@@ -99,6 +147,11 @@ pub struct Config {
     /// opt-in, and the catalog base-URL override.
     #[serde(default, skip_serializing_if = "LocalModelConfig::is_unset")]
     pub local_model: LocalModelConfig,
+    /// Opt-in privacy behaviour (`[privacy]`): today, the REQ-562 redaction
+    /// scan. Absent means off (BR-10) — see [`PrivacyConfig`] for why the
+    /// switch is here rather than in [`Config::categories`].
+    #[serde(default, skip_serializing_if = "PrivacyConfig::is_unset")]
+    pub privacy: PrivacyConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -1142,6 +1195,7 @@ fn is_recognized_auth_ref(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::category::{Category, ParseCategoryError};
     use crate::entities::{
         BoundaryMode, ModelProvider, ProviderCapabilities, ProviderKind, ToolCallTier,
     };
@@ -1403,6 +1457,10 @@ auth_ref = "keychain:anthropic"
                 auto_accept: false,
                 base_url: Some("https://hf-mirror.example.com".to_owned()),
             },
+            // REQ-562: the shared fixture stays on the default (off) posture —
+            // the opt-in has its own tests, and every caller here is asserting
+            // something else.
+            privacy: PrivacyConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),
@@ -2121,6 +2179,166 @@ provider_id = "on-device"
         );
         assert!(!msg.contains("redact"), "{msg}");
         assert!(!msg.contains("'route'"), "{msg}");
+    }
+
+    // ---- REQ-562: the `[privacy]` opt-in (BR-10, AC-13, AC-14) -------------
+
+    /// A config carrying the opt-in *and* a full routing table — the fixture the
+    /// AC-14 test needs, because the interesting claim is that the two coexist
+    /// without the switch reopening the binding surface.
+    const PRIVACY_OPT_IN_TOML: &str = r#"
+[privacy]
+redact = true
+
+[[providers]]
+id = "on-device"
+kind = "local"
+
+[[tiers]]
+tier = "reflex"
+provider_id = "on-device"
+"#;
+
+    #[test]
+    fn a_config_with_no_privacy_table_leaves_redaction_off() {
+        // AC-13's "off by default" leg, asserted on documents that predate the
+        // table entirely — a pre-REQ-562 config is the common case, and it must
+        // load to the off state rather than failing on a missing key.
+        for (label, toml_text) in [
+            ("pre-REQ-557", PRE_REQ_557_TOML),
+            ("the tier table", TIER_TABLE_TOML),
+        ] {
+            let cfg = Config::load(toml_text).expect("must load");
+            assert!(
+                !cfg.privacy.redact,
+                "{label}: a config that never named [privacy] opted in"
+            );
+        }
+        assert!(
+            !Config::default().privacy.redact,
+            "the struct default must agree with the parsed default"
+        );
+        assert!(Config::default().privacy.is_unset());
+    }
+
+    #[test]
+    fn the_privacy_table_reads_the_opt_in_rather_than_defaulting_it() {
+        // LESSON-485: a fixture that cannot discriminate is not a test. "It
+        // loads" would pass against a `redact` field wired to a constant, so
+        // parse the two documents that differ only in this value and assert
+        // they disagree — the read is what is under test, not the parse.
+        let on = Config::load("[privacy]\nredact = true\n").expect("must load");
+        let off = Config::load("[privacy]\nredact = false\n").expect("must load");
+        assert!(
+            on.privacy.redact,
+            "`redact = true` did not survive the load"
+        );
+        assert!(!off.privacy.redact);
+        assert_ne!(
+            on.privacy, off.privacy,
+            "the parsed value does not depend on the document"
+        );
+
+        // A present-but-empty table is the off state too: `#[serde(default)]` on
+        // the field means an author who writes the header and nothing else has
+        // opted into nothing.
+        let empty = Config::load("[privacy]\n").expect("must load");
+        assert!(!empty.privacy.redact);
+        assert_eq!(empty.privacy, off.privacy);
+    }
+
+    #[test]
+    fn the_privacy_table_round_trips_and_stays_out_of_a_config_that_never_opted_in() {
+        // The REQ-557 round-trip rule: what the daemon writes back must be what
+        // a user could have authored. The opt-in survives a write/read cycle...
+        let cfg = Config::load(PRIVACY_OPT_IN_TOML).expect("must load");
+        let toml_text = cfg.to_toml().expect("serialize");
+        assert!(toml_text.contains("[privacy]"), "toml: {toml_text}");
+        assert!(toml_text.contains("redact = true"), "toml: {toml_text}");
+        let back = Config::from_toml(&toml_text).expect("deserialize");
+        assert_eq!(cfg, back, "round-trip mismatch; toml was:\n{toml_text}");
+        assert!(back.privacy.redact);
+        Config::load(&toml_text).expect("a re-serialized config must still validate");
+
+        // ...and a config that never opted in does not grow the table, exactly
+        // as `[local_model]` stays out of a config that never set one.
+        let untouched = Config::load(TIER_TABLE_TOML).expect("must load");
+        let written = untouched.to_toml().expect("serialize");
+        assert!(
+            !written.contains("[privacy]"),
+            "an unset opt-in was written into the user's config: {written}"
+        );
+        assert_eq!(
+            Config::from_toml(&written).expect("deserialize").privacy,
+            PrivacyConfig::default()
+        );
+    }
+
+    #[test]
+    fn the_privacy_opt_in_does_not_make_redact_a_bindable_category() {
+        // AC-14. BR-10's whole warning is that the switch could be built as a
+        // `[[categories]]` row, which would make `redact` deserializable as a
+        // configurable category again and undo REQ-558 ADR-B. This test goes red
+        // if a later change relocates the switch or adds the variant.
+        let cfg = Config::load(PRIVACY_OPT_IN_TOML).expect("must load");
+        assert!(cfg.privacy.redact, "the fixture must have the switch ON");
+        assert!(
+            cfg.categories.is_empty(),
+            "the opt-in must not have materialized a category override"
+        );
+
+        // The pin as a type: nine bindable categories, none of them `redact`.
+        assert_eq!(ConfigurableCategory::ALL.len(), 9);
+        for c in ConfigurableCategory::ALL {
+            assert_ne!(Category::from(c), Category::Redact, "{c} maps to redact");
+        }
+        assert_eq!(
+            "redact".parse::<ConfigurableCategory>().unwrap_err(),
+            ParseCategoryError::RedactIsPinned
+        );
+
+        // And the file path, with the opt-in present in the same document: a
+        // `[[categories]]` entry naming `redact` is still refused at load, and
+        // still says *pinned* rather than reading as a typo.
+        let err = Config::load(&format!(
+            "{PRIVACY_OPT_IN_TOML}\n[[categories]]\nname = \"redact\"\nprovider_id = \"on-device\"\n"
+        ))
+        .expect_err("the opt-in must not have made `redact` bindable");
+        assert!(matches!(err, LoadError::Parse(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("redact"), "{msg}");
+        assert!(
+            msg.contains("pinned"),
+            "the rejection must name the pin, not read as a typo: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_privacy_table_is_ignored_like_any_other_unknown_key() {
+        // No new unknown-key posture: `Config` has no `deny_unknown_fields`
+        // anywhere, so a stray key is ignored, and `[privacy]` matches that
+        // rather than inventing a stricter rule of its own.
+        let stray_top_level = Config::load("nonsense_key = 1\n").expect("must load");
+        assert_eq!(stray_top_level, Config::default());
+
+        // The specific stray key worth naming: BR-10 forbids a provider/model/
+        // tier key here, so one written anyway must not bind anything. It is
+        // dropped on the floor exactly like the top-level case above.
+        let cfg = Config::load("[privacy]\nredact = true\nprovider_id = \"anthropic\"\n")
+            .expect("must load");
+        assert!(cfg.privacy.redact);
+        assert!(cfg.categories.is_empty() && cfg.tiers.is_empty());
+        assert_eq!(
+            cfg.privacy,
+            Config::load("[privacy]\nredact = true\n")
+                .expect("must load")
+                .privacy,
+            "an unknown key changed what [privacy] means"
+        );
+        // The table has exactly one key, and it is not a binding: a serialized
+        // opt-in cannot smuggle a provider back in.
+        let written = cfg.to_toml().expect("serialize");
+        assert!(!written.contains("anthropic"), "toml: {written}");
     }
 
     #[test]

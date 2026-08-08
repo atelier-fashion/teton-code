@@ -37,7 +37,8 @@ use super::{Tool, ToolContext, ToolOutcome, ToolRegistry};
 use crate::egress::ContextBlock;
 use crate::harness::context::ToolProvenance;
 use crate::mcp::{
-    call_provenance, parse_namespaced_tool_name, DiscoveredTool, McpRegistry, McpToolResult,
+    call_provenance, parse_namespaced_tool_name, DiscoveredTool, McpError, McpRegistry,
+    McpToolResult,
 };
 
 /// The framing that marks MCP result content as untrusted data for the model.
@@ -177,14 +178,50 @@ impl Tool for McpToolHandle {
             // `frame_result` (so `dispatch` returns framed content); the loop does
             // not re-frame it.
             Ok(res) => frame_result(&self.namespaced_name, &res).with_provenance(provenance),
-            Err(e) => ToolOutcome::error(format!(
-                "MCP tool `{}` failed: {e}. Do not retry blindly; take a different \
-                 approach or finish.",
-                self.namespaced_name
-            ))
-            .with_provenance(provenance),
+            Err(e) => ToolOutcome::error(tool_error_sentence(&self.namespaced_name, &e))
+                .with_provenance(provenance),
         }
     }
+}
+
+/// The failure sentence the **model** sees for a failed MCP call.
+///
+/// ## A privacy block says one thing to the model, whatever refused it
+///
+/// [`McpError::PrivacyBlocked`] renders three distinct sentences — a boundary,
+/// a redaction finding, a scan that could not run — because a *person*
+/// debugging a block has to know which of the three happened; they are
+/// different problems with different fixes (REQ-562 BR-3). The model is not
+/// that audience, and it is the one audience that can act on the difference.
+///
+/// Folded back as a tool error, a cause-distinct sentence is a **three-way
+/// oracle on an input the model controls**: vary an argument, read which of the
+/// three sentences comes back, and the gate's edges are discoverable from
+/// inside the loop — where a boundary ends, whether a given string trips the
+/// pattern pass, whether the scanner is up. That is an adaptive channel from
+/// the choke point into the context, and it is worth more to an attacker than
+/// the block is worth to the model, which can do nothing with the distinction
+/// except probe it.
+///
+/// So the audiences split here. One sentence for all three causes, naming no
+/// cause, no finding kind and no span. The precise cause keeps going to the
+/// surfaces built for it — the `privacy_block` event, the typed
+/// [`McpError`] a caller may log — neither of which the model reads.
+///
+/// A **non**-privacy failure is still distinct: "the server is down" is not
+/// sensitive and the model can act on it (stop calling that tool).
+fn tool_error_sentence(tool: &str, err: &McpError) -> String {
+    let what = match err {
+        // Deliberately identical across all three `BlockDetail`s — the whole
+        // point of this arm. `..` rather than a spelled-out `detail` so a
+        // future cause cannot be added *and* leak by default.
+        McpError::PrivacyBlocked { .. } => "was refused by the local privacy gate".to_owned(),
+        other => format!("failed: {other}"),
+    };
+    format!(
+        "MCP tool `{tool}` {what}. Do not retry blindly; take a different \
+         approach or finish."
+    )
 }
 
 /// The [`ToolProvenance`] of an MCP tool result: the set of boundary-relevant
@@ -294,6 +331,73 @@ mod tests {
         let outcome = frame_result("mcp__fs__read_file", &result);
         assert!(outcome.is_error);
         assert!(outcome.content.contains("server said no"));
+    }
+
+    /// **The model sees one privacy sentence, whatever refused the call.**
+    ///
+    /// The three causes are three sentences on the surfaces a *person* reads,
+    /// because they are three different problems (REQ-562 BR-3). Handing that
+    /// distinction back to the model as a tool error would give it a three-way
+    /// oracle on an input it controls — vary the argument, read which sentence
+    /// comes back, map the gate's edges from inside the loop.
+    ///
+    /// Two claims, and the second is what keeps the first from being achieved
+    /// by saying nothing at all: the three privacy sentences are **identical**,
+    /// and they are still **distinct** from an ordinary failure.
+    #[test]
+    fn every_privacy_cause_reads_the_same_to_the_model_and_none_reads_like_a_fault() {
+        use teton_providers::transport::BlockDetail;
+
+        let blocked = |detail| {
+            tool_error_sentence(
+                "mcp__fs__read_file",
+                &McpError::PrivacyBlocked {
+                    path: "the outbound payload".to_owned(),
+                    server_id: "fs".to_owned(),
+                    detail,
+                },
+            )
+        };
+        let boundary = blocked(BlockDetail::Boundary);
+        let redaction = blocked(BlockDetail::Redaction);
+        let unavailable = blocked(BlockDetail::ScanUnavailable);
+        assert_eq!(boundary, redaction, "the cause leaked to the model");
+        assert_eq!(redaction, unavailable, "the cause leaked to the model");
+
+        // Non-vacuity: the three typed errors really do differ from each other
+        // on the surface built for a person, so the equality above is this
+        // function collapsing them and not the errors being the same value.
+        let rendered = |detail| {
+            McpError::PrivacyBlocked {
+                path: "the outbound payload".to_owned(),
+                server_id: "fs".to_owned(),
+                detail,
+            }
+            .to_string()
+        };
+        assert_ne!(
+            rendered(BlockDetail::Boundary),
+            rendered(BlockDetail::Redaction)
+        );
+        assert_ne!(
+            rendered(BlockDetail::Redaction),
+            rendered(BlockDetail::ScanUnavailable)
+        );
+
+        // And nothing in the model-facing sentence names a cause, a finding
+        // kind, or a span.
+        for word in ["boundary", "redaction", "scan", "credential", "bytes"] {
+            assert!(
+                !boundary.to_lowercase().contains(word),
+                "`{word}` reached the model: {boundary}"
+            );
+        }
+
+        // Still distinct from a non-privacy failure, which is not sensitive and
+        // which the model CAN act on.
+        let down = tool_error_sentence("mcp__fs__read_file", &McpError::Closed("fs".to_owned()));
+        assert_ne!(down, boundary);
+        assert!(down.contains("closed the connection"), "{down}");
     }
 
     #[test]

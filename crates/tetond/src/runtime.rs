@@ -107,7 +107,7 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction, SessionTitled,
+    BlockCause, Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction, SessionTitled,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -122,8 +122,9 @@ use teton_protocol::{
     Tier as ProtoTier, TierBindingSource,
 };
 
+use teton_providers::transport::Transport;
 use teton_providers::{
-    classify, AnthropicAdapter, CapabilityProfile, FailureAction, FailureClass,
+    classify, AnthropicAdapter, BlockDetail, CapabilityProfile, FailureAction, FailureClass,
     OpenAiCompatAdapter, OpenAiCompatConfig, Provider,
 };
 
@@ -132,14 +133,16 @@ use crate::call_sites::has_call_site;
 use crate::classify::Classification;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
-use crate::egress::{inspect, origin_of, Egress, HttpTransport, Provenance};
+use crate::egress::{
+    inspect, origin_of, Egress, HttpTransport, Provenance, RedactionGate, RedactionVerdict,
+};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolDuties,
-    ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
+    ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -266,6 +269,25 @@ const SCRIPTED_TITLE: &str = "Scripted session";
 const SCRIPTED_COMPACTION: &str =
     "FORGET: 1\nSUMMARY: [scripted compaction of the earlier conversation]";
 
+/// The stand-in engine's answer to a `redact` duty: **nothing sensitive found**
+/// (REQ-562 TASK-069).
+///
+/// The one answer that is both *valid* — it parses as a completed scan rather
+/// than as an unreadable reply, which would fail closed and block every scripted
+/// remote call — and *neutral*. A stand-in cannot judge whether a string is a
+/// secret, and inventing a finding would make a fixture's meaning depend on a
+/// judgement no fixture author wrote.
+///
+/// It does not make the gate vacuous in a scripted fixture: the model pass is
+/// only half the scan, and the deterministic pattern pass runs on the real bytes
+/// either way — so a fixture that plants an `sk-…` credential in an outbound
+/// payload is still blocked, at `High`, with no model involved.
+///
+/// Written as the word the contract asks for rather than as a marker sentence,
+/// because unlike the other four duties this one's answer is *parsed*, and a
+/// legible-but-unparseable marker would fail every scripted scan closed.
+const SCRIPTED_REDACTION: &str = "NONE";
+
 /// A local [`Engine`] that replays a fixed script of replies, one per turn.
 ///
 /// This is the CI/offline stand-in for a real llama.cpp engine: the daemon ships
@@ -281,8 +303,9 @@ const SCRIPTED_COMPACTION: &str =
 /// `triage` whenever a `grep` returns more than one match (REQ-561 TASK-060), a
 /// `shell` interpretation whenever a command fails or overruns its output cap
 /// (REQ-561 TASK-061), a `title` on the first substantive turn of every session
-/// (REQ-561 TASK-062), and a `compact` whenever a conversation crosses the soft
-/// context-pressure threshold (REQ-561 TASK-063).
+/// (REQ-561 TASK-062), a `compact` whenever a conversation crosses the soft
+/// context-pressure threshold (REQ-561 TASK-063), and — where the opt-in is on —
+/// a `redact` scan of **every** outbound payload (REQ-562 TASK-069).
 /// Serving those from the script would silently shift every block by one and
 /// make a fixture's meaning depend on how many duties the daemon happens to run
 /// — so each duty is recognized by its own **output contract**
@@ -291,13 +314,17 @@ const SCRIPTED_COMPACTION: &str =
 /// [`crate::harness::triage::TRIAGE_OUTPUT_CONTRACT`],
 /// [`crate::harness::shell_duty::SHELL_OUTPUT_CONTRACT`],
 /// [`crate::harness::title::TITLE_OUTPUT_CONTRACT`],
-/// [`crate::harness::compact::COMPACT_OUTPUT_CONTRACT`]) and answered off-script,
-/// consuming nothing.
+/// [`crate::harness::compact::COMPACT_OUTPUT_CONTRACT`],
+/// [`crate::harness::redact::REDACTION_OUTPUT_CONTRACT`]) and answered
+/// off-script, consuming nothing.
 ///
-/// `title` is the one that would bite hardest: it fires on the first turn of
-/// **every** session rather than on some particular tool result, so a missing
-/// recognition arm would desynchronize the whole suite at once rather than one
-/// fixture at a time.
+/// `title` is the one that would have bitten hardest among the five: it fires on
+/// the first turn of **every** session rather than on some particular tool
+/// result, so a missing recognition arm would desynchronize the whole suite at
+/// once rather than one fixture at a time. `redact` fires on every *remote call*
+/// once its opt-in is on, which is the same shape again — and it is also the one
+/// whose answer is parsed rather than pasted, so its scripted reply has to be a
+/// valid one (see [`SCRIPTED_REDACTION`]).
 ///
 /// The `digest` half was latent before this task and is not: `summarize_if_large`
 /// has always called this engine, and it *did* consume a block. It has never
@@ -340,14 +367,23 @@ impl ScriptedFileEngine {
 /// How far into a prompt a duty's output contract may start and still be the
 /// **harness's own instruction** rather than material that quotes it.
 ///
-/// Every one of the five harness duty prompts is built the same way: a fixed
+/// Every one of the harness duty prompts is built the same way: a fixed
 /// instruction, then the contract that closes it, then the material. The longest
 /// of those instructions is a few hundred bytes, so a kilobyte is roomy for all
-/// five and for the chat template `render_duty` may wrap them in — while a turn
-/// prompt opens with the system prompt, which is itself several kilobytes of
-/// tool documentation before any conversation block is reached. Nothing a
-/// conversation can say lands inside this window.
-const DUTY_CONTRACT_PREFIX_BYTES: usize = 1_024;
+/// of them and for the chat template `render_duty` may wrap them in — while a
+/// turn prompt opens with the system prompt, which is itself several kilobytes
+/// of tool documentation before any conversation block is reached. Nothing a
+/// *conversation* can say lands inside this window.
+///
+/// One duty's material can, and it is the reason the arms below are ordered
+/// rather than merely enumerated. `redact` (REQ-562) scans an outbound request
+/// body, which for a duty going to a remote provider **is another duty's prompt
+/// verbatim** — so a redact prompt carries `title`'s contract a few hundred
+/// bytes in, well inside this window. Widening the window would not help and
+/// narrowing it would break the prompts it is sized for; checking the redaction
+/// contract first is what settles it, because only the harness builds a redact
+/// prompt and its material can only follow.
+pub(crate) const DUTY_CONTRACT_PREFIX_BYTES: usize = 1_024;
 
 /// Whether `prompt` is a duty prompt built around `contract` — i.e. the contract
 /// appears where a *builder* puts it, in the instruction the prompt opens with.
@@ -400,7 +436,18 @@ impl Engine for ScriptedFileEngine {
         // embedded material happens to end with the classifier's contract — a
         // `grep` hit on this very file, say — is still recognized as the duty it
         // is.
-        let text = if instructs(prompt, crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
+        //
+        // And `redact` comes first among those, because it is the one duty whose
+        // material is another duty's prompt: it scans an outbound request body,
+        // and a body going to a remote provider carries that duty's own contract
+        // a few hundred bytes in — inside the window every arm reads. Only the
+        // harness builds a redact prompt, and its material can only follow the
+        // instruction, so testing this arm first is what keeps a scan *of* a
+        // title prompt from being answered as a title (see
+        // `DUTY_CONTRACT_PREFIX_BYTES`).
+        let text = if instructs(prompt, crate::harness::redact::REDACTION_OUTPUT_CONTRACT) {
+            SCRIPTED_REDACTION.to_owned()
+        } else if instructs(prompt, crate::harness::context::SUMMARIZER_OUTPUT_CONTRACT) {
             SCRIPTED_DIGEST.to_owned()
         } else if instructs(prompt, crate::harness::triage::TRIAGE_OUTPUT_CONTRACT) {
             scripted_triage(prompt)
@@ -478,11 +525,25 @@ impl SessionTaint {
 
     /// Mark `session` tainted — pinned to the local tier for all later turns
     /// (idempotent).
-    pub fn mark(&self, session: &SessionId) {
+    ///
+    /// Returns **whether this call was the clean→tainted transition**, which is
+    /// what makes the pin announceable exactly once per session: the pin is a
+    /// durable, session-wide consequence with no in-session undo, and a
+    /// consequence that durable that nothing says out loud is one the user
+    /// discovers as "why is this suddenly slower". Every production call site
+    /// pairs a `true` with one [`taint_pin_line`] on stderr; a `false` is a
+    /// re-mark and owes nothing, so a session pinned by a boundary read and then
+    /// again by a redaction block still gets one line.
+    ///
+    /// Not `#[must_use]`: the several test call sites that only want the set
+    /// mutated would each have to say so, and the announcement is a call-site
+    /// concern (`template_fallback_line`'s shape) rather than something this
+    /// type performs.
+    pub fn mark(&self, session: &SessionId) -> bool {
         self.tainted
             .lock()
             .expect("taint mutex poisoned")
-            .insert(session.clone());
+            .insert(session.clone())
     }
 
     /// Whether `session` is pinned to the local tier by a prior boundary/unknown
@@ -516,9 +577,57 @@ impl SessionTaint {
 /// at the end of the turn, which compaction and truncation are both entitled to
 /// change — and it is exactly the almost-true invariant a later change builds
 /// on.
+///
+/// ## Not every block establishes anything about the content (REQ-562)
+///
+/// The marking is gated on the cause. A boundary block and a redaction finding
+/// each mean *this content crossed a line*, which is exactly what REQ-544 C-2's
+/// pin is for. A [`BlockCause::ScanUnavailable`] means the scanner was busy,
+/// stalled, or not loaded — it says **nothing** about the payload, because
+/// nothing looked at it. Pinning on it would let one 120-second engine stall
+/// permanently route the rest of a session to the local tier, on the strength
+/// of a fact nobody established. The payload itself is still refused, which is
+/// BR-3's fail-closed posture; what does not follow is the session-wide
+/// consequence.
+/// ## The gate is a field, because it is not the same at every choke point
+///
+/// A block through the **MCP** choke point is answered by a different rule
+/// ([`mcp_cause_taints_the_session`]), so the sink is handed the rule its choke
+/// point uses rather than reaching for one. The two constructors below are the
+/// whole of the difference, and they sit next to each other so a reader who
+/// finds one is told the other exists.
 struct TaintingPrivacySink {
     events: Arc<EventBus>,
     taint: Arc<SessionTaint>,
+    /// Which causes pin, for the choke point this sink was built for.
+    taints: CauseGate,
+}
+
+/// Which block causes pin their session — a rule a [`TaintingPrivacySink`] is
+/// handed rather than one it chooses.
+type CauseGate = fn(&BlockCause) -> bool;
+
+impl TaintingPrivacySink {
+    /// The sink for a **turn or duty** send: [`cause_taints_the_session`], where
+    /// a boundary block and a redaction block both pin.
+    fn for_turn_path(events: Arc<EventBus>, taint: Arc<SessionTaint>) -> Self {
+        Self {
+            events,
+            taint,
+            taints: cause_taints_the_session,
+        }
+    }
+
+    /// The sink for the **MCP** choke point: [`mcp_cause_taints_the_session`],
+    /// where a redaction block pins and a boundary block keeps REQ-544's
+    /// fold-without-pinning posture (user decision, 2026-08-08).
+    fn for_mcp_path(events: Arc<EventBus>, taint: Arc<SessionTaint>) -> Self {
+        Self {
+            events,
+            taint,
+            taints: mcp_cause_taints_the_session,
+        }
+    }
 }
 
 impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
@@ -528,9 +637,156 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
         block: teton_protocol::events::PrivacyBlock,
     ) {
         if let Some(session_id) = &session_id {
-            self.taint.mark(session_id);
+            // One line per session, on the transition only — `mark` reports it.
+            if (self.taints)(&block.cause) && self.taint.mark(session_id) {
+                eprintln!("{}", taint_pin_line(taint_cause_word(&block.cause)));
+            }
         }
         self.events.privacy_block(session_id, block);
+    }
+}
+
+/// Whether a block at the choke point establishes that content crossed a
+/// privacy line, and therefore pins the session local (REQ-544 C-2, REQ-562).
+///
+/// Two of the three do. `Boundary` is C-2's original case: the turn's content
+/// came from a `local-only` source, so a later paraphrase of it must not leave
+/// either. `Redaction` is the same shape one layer in — the scan *found*
+/// something in the outbound payload, and the model that produced it can
+/// restate it next turn.
+///
+/// `ScanUnavailable` does not, and the asymmetry is the point. It means no scan
+/// happened: no local tier, an over-cap payload, an engine error, a deadline.
+/// "The scanner was busy" establishes nothing whatever about the content, and a
+/// taint is a **durable, session-wide** consequence — a transient stall would
+/// permanently pin every remaining turn to the local tier and there is no way
+/// for the user to undo it short of a new session. The payload is still
+/// blocked; that is the fail-closed part, and it is per-payload.
+///
+/// ## This is the **turn and duty** path's rule; MCP has its own
+///
+/// [`mcp_cause_taints_the_session`] answers the same question for the MCP choke
+/// point, and answers it differently for `Boundary`. Two functions rather than
+/// one with a flag: the difference is a decision about two surfaces, taken by
+/// two different REQs, and a parameter would present it as a caller's option.
+fn cause_taints_the_session(cause: &BlockCause) -> bool {
+    match cause {
+        BlockCause::Boundary | BlockCause::Redaction { .. } => true,
+        BlockCause::ScanUnavailable => false,
+    }
+}
+
+/// Whether a block at the **MCP** choke point pins the session (REQ-562; user
+/// decision, 2026-08-08).
+///
+/// One of the three pins here where two do on the turn path
+/// ([`cause_taints_the_session`]), and the divergence is per cause, for reasons
+/// about the causes rather than about MCP:
+///
+/// - **`Redaction` pins**, exactly as on the turn path and for the same reason:
+///   the model authored those tool arguments, so a finding in them is a secret
+///   *the model is holding*, and it can restate it next turn through an
+///   ordinary remote call that this tool error does nothing to constrain. What
+///   the scan established is a fact about the content, not about the surface it
+///   was heading out through, so the two paths' different disposal of a block
+///   does not reach it.
+/// - **`Boundary` does not**, which is REQ-544's posture for this surface, kept
+///   rather than re-derived. This is *not* a claim that a boundary block
+///   establishes less here than on the turn path — it establishes exactly the
+///   same thing. It is that REQ-544 chose to fold an MCP boundary refusal back
+///   into the loop as an ordinary in-context tool error, and re-deciding that
+///   inside a redaction change would silently change an earlier REQ's rule on a
+///   surface this one did not set out to touch. Whether an MCP boundary block
+///   should pin is REQ-544's question to reopen.
+/// - **`ScanUnavailable` never pins**, on either path and for the identical
+///   reason: nothing looked at the payload, so nothing about it was established
+///   (see [`cause_taints_the_session`]). The payload is still refused; that
+///   part is per-payload and fail-closed.
+///
+/// The asymmetry is therefore intended, and
+/// `the_mcp_gate_pins_redaction_and_diverges_from_the_turn_path_on_boundary`
+/// pins it *as* an asymmetry — so a later "make these consistent" edit turns a
+/// test red instead of quietly re-deciding REQ-544.
+fn mcp_cause_taints_the_session(cause: &BlockCause) -> bool {
+    match cause {
+        BlockCause::Redaction { .. } => true,
+        BlockCause::Boundary | BlockCause::ScanUnavailable => false,
+    }
+}
+
+/// The same rule as [`cause_taints_the_session`], in the vocabulary the turn
+/// path has.
+///
+/// The turn path never sees a [`BlockCause`] — the cause reaches it as a
+/// [`BlockDetail`] through the `teton-providers` seam — so the rule is stated
+/// twice in two type systems and `the_two_taint_gates_agree_cause_for_cause`
+/// pins them to each other. One spelling would mean a `BlockCause` dependency
+/// in `teton-providers`, which is the edge that crate exists without.
+///
+/// [`mcp_cause_taints_the_session`] is a **third** function and deliberately
+/// *not* a third spelling of this rule: it answers the same question for a
+/// different choke point and gives a different answer for `Boundary`. It is
+/// therefore outside the agreement these two are held to.
+fn taints_the_session(detail: BlockDetail) -> bool {
+    match detail {
+        BlockDetail::Boundary | BlockDetail::Redaction => true,
+        BlockDetail::ScanUnavailable => false,
+    }
+}
+
+/// A `local-only` boundary was crossed — REQ-544 C-2's original cause.
+const TAINT_BY_BOUNDARY: &str = "a `local-only` privacy boundary was crossed";
+/// The redaction scan found something in an outbound payload (REQ-562).
+const TAINT_BY_REDACTION: &str =
+    "the redaction scan found sensitive content in an outbound payload";
+/// This turn's assembled context carried boundary or unknown-provenance content.
+const TAINT_BY_CONTEXT: &str = "this turn read boundary or unknown-provenance content";
+/// Unreachable: [`cause_taints_the_session`] and [`mcp_cause_taints_the_session`]
+/// both answer `false` for `ScanUnavailable`, so no announcement is ever minted
+/// for it. Present so the maps below are total, and worded so that a future
+/// change which *does* pin on it produces a puzzling line rather than a panic in
+/// the daemon.
+const TAINT_BY_UNSTATED_CAUSE: &str = "a blocked outbound payload";
+
+/// The one line a session's clean→tainted transition owes the operator
+/// (REQ-562).
+///
+/// A pin is the most durable consequence this daemon takes on its own: every
+/// later turn in the session is forced local, and there is no in-session undo —
+/// the user's only remedy is a new session. Announcing it once is what keeps
+/// that from being discovered as "why did this get slower", and it is what the
+/// spec's *no new RPCs* leaves available: the daemon's own stderr, which is
+/// `tetond.log`.
+///
+/// A pure function for the same reason
+/// [`template_fallback_line`] is one — the shape is pinned by a unit test rather
+/// than by reading the emitting branch — and it takes `&'static str` for the
+/// reason `read_findings`' error type does: a compile-time literal cannot carry
+/// a runtime value, so no path, session id, or payload byte can reach this line
+/// even by accident. The cause is a *class*, never an instance.
+fn taint_pin_line(cause: &'static str) -> String {
+    format!(
+        "tetond: privacy — this session is pinned to the local tier for the rest of its life \
+         ({cause}); remote providers will not be used in it again."
+    )
+}
+
+/// The class word a [`BlockCause`] announces its pin with.
+fn taint_cause_word(cause: &BlockCause) -> &'static str {
+    match cause {
+        BlockCause::Boundary => TAINT_BY_BOUNDARY,
+        BlockCause::Redaction { .. } => TAINT_BY_REDACTION,
+        BlockCause::ScanUnavailable => TAINT_BY_UNSTATED_CAUSE,
+    }
+}
+
+/// The same word, from the turn path's [`BlockDetail`] vocabulary — the second
+/// spelling [`taints_the_session`] already exists in, for the same reason.
+fn taint_detail_word(detail: BlockDetail) -> &'static str {
+    match detail {
+        BlockDetail::Boundary => TAINT_BY_BOUNDARY,
+        BlockDetail::Redaction => TAINT_BY_REDACTION,
+        BlockDetail::ScanUnavailable => TAINT_BY_UNSTATED_CAUSE,
     }
 }
 
@@ -1603,7 +1859,7 @@ impl DaemonRuntime {
         // snapshot itself is cheap when that decision is made.
         // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
         // semantics are decided.
-        let tools = self.build_tools(events, &session_id).await;
+        let tools = self.build_tools(&router, events, &session_id).await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
         // not send one — under launchd it is `/`, which is what had every tool
@@ -1652,13 +1908,18 @@ impl DaemonRuntime {
             // one reroute. The egress choke point already emitted the single
             // authoritative `privacy_block`.
             if let Err(err) = &result {
-                if err.is_privacy_blocked() {
-                    self.session_taint.mark(&session_id);
+                // REQ-562 BR-3: the *cause* travels with the signal, so all
+                // three sentences below name which inspection refused the turn.
+                // Read as one value rather than asked twice — a block with no
+                // detail is not a block (see `HarnessError::privacy_block_detail`).
+                if let Some(detail) = err.privacy_block_detail() {
+                    if taints_the_session(detail) && self.session_taint.mark(&session_id) {
+                        eprintln!("{}", taint_pin_line(taint_detail_word(detail)));
+                    }
                     if !self.engine.present() {
                         return Err(RpcError::new(
                             error_code::PRIVACY_BLOCKED,
-                            "this turn's content is under a local-only privacy boundary \
-                             and no local tier is available to serve it",
+                            unrerouteable_block_sentence(detail),
                         ));
                     }
                     if rerouted_local {
@@ -1666,14 +1927,10 @@ impl DaemonRuntime {
                         // cannot privacy-block) — never loop.
                         return Err(RpcError::new(
                             error_code::PRIVACY_BLOCKED,
-                            "privacy boundary blocked this turn and the local reroute \
-                             could not serve it",
+                            failed_reroute_block_sentence(detail),
                         ));
                     }
-                    route = router.resolve_local_pin(
-                        "remote egress blocked by a local-only boundary; rerouted to the \
-                         local tier (BR-1)",
-                    );
+                    route = router.resolve_local_pin(reroute_after_block_reason(detail));
                     rerouted_local = true;
                     continue;
                 }
@@ -1692,8 +1949,10 @@ impl DaemonRuntime {
                     // boundary or carries unknown provenance, pin the session to
                     // the local tier for every subsequent turn (the backstop for
                     // a later model paraphrase of what it read here).
-                    if context_is_sensitive(&ctx, &config.boundaries) {
-                        self.session_taint.mark(&session_id);
+                    if context_is_sensitive(&ctx, &config.boundaries)
+                        && self.session_taint.mark(&session_id)
+                    {
+                        eprintln!("{}", taint_pin_line(TAINT_BY_CONTEXT));
                     }
                     return Ok(PromptTurnResult {
                         turn_id,
@@ -1852,20 +2111,18 @@ impl DaemonRuntime {
 
     /// Build the tool registry for a turn: the built-ins plus any registered MCP
     /// server tools (ADR-003), namespaced and egress-gated.
-    async fn build_tools(&self, events: &Arc<EventBus>, session_id: &SessionId) -> ToolRegistry {
+    async fn build_tools(
+        &self,
+        router: &Router,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> ToolRegistry {
         let mut tools = ToolRegistry::with_builtins();
         if !self.mcp_servers.is_empty() {
-            let boundaries = self
-                .config
-                .lock()
-                .expect("config mutex poisoned")
-                .boundaries
-                .clone();
+            let config = self.config.lock().expect("config mutex poisoned").clone();
             if let Ok(transport) = HttpTransport::new() {
-                let egress = Arc::new(
-                    Egress::new(transport, boundaries, events.clone())
-                        .with_cost_meter(Arc::new(self.ledger.clone())),
-                );
+                let egress =
+                    Arc::new(self.mcp_egress(transport, router, &config, events, session_id));
                 let registry = Arc::new(McpRegistry::with_egress(
                     egress as Arc<dyn crate::mcp::EgressGate>,
                     Some(session_id.clone()),
@@ -1880,6 +2137,67 @@ impl DaemonRuntime {
             }
         }
         tools
+    }
+
+    /// The choke point an MCP `tools/call` crosses (ADR-003, REQ-562 ADR-1).
+    ///
+    /// ADR-003 makes an MCP call remote egress, so ADR-1's "every remote path"
+    /// includes it: a tool argument carrying a credential is scanned exactly
+    /// like a prompt carrying one, and the same boundaries and the same cost
+    /// meter apply.
+    ///
+    /// ## Generic over the transport so the wiring is reachable from a test
+    ///
+    /// [`Self::build_tools`] passes a real [`HttpTransport`], which means the
+    /// gate attachment could only ever be exercised by a test willing to open a
+    /// socket — and so it was not exercised at all: deleting
+    /// `.with_redaction_gate(…)` from `build_tools` left the whole suite green.
+    /// Taking the transport as a parameter lets
+    /// `tests::dispatch::redact::an_mcp_tool_call_crosses_the_gate_when_redact_is_on`
+    /// drive a capture transport through this exact construction, so the
+    /// deletion now turns a test red.
+    ///
+    /// ## The sink pins **per cause** on this path (REQ-562; user decision,
+    /// 2026-08-08)
+    ///
+    /// The sink is a [`TaintingPrivacySink`] built through
+    /// [`TaintingPrivacySink::for_mcp_path`], whose gate is
+    /// [`mcp_cause_taints_the_session`] rather than the turn path's
+    /// [`cause_taints_the_session`]. Cause by cause:
+    ///
+    /// - a **redaction** block pins the session local, exactly as one through a
+    ///   turn does. The model wrote those tool arguments, so the scan found a
+    ///   secret the model is holding — and it leaves just as easily through the
+    ///   next ordinary turn as through the next tool call, which is why the
+    ///   in-context disposal of *this* call does not settle the question;
+    /// - a **boundary** block still folds back into the loop without pinning.
+    ///   That is REQ-544's posture for this surface and is deliberately left
+    ///   where it is;
+    /// - a **scan-unavailable** block pins on no path at all: nothing looked at
+    ///   the payload. The payload is still refused (BR-3).
+    ///
+    /// This replaces the round-2 deviation note and its `TODO(follow-up REQ)`:
+    /// the question they held open — *should an MCP privacy block pin?* — has
+    /// been answered, separately for each cause, and the reasoning per cause
+    /// lives on [`mcp_cause_taints_the_session`].
+    fn mcp_egress<T: Transport>(
+        &self,
+        transport: T,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> Egress<T> {
+        let sink = Arc::new(TaintingPrivacySink::for_mcp_path(
+            Arc::clone(events),
+            Arc::clone(&self.session_taint),
+        ));
+        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
+            .with_cost_meter(Arc::new(self.ledger.clone()));
+        if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
+            egress = egress.with_redaction_gate(gate);
+        }
+        egress
     }
 
     /// Run one turn attempt against the route's provider (local or remote).
@@ -1999,8 +2317,13 @@ impl DaemonRuntime {
         // to this endpoint's origin — never MCP, never another provider.
         let transport = build_remote_transport(provider_cfg, &self.secret_resolver)?;
         let boundaries = config.boundaries.clone();
-        let egress = Egress::new(transport, boundaries, events.clone())
+        let mut egress = Egress::new(transport, boundaries, events.clone())
             .with_cost_meter(Arc::new(self.ledger.clone()));
+        // REQ-562 ADR-1/ADR-2: the turn's own outbound payload is scanned here,
+        // and only when the user opted in.
+        if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
+            egress = egress.with_redaction_gate(gate);
+        }
 
         let mut source = RemoteProviderSource::new(
             &*provider,
@@ -2080,6 +2403,7 @@ impl DaemonRuntime {
         };
         self.resolve_duty(
             DIGEST_DUTY,
+            router,
             &route,
             config,
             events,
@@ -2117,6 +2441,7 @@ impl DaemonRuntime {
         };
         self.resolve_duty(
             TRIAGE_DUTY,
+            router,
             &route,
             config,
             events,
@@ -2152,7 +2477,15 @@ impl DaemonRuntime {
         } else {
             router.resolve(Category::Shell)
         };
-        self.resolve_duty(SHELL_DUTY, &route, config, events, session_id, local_engine)
+        self.resolve_duty(
+            SHELL_DUTY,
+            router,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
     }
 
     /// Resolve the `title` category for this session (REQ-561 TASK-062).
@@ -2185,7 +2518,15 @@ impl DaemonRuntime {
         } else {
             router.resolve(Category::Title)
         };
-        self.resolve_duty(TITLE_DUTY, &route, config, events, session_id, local_engine)
+        self.resolve_duty(
+            TITLE_DUTY,
+            router,
+            &route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
     }
 
     /// Resolve the `compact` category for this turn (REQ-561 TASK-063).
@@ -2218,12 +2559,44 @@ impl DaemonRuntime {
         };
         self.resolve_duty(
             COMPACT_DUTY,
+            router,
             &route,
             config,
             events,
             session_id,
             local_engine,
         )
+    }
+
+    /// The redaction scanner this turn's egress carries, or `None` when the
+    /// feature is off (REQ-562 ADR-2).
+    ///
+    /// The **only** place the `[privacy] redact` switch is read. "Off" is the
+    /// absence of the collaborator, not a flag the gate consults: an
+    /// un-opted-in machine builds no gate, so its choke point makes zero
+    /// scanner calls, loads no weights, pays no latency, and has no `if
+    /// enabled` branch in the hot path for a later change to invert (AC-13).
+    ///
+    /// Called at every [`Egress`] construction site the daemon has — the turn
+    /// path, the duty path, and the MCP path — because ADR-1's guarantee is
+    /// about *every* remote path, and a choke point built without a gate is a
+    /// remote path the scan does not cover.
+    fn redaction_gate(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> Option<Arc<dyn RedactionGate>> {
+        if !config.privacy.redact {
+            return None;
+        }
+        Some(Arc::new(RedactionGateImpl {
+            router: router.clone(),
+            events: Arc::clone(events),
+            session_id: session_id.clone(),
+            engine: Arc::clone(&self.engine),
+        }))
     }
 
     /// Name this session after `prompt`, at most once for its whole life
@@ -2359,17 +2732,27 @@ impl DaemonRuntime {
     /// not resolve fails the **turn** on the turn path (a config error the user
     /// must fix), but only the **duty** here — a duty is never fatal, and the
     /// failure is reported on the duty's own outcome instead.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_duty(
         &self,
         duty: DutyKind,
+        router: &Router,
         route: &crate::router::Route,
         config: &Config,
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
     ) -> DutyRoute {
-        self.build_duty_route(duty, route, config, events, session_id, local_engine)
-            .announcing(events, Some(session_id.clone()), route.route_decided())
+        self.build_duty_route(
+            duty,
+            router,
+            route,
+            config,
+            events,
+            session_id,
+            local_engine,
+        )
+        .announcing(events, Some(session_id.clone()), route.route_decided())
     }
 
     /// Build the [`DutyRoute`] `route` calls for, without announcing anything.
@@ -2385,9 +2768,11 @@ impl DaemonRuntime {
     /// worth knowing that after REQ-557's migration (`default_provider` set to the
     /// first remote provider, no `[[tiers]]` rows) an unbound tier inherits that
     /// provider, so this is the *ordinary* upgraded config and not an exotic one.
+    #[allow(clippy::too_many_arguments)]
     fn build_duty_route(
         &self,
         duty: DutyKind,
+        router: &Router,
         route: &crate::router::Route,
         config: &Config,
         events: &Arc<EventBus>,
@@ -2459,12 +2844,20 @@ impl DaemonRuntime {
         // a turn error, so nothing above would ever mark the session. Marking at
         // the choke point makes the backstop direct rather than dependent on the
         // refusing content still being in `ctx` when the turn ends.
-        let sink = Arc::new(TaintingPrivacySink {
-            events: events.clone(),
-            taint: Arc::clone(&self.session_taint),
-        });
-        let egress = Egress::new(transport, config.boundaries.clone(), sink)
+        let sink = Arc::new(TaintingPrivacySink::for_turn_path(
+            events.clone(),
+            Arc::clone(&self.session_taint),
+        ));
+        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()));
+        // REQ-562 ADR-1: a remotely-bound duty's prompt is an outbound payload
+        // like any other, so it crosses the same gate the turn path's does. It
+        // is the same construction for the same reason the boundaries and the
+        // meter are: a duty that egressed through a laxer choke point is the
+        // hole the single choke point exists to close.
+        if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
+            egress = egress.with_redaction_gate(gate);
+        }
         DutyRoute::remote(
             duty,
             provider_id,
@@ -2473,6 +2866,119 @@ impl DaemonRuntime {
             model,
             session_id.clone(),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The redaction gate (REQ-562 TASK-070)
+// ---------------------------------------------------------------------------
+
+/// The daemon's [`RedactionGate`]: resolve the `redact` duty, run it over the
+/// payload, hand the verdict back to the choke point (REQ-562 ADR-1).
+///
+/// ## What is *not* in this struct is the guarantee
+///
+/// No transport, no provider, no secret resolver, no ledger — the same absence
+/// that makes `LocalDuty` unable to reach a network, one layer up. The redactor
+/// is what inspects a payload *before* it may leave; a redactor that egressed
+/// would re-enter [`Egress::send`], be handed its own prompt to scan, and do it
+/// again. The fields here are the reason that cannot happen, rather than a
+/// depth counter or a re-entrancy flag that says it must not.
+///
+/// ## Cheap to build, because it is built per turn attempt
+///
+/// A [`Router`] clone (a table and a provider map), two `Arc` handles and a
+/// session id. It is constructed at each [`Egress`] construction site and only
+/// when the user opted in, so a machine with the feature off pays for none of
+/// it (ADR-2).
+struct RedactionGateImpl {
+    /// This turn's router — the same one the turn and its five sibling duties
+    /// resolved through, so the scan cannot be routed by a different table than
+    /// the payload it is scanning.
+    router: Router,
+    /// Where `route_decided` goes when a scan actually runs (BR-2).
+    events: Arc<EventBus>,
+    /// The session the scanned payload belongs to.
+    session_id: SessionId,
+    /// The engine slot, read **per scan** rather than captured once: a real
+    /// engine arrives mid-run when a consent install completes, and a gate that
+    /// snapshotted an empty slot at construction would keep failing closed on a
+    /// machine whose local tier came up thirty seconds ago.
+    engine: Arc<EngineSlot>,
+}
+
+impl RedactionGateImpl {
+    /// Resolve the `redact` category for this scan (REQ-562 ADR-3).
+    ///
+    /// The sixth resolver, and it names its category literally for the same
+    /// reason [`DaemonRuntime::digest_route`] and its four siblings do: the
+    /// [`crate::call_sites`] derived-marker test reads the daemon's own source
+    /// looking for a routing call with a `Category::` literal inside it, and a
+    /// helper taking a category *variable* would make that scan blind.
+    ///
+    /// ## No session-taint arm, deliberately (ADR-3)
+    ///
+    /// The five REQ-561 resolvers check taint *first*, because for them taint
+    /// changes the answer: a configurable category bound to a remote provider
+    /// resolves local instead. It cannot change this one. `redact` is pinned
+    /// local by construction — REQ-558 ADR-B gives it no configurable
+    /// counterpart, so the resolver reaches it through the pinned-local branch,
+    /// which consults no binding and yields the engine-backed local tier or
+    /// nothing. A taint arm here would be a guard predicated on a distinction
+    /// that cannot occur (LESSON-443): dead code wearing a safety costume.
+    ///
+    /// AC-12's property — a tainted session produces zero scanner calls — holds
+    /// one layer up and more strongly: a tainted turn is pinned local, never
+    /// reaches remote egress, and so never reaches the gate at all. This
+    /// asymmetry with the sibling resolvers is intentional and this comment is
+    /// the written reason, so it does not get "fixed" into uniformity.
+    ///
+    /// ## No remote arm, also deliberately (ADR-1)
+    ///
+    /// The siblings share [`DaemonRuntime::build_duty_route`], which can build
+    /// a remote route. This one cannot, and that is the anti-recursion
+    /// guarantee: the only route it constructs is
+    /// [`DutyRoute::local`](crate::harness::DutyRoute::local), which holds an
+    /// engine handle and no transport. It is not a locality *check* — there is
+    /// no id comparison here and BR-2 forbids one — it is simply the one
+    /// construction available. The resolver's answer for this category can only
+    /// ever be the engine-backed local tier anyway: `local_tier_id` yields
+    /// `None` when a non-local provider has taken the canonical id
+    /// (BUG-156/TASK-057), so the pin has nothing remote to name.
+    ///
+    /// A route that resolved to nothing, or a tier with no engine loaded,
+    /// returns [`DutyRoute::unresolved`] — which the scan turns into
+    /// `Unavailable`, which blocks (ADR-6). Fail closed, with the resolver's own
+    /// sentence carried verbatim (BR-6).
+    fn redact_route(&self) -> DutyRoute {
+        let route = self.router.resolve(Category::Redact);
+        let Some(provider_id) = route.provider_id.as_ref().map(|p| p.0.clone()) else {
+            return DutyRoute::unresolved(route.reason.clone());
+        };
+        let Some((engine, _format)) = self.engine.get_with_format() else {
+            return DutyRoute::unresolved(format!(
+                "The 'redact' category resolves to '{provider_id}', but no local engine is \
+                 loaded to serve it yet."
+            ));
+        };
+        DutyRoute::local(REDACT_DUTY, provider_id, engine).announcing(
+            &self.events,
+            Some(self.session_id.clone()),
+            route.route_decided(),
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl RedactionGate for RedactionGateImpl {
+    async fn scan(&self, payload: &str) -> RedactionVerdict {
+        // The route is resolved per scan, not per turn: it is two map lookups
+        // and an `Arc` clone, and resolving it here means a scan reflects the
+        // engine slot as it is *now*. Nothing is held across the await below —
+        // `get_with_format` takes the slot lock, clones the handle, and drops
+        // it before this line returns.
+        let route = self.redact_route();
+        crate::harness::redact::scan(&route, payload).await
     }
 }
 
@@ -3860,8 +4366,19 @@ fn fake_engine_loader(
 /// mechanically truncated instead of reaching the engine over-window. The
 /// engine's typed backend error remains as the backstop, never the expected
 /// path.
-#[cfg(feature = "llama")]
-const LOCAL_ENGINE_N_CTX: u32 = 16_384;
+///
+/// ## Not feature-gated, because a second consumer derives from it
+///
+/// `LlamaEngine::load` is the only *caller*, and it exists only under
+/// `--features tetond/llama`. But [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES)
+/// is **derived** from this number in every build (REQ-562, LESSON-446): the
+/// scan's per-chunk cap and this window are two descriptions of one budget,
+/// and they were once picked independently — 64 KiB against a window that
+/// refuses anything over 30,720 bytes — so payloads in the ~30–64 KiB band
+/// passed the cap and then failed as an opaque engine error, blocking with
+/// the wrong reason. One number, one place; the scan's total cap
+/// (`REDACT_INPUT_MAX_BYTES`) is in turn a stated multiple of the chunk cap.
+pub(crate) const LOCAL_ENGINE_N_CTX: u32 = 16_384;
 
 /// The real weights loader: llama.cpp behind the [`Engine`] trait (AC-2).
 ///
@@ -4091,10 +4608,104 @@ fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) ->
 /// `what` is a noun phrase naming the thing being pinned. It is prose, not an
 /// identifier: the sentence is read by a person deciding whether the daemon did
 /// something surprising.
+///
+/// ## Why the cause is generic (REQ-562)
+///
+/// It used to read *"session previously touched local-only content"*, which was
+/// true when [`SessionTaint`] had one source. It now has four: a turn whose
+/// context intersects a boundary ([`context_is_sensitive`]), a turn refused at
+/// the choke point, a **duty** refused there, and an **MCP tool call** refused
+/// by the redaction scan ([`TaintingPrivacySink`] for the last two) — and the
+/// last three include REQ-562's redaction blocks, where no boundary was touched
+/// and no local-only file was read. A user told they touched local-only content
+/// goes looking for a `local-only` glob that does not exist.
+///
+/// So the clause names what is actually common to every source — an earlier
+/// privacy decision in this session — rather than the one source it originally
+/// had. The alternative, threading the cause through `SessionTaint` so the
+/// sentence could name it exactly, is a per-session reason store bought for one
+/// clause; this is the smaller honest change, and the block that caused the
+/// taint already reported itself precisely on its own surfaces.
 fn taint_pin_reason(what: &str) -> String {
     format!(
-        "session previously touched local-only content; {what} is pinned to the local tier \
+        "an earlier privacy decision in this session; {what} is pinned to the local tier \
          (BR-1 backstop)"
+    )
+}
+
+/// What refused this turn at the egress choke point, as a clause the three
+/// turn-surface sentences below are built around (REQ-562 BR-3).
+///
+/// ## Why one clause and three sentences, rather than nine literals
+///
+/// The daemon says three different things after a block — "and there is no
+/// local tier", "and the reroute failed too", "…rerouted" — and each of them
+/// now has to name one of three causes. Nine hand-written sentences is nine
+/// places for the scan-unavailable wording to drift into claiming a finding,
+/// which is exactly the untruth BR-3 forbids. The cause is worded **once**,
+/// here, and the situation is what varies — the same shape, and for the same
+/// reason, as [`taint_pin_reason`] directly above.
+///
+/// ## The rule these clauses exist to keep
+///
+/// A scan that **could not run** and a scan that **found a credential** are
+/// different problems with different fixes: the first is answered by loading a
+/// local tier, the second by taking the secret out of the payload. Told the
+/// wrong one, a user goes hunting for a `local-only` glob that does not exist,
+/// or for a secret that was never there. So the scan-unavailable clause says
+/// the scan could not run and never that it found something.
+///
+/// No clause carries payload content, and cannot: a
+/// [`Finding`](crate::egress::redact::Finding) has no text field, and
+/// [`BlockDetail`] carries no fields at all — the byte span stops at the
+/// `privacy_block` event, which is where a locatable finding belongs.
+fn refusal_clause(detail: BlockDetail) -> &'static str {
+    match detail {
+        // REQ-544's sentence, preserved: this is the one users have seen.
+        BlockDetail::Boundary => "this turn's content is under a local-only privacy boundary",
+        BlockDetail::Redaction => {
+            "the redaction scan found sensitive content in this turn's outbound payload"
+        }
+        BlockDetail::ScanUnavailable => {
+            "the redaction scan could not run, so this turn's outbound payload was blocked \
+             unscanned"
+        }
+    }
+}
+
+/// The turn-failure sentence for a block on a machine with **no local tier** to
+/// reroute to.
+///
+/// The scan-unavailable row is the one this function was written for: with the
+/// redaction switch on and no engine loaded, the scan cannot run, so *every*
+/// remote turn fails closed — and the two halves of this sentence are cause and
+/// remedy in one line, because the missing local tier is simultaneously why the
+/// scan could not run and why there is nowhere to serve the turn instead.
+fn unrerouteable_block_sentence(detail: BlockDetail) -> String {
+    format!(
+        "{}, and no local tier is available to serve it",
+        refusal_clause(detail)
+    )
+}
+
+/// The turn-failure sentence for a block whose local reroute *also* failed.
+fn failed_reroute_block_sentence(detail: BlockDetail) -> String {
+    format!(
+        "{}, and the local reroute could not serve it either",
+        refusal_clause(detail)
+    )
+}
+
+/// The `route_decided` reason a turn carries when the choke point refused it and
+/// the daemon is re-running it locally.
+///
+/// The third surface, and the one a user sees on an ordinary successful reroute
+/// — the turn recovers, so the two sentences above never fire and this line is
+/// the only account of what happened.
+fn reroute_after_block_reason(detail: BlockDetail) -> String {
+    format!(
+        "remote egress refused — {}; rerouted to the local tier (BR-1)",
+        refusal_clause(detail)
     )
 }
 
@@ -4391,6 +5002,11 @@ fn snapshot_from_config(config: &Config, router: &Router) -> ConfigSnapshot {
                 mode: to_proto_mode(b.mode),
             })
             .collect(),
+        // REQ-562: the `[privacy] redact` opt-in, projected so `policy show`
+        // can *report* it. Read from the config rather than from the presence
+        // of a gate, because this is the same question `redaction_gate` asks —
+        // one switch, one reader, no second answer to drift from the first.
+        redact_enabled: config.privacy.redact,
     }
 }
 
@@ -5609,6 +6225,45 @@ provider_id = "on-device"
         assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
     }
 
+    /// **The snapshot reports whether the redaction scan is enabled** (REQ-562;
+    /// user decision, 2026-08-08) — the daemon half of making the `[privacy]`
+    /// switch visible.
+    ///
+    /// Both states from one projection, so each is the other's discrimination
+    /// (LESSON-485): a field wired to a constant, or one projected from
+    /// something that merely correlates with the switch, fails a leg. The
+    /// absent-table leg is the one that matters most, because it is what almost
+    /// every machine sends: no `[privacy]` table at all must reach a client as
+    /// `false` rather than as a missing answer a renderer has to guess at.
+    ///
+    /// It reads `config.privacy.redact` — the same field `redaction_gate`
+    /// consults before installing the gate — so `policy show` and the gate
+    /// cannot disagree about whether anything is scanning. Asserted here rather
+    /// than at the wire, because the projection is the step that could drop it.
+    #[test]
+    fn the_snapshot_reports_whether_the_redaction_scan_is_enabled() {
+        // The overwhelmingly common config: no `[privacy]` table written at all.
+        let absent = Config::default();
+        assert!(
+            !absent.privacy.redact,
+            "the fixture must model the default, or the `false` leg proves nothing"
+        );
+        assert!(
+            !snapshot_from_config(&absent, &router_for_config(&absent)).redact_enabled,
+            "an un-opted-in daemon must report the scan as off"
+        );
+
+        // And the opt-in, on the same projection.
+        let opted_in = Config {
+            privacy: teton_core::config::PrivacyConfig { redact: true },
+            ..Config::default()
+        };
+        assert!(
+            snapshot_from_config(&opted_in, &router_for_config(&opted_in)).redact_enabled,
+            "`[privacy] redact = true` must reach the client that asked for the config"
+        );
+    }
+
     /// A router over `config` with a healthy local tier — what `config/get`
     /// builds, minus the daemon.
     fn router_for_config(config: &Config) -> Router {
@@ -5892,9 +6547,13 @@ provider_id = "on-device"
             .filter(|r| !r.reached)
             .map(|r| r.category.as_str())
             .collect();
+        // Empty since REQ-562 TASK-070 wired `redact`, the last of the eleven.
+        // Stated as the census rather than dropped: the loop below is the
+        // invariant (every row agrees with `has_call_site`), and this line is
+        // what makes a *change* to the set show up as a diff a reviewer reads.
         assert_eq!(
             unreached,
-            vec!["redact"],
+            Vec::<&str>::new(),
             "the marker in the projection must agree with `call_sites::has_call_site`"
         );
         for row in &snap.routing {
@@ -6117,7 +6776,7 @@ provider_id = "on-device"
         // The shared half: the cause, and the rule it comes from.
         for sentence in [&turn, &duty] {
             assert!(
-                sentence.contains("previously touched local-only content"),
+                sentence.contains("an earlier privacy decision in this session"),
                 "the sentence must name the CAUSE: {sentence}"
             );
             assert!(
@@ -6125,6 +6784,16 @@ provider_id = "on-device"
                 "and what was done about it: {sentence}"
             );
             assert!(sentence.contains("BR-1 backstop"), "{sentence}");
+            // **REQ-562: and it must not name a cause it cannot know.** The pin
+            // is now reachable from a redaction block, where no `local-only`
+            // file was read and no boundary was crossed. The wording this
+            // replaced said "session previously touched local-only content",
+            // which sent that user hunting for a glob that does not exist.
+            assert!(
+                !sentence.contains("local-only"),
+                "the pin has three sources and only one of them is boundary \
+                 content; the sentence may not claim that one: {sentence}"
+            );
         }
 
         // The differing half: each names its own subject, so a user reading the
@@ -6776,6 +7445,66 @@ provider_id = "on-device"
         assert!(!taint.is_tainted(&SessionId::from("other")));
     }
 
+    /// **The pin is announced once per session, on the transition** (REQ-562).
+    ///
+    /// A taint forces every later turn in the session local with no in-session
+    /// undo, so it is announced — and announced *once*, because a session pinned
+    /// by a boundary read and then again by a redaction block is one pin. The
+    /// idempotent `mark` is what carries that: it reports the transition, and
+    /// every production call site emits its line only on a `true`.
+    ///
+    /// The line itself is checked separately because it is a pure function
+    /// (`template_fallback_line`'s shape): the emitting branches sit on the turn
+    /// path and behind the choke point, and a test that had to reach them to
+    /// check the wording would be testing the wrong thing.
+    ///
+    /// **The gap this leaves, stated rather than papered over.** What is pinned
+    /// is `mark`'s transition report and the line's wording. What is *not* is
+    /// that each call site actually gates on the former — a site rewritten to
+    /// announce on every block would print one line per blocked payload and no
+    /// test here would notice, because nothing in this suite captures the
+    /// daemon's stderr. `template_fallback_line` has the identical limit, and
+    /// closing it means a stderr-capture harness rather than another assertion.
+    #[test]
+    fn a_session_announces_its_pin_once_and_the_line_names_the_cause_only() {
+        let taint = SessionTaint::new();
+        let s = SessionId::from("s1");
+        assert!(taint.mark(&s), "the first mark is the transition");
+        assert!(
+            !taint.mark(&s),
+            "a re-mark owes no second line: one pin, one announcement"
+        );
+        assert!(
+            taint.mark(&SessionId::from("other")),
+            "and the announcement is per session, not per daemon"
+        );
+
+        for cause in [TAINT_BY_BOUNDARY, TAINT_BY_REDACTION, TAINT_BY_CONTEXT] {
+            let line = taint_pin_line(cause);
+            assert!(line.starts_with("tetond: "), "{line}");
+            assert!(line.contains("pinned to the local tier"), "{line}");
+            assert!(line.contains(cause), "{line}");
+            // A class, never an instance: no session id, no path, no payload.
+            assert!(!line.contains("s1"), "{line}");
+            assert!(!line.contains('/'), "{line}");
+        }
+
+        // Both cause vocabularies map onto the same words, so the line does not
+        // depend on which side of the `teton-providers` seam the block arrived
+        // through.
+        assert_eq!(
+            taint_cause_word(&BlockCause::Boundary),
+            taint_detail_word(BlockDetail::Boundary)
+        );
+        assert_eq!(
+            taint_cause_word(&BlockCause::Redaction {
+                kind: teton_protocol::events::FindingKind::Credential,
+                span: teton_protocol::events::ByteSpan { start: 0, end: 4 },
+            }),
+            taint_detail_word(BlockDetail::Redaction)
+        );
+    }
+
     #[test]
     fn context_sensitivity_flags_boundary_and_unknown_but_not_public() {
         use crate::harness::context::ToolProvenance;
@@ -6994,6 +7723,7 @@ provider_id = "on-device"
             // The whole point: unset.
             default_provider: None,
             local_model: teton_core::LocalModelConfig::default(),
+            privacy: teton_core::PrivacyConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -7305,6 +8035,7 @@ provider_id = "on-device"
             pinned_local_model: None,
             default_provider: Some("anthropic".to_owned()),
             local_model: teton_core::LocalModelConfig::default(),
+            privacy: teton_core::PrivacyConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),
@@ -7705,14 +8436,13 @@ provider_id = "on-device"
         #[test]
         fn an_unattributable_privacy_block_pins_no_session() {
             let taint = Arc::new(SessionTaint::new());
-            let sink = TaintingPrivacySink {
-                events: Arc::new(EventBus::new()),
-                taint: Arc::clone(&taint),
-            };
+            let sink =
+                TaintingPrivacySink::for_turn_path(Arc::new(EventBus::new()), Arc::clone(&taint));
             let block = teton_protocol::events::PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
                 provider_id: ProviderId::from("frontier"),
                 action: teton_protocol::events::PrivacyAction::ReroutedToLocal,
+                cause: teton_protocol::events::BlockCause::Boundary,
             };
 
             crate::egress::PrivacyEventSink::privacy_block(&sink, None, block.clone());
@@ -7727,6 +8457,158 @@ provider_id = "on-device"
                 "non-vacuity: a scoped block really does pin"
             );
             assert!(!taint.is_tainted(&SessionId::from("somebody-else")));
+        }
+
+        // -- which causes pin, and which do not (REQ-562) --------------------
+
+        /// **A scan that could not run establishes nothing, so it pins
+        /// nothing** (REQ-544 C-2 × REQ-562 BR-3).
+        ///
+        /// The taint is a *durable, session-wide* consequence: every remaining
+        /// turn goes to the local tier and the user has no way to undo it short
+        /// of a new session. C-2's justification for that is that content
+        /// **crossed a boundary** and the model may restate it later. A
+        /// `ScanUnavailable` block carries no such fact — no local tier, an
+        /// over-cap payload, an engine error, a 120-second deadline — nothing
+        /// looked at the payload, so nothing is known about it. Pinning on it
+        /// lets one transient stall silently downgrade the rest of a session.
+        ///
+        /// The payload is still refused either way; that is BR-3's fail-closed
+        /// posture and it is per-payload.
+        ///
+        /// All three causes are driven through the same sink, in the same test,
+        /// so the two that pin are the discrimination for the one that does not
+        /// (LESSON-485).
+        #[test]
+        fn a_scan_unavailable_block_refuses_the_payload_without_pinning_the_session() {
+            fn pinned_by(cause: BlockCause) -> bool {
+                let taint = Arc::new(SessionTaint::new());
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let sink = TaintingPrivacySink::for_turn_path(bus, Arc::clone(&taint));
+                let session = SessionId::from("s");
+                crate::egress::PrivacyEventSink::privacy_block(
+                    &sink,
+                    Some(session.clone()),
+                    teton_protocol::events::PrivacyBlock {
+                        path: "the outbound payload".to_owned(),
+                        provider_id: ProviderId::from("frontier"),
+                        action: teton_protocol::events::PrivacyAction::ReroutedToLocal,
+                        cause,
+                    },
+                );
+                // Whatever the cause, the block is still announced — the pin is
+                // a *consequence* of a report, never a replacement for one.
+                assert!(
+                    std::iter::from_fn(|| sub.try_recv())
+                        .any(|env| matches!(env.event, Event::PrivacyBlock(_))),
+                    "{cause:?}: the authoritative privacy_block must still fire"
+                );
+                taint.is_tainted(&session)
+            }
+
+            assert!(
+                pinned_by(BlockCause::Boundary),
+                "content came from a local-only source: C-2's original case"
+            );
+            assert!(
+                pinned_by(BlockCause::Redaction {
+                    kind: teton_protocol::events::FindingKind::Credential,
+                    span: teton_protocol::events::ByteSpan { start: 10, end: 30 },
+                }),
+                "the scan FOUND something, and the model can restate it next turn"
+            );
+            assert!(
+                !pinned_by(BlockCause::ScanUnavailable),
+                "a scan that never ran established nothing about the payload, so it \
+                 must not pin the whole session to the local tier"
+            );
+        }
+
+        /// The turn path's taint gate and the sink's are the same rule written
+        /// in two type systems, and they must agree cause for cause.
+        ///
+        /// The turn path never sees a [`BlockCause`] — the cause reaches it as a
+        /// [`BlockDetail`] across the `teton-providers` seam, which declares no
+        /// protocol dependency by design. So the rule exists twice, and this is
+        /// what stops the two copies drifting into a session that a *duty*
+        /// pinned and a *turn* did not.
+        ///
+        /// **The MCP gate is not one of these two copies** and is deliberately
+        /// absent from the rows below: it is a different rule for a different
+        /// choke point, not a third spelling of this one. The test directly
+        /// after this asserts where it diverges, so "these two agree" and "that
+        /// third one does not" are both pinned rather than one of them being
+        /// inferred from the other's silence.
+        #[test]
+        fn the_two_taint_gates_agree_cause_for_cause() {
+            let rows = [
+                (BlockCause::Boundary, BlockDetail::Boundary),
+                (
+                    BlockCause::Redaction {
+                        kind: teton_protocol::events::FindingKind::Pii,
+                        span: teton_protocol::events::ByteSpan { start: 0, end: 4 },
+                    },
+                    BlockDetail::Redaction,
+                ),
+                (BlockCause::ScanUnavailable, BlockDetail::ScanUnavailable),
+            ];
+            for (cause, detail) in rows {
+                assert_eq!(
+                    cause_taints_the_session(&cause),
+                    taints_the_session(detail),
+                    "the duty path and the turn path disagree about {cause:?}"
+                );
+            }
+            // Non-vacuity: the rule is not constant, so agreeing about
+            // everything is not agreeing about nothing.
+            assert!(taints_the_session(BlockDetail::Boundary));
+            assert!(!taints_the_session(BlockDetail::ScanUnavailable));
+        }
+
+        /// **The MCP gate is a third rule, and the divergence is the point**
+        /// (REQ-562; user decision, 2026-08-08).
+        ///
+        /// Stated as a difference rather than left to be discovered, because
+        /// the failure mode is a later tidy-up: two functions that agree on two
+        /// of three causes look like duplication, and folding them into one
+        /// would silently re-decide REQ-544's MCP boundary posture — the
+        /// decision that says an MCP boundary refusal is an in-context tool
+        /// error and nothing more. Asserting the disagreement makes that fold
+        /// turn red.
+        ///
+        /// The redaction row is where the two rules *must* agree: the model
+        /// authored the tool arguments the scan refused, so it holds a secret
+        /// it can restate through an ordinary turn, and the surface it was
+        /// caught on does not change that.
+        #[test]
+        fn the_mcp_gate_pins_redaction_and_diverges_from_the_turn_path_on_boundary() {
+            let redaction = BlockCause::Redaction {
+                kind: teton_protocol::events::FindingKind::Credential,
+                span: teton_protocol::events::ByteSpan { start: 10, end: 30 },
+            };
+
+            // Where they agree, and why.
+            assert!(
+                mcp_cause_taints_the_session(&redaction),
+                "the model wrote those arguments and can restate the finding next turn"
+            );
+            assert!(
+                cause_taints_the_session(&redaction),
+                "non-vacuity: the turn path's answer for the same cause"
+            );
+            assert!(!mcp_cause_taints_the_session(&BlockCause::ScanUnavailable));
+            assert!(!cause_taints_the_session(&BlockCause::ScanUnavailable));
+
+            // Where they differ, and the direction of the difference.
+            assert!(
+                !mcp_cause_taints_the_session(&BlockCause::Boundary),
+                "REQ-544's fold-without-pinning posture for the MCP surface is kept"
+            );
+            assert!(
+                cause_taints_the_session(&BlockCause::Boundary),
+                "and the turn path still pins on it — this row is the divergence"
+            );
         }
 
         /// **AC-1, the direct regression, end to end through the daemon's own
@@ -9591,6 +10473,1191 @@ provider_id = "on-device"
                 assert!(
                     crate::harness::compact::compact_prompt(pressured().blocks())
                         .contains(COMPACT_OUTPUT_CONTRACT)
+                );
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // The `redact` duty's own dispatch (REQ-562 TASK-070).
+        //
+        // The sixth caller of the seam, and the only one whose resolver does
+        // not live on the runtime: it lives on the gate the choke point holds,
+        // because that is where the scan happens (ADR-1). Two things it has
+        // that the five do not — and both are asserted here rather than only
+        // commented:
+        //
+        // - **no taint arm** (ADR-3): taint cannot change a pinned-local
+        //   resolution, so a taint check would be a guard on a distinction that
+        //   cannot occur. The test below proves the *resolution* is identical
+        //   tainted and clean, against a sibling on the same runtime that
+        //   genuinely changes.
+        // - **no remote arm** (ADR-1): the pin can only name an engine-backed
+        //   tier, so a squatted local id leaves the scan unavailable rather
+        //   than routing it through the squatter — which is what makes the
+        //   scan structurally unable to re-enter the choke point.
+        // -------------------------------------------------------------------
+        mod redact {
+            use super::*;
+            use crate::egress::redact::{decide, EgressDecision, Outcome};
+            use teton_core::config::PrivacyConfig;
+
+            /// `config` with the `[privacy]` opt-in switched on.
+            fn opted_in(mut config: Config) -> Config {
+                config.privacy = PrivacyConfig { redact: true };
+                config
+            }
+
+            /// `config` with every remote endpoint pointed at a closed local
+            /// port.
+            ///
+            /// The two turn-path tests below drive a real turn through a real
+            /// transport, and the point of the first is that the gate refuses
+            /// the payload **before** the transport is ever used. A fixture
+            /// reaching the public internet would make that claim depend on
+            /// what answered, and would put a DNS lookup inside a unit test.
+            /// Port 1 on the loopback refuses instantly and resolves nothing.
+            fn offline_endpoints(mut config: Config) -> Config {
+                for provider in &mut config.providers {
+                    provider.endpoint = Some("http://127.0.0.1:1/v1/chat/completions".to_owned());
+                }
+                config
+            }
+
+            /// `config()` plus a remote `reflex` binding — the tier `redact`
+            /// declares, and the one a resolver that consulted the table would
+            /// inherit.
+            fn reflex_bound_to(provider_id: &str) -> Config {
+                let mut config = config();
+                config.tiers.push(TierBinding {
+                    tier: Tier::Reflex,
+                    provider_id: provider_id.to_owned(),
+                    fallback_id: None,
+                });
+                config
+            }
+
+            /// The gate the turn path installs, from the same runtime state and
+            /// through the same router, announcing on `bus`.
+            fn gate_on(
+                runtime: &DaemonRuntime,
+                bus: &Arc<EventBus>,
+                session: &SessionId,
+            ) -> Option<Arc<dyn RedactionGate>> {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                runtime.redaction_gate(&router, &config, bus, session)
+            }
+
+            fn gate_for(runtime: &DaemonRuntime, session: &SessionId) -> Arc<dyn RedactionGate> {
+                gate_on(runtime, &Arc::new(EventBus::new()), session)
+                    .expect("the privacy switch is on")
+            }
+
+            /// A runtime with `config` and **no** engine in the slot, whose
+            /// local tier the router still registers.
+            ///
+            /// The discriminating state for fail-closed: the pin resolves to a
+            /// tier that exists and nothing is loaded to serve it.
+            fn runtime_without_an_engine(config: Config) -> DaemonRuntime {
+                let runtime = DaemonRuntime::minimal();
+                *runtime.config.lock().expect("config mutex") = config;
+                runtime.local_available.store(true, Ordering::SeqCst);
+                runtime
+            }
+
+            // -- the switch (ADR-2, AC-13) -----------------------------------
+
+            /// **AC-13, both legs.** With no `[privacy]` table there is no gate
+            /// at all — not a gate that permits — so a turn makes zero scanner
+            /// calls and nothing exists to claim one ran. Flipping the switch on
+            /// the same runtime produces exactly one call per scan.
+            #[tokio::test]
+            async fn off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(config(), &engine, true);
+                let session = SessionId::from("sess");
+
+                assert!(
+                    gate_on(&runtime, &Arc::new(EventBus::new()), &session).is_none(),
+                    "absence of the [privacy] table is the off state (ADR-2)"
+                );
+                assert_eq!(
+                    engine.calls(),
+                    0,
+                    "an un-opted-in machine makes zero scanner calls"
+                );
+
+                *runtime.config.lock().expect("config mutex") = opted_in(config());
+                let verdict = gate_for(&runtime, &session)
+                    .scan("an ordinary prompt")
+                    .await;
+                assert_eq!(verdict.outcome(), Outcome::Clean);
+                assert!(verdict.scanned(), "and it really did scan");
+                assert_eq!(engine.calls(), 1, "exactly one scan for one payload");
+            }
+
+            // -- where it routes (ADR-3, BR-2) -------------------------------
+
+            /// **The pin ignores the table.** `redact` declares the `reflex`
+            /// tier, so a remotely bound `reflex` is the configuration that
+            /// would send the scan off the machine if anything consulted the
+            /// binding. Nothing does: the scan runs on the local engine.
+            ///
+            /// The non-vacuity is `title`, the other `reflex` duty, on the same
+            /// runtime and the same router — it genuinely goes remote, so the
+            /// binding under test is real rather than inert.
+            #[tokio::test]
+            async fn the_redact_pin_ignores_a_remote_reflex_binding_that_title_obeys() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(reflex_bound_to("frontier")), &engine, true);
+                let session = SessionId::from("sess");
+
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                assert_eq!(
+                    runtime
+                        .title_route(
+                            &router,
+                            &config,
+                            &Arc::new(EventBus::new()),
+                            &session,
+                            slot.as_ref()
+                        )
+                        .provider(),
+                    Some("frontier"),
+                    "the reflex binding is live for the duty that reads it"
+                );
+
+                let verdict = gate_for(&runtime, &session).scan("ordinary prose").await;
+                assert_eq!(verdict.outcome(), Outcome::Clean);
+                assert_eq!(
+                    engine.calls(),
+                    1,
+                    "the scan ran on the local engine regardless of the binding"
+                );
+            }
+
+            /// **ADR-3's asymmetry, asserted.** Taint changes a sibling's
+            /// resolution and cannot change this one, because this one was never
+            /// anything but local. Without the sibling leg this test would pass
+            /// against a resolver that ignored everything.
+            #[tokio::test]
+            async fn a_tainted_session_resolves_redact_exactly_as_a_clean_one_does() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(reflex_bound_to("frontier")), &engine, true);
+                let clean = SessionId::from("clean");
+                let tainted = SessionId::from("tainted");
+                runtime.session_taint.mark(&tainted);
+
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let slot = runtime.engine.get_with_format();
+                let bus = Arc::new(EventBus::new());
+                // The sibling: taint moves it from the frontier to the tier.
+                assert_eq!(
+                    runtime
+                        .title_route(&router, &config, &bus, &clean, slot.as_ref())
+                        .provider(),
+                    Some("frontier")
+                );
+                assert_eq!(
+                    runtime
+                        .title_route(&router, &config, &bus, &tainted, slot.as_ref())
+                        .provider(),
+                    Some(LOCAL_PROVIDER_ID)
+                );
+
+                // And `redact` answers the same on both sessions.
+                for session in [&clean, &tainted] {
+                    let verdict = gate_for(&runtime, session).scan("ordinary prose").await;
+                    assert_eq!(
+                        verdict.outcome(),
+                        Outcome::Clean,
+                        "the pin resolves identically on a tainted session"
+                    );
+                }
+                assert_eq!(engine.calls(), 2, "both scans really ran");
+            }
+
+            /// **BR-2.** A scan that runs announces its route, with the four
+            /// things every other duty announces — and the provider is the local
+            /// tier, which is the visible half of the pin.
+            #[tokio::test]
+            async fn a_scan_that_runs_announces_its_route_like_every_other_duty() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(config()), &engine, true);
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+
+                let gate = gate_on(&runtime, &bus, &SessionId::from("sess"))
+                    .expect("the privacy switch is on");
+                let verdict = gate.scan("ordinary prose").await;
+                assert_eq!(verdict.outcome(), Outcome::Clean);
+
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Redact,
+                    ProtoTier::Reflex,
+                    LOCAL_PROVIDER_ID,
+                );
+            }
+
+            // -- fail closed (ADR-6, BR-3) -----------------------------------
+
+            /// **Fail closed at the resolver.** The switch is on, the tier
+            /// exists, and nothing is loaded to serve it: the route is
+            /// unresolved, the verdict is `Unavailable`, and it blocks.
+            ///
+            /// The payload is deliberately **clean** — the one case that would
+            /// forward if an unresolved route were treated permissively, so a
+            /// permissive failure turns this red rather than leaving it green.
+            #[tokio::test]
+            async fn a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan() {
+                let runtime = runtime_without_an_engine(opted_in(config()));
+                let verdict = gate_for(&runtime, &SessionId::from("sess"))
+                    .scan("entirely ordinary prose")
+                    .await;
+                assert_eq!(verdict.outcome(), Outcome::Unavailable);
+                assert!(
+                    !verdict.scanned(),
+                    "a scan that could not run must not claim it did"
+                );
+                assert_eq!(decide(&verdict), EgressDecision::Block);
+            }
+
+            /// **The anti-recursion foundation (ADR-1), stated as behaviour.**
+            ///
+            /// A non-local provider that has taken the canonical local-tier id
+            /// does not become the local tier (BUG-156/TASK-057): `local_tier_id`
+            /// yields nothing, so the pin has nothing to name and the scan is
+            /// unavailable. It does **not** fall through to the squatter — which
+            /// is the case that would put a `RemoteDuty` behind the gate and let
+            /// a scan re-enter the choke point with its own prompt.
+            ///
+            /// Non-vacuity: the same runtime, the same engine, without the
+            /// squatter, scans normally.
+            #[tokio::test]
+            async fn a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote() {
+                let engine = CountingEngine::answering("NONE");
+                let mut squatted = opted_in(config());
+                squatted
+                    .providers
+                    .push(remote(LOCAL_PROVIDER_ID, "squatter-model"));
+                let runtime = runtime(squatted, &engine, true);
+                let session = SessionId::from("sess");
+
+                let verdict = gate_for(&runtime, &session).scan("ordinary prose").await;
+                assert_eq!(verdict.outcome(), Outcome::Unavailable);
+                assert_eq!(decide(&verdict), EgressDecision::Block);
+                assert_eq!(
+                    engine.calls(),
+                    0,
+                    "nothing was asked to scan, locally or otherwise"
+                );
+
+                *runtime.config.lock().expect("config mutex") = opted_in(config());
+                let verdict = gate_for(&runtime, &session).scan("ordinary prose").await;
+                assert_eq!(verdict.outcome(), Outcome::Clean);
+                assert_eq!(engine.calls(), 1);
+            }
+
+            /// **AC-4's "no locality guard was added" leg, at the daemon's own
+            /// resolver** (BR-2, LESSON-484, LESSON-443).
+            ///
+            /// The squat test above is the same coin's other face. There, a
+            /// *remote* provider holding the canonical id `local` leaves the pin
+            /// with nothing to name. Here, a genuinely engine-backed tier holds
+            /// an id that is **not** `local` — `[[providers]] id = "on-device",
+            /// kind = "local"` is an ordinary thing for a user to write — and
+            /// the pin must resolve to it and serve.
+            ///
+            /// An id comparison anywhere on this path
+            /// (`if provider_id != LOCAL_PROVIDER_ID { … }`) would fail this
+            /// machine's scan closed, and with the gate on the synchronous send
+            /// path, every one of its remote turns with it. So this test's
+            /// *success* is the discriminating evidence that no such guard
+            /// exists (LESSON-485), asserted behaviourally rather than by
+            /// grepping the source for a comparison (LESSON-489/BUG-159).
+            ///
+            /// ## Why it exists: a mutation that came back green
+            ///
+            /// TASK-071's AC-8 run applied exactly that guard to
+            /// `RedactionGateImpl`'s resolver and **nothing turned red** — every
+            /// fixture in this module built its router from a config whose local
+            /// tier carried the canonical id, so the guard could never fire. The
+            /// integration suite covered the property one layer down
+            /// (`tests/redact_egress.rs::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`,
+            /// over a real `Router` and the real `scan`) but could not reach this
+            /// crate-private resolver. This is the fixture that closes it; the
+            /// green observation is kept in `harness::duty`'s mutation table
+            /// because it is the reason the fixture is here.
+            #[tokio::test]
+            async fn an_engine_backed_local_tier_under_another_id_still_serves_the_scan() {
+                /// A `[[providers]]` entry that is genuinely the on-device tier.
+                fn declared_local(id: &str) -> ModelProvider {
+                    ModelProvider {
+                        id: id.to_owned(),
+                        kind: ProviderKind::Local,
+                        endpoint: None,
+                        model: None,
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities::default(),
+                    }
+                }
+
+                const NON_CANONICAL: &str = "on-device";
+                assert_ne!(
+                    NON_CANONICAL, LOCAL_PROVIDER_ID,
+                    "the fixture's whole point is a local tier under some other name"
+                );
+
+                let engine = CountingEngine::answering("NONE");
+                let mut config = opted_in(config());
+                config.providers.push(declared_local(NON_CANONICAL));
+                let runtime = runtime(config, &engine, true);
+                let session = SessionId::from("sess");
+
+                // The premise: `local_tier_id` names the declared tier, so the
+                // pin resolves to an id that is not the canonical one.
+                assert_eq!(
+                    router_for(&runtime)
+                        .resolve(Category::Redact)
+                        .provider_id
+                        .as_ref()
+                        .map(|p| p.0.as_str()),
+                    Some(NON_CANONICAL),
+                    "the pin must name the declared tier, or this fixture is not \
+                     the one the AC asks for"
+                );
+
+                let bus = Arc::new(EventBus::new());
+                let mut sub = bus.subscribe(16);
+                let verdict = gate_on(&runtime, &bus, &session)
+                    .expect("the privacy switch is on")
+                    .scan("ordinary prose")
+                    .await;
+
+                // The claim: it served. Not `Unavailable`, which is what an id
+                // comparison would have produced.
+                assert_eq!(
+                    verdict.outcome(),
+                    Outcome::Clean,
+                    "a local tier under a non-canonical id must still serve the scan"
+                );
+                assert!(verdict.scanned(), "and it really did scan");
+                assert_eq!(decide(&verdict), EgressDecision::Forward);
+                assert_eq!(
+                    engine.calls(),
+                    1,
+                    "on this machine's own engine, exactly once"
+                );
+
+                // And it announced the route under that tier's own name, so the
+                // provider the scan ran on is observable rather than inferred.
+                assert_announced_route(
+                    &announced(&mut sub),
+                    ProtoCategory::Redact,
+                    ProtoTier::Reflex,
+                    NON_CANONICAL,
+                );
+            }
+
+            // -- what it finds -----------------------------------------------
+
+            /// The gate end to end: a planted credential blocks, and the *same*
+            /// gate lets clean prose through. The pattern pass is what catches
+            /// this one — the stand-in engine answers "found nothing" — which is
+            /// exactly the division of labour ADR-4 describes.
+            #[tokio::test]
+            async fn a_planted_credential_blocks_and_the_same_gate_forwards_clean_prose() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(config()), &engine, true);
+                let gate = gate_for(&runtime, &SessionId::from("sess"));
+
+                let dirty = gate
+                    .scan("please summarize sk-ABCDEFGHIJKLMNOPQRSTUVWX for me")
+                    .await;
+                assert_eq!(dirty.outcome(), Outcome::Findings);
+                assert_eq!(decide(&dirty), EgressDecision::Block);
+
+                let clean = gate.scan("please summarize src/main.rs for me").await;
+                assert_eq!(clean.outcome(), Outcome::Clean);
+                assert_eq!(decide(&clean), EgressDecision::Forward);
+
+                assert_eq!(engine.calls(), 2, "both payloads were really scanned");
+            }
+
+            // -- the MCP path (ADR-003 × ADR-1) ------------------------------
+
+            /// A `Transport` that answers JSON-RPC by method and records every
+            /// body it was handed — the wire, for a remote MCP server.
+            #[derive(Default, Clone)]
+            struct McpWire {
+                sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+            }
+
+            impl McpWire {
+                fn bodies(&self) -> Vec<String> {
+                    self.sent
+                        .lock()
+                        .expect("wire poisoned")
+                        .iter()
+                        .map(|b| String::from_utf8_lossy(b).into_owned())
+                        .collect()
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl Transport for McpWire {
+                async fn execute(
+                    &self,
+                    request: teton_providers::transport::TransportRequest,
+                ) -> Result<
+                    teton_providers::transport::TransportResponse,
+                    teton_providers::transport::TransportError,
+                > {
+                    let method = serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .ok()
+                        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_owned))
+                        .unwrap_or_default();
+                    self.sent
+                        .lock()
+                        .expect("wire poisoned")
+                        .push(request.body.clone());
+                    let result = match method.as_str() {
+                        "initialize" => {
+                            serde_json::json!({"serverInfo":{"name":"kb","version":"1"}})
+                        }
+                        "tools/list" => serde_json::json!({"tools":[{
+                            "name": "lookup",
+                            "description": "look something up",
+                            "inputSchema": {"type":"object"}
+                        }]}),
+                        _ => serde_json::json!({
+                            "content":[{"type":"text","text":"ok"}],
+                            "isError": false
+                        }),
+                    };
+                    let body = serde_json::to_vec(
+                        &serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}),
+                    )
+                    .expect("serialize");
+                    Ok(teton_providers::transport::TransportResponse {
+                        status: 200,
+                        body: Box::pin(futures::stream::once(async move { Ok(body) })),
+                    })
+                }
+            }
+
+            /// A remote MCP server, the only kind that egresses.
+            fn http_server(id: &str) -> McpServerConfig {
+                McpServerConfig {
+                    id: id.to_owned(),
+                    transport: crate::mcp::McpTransport::Http {
+                        endpoint: "https://mcp.example.com/rpc".to_owned(),
+                    },
+                    trusted: false,
+                }
+            }
+
+            /// One `tools/call` through the construction `build_tools` uses:
+            /// [`DaemonRuntime::mcp_egress`] over `wire`, the real
+            /// [`McpRegistry`] over that, the real [`crate::mcp::HttpConnection`],
+            /// the real handshake.
+            ///
+            /// Shared by every test below rather than rebuilt per test, because
+            /// what they are all asserting *about* is this wiring: a second
+            /// hand-rolled copy could keep passing after the production one had
+            /// changed underneath it.
+            ///
+            /// `session` is a parameter because attribution is the subject of
+            /// half these tests — a block the choke point cannot attribute pins
+            /// nothing, so the session has to be a thing the caller controls and
+            /// can then ask the taint about.
+            async fn mcp_lookup(
+                runtime: &DaemonRuntime,
+                wire: &McpWire,
+                session: &SessionId,
+                arguments: serde_json::Value,
+            ) -> Result<crate::mcp::McpToolResult, crate::mcp::McpError> {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let events = Arc::new(EventBus::new());
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let egress =
+                    Arc::new(runtime.mcp_egress(wire.clone(), &router, &config, &events, session));
+                let registry = McpRegistry::with_egress(
+                    egress as Arc<dyn crate::mcp::EgressGate>,
+                    Some(session.clone()),
+                    vec![http_server("kb")],
+                );
+                registry.call_tool("mcp__kb__lookup", arguments).await
+            }
+
+            /// **The MCP choke point carries the gate** (ADR-003, ADR-1).
+            ///
+            /// ## Why this test exists
+            ///
+            /// `build_tools` attached the gate to the MCP egress and **nothing
+            /// covered it**: deleting `.with_redaction_gate(…)` from that
+            /// function left the entire suite green, because the only path to it
+            /// ran through `HttpTransport::new()` and a real socket. An MCP tool
+            /// argument is exactly the payload the feature is for — a credential
+            /// pasted into a `query` field is off the machine the moment the
+            /// call goes out, and provenance cannot see it because the argument
+            /// came from the model, not from a file.
+            ///
+            /// ## What is real here, and what is not
+            ///
+            /// Real: the runtime, its config switch, its router, its engine slot,
+            /// [`DaemonRuntime::mcp_egress`] (the exact construction
+            /// `build_tools` calls), the real [`McpRegistry`] over it, the real
+            /// [`crate::mcp::HttpConnection`], the real handshake, the real
+            /// `tools/call`, the real two-pass scan, and the wire captured.
+            ///
+            /// Not real, and the whole of what remains uncovered: the
+            /// `HttpTransport::new()` line that supplies the transport in
+            /// production, and `register_mcp_tools`, which turns the registry
+            /// into `ToolRegistry` entries and is orthogonal to egress. Both are
+            /// above the gate, not between it and the wire.
+            ///
+            /// ## The discrimination
+            ///
+            /// The same runtime, the same server, the same tool arguments, twice
+            /// — and the only difference is the `[privacy]` switch. On: the call
+            /// is refused, the error names **redaction** (not a boundary), and
+            /// the credential is absent from every captured body. Off: the same
+            /// call succeeds, the engine is never asked, and the credential is on
+            /// the wire — which is what proves the on-leg's absence is the gate
+            /// and not the fixture (LESSON-485).
+            #[tokio::test]
+            async fn an_mcp_tool_call_crosses_the_gate_when_redact_is_on() {
+                /// Pattern-shaped, so the deterministic pass alone blocks it and
+                /// the stand-in engine's "NONE" cannot rescue the payload.
+                const CREDENTIAL: &str = "AKIAMCPWIRESENTINEL0";
+
+                async fn call_lookup(
+                    runtime: &DaemonRuntime,
+                    wire: &McpWire,
+                ) -> Result<crate::mcp::McpToolResult, crate::mcp::McpError> {
+                    mcp_lookup(
+                        runtime,
+                        wire,
+                        &SessionId::from("sess-mcp"),
+                        serde_json::json!({ "q": format!("what does {CREDENTIAL} unlock?") }),
+                    )
+                    .await
+                }
+
+                // -- on ------------------------------------------------------
+                let engine = CountingEngine::answering("NONE");
+                let on_runtime = runtime(opted_in(config()), &engine, true);
+                let wire = McpWire::default();
+                let blocked = call_lookup(&on_runtime, &wire).await;
+
+                match blocked {
+                    Err(crate::mcp::McpError::PrivacyBlocked { detail, .. }) => assert_eq!(
+                        detail,
+                        BlockDetail::Redaction,
+                        "an MCP block must name which inspection refused it"
+                    ),
+                    other => panic!("expected a redaction block, got {other:?}"),
+                }
+                assert!(
+                    engine.calls() > 0,
+                    "the scan must actually have run on the MCP path"
+                );
+                for body in wire.bodies() {
+                    assert!(
+                        !body.contains(CREDENTIAL) && !body.contains("MCPWIRESENTINEL"),
+                        "the credential reached a remote MCP server: {body}"
+                    );
+                }
+
+                // -- off -----------------------------------------------------
+                let off_engine = CountingEngine::answering("NONE");
+                let off_runtime = runtime(config(), &off_engine, true);
+                let off_wire = McpWire::default();
+                let allowed = call_lookup(&off_runtime, &off_wire).await;
+                assert!(
+                    allowed.is_ok(),
+                    "with the switch off the same call must go through: {allowed:?}"
+                );
+                assert_eq!(
+                    off_engine.calls(),
+                    0,
+                    "off means no gate at all — zero scanner calls (AC-13)"
+                );
+                assert!(
+                    off_wire.bodies().iter().any(|b| b.contains(CREDENTIAL)),
+                    "non-vacuity: with no gate the credential really does reach \
+                     the wire, so the on-leg's absence is the gate"
+                );
+            }
+
+            // -- which MCP blocks pin the session (user decision, 2026-08-08) --
+
+            /// **An MCP block pins its session iff the redaction scan found
+            /// something** — all three causes, through the production wiring.
+            ///
+            /// One config and one helper serve all three legs, so what varies
+            /// between them is the cause and nothing else: the tool argument
+            /// picks boundary vs redaction, and the presence of an engine picks
+            /// whether the scan could run at all. A fixture that had simply
+            /// stopped attributing blocks to a session would fail the redaction
+            /// leg rather than pass all three, which is what makes the two
+            /// `false`s evidence of the gate rather than of a broken fixture
+            /// (LESSON-485).
+            ///
+            /// Why they differ is on [`mcp_cause_taints_the_session`]; this is
+            /// the behavioural half, driven through
+            /// [`DaemonRuntime::mcp_egress`] rather than by calling the
+            /// predicate — the sink has to actually be wired to it.
+            #[tokio::test]
+            async fn an_mcp_block_pins_its_session_for_redaction_and_for_no_other_cause() {
+                /// Pattern-shaped, so the deterministic pass alone blocks it.
+                const CREDENTIAL: &str = "AKIAMCPTAINTSENTINEL";
+
+                /// The opt-in **and** a `local-only` boundary, so one config
+                /// can produce all three causes.
+                fn guarded() -> Config {
+                    let mut config = opted_in(config());
+                    config.boundaries = vec![PrivacyBoundary {
+                        path_glob: "secrets/**".to_owned(),
+                        mode: BoundaryMode::LocalOnly,
+                    }];
+                    config
+                }
+
+                /// The refusal `arguments` produces, and whether it pinned the
+                /// session it happened in.
+                async fn block_from(
+                    runtime: &DaemonRuntime,
+                    arguments: serde_json::Value,
+                ) -> (BlockDetail, bool) {
+                    let session = SessionId::from("sess-mcp-taint");
+                    assert!(
+                        !runtime.session_taint.is_tainted(&session),
+                        "the fixture must start clean or it proves nothing"
+                    );
+                    let err = mcp_lookup(runtime, &McpWire::default(), &session, arguments)
+                        .await
+                        .expect_err("the call must be refused");
+                    let crate::mcp::McpError::PrivacyBlocked { detail, .. } = err else {
+                        panic!("expected a privacy block, got {err:?}");
+                    };
+                    (detail, runtime.session_taint.is_tainted(&session))
+                }
+
+                // The model wrote these arguments, so it is holding what the
+                // scan found and can restate it next turn.
+                let engine = CountingEngine::answering("NONE");
+                let (detail, pinned) = block_from(
+                    &runtime(guarded(), &engine, true),
+                    serde_json::json!({ "q": format!("what does {CREDENTIAL} unlock?") }),
+                )
+                .await;
+                assert_eq!(detail, BlockDetail::Redaction);
+                assert!(
+                    pinned,
+                    "a redaction block through MCP must pin the session, exactly as one \
+                     through a turn does"
+                );
+
+                // REQ-544's posture for this surface, kept: a boundary refusal
+                // folds back into the loop as an in-context tool error.
+                let engine = CountingEngine::answering("NONE");
+                let (detail, pinned) = block_from(
+                    &runtime(guarded(), &engine, true),
+                    serde_json::json!({ "path": "secrets/prod.env" }),
+                )
+                .await;
+                assert_eq!(
+                    detail,
+                    BlockDetail::Boundary,
+                    "the boundary leg must be refused by provenance, not by the scan"
+                );
+                assert!(
+                    !pinned,
+                    "REQ-544 folds an MCP boundary block back into the loop without \
+                     pinning, and this REQ does not re-decide that"
+                );
+
+                // Nothing looked at the payload, so nothing was established —
+                // the one answer both paths share.
+                let (detail, pinned) =
+                    block_from(&runtime_without_an_engine(guarded()), serde_json::json!({})).await;
+                assert_eq!(detail, BlockDetail::ScanUnavailable);
+                assert!(
+                    !pinned,
+                    "a scan that never ran must not pin a whole session to the local tier"
+                );
+            }
+
+            /// **What the pin is *for*, on the MCP path**: the next turn in that
+            /// session resolves local.
+            ///
+            /// `is_tainted` is a flag, and a pin that never reached
+            /// [`DaemonRuntime::dispatch_route`] would satisfy the flag while
+            /// changing nothing a user could observe. This asserts the
+            /// consequence instead, with a second untouched session on the same
+            /// runtime as the non-vacuity — it still routes remotely, so the
+            /// pinned leg is the taint and not the fixture's routing.
+            ///
+            /// Structured mode on both, so no classification runs and the
+            /// engine in the slot is only ever the scanner.
+            #[tokio::test]
+            async fn an_mcp_redaction_block_pins_the_session_so_the_next_turn_resolves_local() {
+                const CREDENTIAL: &str = "AKIAMCPNEXTTURNSENT0";
+
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(config()), &engine, true);
+                let blocked = SessionId::from("blocked");
+                let bystander = SessionId::from("bystander");
+
+                let err = mcp_lookup(
+                    &runtime,
+                    &McpWire::default(),
+                    &blocked,
+                    serde_json::json!({ "q": format!("what does {CREDENTIAL} unlock?") }),
+                )
+                .await
+                .expect_err("the credential must be refused");
+                assert!(
+                    matches!(
+                        err,
+                        crate::mcp::McpError::PrivacyBlocked {
+                            detail: BlockDetail::Redaction,
+                            ..
+                        }
+                    ),
+                    "expected a redaction block, got {err:?}"
+                );
+
+                let router = router_for(&runtime);
+                let next = runtime
+                    .dispatch_route(
+                        &router,
+                        &blocked,
+                        SessionMode::Structured,
+                        Some(CorePhase::Implement),
+                        "carry on",
+                    )
+                    .await;
+                assert_eq!(
+                    next.provider_id.as_ref().map(|p| p.0.as_str()),
+                    Some(LOCAL_PROVIDER_ID),
+                    "the turn after an MCP redaction block must be pinned local — {}",
+                    next.reason
+                );
+                assert!(
+                    next.resolution.is_none(),
+                    "the taint pin resolves no category at all (BR-7)"
+                );
+                assert_engine_backed(&opted_in(config()), &next);
+
+                let untouched = runtime
+                    .dispatch_route(
+                        &router,
+                        &bystander,
+                        SessionMode::Structured,
+                        Some(CorePhase::Implement),
+                        "carry on",
+                    )
+                    .await;
+                assert_eq!(
+                    untouched.provider_id.as_ref().map(|p| p.0.as_str()),
+                    Some("cheap"),
+                    "non-vacuity: the identical next turn in an untouched session still \
+                     goes remote, and the pin reaches only the session it happened in"
+                );
+            }
+
+            // -- the turn-failure sentence (BR-3) ----------------------------
+
+            /// **BR-3 on the primary user surface.** The three causes produce
+            /// three different sentences in each of the three situations the
+            /// turn path can report a block from, and the scan-unavailable
+            /// wording never reads as a finding.
+            ///
+            /// Exhaustive over cause × situation rather than three examples,
+            /// because the failure this replaced was not a wrong sentence — it
+            /// was **one** sentence used for every cause, which is what a table
+            /// with a missing row silently reproduces. The `unique.len()`
+            /// assertion per situation is what makes a collapsed clause fail.
+            #[test]
+            fn the_three_block_causes_produce_three_distinct_turn_failure_sentences() {
+                use std::collections::BTreeSet;
+
+                let details = [
+                    BlockDetail::Boundary,
+                    BlockDetail::Redaction,
+                    BlockDetail::ScanUnavailable,
+                ];
+                /// One of the three places the turn path reports a block.
+                type Situation = (&'static str, fn(BlockDetail) -> String);
+
+                let situations: [Situation; 3] = [
+                    ("no local tier", unrerouteable_block_sentence),
+                    ("reroute failed", failed_reroute_block_sentence),
+                    ("rerouted", reroute_after_block_reason),
+                ];
+
+                for (situation, compose) in situations {
+                    let rendered: Vec<String> = details.into_iter().map(compose).collect();
+                    let unique: BTreeSet<&String> = rendered.iter().collect();
+                    assert_eq!(
+                        unique.len(),
+                        3,
+                        "{situation}: the three causes must not share a sentence: {rendered:?}"
+                    );
+
+                    // REQ-544's sentence, unchanged: it is what is already in
+                    // every log and what a user has seen before.
+                    assert!(
+                        rendered[0].contains("local-only privacy boundary"),
+                        "{situation}: {}",
+                        rendered[0]
+                    );
+                    // A finding says something was found...
+                    assert!(
+                        rendered[1].contains("found sensitive content"),
+                        "{situation}: {}",
+                        rendered[1]
+                    );
+                    // ...and the scan that could not run says exactly that, and
+                    // never the other thing. This is the assertion BR-3 is
+                    // about: told the wrong one, a user hunts for a secret that
+                    // is not there instead of for the tier that is not loaded.
+                    assert!(
+                        rendered[2].contains("could not run"),
+                        "{situation}: {}",
+                        rendered[2]
+                    );
+                    assert!(
+                        !rendered[2].contains("found"),
+                        "{situation}: a scan that never ran cannot have found \
+                         anything: {}",
+                        rendered[2]
+                    );
+                    assert!(
+                        !rendered[2].contains("local-only privacy boundary"),
+                        "{situation}: a scan-unavailable block is not a boundary \
+                         block: {}",
+                        rendered[2]
+                    );
+                }
+            }
+
+            /// **The bug this replaced, through the real turn path.**
+            ///
+            /// `[privacy] redact = true` on a machine with no local tier is not
+            /// an exotic configuration — it is remote-only operation with the
+            /// switch on — and in it *every* remote turn fails closed, because
+            /// the scan has no engine to run on. That turn used to be reported
+            /// as "this turn's content is under a local-only privacy boundary",
+            /// which is false and sends the user looking for a glob that does
+            /// not exist.
+            ///
+            /// This drives `run_prompt_turn` itself rather than the sentence
+            /// helper: what is being pinned is that the cause survives the whole
+            /// journey — choke point, `BlockCause`, the transport seam's
+            /// `BlockDetail`, `ProviderError`, `HarnessError` — and reaches the
+            /// RPC error a client renders. Any hop that collapses it turns this
+            /// red at the end.
+            ///
+            /// No network is touched: the gate refuses the payload before
+            /// `inner.execute`, which is the same reason the boundary check
+            /// needs none.
+            #[tokio::test]
+            async fn a_scan_that_could_not_run_fails_the_turn_saying_so_not_blaming_a_boundary() {
+                const SENTINEL: &str = "sk-ZZQUUXSENTINELCREDENTIAL0123";
+
+                // Remote-only: a bound `build` tier, the switch on, no engine.
+                let runtime = Arc::new(runtime_without_an_engine(offline_endpoints(opted_in(
+                    config(),
+                ))));
+                runtime.local_available.store(false, Ordering::SeqCst);
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let err = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        format!("please summarize {SENTINEL} for me"),
+                    )
+                    .await
+                    .expect_err("a scan that cannot run must fail the turn closed");
+
+                assert_eq!(err.code, error_code::PRIVACY_BLOCKED);
+                assert!(
+                    err.message.contains("the redaction scan could not run"),
+                    "the user must be told the scan could not run: {}",
+                    err.message
+                );
+                // The discriminating half: this is the sentence that used to be
+                // emitted here, and emitting it again turns this red.
+                assert!(
+                    !err.message.contains("local-only privacy boundary"),
+                    "a scan-unavailable block must not be reported as a boundary \
+                     block: {}",
+                    err.message
+                );
+                assert!(
+                    !err.message.contains("found"),
+                    "nothing looked, so nothing was found: {}",
+                    err.message
+                );
+                // BR-6: the sentence names a cause, never the payload.
+                assert!(
+                    !err.message.contains("QUUXSENTINEL") && !err.message.contains(SENTINEL),
+                    "no payload content may reach a turn-failure sentence: {}",
+                    err.message
+                );
+            }
+
+            /// The non-vacuity twin: the **same** turn with the switch off
+            /// reaches the provider instead of failing closed.
+            ///
+            /// Without it, the test above would pass just as well against a
+            /// daemon that refused every remote turn for some unrelated reason
+            /// and happened to word it this way. The turn here fails — there is
+            /// no server at the fixture's endpoint — but it fails as a
+            /// *provider* problem, with no privacy sentence anywhere in it.
+            #[tokio::test]
+            async fn the_same_turn_with_the_switch_off_is_not_blocked_at_all() {
+                let runtime = Arc::new(runtime_without_an_engine(offline_endpoints(config())));
+                runtime.local_available.store(false, Ordering::SeqCst);
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let err = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        "please summarize src/main.rs for me".to_owned(),
+                    )
+                    .await
+                    .expect_err("the fixture endpoint answers nothing");
+
+                assert_ne!(
+                    err.code,
+                    error_code::PRIVACY_BLOCKED,
+                    "with the switch off nothing inspects the payload: {}",
+                    err.message
+                );
+                assert!(
+                    !err.message.contains("redaction scan"),
+                    "an un-opted-in machine must not mention a scan: {}",
+                    err.message
+                );
+            }
+
+            /// **The Redaction cause, through the real turn path** — the mirror
+            /// of the ScanUnavailable leg above.
+            ///
+            /// Same journey, and the point is the same: the cause has to survive
+            /// choke point → `BlockCause` → the transport seam's `BlockDetail` →
+            /// `ProviderError` → `HarnessError` and reach a surface a person
+            /// reads. Any hop that collapses it turns this red.
+            ///
+            /// **Which surface, and why it is this one.** The two turn-*failure*
+            /// sentences are unreachable for a Redaction block by construction:
+            /// `unrerouteable_block_sentence` needs no engine loaded, and with
+            /// no engine the scan cannot run, so the cause is `ScanUnavailable`
+            /// rather than `Redaction`; `failed_reroute_block_sentence` needs
+            /// the local reroute to be blocked too, and a local route has no
+            /// choke point to block at. The reachable surface is the third one —
+            /// `reroute_after_block_reason`, carried on the `route_decided` of
+            /// the reroute — which is also the one a user actually meets, since
+            /// the turn recovers and the failure sentences never fire.
+            #[tokio::test]
+            async fn a_redaction_block_reaches_the_reroute_sentence_naming_redaction() {
+                const SENTINEL: &str = "sk-ZZQUUXSENTINELCREDENTIAL0123";
+
+                let engine = CountingEngine::answering("NONE");
+                let runtime = Arc::new(runtime(
+                    offline_endpoints(opted_in(config())),
+                    &engine,
+                    true,
+                ));
+                let events = Arc::new(EventBus::new());
+                let mut sub = events.subscribe(64);
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let _ = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        format!("please summarize {SENTINEL} for me"),
+                    )
+                    .await;
+
+                let reasons: Vec<String> = announced(&mut sub)
+                    .into_iter()
+                    .map(|rd| rd.reason)
+                    .collect();
+                let reroute = reasons
+                    .iter()
+                    .find(|reason| reason.contains("remote egress refused"))
+                    .unwrap_or_else(|| {
+                        panic!("no reroute was announced; route_decided reasons: {reasons:?}")
+                    });
+
+                assert!(
+                    reroute.contains("found sensitive content"),
+                    "the reroute must name redaction as the cause: {reroute}"
+                );
+                // The discriminating half, in both directions.
+                assert!(
+                    !reroute.contains("local-only privacy boundary"),
+                    "a redaction block is not a boundary block: {reroute}"
+                );
+                assert!(
+                    !reroute.contains("could not run"),
+                    "the scan DID run and DID find something: {reroute}"
+                );
+                // BR-6: the sentence names a cause, never the payload.
+                assert!(
+                    !reroute.contains("QUUXSENTINEL") && !reroute.contains(SENTINEL),
+                    "no payload content may reach a routing sentence: {reroute}"
+                );
+            }
+
+            // -- what a block does to the SESSION (REQ-544 C-2 × BR-3) -------
+
+            /// **A scan that could not run refuses the payload and leaves the
+            /// session alone.**
+            ///
+            /// This is the turn path's half of the rule the sink test states
+            /// (`a_scan_unavailable_block_refuses_the_payload_without_pinning_the_session`),
+            /// driven through `run_prompt_turn` so the gate really is the thing
+            /// deciding.
+            ///
+            /// Why it matters here specifically: with `redact = true` and no
+            /// local tier, **every** remote turn is `ScanUnavailable`. If that
+            /// pinned the session, a machine in the configuration this daemon
+            /// most expects — remote-only, switch on — would taint itself on its
+            /// first turn and stay tainted, and a user whose engine finished
+            /// downloading thirty seconds later would still be routed local for
+            /// the rest of the session. The block is per-payload; the taint is
+            /// forever.
+            #[tokio::test]
+            async fn a_scan_unavailable_turn_does_not_pin_the_session() {
+                let runtime = Arc::new(runtime_without_an_engine(offline_endpoints(opted_in(
+                    config(),
+                ))));
+                runtime.local_available.store(false, Ordering::SeqCst);
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let err = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        "please summarize src/main.rs for me".to_owned(),
+                    )
+                    .await
+                    .expect_err("a scan that cannot run must fail the turn closed");
+
+                // Non-vacuity: this really was the scan-unavailable block and
+                // not some other failure that never reached the taint arm.
+                assert_eq!(err.code, error_code::PRIVACY_BLOCKED);
+                assert!(
+                    err.message.contains("the redaction scan could not run"),
+                    "{}",
+                    err.message
+                );
+                assert!(
+                    !runtime.session_taint.is_tainted(&session.session_id),
+                    "a transient scanner outage must not permanently pin the \
+                     session to the local tier"
+                );
+            }
+
+            /// The discriminating twin: a scan that **found** something does
+            /// pin, because that is C-2's case one layer in — the payload
+            /// carried a credential, and the model that wrote it can restate it
+            /// next turn.
+            ///
+            /// Same runtime shape as the test above, same entry point; what
+            /// changes is that an engine is loaded (so the scan runs) and the
+            /// prompt carries a pattern-shaped credential (so it finds one).
+            /// The config declares no boundaries, so `context_is_sensitive`
+            /// cannot be what marked it.
+            #[tokio::test]
+            async fn a_redaction_block_does_pin_the_session() {
+                let engine = CountingEngine::answering("NONE");
+                let runtime = Arc::new(runtime(
+                    offline_endpoints(opted_in(config())),
+                    &engine,
+                    true,
+                ));
+                assert!(
+                    runtime
+                        .config
+                        .lock()
+                        .expect("config mutex")
+                        .boundaries
+                        .is_empty(),
+                    "no boundaries, so `context_is_sensitive` cannot be what pins"
+                );
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let _ = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        "please summarize sk-ABCDEFGHIJKLMNOPQRSTUVWX for me".to_owned(),
+                    )
+                    .await;
+
+                assert!(
+                    runtime.session_taint.is_tainted(&session.session_id),
+                    "a payload the scan found a credential in must pin the session, \
+                     or the next turn is free to send the model's paraphrase of it \
+                     to the same provider"
                 );
             }
         }

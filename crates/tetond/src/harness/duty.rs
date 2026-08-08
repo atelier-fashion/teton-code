@@ -122,6 +122,163 @@
 //! | a duty module takes an `Egress` of its own (BR-6) | [`tests::no_duty_module_carries_any_of_the_seams_concerns`] |
 //! | the choke point stops pinning the session it refused | `runtime::tests::dispatch::a_duty_refused_at_the_choke_point_taints_its_session`, `…::an_unattributable_privacy_block_pins_no_session` |
 //!
+//! ## REQ-562 — the sixth caller, and the gate it is called from
+//!
+//! `redact` reaches this seam from the egress choke point rather than from the
+//! harness (ADR-1), so its rows are about the *wiring*, not about a call site
+//! inside a turn. The rows immediately below are TASK-070's, written from the
+//! wiring as it was built; the AC-8 mutations were **applied and observed** by
+//! TASK-071 and are recorded in their own table after them, one of them green.
+//!
+//! | Mutation | Fails |
+//! |---|---|
+//! | the gate hook moves **above** the provenance early-return in [`Egress::send`](crate::egress::Egress::send) | `egress::tests::a_payload_refused_by_provenance_is_never_scanned` — AC-11's ordering, by scanner call count |
+//! | `Egress::send` forwards on a `Block` decision (the permissive-guard mutation, AC-8a) | `egress::tests::an_unavailable_scan_blocks_the_send_and_says_it_could_not_run`, `…::a_high_confidence_finding_blocks_with_its_kind_span_and_locus` |
+//! | `block_cause` reports `ScanUnavailable` for a findings verdict, or `Redaction` for an unavailable one | `egress::tests::a_redaction_block_reports_the_first_high_finding_and_never_a_low_one`, and both block tests by `cause` |
+//! | the gate is installed unconditionally, ignoring `[privacy] redact` | `runtime::tests::dispatch::redact::off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine` — the off leg, by engine call count |
+//! | `redact_route` grows a session-taint arm (the "uniformity fix" ADR-3 forbids) | nothing turns red, and that is the point: the arm cannot change the answer, which is what `runtime::tests::dispatch::redact::a_tainted_session_resolves_redact_exactly_as_a_clean_one_does` pins from the other direction |
+//! | `redact_route` falls through to the squatting provider when `local_tier_id` yields nothing | `runtime::tests::dispatch::redact::a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote` |
+//! | `redact_route` treats an unresolved route as clean instead of unresolved | `runtime::tests::dispatch::redact::a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan` |
+//! | `build_duty_route` stops installing the gate on a remotely bound duty's choke point | [`tests::a_remote_duty_send_is_scanned_by_the_choke_points_gate`] (at the seam) |
+//! | `mcp_egress` stops installing the gate on the MCP choke point | `runtime::tests::dispatch::redact::an_mcp_tool_call_crosses_the_gate_when_redact_is_on`. **This was GREEN before that fixture existed** — the attachment lived inside `build_tools`, reachable only through `HttpTransport::new()` and a real socket, so deleting it left the whole suite passing. The transport is a parameter of `mcp_egress` now precisely so the construction is drivable from a test |
+//! | the forward path rebuilds the request from the scanned text instead of passing it through | `egress::tests::a_low_only_or_clean_verdict_forwards_the_exact_bytes`, `…::the_gate_reads_the_exact_bytes_that_would_go_on_the_wire` (AC-9) |
+//! | the gate arm keeps the report **call** and drops its **effect** — `for _line in redact::forwarded_findings_report(&verdict) {}` | `egress::tests::the_gate_arm_reports_a_forwarded_findings_verdict`. Applied to a freshly built workspace, observed (716 passed / 1 failed), reverted. The needle used to be the call alone, which this mutation satisfies; it now covers the whole statement, `eprintln!` included, over whitespace-normalized source |
+//! | the gate hook is placed after `inner.execute`, or metering moves ahead of it | `egress::tests::a_blocked_send_bills_nothing_while_an_allowed_one_still_bills` |
+//! | either taint gate pins the session on `ScanUnavailable` (`=> true`) | `runtime::tests::dispatch::{a_scan_unavailable_block_refuses_the_payload_without_pinning_the_session, the_two_taint_gates_agree_cause_for_cause}` and `…::redact::a_scan_unavailable_turn_does_not_pin_the_session` — applied to a freshly built workspace, 694 passed / 3 failed, reverted. **The gates were added by TASK-072**: before them both sites pinned unconditionally, so a 120-second engine stall permanently routed the rest of the session local on the strength of a fact nobody established |
+//!
+//! ### REQ-562 AC-8 — the mutations, applied and observed (TASK-071, TASK-072)
+//!
+//! Each was applied to a freshly built workspace (`cargo build --workspace`
+//! first — LESSON-489's sibling trap), run, and reverted. The diffs are recorded
+//! exactly, because a mutation nobody can reproduce is a claim rather than a
+//! check.
+//!
+//! | # | Mutation (exact diff) | Turns red |
+//! |---|---|---|
+//! | **(a)** permissive unavailable | `egress/redact.rs`, `decide`: `Outcome::Unavailable => EgressDecision::Block` → `=> EgressDecision::Forward` | **12 lib + 4 integration.** `egress::redact::tests::{confidence_drives_the_egress_decision, an_over_cap_payload_is_unavailable_and_blocks_never_forwards, an_over_cap_payload_carrying_a_credential_still_reports_could_not_scan}`, `egress::tests::an_unavailable_scan_blocks_the_send_and_says_it_could_not_run`, `harness::redact::tests::{an_unresolved_route_is_unavailable_not_clean, an_engine_failure_is_unavailable_not_clean, an_unreadable_answer_blocks_rather_than_passing_as_clean, an_over_cap_payload_is_unavailable_before_any_model_call, a_scan_that_overruns_the_deadline_is_unavailable}`, `runtime::tests::dispatch::redact::{a_machine_with_no_engine_loaded_blocks_rather_than_passing_the_scan, a_squatted_local_tier_id_leaves_the_scan_unavailable_never_remote, a_scan_that_could_not_run_fails_the_turn_saying_so_not_blaming_a_boundary}`, and `tests/redact_egress.rs::{with_no_local_tier_the_payload_is_blocked_unscanned_and_nothing_claims_otherwise, a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call, a_remote_provider_squatting_the_local_id_never_receives_the_scan, an_engine_backed_local_tier_under_another_id_still_serves_the_scan}` |
+//! | **(b)** unbounded scan input (BR-7) | `egress/redact.rs`, `pattern_verdict`: delete the `if text.len() > REDACT_INPUT_MAX_BYTES { return RedactionVerdict::unavailable(); }` guard | **4 lib + 1 integration.** `egress::redact::tests::{an_over_cap_payload_is_unavailable_and_blocks_never_forwards, an_over_cap_payload_carrying_a_credential_still_reports_could_not_scan}`, `harness::redact::tests::{an_over_cap_payload_is_unavailable_before_any_model_call, an_over_cap_payload_carrying_a_credential_still_says_the_scan_could_not_run}`, `tests/redact_egress.rs::a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` |
+//! | **(c)** a finding carries its matched text, threaded to the event | `egress/redact.rs`: `Finding` gains `text: String` (both constructors init `String::new()`) plus `fn carrying(self, &str) -> Self` and `fn text(&self) -> &str`; `pattern_pass` maps `Finding::pattern(..).carrying(&text[span])`; `harness/redact.rs`'s `read_findings` maps `Finding::model(..).carrying(&payload[span])`; `egress/mod.rs`'s gate arm builds `path` as `format!("{} ({})", redaction_locus(cause), finding.text())` | **2 lib + 2 integration.** `egress::redact::tests::a_finding_never_carries_the_matched_text` (the derived `Debug` starts rendering the secret), `egress::tests::a_high_confidence_finding_blocks_with_its_kind_span_and_locus`, `tests/redact_egress.rs::{no_emitted_surface_carries_the_sentinel, a_planted_credential_with_clean_provenance_is_blocked_and_the_event_names_redaction}`. **`teton_protocol::events::tests::a_redaction_cause_carries_only_a_kind_and_a_span` stays green** and it is right to: that test guards `BlockCause::Redaction`'s key set, and this variant of the mutation rides the text on `PrivacyBlock.path`, which is a `String` either way. The wire-key-set test covers the *other* variant (a new field on the cause); the sentinel sweep covers this one. Both are needed. |
+//! | **(d)** an id-based locality assertion, restored (BR-2) | two placements, see below | **RED at both layers** (one of them only after a fixture was added — see the note) |
+//! | **(e)** a prefix shape matches mid-word (the precision mutation) | `egress/redact.rs`, `scan_prefix_shape`: delete the `if !is_left_boundary(bytes, i) { i += 1; continue; }` guard | **3 lib, 0 integration.** `egress::redact::tests::{every_prefix_shape_requires_a_left_word_boundary, only_an_escape_that_decodes_to_a_non_word_character_is_a_boundary, the_pattern_pass_locates_each_shape_and_nothing_else}`. Re-applied to a freshly built workspace after the round-2 boundary rewrite, observed (708 passed / 3 failed), reverted. That **nothing else** turns red is the other half of the check: the boundary requirement loses no true positive, so every existing shape fixture stays green. `…::a_credential_at_the_start_of_a_json_encoded_line_is_still_found` stays green too, and correctly: it is a *recall* fixture, and deleting a precision guard cannot lose recall — its discriminating mutation is the opposite one, restoring the alphabet-relative predicate (below) |
+//! | **(e′)** the left boundary goes back to the shape's own body alphabet (`is_word_left: is_sk_body` / `is_upper_alnum`) instead of `is_ascii_alphanumeric`, and the string-escape exception is dropped | `egress::redact::tests::{a_credential_at_the_start_of_a_json_encoded_line_is_still_found, only_an_escape_that_decodes_to_a_non_word_character_is_a_boundary, the_pattern_pass_locates_each_shape_and_nothing_else}`. This is the direction that **shipped broken** in round 1: the scan reads the *serialized* body, where a content newline is backslash + `n`, so every credential at the start of a content line was preceded by a "word byte" and skipped — a JSON body with four line-start credentials detected exactly one |
+//!
+//! **(d) has two plausible homes, and on the first run only one of them was
+//! covered.** Both are red now:
+//!
+//! - **In `harness::redact::scan`** — `if route.provider() != Some("local") {
+//!   return RedactionVerdict::unavailable(); }` after the unresolved check.
+//!   **RED**: `tests/redact_egress.rs::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`
+//!   and `harness::redact::tests::a_scan_that_overruns_the_deadline_is_unavailable`.
+//! - **In `runtime::RedactionGateImpl::redact_route`** — the same comparison
+//!   between the resolve and the engine-slot read:
+//!   ```text
+//!   if provider_id != LOCAL_PROVIDER_ID {
+//!       return DutyRoute::unresolved(format!(
+//!           "The 'redact' category resolved to '{provider_id}', which is not the local tier."
+//!       ));
+//!   }
+//!   ```
+//!   **RED**: `runtime::tests::dispatch::redact::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`
+//!   (`left: Unavailable, right: Clean`). **On the first run this was GREEN** —
+//!   see immediately below, because the history is the reason the fixture exists.
+//!
+//! ## The green observation that produced the fixture (kept on the record)
+//!
+//! On TASK-071's first AC-8 pass the runtime-layer placement of (d) turned
+//! **nothing** red: `cargo test -p tetond --lib` reported 684 passed, 0 failed
+//! with the guard in place.
+//!
+//! `local_tier_id` returns the id of any provider declaring `kind = "local"`,
+//! which is very often *not* the string `local` — a user who writes
+//! `id = "on-device"` has a genuinely engine-backed tier under another name. An
+//! id comparison inside `RedactionGateImpl::redact_route` fails that machine's
+//! scan closed, and — since the gate sits on the synchronous send path — every
+//! one of its remote turns with it. The suite could not see it: every
+//! `runtime::tests::dispatch::redact` fixture built its router from a config
+//! whose local tier carried the canonical id, so the guard could never fire.
+//! `tests/redact_egress.rs::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`
+//! covered the same property one layer down — a real `Router` whose
+//! `local_provider_id` is `on-device`, driving the real `scan` — but
+//! `RedactionGateImpl` is private to this crate, so no integration test can
+//! reach the daemon's own copy of the resolver.
+//!
+//! The gap was reported first and closed second, in that order, by
+//! `runtime::tests::dispatch::redact::an_engine_backed_local_tier_under_another_id_still_serves_the_scan`:
+//! one config (`[[providers]] id = "on-device", kind = "local"`) and the
+//! assertion that the scan resolves, serves, and announces its route under that
+//! id. Re-running the identical mutation against a freshly built workspace after
+//! the fixture landed turns it red. The green observation is kept here rather
+//! than deleted: it is what the fixture is *for*, and a mutation table that only
+//! records reds cannot show which of its rows were ever load-bearing.
+//!
+//! ### REQ-562 round 3 — the model pass is chunked, and the mutations that pin it
+//!
+//! The scan's cap was one number doing two jobs: the engine's window *and* the
+//! bound on what could be scanned. Because the window (27,070 bytes) sits under
+//! `HarnessConfig::context_budget_bytes` (32,768), every context-budget-full
+//! remote turn assembled a body the scan refused, and blocked. The model pass
+//! now cuts the payload into overlapping windows and scans each one
+//! ([`crate::harness::redact::chunk_ranges`]); the pattern pass, which has no
+//! window, still sweeps the whole payload in one piece.
+//!
+//! Three properties carry the change, and each has a mutation. All three were
+//! applied to a **freshly built workspace** (`cargo build --workspace` first —
+//! LESSON-489), run with `--no-fail-fast`, and reverted.
+//!
+//! | # | Mutation (exact diff) | Turns red |
+//! |---|---|---|
+//! | **(f)** the overlap is removed — `chunk_ranges`: `start = end - REDACT_CHUNK_OVERLAP_BYTES;` → `start = end;` | **5 lib.** `harness::redact::tests::{a_secret_straddling_a_chunk_boundary_is_still_found_whole_in_the_overlap, a_secret_inside_the_overlap_is_reported_once_not_once_per_chunk, the_chunker_covers_the_payload_with_overlapping_windows_on_char_boundaries, the_chunker_never_cuts_more_chunks_than_the_derived_ceiling, an_over_cap_payload_is_unavailable_before_any_model_call}` (727 passed / 5 failed). The straddling fixture is the discriminator: its secret has **no pattern shape**, so with abutting chunks neither half locates it and the finding vanishes. A `sk-…` fixture here would stay green, because the pattern pass never chunked |
+//! | **(g)** a chunk that could not run is skipped instead of failing the scan — `scan`: both `else { return RedactionVerdict::unavailable_with_evidence(established()); }` arms in the chunk loop → `else { continue; }` | **5 lib.** `harness::redact::tests::{a_chunk_that_could_not_run_makes_the_whole_verdict_unavailable, a_credential_the_pattern_pass_established_survives_a_failed_chunk, an_engine_failure_is_unavailable_not_clean, an_unreadable_answer_blocks_rather_than_passing_as_clean, a_scan_that_overruns_the_deadline_is_unavailable}` (728 passed / 5 failed). This is the permissive direction with a new door: the composed verdict reads `Clean` → **Forward** for a payload part of which no model saw — a truncate-and-scan in different clothes (BR-7, LESSON-447). The single-chunk fixtures turn red too, and that is the point: with one chunk, "skip the chunk" *is* "skip the scan". (The second fixture was named `…does_not_outrank_a_chunk_that_failed` when this row was recorded; it was renamed with the round-4 reversal below, and the mutation still reddens it for the same reason — the outcome, not the cause, is what it asserts here) |
+//! | **(h)** the chunk-relative span is not translated — `read_findings`: `locate(chunk, quoted).map(\|span\| span.start + offset..span.end + offset)` → `locate(chunk, quoted)` | **3 lib.** `harness::redact::tests::{a_model_finding_from_the_second_chunk_carries_a_payload_absolute_span, a_secret_straddling_a_chunk_boundary_is_still_found_whole_in_the_overlap, a_secret_inside_the_overlap_is_reported_once_not_once_per_chunk}` (730 passed / 3 failed). The span still *looks* well formed — right length, inside the payload — and points thousands of bytes early, at filler the model never mentioned. The assertion that catches it is on the bytes the span selects (`&payload[span] == ADDRESS`), never on the numbers |
+//! | **(i)** the render guard is hoisted out of the chunk loop and applied to the whole payload | **10 lib + 1 integration.** Every chunked fixture, plus `tests/redact_egress.rs::a_context_budget_full_payload_is_scanned_across_windows_and_forwards` (723 passed / 10 failed; 9 passed / 1 failed). A payload of several windows renders past a single window by construction, so a hoisted guard refuses every multi-chunk scan — the old collision, restored one layer in. Its subtler sibling (hoist it but measure only the first chunk) is red on `…::a_second_chunk_that_renders_past_the_window_is_refused_before_its_own_call`, whose call count is `1` precisely because neither `0` nor `2` is reachable with a per-chunk guard |
+//!
+//! **What did *not* change, and is worth saying because a reviewer will look
+//! for it.** `route_decided` fires once per [`DutyRoute::perform`], so an
+//! N-chunk scan announces N times. That is this seam's stated rule — "two
+//! oversized tool results are two routed model calls" — applied to a duty that
+//! now makes several calls per send, and it is honest: the events describe
+//! model calls, and a chunked scan really is several. Collapsing them would
+//! under-report exactly the sends that cost the most.
+//! `harness::redact::tests::a_multi_chunk_scan_announces_its_route_once_per_chunk`
+//! pins the count in both directions (one chunk → one, two chunks → two, a scan
+//! that never reaches a call → none), so a later "deduplicate the announcement"
+//! change has to argue with a test rather than slip past one.
+//!
+//! ### REQ-562 round 4 — a failed chunk no longer erases what the pattern pass found
+//!
+//! Round 3's composition rule was right about the *outcome* and wrong about the
+//! *cause*. The deterministic pass has no window and completes over the whole
+//! payload before the chunk loop starts, so a chunk failure would discard a
+//! finished High finding and report `ScanUnavailable` — which (correctly) does
+//! not pin the session. Net effect: one transient engine stall both mis-told the
+//! user "the scan could not run" about a payload where a credential *was* found,
+//! and unmade a session pin the deterministic pass had earned.
+//!
+//! The fix keeps the outcome (`Unavailable`, `scanned: false`, Block) and moves
+//! only what the block may say: the pattern pass's High findings ride the verdict
+//! as `RedactionVerdict::evidence`, and `egress::block_cause` reads them.
+//! Both mutations were applied to a **freshly built workspace** (LESSON-489),
+//! run with `--no-fail-fast`, and reverted.
+//!
+//! | # | Mutation (exact diff) | Turns red |
+//! |---|---|---|
+//! | **(j)** the cause ignores the evidence — `egress::block_cause`: `verdict.findings().iter().chain(verdict.evidence())` → `verdict.findings().iter()` | **1 lib.** `egress::tests::an_unavailable_verdict_names_a_credential_only_when_the_pattern_pass_found_one` (734 passed / 1 failed). This is the pre-fix behaviour restored exactly: the verdict still carries the finding, and the block still reports "could not run" — and with it goes the `Redaction` cause that is the *only* thing pinning the session, so the mutation is silently permissive one layer downstream |
+//! | **(k)** the scan mints no evidence — `scan`: all three `RedactionVerdict::unavailable_with_evidence(established())` in the chunk loop → `RedactionVerdict::unavailable()` | **1 lib.** `harness::redact::tests::a_credential_the_pattern_pass_established_survives_a_failed_chunk` (734 passed / 1 failed). The pair to (j) at the other end of the seam: (j) breaks the reading, (k) breaks the writing, and each is caught by the test on its own side. Its twin `a_clean_payload_whose_chunk_failed_still_reports_only_that_it_could_not_run` stays **green** under both, which is what makes it the discriminator rather than a second copy |
+//!
+//! ### REQ-562 round 4 — the declared bounds become enforced code
+//!
+//! Three bounds this REQ had written down but not checked. Each is a line, and
+//! each was mutated against a **freshly built workspace** (LESSON-489) with
+//! `--no-fail-fast`, then reverted.
+//!
+//! | # | Mutation (exact diff) | Turns red |
+//! |---|---|---|
+//! | **(l)** the scan-wide deadline is removed — `scan`: `tokio::time::timeout(DUTY_DEADLINE, async { … }).await` → the same block awaited bare, wrapped in `Ok(…)` so the `let-else` still typechecks | **1 lib.** `harness::redact::tests::a_scan_whose_chunks_each_answer_in_time_still_stops_at_one_scan_deadline` (736 passed / 1 failed). Only that one, and that is the design of the fixture: every other deadline test has a chunk that *overruns*, which the seam's per-call deadline catches on its own. The discriminating shape is a first chunk answering at ⅔ of the budget and a second that stalls — both inside the per-call bound, `1⅔ × DUTY_DEADLINE` of total wait, and only the elapsed assertion sees it |
+//! | **(m)** the chunk ceiling never refuses — `past_the_chunk_ceiling`: `ranges.len() > REDACT_MAX_CHUNKS` → `false` | **1 lib.** `harness::redact::tests::the_chunk_ceiling_refuses_a_cut_past_it` (736 passed / 1 failed). Only the unit test, necessarily: the guard is unreachable through `scan` today because the total cap *is* `REDACT_MAX_CHUNKS` windows, which is stated in the fixture rather than left for a reader to wonder about. It is the bound BR-7 asks for, kept for the day one of the four derived constants moves |
+//! | **(n)** the stride goes to zero — `REDACT_CHUNK_OVERLAP_BYTES: 256` → `REDACT_CHUNK_MAX_BYTES` | **The build.** `const _: () = assert!(REDACT_CHUNK_STRIDE_BYTES > 0)` fails to evaluate, naming the stride. Recorded honestly: `REDACT_MAX_CHUNKS`'s `div_ceil` *also* fails on this input, as a divide-by-zero two derivations away from the loop that would hang — so today the assert is the better error rather than the only one, and it is what still holds if that derivation changes shape |
+//! | **(o)** the cross-chunk quote dedupe is removed — `merge`: the `quoted.contains(&bytes)` guard and its `push` deleted | **1 lib.** `harness::redact::tests::the_same_quote_located_in_two_chunks_is_one_finding_and_one_report_line` (738 passed / 1 failed). Span overlap does not reach this: the two occurrences are at genuinely different offsets, so without the byte comparison the report grows one line per *mention* of a secret the user fixes in one place |
+//! | **(p)** the pin is announced on every block, not on the transition — the sink's `&& self.taint.mark(session_id)` → `&& { self.taint.mark(session_id); true }` | **Nothing.** Recorded as a **gap**, not a pass: `mark`'s transition report and `taint_pin_line`'s wording are both pinned, but nothing in the suite captures the daemon's stderr, so a call site that stopped gating on the transition would print one line per blocked payload undetected. `template_fallback_line` has the identical limit — closing it is a stderr-capture harness, not another assertion |
+//!
 //! ## What draining past the ceiling buys, and why it is still done
 //!
 //! Past the ceiling [`RemoteDuty::perform`] stops *accumulating* but keeps
@@ -267,7 +424,17 @@ impl DutyKind {
 /// request, as the thing that actually bounds the answer. Erring the other way
 /// would make `max_tokens` the real bound and the declared ceiling decorative,
 /// which is the shape LESSON-443 warns about: a guard that can never fire.
-const DUTY_REQUEST_BYTES_PER_TOKEN: usize = 2;
+///
+/// **An estimate, not a bound.** Real BPE on prose and code runs nearer four
+/// bytes per token, but dense punctuation, base64 and CJK can all run *under*
+/// two — so a byte count divided by this can under-state a real token count.
+/// That is safe on the output side, where the byte ceiling binds regardless.
+/// It is what makes REQ-562's derived per-chunk cap a *filter* rather than a
+/// proof: see
+/// [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES),
+/// which reads this constant rather than restating it, and the measured render
+/// guard in [`crate::harness::redact::scan`] that stands behind it, per chunk.
+pub(crate) const DUTY_REQUEST_BYTES_PER_TOKEN: usize = 2;
 
 /// Ceiling on the `max_tokens` any duty asks a provider for.
 ///
@@ -765,7 +932,7 @@ pub(crate) mod testing {
     };
 
     use super::{DutyKind, DutyRoute};
-    use crate::egress::{Egress, NoopSink};
+    use crate::egress::{Egress, NoopSink, RedactionGate};
 
     /// The request bodies a [`CaptureTransport`] was handed, newest last.
     ///
@@ -833,7 +1000,7 @@ pub(crate) mod testing {
                 })
                 .await
                 .map_err(|err| match err {
-                    TransportError::PrivacyBlocked => ProviderError::PrivacyBlocked,
+                    TransportError::PrivacyBlocked(detail) => ProviderError::PrivacyBlocked(detail),
                     _ => ProviderError::Transport,
                 })?;
             // `repeat` models a provider that ignores `max_tokens`: the same
@@ -858,9 +1025,30 @@ pub(crate) mod testing {
         reply: &str,
         repeat: usize,
     ) -> (DutyRoute, Sent) {
+        remote_duty_route_gated(kind, boundaries, reply, repeat, None)
+    }
+
+    /// The same route, optionally with a redaction gate at its choke point —
+    /// which is how the daemon builds it when `[privacy] redact` is on
+    /// (REQ-562 TASK-070).
+    ///
+    /// `None` is the shape every pre-REQ-562 caller gets, and it is the *same*
+    /// construction rather than a parallel one: a duty route built without a
+    /// gate has to keep behaving exactly as it did, and that is only checkable
+    /// if both come out of one builder.
+    pub(crate) fn remote_duty_route_gated(
+        kind: DutyKind,
+        boundaries: Vec<PrivacyBoundary>,
+        reply: &str,
+        repeat: usize,
+        gate: Option<Arc<dyn RedactionGate>>,
+    ) -> (DutyRoute, Sent) {
         let transport = CaptureTransport::default();
         let sent = Arc::clone(&transport.sent);
-        let egress = Egress::new(transport, boundaries, Arc::new(NoopSink));
+        let mut egress = Egress::new(transport, boundaries, Arc::new(NoopSink));
+        if let Some(gate) = gate {
+            egress = egress.with_redaction_gate(gate);
+        }
         let route = DutyRoute::remote(
             kind,
             "frontier",
@@ -901,14 +1089,23 @@ mod tests {
     use teton_inference::{Completion, Engine, EngineError, GenParams};
     use teton_protocol::Category;
 
-    /// The five duty modules — where ADR-3 allows per-category source to live,
-    /// and the only place it may.
-    const DUTY_MODULES: [&str; 5] = [
+    /// The duty modules — where ADR-3 allows per-category source to live, and
+    /// the only place it may.
+    ///
+    /// A census, not a bound: REQ-561 shipped five and REQ-562 adds `redact` as
+    /// the sixth caller of this seam, so a task that wires a new duty adds its
+    /// module here and the scans below start covering it. What the list is *for*
+    /// is the rule beneath it — one `DutyKind` per duty module and no others,
+    /// and no duty module carrying any of the seam's concerns — which is
+    /// unchanged by how many entries it has. (`redact`'s call site is not in the
+    /// harness at all: it is the egress choke point, REQ-562 ADR-1.)
+    const DUTY_MODULES: [&str; 6] = [
         "harness/digest.rs",
         "harness/triage.rs",
         "harness/shell_duty.rs",
         "harness/title.rs",
         "harness/compact.rs",
+        "harness/redact.rs",
     ];
 
     /// The one place in the daemon that maps text to a routing-category *name*,
@@ -1420,7 +1617,7 @@ mod tests {
                 assert!(
                     !src.contains(needle),
                     "BR-6 VIOLATION: `{module}` contains `{needle}` — {meaning}. The seam \
-                     owns that concern once, for all five duties (ADR-3)."
+                     owns that concern once, for every duty (ADR-3)."
                 );
             }
             assert!(
@@ -1429,8 +1626,8 @@ mod tests {
             );
         }
 
-        // And exactly five duties exist, each constructed exactly once. A sixth
-        // `DutyKind` built somewhere else is a duty nobody declared.
+        // And one `DutyKind` per duty module, each constructed exactly once. One
+        // built anywhere else is a duty nobody declared.
         let built: Vec<String> = code()
             .into_iter()
             .flat_map(|(rel, src)| std::iter::repeat_n(rel, count(&src, "DutyKind::new(")))
@@ -1505,8 +1702,7 @@ mod tests {
         assert!(
             checked >= DUTY_MODULES.len(),
             "the scan found only {checked} duty-category mentions, which is fewer than \
-             the five `DutyKind` constants that must exist — it is reading the wrong \
-             thing"
+             the `DutyKind` constants that must exist — it is reading the wrong thing"
         );
 
         // ADR-10's own claim, and the sharpest one: the tool layer — where a
@@ -1526,8 +1722,7 @@ mod tests {
         }
     }
 
-    /// Whether `line` names one of the five duty categories **on the routing
-    /// type**.
+    /// Whether `line` names one of the duty categories **on the routing type**.
     ///
     /// The qualifier matters and is read rather than assumed. Three other enums
     /// in this workspace carry the same variant names and none of them routes
@@ -1538,7 +1733,7 @@ mod tests {
     /// surface. Only `teton_core`'s `Category` — imported here and, in
     /// `router.rs`, aliased `CoreCategory` — can reach a router.
     fn names_a_duty_category(line: &str) -> bool {
-        const DUTIES: [&str; 5] = ["Digest", "Triage", "Shell", "Title", "Compact"];
+        const DUTIES: [&str; 6] = ["Digest", "Triage", "Shell", "Title", "Compact", "Redact"];
         const ROUTING_TYPE: [&str; 2] = ["Category", "CoreCategory"];
         line.match_indices("Category::").any(|(at, _)| {
             let qualifier: String = line[..at + "Category".len()]
@@ -1655,5 +1850,106 @@ mod tests {
             assert!(SHELL_DUTY.ceiling_bytes() < DIGEST_DUTY.ceiling_bytes());
             assert!(DIGEST_DUTY.ceiling_bytes() < COMPACT_DUTY.ceiling_bytes());
         }
+    }
+
+    // =======================================================================
+    // REQ-562 TASK-070 — every remote path crosses the redaction gate.
+    // =======================================================================
+
+    /// A gate that records every payload it is shown and answers `verdict`.
+    struct RecordingGate {
+        verdict: crate::egress::RedactionVerdict,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl RecordingGate {
+        fn new(verdict: crate::egress::RedactionVerdict) -> Arc<Self> {
+            Arc::new(Self {
+                verdict,
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().expect("gate poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::egress::RedactionGate for RecordingGate {
+        async fn scan(&self, payload: &str) -> crate::egress::RedactionVerdict {
+            self.seen
+                .lock()
+                .expect("gate poisoned")
+                .push(payload.to_owned());
+            self.verdict.clone()
+        }
+    }
+
+    /// **REQ-562 ADR-1.** A remotely bound duty reaches the network through the
+    /// same [`Egress::send`] a turn does, so with the gate installed its prompt
+    /// is scanned too — and a blocking verdict stops it before a byte leaves.
+    ///
+    /// `boundaries` is deliberately **empty**: the provenance inspection must
+    /// not be what refuses this, or the test would pass against a choke point
+    /// with no gate at all. The two legs share everything but the verdict, so
+    /// what discriminates them is the scan and nothing else.
+    #[tokio::test]
+    async fn a_remote_duty_send_is_scanned_by_the_choke_points_gate() {
+        use crate::egress::redact::{Finding, FindingKind, RedactionVerdict};
+        use crate::harness::duty::testing;
+        use crate::harness::DIGEST_DUTY;
+
+        const PROMPT: &str = "summarize this tool result for the turn";
+
+        // Blocked: the duty fails and the wire is empty.
+        let blocking = RecordingGate::new(RedactionVerdict::from_findings(vec![Finding::pattern(
+            FindingKind::Credential,
+            0..4,
+        )]));
+        let (route, sent) = testing::remote_duty_route_gated(
+            DIGEST_DUTY,
+            Vec::new(),
+            "a summary",
+            1,
+            Some(blocking.clone()),
+        );
+        let err = route
+            .perform(PROMPT, &Provenance::empty())
+            .await
+            .expect_err("a blocking verdict must refuse the duty's send");
+        assert!(
+            testing::wire(&sent).is_empty(),
+            "not a byte of a blocked duty prompt may leave: {}",
+            testing::wire(&sent)
+        );
+        assert!(!err.is_empty(), "the call site is handed a sentence");
+        let scanned = blocking.seen();
+        assert_eq!(scanned.len(), 1, "the duty's send was scanned exactly once");
+        assert!(
+            scanned[0].contains(PROMPT),
+            "and what it scanned is the duty's own outbound body: {}",
+            scanned[0]
+        );
+
+        // Allowed: the same route, the same prompt, a clean verdict — and now
+        // the prompt really is on the wire, which is what makes the leg above
+        // an assertion about the gate rather than about a route that cannot
+        // send at all.
+        let clean = RecordingGate::new(RedactionVerdict::clean());
+        let (route, sent) = testing::remote_duty_route_gated(
+            DIGEST_DUTY,
+            Vec::new(),
+            "a summary",
+            1,
+            Some(clean.clone()),
+        );
+        let answer = route
+            .perform(PROMPT, &Provenance::empty())
+            .await
+            .expect("a clean verdict forwards");
+        assert_eq!(answer, "a summary");
+        assert!(testing::wire(&sent).contains(PROMPT));
+        assert_eq!(clean.seen().len(), 1);
     }
 }

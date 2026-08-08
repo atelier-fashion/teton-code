@@ -60,6 +60,65 @@ impl std::fmt::Debug for TransportResponse {
     }
 }
 
+/// Which inspection inside the egress choke point refused a payload, in the
+/// only vocabulary this seam can carry.
+///
+/// ## Why this exists rather than the daemon's own value
+///
+/// The authoritative one is `teton_protocol::events::BlockCause`, and it says
+/// more: a redaction block there carries the finding's kind and byte span. It
+/// cannot come through here. This crate performs no I/O and declares no
+/// protocol dependency — the manifest comment at the top of `Cargo.toml` is the
+/// load-bearing constraint that keeps the single choke point enforceable — so a
+/// `BlockCause` crossing into it would be a new dependency edge bought for a
+/// sentence.
+///
+/// So the cause crosses as three values and nothing more: **enough to choose
+/// the right sentence, not enough to say anything about the payload**. That the
+/// span does not fit through this seam is a feature — the `privacy_block` event
+/// is where a locatable finding belongs, and it goes there directly from the
+/// choke point.
+///
+/// ## No `Default`, deliberately
+///
+/// There is exactly one construction site (`tetond`'s
+/// `EgressError::into_transport_error`), which maps a real cause. A default
+/// would let a later call site write `PrivacyBlocked(…default…)` and silently
+/// report a redaction block as a boundary — the precise untruth REQ-562 BR-3
+/// exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockDetail {
+    /// Content provenance intersected a declared `local-only` boundary — the
+    /// block REQ-544 shipped.
+    Boundary,
+    /// The redaction scan (REQ-562) found something in the outbound payload.
+    Redaction,
+    /// The redaction scan **could not run** and the payload was blocked
+    /// unscanned (REQ-562 BR-3, fail closed). This says nothing about what the
+    /// payload contains, because nothing looked.
+    ScanUnavailable,
+}
+
+impl std::fmt::Display for BlockDetail {
+    /// The **log** clause, for the transport and provider error Displays.
+    ///
+    /// Not the user's sentence: a surface that has a person reading it composes
+    /// its own wording from the value (the daemon's turn-failure sentence and
+    /// the CLI's `privacy_block` line both do). What is fixed here is the rule
+    /// those surfaces also follow — the scan-unavailable clause says the scan
+    /// could not run, never that it found something, and no clause can carry
+    /// payload content because this type has no field to carry it in.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let clause = match self {
+            // Unchanged from REQ-544: this is the wording already in every log.
+            BlockDetail::Boundary => "content is under a local-only privacy boundary",
+            BlockDetail::Redaction => "the redaction scan found sensitive content",
+            BlockDetail::ScanUnavailable => "the redaction scan could not run",
+        };
+        f.write_str(clause)
+    }
+}
+
 /// A transport-level failure — i.e. one that occurs before any HTTP status is
 /// known. HTTP 4xx/5xx are *not* transport errors; they arrive as a
 /// [`TransportResponse::status`].
@@ -74,15 +133,22 @@ pub enum TransportError {
     /// A lower-level I/O error while reading the stream.
     #[error("transport I/O error")]
     Io,
-    /// The egress choke point refused the request because its content provenance
-    /// intersected a `local-only` privacy boundary (BR-1). This is **not** a
-    /// network fault and must never be retried: no connection was attempted, and
-    /// the authoritative `privacy_block` event has already fired at the choke
-    /// point. Distinct from [`TransportError::Connect`] precisely so the daemon
-    /// can reroute the turn to the local tier rather than retry the blocked
-    /// provider (REQ-544 M-1).
-    #[error("egress refused: content is under a local-only privacy boundary")]
-    PrivacyBlocked,
+    /// The egress choke point refused the request — because content provenance
+    /// intersected a `local-only` privacy boundary (BR-1), or because the
+    /// REQ-562 redaction scan blocked it. This is **not** a network fault and
+    /// must never be retried: no connection was attempted, and the
+    /// authoritative `privacy_block` event has already fired at the choke point.
+    /// Distinct from [`TransportError::Connect`] precisely so the daemon can
+    /// reroute the turn to the local tier rather than retry the blocked provider
+    /// (REQ-544 M-1).
+    ///
+    /// It carries a [`BlockDetail`] because *which* inspection refused it is
+    /// what the daemon's turn-failure sentence has to say (REQ-562 BR-3): a
+    /// scan that could not run and a scan that found a credential are different
+    /// problems with different fixes, and a single sentence for both sends the
+    /// user looking for the wrong thing.
+    #[error("egress refused: {0}")]
+    PrivacyBlocked(BlockDetail),
 }
 
 /// The one seam through which adapters reach the network (D-2). Implemented by

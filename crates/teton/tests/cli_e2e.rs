@@ -1718,17 +1718,27 @@ fn policy_show_renders_the_daemons_resolved_table() {
     // daemon's own call sites, so this also shows the CLI is rendering the
     // daemon's answer rather than a table of its own.
     //
-    // The marked example is `redact`, the one category REQ-561 leaves unwired
-    // (it is REQ-562's, because a model call inside the egress choke point needs
-    // its own spec). It replaced `compact` here when TASK-063 gave `compact` a
-    // call site — moved rather than dropped, because a test that only checks the
-    // *unmarked* side would pass just as well against a renderer that had
-    // forgotten how to print the marker at all.
-    let unreached = row(&shown, "redact").expect("a `redact` row");
-    assert!(
-        unreached.contains("declared, no call site yet"),
-        "an unreached category must be marked; row:\n{unreached}"
-    );
+    // **The marked set is now empty.** `redact` was the last one standing —
+    // REQ-561 left it unwired because a model call inside the egress choke point
+    // needed its own spec, and REQ-562 TASK-070 wired it — so this end of the
+    // assertion is now "nothing is marked", derived from the same place.
+    //
+    // That does cost this test something, and it is worth naming: with no
+    // unreached category left, a renderer that had simply forgotten how to print
+    // the marker would satisfy every `!contains("no call site")` here. That half
+    // is not dropped, it is re-homed to the layer where an unreached row can
+    // still be *constructed* —
+    // `main::tests::policy_show_marks_the_unreached_categories_and_the_judgment_default`
+    // renders a synthetic snapshot with `reached: false` and asserts the marker
+    // appears. A twelfth category that arrives unwired brings the e2e half back.
+    let redact_row = row(&shown, "redact").expect("a `redact` row");
+    for line in shown.lines() {
+        assert!(
+            !line.contains("no call site"),
+            "every declared category is dispatched on, so no row may carry the \
+             `declared, no call site yet` marker; row:\n{line}"
+        );
+    }
     let reached = row(&shown, "edit").expect("an `edit` row");
     assert!(
         !reached.contains("no call site"),
@@ -1814,13 +1824,38 @@ fn policy_show_renders_the_daemons_resolved_table() {
          \ntriage:\n{triage_row}\ncompact:\n{compact_row}"
     );
 
-    // AC-16's other half: `redact` transmits nothing today, and its row says so
-    // in one phrase rather than leaving a reader to join a content class at one
-    // end of the line to a marker at the other. A class printed alone reads as a
-    // live egress path.
+    // AC-16's other half, now on the other side of the line REQ-562 crossed.
+    // `redact` used to transmit nothing, and its row read "would send outbound
+    // payloads; declared, no call site yet" — the conditional verb and the
+    // marker in one phrase, so a class printed alone could not read as a live
+    // egress path. TASK-070 gave it a call site, so the marker is gone (asserted
+    // for every row above).
+    //
+    // **The verb stays conditional on this daemon, and that is the assertion
+    // rather than a regression** (REQ-562 report honesty; user decision,
+    // 2026-08-08). `[privacy] redact` is off by default (BR-10/OQ-3) and this
+    // fixture never sets it, so no gate is installed, nothing is scanned, and
+    // the present-tense "sends outbound payloads" this test used to require was
+    // a claim about work the daemon was not doing — the exact untruth AC-13
+    // forbids on the other surfaces. The row is now conditional *and* says
+    // which state it is in, so the two readings a user could otherwise not tell
+    // apart — "the switch is off" and "the binding is missing" — are distinct.
+    //
+    // The enabled leg is unit-covered rather than added here: flipping the
+    // switch means a second daemon boot with a different config, and it would
+    // put a real scan in front of every remote call in this suite. Both states
+    // render from one fixture in
+    // `main::tests::policy_show_reports_whether_the_redaction_scan_runs`.
     assert!(
-        unreached.contains("would send outbound payloads; declared, no call site yet"),
-        "`redact`'s class and its call-site marker must render adjacently; row:\n{unreached}"
+        redact_row.contains("would send outbound payloads"),
+        "with the scan off, `redact`'s row must not claim the present tense; \
+         row:\n{redact_row}"
+    );
+    assert!(
+        redact_row
+            .contains("content scan: disabled (default — enable with `[privacy] redact = true`)"),
+        "the row must say the scan is off and name the key that turns it on; \
+         row:\n{redact_row}"
     );
 
     // AC-12: the BR-9 declared default is configuration-visible, and the CLI

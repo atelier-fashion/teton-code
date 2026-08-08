@@ -38,7 +38,7 @@ use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{Event, SessionUpdate, SessionUpdatePayload, ToolCallStatus};
 use teton_protocol::methods::StopReason;
 use teton_protocol::{ProviderId, SessionId};
-use teton_providers::{HarnessProfile, ProviderError, ToolCall};
+use teton_providers::{BlockDetail, HarnessProfile, ProviderError, ToolCall};
 
 use crate::broadcast::EventBus;
 
@@ -108,7 +108,26 @@ impl HarnessError {
     /// (REQ-544 M-1).
     #[must_use]
     pub fn is_privacy_blocked(&self) -> bool {
-        matches!(self, HarnessError::Remote(e) if e.is_privacy_blocked())
+        self.privacy_block_detail().is_some()
+    }
+
+    /// Which inspection at the choke point refused this turn, or `None` if it
+    /// was not a privacy block at all (REQ-562 BR-3).
+    ///
+    /// The last hop of the cause's journey: choke point → `BlockCause` →
+    /// `BlockDetail` at the transport seam → here → the daemon's turn-failure
+    /// sentence. It exists because "your turn was blocked" is not an actionable
+    /// sentence when there are three unrelated ways to earn it, and because the
+    /// scan-could-not-run case must never be reported as something found.
+    ///
+    /// [`Self::is_privacy_blocked`] is defined in terms of this, so the two
+    /// cannot come to disagree about what counts as a block.
+    #[must_use]
+    pub fn privacy_block_detail(&self) -> Option<BlockDetail> {
+        match self {
+            HarnessError::Remote(e) => e.privacy_block_detail(),
+            _ => None,
+        }
     }
 }
 

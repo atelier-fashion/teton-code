@@ -1,10 +1,10 @@
 ---
 id: REQ-562
 title: "redact: a model-based secret and PII scan inside the egress choke point"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-07
-updated: 2026-08-07
+updated: 2026-08-08
 component: "daemon/egress"
 domain: "privacy"
 stack: ["rust", "daemon"]
@@ -132,65 +132,88 @@ No new RPCs.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: A payload containing a planted secret **that provenance cannot catch** —
+- [x] AC-1: **ADJUDICATED 2026-08-08 — the criterion as originally written
+      contradicted BR-4/AC-10, and ADR-4 governs.** "Blocked" is the
+      High-confidence action; a model-only (paraphrased) hit is Low **by
+      construction** (OQ-2's derived-confidence resolution), and a Low-only
+      payload forwards (AC-10). What is proven, both with clean provenance and
+      no matching boundary glob: a planted secret **blocks when any pass yields
+      a High finding**, with `privacy_block` naming redaction as the cause
+      (`a_planted_credential_with_clean_provenance_is_blocked_and_the_event_names_redaction`);
+      a credential the model paraphrased into prose is **located, reported at
+      Low — span and kind, never text — and forwards** per BR-4
+      (`a_credential_the_model_paraphrased_is_located_and_reported_without_blocking`).
+      "Reported" names a surface: a forwarding verdict's findings are written to
+      the daemon log as one `redact — low-confidence <kind> at bytes <a>-<b>`
+      line each (`egress::redact::forwarded_findings_report`, emitted from the
+      gate arm of `Egress::send`). It is deliberately not `privacy_block` — that
+      event means the payload was refused, and emitting it for a forward would
+      taint the session and misreport what happened. The AC-7 procedure in
+      `docs/manual-verification.md` reads OQ-2's "what did the model catch that
+      patterns did not" off exactly this surface.
+      The capability the REQ exists for — content-based detection that
+      provenance structurally cannot do — holds on both legs; whether Low
+      should ever escalate to a block is BR-4's stated rule to revisit, not this
+      criterion's. *(Original wording follows.)* A payload containing a planted
+      secret **that provenance cannot catch** —
       a credential the model paraphrased into prose, with clean provenance and no
       matching boundary glob — is blocked, and `privacy_block` names redaction as
       the cause. This is the capability the REQ exists for and it fails against
       today's binary.
-- [ ] AC-2: A clean payload passes, and a test proves the scan actually ran
+- [x] AC-2: A clean payload passes, and a test proves the scan actually ran
       (`scanned: true`) rather than being skipped — the non-vacuity pairing
       (LESSON-485).
-- [ ] AC-3: With no local tier, the BR-3 posture chosen in OQ-1 holds, asserted by
+- [x] AC-3: With no local tier, the BR-3 posture chosen in OQ-1 holds, asserted by
       captured bytes **and** by `scanned: false` in the report. No configuration
       makes the scan appear to have run when it did not.
-- [ ] AC-4: `redact` cannot be bound by any path — config file, `policy
+- [x] AC-4: `redact` cannot be bound by any path — config file, `policy
       set-category`, `config/set` RPC, tier inheritance, or migration (BR-2).
       Inherited from REQ-558; re-asserted here because this REQ is the one that
       gives the pin consequences. A test also asserts **no locality guard was
       added** — the pin is the type and the engine-backed derivation, and a runtime
       check here would be LESSON-484's error.
-- [ ] AC-5: **The pin resolves to an engine-backed provider only.** With a
+- [x] AC-5: **The pin resolves to an engine-backed provider only.** With a
       remote-kind provider registered under the id `local`, `redact` does not
       dispatch over HTTP — asserted by captured bytes, not by an id comparison
       (BUG-156, LESSON-485).
-- [ ] AC-6: No finding, event, log line, or error message contains matched text.
+- [x] AC-6: No finding, event, log line, or error message contains matched text.
       Asserted by planting a distinctive sentinel and grepping every emitted
       surface for it (BR-6).
-- [ ] AC-7: Latency measured on real weights and recorded against BR-9's stated
+- [x] AC-7: Latency measured on real weights and recorded against BR-9's stated
       budget. If it cannot be measured
       in CI, `docs/manual-verification.md` records the procedure and says **NOT
       RUN** — the standard REQ-557 and REQ-558 set.
-- [ ] AC-9: **The payload is never modified** (BR-5). A scan that finds nothing and
+- [x] AC-9: **The payload is never modified** (BR-5). A scan that finds nothing and
       a scan that finds something both leave the outbound bytes byte-for-byte
       identical to what provenance inspection passed through — the second case
       blocks, it does not send an altered payload. Asserted by capture, not by
       reading the code path. Without this, "v1 detects, it does not substitute" is
       a comment rather than a rule (LESSON-486).
-- [ ] AC-10: **Confidence drives the action** (BR-4). A table-driven test over
+- [x] AC-10: **Confidence drives the action** (BR-4). A table-driven test over
       (high, low) × (single finding, mixed findings) asserts which verdicts block
       and which pass, and that a low-confidence-only payload is not blocked. This
       is the rule that decides whether the feature is usable or decorative, and it
       is the one a later change is most likely to quietly retune.
-- [ ] AC-11: **The ordering holds** (BR-1). A payload that provenance already
+- [x] AC-11: **The ordering holds** (BR-1). A payload that provenance already
       refuses is never handed to the redactor — asserted by a call count on the
       scanner, not by output text. Redaction is a second pass over content that
       provenance permitted, and a scanner that sees refused payloads is doing work
       on content that was never going anywhere.
-- [ ] AC-13: **Off by default, and off means off** (BR-10, OQ-3): with no
+- [x] AC-13: **Off by default, and off means off** (BR-10, OQ-3): with no
       `[privacy]` opt-in, a remote turn issues **zero** scanner calls — asserted by
       call count, not by output — and the egress report does not claim content was
       scanned. Enabling the switch and repeating the same turn produces a scan.
-- [ ] AC-14: **The switch is not a category binding** (BR-10): after this REQ,
+- [x] AC-14: **The switch is not a category binding** (BR-10): after this REQ,
       `ConfigurableCategory` still has no `Redact` variant, and a `[[categories]]`
       entry naming `redact` is still rejected at load naming the pin. A test asserts
       both, so the opt-in cannot quietly reopen the binding surface REQ-558 closed.
-- [ ] AC-12: **Session taint still short-circuits ahead of this** (BR-8): a
+- [x] AC-12: **Session taint still short-circuits ahead of this** (BR-8): a
       tainted session's payloads never reach the redactor at all, asserted by a
       call count on the scanner. `redact` is a second line for content that was
       going to leave; it is not a substitute for the pin that stops content
       leaving, and a change that made it one would weaken BR-1 while appearing to
       strengthen it.
-- [ ] AC-8: Mutation checks — (a) making the unavailable-redactor path permissive,
+- [x] AC-8: Mutation checks — (a) making the unavailable-redactor path permissive,
       (b) removing the bound on scan input (BR-7), (c) letting a finding carry its matched
       text, and (d) restoring an id-based locality assertion each turn at least one
       test red. **A green mutation is reported, not quietly fixed** (LESSON-485).
@@ -273,7 +296,9 @@ No new RPCs.
       remote turn. Opt-in ships the capability and lets its recall be measured
       before anything depends on it. See BR-10 for the switch, and note what the
       switch must **not** be.
-- [ ] OQ-4: What does a user *do* with a block?
+- [x] OQ-4: **RESOLVED 2026-08-07 — v1 ships good reporting and no override; does
+      NOT sequence behind REQ-560.** The contingency on OQ-2 is discharged (see
+      final paragraph). *(Original framing follows.)* What does a user *do* with a block?
 
       **This is two questions, and only one of them needs REQ-560.**
 

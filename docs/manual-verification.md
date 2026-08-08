@@ -553,3 +553,230 @@ teton policy set-category redact deepseek           # must fail, naming the pin 
 ```
 
 **Status: NOT RUN.**
+
+---
+
+## REQ-562 — `redact`, a model call inside the egress choke point
+
+Everything REQ-562 claims is covered by automated tests except the leg below,
+which is the one the REQ's own BR-9 calls an acceptance criterion rather than a
+nice-to-have: **latency**.
+
+### Not automated: the redaction scan's latency on real weights (AC-7, BR-9, ADR-8)
+
+**What is uncovered.** The wall clock. `redact` is unlike every other duty in
+this daemon: REQ-558's classifier runs on freeform *judgment* turns only, and
+REQ-561's five duties are threshold-triggered, but this one is on the
+**synchronous send path of every remote call** once `[privacy] redact = true`.
+Every outbound request now waits for a complete local inference over the whole
+outbound body before a byte leaves. The spec says so in as many words — *"a
+stated budget and a measurement are acceptance criteria, not nice-to-haves"* —
+and its own Assumptions section names user tolerance for that latency as one of
+the three things most likely to be wrong.
+
+**The stated budget (ADR-8).** On real mid-tier weights, a model call over a
+chunk at `REDACT_CHUNK_MAX_BYTES` completes in **p50 ≤ 2 s, p95 ≤ 5 s**. The
+budget is **per chunk**: the model pass scans a payload larger than one engine
+window in several overlapping calls, so a context-budget-full turn (~41 KiB
+body) is two chunks and ~4 s at p50, and a payload at the total cap is five
+chunks and ~10 s. The duty seam's
+`DUTY_DEADLINE` (120 s) is the hard stop, and an overrun is `Unavailable` →
+**Block** (ADR-6) — a timed-out guard does not become a guard that passes
+everything, so a machine that misses the budget badly enough degrades into
+blocked turns rather than into unscanned ones. That is the failure mode a
+measurement is looking for.
+
+**The budget is per *scan*, and a turn is not one scan.** This is the thing the
+procedure has to measure and the earlier version of it did not. The gate sits in
+`Egress::send`, so it runs **once per remote call**, and one user turn is many
+remote calls:
+
+| Multiplier | Where it comes from | Count |
+|---|---|---|
+| Tool-call iterations | `HarnessConfig::max_turns` — the agent loop calls the provider once per iteration | up to **12** (weak-model default) or **40** (`for_strong_model`) |
+| Remotely-bound duties | every `RemoteDuty` send crosses the same choke point | 0–2 per turn typically (`title` once per session, `compact` under pressure) |
+| Remote MCP calls | ADR-003 makes a `tools/call` remote egress | 1 per remote MCP tool use |
+
+So a 2-second p50 per scan is **up to 80 seconds added to one long tool-looping
+turn** on a strong-model route. A procedure that times the first scan of a turn
+measures a number nobody experiences. Measure the **turn**, and measure it
+against a control.
+
+**Why there is no harness.** The same reason REQ-558's classifier gap has none,
+and more so. CI ships no weights: `tetond` is built without
+`--features tetond/llama`, and every automated fixture's local tier is a
+`ScriptedFileEngine` or a canned mock, which answers a scan of a chunk at the
+27,070-byte window from a string table in microseconds. A stand-in can prove the
+*call count* (including the **chunk** count, which is the same number), the
+*caps*, and the *decision* — it does, exhaustively — but a wall-clock number
+measured against a string table would be a fabricated one.
+
+**The budget's provenance, stated so nobody mistakes it for an observation.**
+2 s / 5 s is a **design target**. It was sized against a 3B model on Metal from
+an input cap of 64 KiB — which is **not what a model call sees any more**: a
+call sees one chunk, `REDACT_CHUNK_MAX_BYTES`, derived from the engine window at
+**27,070 bytes** (≈13.5k tokens at the duty seam's 2-bytes-per-token
+convention), less than half what the target was sized for. The output side is
+tiny either way (`REDACT_OUTPUT_MAX_BYTES` = 2 KiB, a sixteen-line contract). So
+the per-chunk target is if anything *pessimistic* now — but a chunked scan makes
+**several** such calls, which is the direction that cuts the other way, and
+**nobody has run either number**. The measurement is what settles it; do not
+re-derive it from the window and call that a result.
+
+**What IS covered automatically, and how far it goes:**
+
+| Leg | Where | Strength |
+|---|---|---|
+| A payload past the **total** cap costs **zero** model calls and blocks | `harness::redact::tests::an_over_cap_payload_is_unavailable_before_any_model_call`, `tests/redact_egress.rs::a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` | Full — by model-call count, not by elapsed time |
+| A payload past one engine **window** is scanned in several calls, not refused | `harness::redact::tests::a_payload_larger_than_one_window_is_scanned_in_several_calls_and_forwards`, `tests/redact_egress.rs::a_context_budget_full_payload_is_scanned_across_windows_and_forwards` | Full at the count — the number of model calls is what tells chunking from a raised cap. Says nothing about what those calls cost, which is step 4 |
+| The chunk count is bounded, and every chunk fits the window | `harness::redact::tests::{the_chunker_never_cuts_more_chunks_than_the_derived_ceiling, the_chunker_covers_the_payload_with_overlapping_windows_on_char_boundaries}` | Full. This is what makes "p50 × chunks" a bounded number rather than an open one |
+| A deadline overrun is `Unavailable` → Block | `harness::redact::tests::a_scan_that_overruns_the_deadline_is_unavailable` | Full, on a **paused clock**. It pins the wiring, and says nothing about how long a real scan takes |
+| A whole scan waits at most **one** `DUTY_DEADLINE`, not one per chunk | `harness::redact::tests::a_scan_whose_chunks_each_answer_in_time_still_stops_at_one_scan_deadline` | Full at the bound, on a **paused clock** — a first chunk answering at ⅔ of the budget and a second that stalls. It says nothing about real latency; what it removes is the ×`REDACT_MAX_CHUNKS` worst case the chunked design introduced |
+| Off costs nothing at all — no gate, no call, no latency | `runtime::tests::dispatch::redact::off_means_no_gate_and_on_means_a_gate_that_reaches_the_engine`, `egress::tests::off_means_zero_scanner_calls_and_on_means_exactly_one` | Full — by call count. This is what bounds the blast radius of the unmeasured budget: nobody who has not opted in pays it (OQ-3) |
+| The scan runs once per outbound payload, not more | `tests/redact_egress.rs::a_clean_payload_forwards_and_the_scan_provably_ran` | Full at the count; says nothing about elapsed time — and "once per payload" is many times per *turn*, which is what step 2 measures |
+| Engine-mutex contention between sessions | — | **Nothing.** Every automated fixture answers from a string table in microseconds, so no fixture can hold the mutex long enough for a second session to notice. Step 3 is the only instrument |
+
+**To close it by hand** (macOS/Apple Silicon, ~10 min, after a REQ-547 AC-13
+install has already put weights on disk):
+
+```sh
+cargo build --workspace --release --features tetond/llama
+# opt in — the switch is its own table, NOT a [[categories]] row (BR-10).
+# The daemon reads $TETON_CONFIG, else <base>/config.toml, where <base> is
+# $XDG_RUNTIME_DIR/teton or, on macOS, ~/Library/Application Support/teton.
+cat >> ~/"Library/Application Support/teton/config.toml" <<'EOF'
+[privacy]
+redact = true
+EOF
+./target/release/teton-code &
+./target/release/teton
+```
+
+Every step below is run **twice**: once as written, and once with
+`redact = false` as the control. **The scan's cost is the difference**, not the
+absolute number — the remote call is in both. Record p50 and p95 over the stated
+run count for each half, and record the difference.
+
+**Step 1 — the single scan (ADR-8's stated budget).** With `/verbose` on, run
+TWENTY remote turns of two shapes, each answered without a tool call:
+
+- a short prompt — the everyday case;
+- a prompt whose assembled context is **at the input cap** — read several large
+  files first, then ask a question; `/verbose` shows the context size.
+
+Measure the gap between submitting the prompt and the first token of the answer.
+Check against ADR-8: p50 ≤ 2 s, p95 ≤ 5 s **at the cap**.
+
+**Step 2 — the whole turn (the number a user actually feels).** Run TEN turns
+that force the agent loop to iterate: *"read every file under `crates/teton-core/src/`
+and list the public types in each"* is one shape that reliably produces a
+double-digit tool loop. Measure **total wall-clock from submit to the turn
+ending**, and record alongside it the **number of remote calls the turn made**
+(`/verbose` shows each `route_decided`; count them, and add any `tools/call` to a
+remote MCP server).
+
+Then check the arithmetic: `turn_delta ≈ remote_calls × step_1_p50`. If it does
+not, say so — either the scan is faster on the short intermediate payloads (good,
+and worth recording as the real shape of the cost) or something else is serial
+that this document has not accounted for. **A turn that takes more than 30 s
+longer with the switch on is a finding**, whatever the per-scan number said.
+
+**Step 3 — two sessions at once (contention on the one engine).** The scan holds
+the **single local engine mutex** for its whole completion, and it is the first
+duty that runs unconditionally, so two sessions contend on every remote call. In
+two terminals against the same daemon:
+
+1. In session A, start a long **local** turn — a prompt routed to the local tier
+   (a tainted session, or `teton policy set-tier build local`) over a large
+   context, so the engine mutex is held for many seconds.
+2. Immediately, in session B, submit an ordinary **remote** turn.
+
+Record session B's time to first token. With `redact = false` it does not touch
+the engine at all and should be unaffected; with the switch on it cannot start
+its scan until A's completion releases the mutex. **Record the difference and
+whether B ever hit the 120-second `DUTY_DEADLINE`** — that is the fail-closed
+timeout, and it means B's turn was *blocked* by A's unrelated work.
+
+**Also record, in every step, how often the scan came back `Unavailable`** (a
+`privacy_block` with cause `scan_unavailable`, or a turn failing with *"the
+redaction scan could not run"*): at the cap on slow weights that is the deadline
+firing, and a fail-closed timeout is a worse user outcome than a slow one.
+
+**Step 4 — the chunk-count distribution and the per-chunk latency (what
+replaced the over-cap block rate).**
+
+Round 2 of this REQ measured a *block rate*: `REDACT_INPUT_MAX_BYTES` was
+27,070 bytes against a `context_budget_bytes` of 32,768, so a
+context-budget-full remote turn assembled a body the scan refused and blocked
+with `ScanUnavailable`. That collision is **closed** — the model pass chunks
+now (ADR-6), the total cap is 108,280 bytes, and a context-heavy turn is
+scanned in two model calls instead of refused. There is nothing left to measure
+a rate of, and a step that kept counting a number that should now be zero would
+be measuring nothing.
+
+What replaced it is the number the cost actually moved to: **how many chunks a
+real turn's payload is cut into, and what each chunk costs.** Chunking did not
+delete the latency; it converted a fail-closed block into a multiple of the
+per-chunk budget, and whether that trade is a good one is exactly what a
+measurement can tell you and an argument cannot.
+
+Over the twenty turns of step 1 and the ten of step 2:
+
+| Record | How |
+|---|---|
+| **Chunk-count distribution** | count `route_decided` events with `category: redact` per outbound payload — a chunked scan announces **once per chunk** (ADR-8), so the count per send *is* the chunk count. Report the histogram: how many sends were 1 chunk, 2, 3+ |
+| **Per-chunk latency** | for multi-chunk sends, the send's total scan time divided by its chunk count. Check against ADR-8: p50 ≤ 2 s, p95 ≤ 5 s **per chunk** — the budget is per chunk, not per send |
+| **The context-budget-full send specifically** | force one deliberately (below) and record its chunk count and total scan time. ADR-8 expects **2 chunks, ≤ 4 s p50**. Anything much over two chunks at that size means the body carries more overhead than the cap's arithmetic assumes |
+| **Any `ScanUnavailable` at all** | it should no longer come from size. If one appears, record the payload size and whether the daemon log shows an engine error — a block from a payload under 108,280 bytes is now a **finding**, not the expected fail-closed path |
+
+Force the multi-chunk state deliberately at least once: read four or five large
+files in one turn until `/verbose` shows the context near budget, then ask a
+question. That turn should **succeed**, in two chunks. Before this change it
+blocked; if it still blocks, the change did not land and that is the single most
+important line to write in this document.
+
+**A turn whose scan takes more than 10 s is a finding**, whatever the per-chunk
+number said — that is the `REDACT_MAX_CHUNKS` ceiling (5) at ADR-8's p50, and a
+payload that reaches it is at the total cap.
+
+**Also record the worst-case wait.** The seam's `DUTY_DEADLINE` is per model
+call, so a five-chunk scan can in principle wait `5 × 120 s` before failing
+closed (ADR-8's stated residual). Note any send whose scan took longer than 120
+seconds without failing — that is the residual becoming real rather than
+theoretical, and it is the evidence a scan-wide deadline needs.
+
+A miss anywhere is a finding to record here, not a number to re-run until it
+looks acceptable — and the honest response to a miss is a smaller total cap, a
+faster tier, or a scan that does not run on every call, never a partial scan
+that reports itself complete (BR-7).
+
+**Also worth recording while the weights are loaded** (it is the assumption the
+REQ says is most likely to be wrong, and this is the only place it can be
+observed): of the payloads the scan flagged, **how many did the model catch that
+the pattern pass did not** — the `Confidence::Low` findings. That question, not
+raw recall, is what tells you whether the model call earns its latency (OQ-2's
+recorded counter-argument).
+
+**Where to read it.** A low-confidence finding forwards (BR-4), so it produces
+no `privacy_block` and nothing in the CLI. It writes one line per finding to the
+daemon's log — `tetond`'s stderr, i.e. `<base>/tetond.log`:
+
+```sh
+grep 'redact — low-confidence' ~/"Library/Application Support/teton/tetond.log"
+# tetond: redact — low-confidence credential at bytes 1402-1440 of the outbound
+# payload; forwarded (a low-confidence finding is reported, not blocked — BR-4).
+```
+
+Kind and byte span, never the matched text (BR-6) — the span is what lets you
+find the string yourself in the payload you sent.
+
+Procedure: plant a handful of paraphrased credentials that no pattern shape
+matches (`the deploy password is <something>`, a connection string described in
+prose, an address), run one remote turn each, and count the lines. **Zero lines
+across the whole set is the finding**: it means the model half caught nothing
+the pattern pass could not, and OQ-2's recorded counter-argument — that the
+pattern pass makes the feature *look* like it works — has come true. Record the
+count either way; a number here is the only evidence the model call earns its
+latency.
+
+**Status: NOT RUN.** No sign-off block below, because nobody has executed it.

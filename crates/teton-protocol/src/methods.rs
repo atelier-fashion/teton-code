@@ -619,9 +619,9 @@ impl ContentClass {
             // session from its first one. Both carry prompt text and nothing
             // else, which is why they share a class despite sharing no purpose.
             Category::Route | Category::Title => ContentClass::UserPrompt,
-            // Screens an outbound payload for secrets before it leaves. No model
-            // call today (REQ-562 builds it); the class states what that call
-            // will see.
+            // Screens an outbound payload for secrets before it leaves. Since
+            // REQ-562 that scan is a real model call at the egress choke point,
+            // and this class is what it sees: the exact bytes on their way out.
             Category::Redact => ContentClass::OutboundPayload,
             // Summarises a tool result on its way into context.
             Category::Digest => ContentClass::ToolOutput,
@@ -822,6 +822,48 @@ pub struct ConfigSnapshot {
     pub judgment_default: Option<Category>,
     /// Privacy boundaries.
     pub privacy: Vec<PrivacyBoundaryConfig>,
+    /// Whether the REQ-562 redaction scan runs inside the egress choke point —
+    /// the `[privacy] redact` opt-in, on the wire so a client can *report* it.
+    ///
+    /// ## Why it is not called `privacy`
+    ///
+    /// That name is taken, by the boundary list directly above, and the two are
+    /// different things: a set of path globs, and a single switch over outbound
+    /// payloads. Folding the switch into the boundary table's name is the
+    /// collision REQ-562 TASK-067 recorded when it deliberately left the opt-in
+    /// off the wire; this is that note being acted on rather than re-discovered.
+    ///
+    /// ## Visibility, not control
+    ///
+    /// There is no [`ConfigUpdate`] variant for it and none is coming from this
+    /// REQ (the spec's *"no new RPCs"*): the switch is set in the config file
+    /// and merely read here. `teton policy show` renders it, because a `redact`
+    /// row that says what the category *would* send leaves a user with no way
+    /// to tell whether anything is scanning today.
+    ///
+    /// ## Additive with a default, like every field added to this wire since
+    ///
+    /// A snapshot from a daemon predating this field carries no key, and reads
+    /// `false` — the historical fact rather than a filler value, since no
+    /// **released** daemon predating it ran the scan. (The claim is narrowed to
+    /// released builds on purpose: within REQ-562's own branch there were
+    /// intermediate builds that ran the scan before the field was added to this
+    /// wire, so "no such daemon ran the scan" is false of them. They shipped to
+    /// nobody, no client will ever read a snapshot one of them wrote, and the
+    /// default is the safe direction anyway — but a claim that is true of the
+    /// world and false of the repository's own history is the kind that gets
+    /// quoted back at a later reader.) A client predating the field ignores a
+    /// key it does not know. So the addition moves neither
+    /// [`crate::PROTOCOL_VERSION`] nor
+    /// [`crate::PROTOCOL_VERSION_MIN`], exactly as `PrivacyBlock::cause` did
+    /// not (REQ-562 ADR-7); both directions are asserted against literal JSON
+    /// in this module's tests rather than left as a claim.
+    ///
+    /// `false` is also the only safe direction for an absent answer to fall in:
+    /// a reader that assumed *enabled* from a daemon's silence would tell a
+    /// user their outbound payloads are scanned when nothing is scanning them.
+    #[serde(default)]
+    pub redact_enabled: bool,
 }
 
 /// Result of [`ConfigGetParams`].
@@ -953,6 +995,7 @@ impl RpcMethod for CostQueryParams {
 mod tests {
     use super::*;
     use crate::events::{ChosenBand, GpuClass, TierBand};
+    use crate::ParseCategoryError;
 
     /// **Mixed-version skew, on the pairing ADR-007 explicitly endorses.**
     ///
@@ -1428,8 +1471,84 @@ mod tests {
                     path_glob: "secrets/**".to_owned(),
                     mode: PrivacyMode::LocalOnly,
                 }],
+                redact_enabled: true,
             },
         });
+    }
+
+    /// A snapshot from a daemon that predates `redact_enabled` reads as **off**
+    /// (REQ-562), which is the historical fact about such a daemon rather than
+    /// a filler value: none of them ran the scan.
+    ///
+    /// The fixture is a v2-shaped snapshot, because v2 is the oldest shape this
+    /// build can read at all — a genuine v1 body fails on `routing` long before
+    /// reaching this key, which the neighbouring
+    /// `the_last_releases_snapshot_is_unreadable_which_is_why_the_version_is_pinned`
+    /// pins and this test must not be read as contradicting. What is asserted
+    /// here is the *field's* compatibility posture: a daemon inside the
+    /// supported handshake range that has simply never heard of the key.
+    #[test]
+    fn a_snapshot_with_no_redact_enabled_key_reads_as_off() {
+        let without_the_key = serde_json::json!({
+            "providers": [],
+            "tiers": [],
+            "routing": [],
+            "privacy": [{"path_glob": "secrets/**", "mode": "local_only"}]
+        });
+        let snapshot: ConfigSnapshot = serde_json::from_value(without_the_key.clone()).unwrap();
+        assert!(
+            !snapshot.redact_enabled,
+            "an absent answer must never read as `the scan is running`"
+        );
+        // The rest of the snapshot still arrives — the default is a default,
+        // not a fallback for a body that failed to parse.
+        assert_eq!(snapshot.privacy.len(), 1);
+
+        // Non-vacuity: the default is not swallowing a key that *is* present,
+        // in either state (LESSON-485 — one leg alone would pass against a
+        // field hard-wired to `false`).
+        for stated in [true, false] {
+            let mut wire = without_the_key.clone();
+            wire["redact_enabled"] = serde_json::Value::Bool(stated);
+            let snapshot: ConfigSnapshot = serde_json::from_value(wire).unwrap();
+            assert_eq!(snapshot.redact_enabled, stated);
+        }
+    }
+
+    /// The other direction of the same claim: a client that predates the field
+    /// still reads a snapshot that carries it.
+    ///
+    /// Serde ignores unknown fields by default and no type here opts out, but
+    /// this posture is what keeps [`crate::PROTOCOL_VERSION`] still across the
+    /// addition, so it is asserted rather than assumed — modelled by the
+    /// pre-REQ-562 shape of the reader, exactly as `PrivacyBlock::cause`'s
+    /// skew test does.
+    #[test]
+    fn a_client_predating_redact_enabled_still_reads_a_snapshot_that_carries_it() {
+        #[derive(Deserialize)]
+        struct PreSwitchSnapshot {
+            privacy: Vec<PrivacyBoundaryConfig>,
+            judgment_default: Option<Category>,
+        }
+
+        let wire = serde_json::to_string(&ConfigSnapshot {
+            privacy: vec![PrivacyBoundaryConfig {
+                path_glob: "secrets/**".to_owned(),
+                mode: PrivacyMode::LocalOnly,
+            }],
+            judgment_default: Some(Category::Edit),
+            redact_enabled: true,
+            ..ConfigSnapshot::default()
+        })
+        .unwrap();
+        assert!(
+            wire.contains("\"redact_enabled\":true"),
+            "the fixture must actually carry the new key: {wire}"
+        );
+
+        let old: PreSwitchSnapshot = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.privacy.len(), 1, "the old reader still gets its fields");
+        assert_eq!(old.judgment_default, Some(Category::Edit));
     }
 
     /// The eleven categories, spelled out rather than iterated, so a twelfth
@@ -1510,10 +1629,14 @@ mod tests {
     /// AC-16's other half: a category with no call site is described, not
     /// omitted — and the pair of fields says both things at once.
     ///
-    /// `redact` is REQ-562's to build. Declaring what its call *would* see is a
-    /// description of intent; `reached: false` is what says nothing is sent
-    /// today. Neither field alone is the disclosure, which is why the row is
-    /// asserted rather than the mapping.
+    /// **The set of unreached categories is empty as of REQ-562**, which wired
+    /// `redact` — the last of the eleven. So this row is now hypothetical
+    /// rather than a snapshot of any live category, and it is kept deliberately:
+    /// the *shape* is the contract. A future category lands declared before it
+    /// is called, and what this pins is that such a row still discloses what it
+    /// would send (`content_class`) while saying nothing is sent yet
+    /// (`reached: false`). Neither field alone is the disclosure, which is why
+    /// the row is asserted rather than the mapping.
     #[test]
     fn an_unreached_category_still_says_what_it_would_send() {
         let row = CategoryRouteView {
@@ -1527,7 +1650,11 @@ mod tests {
             reason: "The 'redact' category is pinned to the local tier.".to_owned(),
         };
         assert_eq!(row.content_class, ContentClass::OutboundPayload);
-        assert!(!row.reached, "redact has no call site until REQ-562");
+        assert!(
+            !row.reached,
+            "the fixture is a hypothetical unreached category; `redact` itself \
+             has had a call site since REQ-562"
+        );
         round_trip(&row);
 
         let json = serde_json::to_string(&row).unwrap();
@@ -1607,6 +1734,54 @@ mod tests {
             round_trip(&ConfigSetParams { update });
         }
         round_trip(&ConfigSetResult { applied: true });
+    }
+
+    /// REQ-562 AC-4, RPC leg: `config/set` cannot carry a binding for a pinned
+    /// category, and REQ-562's `[privacy]` opt-in does not change that.
+    ///
+    /// This asserts the **protocol** type, which is a different type from the
+    /// config-file `FromStr` path with a different rejection mechanism
+    /// (LESSON-486 #2): the daemon deserializes [`ConfigSetParams`] straight out
+    /// of the request, so the pin here is serde refusing a variant that does not
+    /// exist. The [`ParseCategoryError::RedactIsPinned`] *sentence* belongs to
+    /// `FromStr`, which is the CLI's path — asserted below so the two legs are
+    /// visibly distinct rather than assumed to be one.
+    ///
+    /// The payload is derived from a valid one by swapping only the category
+    /// name, so the test cannot pass because the request was malformed for some
+    /// unrelated reason.
+    #[test]
+    fn a_config_set_payload_naming_a_pinned_category_cannot_be_deserialized() {
+        let valid = ConfigSetParams {
+            update: ConfigUpdate::SetCategoryBinding(CategoryBindingConfig {
+                name: ConfigurableCategory::Review,
+                provider_id: ProviderId::from("on-device"),
+                fallback_id: None,
+            }),
+        };
+        let mut payload = serde_json::to_value(&valid).expect("serialize");
+        assert_eq!(payload["update"]["name"], "review", "payload: {payload}");
+        assert!(
+            serde_json::from_value::<ConfigSetParams>(payload.clone()).is_ok(),
+            "the fixture must be a payload the daemon would otherwise accept"
+        );
+
+        for pinned in ["redact", "route"] {
+            payload["update"]["name"] = serde_json::Value::String(pinned.to_owned());
+            assert!(
+                serde_json::from_value::<ConfigSetParams>(payload.clone()).is_err(),
+                "config/set accepted a binding for the pinned category {pinned}: {payload}"
+            );
+            // The FromStr leg — what `teton policy set-category` parses — names
+            // the pin rather than reading as a typo.
+            assert!(
+                matches!(
+                    pinned.parse::<ConfigurableCategory>(),
+                    Err(ParseCategoryError::RedactIsPinned | ParseCategoryError::RouteIsPinned)
+                ),
+                "{pinned} lost its pinned-category sentence"
+            );
+        }
     }
 
     #[test]

@@ -153,10 +153,15 @@ async fn scripted_session_leaks_zero_boundary_bytes_and_blocks_deliberate_egress
             path,
             provider_id,
             action,
+            // REQ-562 ADR-7: the provenance inspection is one of several things
+            // that can refuse a payload here, and this is the one that says
+            // *boundary*.
+            cause,
         }) => {
             assert_eq!(path, "secrets/prod.env");
             assert_eq!(provider_id, ProviderId::from("anthropic"));
             assert_eq!(action, PrivacyAction::ReroutedToLocal);
+            assert_eq!(cause, teton_protocol::events::BlockCause::Boundary);
         }
         other => panic!("turn 2 must be a privacy block, got {other:?}"),
     }
@@ -276,7 +281,11 @@ async fn adapter_seam_is_enforced() {
     let err = Transport::execute(&scoped, request)
         .await
         .expect_err("scoped transport must refuse");
-    assert_eq!(err, TransportError::PrivacyBlocked);
+    assert_eq!(
+        err,
+        TransportError::PrivacyBlocked(teton_providers::BlockDetail::Boundary),
+        "REQ-562 BR-3: and it names the inspection that refused it"
+    );
     assert!(capture.captured().is_empty(), "nothing may reach the wire");
     assert_eq!(sink.events().len(), 1, "the block still emitted its event");
 }

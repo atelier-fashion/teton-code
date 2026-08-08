@@ -18,6 +18,12 @@
 //! does not exist yet; until it does, egress **also** blocks that content rather
 //! than leak it un-redacted. So any boundary-tagged source is held local. This is
 //! deliberately stricter than the eventual behavior and is documented as such.
+//!
+//! **REQ-562 did not change this.** The `redact` that now exists *detects and
+//! blocks* — BR-5 says in as many words that v1 never rewrites a payload. What
+//! `RedactThenRemote` needs is a **substituting** redactor, one that replaces
+//! the sensitive spans and sends the rest, and that is a separate REQ. So the
+//! mode still has no implementation and this arm still fails closed.
 
 use teton_core::boundary::BoundaryMatcher;
 use teton_protocol::events::PrivacyAction;
@@ -170,8 +176,10 @@ mod tests {
 
     #[test]
     fn redact_then_remote_is_also_blocked_until_the_redactor_exists() {
-        // Fail-closed: the redactor is post-MVP (OQ-7), so this content is held
-        // local rather than sent un-redacted.
+        // Fail-closed: the *substituting* redactor this mode needs is post-MVP
+        // (OQ-7), so this content is held local rather than sent un-redacted.
+        // REQ-562's `redact` detects and blocks — BR-5 forbids it rewriting a
+        // payload — so it is not the redactor that would unblock this arm.
         let bs = vec![boundary("vendor/**", BoundaryMode::RedactThenRemote)];
         let m = matcher(&bs);
         let prov = Provenance::tainted_by("vendor/private.json");

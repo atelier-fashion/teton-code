@@ -2,11 +2,16 @@
 //!
 //! REQ-558 declares all eleven categories and resolves all eleven, so the config
 //! schema stabilizes once and the remaining call sites can be tagged later
-//! without a second migration. But some of them have **no model call site at
+//! without a second migration. But some of them had **no model call site at
 //! all**, and a knob that silently does nothing invites a user to tune it —
 //! LESSON-481's shape ("a gate that hides a feature from users also hides it
-//! from the test suite"). So `teton policy show` marks them
+//! from the test suite"). So `teton policy show` marks such a category
 //! `declared, no call site yet`, and this module is where that marker comes from.
+//!
+//! As of REQ-562 the marked set is **empty**: every declared category is
+//! dispatched on. The module stays because the marker is derived rather than
+//! trusted — an exhaustive match plus the source scan below — and a twelfth
+//! category, or a call site someone deletes, still has to answer for itself.
 //!
 //! # The marker is only honest because a test derives it
 //!
@@ -16,9 +21,11 @@
 //! the direction the list actually rots in. The test at the bottom of this file
 //! closes that gap: it reads the daemon's own source, finds every routing call
 //! site, works out which categories reach a router through them, and asserts the
-//! result equals this match. Wire up `redact` and the test fails until the
+//! result equals this match. Wire up a category and the test fails until the
 //! marker follows — which is exactly how `triage` (REQ-561 TASK-060), `shell`
-//! (TASK-061), `title` (TASK-062) and `compact` (TASK-063) arrived.
+//! (TASK-061), `title` (TASK-062), `compact` (TASK-063) and finally `redact`
+//! (REQ-562 TASK-070) arrived. It works in the other direction too: delete a
+//! call site and the marker is caught still claiming the category is reached.
 //!
 //! That test is the load-bearing half of ADR-A. This match is just where its
 //! answer is written down.
@@ -73,10 +80,13 @@ pub const fn has_call_site(category: Category) -> bool {
         // the budget — the duty only ever improves the choice, which is why
         // wiring it cannot weaken the gate.
         Category::Compact => true,
-        // Declared, unreached. Egress redaction is regex-based and makes no
-        // model call; giving it one means putting a model inside the choke
-        // point, which is REQ-562's subject and its own adversarial review.
-        Category::Redact => false,
+        // The last of the eleven, and the only one whose call site is not in
+        // the harness at all: `RedactionGateImpl::redact_route` resolves it
+        // inside the egress choke point, where the scan runs on the exact bytes
+        // that would leave the machine (REQ-562 ADR-1, TASK-070). Unreached
+        // until then — egress refused by provenance and nothing else, because a
+        // regex pass with no model behind it is not a call site.
+        Category::Redact => true,
     }
 }
 
@@ -116,15 +126,49 @@ pub(crate) mod scan {
     /// it can only shrink what a scan sees, which makes an assertion fail loudly
     /// rather than pass wrongly.
     pub(crate) fn production_source(path: &Path) -> String {
-        let text = std::fs::read_to_string(path).expect("readable source file");
+        strip_test_modules(&std::fs::read_to_string(path).expect("readable source file"))
+    }
+
+    /// `text` truncated at its first `#[cfg(test)]` item. See
+    /// [`production_source`] for why truncating is exact today and conservative
+    /// if that changes.
+    fn strip_test_modules(text: &str) -> String {
         match text.find("\n#[cfg(test)]") {
             Some(at) => text[..at].to_owned(),
-            None => text,
+            None => text.to_owned(),
         }
     }
 
     /// Every production `.rs` under `src/`, as `(path relative to src/, source)`,
     /// in sorted order.
+    ///
+    /// ## A file that vanishes mid-scan is skipped, not fatal (LESSON-489/BUG-159)
+    ///
+    /// [`rust_files`] lists the directory and this reads the results a moment
+    /// later, and a file can disappear in between: an editor saving by
+    /// atomic rename, a `git checkout` or `git stash` in another worktree
+    /// sharing this checkout, a generated file being rewritten. That is a race
+    /// in the **scan**, not a fact about the source tree, and crashing every
+    /// caller over it makes a whole test binary fail for a reason no diff
+    /// explains.
+    ///
+    /// The loud failure is kept exactly where it means something: a caller
+    /// looking for a *specific* file still asserts its own presence
+    /// (`.expect("this module is a production source")`), so a module that was
+    /// renamed or deleted fails by name. What is skipped is only a file nobody
+    /// asked for by name — and the skip is announced rather than silent.
+    ///
+    /// ## "Vanished" is re-checked, because several callers are set-based
+    ///
+    /// A `NotFound` on its own does not establish that a file is gone: the
+    /// commonest cause is an editor's atomic-rename save, where the path is
+    /// missing for microseconds and then back. Skipping on the first `NotFound`
+    /// would therefore drop a file that *exists* — and the callers that sweep
+    /// **every** production source for a property (the seam assertions, the
+    /// no-printers checks) pass a little more vacuously for each file they did
+    /// not see, silently. So the directory is re-listed: if the path is still
+    /// there the read is retried and a second failure is fatal, and only a path
+    /// that is genuinely absent from a fresh listing is skipped.
     pub(crate) fn production_sources() -> Vec<(String, String)> {
         let root = daemon_src();
         let mut files = Vec::new();
@@ -132,13 +176,38 @@ pub(crate) mod scan {
         files.sort();
         files
             .iter()
-            .map(|path| {
+            .filter_map(|path| {
+                let text = match std::fs::read_to_string(path) {
+                    Ok(text) => text,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        let mut current = Vec::new();
+                        rust_files(&root, &mut current);
+                        if !current.contains(path) {
+                            eprintln!(
+                                "call_sites::scan: {} vanished between the directory listing \
+                                 and the read, and is gone from a fresh listing; skipped",
+                                path.display()
+                            );
+                            return None;
+                        }
+                        // Still there — the window was a rename, not a deletion.
+                        // The tolerance is for a file that is gone, not for one
+                        // this process could not read.
+                        std::fs::read_to_string(path).unwrap_or_else(|err| {
+                            panic!(
+                                "source file {} is listed but unreadable: {err}",
+                                path.display()
+                            )
+                        })
+                    }
+                    Err(err) => panic!("unreadable source file {}: {err}", path.display()),
+                };
                 let rel = path
                     .strip_prefix(&root)
                     .expect("a file under src/")
                     .to_string_lossy()
                     .into_owned();
-                (rel, production_source(path))
+                (rel, strip_test_modules(&text)).into()
             })
             .collect()
     }
@@ -378,9 +447,15 @@ mod tests {
     /// The unreached set is stated once, here, so a reviewer can check it
     /// against the architecture's table without reading the match.
     ///
-    /// Named for the list rather than its length (REQ-561 shrinks it one
-    /// category per task, and a test whose *name* has to change with each one is
-    /// a rename nobody wants four times).
+    /// Named for the list rather than its length (REQ-561 shrank it one category
+    /// per task and REQ-562 emptied it, and a test whose *name* has to change
+    /// with each one is a rename nobody wants five times).
+    ///
+    /// **The list is now empty**, which is a stronger assertion than it looks:
+    /// every declared category has a call site, so the `declared, no call site
+    /// yet` marker has nothing to mark. It is not deleted — the exhaustive match
+    /// is what makes a twelfth category answer the question, and this row is
+    /// what makes an answer of `false` visible to a reviewer.
     #[test]
     fn the_declared_unreached_categories_are_stated_once() {
         let unreached: Vec<&str> = Category::ALL
@@ -388,6 +463,10 @@ mod tests {
             .filter(|c| !has_call_site(*c))
             .map(Category::as_str)
             .collect();
-        assert_eq!(unreached, vec!["redact"], "the unreached set changed");
+        assert_eq!(
+            unreached,
+            Vec::<&str>::new(),
+            "the unreached set changed; every category REQ-558 declared is now dispatched on"
+        );
     }
 }

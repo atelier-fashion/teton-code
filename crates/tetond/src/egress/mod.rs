@@ -78,6 +78,7 @@
 
 pub mod inspector;
 pub mod provenance;
+pub mod redact;
 
 use std::sync::Arc;
 
@@ -86,10 +87,13 @@ use futures::StreamExt;
 
 use teton_core::boundary::BoundaryMatcher;
 use teton_core::entities::PrivacyBoundary;
-use teton_protocol::events::{Event, PrivacyAction, PrivacyBlock};
+use teton_protocol::events::{
+    BlockCause, ByteSpan, Event, FindingKind as WireFindingKind, PrivacyAction, PrivacyBlock,
+};
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
-    ByteStream, HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
+    BlockDetail, ByteStream, HttpMethod, Transport, TransportError, TransportRequest,
+    TransportResponse,
 };
 
 use crate::broadcast::EventBus;
@@ -97,6 +101,7 @@ use crate::cost::{CostAttribution, CostMeter};
 
 pub use inspector::{inspect, Inspection, Violation};
 pub use provenance::{assembled_provenance, ContextBlock, Provenance};
+pub use redact::{RedactionGate, RedactionVerdict};
 
 /// A failure at the egress choke point.
 ///
@@ -107,19 +112,26 @@ pub use provenance::{assembled_provenance, ContextBlock, Provenance};
 /// boundary content.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EgressError {
-    /// A `local-only` boundary was about to be crossed; the request was refused
-    /// before any network activity. The offending `path` is safe to surface (it
-    /// is the boundary glob's target, not file content).
-    #[error(
-        "privacy boundary blocked egress of `{path}` to provider `{provider_id}` ({action:?})"
-    )]
+    /// An inspection inside the choke point refused the payload; the request was
+    /// dropped before any network activity. Which inspection is `cause`
+    /// (REQ-562 ADR-7) — a `local-only` boundary, a redaction finding, or a
+    /// redaction scan that could not run.
+    ///
+    /// `path` is safe to surface for every cause: for a boundary block it is the
+    /// boundary glob's target (not file content), and for a redaction block it
+    /// is a fixed locus phrase naming the payload rather than quoting it (BR-6).
+    #[error("{}", privacy_blocked_sentence(.path, .provider_id, .action, .cause))]
     PrivacyBlocked {
-        /// Repo-relative path of the boundary source that would have leaked.
+        /// Repo-relative path of the boundary source that would have leaked, or
+        /// the non-secret locus of a redaction block.
         path: String,
         /// Provider the content would have reached.
         provider_id: ProviderId,
         /// What the choke point did instead.
         action: PrivacyAction,
+        /// Which inspection refused it — the same value the `privacy_block`
+        /// event carries, so the typed error and the event cannot disagree.
+        cause: BlockCause,
     },
     /// The underlying transport failed (before any HTTP status was known).
     #[error("transport error: {0}")]
@@ -140,16 +152,177 @@ impl EgressError {
     /// **non-retryable** [`TransportError::PrivacyBlocked`] — never a
     /// connect refusal — so it cannot be misclassified as a transient transport
     /// fault and retried against the blocked provider (REQ-544 M-1). The
-    /// authoritative typed signal (this error) and the `privacy_block` event
-    /// carry the real reason; the daemon reroutes the turn to the local tier.
+    /// `privacy_block` event carries the full reason; the daemon reroutes the
+    /// turn to the local tier.
+    ///
+    /// ## What survives the collapse, and what does not (REQ-562 BR-3)
+    ///
+    /// The [`BlockCause`] does not fit through this seam — `teton-providers`
+    /// declares no protocol dependency, by design — so it is projected onto
+    /// [`BlockDetail`], which names *which inspection* refused the payload and
+    /// nothing else. That projection is lossy on purpose: the finding's kind and
+    /// byte span stay behind, because the `privacy_block` event already carries
+    /// them straight from the choke point and a byte range has no business
+    /// travelling through an adapter.
+    ///
+    /// What must **not** be lost is which of the three it was. The daemon's
+    /// turn-failure sentence is composed from this value, and a redaction block
+    /// reported as a boundary sends the user looking for a `local-only` glob
+    /// that does not exist — or, worse, tells someone whose scan could not run
+    /// that something was found.
     #[must_use]
     pub fn into_transport_error(self) -> TransportError {
         match self {
             EgressError::Transport(t) => t,
-            EgressError::PrivacyBlocked { .. } => TransportError::PrivacyBlocked,
+            EgressError::PrivacyBlocked { cause, .. } => {
+                TransportError::PrivacyBlocked(match cause {
+                    BlockCause::Boundary => BlockDetail::Boundary,
+                    BlockCause::Redaction { .. } => BlockDetail::Redaction,
+                    BlockCause::ScanUnavailable => BlockDetail::ScanUnavailable,
+                })
+            }
             EgressError::ClientInit => TransportError::Connect,
             EgressError::BoundaryCompile => TransportError::Io,
         }
+    }
+}
+
+/// The sentence [`EgressError::PrivacyBlocked`] renders, one per cause
+/// (REQ-562 BR-3).
+///
+/// Three causes are three different problems with three different fixes, so
+/// they are three sentences rather than one sentence with a noun swapped. The
+/// scan-unavailable line says the scan **could not run** and never that it found
+/// something: told the wrong one, a user goes looking for a secret that is not
+/// there instead of for the local tier that is not loaded.
+///
+/// Nothing here interpolates payload content, for the same structural reason the
+/// event renderer does not: a [`Finding`](redact::Finding) has no text field to
+/// interpolate (ADR-5), so `path`, `kind` and the byte span are the whole
+/// vocabulary available to this function.
+fn privacy_blocked_sentence(
+    path: &str,
+    provider_id: &ProviderId,
+    action: &PrivacyAction,
+    cause: &BlockCause,
+) -> String {
+    match cause {
+        // Unchanged from REQ-544, deliberately: this is the sentence in every
+        // existing log, and a defaulted `cause` on an old frame reads as this.
+        BlockCause::Boundary => {
+            format!("privacy boundary blocked egress of `{path}` to provider `{provider_id}` ({action:?})")
+        }
+        BlockCause::Redaction { kind, span } => format!(
+            "the redaction scan found {} at bytes {}-{} of {path}, so egress to provider \
+             `{provider_id}` was refused ({action:?})",
+            kind.user_label(),
+            span.start,
+            span.end
+        ),
+        BlockCause::ScanUnavailable => format!(
+            "the redaction scan could not run on {path}, so egress to provider \
+             `{provider_id}` was refused unscanned ({action:?})"
+        ),
+    }
+}
+
+/// The cause a blocking [`RedactionVerdict`] reports (ADR-7).
+///
+/// Derived from the verdict rather than passed alongside it, so the reported
+/// cause and the decision to block cannot come from two different readings of
+/// the same value: [`redact::decide`] blocks a *completed* scan only on a
+/// high-confidence finding, so a blocking verdict either has one — which is what
+/// `Redaction` names — or the scan never completed, which is `ScanUnavailable`.
+///
+/// The **first** high finding is the one reported. A payload can carry several;
+/// naming one is enough to act on, and enumerating them would turn a block
+/// notice into a map of where the secrets are.
+///
+/// ## An `Unavailable` verdict may still name what was found (2026-08-08)
+///
+/// The deterministic pattern pass has no window and sweeps the whole payload in
+/// one piece, so it can complete on a payload whose *model* pass then fails on
+/// some chunk. [`RedactionVerdict::evidence`] carries what it established, and
+/// this function reads it exactly like a finding: `Unavailable` **with** High
+/// evidence is `Redaction`, `Unavailable` without it is `ScanUnavailable`.
+///
+/// That is the truthful reading, not a lenient one. "The scan found a credential
+/// at bytes 40-66" is a claim about a pass that ran to completion over every
+/// byte; "the scan could not run" would be a claim about the *model* pass wearing
+/// the whole scan's name, and it sends the user to debug an engine instead of to
+/// the credential they are about to send. It is also strictly more conservative
+/// downstream: `Redaction` pins the session where `ScanUnavailable` does not
+/// ([`crate::runtime`]'s cause gate), so the evidence restores a pin the
+/// deterministic pass had earned and a transient stall used to erase.
+///
+/// The direction here was **reversed on review evidence**: until 2026-08-08 the
+/// pattern findings were discarded outright at the point the scan failed, and
+/// `a_credential_in_a_scanned_chunk_does_not_outrank_a_chunk_that_failed` pinned
+/// that. Its successor
+/// (`harness::redact::tests::a_credential_the_pattern_pass_established_survives_a_failed_chunk`)
+/// pins this.
+fn block_cause(verdict: &RedactionVerdict) -> BlockCause {
+    // Findings first, evidence second: on a completed scan there is no evidence
+    // to consider, and on a failed one there are no findings — so the chain is
+    // a single ordered read rather than a branch on outcome that could drift
+    // from `decide`'s.
+    let high = verdict
+        .findings()
+        .iter()
+        .chain(verdict.evidence())
+        .find(|f| f.is_high());
+    if let Some(finding) = high {
+        let span = finding.span();
+        return BlockCause::Redaction {
+            kind: wire_kind(finding.kind()),
+            span: ByteSpan {
+                start: span.start as u64,
+                end: span.end as u64,
+            },
+        };
+    }
+    debug_assert_eq!(
+        verdict.outcome(),
+        redact::Outcome::Unavailable,
+        "a completed scan blocks only on a high-confidence finding"
+    );
+    BlockCause::ScanUnavailable
+}
+
+/// The non-secret locus a redaction block reports as its `path` (ADR-7).
+///
+/// A fixed phrase, and a *noun phrase* rather than a sentence, because it has to
+/// read correctly in two different renderings that this crate does not own:
+///
+/// - the cause-aware one — "…at bytes 1400-1436 of **the outbound payload**,
+///   bound for anthropic";
+/// - and the one a client predating [`BlockCause`] falls back to, where the
+///   defaulted `Boundary` reading prints "**the outbound payload** would have
+///   reached anthropic — call re-routed to the local tier".
+///
+/// Both are true and neither quotes a byte of the payload. Folding the kind and
+/// span into this string would make the skew sentence more informative and the
+/// cause-aware one — the sentence this REQ actually promises — read them twice.
+///
+/// It takes the cause so that a future locus that *does* vary by cause has one
+/// place to vary in; today the answer is the same phrase, because "where the
+/// blocked bytes are" does not depend on why they were refused.
+fn redaction_locus(cause: BlockCause) -> &'static str {
+    match cause {
+        BlockCause::Redaction { .. } | BlockCause::ScanUnavailable => "the outbound payload",
+        // Not reachable from the gate hook, which never mints a boundary cause.
+        BlockCause::Boundary => "the outbound payload",
+    }
+}
+
+/// The wire twin of a finding kind. Two enums, one meaning, and the map stated
+/// once — here, at the only place a finding becomes an event.
+fn wire_kind(kind: redact::FindingKind) -> WireFindingKind {
+    match kind {
+        redact::FindingKind::Secret => WireFindingKind::Secret,
+        redact::FindingKind::Credential => WireFindingKind::Credential,
+        redact::FindingKind::Pii => WireFindingKind::Pii,
+        redact::FindingKind::Unknown => WireFindingKind::Unknown,
     }
 }
 
@@ -246,6 +419,10 @@ pub struct Egress<T: Transport> {
     boundaries: Vec<PrivacyBoundary>,
     sink: Arc<dyn PrivacyEventSink>,
     cost: Option<Arc<dyn CostMeter>>,
+    /// The REQ-562 redaction scanner, present **iff** `[privacy] redact` is on
+    /// (ADR-2). `None` is the off state in full: no branch inside the hot path,
+    /// no scanner call, nothing that could claim a scan ran.
+    redaction: Option<Arc<dyn RedactionGate>>,
 }
 
 impl<T: Transport> Egress<T> {
@@ -262,6 +439,7 @@ impl<T: Transport> Egress<T> {
             boundaries,
             sink,
             cost: None,
+            redaction: None,
         }
     }
 
@@ -274,6 +452,19 @@ impl<T: Transport> Egress<T> {
         self
     }
 
+    /// Install the redaction scanner (REQ-562 ADR-2): every payload the
+    /// provenance inspection allows is scanned before it is forwarded.
+    ///
+    /// Additive and mirroring [`Self::with_cost_meter`] — a choke point built
+    /// without one behaves *exactly* as it did before REQ-562, which is what
+    /// makes "off" checkable by scanner call count rather than by reading a flag
+    /// (AC-13). The daemon calls this only when `[privacy] redact` is true.
+    #[must_use]
+    pub fn with_redaction_gate(mut self, gate: Arc<dyn RedactionGate>) -> Self {
+        self.redaction = Some(gate);
+        self
+    }
+
     /// The configured boundaries (read-only).
     #[must_use]
     pub fn boundaries(&self) -> &[PrivacyBoundary] {
@@ -283,11 +474,30 @@ impl<T: Transport> Egress<T> {
     /// Dispatch `request` for the context assembled with `provenance`.
     ///
     /// This is the choke point's primary API and the daemon's turn loop calls it.
-    /// If `provenance` intersects a boundary, the request is refused before any
-    /// network activity: a `privacy_block` event is emitted and
-    /// [`EgressError::PrivacyBlocked`] is returned. The `request` — whose body may
-    /// contain boundary bytes — is dropped, never forwarded, never logged.
-    /// Otherwise the request is forwarded to the inner transport.
+    /// **Two** inspections run here, in this order (REQ-562 ADR-1):
+    ///
+    /// 1. **Provenance** — if `provenance` intersects a boundary, the request is
+    ///    refused before any network activity, with cause `Boundary`.
+    /// 2. **Redaction** — if a gate is installed, the exact bytes that would go
+    ///    on the wire are scanned, and a blocking verdict refuses them with cause
+    ///    `Redaction` or `ScanUnavailable`.
+    ///
+    /// The order is load-bearing, not incidental: a payload the boundary check
+    /// refuses returns before the gate line is reached, so it costs **zero**
+    /// scanner calls (AC-11). Running the model first would spend an inference on
+    /// content that was never allowed to leave in the first place.
+    ///
+    /// Either refusal emits a `privacy_block` event and returns
+    /// [`EgressError::PrivacyBlocked`]. A verdict that **forwards** with
+    /// low-confidence findings writes one daemon-log line per finding
+    /// ([`redact::forwarded_findings_report`]) — kind, confidence and span, no
+    /// payload text — because a finding computed and then discarded is
+    /// indistinguishable from one never made (BR-4, ADR-4).
+    ///
+    /// The `request` — whose body may contain
+    /// the offending bytes — is dropped, never forwarded, never logged. A payload
+    /// both inspections allow reaches the inner transport **byte-identical**:
+    /// v1 detects, it never substitutes (BR-5, AC-9).
     pub async fn send(
         &self,
         request: TransportRequest,
@@ -305,13 +515,89 @@ impl<T: Transport> Egress<T> {
                     path: violation.path.clone(),
                     provider_id: ctx.provider_id.clone(),
                     action: violation.action,
+                    // Named rather than defaulted: the provenance inspection is
+                    // one of several things that can refuse a payload here
+                    // (REQ-562 ADR-7), and this is the one that says *boundary*.
+                    // `#[serde(default)]` exists for frames a v1 daemon wrote,
+                    // not as a way for this emit site to leave the cause unsaid.
+                    cause: BlockCause::Boundary,
                 };
                 self.sink.privacy_block(ctx.session_id.clone(), block);
                 return Err(EgressError::PrivacyBlocked {
                     path: violation.path,
                     provider_id: ctx.provider_id.clone(),
                     action: violation.action,
+                    cause: BlockCause::Boundary,
                 });
+            }
+        }
+
+        // The second inspection (REQ-562 ADR-1). It sits *here*: after the
+        // provenance early-return above, before the forward below, on the exact
+        // bytes that would go on the wire. There is no separate "text
+        // projection" that could drift from what is actually sent — the scan
+        // input is `request.body` read as lossy UTF-8, and the thing forwarded
+        // on a clean verdict is that same `request`, untouched (LESSON-485:
+        // scan the thing the guarantee is about).
+        //
+        // Lossy rather than strict because a body that is not valid UTF-8 must
+        // still be scanned: refusing to look at it would be a scan that skips
+        // exactly the payloads an exfiltrator would choose.
+        //
+        // What a span indexes, precisely: **the lossy text**, not `request.body`.
+        // For every body this daemon actually sends the two are the same string
+        // — an adapter serializes JSON, and `serde_json` emits valid UTF-8 — so
+        // "bytes 1400-1436 of the outbound payload" is exact today.
+        //
+        // It would NOT be exact for a body that is not valid UTF-8, and the
+        // earlier claim here that replacement shifts no offset is simply false:
+        // U+FFFD is three bytes, so a single invalid byte becomes three and
+        // every span after it is skewed by two. That is a reporting inaccuracy
+        // in a case no current adapter can produce, and it is a locus string
+        // rather than a pointer anything dereferences — but it is recorded
+        // rather than asserted away, and an adapter that ever sends a non-UTF-8
+        // body has to revisit it.
+        //
+        // Detection itself is unaffected either way: replacement never creates
+        // or destroys an ASCII byte, so no pattern shape can be hidden or
+        // conjured by it.
+        if let Some(gate) = &self.redaction {
+            let verdict = {
+                let text = String::from_utf8_lossy(&request.body);
+                gate.scan(&text).await
+            };
+            if redact::decide(&verdict) == redact::EgressDecision::Block {
+                let cause = block_cause(&verdict);
+                let path = redaction_locus(cause).to_owned();
+                self.sink.privacy_block(
+                    ctx.session_id.clone(),
+                    PrivacyBlock {
+                        path: path.clone(),
+                        provider_id: ctx.provider_id.clone(),
+                        action: ctx.block_action,
+                        cause,
+                    },
+                );
+                return Err(EgressError::PrivacyBlocked {
+                    path,
+                    provider_id: ctx.provider_id.clone(),
+                    action: ctx.block_action,
+                    cause,
+                });
+            }
+            // The forwarded half of ADR-4's decision table. A `Findings` verdict
+            // that forwards is Low-only (BR-4), and a low-confidence finding
+            // that is computed and then dropped is indistinguishable from one
+            // that was never made — nothing tells the operator, and OQ-2's
+            // "what did the model catch that patterns did not?" has no
+            // observable answer. So it goes to the daemon's log, which is this
+            // process's stderr and therefore `tetond.log`.
+            //
+            // Kind, confidence and span only. `Finding` has no text field, so
+            // "the report never quotes the payload" (BR-6) is a property of the
+            // input rather than of this loop.
+            for line in redact::forwarded_findings_report(&verdict) {
+                eprintln!("{line}");
             }
         }
 
@@ -637,7 +923,9 @@ mod tests {
                 path,
                 provider_id,
                 action,
+                cause,
             } => {
+                assert_eq!(cause, BlockCause::Boundary);
                 assert_eq!(path, "secrets/prod.env");
                 assert_eq!(provider_id, ProviderId::from("anthropic"));
                 assert_eq!(action, PrivacyAction::ReroutedToLocal);
@@ -675,7 +963,12 @@ mod tests {
             .expect_err("scoped transport must refuse");
         // REQ-544 M-1: a block surfaces as the dedicated, non-retryable variant,
         // never a connect refusal.
-        assert_eq!(err, TransportError::PrivacyBlocked);
+        assert_eq!(
+            err,
+            TransportError::PrivacyBlocked(BlockDetail::Boundary),
+            "and the cause travels with it, so the daemon can say which \
+             inspection refused the turn"
+        );
         // The event still fired even though the adapter only saw a transport error.
         assert_eq!(sink.events.lock().unwrap().len(), 1);
     }
@@ -695,6 +988,518 @@ mod tests {
         assert_eq!(resp.status, 200);
     }
 
+    // -----------------------------------------------------------------------
+    // REQ-562 — the redaction gate hook (ADR-1, ADR-2).
+    // -----------------------------------------------------------------------
+
+    /// A gate that answers with a canned verdict and records every payload it
+    /// was handed.
+    ///
+    /// The **count** is the instrument for half these tests: "off means off" and
+    /// "provenance runs first" are claims about how many times the scanner ran,
+    /// not about what it returned, and a mock that only returned a verdict could
+    /// not tell a skipped scan from a permissive one (LESSON-485).
+    struct CountingGate {
+        verdict: RedactionVerdict,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl CountingGate {
+        fn new(verdict: RedactionVerdict) -> Arc<Self> {
+            Arc::new(Self {
+                verdict,
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        fn payloads(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl RedactionGate for CountingGate {
+        async fn scan(&self, payload: &str) -> RedactionVerdict {
+            self.seen.lock().unwrap().push(payload.to_owned());
+            self.verdict.clone()
+        }
+    }
+
+    fn a_high_finding() -> RedactionVerdict {
+        RedactionVerdict::from_findings(vec![redact::Finding::pattern(
+            redact::FindingKind::Credential,
+            1400..1436,
+        )])
+    }
+
+    fn a_low_finding() -> RedactionVerdict {
+        RedactionVerdict::from_findings(vec![redact::Finding::model(
+            redact::FindingKind::Pii,
+            10..22,
+        )])
+    }
+
+    #[tokio::test]
+    async fn off_means_zero_scanner_calls_and_on_means_exactly_one() {
+        // AC-13, both legs, by call count — and by the SAME gate object, so
+        // "zero" is a fact about the choke point's construction rather than
+        // about a gate that could not have counted anyway.
+        let gate = CountingGate::new(RedactionVerdict::clean());
+        let ctx = EgressContext::new("anthropic");
+
+        let inner = CaptureTransport::default();
+        let off_sent = inner.sent.clone();
+        let off = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()));
+        off.send(a_request("ordinary prompt"), &Provenance::empty(), &ctx)
+            .await
+            .expect("an un-gated choke point forwards");
+        assert_eq!(
+            gate.calls(),
+            0,
+            "with no gate installed nothing may claim a scan ran"
+        );
+        assert_eq!(off_sent.lock().unwrap().len(), 1);
+
+        let inner = CaptureTransport::default();
+        let on_sent = inner.sent.clone();
+        let on = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_redaction_gate(gate.clone());
+        on.send(a_request("ordinary prompt"), &Provenance::empty(), &ctx)
+            .await
+            .expect("a clean verdict forwards");
+        assert_eq!(
+            gate.calls(),
+            1,
+            "the same gate, now installed, scans exactly once per send"
+        );
+        assert_eq!(on_sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_payload_refused_by_provenance_is_never_scanned() {
+        // AC-11: the boundary check returns before the gate line is reached, so
+        // a refused payload costs zero inferences. Paired with the leg below,
+        // where the identical gate on the identical choke point *does* run —
+        // otherwise "zero calls" would also be satisfied by a gate that never
+        // runs at all.
+        let gate = CountingGate::new(RedactionVerdict::clean());
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_redaction_gate(gate.clone());
+        let ctx = EgressContext::new("anthropic");
+
+        let err = egress
+            .send(
+                a_request("API_KEY=super-secret-xyzzy"),
+                &Provenance::tainted_by("secrets/prod.env"),
+                &ctx,
+            )
+            .await
+            .expect_err("the boundary refuses it");
+        assert!(matches!(
+            err,
+            EgressError::PrivacyBlocked {
+                cause: BlockCause::Boundary,
+                ..
+            }
+        ));
+        assert_eq!(gate.calls(), 0, "a boundary block buys no scanner call");
+        assert!(sent.lock().unwrap().is_empty());
+
+        // The discriminating leg: same gate, same choke point, provenance the
+        // boundary does not match.
+        egress
+            .send(
+                a_request("public code"),
+                &Provenance::tainted_by("src/main.rs"),
+                &ctx,
+            )
+            .await
+            .expect("an allowed payload is scanned and forwarded");
+        assert_eq!(gate.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_scan_blocks_the_send_and_says_it_could_not_run() {
+        // AC-3 at this layer, fail closed: the transport records zero requests,
+        // and both the event and the typed error say the scan could not run —
+        // never that it found something (BR-3).
+        let sink = Arc::new(CapturingSink::default());
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), sink.clone())
+            .with_redaction_gate(CountingGate::new(RedactionVerdict::unavailable()));
+
+        let err = egress
+            .send(
+                a_request("ordinary prompt"),
+                &Provenance::empty(),
+                &EgressContext::new("anthropic").with_session("sess-1"),
+            )
+            .await
+            .expect_err("an unscannable payload must not be sent");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a guard that cannot run does not become a guard that passes everything"
+        );
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].cause, BlockCause::ScanUnavailable);
+        assert_eq!(events[0].path, "the outbound payload");
+        assert_eq!(events[0].provider_id, ProviderId::from("anthropic"));
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("could not run"), "{rendered}");
+        assert!(
+            !rendered.contains("found"),
+            "a scan that never ran cannot have found anything: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_high_confidence_finding_blocks_with_its_kind_span_and_locus() {
+        // AC-1 at this layer. The span is the fixture's, so this pins that the
+        // finding's own offsets reach the event rather than a placeholder.
+        let sink = Arc::new(CapturingSink::default());
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), sink.clone())
+            .with_redaction_gate(CountingGate::new(a_high_finding()));
+
+        let err = egress
+            .send(
+                a_request("a prompt with a credential in it"),
+                &Provenance::empty(),
+                &EgressContext::new("anthropic"),
+            )
+            .await
+            .expect_err("a high-confidence finding blocks");
+
+        assert!(sent.lock().unwrap().is_empty(), "the bytes are dropped");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].cause,
+            BlockCause::Redaction {
+                kind: WireFindingKind::Credential,
+                span: ByteSpan {
+                    start: 1400,
+                    end: 1436
+                },
+            }
+        );
+        // A locus, not a path: there is no file here, and there is no matched
+        // text on the event to name one with (BR-6).
+        assert_eq!(events[0].path, "the outbound payload");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("a credential"), "{rendered}");
+        assert!(rendered.contains("1400-1436"), "{rendered}");
+        assert!(
+            !rendered.contains("credential in it"),
+            "no payload content may reach the sentence: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_low_only_or_clean_verdict_forwards_the_exact_bytes() {
+        // AC-9: v1 detects, it never substitutes. Both forwarding verdicts are
+        // here because they reach the forward through different arms of
+        // `decide`, and both must leave the request byte-identical.
+        const BODY: &str = "a prompt the scan looked at and let through";
+        for (name, verdict) in [
+            ("clean", RedactionVerdict::clean()),
+            ("low only", a_low_finding()),
+        ] {
+            let sink = Arc::new(CapturingSink::default());
+            let inner = CaptureTransport::default();
+            let sent = inner.sent.clone();
+            let gate = CountingGate::new(verdict);
+            let egress =
+                Egress::new(inner, boundaries(), sink.clone()).with_redaction_gate(gate.clone());
+
+            let resp = egress
+                .send(
+                    a_request(BODY),
+                    &Provenance::empty(),
+                    &EgressContext::new("anthropic"),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name}: must forward, got {e}"));
+            assert_eq!(resp.status, 200, "{name}");
+
+            let forwarded = sent.lock().unwrap();
+            assert_eq!(forwarded.len(), 1, "{name}");
+            assert_eq!(
+                forwarded[0].body,
+                BODY.as_bytes(),
+                "{name}: the forwarded bytes must be byte-identical to the input"
+            );
+            // Non-vacuity: the scan ran, and it saw exactly those bytes.
+            assert_eq!(gate.calls(), 1, "{name}");
+            assert_eq!(gate.payloads(), vec![BODY.to_owned()], "{name}");
+            assert!(
+                sink.events.lock().unwrap().is_empty(),
+                "{name}: a forward emits no privacy_block"
+            );
+        }
+    }
+
+    /// **The forwarded-findings report is actually wired into `send`** (BR-4,
+    /// ADR-4).
+    ///
+    /// Asserted against this module's own source rather than against captured
+    /// output, and the reason is a limitation worth naming: the report goes to
+    /// the daemon's log, which is this process's **stderr** — the one output
+    /// stream `libtest` does not capture, and a process-global file descriptor
+    /// no test may redirect without racing every other test in the binary.
+    ///
+    /// So the split is: [`redact::forwarded_findings_report`] owns the *content*
+    /// and is pinned by four unit tests beside it (kind, span, one line per
+    /// finding, no matched text, and nothing at all for a clean or blocked
+    /// verdict), and this pins the *call* — delete the loop in `send` and this
+    /// turns red. The same instrument the duty seam uses for
+    /// `bound_to_ceiling`.
+    ///
+    /// ## The needle covers the loop **body**, not just its header
+    ///
+    /// Matching only `forwarded_findings_report(&verdict)` accepts a loop that
+    /// calls the report and then does nothing with the lines — "call kept,
+    /// effect dropped", which is precisely the state this test exists to
+    /// forbid: findings computed and discarded are indistinguishable from
+    /// findings never made. So the whole statement is the needle, `eprintln!`
+    /// included. Whitespace is normalized first because `rustfmt`'s indentation
+    /// is not the thing under test.
+    #[test]
+    fn the_gate_arm_reports_a_forwarded_findings_verdict() {
+        let source = crate::call_sites::scan::production_sources()
+            .into_iter()
+            .find(|(rel, _)| rel == "egress/mod.rs")
+            .map(|(_, src)| crate::call_sites::scan::code_only(&src))
+            .expect("this module is a production source");
+        let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(
+                "for line in redact::forwarded_findings_report(&verdict) { eprintln!(\"{line}\"); }"
+            ),
+            "the gate arm must report a forwarded verdict's findings AND emit them; a \
+             finding computed and then dropped is indistinguishable from one never made \
+             (BR-4, ADR-4)"
+        );
+        assert_eq!(
+            crate::call_sites::scan::count(&source, "forwarded_findings_report"),
+            1,
+            "exactly one report site, so one payload cannot be reported twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_send_bills_nothing_while_an_allowed_one_still_bills() {
+        /// A meter that counts the responses it was asked to wrap.
+        #[derive(Default)]
+        struct CountingMeter {
+            metered: std::sync::atomic::AtomicUsize,
+        }
+
+        impl CostMeter for CountingMeter {
+            fn meter_response(
+                &self,
+                response: TransportResponse,
+                _session_id: Option<SessionId>,
+                _provider_id: ProviderId,
+                _attribution: CostAttribution,
+            ) -> TransportResponse {
+                self.metered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                response
+            }
+        }
+
+        // The gate hook must not move cost metering: a blocked send never
+        // reaches `inner.execute`, so it bills nothing — today's behaviour for
+        // boundary blocks — and an allowed forward bills exactly as before.
+        let meter = Arc::new(CountingMeter::default());
+        let ctx = EgressContext::new("anthropic")
+            .with_session("sess-1")
+            .with_cost(CostAttribution::new("claude-opus-4"));
+
+        let blocked = Egress::new(
+            CaptureTransport::default(),
+            boundaries(),
+            Arc::new(CapturingSink::default()),
+        )
+        .with_cost_meter(meter.clone())
+        .with_redaction_gate(CountingGate::new(a_high_finding()));
+        let _ = blocked
+            .send(a_request("blocked"), &Provenance::empty(), &ctx)
+            .await
+            .expect_err("blocked");
+        assert_eq!(
+            meter.metered.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blocked send bills nothing"
+        );
+
+        let allowed = Egress::new(
+            CaptureTransport::default(),
+            boundaries(),
+            Arc::new(CapturingSink::default()),
+        )
+        .with_cost_meter(meter.clone())
+        .with_redaction_gate(CountingGate::new(RedactionVerdict::clean()));
+        allowed
+            .send(a_request("allowed"), &Provenance::empty(), &ctx)
+            .await
+            .expect("allowed");
+        assert_eq!(
+            meter.metered.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an allowed forward meters exactly as it did before the gate existed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gate_reads_the_exact_bytes_that_would_go_on_the_wire() {
+        // ADR-1: no separate text projection that could drift from the wire.
+        // A body that is not valid UTF-8 is still scanned — refusing to look at
+        // it would skip exactly the payloads worth looking at.
+        let gate = CountingGate::new(RedactionVerdict::clean());
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_redaction_gate(gate.clone());
+        let mut request = a_request("");
+        request.body = vec![b'o', b'k', 0xff, b'!'];
+
+        egress
+            .send(
+                request,
+                &Provenance::empty(),
+                &EgressContext::new("anthropic"),
+            )
+            .await
+            .expect("a clean verdict forwards");
+
+        assert_eq!(gate.payloads(), vec![String::from("ok\u{fffd}!")]);
+        // And the forward is still the original bytes, not the lossy text.
+        assert_eq!(sent.lock().unwrap()[0].body, vec![b'o', b'k', 0xff, b'!']);
+    }
+
+    #[test]
+    fn a_redaction_block_reports_the_first_high_finding_and_never_a_low_one() {
+        // `block_cause` is derived from the verdict, so it must agree with
+        // `decide` about what blocked: the high finding, whichever position it
+        // arrives in, and never a low one (which does not block at all).
+        let verdict = RedactionVerdict::from_findings(vec![
+            redact::Finding::model(redact::FindingKind::Pii, 0..4),
+            redact::Finding::pattern(redact::FindingKind::Secret, 90..120),
+            redact::Finding::pattern(redact::FindingKind::Credential, 200..230),
+        ]);
+        assert_eq!(
+            block_cause(&verdict),
+            BlockCause::Redaction {
+                kind: WireFindingKind::Secret,
+                span: ByteSpan {
+                    start: 90,
+                    end: 120
+                },
+            }
+        );
+        assert_eq!(
+            block_cause(&RedactionVerdict::unavailable()),
+            BlockCause::ScanUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_verdict_names_a_credential_only_when_the_pattern_pass_found_one() {
+        // The 2026-08-08 reversal, and its discriminator, at the layer that
+        // decides the cause. Both verdicts are `Unavailable` → Block; what
+        // separates them is whether the deterministic pass had established
+        // anything before the model pass failed.
+        //
+        // The consequence rides the cause rather than being decided again:
+        // `Redaction` pins the session and `ScanUnavailable` does not
+        // (`runtime::cause_taints_the_session`, held to its `BlockDetail` twin
+        // by `the_two_taint_gates_agree_cause_for_cause`), so the row below is
+        // also the row that restores a pin a transient stall used to erase.
+        let established =
+            RedactionVerdict::unavailable_with_evidence(vec![redact::Finding::pattern(
+                redact::FindingKind::Credential,
+                40..66,
+            )]);
+        assert_eq!(
+            block_cause(&established),
+            BlockCause::Redaction {
+                kind: WireFindingKind::Credential,
+                span: ByteSpan { start: 40, end: 66 },
+            },
+            "the pattern pass completed over the whole payload and found this; \
+             reporting `could not run` throws away the only fact anyone \
+             established"
+        );
+        assert_eq!(
+            block_cause(&RedactionVerdict::unavailable()),
+            BlockCause::ScanUnavailable,
+            "and with nothing established there is nothing to name"
+        );
+
+        // A low finding cannot reach the cause through this door either: BR-4's
+        // rule that a low-confidence finding never blocks is not routed around
+        // by handing it to the evidence constructor.
+        assert_eq!(
+            block_cause(&RedactionVerdict::unavailable_with_evidence(vec![
+                redact::Finding::model(redact::FindingKind::Pii, 10..22),
+            ])),
+            BlockCause::ScanUnavailable
+        );
+
+        // And the whole way through the choke point: the event a real send
+        // emits carries the named cause, and the sentence names the credential
+        // rather than telling the user to go debug an engine.
+        let sink = Arc::new(CapturingSink::default());
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let egress = Egress::new(inner, boundaries(), sink.clone())
+            .with_redaction_gate(CountingGate::new(established));
+
+        let err = egress
+            .send(
+                a_request("a prompt with a credential in it"),
+                &Provenance::empty(),
+                &EgressContext::new("anthropic").with_session("sess-1"),
+            )
+            .await
+            .expect_err("an unavailable verdict still blocks");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the bytes are still dropped"
+        );
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].cause,
+            BlockCause::Redaction {
+                kind: WireFindingKind::Credential,
+                span: ByteSpan { start: 40, end: 66 },
+            }
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("a credential"), "{rendered}");
+        assert!(rendered.contains("40-66"), "{rendered}");
+        assert!(
+            !rendered.contains("credential in it"),
+            "no payload content may reach the sentence: {rendered}"
+        );
+    }
+
     #[test]
     fn egress_error_display_carries_no_content() {
         // AC-4: the typed error is safe to log — path + provider + action only.
@@ -702,6 +1507,7 @@ mod tests {
             path: "secrets/prod.env".to_owned(),
             provider_id: ProviderId::from("anthropic"),
             action: PrivacyAction::ReroutedToLocal,
+            cause: BlockCause::Boundary,
         };
         let rendered = err.to_string();
         assert!(rendered.contains("secrets/prod.env"));
@@ -719,13 +1525,71 @@ mod tests {
             path: "secrets/x".to_owned(),
             provider_id: ProviderId::from("p"),
             action: PrivacyAction::ReroutedToLocal,
+            cause: BlockCause::Boundary,
         };
-        assert_eq!(err.into_transport_error(), TransportError::PrivacyBlocked);
+        assert_eq!(
+            err.into_transport_error(),
+            TransportError::PrivacyBlocked(BlockDetail::Boundary)
+        );
         // ClientInit is unrelated and still a connect refusal.
         assert_eq!(
             EgressError::ClientInit.into_transport_error(),
             TransportError::Connect
         );
+    }
+
+    /// **REQ-562 BR-3.** Each cause projects onto its own [`BlockDetail`] as the
+    /// error collapses to the transport seam, so the daemon's turn-failure
+    /// sentence can name which inspection refused the turn.
+    ///
+    /// Table-driven and exhaustive over the three, because the failure mode is a
+    /// `match` arm quietly collapsing two causes into one value — which reads as
+    /// working code and produces a sentence that sends the user after the wrong
+    /// problem. The `assert_ne` pass is what catches a collapse that a
+    /// per-row `assert_eq` on a single row would not.
+    #[test]
+    fn every_block_cause_projects_onto_its_own_transport_detail() {
+        fn collapse(cause: BlockCause) -> TransportError {
+            EgressError::PrivacyBlocked {
+                path: "the outbound payload".to_owned(),
+                provider_id: ProviderId::from("p"),
+                action: PrivacyAction::ReroutedToLocal,
+                cause,
+            }
+            .into_transport_error()
+        }
+
+        let rows = [
+            (BlockCause::Boundary, BlockDetail::Boundary),
+            (
+                BlockCause::Redaction {
+                    kind: WireFindingKind::Credential,
+                    span: ByteSpan {
+                        start: 1400,
+                        end: 1436,
+                    },
+                },
+                BlockDetail::Redaction,
+            ),
+            (BlockCause::ScanUnavailable, BlockDetail::ScanUnavailable),
+        ];
+        for (cause, expected) in rows {
+            assert_eq!(
+                collapse(cause),
+                TransportError::PrivacyBlocked(expected),
+                "{cause:?} must reach the seam as {expected:?}"
+            );
+        }
+        // No two causes may arrive as the same detail.
+        for (i, (cause, _)) in rows.iter().enumerate() {
+            for (other, _) in rows.iter().skip(i + 1) {
+                assert_ne!(
+                    collapse(*cause),
+                    collapse(*other),
+                    "{cause:?} and {other:?} must not collapse into one signal"
+                );
+            }
+        }
     }
 
     const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
