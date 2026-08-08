@@ -771,8 +771,26 @@ pub async fn run_routed_session_turn(
     .await
 }
 
-/// Build the system prompt: the agent's instructions plus the exposed tool docs
-/// and the tool-call format the local model must follow.
+/// Teton's own setup instructions, compiled into the binary (BUG-160).
+///
+/// "How do I hook up external models?" is answerable from neither the model's
+/// weights nor the user's files — Teton's configuration surface is never in
+/// the repository being worked on. Without this block the frame's "use tools
+/// to find out what only the files can tell you" made a repo search the
+/// model's only legal move, and it hunted for instructions that do not exist
+/// on disk. Bundled with [`include_str!`] for the same reason the structured
+/// templates are (`structured/templates.rs`): a fresh install needs nothing on
+/// disk for it to hold.
+///
+/// Sized to stay resident in every turn: the whole system prompt must clear
+/// `REDACT_BODY_OVERHEAD_BYTES` with escaping headroom —
+/// `the_total_cap_clears_the_harness_context_budget_with_margin`
+/// (`egress/redact.rs`) measures the real prompt and turns red on overflow.
+const SELF_CONFIG_GUIDE: &str = include_str!("self_config.md");
+
+/// Build the system prompt: the agent's instructions, Teton's bundled
+/// self-configuration guide, the exposed tool docs, and the tool-call format
+/// the local model must follow.
 #[must_use]
 pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> String {
     let mut s = String::from(
@@ -793,6 +811,8 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
              with the shell tool) before finishing.\n",
         );
     }
+    s.push('\n');
+    s.push_str(SELF_CONFIG_GUIDE);
     s.push_str("\nAvailable tools:\n");
     s.push_str(&tools.docs(config.max_tools));
     s
@@ -1305,6 +1325,39 @@ mod tests {
             assert!(
                 system.contains("{\"tool\": \"<name>\", \"arguments\""),
                 "the tool-call format is missing:\n{system}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_system_prompt_bundles_tetons_own_provider_setup() {
+        // BUG-160, the gap BUG-154's fix does not close. That fix lets the
+        // model answer from knowledge without a tool — but "how do I hook up
+        // external models?" is answerable from neither the weights nor the
+        // user's files, because Teton's configuration surface is never in the
+        // repository being worked on. With nothing bundled, "use tools to
+        // find out what only the files can tell you" made a repo search the
+        // model's only legal move, and it hunted for instructions that do not
+        // exist on disk.
+        //
+        // Checked on both profiles for the same reason BUG-154's test is: a
+        // strong model that greps a user's repo for Teton's own config
+        // surface is just as wrong as the local tier.
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                system.contains("teton provider add"),
+                "the bundled provider-setup guide is gone from the system \
+                 prompt — a question about hooking up external models will go \
+                 searching the repo again. If the guide was reworded \
+                 deliberately, update this test to the new wording; do not \
+                 just delete the assertion.\n{system}"
+            );
+            assert!(
+                system.contains("never inside the repository"),
+                "the guide no longer tells the model that Teton's own \
+                 configuration is not in the user's repo — that clause is \
+                 what stops the file hunt:\n{system}"
             );
         }
     }
