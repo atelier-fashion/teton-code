@@ -16,6 +16,7 @@ Add the wire vocabulary (architecture D-8) and the ledger sibling table
 ## Files to Create/Modify
 
 - `crates/teton-protocol/src/events.rs` — three new `Event` variants: `WebLookup { kind: fetch|search, host: String, outcome: WebLookupOutcome, bytes_in: u64 }` with `WebLookupOutcome` ∈ {completed, cache_hit, blocked_privacy, blocked_redact, refused_domain, refused_tier, taint_restricted, offline}; `WebConsentDecided { scope: once|session|persistent, tier, granted: bool }`; `WebTaintOverridden { tiers_restored }`. Add to `Event::name()` match (snake_case names `web_lookup`, `web_consent_decided`, `web_taint_overridden`) and the index comment at the top of the enum.
+- `crates/teton-protocol/src/methods.rs` — request/response types for the two client RPCs: `web/override` (no params → ack with tiers restored) and `web/refresh` (url → ack evicted|absent). Types only; handlers land in TASK-077.
 - `crates/tetond/src/cost/ledger.rs` — `web_lookups` table: `id, ts, session_id, kind, host, bytes_in, duration_ms, outcome, usd_micros` with the same append-only UPDATE/DELETE-denying trigger pattern as the provider table (ledger.rs:65-70); `record_web_lookup()` insert fn; extend the `/cost` aggregation query to include lookup counts + bytes per session.
 
 ## Acceptance Criteria
