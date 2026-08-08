@@ -216,10 +216,12 @@ The **chunk count** is the other half of the choice, because every chunk is a
 model call and ADR-8's budget is per call. With a 256-byte overlap
 (`REDACT_CHUNK_OVERLAP_BYTES`) the stride is 26,814 bytes, so a payload at the
 total cap is at most **five** chunks — `REDACT_MAX_CHUNKS`, derived from the
-same constants and asserted against the real chunker rather than restated.
-Five is the number that has to stay small: the seam's deadline is per call, so
-the worst-case *wait* is `chunks × DUTY_DEADLINE`, and a cap twice this size
-would double it. See ADR-8.
+same constants, asserted against the real chunker rather than restated, and
+**enforced** by `scan` before the first call rather than trusted. Five is the
+number that has to stay small because it is what ADR-8's per-call budget is
+multiplied by: five chunks at p95 is 25 s of ordinary latency, and a cap twice
+this size doubles it. (It no longer multiplies the *worst case*: round 4 bounds
+a whole scan at one `DUTY_DEADLINE` — see ADR-8.)
 
 **The overlap, and what it is sized from.** Consecutive chunks overlap by 256
 bytes so that anything shorter appears whole in at least one chunk. 256 covers
@@ -345,21 +347,36 @@ the harness produces on ordinary context-heavy work and the shape that used to
 **block** rather than take four seconds. Two chunks is the expected steady
 state; five is the ceiling, not the common case.
 
-**A residual chunking introduces, stated rather than discovered later: the
-deadline is per call, so the worst-case *wait* is `chunks × DUTY_DEADLINE`.** A
-maximal payload whose every chunk answers just under the 120-second deadline
-waits up to 600 seconds, where before it waited 120. Three things bound how bad
-that is, and none of them removes it: the first chunk that *overruns* ends the
-scan (fail-closed short-circuit — the 600 s case needs four chunks each
-answering at 119 s and succeeding, which is a degenerate engine rather than a
-slow one); the total cap is what bounds the multiplier, and it was chosen with
-this in mind (ADR-6); and the failure direction is slowness, not leakage. A
-scan-wide deadline — one budget across all chunks rather than one per call —
-is the fix, and it belongs at the seam where `DUTY_DEADLINE` lives rather than
-inside this duty, which is why it is **deliberate follow-up** and not part of
-this change. Adding a second spelling of "the scan ran out of time" inside
-`harness::redact` is exactly the two-spellings hazard the `RedactionGate`
-trait's docstring refuses for errors.
+**The scan's total wait is bounded at one `DUTY_DEADLINE`, and the bound is
+enforced (round 4).** Chunking introduced a residual — the seam's deadline is
+per call, so the worst-case *wait* was `chunks × DUTY_DEADLINE`, up to 600
+seconds for a maximal payload whose every chunk answered just under 120 — and
+this round closes it rather than living with it. `scan` runs its whole chunk
+loop inside a single `tokio::time::timeout(DUTY_DEADLINE, …)`; the per-call
+deadline stays underneath it, tighter for a one-chunk scan and irrelevant for a
+multi-chunk one.
+
+It is inside `harness::redact` rather than at the seam, which is a reversal of
+this ADR's earlier reasoning: the seam's deadline is per `perform`, and a
+*scan* is not a `perform` — it is N of them — so the seam has no seam-shaped
+place to put a budget over a sequence it does not own. The two-spellings hazard
+the earlier text worried about is avoided the other way: a timeout here does not
+mint a new outcome, it falls into the **same** `Unavailable` arm as a failed
+chunk (`Err(Elapsed)` and `Ok(None)` are one `let-else`), so there is still
+exactly one spelling of "the scan did not finish".
+
+Safe under LESSON-488 ("a timeout is a drop, and a dropped stream never
+bills"): the cancelled future here is a **local** duty. No `MeteredBody` rides
+the scan — `redact` is pinned local by construction — so there is no ledger row
+for the drop to skip, and the drop posture is fail-closed anyway (the payload
+does not leave). The deterministic pattern pass is computed *before* the
+timeout starts, so a scan that runs out of time still carries what that pass
+established (ADR-6's evidence rule).
+
+`harness::redact::tests::a_scan_whose_chunks_each_answer_in_time_still_stops_at_one_scan_deadline`
+pins it on a paused clock: a first chunk answering at ⅔ of the deadline and a
+second that stalls forever: the scan returns at one deadline, where a per-call
+bound would return at 1⅔.
 
 **`route_decided` fires once per chunk, and that is correct rather than
 tolerated.** `DutyRoute::perform` announces on every invocation and

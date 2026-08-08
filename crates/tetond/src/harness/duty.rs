@@ -265,6 +265,18 @@
 //! | **(j)** the cause ignores the evidence — `egress::block_cause`: `verdict.findings().iter().chain(verdict.evidence())` → `verdict.findings().iter()` | **1 lib.** `egress::tests::an_unavailable_verdict_names_a_credential_only_when_the_pattern_pass_found_one` (734 passed / 1 failed). This is the pre-fix behaviour restored exactly: the verdict still carries the finding, and the block still reports "could not run" — and with it goes the `Redaction` cause that is the *only* thing pinning the session, so the mutation is silently permissive one layer downstream |
 //! | **(k)** the scan mints no evidence — `scan`: all three `RedactionVerdict::unavailable_with_evidence(established())` in the chunk loop → `RedactionVerdict::unavailable()` | **1 lib.** `harness::redact::tests::a_credential_the_pattern_pass_established_survives_a_failed_chunk` (734 passed / 1 failed). The pair to (j) at the other end of the seam: (j) breaks the reading, (k) breaks the writing, and each is caught by the test on its own side. Its twin `a_clean_payload_whose_chunk_failed_still_reports_only_that_it_could_not_run` stays **green** under both, which is what makes it the discriminator rather than a second copy |
 //!
+//! ### REQ-562 round 4 — the declared bounds become enforced code
+//!
+//! Three bounds this REQ had written down but not checked. Each is a line, and
+//! each was mutated against a **freshly built workspace** (LESSON-489) with
+//! `--no-fail-fast`, then reverted.
+//!
+//! | # | Mutation (exact diff) | Turns red |
+//! |---|---|---|
+//! | **(l)** the scan-wide deadline is removed — `scan`: `tokio::time::timeout(DUTY_DEADLINE, async { … }).await` → the same block awaited bare, wrapped in `Ok(…)` so the `let-else` still typechecks | **1 lib.** `harness::redact::tests::a_scan_whose_chunks_each_answer_in_time_still_stops_at_one_scan_deadline` (736 passed / 1 failed). Only that one, and that is the design of the fixture: every other deadline test has a chunk that *overruns*, which the seam's per-call deadline catches on its own. The discriminating shape is a first chunk answering at ⅔ of the budget and a second that stalls — both inside the per-call bound, `1⅔ × DUTY_DEADLINE` of total wait, and only the elapsed assertion sees it |
+//! | **(m)** the chunk ceiling never refuses — `past_the_chunk_ceiling`: `ranges.len() > REDACT_MAX_CHUNKS` → `false` | **1 lib.** `harness::redact::tests::the_chunk_ceiling_refuses_a_cut_past_it` (736 passed / 1 failed). Only the unit test, necessarily: the guard is unreachable through `scan` today because the total cap *is* `REDACT_MAX_CHUNKS` windows, which is stated in the fixture rather than left for a reader to wonder about. It is the bound BR-7 asks for, kept for the day one of the four derived constants moves |
+//! | **(n)** the stride goes to zero — `REDACT_CHUNK_OVERLAP_BYTES: 256` → `REDACT_CHUNK_MAX_BYTES` | **The build.** `const _: () = assert!(REDACT_CHUNK_STRIDE_BYTES > 0)` fails to evaluate, naming the stride. Recorded honestly: `REDACT_MAX_CHUNKS`'s `div_ceil` *also* fails on this input, as a divide-by-zero two derivations away from the loop that would hang — so today the assert is the better error rather than the only one, and it is what still holds if that derivation changes shape |
+//!
 //! ## What draining past the ceiling buys, and why it is still done
 //!
 //! Past the ceiling [`RemoteDuty::perform`] stops *accumulating* but keeps

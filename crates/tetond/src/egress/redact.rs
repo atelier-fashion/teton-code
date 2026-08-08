@@ -285,11 +285,13 @@ const REDACT_BODY_OVERHEAD_BYTES: usize = 8 * 1024;
 /// overlap the stride is 26,814 bytes, so a payload at the total cap is at most
 /// **five** chunks
 /// ([`REDACT_MAX_CHUNKS`](crate::harness::redact::REDACT_MAX_CHUNKS), asserted
-/// against the real chunker rather than restated) — p50 ≤ 10 s and p95 ≤ 25 s at
-/// ADR-8's per-chunk budget, against a context-budget-full turn's expected
-/// **two**. Five is the number that has to stay small: the seam's deadline is
-/// per call, so the worst-case *wait* is `chunks × DUTY_DEADLINE`, and a cap
-/// twice this size would double it.
+/// against the real chunker rather than restated, and enforced by
+/// [`scan`](crate::harness::redact::scan) before the first call) — p50 ≤ 10 s
+/// and p95 ≤ 25 s at ADR-8's per-chunk budget, against a context-budget-full
+/// turn's expected **two**. Five is the number that has to stay small because
+/// it multiplies that budget, and a cap twice this size would double the
+/// ordinary latency. It no longer multiplies the *worst case*: the scan as a
+/// whole is bounded at one `DUTY_DEADLINE`, not one per chunk.
 const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
 
 /// The largest payload the redactor will scan **at all**, in bytes (BR-7,

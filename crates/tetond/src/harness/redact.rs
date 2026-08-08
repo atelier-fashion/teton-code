@@ -111,7 +111,7 @@ use crate::egress::redact::{
 };
 use crate::egress::Provenance;
 
-use super::duty::{DutyKind, DutyRoute};
+use super::duty::{DutyKind, DutyRoute, DUTY_DEADLINE};
 use super::render::render_duty;
 
 /// How many findings [`REDACTION_OUTPUT_CONTRACT`] asks for, at most.
@@ -394,6 +394,22 @@ pub const REDACT_CHUNK_OVERLAP_BYTES: usize = 256;
 /// and writing it down beside them is the second number LESSON-446 is about.
 const REDACT_CHUNK_STRIDE_BYTES: usize = REDACT_CHUNK_MAX_BYTES - REDACT_CHUNK_OVERLAP_BYTES;
 
+/// A zero stride is an unbounded loop on the send path, so it is a **build**
+/// failure rather than a hang.
+///
+/// The stride is derived from two constants that are themselves derived, and
+/// [`chunk_ranges`] advances by it: `start = end - REDACT_CHUNK_OVERLAP_BYTES`
+/// makes no progress if the overlap ever grows to the window, and the first
+/// multi-chunk payload to reach the gate spins forever inside `Egress::send`.
+///
+/// At today's constants [`REDACT_MAX_CHUNKS`]'s `div_ceil` happens to catch the
+/// same thing one line below, and that is recorded rather than leaned on: it
+/// catches it as "attempt to divide by zero" in a derivation two removes from
+/// the loop that hangs, and it stops catching it the moment that derivation
+/// changes shape. This names the condition where the condition matters, for one
+/// line checked at compile time — the only time cheaper than the first hang.
+const _: () = assert!(REDACT_CHUNK_STRIDE_BYTES > 0);
+
 /// The most chunks a payload can be cut into — equivalently, the most model
 /// calls one send can buy (BR-7, ADR-8).
 ///
@@ -402,11 +418,17 @@ const REDACT_CHUNK_STRIDE_BYTES: usize = REDACT_CHUNK_MAX_BYTES - REDACT_CHUNK_O
 /// `ceil((108,280 − 27,070) / 26,814) + 1 = 5` of them.
 ///
 /// It is the number ADR-8's budget is multiplied by — p50 ≤ 2 s per chunk means
-/// p50 ≤ 10 s for a maximal payload — and the number the seam's per-call
-/// deadline is multiplied by in the worst case. Derived here rather than
-/// declared so that raising the total cap moves it, and
+/// p50 ≤ 10 s for a maximal payload. It is **not** what the worst-case wait is
+/// multiplied by: [`scan`] bounds the whole loop at one
+/// [`DUTY_DEADLINE`](super::duty::DUTY_DEADLINE), so a degenerate engine costs
+/// one deadline rather than five.
+///
+/// Derived here rather than declared so that raising the total cap moves it;
 /// [`tests::the_chunker_never_cuts_more_chunks_than_the_derived_ceiling`] checks
-/// the derivation against the real chunker instead of trusting the arithmetic.
+/// the derivation against the real chunker instead of trusting the arithmetic,
+/// and [`scan`] refuses a cut past it
+/// ([`past_the_chunk_ceiling`]) rather than assuming the check above will always
+/// hold.
 pub const REDACT_MAX_CHUNKS: usize =
     (REDACT_INPUT_MAX_BYTES - REDACT_CHUNK_MAX_BYTES).div_ceil(REDACT_CHUNK_STRIDE_BYTES) + 1;
 
@@ -456,11 +478,30 @@ fn chunk_ranges(payload: &str) -> Vec<Range<usize>> {
         }
         // Backwards again, so the overlap grows rather than shrinks below the
         // length it is sized to cover.
+        //
+        // The `start > 0` guard is symmetry with the walk above rather than a
+        // reachable case: byte 0 is always a char boundary, so the loop cannot
+        // walk past it today. It costs one comparison and it means neither walk
+        // can underflow if a future change lets `end` sit under the overlap.
         start = end - REDACT_CHUNK_OVERLAP_BYTES;
-        while !payload.is_char_boundary(start) {
+        while start > 0 && !payload.is_char_boundary(start) {
             start -= 1;
         }
     }
+}
+
+/// Whether a cut payload is past [`REDACT_MAX_CHUNKS`], the ceiling ADR-8's
+/// per-call latency budget is multiplied by (BR-7).
+///
+/// A named predicate for a comparison, because the comparison is the only part
+/// of the bound a test can reach: the total cap is `REDACT_MAX_CHUNKS` windows
+/// by construction, so [`scan`] cannot be handed a payload that trips it and
+/// there is no fixture that would turn the guard clause red. Naming it gives
+/// [`tests::the_chunk_ceiling_refuses_a_cut_past_it`] something to assert
+/// against directly, which is the difference between a bound that is enforced
+/// and a bound that is merely written down.
+fn past_the_chunk_ceiling(ranges: &[Range<usize>]) -> bool {
+    ranges.len() > REDACT_MAX_CHUNKS
 }
 
 /// Scan `payload` with both passes and return the verdict the choke point acts
@@ -484,7 +525,11 @@ fn chunk_ranges(payload: &str) -> Vec<Range<usize>> {
 /// 2. **An unresolved route next**, before any prompt is built: a payload at
 ///    the cap rendered into five prompts no model will ever see is a lot of work
 ///    done for calls that cannot happen (`name_session`'s precedent).
-/// 3. **Then, per chunk, the rendered prompt is measured** against the engine's
+/// 3. **Then the chunk count**, against [`REDACT_MAX_CHUNKS`]. The declared
+///    ceiling is what ADR-8's per-call budget is multiplied by, and it is
+///    arithmetic over four derived constants — so it is enforced here rather
+///    than left as a property the chunker is trusted to keep.
+/// 4. **Then, per chunk, the rendered prompt is measured** against the engine's
 ///    own budget ([`rendered_prompt_bytes`], LESSON-488). The per-chunk cap is
 ///    arithmetic over the payload; the thing that has to fit is the *rendered*
 ///    prompt, and two transforms run after the chunk is cut — the frame defusing
@@ -495,9 +540,24 @@ fn chunk_ranges(payload: &str) -> Vec<Range<usize>> {
 ///    could not run" when the truth is "this chunk is too dense to render". The
 ///    per-chunk cap stays as the cheap first filter; this is the bound. It is
 ///    checked **per chunk**, because it is the chunk that becomes a prompt.
-/// 4. Then that chunk's model call, then its findings mapped from chunk-relative
+/// 5. Then that chunk's model call, then its findings mapped from chunk-relative
 ///    offsets into the payload's own, then the next chunk — and the merge once
 ///    every chunk is in.
+///
+/// ## One deadline for the scan, not one per chunk (ADR-8)
+///
+/// The whole chunk loop runs inside a single
+/// [`DUTY_DEADLINE`](super::duty::DUTY_DEADLINE). The seam's own deadline bounds
+/// one [`DutyRoute::perform`], which before this made the worst-case *wait*
+/// `chunks × DUTY_DEADLINE` — up to ten minutes for a maximal payload whose
+/// every chunk answered just under the limit. ADR-8 recorded that as the
+/// residual chunking introduced; the bound above is now one budget for the whole
+/// scan, and the per-call deadline stays underneath it as the tighter of the two
+/// for a single-chunk scan.
+///
+/// The pattern verdict is computed **before** the timeout starts, so nothing
+/// deterministic is inside the budget: a scan that times out still knows what
+/// the pattern pass found, which is what the evidence below is about.
 ///
 /// Failure of any of those, on **any** chunk, is [`Outcome::Unavailable`], never
 /// [`Outcome::Clean`] — including when every other chunk came back clean. See
@@ -511,8 +571,9 @@ fn chunk_ranges(payload: &str) -> Vec<Range<usize>> {
 /// The one thing that failure does not erase is the deterministic pass. It ran
 /// before the loop, over the whole payload, with no window to be cut by — so a
 /// High finding it produced is a completed fact about these bytes whatever the
-/// engine then did. Every `Unavailable` minted inside the loop therefore carries
-/// it as [`RedactionVerdict::evidence`], and
+/// engine then did. Every `Unavailable` minted inside the loop — and the one the
+/// scan-wide deadline mints — therefore carries it as
+/// [`RedactionVerdict::evidence`], and
 /// [`block_cause`](crate::egress) reports `Redaction` rather than
 /// `ScanUnavailable` when it is there.
 ///
@@ -577,28 +638,67 @@ pub async fn scan(route: &DutyRoute, payload: &str) -> RedactionVerdict {
             .cloned()
             .collect()
     };
-    let mut model = Vec::new();
-    for chunk in chunk_ranges(payload) {
-        let text = &payload[chunk.clone()];
-        let prompt = redact_prompt(text);
-        // The bound, measured rather than estimated (LESSON-488). A prompt the
-        // engine would refuse as over-window is refused HERE, before the call,
-        // so it costs nothing and — more to the point — so it is one failure
-        // with one cause instead of an engine error wearing the wrong reason.
-        if rendered_prompt_bytes(&prompt) > REDACT_PROMPT_BUDGET_BYTES {
-            return RedactionVerdict::unavailable_with_evidence(established());
-        }
-        let Ok(answer) = route.perform(&prompt, &Provenance::empty()).await else {
-            return RedactionVerdict::unavailable_with_evidence(established());
-        };
-        // The reply is consumed here and nowhere else. What comes back out is a
-        // list of spans in the PAYLOAD's coordinates; what goes in is never
-        // returned, never logged, and never carried by the error (ADR-5, BR-6).
-        let Ok(found) = read_findings(&answer, text, chunk.start) else {
-            return RedactionVerdict::unavailable_with_evidence(established());
-        };
-        model.extend(found);
+    let ranges = chunk_ranges(payload);
+    // The declared ceiling, enforced rather than argued (BR-7). It is
+    // unreachable through this function today — the total cap is
+    // `REDACT_MAX_CHUNKS` windows by construction, and
+    // `the_chunker_never_cuts_more_chunks_than_the_derived_ceiling` pins the
+    // chunker to it — which is exactly why it is worth a line: the ceiling is a
+    // number ADR-8's latency budget is multiplied by, and the thing that keeps
+    // it true is arithmetic among four derived constants. If a later change to
+    // any of them makes the chunker cut a sixth window, the choice today is
+    // between a scan that quietly costs 20% more model calls than its budget
+    // and one that refuses. BR-7 asks for a bound; this is the bound refusing.
+    if past_the_chunk_ceiling(&ranges) {
+        return RedactionVerdict::unavailable_with_evidence(established());
     }
+    // **One deadline for the whole scan** (ADR-8), not one per chunk. The seam's
+    // `DUTY_DEADLINE` bounds a single `perform`, so before this a maximal scan
+    // could wait `chunks × DUTY_DEADLINE` — up to ~600 s for five chunks each
+    // answering just under the limit. That is the residual ADR-8 recorded as
+    // follow-up; this is the follow-up. The pattern verdict is already computed
+    // above, so nothing deterministic is inside the budget.
+    //
+    // Safe under LESSON-488 ("a timeout is a drop, and a dropped stream never
+    // bills"): a timeout cancels the inner future, and here the inner future is
+    // a local duty. There is no `MeteredBody` on the scan — `redact` is pinned
+    // local by construction, so there is no ledger row for a drop to skip — and
+    // the drop posture is fail-closed anyway: the payload does not leave.
+    let scanned = tokio::time::timeout(DUTY_DEADLINE, async {
+        let mut model = Vec::new();
+        for chunk in ranges {
+            let text = &payload[chunk.clone()];
+            let prompt = redact_prompt(text);
+            // The bound, measured rather than estimated (LESSON-488). A prompt
+            // the engine would refuse as over-window is refused HERE, before the
+            // call, so it costs nothing and — more to the point — so it is one
+            // failure with one cause instead of an engine error wearing the
+            // wrong reason.
+            if rendered_prompt_bytes(&prompt) > REDACT_PROMPT_BUDGET_BYTES {
+                return None;
+            }
+            let Ok(answer) = route.perform(&prompt, &Provenance::empty()).await else {
+                return None;
+            };
+            // The reply is consumed here and nowhere else. What comes back out
+            // is a list of spans in the PAYLOAD's coordinates; what goes in is
+            // never returned, never logged, and never carried by the error
+            // (ADR-5, BR-6).
+            let Ok(found) = read_findings(&answer, text, chunk.start) else {
+                return None;
+            };
+            model.extend(found);
+        }
+        Some(model)
+    })
+    .await;
+    // `Err(Elapsed)` (the scan ran out of time) and `Ok(None)` (a chunk could
+    // not run) are one arm on purpose: ADR-6 has one `Unavailable`, and a second
+    // spelling of "the scan did not finish" is what the `RedactionGate` trait
+    // refuses for errors.
+    let Ok(Some(model)) = scanned else {
+        return RedactionVerdict::unavailable_with_evidence(established());
+    };
     RedactionVerdict::from_findings(merge(pattern.findings().to_vec(), model))
 }
 
@@ -1880,6 +1980,141 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             pending().await
         }
+    }
+
+    /// **The declared chunk ceiling is enforced, not argued** (BR-7, ADR-8).
+    ///
+    /// [`REDACT_MAX_CHUNKS`] is the number ADR-8's per-call budget is multiplied
+    /// by, and until now it was a property the chunker happened to have rather
+    /// than one the scan checked. `scan` now refuses a cut past it.
+    ///
+    /// **Stated note: the guard is unreachable through [`scan`] today**, and
+    /// deliberately so — the total cap *is* `REDACT_MAX_CHUNKS` windows, and
+    /// [`the_chunker_never_cuts_more_chunks_than_the_derived_ceiling`] pins the
+    /// chunker to it at the cap, so no payload `pattern_verdict` admits can trip
+    /// it. That is why this is a unit test on the predicate rather than a
+    /// fixture through the public API: there is no such fixture to build, and a
+    /// synthetic payload that produced six ranges would be testing a chunker
+    /// that does not exist. What the guard is for is the day one of the four
+    /// derived constants moves and the ceiling stops being tight — at which
+    /// point the choice is between a scan that quietly costs a call more than
+    /// its budget and one that refuses, and BR-7 already answered it.
+    #[test]
+    fn the_chunk_ceiling_refuses_a_cut_past_it() {
+        // The ordinary cut, from the real chunker rather than a literal.
+        assert!(!past_the_chunk_ceiling(&chunk_ranges(&filler(1_024))));
+
+        let at_ceiling: Vec<Range<usize>> = (0..REDACT_MAX_CHUNKS).map(|i| i..i + 10).collect();
+        assert!(
+            !past_the_chunk_ceiling(&at_ceiling),
+            "the ceiling is reached at the cap by construction, so exactly \
+             {REDACT_MAX_CHUNKS} must pass or every maximal payload is refused"
+        );
+
+        let past: Vec<Range<usize>> = (0..=REDACT_MAX_CHUNKS).map(|i| i..i + 10).collect();
+        assert!(
+            past_the_chunk_ceiling(&past),
+            "one chunk past the ceiling is one model call past the budget"
+        );
+
+        // And the reachability claim above, checked rather than asserted in
+        // prose: the largest payload the cap admits cuts to exactly the ceiling.
+        assert_eq!(
+            chunk_ranges(&filler(REDACT_INPUT_MAX_BYTES)).len(),
+            REDACT_MAX_CHUNKS
+        );
+    }
+
+    /// A duty whose **first** call takes real time and answers, and whose every
+    /// later call never answers at all — the shape that separates a scan-wide
+    /// deadline from a per-call one.
+    struct SlowThenStalled {
+        first: std::time::Duration,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Duty for SlowThenStalled {
+        fn category(&self) -> Category {
+            Category::Redact
+        }
+        fn ceiling_bytes(&self) -> usize {
+            REDACT_OUTPUT_MAX_BYTES
+        }
+        async fn perform(&self, _prompt: &str, _provenance: &Provenance) -> Result<String, String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::time::sleep(self.first).await;
+                return Ok(NOTHING_FOUND.to_owned());
+            }
+            pending().await
+        }
+    }
+
+    /// **The scan's total wait is one [`DUTY_DEADLINE`], not one per chunk**
+    /// (ADR-8's residual, closed).
+    ///
+    /// Every chunk here is *inside* the seam's per-call deadline or stalls
+    /// forever, which is exactly the case the per-call bound cannot catch: the
+    /// first chunk answers at two-thirds of the deadline, so the second chunk's
+    /// own budget does not expire until 1⅔ deadlines in. Before this the scan
+    /// waited for that — `chunks × DUTY_DEADLINE` in the general case, ten
+    /// minutes for a maximal payload.
+    ///
+    /// The elapsed assertion is the whole test. Outcome and `decide` would be
+    /// identical either way (the per-call deadline gets there in the end); only
+    /// *when* differs, so a fixture that checked the verdict alone would stay
+    /// green with the scan-wide timeout removed.
+    ///
+    /// Run on a paused clock, so "waited two minutes" costs no wall clock. The
+    /// credential in the fixture is there to pin the second half: a scan that
+    /// runs out of time still carries what the pattern pass established, because
+    /// that pass completed before the budget started.
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_whose_chunks_each_answer_in_time_still_stops_at_one_scan_deadline() {
+        let payload = format!("{CREDENTIAL} then {}", filler(OVER_ONE_WINDOW));
+        assert_eq!(chunk_ranges(&payload).len(), 2, "the fixture is two chunks");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route = DutyRoute::Serves {
+            provider_id: "stub".to_owned(),
+            duty: Arc::new(SlowThenStalled {
+                first: DUTY_DEADLINE * 2 / 3,
+                calls: Arc::clone(&calls),
+            }),
+            announce: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let verdict = scan(&route, &payload).await;
+        let waited = started.elapsed();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "non-vacuity: the first chunk really answered and the second really \
+             was asked, so this is the scan's own budget expiring rather than \
+             the route declining"
+        );
+        assert!(
+            waited <= DUTY_DEADLINE + std::time::Duration::from_secs(1),
+            "the scan waited {waited:?}, past its own deadline of {DUTY_DEADLINE:?} \
+             — a per-call deadline would let this reach {:?}",
+            DUTY_DEADLINE * 2 / 3 + DUTY_DEADLINE
+        );
+        assert_eq!(verdict.outcome(), Outcome::Unavailable);
+        assert!(!verdict.scanned());
+        assert_eq!(
+            decide(&verdict),
+            EgressDecision::Block,
+            "a scan that ran out of time must not forward"
+        );
+        assert_eq!(
+            verdict.evidence().len(),
+            1,
+            "the pattern pass completed before the budget started, so a timeout \
+             does not erase it either: {:?}",
+            verdict.evidence()
+        );
     }
 
     /// **ADR-8.** A scan that overruns the seam's deadline is `Unavailable`, so a
