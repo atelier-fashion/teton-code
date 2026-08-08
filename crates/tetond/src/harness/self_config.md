@@ -1,0 +1,5 @@
+About Teton itself: Teton's own configuration is never inside the repository you are working on, so do not search the project files for it — answer setup questions from this section.
+Teton runs a local model by default and can route work to external providers (Anthropic, or any OpenAI-compatible endpoint). To hook one up:
+1. `teton provider add <id> --kind anthropic --model <model>` — or `--kind openai-compatible --endpoint <url> --model <model>`. A remote provider must declare `--model`. The API key is read from TETON_PROVIDER_KEY or prompted for, and stored in the OS keychain — never written to a file.
+2. `teton policy set-tier <reflex|scan|build|think> <provider-id>` routes a whole tier there (`--fallback <id>` names a backup); `teton policy set-category <category> <provider-id>` overrides one category.
+3. Inspect with `teton policy show`, `teton provider list`, and `teton doctor`. Config lives in config.toml in Teton's state directory (or $TETON_CONFIG); API keys are never stored in it.

@@ -165,6 +165,30 @@ differentiators:
   to a cheap one executing from well-specified task artifacts, mechanical I/O to
   the local daemon.
 
+### Hooking up an external model
+
+```bash
+# Register the provider (remote kinds must declare --model; the API key is
+# read from TETON_PROVIDER_KEY or prompted for, and stored in the OS
+# keychain — never written to a file):
+teton provider add opus --kind anthropic --model claude-opus-5
+teton provider add kimi --kind openai-compatible \
+  --endpoint https://api.moonshot.ai/v1 --model kimi-k2
+
+# Route work to it — a whole tier (reflex | scan | build | think), with an
+# optional fallback, or a single category ahead of its tier:
+teton policy set-tier think opus --fallback kimi
+teton policy set-category review opus
+
+# Inspect:
+teton policy show
+teton provider list
+teton doctor
+```
+
+Config lives in `config.toml` in Teton's state directory (override with
+`TETON_CONFIG`); API keys are never stored in it.
+
 Two promises, both made visible:
 
 - **Cost control** — a live cost meter with per-phase attribution and measured
