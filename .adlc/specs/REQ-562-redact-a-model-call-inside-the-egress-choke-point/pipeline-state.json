@@ -28,8 +28,9 @@
   },
   "mergeOrder": ["teton-code"],
   "phase4": {
-    "currentTask": null,
-    "completedTasks": [],
-    "failedTasks": []
+    "currentTask": "TASK-071",
+    "completedTasks": ["TASK-066", "TASK-067", "TASK-068", "TASK-069", "TASK-070"],
+    "failedTasks": [],
+    "note": "tier 3 done (27d1de8 + BR-3 sentence fix 15ed1ce); tier 4 = TASK-071"
   }
 }

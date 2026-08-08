@@ -132,7 +132,22 @@ No new RPCs.
 
 ## Acceptance Criteria
 
-- [x] AC-1: A payload containing a planted secret **that provenance cannot catch** —
+- [x] AC-1: **ADJUDICATED 2026-08-08 — the criterion as originally written
+      contradicted BR-4/AC-10, and ADR-4 governs.** "Blocked" is the
+      High-confidence action; a model-only (paraphrased) hit is Low **by
+      construction** (OQ-2's derived-confidence resolution), and a Low-only
+      payload forwards (AC-10). What is proven, both with clean provenance and
+      no matching boundary glob: a planted secret **blocks when any pass yields
+      a High finding**, with `privacy_block` naming redaction as the cause
+      (`a_planted_credential_with_clean_provenance_is_blocked_and_the_event_names_redaction`);
+      a credential the model paraphrased into prose is **located, reported at
+      Low — span and kind, never text — and forwards** per BR-4
+      (`a_credential_the_model_paraphrased_is_located_and_reported_without_blocking`).
+      The capability the REQ exists for — content-based detection that
+      provenance structurally cannot do — holds on both legs; whether Low
+      should ever escalate to a block is BR-4's stated rule to revisit, not this
+      criterion's. *(Original wording follows.)* A payload containing a planted
+      secret **that provenance cannot catch** —
       a credential the model paraphrased into prose, with clean provenance and no
       matching boundary glob — is blocked, and `privacy_block` names redaction as
       the cause. This is the capability the REQ exists for and it fails against
