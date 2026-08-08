@@ -26,10 +26,10 @@
 use std::collections::{HashMap, HashSet};
 
 use teton_protocol::events::{
-    BlockCause, DaemonClientAttach, Event, EventEnvelope, FailureClass, FindingKind,
-    ModelLifecycle, ModelSelectionProposed, PermissionOption, PermissionOptionKind,
-    PermissionRequest, PhaseTransition, PrivacyAction, PrivacyBlock, ProviderDegraded,
-    RouteDecided, SessionUpdatePayload, ToolCallStatus,
+    BlockCause, DaemonClientAttach, Event, EventEnvelope, FailureClass, ModelLifecycle,
+    ModelSelectionProposed, PermissionOption, PermissionOptionKind, PermissionRequest,
+    PhaseTransition, PrivacyAction, PrivacyBlock, ProviderDegraded, RouteDecided,
+    SessionUpdatePayload, ToolCallStatus,
 };
 use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
 use teton_protocol::{Phase, RequestId};
@@ -468,7 +468,7 @@ fn format_privacy(pb: &PrivacyBlock) -> String {
         ),
         BlockCause::Redaction { kind, span } => format!(
             "privacy: the redaction scan detected {} at bytes {}–{} of {}, bound for {} — {action}",
-            finding_kind_label(*kind),
+            kind.user_label(),
             span.start,
             span.end,
             pb.path,
@@ -478,17 +478,6 @@ fn format_privacy(pb: &PrivacyBlock) -> String {
             "privacy: the redaction scan could not run on {}, bound for {} — blocked unscanned; {action}",
             pb.path, pb.provider_id
         ),
-    }
-}
-
-/// The user-facing noun for a finding kind. The wording lives at the surface,
-/// like every other sentence the CLI prints; `teton-protocol` carries the value.
-fn finding_kind_label(kind: FindingKind) -> &'static str {
-    match kind {
-        FindingKind::Secret => "a secret",
-        FindingKind::Credential => "a credential",
-        FindingKind::Pii => "personal information",
-        FindingKind::Unknown => "a sensitive-looking string",
     }
 }
 
@@ -702,7 +691,7 @@ mod tests {
                 provider_id: ProviderId::from("anthropic"),
                 action: PrivacyAction::ReroutedToLocal,
                 cause: BlockCause::Redaction {
-                    kind: FindingKind::Credential,
+                    kind: teton_protocol::events::FindingKind::Credential,
                     span: ByteSpan {
                         start: 1400,
                         end: 1436,

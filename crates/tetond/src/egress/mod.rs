@@ -215,7 +215,7 @@ fn privacy_blocked_sentence(
         BlockCause::Redaction { kind, span } => format!(
             "the redaction scan found {} at bytes {}-{} of {path}, so egress to provider \
              `{provider_id}` was refused ({action:?})",
-            wire_kind_label(*kind),
+            kind.user_label(),
             span.start,
             span.end
         ),
@@ -223,20 +223,6 @@ fn privacy_blocked_sentence(
             "the redaction scan could not run on {path}, so egress to provider \
              `{provider_id}` was refused unscanned ({action:?})"
         ),
-    }
-}
-
-/// The content-free noun for a finding kind, for the typed error's sentence.
-///
-/// Names the *class* of thing found, never the thing itself (BR-6). The CLI has
-/// its own wording for the same values; this one exists because an
-/// [`EgressError`] can be logged on a machine with no client attached.
-fn wire_kind_label(kind: WireFindingKind) -> &'static str {
-    match kind {
-        WireFindingKind::Secret => "a secret",
-        WireFindingKind::Credential => "a credential",
-        WireFindingKind::Pii => "personal information",
-        WireFindingKind::Unknown => "a sensitive-looking string",
     }
 }
 
@@ -523,9 +509,25 @@ impl<T: Transport> Egress<T> {
         //
         // Lossy rather than strict because a body that is not valid UTF-8 must
         // still be scanned: refusing to look at it would be a scan that skips
-        // exactly the payloads an exfiltrator would choose. The replacement
-        // characters shift no ASCII byte offset relative to the run they
-        // replace, and every pattern shape is pure ASCII.
+        // exactly the payloads an exfiltrator would choose.
+        //
+        // What a span indexes, precisely: **the lossy text**, not `request.body`.
+        // For every body this daemon actually sends the two are the same string
+        // — an adapter serializes JSON, and `serde_json` emits valid UTF-8 — so
+        // "bytes 1400-1436 of the outbound payload" is exact today.
+        //
+        // It would NOT be exact for a body that is not valid UTF-8, and the
+        // earlier claim here that replacement shifts no offset is simply false:
+        // U+FFFD is three bytes, so a single invalid byte becomes three and
+        // every span after it is skewed by two. That is a reporting inaccuracy
+        // in a case no current adapter can produce, and it is a locus string
+        // rather than a pointer anything dereferences — but it is recorded
+        // rather than asserted away, and an adapter that ever sends a non-UTF-8
+        // body has to revisit it.
+        //
+        // Detection itself is unaffected either way: replacement never creates
+        // or destroys an ASCII byte, so no pattern shape can be hidden or
+        // conjured by it.
         if let Some(gate) = &self.redaction {
             let verdict = {
                 let text = String::from_utf8_lossy(&request.body);

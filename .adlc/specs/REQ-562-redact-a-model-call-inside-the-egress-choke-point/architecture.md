@@ -248,6 +248,17 @@ New/changed surfaces per crate:
 
 - **teton-core**: `config.rs` — `PrivacyConfig { redact: bool }` (default false),
   `[privacy]` table; `ConfigurableCategory` untouched (AC-14 pins it).
+
+  **Name collision, recorded before it bites.** `teton_protocol::methods::ConfigSnapshot`
+  already has a field called `privacy`, and it is
+  `Vec<PrivacyBoundaryConfig>` — the boundary list, not this switch. The two are
+  unrelated settings that happen to share the most obvious name. Nothing breaks
+  today because `PrivacyConfig` is **not** projected into the snapshot: the
+  switch is daemon-local and no RPC exposes it. If a later REQ does expose it,
+  it must pick a non-colliding name (`redaction`, `privacy_scan`, …) — reusing
+  `privacy` would either shadow the boundary list or silently re-type a field
+  v1 clients deserialize, which is the `ConfigSnapshot` re-typing that moved
+  `PROTOCOL_VERSION` in REQ-558.
 - **teton-protocol**: `events.rs` — `BlockCause` + defaulted `cause` field.
 - **tetond**: `egress/redact.rs` (new — verdict/finding types, pattern pass,
   `decide`, `RedactionGate` trait); `harness/redact.rs` (new — `REDACT_DUTY`,

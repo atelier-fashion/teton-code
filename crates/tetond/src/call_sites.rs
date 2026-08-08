@@ -126,15 +126,37 @@ pub(crate) mod scan {
     /// it can only shrink what a scan sees, which makes an assertion fail loudly
     /// rather than pass wrongly.
     pub(crate) fn production_source(path: &Path) -> String {
-        let text = std::fs::read_to_string(path).expect("readable source file");
+        strip_test_modules(&std::fs::read_to_string(path).expect("readable source file"))
+    }
+
+    /// `text` truncated at its first `#[cfg(test)]` item. See
+    /// [`production_source`] for why truncating is exact today and conservative
+    /// if that changes.
+    fn strip_test_modules(text: &str) -> String {
         match text.find("\n#[cfg(test)]") {
             Some(at) => text[..at].to_owned(),
-            None => text,
+            None => text.to_owned(),
         }
     }
 
     /// Every production `.rs` under `src/`, as `(path relative to src/, source)`,
     /// in sorted order.
+    ///
+    /// ## A file that vanishes mid-scan is skipped, not fatal (LESSON-489/BUG-159)
+    ///
+    /// [`rust_files`] lists the directory and this reads the results a moment
+    /// later, and a file can disappear in between: an editor saving by
+    /// atomic rename, a `git checkout` or `git stash` in another worktree
+    /// sharing this checkout, a generated file being rewritten. That is a race
+    /// in the **scan**, not a fact about the source tree, and crashing every
+    /// caller over it makes a whole test binary fail for a reason no diff
+    /// explains.
+    ///
+    /// The loud failure is kept exactly where it means something: a caller
+    /// looking for a *specific* file still asserts its own presence
+    /// (`.expect("this module is a production source")`), so a module that was
+    /// renamed or deleted fails by name. What is skipped is only a file nobody
+    /// asked for by name — and the skip is announced rather than silent.
     pub(crate) fn production_sources() -> Vec<(String, String)> {
         let root = daemon_src();
         let mut files = Vec::new();
@@ -142,13 +164,25 @@ pub(crate) mod scan {
         files.sort();
         files
             .iter()
-            .map(|path| {
+            .filter_map(|path| {
+                let text = match std::fs::read_to_string(path) {
+                    Ok(text) => text,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        eprintln!(
+                            "call_sites::scan: {} vanished between the directory listing and \
+                             the read; skipped",
+                            path.display()
+                        );
+                        return None;
+                    }
+                    Err(err) => panic!("unreadable source file {}: {err}", path.display()),
+                };
                 let rel = path
                     .strip_prefix(&root)
                     .expect("a file under src/")
                     .to_string_lossy()
                     .into_owned();
-                (rel, production_source(path))
+                (rel, strip_test_modules(&text)).into()
             })
             .collect()
     }

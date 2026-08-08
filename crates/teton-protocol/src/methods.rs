@@ -619,9 +619,9 @@ impl ContentClass {
             // session from its first one. Both carry prompt text and nothing
             // else, which is why they share a class despite sharing no purpose.
             Category::Route | Category::Title => ContentClass::UserPrompt,
-            // Screens an outbound payload for secrets before it leaves. No model
-            // call today (REQ-562 builds it); the class states what that call
-            // will see.
+            // Screens an outbound payload for secrets before it leaves. Since
+            // REQ-562 that scan is a real model call at the egress choke point,
+            // and this class is what it sees: the exact bytes on their way out.
             Category::Redact => ContentClass::OutboundPayload,
             // Summarises a tool result on its way into context.
             Category::Digest => ContentClass::ToolOutput,
@@ -1511,10 +1511,14 @@ mod tests {
     /// AC-16's other half: a category with no call site is described, not
     /// omitted — and the pair of fields says both things at once.
     ///
-    /// `redact` is REQ-562's to build. Declaring what its call *would* see is a
-    /// description of intent; `reached: false` is what says nothing is sent
-    /// today. Neither field alone is the disclosure, which is why the row is
-    /// asserted rather than the mapping.
+    /// **The set of unreached categories is empty as of REQ-562**, which wired
+    /// `redact` — the last of the eleven. So this row is now hypothetical
+    /// rather than a snapshot of any live category, and it is kept deliberately:
+    /// the *shape* is the contract. A future category lands declared before it
+    /// is called, and what this pins is that such a row still discloses what it
+    /// would send (`content_class`) while saying nothing is sent yet
+    /// (`reached: false`). Neither field alone is the disclosure, which is why
+    /// the row is asserted rather than the mapping.
     #[test]
     fn an_unreached_category_still_says_what_it_would_send() {
         let row = CategoryRouteView {
@@ -1528,7 +1532,11 @@ mod tests {
             reason: "The 'redact' category is pinned to the local tier.".to_owned(),
         };
         assert_eq!(row.content_class, ContentClass::OutboundPayload);
-        assert!(!row.reached, "redact has no call site until REQ-562");
+        assert!(
+            !row.reached,
+            "the fixture is a hypothetical unreached category; `redact` itself \
+             has had a call site since REQ-562"
+        );
         round_trip(&row);
 
         let json = serde_json::to_string(&row).unwrap();

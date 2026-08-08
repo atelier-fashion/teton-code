@@ -10941,6 +10941,84 @@ provider_id = "on-device"
                 );
             }
 
+            /// **The Redaction cause, through the real turn path** — the mirror
+            /// of the ScanUnavailable leg above.
+            ///
+            /// Same journey, and the point is the same: the cause has to survive
+            /// choke point → `BlockCause` → the transport seam's `BlockDetail` →
+            /// `ProviderError` → `HarnessError` and reach a surface a person
+            /// reads. Any hop that collapses it turns this red.
+            ///
+            /// **Which surface, and why it is this one.** The two turn-*failure*
+            /// sentences are unreachable for a Redaction block by construction:
+            /// `unrerouteable_block_sentence` needs no engine loaded, and with
+            /// no engine the scan cannot run, so the cause is `ScanUnavailable`
+            /// rather than `Redaction`; `failed_reroute_block_sentence` needs
+            /// the local reroute to be blocked too, and a local route has no
+            /// choke point to block at. The reachable surface is the third one —
+            /// `reroute_after_block_reason`, carried on the `route_decided` of
+            /// the reroute — which is also the one a user actually meets, since
+            /// the turn recovers and the failure sentences never fire.
+            #[tokio::test]
+            async fn a_redaction_block_reaches_the_reroute_sentence_naming_redaction() {
+                const SENTINEL: &str = "sk-ZZQUUXSENTINELCREDENTIAL0123";
+
+                let engine = CountingEngine::answering("NONE");
+                let runtime = Arc::new(runtime(
+                    offline_endpoints(opted_in(config())),
+                    &engine,
+                    true,
+                ));
+                let events = Arc::new(EventBus::new());
+                let mut sub = events.subscribe(64);
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let _ = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        format!("please summarize {SENTINEL} for me"),
+                    )
+                    .await;
+
+                let reasons: Vec<String> = announced(&mut sub)
+                    .into_iter()
+                    .map(|rd| rd.reason)
+                    .collect();
+                let reroute = reasons
+                    .iter()
+                    .find(|reason| reason.contains("remote egress refused"))
+                    .unwrap_or_else(|| {
+                        panic!("no reroute was announced; route_decided reasons: {reasons:?}")
+                    });
+
+                assert!(
+                    reroute.contains("found sensitive content"),
+                    "the reroute must name redaction as the cause: {reroute}"
+                );
+                // The discriminating half, in both directions.
+                assert!(
+                    !reroute.contains("local-only privacy boundary"),
+                    "a redaction block is not a boundary block: {reroute}"
+                );
+                assert!(
+                    !reroute.contains("could not run"),
+                    "the scan DID run and DID find something: {reroute}"
+                );
+                // BR-6: the sentence names a cause, never the payload.
+                assert!(
+                    !reroute.contains("QUUXSENTINEL") && !reroute.contains(SENTINEL),
+                    "no payload content may reach a routing sentence: {reroute}"
+                );
+            }
+
             // -- what a block does to the SESSION (REQ-544 C-2 × BR-3) -------
 
             /// **A scan that could not run refuses the payload and leaves the

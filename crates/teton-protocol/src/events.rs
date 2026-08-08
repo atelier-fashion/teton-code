@@ -359,6 +359,37 @@ pub enum FindingKind {
     Unknown,
 }
 
+impl FindingKind {
+    /// The noun phrase a **person** reads, for a sentence like *"the redaction
+    /// scan found a credential at bytes 1400-1436"*.
+    ///
+    /// Distinct from the serde name (`"credential"`), which is the wire value
+    /// and must never drift for compatibility — this one is prose and may.
+    ///
+    /// ## Why it lives on the protocol type
+    ///
+    /// Both ends render it, and they had **byte-identical** private copies:
+    /// `tetond`'s `egress::wire_kind_label` composes the daemon's typed-error
+    /// sentence, and `teton`'s `session_ui::finding_kind_label` composes the
+    /// CLI's `privacy_block` line. Two spellings of one fact drift, and the
+    /// drift is user-visible on the one surface that explains a privacy
+    /// decision — a user comparing the daemon log against what the CLI printed
+    /// should not have to work out whether two wordings mean the same finding.
+    ///
+    /// It is safe at this layer for the reason the variants are: naming the
+    /// *class* of thing found is exactly what [`FindingKind`] is, and it can
+    /// never name the thing itself (BR-6) because the type carries no text.
+    #[must_use]
+    pub fn user_label(self) -> &'static str {
+        match self {
+            FindingKind::Secret => "a secret",
+            FindingKind::Credential => "a credential",
+            FindingKind::Pii => "personal information",
+            FindingKind::Unknown => "a sensitive-looking string",
+        }
+    }
+}
+
 /// A half-open byte range `[start, end)` within the outbound payload.
 ///
 /// Offsets only — locating a finding is what this carries, and quoting it is
@@ -1331,6 +1362,46 @@ mod tests {
         assert_eq!(wire["kind"], "pii");
         assert_eq!(wire["span"]["start"], 0);
         assert_eq!(wire["span"]["end"], 12);
+    }
+
+    /// **One label, two renderers.** The daemon's typed-error sentence and the
+    /// CLI's `privacy_block` line both compose from this, and they used to hold
+    /// byte-identical private copies — two spellings of one fact, on the one
+    /// surface that explains a privacy decision.
+    ///
+    /// What is pinned: each kind gets its own phrase (a collapsed label would
+    /// make two different findings read the same), the phrases are content-free
+    /// nouns, and they are *not* the wire names — the wire value is frozen for
+    /// compatibility and the prose is free to change.
+    #[test]
+    fn every_finding_kind_has_its_own_content_free_user_label() {
+        use std::collections::BTreeSet;
+
+        let kinds = [
+            FindingKind::Secret,
+            FindingKind::Credential,
+            FindingKind::Pii,
+            FindingKind::Unknown,
+        ];
+        let labels: Vec<&str> = kinds.iter().map(|k| k.user_label()).collect();
+        assert_eq!(
+            labels.iter().collect::<BTreeSet<_>>().len(),
+            kinds.len(),
+            "two kinds sharing a label read as the same finding: {labels:?}"
+        );
+        for label in &labels {
+            assert!(!label.is_empty());
+            assert!(
+                label.starts_with("a ") || label.starts_with("personal "),
+                "a label is a noun phrase a sentence can be built around: {label}"
+            );
+        }
+        assert_eq!(FindingKind::Credential.user_label(), "a credential");
+        // The wire name is a different value with a different contract.
+        assert_eq!(
+            serde_json::to_value(FindingKind::Credential).unwrap(),
+            "credential"
+        );
     }
 
     #[test]

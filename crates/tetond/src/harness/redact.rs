@@ -385,11 +385,14 @@ fn read_findings(answer: &str, payload: &str) -> Result<Vec<Finding>, &'static s
         if line.is_empty() {
             continue;
         }
-        if says_nothing_found(line) {
-            readable = true;
-            continue;
-        }
+        // The finding shape is tried FIRST. A line that carries one is a
+        // finding whatever it opens with, so a leading `NONE` cannot swallow
+        // it — the recall bug an "is it the sentinel?" test in front of this
+        // one produces.
         let Some((kind, quoted)) = read_finding_line(line) else {
+            if says_nothing_found(line) {
+                readable = true;
+            }
             continue;
         };
         readable = true;
@@ -414,11 +417,27 @@ fn read_findings(answer: &str, payload: &str) -> Result<Vec<Finding>, &'static s
 /// data found" is not the word the contract asked for, and treating every
 /// hopeful-sounding sentence as a clean bill of health is how a scanner starts
 /// passing answers it did not understand.
+///
+/// ## And not of a sentinel that turns out to introduce something
+///
+/// The first word being `NONE` is not enough: *"NONE of these should be shared.
+/// Here they are: sk-…"* opens with the sentinel and is the opposite of a clean
+/// bill of health. Reading it as one is a **permissive** failure — the payload
+/// forwards on the strength of an answer nobody understood, which is exactly
+/// what BR-3 and LESSON-447 forbid.
+///
+/// So the line must carry no colon after the sentinel word. The contract uses
+/// `:` to introduce content, and an answer that found nothing has no content to
+/// introduce; a line that does have some is an answer this parser could not
+/// read, which is `Unavailable` → Block, not `Clean`. Every decoration form the
+/// contract tolerates survives it, because none of them contains a colon.
 fn says_nothing_found(line: &str) -> bool {
-    line.split_whitespace()
+    let mut words = line.split_whitespace();
+    let is_sentinel = words
         .next()
         .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
-        .is_some_and(|word| word.eq_ignore_ascii_case(NOTHING_FOUND))
+        .is_some_and(|word| word.eq_ignore_ascii_case(NOTHING_FOUND));
+    is_sentinel && !words.any(|word| word.contains(':'))
 }
 
 /// Split one answer line into the kind it claims and the string it quoted.
@@ -432,10 +451,26 @@ fn read_finding_line(line: &str) -> Option<(FindingKind, &str)> {
     Some((read_kind(head)?, quoted))
 }
 
-/// The [`FindingKind`] `head` names, ignoring case and the bullets, backticks
-/// and asterisks a model decorates a list with.
+/// The [`FindingKind`] `head` names, ignoring case and the bullets, backticks,
+/// asterisks and **list numbering** a model decorates a list with.
+///
+/// `1. credential` is the shape that motivated the last of those: trimming
+/// non-alphanumerics from the ends leaves `1. credential` untouched, because it
+/// both starts and ends alphanumeric — so a numbered list, which is what a small
+/// model reaches for when asked for "one line for each", dropped every finding
+/// in it. Taking the **last** whitespace-separated word first handles `1.`,
+/// `(2)` and `- ` alike without a marker vocabulary to keep in step.
+///
+/// Leniency here is cheap in the direction it errs: a head this reads too
+/// generously costs at most one `Confidence::Low` report on a string that must
+/// still be *found in the payload* (ADR-5), and a Low finding never blocks
+/// (BR-4).
 fn read_kind(head: &str) -> Option<FindingKind> {
-    let word = head.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    let word = head
+        .split_whitespace()
+        .next_back()
+        .unwrap_or(head)
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric());
     [
         FindingKind::Secret,
         FindingKind::Credential,
@@ -446,8 +481,23 @@ fn read_kind(head: &str) -> Option<FindingKind> {
     .find(|kind| word.eq_ignore_ascii_case(kind.as_str()))
 }
 
+/// The shortest string a model may quote and still have it located (ADR-5).
+///
+/// A one- or two-byte "quote" locates itself in almost any payload, so a garbled
+/// line like `pii: e` would mint a finding pointing at the first `e` in the
+/// request — a report with a span that means nothing, on a surface whose only
+/// value is telling the user *where to look*. Below this floor the quote is
+/// treated exactly like a fabrication: dropped, never reported.
+///
+/// Four bytes is the shortest thing that is plausibly a secret rather than a
+/// stray character, and the floor costs nothing real: the contract asks for "the
+/// string copied exactly as it appears", and no credential or piece of personal
+/// information is three bytes long.
+const MIN_QUOTE_BYTES: usize = 4;
+
 /// Find `quoted` in `payload` and return its byte span, or `None` when the model
-/// reported a string that is not there (ADR-5).
+/// reported a string that is not there — or one too short to mean anything
+/// (ADR-5, [`MIN_QUOTE_BYTES`]).
 ///
 /// The wrapping quotes and whitespace a model adds are stripped first, because
 /// they are decoration rather than content and a payload rarely contains them
@@ -463,7 +513,7 @@ fn locate(payload: &str, quoted: &str) -> Option<Range<usize>> {
         .trim()
         .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
         .trim();
-    if quoted.is_empty() {
+    if quoted.len() < MIN_QUOTE_BYTES {
         return None;
     }
     let at = payload.find(quoted)?;
@@ -822,6 +872,151 @@ mod tests {
                 "{clean:?} must read as a completed scan that found nothing"
             );
         }
+    }
+
+    /// **A sentinel that introduces content is not a sentinel** — the
+    /// permissive failure BR-3 and LESSON-447 forbid.
+    ///
+    /// *"NONE of these should be shared. Here they are: sk-…"* opens with the
+    /// contract's word and is the opposite of a clean bill of health. Read as
+    /// the sentinel it becomes `Clean` → **forward**, on the strength of an
+    /// answer nobody understood. It is now unreadable, which is `Unavailable` →
+    /// Block.
+    ///
+    /// Paired with its twin: the decoration forms the contract does tolerate all
+    /// still read as clean, so this is the colon discriminating rather than the
+    /// sentinel check having been broken.
+    #[test]
+    fn a_sentinel_with_content_after_it_is_unreadable_not_clean() {
+        for permissive in [
+            "NONE of these should be shared. Here they are: sk-abcdefghij",
+            "None found, but note: jane.doe@example.com",
+            "NONE. Details: the payload has a key in it",
+        ] {
+            assert!(
+                read_findings(permissive, PAYLOAD).is_err(),
+                "{permissive:?} was read as a completed clean scan"
+            );
+        }
+        // The twin: decoration with no content after it is still the sentinel.
+        for clean in ["NONE", "None.", "**NONE**", "NONE - nothing sensitive"] {
+            assert_eq!(read_findings(clean, PAYLOAD), Ok(Vec::new()), "{clean:?}");
+        }
+    }
+
+    /// **A line that carries a finding is a finding, whatever it opens with.**
+    ///
+    /// The sentinel test used to run first, so a line beginning `NONE`/`None`
+    /// was skipped whole — losing any contract-shaped finding on it. The
+    /// finding shape is tried first now.
+    #[test]
+    fn a_line_opening_with_the_sentinel_word_still_yields_its_finding() {
+        let found = read_findings(&format!("none — pii: {ADDRESS}"), PAYLOAD).expect("readable");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(*found[0].span(), span_of(PAYLOAD, ADDRESS));
+    }
+
+    /// **Numbered-list decoration is read through.** "one line for each" is a
+    /// list, and a small model asked for a list writes `1.`, `2.`, `3.` — which
+    /// the end-trimming reader could not see past, because `1. credential`
+    /// both starts and ends alphanumeric.
+    #[test]
+    fn a_numbered_list_is_read_like_any_other_decoration() {
+        let answer = format!("1. credential: {CREDENTIAL}\n2. pii: {ADDRESS}");
+        let found = read_findings(&answer, PAYLOAD).expect("readable");
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].kind(), FindingKind::Credential);
+        assert_eq!(found[1].kind(), FindingKind::Pii);
+        assert_eq!(*found[1].span(), span_of(PAYLOAD, ADDRESS));
+
+        // The other markers, on the same reader.
+        for decorated in ["(2) pii", "- pii", "* **PII**", "  3.  pii  "] {
+            assert_eq!(
+                read_kind(decorated),
+                Some(FindingKind::Pii),
+                "{decorated:?}"
+            );
+        }
+        // And not everything: a head that names no kind still names no kind.
+        assert_eq!(read_kind("Here is what I found"), None);
+        assert_eq!(read_kind("1. an email address"), None);
+    }
+
+    /// **A quote too short to mean anything is dropped** ([`MIN_QUOTE_BYTES`]).
+    ///
+    /// `pii: e` locates itself in almost any payload, minting a one-byte span on
+    /// a surface whose whole value is saying where to look. It is treated as the
+    /// fabrication it effectively is.
+    ///
+    /// The twin is the shortest quote that IS located, so the floor is a floor
+    /// rather than a blanket refusal.
+    #[test]
+    fn a_quote_shorter_than_the_floor_mints_no_span() {
+        for degenerate in ["e", "d ", "\"ea\"", "the"] {
+            assert_eq!(
+                locate(PAYLOAD, degenerate),
+                None,
+                "{degenerate:?} minted a span"
+            );
+        }
+        let at = PAYLOAD.find("from").expect("the fixture contains it");
+        assert_eq!(locate(PAYLOAD, "from"), Some(at..at + 4));
+
+        // Through the parser, which is where it matters: a garbled line reports
+        // nothing rather than a meaningless span.
+        assert_eq!(read_findings("pii: e", PAYLOAD), Ok(Vec::new()));
+    }
+
+    /// **The same secret twice in one payload is one finding, at the first
+    /// occurrence** — the doc comment's claim, asserted.
+    ///
+    /// The span says *where to look*; a second copy of the same string is the
+    /// same problem in the same payload, and reporting the later one would send
+    /// the user past the first.
+    #[test]
+    fn a_string_appearing_twice_is_located_at_its_first_occurrence() {
+        let payload = format!("first {CREDENTIAL} then again {CREDENTIAL} at the end");
+        let first = payload.find(CREDENTIAL).expect("fixture");
+        let second = payload.rfind(CREDENTIAL).expect("fixture");
+        assert_ne!(first, second, "the fixture must really contain two copies");
+
+        assert_eq!(
+            locate(&payload, CREDENTIAL),
+            Some(first..first + CREDENTIAL.len())
+        );
+        let found =
+            read_findings(&format!("credential: {CREDENTIAL}"), &payload).expect("readable");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(*found[0].span(), first..first + CREDENTIAL.len());
+    }
+
+    /// **A model that repeats itself reports once** — `merge`'s overlap rule,
+    /// asserted rather than only described.
+    ///
+    /// Two model lines quoting the same string locate to the same span, and the
+    /// second is dropped. Inflating the report with a duplicate points the user
+    /// at bytes already named.
+    #[tokio::test]
+    async fn a_model_repeating_a_string_on_two_lines_reports_it_once() {
+        const CLEAN: &str = "Please email jane.doe@example.com about the retry helper.";
+        let verdict = scan(
+            &local_route(&format!("pii: {ADDRESS}\nunknown: {ADDRESS}")),
+            CLEAN,
+        )
+        .await;
+        assert_eq!(verdict.outcome(), Outcome::Findings);
+        assert_eq!(verdict.findings().len(), 1, "{:?}", verdict.findings());
+        assert_eq!(*verdict.findings()[0].span(), span_of(CLEAN, ADDRESS));
+
+        // Non-vacuity: two lines quoting DIFFERENT strings really do give two
+        // findings, so the dedupe above is the overlap rule and not the parser
+        // reading one line.
+        let two = scan(
+            &local_route(&format!("pii: {ADDRESS}\nunknown: retry helper")),
+            CLEAN,
+        )
+        .await;
+        assert_eq!(two.findings().len(), 2, "{:?}", two.findings());
     }
 
     /// **BR-6 / AC-6, at the boundary that handles the raw text.** The model's

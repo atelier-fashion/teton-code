@@ -1544,10 +1544,13 @@ fn tier_origin_label(source: TierBindingSource) -> &'static str {
 /// for all eleven including the ones with no call site — "what would leave this
 /// machine if I bound that tier remotely?" has an answer before the call site
 /// exists, and a blank cell would read as "this one is safe". But a class
-/// printed on its own reads as a live egress path, which for `redact` (REQ-562)
-/// it is not. So the verb carries `reached`: a category with no call site *would*
-/// send, and says in the same breath that nothing calls it yet. ADR-A's marker
-/// stays exactly where a reader needs it — next to the claim it qualifies.
+/// printed on its own reads as a live egress path, which a declared-but-uncalled
+/// category's is not. So the verb carries `reached`: a category with no call
+/// site *would* send, and says in the same breath that nothing calls it yet.
+/// ADR-A's marker stays exactly where a reader needs it — next to the claim it
+/// qualifies. (All eleven are reached as of REQ-562, which wired `redact` last;
+/// the `reached: false` arm is for the next category to land declared before it
+/// is called.)
 ///
 /// `routable` is the third fact and the reason an unresolved row does not claim
 /// to send: a category whose tier is unbound transmits nothing today either, and

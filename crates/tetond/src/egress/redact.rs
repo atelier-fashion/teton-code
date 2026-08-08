@@ -64,9 +64,24 @@
 //! The REQ forbids new crates and `regex` is not a declared dependency of any
 //! crate in this workspace (it appears in `Cargo.lock` only transitively). The
 //! five shapes are anchored on a literal prefix or a literal suffix, so they are
-//! hand-rolled byte scans below. Every shape is pure ASCII, and an ASCII byte in
-//! UTF-8 can never occur inside a multi-byte sequence — so the byte offsets
-//! these scans produce are always valid `str` char boundaries.
+//! hand-rolled byte scans below.
+//!
+//! ## Why byte offsets from those scans are always char boundaries
+//!
+//! Not because "every shape is pure ASCII" — the assignment shape's `\S+` value
+//! arm consumes *any* non-whitespace byte, continuation bytes included, so a
+//! match on `AWS_API_KEY=café` really does span multi-byte content. The
+//! guarantee comes from where each run can **stop**:
+//!
+//! - every span *start* is at a literal ASCII prefix, or at the start of an
+//!   ASCII `[A-Z_]+` run extended leftward one ASCII byte at a time;
+//! - every span *end* is at a byte that failed an ASCII-only predicate
+//!   (`is_body`, `is_shape_space`) or at the end of the input.
+//!
+//! An ASCII byte can never occur inside a multi-byte UTF-8 sequence, so a run
+//! that begins and ends at ASCII decisions can never stop in the middle of one.
+//! `spans_are_byte_offsets_that_stay_on_char_boundaries` and
+//! `a_multibyte_assignment_value_still_slices` pin both halves.
 
 use std::ops::Range;
 
@@ -696,20 +711,48 @@ fn is_shape_space(b: u8) -> bool {
 /// (which must contribute at least one byte, so a bare `API_KEY=x` is *not* a
 /// match — the shape requires a qualified name) and right over the separator and
 /// the value.
+///
+/// ## The left extension is memoized, and that is a bound rather than a tidy-up
+///
+/// Every byte of the suffix is a name byte, so a suffix occurrence always lies
+/// inside a maximal `[A-Z_]+` run — and every occurrence *in the same run*
+/// extends left to the same place. Re-walking the run per occurrence is
+/// quadratic on the input this scan is most likely to meet adversarially: 27 KiB
+/// of `_TOKEN_TOKEN_TOKEN…` is one run with thousands of occurrences, and the
+/// scan measured **123 ms** on a 64 KiB version of it — on the synchronous send
+/// path of every remote call, from a payload an attacker chooses.
+///
+/// So the run containing the current position is computed once and cached.
+/// `i` never decreases, and runs are maximal and therefore disjoint, so each run
+/// is walked at most once in each direction: the whole scan is amortized linear.
+/// Behaviour is byte-for-byte what it was — the cache answers the same question,
+/// it just stops asking it repeatedly.
 fn scan_env_assignment(bytes: &[u8], out: &mut Vec<Range<usize>>) {
     for suffix in ENV_SUFFIXES {
         let slen = suffix.len();
         let mut i = 0usize;
+        // The maximal `[A-Z_]+` run last computed, as `start..end`.
+        let mut run: Range<usize> = 0..0;
         while i + slen <= bytes.len() {
             if &bytes[i..i + slen] != *suffix {
                 i += 1;
                 continue;
             }
-            // `[A-Z_]+` immediately left of the suffix's leading underscore.
-            let mut start = i;
-            while start > 0 && is_name_byte(bytes[start - 1]) {
-                start -= 1;
+            // `[A-Z_]+` immediately left of the suffix's leading underscore —
+            // i.e. the start of the maximal name run `i` sits in. Recomputed
+            // only when `i` has left the cached run.
+            if !run.contains(&i) {
+                let mut start = i;
+                while start > 0 && is_name_byte(bytes[start - 1]) {
+                    start -= 1;
+                }
+                let mut end = i;
+                while end < bytes.len() && is_name_byte(bytes[end]) {
+                    end += 1;
+                }
+                run = start..end;
             }
+            let start = run.start;
             if start == i {
                 i += 1;
                 continue;
@@ -1091,6 +1134,25 @@ mod tests {
     }
 
     #[test]
+    fn a_multibyte_assignment_value_still_slices() {
+        // The half the "every shape is pure ASCII" claim got wrong: the
+        // assignment shape's `\S+` arm consumes continuation bytes, so this
+        // match genuinely spans multi-byte content. It stays sliceable because
+        // the run stops at an ASCII whitespace byte (or the end), never inside
+        // a sequence.
+        let text = "export SOME_API_KEY=café-au-lait☕ and then more prose";
+        let findings = pattern_pass(text);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let span = findings[0].span().clone();
+        // Would panic if either offset were not a char boundary.
+        assert_eq!(&text[span.clone()], "SOME_API_KEY=café-au-lait☕");
+        assert!(
+            text[span].len() > "SOME_API_KEY=cafe-au-lait".len(),
+            "the fixture must really carry multi-byte bytes inside the span"
+        );
+    }
+
+    #[test]
     fn spans_are_byte_offsets_that_stay_on_char_boundaries() {
         // Every shape is ASCII, and an ASCII byte never occurs inside a
         // multi-byte UTF-8 sequence — so a span derived from a byte scan must
@@ -1130,6 +1192,43 @@ mod tests {
         assert_eq!(*findings[0].span(), 0..20);
         let sk = text.find("sk-").unwrap();
         assert_eq!(*findings[1].span(), sk..text.len() - " and more".len());
+    }
+
+    /// **The assignment scan's left extension is bounded** — a payload that is
+    /// one enormous `[A-Z_]+` run full of suffix occurrences does not cost
+    /// quadratic time.
+    ///
+    /// The fixture is the adversarial one: a single unbroken name run of
+    /// `_TOKEN` repeated, which is what an attacker who wants the scan to be
+    /// slow writes, on the synchronous send path of every remote call. Half a
+    /// mebibyte of it is ~87,000 suffix occurrences in **one** run: linear it is
+    /// milliseconds, quadratic it is on the order of 10^10 byte comparisons.
+    ///
+    /// The wall-clock bound is a complexity-class discriminator, not a
+    /// performance target. Measured, debug build: **0.04 s memoized, 52.9 s
+    /// with the memoization deleted** — three orders of magnitude between pass
+    /// and fail, so the 10-second bound is nowhere near either. This is not the
+    /// flaky shape LESSON-450 warns about: nothing is polled and nothing is
+    /// raced, it is one pure call over a fixed input.
+    #[test]
+    fn the_assignment_scans_left_extension_does_not_go_quadratic() {
+        let adversarial = "A".to_owned() + &"_TOKEN".repeat(87_000);
+        assert!(adversarial.len() > 500 * 1024, "{}", adversarial.len());
+        assert!(
+            adversarial.bytes().all(is_name_byte),
+            "the fixture must be ONE unbroken name run, or it bounds nothing"
+        );
+
+        let started = std::time::Instant::now();
+        let findings = pattern_pass(&adversarial);
+        let elapsed = started.elapsed();
+
+        // No `[=:]` follows any occurrence, so the shape never completes.
+        assert!(findings.is_empty(), "{findings:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the left extension went quadratic: {elapsed:?}"
+        );
     }
 
     #[test]
