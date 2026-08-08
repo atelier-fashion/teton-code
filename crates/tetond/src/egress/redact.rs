@@ -425,6 +425,15 @@ struct PrefixShape {
     body_cap: Option<usize>,
     /// Which bytes may appear in the body.
     is_body: fn(u8) -> bool,
+    /// Which byte **immediately left of the prefix** means the prefix is the
+    /// tail of a longer word rather than the start of a credential — the left
+    /// word boundary (see [`scan_prefix_shape`]).
+    ///
+    /// Ordinarily the body alphabet: `sk-` inside `disk-encryption` is preceded
+    /// by a body byte, and a real `sk-…` never is. `Bearer ` is the exception —
+    /// its body alphabet includes `.`, `_` and `-`, none of which can end the
+    /// word `Bearer` belongs to — so it uses plain alphanumeric.
+    is_word_left: fn(u8) -> bool,
 }
 
 /// `sk-[A-Za-z0-9_-]{20,}` — OpenAI/Anthropic-style secret keys.
@@ -454,33 +463,58 @@ const PREFIX_SHAPES: &[PrefixShape] = &[
         min_body: 20,
         body_cap: None,
         is_body: is_sk_body,
+        is_word_left: is_sk_body,
     },
     PrefixShape {
         prefix: b"AKIA",
         min_body: 16,
         body_cap: Some(16),
         is_body: is_upper_alnum,
+        is_word_left: is_upper_alnum,
     },
     PrefixShape {
         prefix: b"ghp_",
         min_body: 36,
         body_cap: None,
         is_body: is_alnum,
+        is_word_left: is_alnum,
     },
     PrefixShape {
         prefix: b"Bearer ",
         min_body: 20,
         body_cap: None,
         is_body: is_bearer_body,
+        is_word_left: is_alnum,
     },
 ];
 
 /// Collect every non-overlapping, leftmost-longest match of `shape` in `bytes`.
+///
+/// ## The left word boundary, and why it is not optional
+///
+/// A prefix these shapes anchor on is only a credential when it *starts* a
+/// word. Without that check `sk-` matches inside `disk-encryption-configuration`
+/// and `risk-assessment-and-mitigation`: both carry a ≥20-byte run of body
+/// bytes after the `sk-`, so both scored a `High`-confidence credential and
+/// **blocked the turn** — a pattern pass whose precision was supposed to be the
+/// thing that keeps this feature usable (BR-4, OQ-2) refusing ordinary English.
+///
+/// So a match at `i` is accepted only when `i == 0` or `bytes[i - 1]` is not a
+/// word byte for that shape. **No true positive is lost**: a real credential is
+/// preceded by a quote, an `=`, a `:`, whitespace, or the start of the payload —
+/// never by another body byte, because a body byte there would be part of the
+/// credential.
 fn scan_prefix_shape(bytes: &[u8], shape: &PrefixShape, out: &mut Vec<Range<usize>>) {
     let plen = shape.prefix.len();
     let mut i = 0usize;
     while i + plen <= bytes.len() {
         if &bytes[i..i + plen] != shape.prefix {
+            i += 1;
+            continue;
+        }
+        // The left word boundary: a prefix in the middle of a longer word is
+        // that word, not a credential.
+        if i > 0 && (shape.is_word_left)(bytes[i - 1]) {
             i += 1;
             continue;
         }
@@ -777,6 +811,27 @@ mod tests {
             text: "API_KEY=value",
             expect: None,
         },
+        // The left word boundary. Both of these carry a ≥20-byte run of `sk-`
+        // body bytes after an `sk-` that is the tail of an ordinary English
+        // word, and both blocked turns before the boundary check existed.
+        ShapeCase {
+            name: "sk- inside `disk-` is a word, not a key",
+            text: "we should review the disk-encryption-configuration before shipping",
+            expect: None,
+        },
+        ShapeCase {
+            name: "sk- inside `risk-` is a word, not a key",
+            text: "see the risk-assessment-and-mitigation doc",
+            expect: None,
+        },
+        // The positive twin, and the reason the boundary check loses no true
+        // positive: a real key is preceded by a quote, an `=`, a `:` or
+        // whitespace — never by a body byte.
+        ShapeCase {
+            name: "sk- after an equals and a quote still matches",
+            text: "let key = \"sk-ABCDEFGHIJKLMNOPQRSTUVWX\";",
+            expect: Some("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        },
     ];
 
     #[test]
@@ -811,6 +866,72 @@ mod tests {
                     case.name
                 ),
             }
+        }
+    }
+
+    /// **Every prefix shape requires a left word boundary**, and the same
+    /// prefix one byte to the right of a separator still matches.
+    ///
+    /// Each row is a pair over the *same* prefix and the *same* body run: the
+    /// only difference between the negative and the positive is the byte
+    /// immediately left of the prefix. That is what makes this a discrimination
+    /// rather than four assertions that the pass sometimes finds nothing —
+    /// deleting the boundary check turns every negative red while every
+    /// positive stays green (LESSON-485).
+    #[test]
+    fn every_prefix_shape_requires_a_left_word_boundary() {
+        struct BoundaryCase {
+            /// The prefix, embedded mid-word: must NOT match.
+            mid_word: &'static str,
+            /// The same prefix and body after a separator: must match.
+            at_boundary: &'static str,
+            /// The exact credential `at_boundary` carries.
+            expect: &'static str,
+        }
+
+        const CASES: &[BoundaryCase] = &[
+            BoundaryCase {
+                mid_word: "the disk-encryption-configuration file",
+                at_boundary: "key=sk-encryption-configuration-x",
+                expect: "sk-encryption-configuration-x",
+            },
+            BoundaryCase {
+                mid_word: "PREFIXAKIAIOSFODNN7EXAMPLE",
+                at_boundary: "PREFIX AKIAIOSFODNN7EXAMPLE",
+                expect: "AKIAIOSFODNN7EXAMPLE",
+            },
+            BoundaryCase {
+                mid_word: "xghp_abcdefghijklmnopqrstuvwxyz0123456789",
+                at_boundary: "x ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+                expect: "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            },
+            BoundaryCase {
+                mid_word: "xBearer eyJhbGciOiJIUzI1NiJ9.abc",
+                at_boundary: "x Bearer eyJhbGciOiJIUzI1NiJ9.abc",
+                expect: "Bearer eyJhbGciOiJIUzI1NiJ9.abc",
+            },
+        ];
+
+        for case in CASES {
+            assert!(
+                pattern_pass(case.mid_word).is_empty(),
+                "a prefix inside a longer word is that word, not a credential: {:?} \
+                 produced {:?}",
+                case.mid_word,
+                pattern_pass(case.mid_word)
+            );
+            let found = pattern_pass(case.at_boundary);
+            assert_eq!(
+                found.len(),
+                1,
+                "the twin must still match: {:?} produced {found:?}",
+                case.at_boundary
+            );
+            let start = case
+                .at_boundary
+                .find(case.expect)
+                .expect("the fixture is malformed");
+            assert_eq!(*found[0].span(), start..start + case.expect.len());
         }
     }
 

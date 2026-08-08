@@ -127,9 +127,8 @@
 //! `redact` reaches this seam from the egress choke point rather than from the
 //! harness (ADR-1), so its rows are about the *wiring*, not about a call site
 //! inside a turn. The rows immediately below are TASK-070's, written from the
-//! wiring as it was built; the four AC-8 mutations were **applied and observed**
-//! by TASK-071 and are recorded in their own table after them, one of them
-//! green.
+//! wiring as it was built; the AC-8 mutations were **applied and observed** by
+//! TASK-071 and are recorded in their own table after them, one of them green.
 //!
 //! | Mutation | Fails |
 //! |---|---|
@@ -144,7 +143,7 @@
 //! | the forward path rebuilds the request from the scanned text instead of passing it through | `egress::tests::a_low_only_or_clean_verdict_forwards_the_exact_bytes`, `…::the_gate_reads_the_exact_bytes_that_would_go_on_the_wire` (AC-9) |
 //! | the gate hook is placed after `inner.execute`, or metering moves ahead of it | `egress::tests::a_blocked_send_bills_nothing_while_an_allowed_one_still_bills` |
 //!
-//! ### REQ-562 AC-8 — the four mutations, applied and observed (TASK-071)
+//! ### REQ-562 AC-8 — the mutations, applied and observed (TASK-071, TASK-072)
 //!
 //! Each was applied to a freshly built workspace (`cargo build --workspace`
 //! first — LESSON-489's sibling trap), run, and reverted. The diffs are recorded
@@ -157,6 +156,7 @@
 //! | **(b)** unbounded scan input (BR-7) | `egress/redact.rs`, `pattern_verdict`: delete the `if text.len() > REDACT_INPUT_MAX_BYTES { return RedactionVerdict::unavailable(); }` guard | **4 lib + 1 integration.** `egress::redact::tests::{an_over_cap_payload_is_unavailable_and_blocks_never_forwards, an_over_cap_payload_carrying_a_credential_still_reports_could_not_scan}`, `harness::redact::tests::{an_over_cap_payload_is_unavailable_before_any_model_call, an_over_cap_payload_carrying_a_credential_still_says_the_scan_could_not_run}`, `tests/redact_egress.rs::a_payload_past_the_input_cap_blocks_unscanned_and_costs_no_model_call` |
 //! | **(c)** a finding carries its matched text, threaded to the event | `egress/redact.rs`: `Finding` gains `text: String` (both constructors init `String::new()`) plus `fn carrying(self, &str) -> Self` and `fn text(&self) -> &str`; `pattern_pass` maps `Finding::pattern(..).carrying(&text[span])`; `harness/redact.rs`'s `read_findings` maps `Finding::model(..).carrying(&payload[span])`; `egress/mod.rs`'s gate arm builds `path` as `format!("{} ({})", redaction_locus(cause), finding.text())` | **2 lib + 2 integration.** `egress::redact::tests::a_finding_never_carries_the_matched_text` (the derived `Debug` starts rendering the secret), `egress::tests::a_high_confidence_finding_blocks_with_its_kind_span_and_locus`, `tests/redact_egress.rs::{no_emitted_surface_carries_the_sentinel, a_planted_credential_with_clean_provenance_is_blocked_and_the_event_names_redaction}`. **`teton_protocol::events::tests::a_redaction_cause_carries_only_a_kind_and_a_span` stays green** and it is right to: that test guards `BlockCause::Redaction`'s key set, and this variant of the mutation rides the text on `PrivacyBlock.path`, which is a `String` either way. The wire-key-set test covers the *other* variant (a new field on the cause); the sentinel sweep covers this one. Both are needed. |
 //! | **(d)** an id-based locality assertion, restored (BR-2) | two placements, see below | **RED at both layers** (one of them only after a fixture was added — see the note) |
+//! | **(e)** a prefix shape matches mid-word (the precision mutation) | `egress/redact.rs`, `scan_prefix_shape`: delete the `if i > 0 && (shape.is_word_left)(bytes[i - 1]) { i += 1; continue; }` guard | **2 lib, 0 integration.** `egress::redact::tests::{every_prefix_shape_requires_a_left_word_boundary, the_pattern_pass_locates_each_shape_and_nothing_else}`. Applied to a freshly built workspace, observed (684 passed / 2 failed), reverted. That **nothing else** turns red is the other half of the check: the boundary requirement loses no true positive, so every existing shape fixture stays green |
 //!
 //! **(d) has two plausible homes, and on the first run only one of them was
 //! covered.** Both are red now:

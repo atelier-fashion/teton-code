@@ -61,7 +61,14 @@ Two passes (OQ-2 = BOTH):
 - **Pattern pass** — new deterministic module with the five credential shapes
   (`sk-[A-Za-z0-9_-]{20,}`, `AKIA[A-Z0-9]{16}`, `ghp_[A-Za-z0-9]{36,}`,
   `Bearer [A-Za-z0-9._-]{20,}`, `[A-Z_]+_(API_KEY|TOKEN)\s*[=:]\s*\S+`). A hit
-  is `confidence: High` **by construction**.
+  is `confidence: High` **by construction**. Each prefix shape additionally
+  requires a **left word boundary** (`\b`-equivalent: start of payload, or a
+  preceding byte outside the shape's own alphabet). Without it `sk-` matches
+  inside `disk-encryption-configuration`, which is a High finding and therefore
+  a blocked turn — the pattern pass's near-perfect precision is the entire
+  argument for blocking on it (OQ-2), so an unanchored prefix is not a cosmetic
+  defect. No true positive is lost: a real credential is preceded by a quote,
+  `=`, `:`, whitespace, or nothing.
 - **Model pass** — the duty's local-model call. A model-only hit is
   `confidence: Low` by construction. The model's self-reported certainty is
   never consulted.
