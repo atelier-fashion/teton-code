@@ -575,9 +575,45 @@ impl SessionTaint {
 /// of a fact nobody established. The payload itself is still refused, which is
 /// BR-3's fail-closed posture; what does not follow is the session-wide
 /// consequence.
+/// ## The gate is a field, because it is not the same at every choke point
+///
+/// A block through the **MCP** choke point is answered by a different rule
+/// ([`mcp_cause_taints_the_session`]), so the sink is handed the rule its choke
+/// point uses rather than reaching for one. The two constructors below are the
+/// whole of the difference, and they sit next to each other so a reader who
+/// finds one is told the other exists.
 struct TaintingPrivacySink {
     events: Arc<EventBus>,
     taint: Arc<SessionTaint>,
+    /// Which causes pin, for the choke point this sink was built for.
+    taints: CauseGate,
+}
+
+/// Which block causes pin their session — a rule a [`TaintingPrivacySink`] is
+/// handed rather than one it chooses.
+type CauseGate = fn(&BlockCause) -> bool;
+
+impl TaintingPrivacySink {
+    /// The sink for a **turn or duty** send: [`cause_taints_the_session`], where
+    /// a boundary block and a redaction block both pin.
+    fn for_turn_path(events: Arc<EventBus>, taint: Arc<SessionTaint>) -> Self {
+        Self {
+            events,
+            taint,
+            taints: cause_taints_the_session,
+        }
+    }
+
+    /// The sink for the **MCP** choke point: [`mcp_cause_taints_the_session`],
+    /// where a redaction block pins and a boundary block keeps REQ-544's
+    /// fold-without-pinning posture (user decision, 2026-08-08).
+    fn for_mcp_path(events: Arc<EventBus>, taint: Arc<SessionTaint>) -> Self {
+        Self {
+            events,
+            taint,
+            taints: mcp_cause_taints_the_session,
+        }
+    }
 }
 
 impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
@@ -587,7 +623,7 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
         block: teton_protocol::events::PrivacyBlock,
     ) {
         if let Some(session_id) = &session_id {
-            if cause_taints_the_session(&block.cause) {
+            if (self.taints)(&block.cause) {
                 self.taint.mark(session_id);
             }
         }
@@ -611,10 +647,55 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
 /// permanently pin every remaining turn to the local tier and there is no way
 /// for the user to undo it short of a new session. The payload is still
 /// blocked; that is the fail-closed part, and it is per-payload.
+///
+/// ## This is the **turn and duty** path's rule; MCP has its own
+///
+/// [`mcp_cause_taints_the_session`] answers the same question for the MCP choke
+/// point, and answers it differently for `Boundary`. Two functions rather than
+/// one with a flag: the difference is a decision about two surfaces, taken by
+/// two different REQs, and a parameter would present it as a caller's option.
 fn cause_taints_the_session(cause: &BlockCause) -> bool {
     match cause {
         BlockCause::Boundary | BlockCause::Redaction { .. } => true,
         BlockCause::ScanUnavailable => false,
+    }
+}
+
+/// Whether a block at the **MCP** choke point pins the session (REQ-562; user
+/// decision, 2026-08-08).
+///
+/// One of the three pins here where two do on the turn path
+/// ([`cause_taints_the_session`]), and the divergence is per cause, for reasons
+/// about the causes rather than about MCP:
+///
+/// - **`Redaction` pins**, exactly as on the turn path and for the same reason:
+///   the model authored those tool arguments, so a finding in them is a secret
+///   *the model is holding*, and it can restate it next turn through an
+///   ordinary remote call that this tool error does nothing to constrain. What
+///   the scan established is a fact about the content, not about the surface it
+///   was heading out through, so the two paths' different disposal of a block
+///   does not reach it.
+/// - **`Boundary` does not**, which is REQ-544's posture for this surface, kept
+///   rather than re-derived. This is *not* a claim that a boundary block
+///   establishes less here than on the turn path — it establishes exactly the
+///   same thing. It is that REQ-544 chose to fold an MCP boundary refusal back
+///   into the loop as an ordinary in-context tool error, and re-deciding that
+///   inside a redaction change would silently change an earlier REQ's rule on a
+///   surface this one did not set out to touch. Whether an MCP boundary block
+///   should pin is REQ-544's question to reopen.
+/// - **`ScanUnavailable` never pins**, on either path and for the identical
+///   reason: nothing looked at the payload, so nothing about it was established
+///   (see [`cause_taints_the_session`]). The payload is still refused; that
+///   part is per-payload and fail-closed.
+///
+/// The asymmetry is therefore intended, and
+/// `the_mcp_gate_pins_redaction_and_diverges_from_the_turn_path_on_boundary`
+/// pins it *as* an asymmetry — so a later "make these consistent" edit turns a
+/// test red instead of quietly re-deciding REQ-544.
+fn mcp_cause_taints_the_session(cause: &BlockCause) -> bool {
+    match cause {
+        BlockCause::Redaction { .. } => true,
+        BlockCause::Boundary | BlockCause::ScanUnavailable => false,
     }
 }
 
@@ -626,6 +707,11 @@ fn cause_taints_the_session(cause: &BlockCause) -> bool {
 /// twice in two type systems and `the_two_taint_gates_agree_cause_for_cause`
 /// pins them to each other. One spelling would mean a `BlockCause` dependency
 /// in `teton-providers`, which is the edge that crate exists without.
+///
+/// [`mcp_cause_taints_the_session`] is a **third** function and deliberately
+/// *not* a third spelling of this rule: it answers the same question for a
+/// different choke point and gives a different answer for `Boundary`. It is
+/// therefore outside the agreement these two are held to.
 fn taints_the_session(detail: BlockDetail) -> bool {
     match detail {
         BlockDetail::Boundary | BlockDetail::Redaction => true,
@@ -1998,44 +2084,29 @@ impl DaemonRuntime {
     /// drive a capture transport through this exact construction, so the
     /// deletion now turns a test red.
     ///
-    /// ## The sink is `events`, not a [`TaintingPrivacySink`] — recorded, not
-    /// resolved (REQ-562)
+    /// ## The sink pins **per cause** on this path (REQ-562; user decision,
+    /// 2026-08-08)
     ///
-    /// An MCP block is reported but does **not** pin the session. That is
-    /// REQ-544's behaviour here, and this REQ deliberately leaves it alone —
-    /// but leaving it alone is now a *deviation* rather than a non-event, so it
-    /// is written down.
+    /// The sink is a [`TaintingPrivacySink`] built through
+    /// [`TaintingPrivacySink::for_mcp_path`], whose gate is
+    /// [`mcp_cause_taints_the_session`] rather than the turn path's
+    /// [`cause_taints_the_session`]. Cause by cause:
     ///
-    /// The turn path's rule (see [`cause_taints_the_session`]) is that a
-    /// `Boundary` block and a `Redaction` block each establish that content
-    /// crossed a line, and therefore pin the session local; only
-    /// `ScanUnavailable` does not, because nothing looked at the payload. This
-    /// REQ added the redaction causes, so the obvious reading is that a
-    /// redaction block through MCP should pin too. It does not, and the reason
-    /// is that the two paths dispose of a block differently:
+    /// - a **redaction** block pins the session local, exactly as one through a
+    ///   turn does. The model wrote those tool arguments, so the scan found a
+    ///   secret the model is holding — and it leaves just as easily through the
+    ///   next ordinary turn as through the next tool call, which is why the
+    ///   in-context disposal of *this* call does not settle the question;
+    /// - a **boundary** block still folds back into the loop without pinning.
+    ///   That is REQ-544's posture for this surface and is deliberately left
+    ///   where it is;
+    /// - a **scan-unavailable** block pins on no path at all: nothing looked at
+    ///   the payload. The payload is still refused (BR-3).
     ///
-    /// - on the **turn** path a block is a typed error the runtime handles, the
-    ///   turn is re-routed to the local tier, and the pin is what makes that
-    ///   decision stick for the rest of the session;
-    /// - on the **MCP** path a block folds back into the loop as an ordinary
-    ///   in-context tool error (REQ-544, ADR-003) and the turn carries on. The
-    ///   model retries something else, or finishes. Pinning there would convert
-    ///   one refused tool call into a session-wide re-route of every subsequent
-    ///   turn — a much larger consequence than the one REQ-544 chose for this
-    ///   surface, and one whose blast radius includes turns that never touch
-    ///   MCP at all.
-    ///
-    /// Whether that is right is a question about REQ-544's MCP boundary
-    /// behaviour, not about redaction: it has the same answer for a `Boundary`
-    /// block, which predates this REQ entirely. Changing it here would silently
-    /// re-decide an earlier REQ's rule inside a fix for a different one.
-    ///
-    /// TODO(follow-up REQ): decide whether an MCP privacy block should pin its
-    /// session, for **all** blocking causes rather than for the redaction ones
-    /// alone. The decision belongs with REQ-544's owner of the MCP boundary
-    /// posture; the two candidate answers are "an MCP block is an in-context
-    /// tool error and the loop's business" (today) and "any established
-    /// crossing pins, wherever it happened" (the turn path's rule, generalized).
+    /// This replaces the round-2 deviation note and its `TODO(follow-up REQ)`:
+    /// the question they held open — *should an MCP privacy block pin?* — has
+    /// been answered, separately for each cause, and the reasoning per cause
+    /// lives on [`mcp_cause_taints_the_session`].
     fn mcp_egress<T: Transport>(
         &self,
         transport: T,
@@ -2044,7 +2115,11 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
     ) -> Egress<T> {
-        let mut egress = Egress::new(transport, config.boundaries.clone(), events.clone())
+        let sink = Arc::new(TaintingPrivacySink::for_mcp_path(
+            Arc::clone(events),
+            Arc::clone(&self.session_taint),
+        ));
+        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()));
         if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
             egress = egress.with_redaction_gate(gate);
@@ -2696,10 +2771,10 @@ impl DaemonRuntime {
         // a turn error, so nothing above would ever mark the session. Marking at
         // the choke point makes the backstop direct rather than dependent on the
         // refusing content still being in `ctx` when the turn ends.
-        let sink = Arc::new(TaintingPrivacySink {
-            events: events.clone(),
-            taint: Arc::clone(&self.session_taint),
-        });
+        let sink = Arc::new(TaintingPrivacySink::for_turn_path(
+            events.clone(),
+            Arc::clone(&self.session_taint),
+        ));
         let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()));
         // REQ-562 ADR-1: a remotely-bound duty's prompt is an outbound payload
@@ -4463,13 +4538,13 @@ fn unserved_turn_sentence(route: &crate::router::Route, classified: RpcError) ->
 /// ## Why the cause is generic (REQ-562)
 ///
 /// It used to read *"session previously touched local-only content"*, which was
-/// true when [`SessionTaint`] had one source. It now has three: a turn whose
+/// true when [`SessionTaint`] had one source. It now has four: a turn whose
 /// context intersects a boundary ([`context_is_sensitive`]), a turn refused at
-/// the choke point, and a **duty** refused there
-/// ([`TaintingPrivacySink`]) — and the last two include REQ-562's redaction
-/// blocks, where no boundary was touched and no local-only file was read. A
-/// user told they touched local-only content goes looking for a `local-only`
-/// glob that does not exist.
+/// the choke point, a **duty** refused there, and an **MCP tool call** refused
+/// by the redaction scan ([`TaintingPrivacySink`] for the last two) — and the
+/// last three include REQ-562's redaction blocks, where no boundary was touched
+/// and no local-only file was read. A user told they touched local-only content
+/// goes looking for a `local-only` glob that does not exist.
 ///
 /// So the clause names what is actually common to every source — an earlier
 /// privacy decision in this session — rather than the one source it originally
@@ -8183,10 +8258,8 @@ provider_id = "on-device"
         #[test]
         fn an_unattributable_privacy_block_pins_no_session() {
             let taint = Arc::new(SessionTaint::new());
-            let sink = TaintingPrivacySink {
-                events: Arc::new(EventBus::new()),
-                taint: Arc::clone(&taint),
-            };
+            let sink =
+                TaintingPrivacySink::for_turn_path(Arc::new(EventBus::new()), Arc::clone(&taint));
             let block = teton_protocol::events::PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
                 provider_id: ProviderId::from("frontier"),
@@ -8234,10 +8307,7 @@ provider_id = "on-device"
                 let taint = Arc::new(SessionTaint::new());
                 let bus = Arc::new(EventBus::new());
                 let mut sub = bus.subscribe(16);
-                let sink = TaintingPrivacySink {
-                    events: bus,
-                    taint: Arc::clone(&taint),
-                };
+                let sink = TaintingPrivacySink::for_turn_path(bus, Arc::clone(&taint));
                 let session = SessionId::from("s");
                 crate::egress::PrivacyEventSink::privacy_block(
                     &sink,
@@ -8285,6 +8355,13 @@ provider_id = "on-device"
         /// protocol dependency by design. So the rule exists twice, and this is
         /// what stops the two copies drifting into a session that a *duty*
         /// pinned and a *turn* did not.
+        ///
+        /// **The MCP gate is not one of these two copies** and is deliberately
+        /// absent from the rows below: it is a different rule for a different
+        /// choke point, not a third spelling of this one. The test directly
+        /// after this asserts where it diverges, so "these two agree" and "that
+        /// third one does not" are both pinned rather than one of them being
+        /// inferred from the other's silence.
         #[test]
         fn the_two_taint_gates_agree_cause_for_cause() {
             let rows = [
@@ -8309,6 +8386,51 @@ provider_id = "on-device"
             // everything is not agreeing about nothing.
             assert!(taints_the_session(BlockDetail::Boundary));
             assert!(!taints_the_session(BlockDetail::ScanUnavailable));
+        }
+
+        /// **The MCP gate is a third rule, and the divergence is the point**
+        /// (REQ-562; user decision, 2026-08-08).
+        ///
+        /// Stated as a difference rather than left to be discovered, because
+        /// the failure mode is a later tidy-up: two functions that agree on two
+        /// of three causes look like duplication, and folding them into one
+        /// would silently re-decide REQ-544's MCP boundary posture — the
+        /// decision that says an MCP boundary refusal is an in-context tool
+        /// error and nothing more. Asserting the disagreement makes that fold
+        /// turn red.
+        ///
+        /// The redaction row is where the two rules *must* agree: the model
+        /// authored the tool arguments the scan refused, so it holds a secret
+        /// it can restate through an ordinary turn, and the surface it was
+        /// caught on does not change that.
+        #[test]
+        fn the_mcp_gate_pins_redaction_and_diverges_from_the_turn_path_on_boundary() {
+            let redaction = BlockCause::Redaction {
+                kind: teton_protocol::events::FindingKind::Credential,
+                span: teton_protocol::events::ByteSpan { start: 10, end: 30 },
+            };
+
+            // Where they agree, and why.
+            assert!(
+                mcp_cause_taints_the_session(&redaction),
+                "the model wrote those arguments and can restate the finding next turn"
+            );
+            assert!(
+                cause_taints_the_session(&redaction),
+                "non-vacuity: the turn path's answer for the same cause"
+            );
+            assert!(!mcp_cause_taints_the_session(&BlockCause::ScanUnavailable));
+            assert!(!cause_taints_the_session(&BlockCause::ScanUnavailable));
+
+            // Where they differ, and the direction of the difference.
+            assert!(
+                !mcp_cause_taints_the_session(&BlockCause::Boundary),
+                "REQ-544's fold-without-pinning posture for the MCP surface is kept"
+            );
+            assert!(
+                cause_taints_the_session(&BlockCause::Boundary),
+                "and the turn path still pins on it — this row is the divergence"
+            );
         }
 
         /// **AC-1, the direct regression, end to end through the daemon's own
@@ -10664,6 +10786,40 @@ provider_id = "on-device"
                 }
             }
 
+            /// One `tools/call` through the construction `build_tools` uses:
+            /// [`DaemonRuntime::mcp_egress`] over `wire`, the real
+            /// [`McpRegistry`] over that, the real [`crate::mcp::HttpConnection`],
+            /// the real handshake.
+            ///
+            /// Shared by every test below rather than rebuilt per test, because
+            /// what they are all asserting *about* is this wiring: a second
+            /// hand-rolled copy could keep passing after the production one had
+            /// changed underneath it.
+            ///
+            /// `session` is a parameter because attribution is the subject of
+            /// half these tests — a block the choke point cannot attribute pins
+            /// nothing, so the session has to be a thing the caller controls and
+            /// can then ask the taint about.
+            async fn mcp_lookup(
+                runtime: &DaemonRuntime,
+                wire: &McpWire,
+                session: &SessionId,
+                arguments: serde_json::Value,
+            ) -> Result<crate::mcp::McpToolResult, crate::mcp::McpError> {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let events = Arc::new(EventBus::new());
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let egress =
+                    Arc::new(runtime.mcp_egress(wire.clone(), &router, &config, &events, session));
+                let registry = McpRegistry::with_egress(
+                    egress as Arc<dyn crate::mcp::EgressGate>,
+                    Some(session.clone()),
+                    vec![http_server("kb")],
+                );
+                registry.call_tool("mcp__kb__lookup", arguments).await
+            }
+
             /// **The MCP choke point carries the gate** (ADR-003, ADR-1).
             ///
             /// ## Why this test exists
@@ -10710,29 +10866,13 @@ provider_id = "on-device"
                     runtime: &DaemonRuntime,
                     wire: &McpWire,
                 ) -> Result<crate::mcp::McpToolResult, crate::mcp::McpError> {
-                    let config = runtime.config.lock().expect("config mutex").clone();
-                    let events = Arc::new(EventBus::new());
-                    let router =
-                        build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
-                    let session = SessionId::from("sess-mcp");
-                    let egress = Arc::new(runtime.mcp_egress(
-                        wire.clone(),
-                        &router,
-                        &config,
-                        &events,
-                        &session,
-                    ));
-                    let registry = McpRegistry::with_egress(
-                        egress as Arc<dyn crate::mcp::EgressGate>,
-                        Some(session),
-                        vec![http_server("kb")],
-                    );
-                    registry
-                        .call_tool(
-                            "mcp__kb__lookup",
-                            serde_json::json!({ "q": format!("what does {CREDENTIAL} unlock?") }),
-                        )
-                        .await
+                    mcp_lookup(
+                        runtime,
+                        wire,
+                        &SessionId::from("sess-mcp"),
+                        serde_json::json!({ "q": format!("what does {CREDENTIAL} unlock?") }),
+                    )
+                    .await
                 }
 
                 // -- on ------------------------------------------------------
@@ -10778,6 +10918,184 @@ provider_id = "on-device"
                     off_wire.bodies().iter().any(|b| b.contains(CREDENTIAL)),
                     "non-vacuity: with no gate the credential really does reach \
                      the wire, so the on-leg's absence is the gate"
+                );
+            }
+
+            // -- which MCP blocks pin the session (user decision, 2026-08-08) --
+
+            /// **An MCP block pins its session iff the redaction scan found
+            /// something** — all three causes, through the production wiring.
+            ///
+            /// One config and one helper serve all three legs, so what varies
+            /// between them is the cause and nothing else: the tool argument
+            /// picks boundary vs redaction, and the presence of an engine picks
+            /// whether the scan could run at all. A fixture that had simply
+            /// stopped attributing blocks to a session would fail the redaction
+            /// leg rather than pass all three, which is what makes the two
+            /// `false`s evidence of the gate rather than of a broken fixture
+            /// (LESSON-485).
+            ///
+            /// Why they differ is on [`mcp_cause_taints_the_session`]; this is
+            /// the behavioural half, driven through
+            /// [`DaemonRuntime::mcp_egress`] rather than by calling the
+            /// predicate — the sink has to actually be wired to it.
+            #[tokio::test]
+            async fn an_mcp_block_pins_its_session_for_redaction_and_for_no_other_cause() {
+                /// Pattern-shaped, so the deterministic pass alone blocks it.
+                const CREDENTIAL: &str = "AKIAMCPTAINTSENTINEL";
+
+                /// The opt-in **and** a `local-only` boundary, so one config
+                /// can produce all three causes.
+                fn guarded() -> Config {
+                    let mut config = opted_in(config());
+                    config.boundaries = vec![PrivacyBoundary {
+                        path_glob: "secrets/**".to_owned(),
+                        mode: BoundaryMode::LocalOnly,
+                    }];
+                    config
+                }
+
+                /// The refusal `arguments` produces, and whether it pinned the
+                /// session it happened in.
+                async fn block_from(
+                    runtime: &DaemonRuntime,
+                    arguments: serde_json::Value,
+                ) -> (BlockDetail, bool) {
+                    let session = SessionId::from("sess-mcp-taint");
+                    assert!(
+                        !runtime.session_taint.is_tainted(&session),
+                        "the fixture must start clean or it proves nothing"
+                    );
+                    let err = mcp_lookup(runtime, &McpWire::default(), &session, arguments)
+                        .await
+                        .expect_err("the call must be refused");
+                    let crate::mcp::McpError::PrivacyBlocked { detail, .. } = err else {
+                        panic!("expected a privacy block, got {err:?}");
+                    };
+                    (detail, runtime.session_taint.is_tainted(&session))
+                }
+
+                // The model wrote these arguments, so it is holding what the
+                // scan found and can restate it next turn.
+                let engine = CountingEngine::answering("NONE");
+                let (detail, pinned) = block_from(
+                    &runtime(guarded(), &engine, true),
+                    serde_json::json!({ "q": format!("what does {CREDENTIAL} unlock?") }),
+                )
+                .await;
+                assert_eq!(detail, BlockDetail::Redaction);
+                assert!(
+                    pinned,
+                    "a redaction block through MCP must pin the session, exactly as one \
+                     through a turn does"
+                );
+
+                // REQ-544's posture for this surface, kept: a boundary refusal
+                // folds back into the loop as an in-context tool error.
+                let engine = CountingEngine::answering("NONE");
+                let (detail, pinned) = block_from(
+                    &runtime(guarded(), &engine, true),
+                    serde_json::json!({ "path": "secrets/prod.env" }),
+                )
+                .await;
+                assert_eq!(
+                    detail,
+                    BlockDetail::Boundary,
+                    "the boundary leg must be refused by provenance, not by the scan"
+                );
+                assert!(
+                    !pinned,
+                    "REQ-544 folds an MCP boundary block back into the loop without \
+                     pinning, and this REQ does not re-decide that"
+                );
+
+                // Nothing looked at the payload, so nothing was established —
+                // the one answer both paths share.
+                let (detail, pinned) =
+                    block_from(&runtime_without_an_engine(guarded()), serde_json::json!({})).await;
+                assert_eq!(detail, BlockDetail::ScanUnavailable);
+                assert!(
+                    !pinned,
+                    "a scan that never ran must not pin a whole session to the local tier"
+                );
+            }
+
+            /// **What the pin is *for*, on the MCP path**: the next turn in that
+            /// session resolves local.
+            ///
+            /// `is_tainted` is a flag, and a pin that never reached
+            /// [`DaemonRuntime::dispatch_route`] would satisfy the flag while
+            /// changing nothing a user could observe. This asserts the
+            /// consequence instead, with a second untouched session on the same
+            /// runtime as the non-vacuity — it still routes remotely, so the
+            /// pinned leg is the taint and not the fixture's routing.
+            ///
+            /// Structured mode on both, so no classification runs and the
+            /// engine in the slot is only ever the scanner.
+            #[tokio::test]
+            async fn an_mcp_redaction_block_pins_the_session_so_the_next_turn_resolves_local() {
+                const CREDENTIAL: &str = "AKIAMCPNEXTTURNSENT0";
+
+                let engine = CountingEngine::answering("NONE");
+                let runtime = runtime(opted_in(config()), &engine, true);
+                let blocked = SessionId::from("blocked");
+                let bystander = SessionId::from("bystander");
+
+                let err = mcp_lookup(
+                    &runtime,
+                    &McpWire::default(),
+                    &blocked,
+                    serde_json::json!({ "q": format!("what does {CREDENTIAL} unlock?") }),
+                )
+                .await
+                .expect_err("the credential must be refused");
+                assert!(
+                    matches!(
+                        err,
+                        crate::mcp::McpError::PrivacyBlocked {
+                            detail: BlockDetail::Redaction,
+                            ..
+                        }
+                    ),
+                    "expected a redaction block, got {err:?}"
+                );
+
+                let router = router_for(&runtime);
+                let next = runtime
+                    .dispatch_route(
+                        &router,
+                        &blocked,
+                        SessionMode::Structured,
+                        Some(CorePhase::Implement),
+                        "carry on",
+                    )
+                    .await;
+                assert_eq!(
+                    next.provider_id.as_ref().map(|p| p.0.as_str()),
+                    Some(LOCAL_PROVIDER_ID),
+                    "the turn after an MCP redaction block must be pinned local — {}",
+                    next.reason
+                );
+                assert!(
+                    next.resolution.is_none(),
+                    "the taint pin resolves no category at all (BR-7)"
+                );
+                assert_engine_backed(&opted_in(config()), &next);
+
+                let untouched = runtime
+                    .dispatch_route(
+                        &router,
+                        &bystander,
+                        SessionMode::Structured,
+                        Some(CorePhase::Implement),
+                        "carry on",
+                    )
+                    .await;
+                assert_eq!(
+                    untouched.provider_id.as_ref().map(|p| p.0.as_str()),
+                    Some("cheap"),
+                    "non-vacuity: the identical next turn in an untouched session still \
+                     goes remote, and the pin reaches only the session it happened in"
                 );
             }
 
