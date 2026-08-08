@@ -2,7 +2,7 @@
   "req": "REQ-562",
   "branch": "feat/REQ-562-redact-egress-scan",
   "startedAt": "2026-08-07T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -63,6 +63,12 @@
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-08T00:00:00Z",
       "note": "sanity sweep clean (sentinels only, no live TODOs, no bare println); all 6 CI checks green"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-08T00:00:00Z",
+      "note": "PR #69 squash-merged as 2b57c76; remote+local branch deleted; worktree removed; wrapup PR carries lessons + assumption + this state flip"
     }
   ],
   "repos": {
@@ -74,7 +80,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/69",
       "prNumber": 69,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
