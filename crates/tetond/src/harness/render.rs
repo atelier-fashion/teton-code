@@ -126,6 +126,22 @@ const CHATML_GENERATION_CUE: &str = "<|im_start|>assistant\n";
 pub(crate) const CHATML_PER_MESSAGE_OVERHEAD_BYTES: usize =
     CHATML_START.len() + "assistant".len() + 1 + CHATML_END.len();
 
+/// Upper bound on what [`render_duty`]'s [`ChatFormat::ChatMl`] arm adds around
+/// a duty instruction: one message's delimiters plus the generation cue.
+///
+/// Exported because REQ-562's input cap is derived through it. The redaction
+/// scan's prompt has to fit the local engine's window *after* rendering, and a
+/// cap sized against the unrendered prompt lets a payload at the cap come back
+/// as an over-window engine error — reported as "the scan could not run" when
+/// the true reason is "this payload is too large" (LESSON-446, LESSON-488).
+///
+/// A bound rather than the exact figure: a duty renders as a `user` message
+/// (4 bytes of role name), and [`CHATML_PER_MESSAGE_OVERHEAD_BYTES`] charges
+/// `assistant`'s 9. Over-counting by five bytes is the right direction for
+/// something a budget is derived from.
+pub(crate) const CHATML_DUTY_ENVELOPE_BYTES: usize =
+    CHATML_PER_MESSAGE_OVERHEAD_BYTES + CHATML_GENERATION_CUE.len();
+
 /// The ChatML role name for a structured message's role.
 fn chatml_role(role: MessageRole) -> &'static str {
     match role {

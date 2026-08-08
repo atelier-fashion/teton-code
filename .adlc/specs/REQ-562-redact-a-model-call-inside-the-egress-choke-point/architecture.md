@@ -132,10 +132,22 @@ budget):
   LOCAL_ENGINE_N_CTX          16,384 tokens
   − REDACT_DUTY.max_tokens()   1,024 tokens   (the duty's generation reservation)
   = prompt budget             15,360 tokens
-  × 2 bytes/token             30,720 bytes    (the duty seam's convention)
+  × 2 bytes/token             30,720 bytes    (the duty seam's convention —
+                                               DUTY_REQUEST_BYTES_PER_TOKEN,
+                                               read from the seam, not restated)
+  − CHATML_DUTY_ENVELOPE_BYTES    55 bytes    (33 message delimiters + 22
+                                               generation cue, added by
+                                               render_duty AFTER the prompt is
+                                               built)
   − REDACT_PROMPT_OVERHEAD_BYTES 586 bytes    (instruction + contract + header,
                                                measured from the constants)
-  = REDACT_INPUT_MAX_BYTES    30,134 bytes
+  − 1 byte                                    (the frame-defusing bound's
+                                               constant term)
+  = 30,078 bytes for payload + its worst-case defusing
+  × 9/10                      30,078 → 27,070 (ADR-10's insertion: at most one
+                                               byte per 9 of payload —
+                                               REDACT_DEFUSE_GROWTH_DIVISOR)
+  = REDACT_INPUT_MAX_BYTES    27,070 bytes
 ```
 
 *(Originally stated as a flat 64 KiB "≈32k tokens at the duty seam's
@@ -145,6 +157,39 @@ refuses any prompt over `n_ctx - max_tokens` tokens, so every payload from
 an engine error — blocking with `ScanUnavailable` when the true reason was
 "too large to scan". BR-3's distinction, collapsed by arithmetic instead of by
 wording.)*
+
+**The cap is the filter; the bound is measured** (LESSON-488). Two terms are
+deliberately *not* in the arithmetic above, and they are why
+`harness::redact::scan` renders the prompt with the real `render_duty` and
+returns `Unavailable` — before the model call, at zero model cost — when the
+rendered size exceeds the prompt budget:
+
+1. **Control-token neutralization.** `render_duty` defuses every `<|…|>` run on
+   both arms, insertion-only, worst-cased at **one byte per two** of payload: a
+   payload of `<|`-runs closed by a `|>` inside the renderer's 64-byte span
+   window renders ~48% larger. Folding a `× 2/3` term into the constant would
+   drop the cap to ~18 KiB — below a single large file — for every user, to
+   pre-reject a payload the render guard rejects for nothing. So the term is
+   stated here and enforced there.
+2. **`2 bytes/token` is an estimate, not a bound.** Base64 and CJK content can
+   tokenize under two bytes per token, and no byte arithmetic fixes that. The
+   engine's typed over-window refusal stays as the last backstop, as for every
+   other duty.
+
+**The cap collides with the harness's own context budget, and this REQ does not
+resolve it.** `HarnessConfig::context_budget_bytes` is **32,768**
+(`turn_loop.rs:173`) — *larger* than the 27,070-byte cap. A turn that fills its
+context budget therefore assembles a body this scan refuses, so with
+`[privacy] redact = true` a context-budget-full remote turn **blocks**, reported
+as `ScanUnavailable`. That is fail-closed and honest about its reason, and it is
+a real usability cost: the ceiling on "how much context can a remote turn carry
+while redaction is on" is set by the redactor's window, not by the harness's
+budget. Reconciling them — chunked scanning with a composed verdict, or a
+context budget derived from the cap — is **deliberate follow-up**; changing
+`context_budget_bytes` inside this REQ would move a budget five other subsystems
+are sized against. What this REQ owes instead is *measurement*: the AC-7
+procedure records the **over-cap block rate** as a first-class number, so the
+size of the collision is observed rather than argued about.
 
 ### ADR-7: `privacy_block` gains an additive `cause`; the shape otherwise holds
 

@@ -688,6 +688,38 @@ timeout, and it means B's turn was *blocked* by A's unrelated work.
 redaction scan could not run"*): at the cap on slow weights that is the deadline
 firing, and a fail-closed timeout is a worse user outcome than a slow one.
 
+**Step 4 — the over-cap block rate (the cap-vs-context-budget collision).**
+
+This one is not about latency at all, and it is the number most likely to decide
+whether the feature is usable. `REDACT_INPUT_MAX_BYTES` is **27,070 bytes** —
+derived from the local engine's window (ADR-6) — while
+`HarnessConfig::context_budget_bytes` is **32,768** (`turn_loop.rs:173`). The
+harness is allowed to assemble a turn about 20% larger than the redactor can
+scan, so a **context-budget-full remote turn blocks** when the switch is on. Not
+silently: it is `ScanUnavailable`, fail-closed, and says the scan could not run.
+But a user whose repository makes long turns normal would experience redaction
+as "remote turns stopped working", and no automated fixture can tell us how
+often that happens because none of them assembles a realistic context.
+
+So measure it, as a rate rather than as an anecdote. Over the twenty turns of
+step 1 and the ten of step 2 (sixty scans in total across both halves of the
+control):
+
+| Record | How |
+|---|---|
+| **Over-cap block rate** | count turns that failed with *"the redaction scan could not run"* whose `/verbose` context size was at or near the 32,768-byte budget, over total turns with `redact = true` |
+| The context size at which it starts | `/verbose` reports the assembled context size per turn; note the smallest one that blocked |
+| Whether the control turn succeeded | the same prompt with `redact = false` — if it succeeded, the block is the cap and not the prompt |
+
+Force the state deliberately at least once: read four or five large files in one
+turn until `/verbose` shows the context near budget, then ask a question. That
+turn should block with the scan-unavailable sentence.
+
+**Any non-zero rate on ordinary work is a finding**, and the fix is *not* a
+bigger cap against the same window — that is the arithmetic this REQ removed. It
+is chunked scanning with a composed verdict, or a context budget derived from
+the cap. Both are follow-up REQs; this step is what sizes them.
+
 A miss anywhere is a finding to record here, not a number to re-run until it
 looks acceptable — and the honest response to a miss is a smaller cap, a faster
 tier, or a scan that does not run on every call, never a partial scan that

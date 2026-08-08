@@ -355,7 +355,16 @@ impl DutyKind {
 /// request, as the thing that actually bounds the answer. Erring the other way
 /// would make `max_tokens` the real bound and the declared ceiling decorative,
 /// which is the shape LESSON-443 warns about: a guard that can never fire.
-const DUTY_REQUEST_BYTES_PER_TOKEN: usize = 2;
+///
+/// **An estimate, not a bound.** Real BPE on prose and code runs nearer four
+/// bytes per token, but dense punctuation, base64 and CJK can all run *under*
+/// two — so a byte count divided by this can under-state a real token count.
+/// That is safe on the output side, where the byte ceiling binds regardless.
+/// It is what makes REQ-562's derived input cap a *filter* rather than a proof:
+/// see [`REDACT_INPUT_MAX_BYTES`](crate::egress::redact::REDACT_INPUT_MAX_BYTES),
+/// which reads this constant rather than restating it, and the measured render
+/// guard in [`crate::harness::redact::scan`] that stands behind it.
+pub(crate) const DUTY_REQUEST_BYTES_PER_TOKEN: usize = 2;
 
 /// Ceiling on the `max_tokens` any duty asks a provider for.
 ///

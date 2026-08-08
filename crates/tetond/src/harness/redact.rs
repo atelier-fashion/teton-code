@@ -79,12 +79,16 @@
 
 use std::ops::Range;
 
+use teton_inference::ChatFormat;
 use teton_protocol::Category;
 
-use crate::egress::redact::{pattern_verdict, Finding, FindingKind, Outcome, RedactionVerdict};
+use crate::egress::redact::{
+    pattern_verdict, Finding, FindingKind, Outcome, RedactionVerdict, REDACT_PROMPT_BUDGET_BYTES,
+};
 use crate::egress::Provenance;
 
 use super::duty::{DutyKind, DutyRoute};
+use super::render::render_duty;
 
 /// How many findings [`REDACTION_OUTPUT_CONTRACT`] asks for, at most.
 ///
@@ -291,6 +295,29 @@ pub fn redact_prompt(payload: &str) -> String {
     prompt
 }
 
+/// The size of what the **engine** is actually handed for `prompt`, in bytes
+/// (LESSON-488, LESSON-485).
+///
+/// [`redact_prompt`] is not the last transform on the way to the model.
+/// `LocalDuty::perform` renders it for the engine's chat format, and rendering
+/// is not free: it defuses every control-token spelling in the text (an
+/// insertion, worst-cased at one byte per two of `<|`-runs) and — on the ChatML
+/// arm — wraps the result in a message envelope and a generation cue. Both
+/// happen *after* the input cap has already been checked, so a payload that
+/// passed the cap can still produce a prompt the engine refuses as over-window,
+/// which surfaces as "the scan could not run" rather than as "this payload is
+/// too large".
+///
+/// So the thing measured is the rendered string produced by the real
+/// [`render_duty`], not an estimate of it. `ChatMl` is the larger of the two
+/// arms by construction — `Flat` is the same neutralization without the
+/// envelope — so measuring it bounds both, whichever format the engine that
+/// eventually serves the scan reports.
+#[must_use]
+pub(crate) fn rendered_prompt_bytes(prompt: &str) -> usize {
+    render_duty(ChatFormat::ChatMl, prompt).len()
+}
+
 /// Scan `payload` with both passes and return the verdict the choke point acts
 /// on — **the entry point the gate calls** (ADR-4, ADR-6).
 ///
@@ -309,10 +336,20 @@ pub fn redact_prompt(payload: &str) -> String {
 ///    [`pattern_verdict`](crate::egress::redact::pattern_verdict) and is read
 ///    from its outcome rather than re-tested here, so there is one cap and one
 ///    place to change it.
-/// 2. **An unresolved route next**, before the prompt is built: a 64 KiB
-///    payload rendered into a prompt no model will ever see is 64 KiB of work
+/// 2. **An unresolved route next**, before the prompt is built: a payload at
+///    the cap rendered into a prompt no model will ever see is 27 KiB of work
 ///    done for a call that cannot happen (`name_session`'s precedent).
-/// 3. Then the model pass, then the merge.
+/// 3. **Then the rendered prompt is measured** against the engine's own budget
+///    ([`rendered_prompt_bytes`], LESSON-488). The input cap is arithmetic over
+///    the payload; the thing that has to fit is the *rendered* prompt, and two
+///    transforms run after the cap check — the frame defusing this module does
+///    and the control-token neutralization plus ChatML envelope `render_duty`
+///    does. A payload at the cap built of `<|`-runs renders ~48% larger than
+///    the arithmetic allows for, and without this it reached the engine, came
+///    back as an over-window error, and blocked saying "the scan could not
+///    run" when the truth is "this payload is too large to scan". The cap stays
+///    as the cheap first filter; this is the bound.
+/// 4. Then the model pass, then the merge.
 ///
 /// Failure of any of those is [`Outcome::Unavailable`], never [`Outcome::Clean`]
 /// — including when the pattern pass already found something. See the module
@@ -337,10 +374,15 @@ pub async fn scan(route: &DutyRoute, payload: &str) -> RedactionVerdict {
     if matches!(route, DutyRoute::Unresolved { .. }) {
         return RedactionVerdict::unavailable();
     }
-    let Ok(answer) = route
-        .perform(&redact_prompt(payload), &Provenance::empty())
-        .await
-    else {
+    let prompt = redact_prompt(payload);
+    // The bound, measured rather than estimated (LESSON-488). A prompt the
+    // engine would refuse as over-window is refused HERE, before the call, so
+    // it costs nothing and — more to the point — so it is one failure with one
+    // cause instead of an engine error wearing the wrong reason.
+    if rendered_prompt_bytes(&prompt) > REDACT_PROMPT_BUDGET_BYTES {
+        return RedactionVerdict::unavailable();
+    }
+    let Ok(answer) = route.perform(&prompt, &Provenance::empty()).await else {
         return RedactionVerdict::unavailable();
     };
     // The reply is consumed here and nowhere else. What comes back out is a list
@@ -1370,6 +1412,59 @@ mod tests {
             1,
             "non-vacuity: the same route really does call a model under the cap"
         );
+    }
+
+    /// **The cap is the filter; the rendered size is the bound** (LESSON-488).
+    ///
+    /// `render_duty` runs *after* the input cap has been checked and after this
+    /// module's own frame defusing: it neutralizes every control-token spelling
+    /// (one inserted byte per two of a `<|`-run) and wraps the result in a
+    /// ChatML envelope. A payload **under** the cap can therefore be handed to
+    /// the engine **over** its window, which comes back as an engine error and
+    /// blocks saying "the scan could not run" — when the truth is "this payload
+    /// is too large to scan". Different problems, different fixes (BR-3).
+    ///
+    /// So the guard measures the rendered form and refuses before the call. The
+    /// model-call count is the assertion that matters: an engine error would
+    /// also produce `Unavailable`, and only the count distinguishes "refused
+    /// before the call" from "refused by the engine".
+    ///
+    /// Its non-vacuity twin is the row below it: the *same* size of payload
+    /// without the `<|`-runs renders inside the window and is scanned.
+    #[tokio::test]
+    async fn a_payload_that_renders_past_the_window_is_unavailable_before_any_model_call() {
+        let (route, calls) = counting_route(NOTHING_FOUND);
+
+        // 31 `<|` pairs closed by a `|>` inside the renderer's 64-byte span
+        // window: every one is defused, which is the densest growth possible.
+        let block = "<|".repeat(31) + "|>";
+        let mut adversarial = block.repeat(REDACT_INPUT_MAX_BYTES / 64);
+        adversarial.push_str(&"z".repeat(REDACT_INPUT_MAX_BYTES - adversarial.len()));
+        assert_eq!(
+            adversarial.len(),
+            REDACT_INPUT_MAX_BYTES,
+            "the fixture is AT the cap, so the cheap filter passes it"
+        );
+
+        let verdict = scan(&route, &adversarial).await;
+        assert_eq!(verdict.outcome(), Outcome::Unavailable);
+        assert!(!verdict.scanned());
+        assert_eq!(decide(&verdict), EgressDecision::Block);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a prompt the engine would refuse as over-window must be refused HERE, \
+             not by the engine: an engine error is Unavailable too, and only the \
+             call count tells them apart"
+        );
+
+        // The twin: the same length, no control-token spellings, and the same
+        // route really does scan it.
+        let plain = "z".repeat(REDACT_INPUT_MAX_BYTES);
+        let verdict = scan(&route, &plain).await;
+        assert_eq!(verdict.outcome(), Outcome::Clean);
+        assert!(verdict.scanned());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// **ADR-6, the "found something but could not finish" row.** An over-cap

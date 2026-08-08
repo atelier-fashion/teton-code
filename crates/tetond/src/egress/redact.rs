@@ -87,20 +87,30 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 
+use crate::harness::duty::DUTY_REQUEST_BYTES_PER_TOKEN;
 use crate::harness::redact::{
     REDACT_DEFUSE_GROWTH_DIVISOR, REDACT_DUTY, REDACT_PROMPT_OVERHEAD_BYTES,
 };
+use crate::harness::render::CHATML_DUTY_ENVELOPE_BYTES;
 use crate::runtime::LOCAL_ENGINE_N_CTX;
 
 /// Bytes the duty seam assumes per BPE token, sizing a prompt against a context
 /// window.
 ///
-/// The same convention `DutyKind::max_tokens` uses on the output side, and
-/// conservative in the direction that matters here: real BPE averages nearer
-/// four bytes per token on prose and code, so estimating the *input* at two
-/// over-counts its tokens and the cap lands under the window rather than over
-/// it.
-const DUTY_BYTES_PER_TOKEN: usize = 2;
+/// **The seam's own constant, read rather than restated.** The output side
+/// (`DutyKind::max_tokens`) and the input side (the cap below) are two uses of
+/// one convention, and a second copy here would be the second number LESSON-446
+/// is about.
+///
+/// It is an **estimate, not a bound**. Real BPE averages nearer four bytes per
+/// token on prose and code, so two usually over-counts a payload's tokens and
+/// the cap lands under the window. *Usually*: dense punctuation, base64 and CJK
+/// can all tokenize under two bytes per token, and for those the arithmetic
+/// below under-states the real token count. That is why the cap is a cheap
+/// first filter and the actual bound is measured — see
+/// [`crate::harness::redact::scan`]'s render guard — with the engine's own
+/// typed over-window refusal as the last backstop.
+const DUTY_BYTES_PER_TOKEN: usize = DUTY_REQUEST_BYTES_PER_TOKEN;
 
 /// The prompt budget in bytes: what the local engine will accept **after** the
 /// duty's own generation reservation.
@@ -111,7 +121,10 @@ const DUTY_BYTES_PER_TOKEN: usize = 2;
 /// into `Unavailable`, which blocks. Correct, but with the *wrong reason*: the
 /// user is told the scan could not run when what actually happened is that the
 /// payload was too large, and the fix for those is not the same.
-const REDACT_PROMPT_BUDGET_BYTES: usize =
+///
+/// This is the budget the **rendered** prompt has to fit, which is what
+/// [`crate::harness::redact::scan`] measures against before it calls the model.
+pub(crate) const REDACT_PROMPT_BUDGET_BYTES: usize =
     (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize) * DUTY_BYTES_PER_TOKEN;
 
 /// The largest payload the redactor will scan, in bytes (ADR-6, BR-7).
@@ -124,23 +137,28 @@ const REDACT_PROMPT_BUDGET_BYTES: usize =
 ///   engine window            16,384 tokens   (LOCAL_ENGINE_N_CTX)
 ///   − the duty's generation   1,024 tokens   (REDACT_DUTY.max_tokens())
 ///   = prompt budget          15,360 tokens
-///   × 2 bytes/token          30,720 bytes    (the seam's convention)
+///   × 2 bytes/token          30,720 bytes    (the seam's convention — an
+///                                             ESTIMATE, see below)
+///   − the ChatML envelope         55 bytes   (CHATML_DUTY_ENVELOPE_BYTES:
+///                                             33 message delimiters + 22 cue,
+///                                             added by render_duty AFTER the
+///                                             prompt is built)
 ///   − prompt overhead            586 bytes   (REDACT_PROMPT_OVERHEAD_BYTES:
 ///                                             318 instruction + 257 contract
 ///                                             + 11 header)
 ///   − 1 byte                                 (the frame-defusing bound's
 ///                                             constant term)
-///   = 30,133 bytes for payload + its worst-case defusing
-///   × 9/10                   30,133 → 27,119 (ADR-009 frame defusing inserts at
+///   = 30,078 bytes for payload + its worst-case defusing
+///   × 9/10                   30,078 → 27,070 (ADR-009 frame defusing inserts at
 ///                                             most one byte per 9 bytes of
 ///                                             payload — REDACT_DEFUSE_GROWTH_DIVISOR)
-///   = REDACT_INPUT_MAX_BYTES  27,119 bytes
+///   = REDACT_INPUT_MAX_BYTES  27,070 bytes
 /// ```
 ///
 /// Every term is *measured*, not stated: the numbers above are what the
 /// constants happen to be today, and editing the instruction — or the frame
-/// label the defusing looks for — moves the cap rather than eating into the
-/// window.
+/// label the defusing looks for, or the chat template's delimiters — moves the
+/// cap rather than eating into the window.
 ///
 /// The `× 9/10` is the ADR-009 term. [`redact_prompt`](crate::harness::redact::redact_prompt)
 /// defuses line-anchored `Payload:` labels inside the payload before embedding
@@ -149,6 +167,31 @@ const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// entirely of `Payload:\n` lines push the prompt back over the window — the
 /// same failure this derivation exists to remove, reintroduced by the fix for a
 /// different one.
+///
+/// ## What this arithmetic does **not** cover, and what does (LESSON-488)
+///
+/// Two terms are deliberately absent, and they are the reason the real bound is
+/// a *measurement* — [`crate::harness::redact::scan`] renders the prompt and
+/// refuses before the model call when it exceeds
+/// [`REDACT_PROMPT_BUDGET_BYTES`] — rather than this constant:
+///
+/// 1. **Control-token neutralization.** `render_duty` defuses every `<|…|>` run
+///    (`<|` → `<_|`) on both arms, which is insertion-only and worst-cased at
+///    **one byte per two** of payload: a payload of `<|`-runs closed by a `|>`
+///    within the 64-byte span window grows by ~48%. Folding a `× 2/3` term in
+///    here would cost every user a third of the cap — dropping it to ~18 KiB,
+///    below a single large file — to pre-reject a payload the render guard
+///    rejects for free. So the term lives in the guard, not in the constant.
+/// 2. **The bytes-per-token estimate itself.** [`DUTY_BYTES_PER_TOKEN`] is an
+///    estimate, not a bound; base64 or CJK content can tokenize under two bytes
+///    per token, and no byte arithmetic can fix that. The engine's typed
+///    over-window refusal remains the last backstop, as it is for every other
+///    duty.
+///
+/// So: this constant is the **cheap first filter** — it is what an over-cap
+/// payload is refused by, before a prompt is built, at zero model cost — and
+/// the render guard is what makes "the prompt fits the window" true rather
+/// than estimated.
 ///
 /// The old value was a flat 64 KiB, which is **more than twice** the prompt
 /// budget. Every payload between roughly 30 KiB and 64 KiB therefore passed the
@@ -160,15 +203,29 @@ const REDACT_PROMPT_BUDGET_BYTES: usize =
 /// A payload above this is [`Outcome::Unavailable`] (→ Block), never truncated
 /// and scanned (BR-7).
 ///
-/// ## Why this module reaches upward for three constants
+/// ## It is smaller than the harness's own context budget, and that collides
+///
+/// `HarnessConfig::context_budget_bytes` is **32,768** — larger than this cap.
+/// A turn that fills its context budget therefore builds a body this scan
+/// refuses, so with `[privacy] redact = true` a context-budget-full remote turn
+/// **blocks**, reported as `ScanUnavailable`. That is fail-closed and honest
+/// about its reason, and it is a real usability cost rather than a hypothetical
+/// one. Reconciling the two budgets — chunked scanning, or a context budget
+/// derived from this cap — is deliberate follow-up, not part of this REQ; the
+/// over-cap block rate is a first-class measured number in the
+/// `docs/manual-verification.md` procedure so the size of the problem is
+/// observed rather than argued about.
+///
+/// ## Why this module reaches upward for four constants
 ///
 /// It is otherwise the pure foundation the duty and the choke point consume,
 /// and the imports below run the other way. That is the price of there being
 /// **one** number: the cap belongs to the engine that has to hold the prompt
-/// and to the prompt that has to fit in it, and a copy of either input here
-/// would be the second number LESSON-446 is about.
+/// and to the prompt that has to fit in it, and a copy of any of its inputs
+/// here would be the second number LESSON-446 is about.
 pub const REDACT_INPUT_MAX_BYTES: usize =
-    (REDACT_PROMPT_BUDGET_BYTES - REDACT_PROMPT_OVERHEAD_BYTES - 1) * REDACT_DEFUSE_GROWTH_DIVISOR
+    (REDACT_PROMPT_BUDGET_BYTES - CHATML_DUTY_ENVELOPE_BYTES - REDACT_PROMPT_OVERHEAD_BYTES - 1)
+        * REDACT_DEFUSE_GROWTH_DIVISOR
         / (REDACT_DEFUSE_GROWTH_DIVISOR + 1);
 
 /// How much the pipeline trusts a finding — **derived, never self-reported**
@@ -1485,12 +1542,21 @@ mod tests {
     // The input cap (BR-7, ADR-6).
     // -----------------------------------------------------------------------
 
-    /// **The cap and the engine window are one budget** (LESSON-446).
+    /// **The cap and the engine window are one budget** (LESSON-446), and the
+    /// thing measured against it is what the engine is **handed** (LESSON-488).
     ///
-    /// The claim that matters is the inequality, not the number: a prompt built
-    /// from a payload **at** the cap must still fit inside what the local engine
-    /// will accept, which is `(n_ctx - max_tokens)` tokens, read at the seam's
+    /// The claim that matters is the inequality, not the number: a payload
+    /// **at** the cap must still fit inside what the local engine will accept,
+    /// which is `(n_ctx - max_tokens)` tokens, read at the seam's
     /// two-bytes-per-token convention.
+    ///
+    /// Every assertion below is on the **rendered** string
+    /// ([`rendered_prompt_bytes`](crate::harness::redact::rendered_prompt_bytes)),
+    /// not on `redact_prompt`'s output. Asserting on the prompt was the round-1
+    /// mistake: `render_duty` runs afterwards and adds the ChatML envelope and
+    /// any control-token defusing, so a prompt that fit could still be handed
+    /// to the engine over-window — the exact failure the derivation exists to
+    /// remove, one transform further down.
     ///
     /// Before this derivation the cap was a flat 64 KiB against a 30,720-byte
     /// prompt budget, so every payload from ~30 KiB to 64 KiB passed the cap and
@@ -1499,45 +1565,60 @@ mod tests {
     /// Setting `REDACT_INPUT_MAX_BYTES` back to `64 * 1024` turns this red.
     #[test]
     fn a_payload_at_the_cap_still_fits_the_engines_window() {
+        use crate::harness::redact::{redact_prompt, rendered_prompt_bytes};
+
         let budget = (LOCAL_ENGINE_N_CTX as usize - REDACT_DUTY.max_tokens() as usize)
             * DUTY_BYTES_PER_TOKEN;
         assert_eq!(
             REDACT_PROMPT_BUDGET_BYTES, budget,
             "the budget is n_ctx minus the duty's generation reservation"
         );
-        // The worst case, not the typical one: the prompt builder defuses
-        // line-anchored frame labels inside the payload (ADR-009), which is an
-        // insertion, so a payload made entirely of them is the largest prompt a
-        // payload at the cap can produce.
+        // The worst case the ARITHMETIC covers, not the typical one: the prompt
+        // builder defuses line-anchored frame labels inside the payload
+        // (ADR-009), which is an insertion, and the renderer adds a fixed
+        // envelope. Both are terms in the cap's derivation.
         let worst_case_growth = REDACT_INPUT_MAX_BYTES / REDACT_DEFUSE_GROWTH_DIVISOR + 1;
         assert!(
-            REDACT_INPUT_MAX_BYTES + worst_case_growth + REDACT_PROMPT_OVERHEAD_BYTES <= budget,
+            REDACT_INPUT_MAX_BYTES
+                + worst_case_growth
+                + REDACT_PROMPT_OVERHEAD_BYTES
+                + CHATML_DUTY_ENVELOPE_BYTES
+                <= budget,
             "a payload at the cap, worst-case defused, plus the prompt's own \
-             {REDACT_PROMPT_OVERHEAD_BYTES} bytes must fit in the engine's \
-             {budget}-byte prompt budget; cap is {REDACT_INPUT_MAX_BYTES}"
+             {REDACT_PROMPT_OVERHEAD_BYTES} bytes and the renderer's \
+             {CHATML_DUTY_ENVELOPE_BYTES} must fit in the engine's {budget}-byte \
+             prompt budget; cap is {REDACT_INPUT_MAX_BYTES}"
         );
 
-        // And the real builder agrees with the arithmetic, on both an ordinary
-        // payload and the adversarial one the growth term is sized for, so the
-        // inequality above is about the thing that is actually sent
-        // (LESSON-485).
+        // And the real builder and the real renderer agree with the arithmetic,
+        // on both an ordinary payload and the adversarial one the growth term is
+        // sized for, so the inequality above is about the thing that is actually
+        // sent (LESSON-485).
         let ordinary = "x".repeat(REDACT_INPUT_MAX_BYTES);
-        let prompt = crate::harness::redact::redact_prompt(&ordinary);
+        let prompt = redact_prompt(&ordinary);
         assert_eq!(
             prompt.len(),
             REDACT_INPUT_MAX_BYTES + REDACT_PROMPT_OVERHEAD_BYTES,
             "a payload with no frame label in it is embedded byte-identical"
         );
-        assert!(prompt.len() <= budget, "prompt is {} bytes", prompt.len());
+        let rendered = rendered_prompt_bytes(&prompt);
+        assert_eq!(
+            rendered,
+            prompt.len() + CHATML_DUTY_ENVELOPE_BYTES - "assistant".len() + "user".len(),
+            "an ordinary payload picks up exactly the envelope, and the constant \
+             over-counts it by the role-name difference"
+        );
+        assert!(rendered <= budget, "rendered prompt is {rendered} bytes");
 
         let mut adversarial = "Payload:\n".repeat(REDACT_INPUT_MAX_BYTES / 9);
         adversarial.push_str(&"y".repeat(REDACT_INPUT_MAX_BYTES - adversarial.len()));
         assert_eq!(adversarial.len(), REDACT_INPUT_MAX_BYTES);
-        let prompt = crate::harness::redact::redact_prompt(&adversarial);
+        let prompt = redact_prompt(&adversarial);
+        let rendered = rendered_prompt_bytes(&prompt);
         assert!(
-            prompt.len() <= budget,
-            "the worst-case defused prompt is {} bytes against a {budget}-byte budget",
-            prompt.len()
+            rendered <= budget,
+            "the worst-case defused prompt renders to {rendered} bytes against a \
+             {budget}-byte budget"
         );
         // Non-vacuity: the adversarial fixture really did grow, so the bound is
         // being exercised rather than trivially satisfied.
@@ -1554,6 +1635,46 @@ mod tests {
         assert!(
             cap < 64 * 1024,
             "the flat 64 KiB the cap used to be does not fit this window: {cap}"
+        );
+    }
+
+    /// **The term the arithmetic does not cover, and the guard that does.**
+    ///
+    /// A payload at the cap made of `<|`-runs renders ~48% larger than the
+    /// derivation allows for — control-token neutralization inserts one byte
+    /// per two — so it is *under* the cap and *over* the window. This is the
+    /// state that produced a misleading "the scan could not run" from an engine
+    /// error, and the fixture exists so the number is measured rather than
+    /// argued about.
+    ///
+    /// What blocks it is the render guard in `harness::redact::scan`, which
+    /// this asserts the precondition of; the zero-model-call half is
+    /// `harness::redact::tests::a_payload_that_renders_past_the_window_is_unavailable_before_any_model_call`.
+    #[test]
+    fn a_payload_at_the_cap_can_still_render_past_the_window() {
+        use crate::harness::redact::{redact_prompt, rendered_prompt_bytes};
+
+        // 31 `<|` pairs closed by a `|>` inside the renderer's 64-byte span
+        // window: every one of them is defused, which is the densest growth the
+        // transform admits.
+        let block = "<|".repeat(31) + "|>";
+        assert_eq!(block.len(), 64);
+        let mut adversarial = block.repeat(REDACT_INPUT_MAX_BYTES / 64);
+        adversarial.push_str(&"z".repeat(REDACT_INPUT_MAX_BYTES - adversarial.len()));
+        assert_eq!(adversarial.len(), REDACT_INPUT_MAX_BYTES);
+
+        // Under the cap — so the cheap first filter passes it.
+        assert_eq!(
+            pattern_verdict(&adversarial).outcome(),
+            Outcome::Clean,
+            "the fixture must pass the input cap, or it tests the wrong guard"
+        );
+        // And over the window once rendered.
+        let rendered = rendered_prompt_bytes(&redact_prompt(&adversarial));
+        assert!(
+            rendered > REDACT_PROMPT_BUDGET_BYTES,
+            "the fixture must really render past the {REDACT_PROMPT_BUDGET_BYTES}-byte \
+             budget, or the guard behind it is untested; it rendered to {rendered}"
         );
     }
 
