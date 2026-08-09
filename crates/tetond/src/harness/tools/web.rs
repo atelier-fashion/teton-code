@@ -318,9 +318,15 @@ impl WebTool {
         }
 
         // --- gate: consent, under a per-tier key (BR-3, BR-4) ---
+        //
+        // `needed` rides along with the key because the two answer different
+        // questions: the key is what a session grant is remembered under, and
+        // the tier is what an `enable_permanent` answer writes to config. It is
+        // the tier already checked against the ceiling above, so the option can
+        // never offer to persist a tier this lookup was not entitled to.
         if self
             .gate
-            .authorize(call.permission_key(), Some(self.describe(&call)))
+            .authorize_web(call.permission_key(), Some(self.describe(&call)), needed)
             .await
             == PermissionDecision::Denied
         {
@@ -646,7 +652,12 @@ pub fn register_web_tool(
 /// tier` *config* vocabulary, and the exhaustive match means a tier added to
 /// the ladder fails to compile here rather than rendering as a debug string in
 /// a sentence the user reads.
-fn tier_name(tier: WebTier) -> &'static str {
+///
+/// `pub(crate)` so the consent prompt's `enable_permanent` label names the tier
+/// with the same spelling this refusal does — the label promises to write a
+/// config value, and a second mapping would be a second chance to write a
+/// different one.
+pub(crate) fn tier_name(tier: WebTier) -> &'static str {
     match tier {
         WebTier::Off => "off",
         WebTier::FetchUserUrl => "fetch_user_url",
@@ -1262,12 +1273,22 @@ mod tests {
         assert_eq!(pending.pending_count(), 0, "{}", out.content);
 
         // ...and a search still asks.
+        //
+        // Skipping past non-prompt events rather than asserting the *next* event
+        // is one: since REQ-563's TASK-077 the fetch decision also publishes a
+        // `web_consent_decided`, and this test's claim is that a search raises
+        // its own prompt — not that nothing else is ever said in between.
         let search_args = json!({ "query": "anything" });
         let ask = tool.lookup(&search_args);
         let answer = async {
-            let env = sub.recv().await.unwrap();
-            let Event::PermissionRequest(request) = env.event else {
-                panic!("a session grant on fetch silently granted search");
+            let request = loop {
+                let env = sub
+                    .recv()
+                    .await
+                    .expect("a session grant on fetch silently granted search");
+                if let Event::PermissionRequest(request) = env.event {
+                    break request;
+                }
             };
             assert_eq!(request.tool_name, PERMISSION_KEY_SEARCH);
             pending.resolve(&request.request_id, PermissionOutcome::Cancelled);

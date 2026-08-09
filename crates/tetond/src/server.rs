@@ -43,7 +43,7 @@ use teton_protocol::methods::{
     ModelConfirmParams, ModelListParams, ModelSetParams, ModelStatusParams,
     PermissionRespondParams, PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod,
     SessionAttachParams, SessionAttachResult, SessionCreateParams, SessionCreateResult,
-    SessionListParams, SessionListResult, WebOverrideParams,
+    SessionListParams, SessionListResult, WebOverrideParams, WebRefreshParams,
 };
 
 use crate::auth;
@@ -478,6 +478,7 @@ fn dispatch(daemon: &Daemon, id: Id, method: &str, params: Value) -> Option<Stri
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, id)),
         WebOverrideParams::METHOD => Some(handle_web_override(daemon, id, params)),
+        WebRefreshParams::METHOD => Some(handle_web_refresh(daemon, id, params)),
         _ => Some(error_string(
             id,
             error_code::METHOD_NOT_FOUND,
@@ -501,6 +502,25 @@ fn handle_web_override(daemon: &Daemon, id: Id, params: Value) -> String {
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
     ok_string(id, &daemon.runtime.web_override(&params, &daemon.events))
+}
+
+/// Evict a cached document so the next lookup re-fetches (`web/refresh`,
+/// REQ-563 AC-10).
+///
+/// The same channel argument as [`handle_web_override`] applies: this is a
+/// client RPC, and tool dispatch cannot reach one. It differs in being
+/// fallible — a cached file that will not unlink is the one outcome that would
+/// otherwise leave the user's next lookup silently reading the copy they asked
+/// to drop, so it comes back as an error rather than as `absent`.
+fn handle_web_refresh(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: WebRefreshParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    match daemon.runtime.web_refresh(&params) {
+        Ok(result) => ok_string(id, &result),
+        Err(err) => error_from(id, err),
+    }
 }
 
 /// Deliver a client's `permission/respond` to the waiting harness gate. Always
@@ -853,5 +873,63 @@ mod tests {
         )
         .unwrap();
         assert!(listed.contains("sess-0"));
+    }
+
+    /// REQ-563 AC-10: `web/refresh` is a dispatchable method, and it answers
+    /// with an outcome rather than the URL it was handed (BR-7 — the daemon
+    /// never echoes an outgoing destination back).
+    #[test]
+    fn dispatch_answers_web_refresh_with_an_outcome_and_no_url() {
+        let daemon = Daemon::new();
+        let response = dispatch(
+            &daemon,
+            Id::Number(1),
+            WebRefreshParams::METHOD,
+            serde_json::json!({"url": "https://docs.rs/serde"}),
+        )
+        .unwrap();
+
+        assert!(
+            !response.contains("-32601"),
+            "the method must be routed, not rejected as unknown: {response}"
+        );
+        // Nothing was cached in this daemon's (temp) data dir, so `absent` is
+        // the honest answer — and it is an answer, not an error.
+        assert!(response.contains("absent"), "{response}");
+        assert!(
+            !response.contains("docs.rs"),
+            "the refreshed URL must not travel back: {response}"
+        );
+    }
+
+    /// Params that are not a `web/refresh` request are an invalid-params error,
+    /// not a panic and not a silent no-op.
+    #[test]
+    fn dispatch_rejects_a_malformed_web_refresh() {
+        let daemon = Daemon::new();
+        let response = dispatch(
+            &daemon,
+            Id::Number(1),
+            WebRefreshParams::METHOD,
+            serde_json::json!({"not_a_url": 3}),
+        )
+        .unwrap();
+        assert!(response.contains("-32602"), "{response}"); // INVALID_PARAMS
+    }
+
+    /// The two web controls are **client** RPCs, and that is what makes them
+    /// user-only (AC-12). This pins the half that is checkable here: they are in
+    /// the dispatch table. The other half — that no tool of these names exists —
+    /// is pinned beside the tool registry.
+    #[test]
+    fn both_web_controls_are_client_methods() {
+        let daemon = Daemon::new();
+        for method in [WebOverrideParams::METHOD, WebRefreshParams::METHOD] {
+            let response = dispatch(&daemon, Id::Number(1), method, Value::Null).unwrap();
+            assert!(
+                !response.contains("-32601"),
+                "`{method}` must be a routed client method: {response}"
+            );
+        }
     }
 }

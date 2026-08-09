@@ -890,6 +890,23 @@ pub struct PermissionOption {
     pub kind: PermissionOptionKind,
 }
 
+/// The `option_id` of REQ-563's persistent-enable choice (BR-4).
+///
+/// Lives here, in the protocol, rather than as a private constant on each side:
+/// the daemon offers it and the client selects it, and a fifth option told apart
+/// **by id** is a string two crates have to agree on exactly. The other four ids
+/// can stay private to the daemon because the client picks those by
+/// [`PermissionOptionKind`]; this one cannot be, and that is the whole reason it
+/// is public.
+///
+/// It carries [`PermissionOptionKind::AllowAlways`] on the wire — the ACP kind
+/// enum is closed and none of its four variants means "and write it down". The
+/// kind is therefore a *floor* on what the option does (it does at least allow
+/// for the session), and the id is what distinguishes it. A client selecting by
+/// kind alone can never reach it by accident, which is deliberate: writing
+/// config is not a fallback for "allow for this session".
+pub const OPTION_ID_ENABLE_PERMANENT: &str = "enable_permanent";
+
 /// Semantic kind of a permission option. ACP: `PermissionOptionKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

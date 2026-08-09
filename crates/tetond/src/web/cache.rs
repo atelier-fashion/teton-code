@@ -216,14 +216,28 @@ impl WebCache {
     /// every subsequent reader sees the refreshed document too.
     ///
     /// Removing an entry that is not there succeeds — the caller asked for the
-    /// document not to be cached, and it is not.
+    /// document not to be cached, and it is not. It answers `false` rather than
+    /// `true`, because "there was a stale copy and it is gone" and "there was
+    /// never a copy" are different answers to *why* the next fetch is live
+    /// ([`teton_protocol::methods::WebRefreshOutcome`] keeps them apart, and this
+    /// is the only place that can tell them apart).
+    ///
+    /// Deliberately **not** implemented as "[`Self::get`] first, then remove":
+    /// `get` answers `None` for a stale-but-present entry and for a disabled
+    /// cache, so a probe would report `false` while this call unlinked a real
+    /// file — and two syscalls would leave a race between them. The removal's own
+    /// result is the only non-lying source of the answer.
+    ///
+    /// Unlike [`Self::get`] and [`Self::put`] it does not consult
+    /// [`Self::is_enabled`]: a cache turned off after entries were written still
+    /// has those files, and a user refreshing one means the file.
     ///
     /// # Errors
     /// [`CacheError::Io`] if the entry exists and cannot be removed.
-    pub fn evict(&self, url: &str) -> Result<(), CacheError> {
+    pub fn evict(&self, url: &str) -> Result<bool, CacheError> {
         match std::fs::remove_file(self.path_for(url)) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(err.into()),
         }
     }
@@ -451,9 +465,58 @@ mod tests {
         let cache = WebCache::new(&base, 900);
         cache.put(URL, "text").expect("put");
         assert!(cache.get(URL).is_some());
-        cache.evict(URL).expect("evict");
+        assert!(
+            cache.evict(URL).expect("evict"),
+            "a present entry reports that it was the one removed"
+        );
         assert!(cache.get(URL).is_none());
-        cache.evict(URL).expect("evicting an absent entry succeeds");
+        assert!(
+            !cache.evict(URL).expect("evicting an absent entry succeeds"),
+            "the second eviction found nothing, and says so rather than \
+             claiming a removal"
+        );
+    }
+
+    /// The stale case is the one a `get`-then-remove implementation would get
+    /// wrong: [`WebCache::get`] answers `None` for a stale entry, so a probe
+    /// would report "absent" while the file was there and about to be unlinked.
+    #[test]
+    fn evicting_a_stale_but_present_entry_reports_a_removal() {
+        let base = scratch_base("evict-stale");
+        let cache = WebCache::new(&base, 1);
+        cache.put(URL, "text").expect("put");
+        // Age it past its own window without waiting for a real second.
+        let aged = WebCache::new(&base, 900);
+        let path = aged.path_for(URL);
+        let entry = CacheEntry {
+            content: "text".to_owned(),
+            fetched_at_secs: 1,
+            ttl_secs: 1,
+        };
+        std::fs::write(&path, serde_json::to_vec(&entry).expect("encode")).expect("write");
+
+        assert!(aged.get(URL).is_none(), "the entry really is stale");
+        assert!(
+            aged.evict(URL).expect("evict"),
+            "a stale entry is present on disk, and eviction removed it"
+        );
+        assert!(!path.exists());
+    }
+
+    /// A disabled cache still evicts: turning the TTL to zero does not delete
+    /// what was already written, and a user refreshing one of those files means
+    /// the file.
+    #[test]
+    fn a_disabled_cache_still_evicts_what_an_enabled_one_wrote() {
+        let base = scratch_base("evict-disabled");
+        WebCache::new(&base, 900).put(URL, "text").expect("put");
+        let disabled = WebCache::new(&base, 0);
+        assert!(!disabled.is_enabled());
+        assert!(
+            disabled.evict(URL).expect("evict"),
+            "the stored file is still there to remove"
+        );
+        assert!(!disabled.path_for(URL).exists());
     }
 
     /// A ttl of zero disables the store outright: nothing is written, no

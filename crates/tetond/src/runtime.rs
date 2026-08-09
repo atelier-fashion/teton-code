@@ -115,7 +115,8 @@ use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
-    TierRouteView, WebOverrideParams, WebOverrideResult,
+    TierRouteView, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
+    WebRefreshResult, WebTotalsView,
 };
 use teton_protocol::{
     BindingSource, ConfigurableCategory as ProtoConfigurableCategory, Phase as ProtoPhase,
@@ -146,7 +147,8 @@ use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolDuties,
-    ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
+    ToolRegistry, WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY,
+    TITLE_DUTY, TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -2091,12 +2093,18 @@ impl DaemonRuntime {
         // Built before the tools, because the web tool holds it: that tool
         // raises its own per-tier prompt inside its run rather than being
         // authorized by name at dispatch (REQ-563 BR-3/BR-12).
-        let gate = Arc::new(PermissionGate::new(
-            session_id.clone(),
-            self.permission_config.clone(),
-            events.clone(),
-            self.pending.clone(),
-        ));
+        let gate = Arc::new(
+            PermissionGate::new(
+                session_id.clone(),
+                self.permission_config.clone(),
+                events.clone(),
+                self.pending.clone(),
+            )
+            // REQ-563 BR-4: the one consent answer that outlives the session
+            // writes through the daemon, never the client. The gate holds the
+            // seam and this is the only place it is filled in.
+            .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>),
+        );
         let tools = self.build_tools(&router, events, &session_id, &gate).await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
@@ -3085,6 +3093,109 @@ impl DaemonRuntime {
         }
     }
 
+    /// Evict a cached document so the next lookup of that URL re-fetches
+    /// (`web/refresh`, REQ-563 BR-12's explicit-refresh clause / AC-10).
+    ///
+    /// Like [`Self::web_override`] this hangs off the **client** RPC channel and
+    /// nothing else: a model that emits a tool call named `web/refresh` reaches
+    /// the tool registry and finds no such tool. Unlike the override it needs no
+    /// user-only argument — refreshing is not a capability grant, it is a
+    /// deletion of the daemon's own copy.
+    ///
+    /// It publishes no event and writes no ledger row. A refresh is not a lookup:
+    /// nothing was requested of the network, nothing came back, and BR-7's ledger
+    /// counts lookups. The `Evicted`/`Absent` answer goes to the one client that
+    /// asked, which is the only party that asked anything.
+    ///
+    /// # Errors
+    /// [`RpcError`] (`INTERNAL_ERROR`) if a cached entry exists and cannot be
+    /// removed — the one case where the user's next lookup would silently keep
+    /// reading the copy they asked to drop.
+    pub fn web_refresh(&self, params: &WebRefreshParams) -> Result<WebRefreshResult, RpcError> {
+        match self.web_cache().evict(&params.url) {
+            Ok(true) => Ok(WebRefreshResult {
+                outcome: WebRefreshOutcome::Evicted,
+            }),
+            Ok(false) => Ok(WebRefreshResult {
+                outcome: WebRefreshOutcome::Absent,
+            }),
+            // Names the failure class and never the path: the cache path is
+            // derived from the URL's digest, and echoing it back would put a
+            // (weak) trace of the destination in an error string (BR-7).
+            Err(err) => Err(RpcError::new(
+                error_code::INTERNAL_ERROR,
+                format!("the cached document could not be removed ({err})"),
+            )),
+        }
+    }
+
+    /// The document cache the web tool reads and writes.
+    ///
+    /// Built on demand from the live config rather than held, exactly as
+    /// `build_tools` builds it per turn: [`WebCache`] is a path and a number, and
+    /// two of them addressing the same directory are the same cache. The entry
+    /// path is a function of the URL alone, so an eviction is unaffected by which
+    /// TTL the caller happened to read.
+    fn web_cache(&self) -> WebCache {
+        WebCache::from_config(
+            &self.data_dir,
+            &self.config.lock().expect("config mutex poisoned").web,
+        )
+    }
+
+    /// Persist `tier` as the configured `[web] tier` ceiling — the whole effect
+    /// of the `enable_permanent` consent option (BR-4, AC-2's persistence half).
+    ///
+    /// BR-4 makes this the **only** consent path that writes config; allow-once
+    /// and allow-for-session are session facts and reach no file. The write goes
+    /// through the daemon's existing atomic config path (BUG-155), so a
+    /// half-written config is not a state this can produce, and the in-memory
+    /// config is replaced only after the file lands — a failed write leaves the
+    /// daemon exactly as it was rather than running above what is on disk.
+    ///
+    /// **Raising only.** A grant is a ceiling raise, so a config already at or
+    /// above `tier` is left byte-for-byte alone: consenting to fetch a page on a
+    /// machine configured for `search` must not quietly demote it.
+    ///
+    /// # Errors
+    /// A message naming what stopped the write, in two cases the caller must
+    /// distinguish from success because both mean "this did not become
+    /// permanent":
+    ///
+    /// - **no config file** — a defaulted config has no path to write, so
+    ///   "permanent" would outlive nothing. Reported rather than silently applied
+    ///   in memory (the shape [`Self::apply_config_update`] can afford, because
+    ///   nothing there tells the user the word "permanently").
+    /// - **the result would not load** — `[web] tier = "search"` with no
+    ///   `search_endpoint` is a config this daemon refuses to start on, so
+    ///   validating the candidate first is what keeps a consent answer from
+    ///   bricking the next start.
+    pub fn persist_web_tier(&self, tier: WebTier) -> Result<(), String> {
+        let mut config = self.config.lock().expect("config mutex poisoned");
+        if config.web.tier >= tier {
+            // Already at or above the granted tier: it is durable, and there is
+            // nothing to write. Reported as success because the user's ask
+            // ("make this permanent") is already true.
+            return Ok(());
+        }
+        let mut candidate = config.clone();
+        candidate.web.tier = tier;
+        candidate
+            .validate()
+            .map_err(|e| format!("the resulting configuration would not load: {e}"))?;
+        let Some(path) = &self.config_path else {
+            return Err(
+                "this daemon has no configuration file to write, so the choice could not be \
+                 made permanent"
+                    .to_owned(),
+            );
+        };
+        write_config_atomically(path, &candidate)
+            .map_err(|err| format!("the configuration could not be saved ({err})"))?;
+        *config = candidate;
+        Ok(())
+    }
+
     /// Name this session after `prompt`, at most once for its whole life
     /// (REQ-561 BR-9a, TASK-062).
     ///
@@ -3512,6 +3623,20 @@ fn load_config(path: Option<&Path>) -> anyhow::Result<Config> {
              refusing to start rather than silently ignore it.",
             err.kind()
         )),
+    }
+}
+
+/// The daemon *is* the place a permanent consent answer is written (REQ-563
+/// BR-4, architecture D-5).
+///
+/// A one-line impl over [`DaemonRuntime::persist_web_tier`], and the indirection
+/// earns its keep: the permission gate depends on this trait rather than on the
+/// runtime, so nothing in the harness can reach config by any other route, and
+/// the "never client-side file writes" rule is a fact about which types exist
+/// rather than a review note.
+impl WebTierPersistence for DaemonRuntime {
+    fn persist_web_tier(&self, tier: WebTier) -> Result<(), String> {
+        DaemonRuntime::persist_web_tier(self, tier)
     }
 }
 
@@ -5692,6 +5817,19 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
         methodology: report.methodology.clone(),
         per_phase: report.per_phase.iter().map(group).collect(),
         per_provider: report.per_provider.iter().map(group).collect(),
+        // REQ-563 BR-7 / AC-6: lookups are recorded per session in their own
+        // ledger table, and `/cost` is where BR-7 says they become visible. The
+        // aggregation already happened (`cost::report::aggregate`); dropping it
+        // here would have left the table written and unreadable.
+        web_per_session: report
+            .web_per_session
+            .iter()
+            .map(|w| WebTotalsView {
+                key: w.key.clone(),
+                lookups: w.lookups,
+                bytes_in: w.bytes_in,
+            })
+            .collect(),
     }
 }
 
@@ -12514,6 +12652,181 @@ provider_id = "on-device"
                     "the provider gate has no business on the lookup path"
                 );
             }
+        }
+
+        // -- TASK-077: enable_permanent's write, and web/refresh -------------
+
+        /// A runtime with a real config file and state directory — what the two
+        /// durable web paths need and `minimal()` deliberately has not got.
+        fn runtime_on_disk(tag: &str) -> (DaemonRuntime, PathBuf, PathBuf) {
+            let dir = super::scratch_dir(tag);
+            let config_path = dir.join("config.toml");
+            std::fs::write(&config_path, "").expect("seed an empty config");
+            let mut runtime = DaemonRuntime::minimal();
+            runtime.config_path = Some(config_path.clone());
+            runtime.data_dir = dir.clone();
+            (runtime, config_path, dir)
+        }
+
+        /// AC-2's persistence half, asserted against the **file**: a decision
+        /// that only reached memory would not survive the restart the criterion
+        /// is about, so the check is that a fresh load of the written bytes
+        /// carries the tier.
+        #[test]
+        fn enable_permanent_writes_a_tier_a_restart_reads_back() {
+            for tier in [WebTier::FetchUserUrl, WebTier::FetchAnyUrl] {
+                let (runtime, config_path, _dir) = runtime_on_disk("persist-tier");
+                assert_eq!(
+                    runtime.config.lock().expect("config mutex").web.tier,
+                    WebTier::Off,
+                    "non-vacuity: the ceiling really was off first (BR-1)"
+                );
+
+                runtime.persist_web_tier(tier).expect("the write must land");
+
+                // The restart, simulated by the only thing a restart does with
+                // this file: load it.
+                let reloaded = load_config(Some(&config_path)).expect("the written config loads");
+                assert_eq!(
+                    reloaded.web.tier, tier,
+                    "`[web] tier` did not survive a reload"
+                );
+                // And the live config agrees, so this turn is not running under
+                // a ceiling different from the one on disk.
+                assert_eq!(runtime.config.lock().expect("config mutex").web.tier, tier);
+            }
+        }
+
+        /// A grant never lowers a ceiling. Consenting to fetch a page on a
+        /// machine configured for `search` must leave `search` alone.
+        #[test]
+        fn persisting_a_lower_tier_never_demotes_the_configured_ceiling() {
+            let (runtime, config_path, _dir) = runtime_on_disk("no-demote");
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = WebTier::Search;
+                config.web.search_endpoint = Some("https://search.example/api".to_owned());
+            }
+            runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect("already durable at a higher tier");
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web.tier,
+                WebTier::Search
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                "",
+                "nothing to write means the file is left byte-for-byte alone"
+            );
+        }
+
+        /// A config the daemon would refuse to start on is refused *before* it is
+        /// written: `[web] tier = "search"` with no endpoint fails to load, so
+        /// persisting it would answer one consent prompt by bricking the next
+        /// start.
+        #[test]
+        fn a_tier_that_would_not_load_is_never_written() {
+            let (runtime, config_path, _dir) = runtime_on_disk("invalid-tier");
+            let err = runtime
+                .persist_web_tier(WebTier::Search)
+                .expect_err("search with no endpoint must be refused");
+            assert!(err.contains("would not load"), "{err}");
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web.tier,
+                WebTier::Off,
+                "a refused write must not have moved the live ceiling either"
+            );
+            assert_eq!(std::fs::read_to_string(&config_path).expect("read"), "");
+        }
+
+        /// With nowhere to write, "permanently" would outlive nothing — so it is
+        /// reported rather than silently applied in memory. The gate turns this
+        /// into a `session`-scoped consent event.
+        #[test]
+        fn a_runtime_with_no_config_file_refuses_to_claim_permanence() {
+            let runtime = DaemonRuntime::minimal();
+            assert!(runtime.config_path.is_none());
+            let err = runtime
+                .persist_web_tier(WebTier::FetchAnyUrl)
+                .expect_err("no file, no permanence");
+            assert!(err.contains("no configuration file"), "{err}");
+        }
+
+        /// The runtime really is the seam the permission gate writes through —
+        /// the trait impl and the inherent method are one behaviour, not two.
+        #[test]
+        fn the_persistence_seam_is_the_runtime_s_own_write() {
+            let (runtime, config_path, _dir) = runtime_on_disk("seam");
+            let sink: &dyn WebTierPersistence = &runtime;
+            sink.persist_web_tier(WebTier::FetchAnyUrl)
+                .expect("the seam writes");
+            assert_eq!(
+                load_config(Some(&config_path)).expect("loads").web.tier,
+                WebTier::FetchAnyUrl
+            );
+        }
+
+        /// AC-10's refresh half: after `web/refresh`, the entry the next lookup
+        /// would have hit is gone, so that lookup re-fetches.
+        #[test]
+        fn web_refresh_evicts_the_entry_the_next_lookup_would_have_hit() {
+            let (runtime, _config_path, dir) = runtime_on_disk("refresh");
+            let url = "https://docs.rs/serde";
+            let cache = WebCache::new(&dir, 900);
+            cache.put(url, "the cached reduction").expect("put");
+            assert!(
+                cache.get(url).is_some(),
+                "non-vacuity: there is a hit to evict"
+            );
+
+            let result = runtime
+                .web_refresh(&WebRefreshParams {
+                    url: url.to_owned(),
+                })
+                .expect("refresh");
+            assert_eq!(result.outcome, WebRefreshOutcome::Evicted);
+            assert!(
+                cache.get(url).is_none(),
+                "the next lookup must miss, which is what makes it re-fetch"
+            );
+        }
+
+        /// Nothing cached is `absent`, not `evicted` and not an error: the user
+        /// asked for the document not to be cached, and it is not.
+        #[test]
+        fn web_refresh_reports_an_uncached_url_as_absent() {
+            let (runtime, _config_path, _dir) = runtime_on_disk("refresh-absent");
+            let result = runtime
+                .web_refresh(&WebRefreshParams {
+                    url: "https://docs.rs/never-fetched".to_owned(),
+                })
+                .expect("an uncached url is not a failure");
+            assert_eq!(result.outcome, WebRefreshOutcome::Absent);
+        }
+
+        /// Refresh addresses the same entry the tool's own cache does. Keyed by
+        /// a URL normalization the daemon owns, so a URL that differs only in
+        /// the ways normalization folds still finds the stored copy.
+        #[test]
+        fn web_refresh_addresses_the_same_entry_the_tool_reads() {
+            let (runtime, _config_path, dir) = runtime_on_disk("refresh-keying");
+            let cache = WebCache::from_config(
+                &dir,
+                &runtime.config.lock().expect("config mutex").web.clone(),
+            );
+            cache.put("https://docs.rs/serde", "body").expect("put");
+
+            let result = runtime
+                .web_refresh(&WebRefreshParams {
+                    url: "https://docs.rs/serde".to_owned(),
+                })
+                .expect("refresh");
+            assert_eq!(
+                result.outcome,
+                WebRefreshOutcome::Evicted,
+                "the refresh path and the tool's cache must agree on the key"
+            );
         }
     }
 

@@ -979,6 +979,39 @@ pub struct CostReportView {
     pub per_phase: Vec<CostGroupView>,
     /// Per-provider roll-up, ordered by provider id.
     pub per_provider: Vec<CostGroupView>,
+    /// Per-session web-lookup roll-up, ordered by session id (REQ-563 BR-7 /
+    /// AC-6).
+    ///
+    /// A separate list rather than columns on [`CostGroupView`], mirroring the
+    /// separate ledger table it comes from: a lookup has no tokens and no cost
+    /// to add to a call's, and "calls" and "lookups" are different counts a
+    /// reader must not see summed.
+    ///
+    /// `#[serde(default)]`, like [`Self::unpriced_models`]: a daemon built
+    /// before REQ-563 sends no such key, and a client reading one must get an
+    /// empty roll-up rather than a deserialization failure.
+    #[serde(default)]
+    pub web_per_session: Vec<WebTotalsView>,
+}
+
+/// One session's web-lookup totals inside a [`CostReportView`] (REQ-563 AC-6).
+///
+/// Carries no host and no URL. The per-lookup destination is on the
+/// [`crate::events::WebLookup`] event and in the ledger row; a roll-up's job is
+/// how many and how much, and adding a destination list here would put an
+/// outgoing-utterance trace in the one surface a user is most likely to paste
+/// into a bug report (BR-7).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebTotalsView {
+    /// The session id.
+    pub key: String,
+    /// Lookups this session performed, whatever their outcome — blocked,
+    /// refused, and cache-served ones included (BR-7: every lookup is counted,
+    /// including the free ones).
+    pub lookups: u64,
+    /// Bytes those lookups brought back. `0` from every ending that transferred
+    /// nothing, so this is content received and not traffic attempted.
+    pub bytes_in: u64,
 }
 
 /// Result of [`CostQueryParams`].
@@ -1914,8 +1947,37 @@ mod tests {
                     output_tokens: 2_000,
                     usd_micros: 3_000,
                 }],
+                web_per_session: vec![WebTotalsView {
+                    key: "sess-1".to_owned(),
+                    lookups: 2,
+                    bytes_in: 8_192,
+                }],
             },
         });
+    }
+
+    /// A `cost/query` answer from a daemon built before REQ-563 carries no
+    /// `web_per_session` key at all. It must deserialize into an empty roll-up
+    /// rather than fail: the field is additive, and a client refusing the whole
+    /// report over a missing web section would break `teton cost` against every
+    /// older daemon.
+    #[test]
+    fn a_cost_report_without_the_web_roll_up_still_deserializes() {
+        let without_web = serde_json::json!({
+            "total_usd_micros": 0,
+            "total_calls": 0,
+            "priced_calls": 0,
+            "unpriced_calls": 0,
+            "savings_usd_micros": 0,
+            "baseline_usd_micros": 0,
+            "baseline_model": "anthropic/claude-opus-4",
+            "methodology": "Estimate, not a measurement.",
+            "per_phase": [],
+            "per_provider": [],
+        });
+        let decoded: CostReportView =
+            serde_json::from_value(without_web).expect("an older report still decodes");
+        assert!(decoded.web_per_session.is_empty());
     }
 
     #[test]

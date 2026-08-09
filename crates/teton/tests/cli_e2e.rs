@@ -802,7 +802,7 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
         "the hint must point at /help; output:\n{session}"
     );
 
-    // AC-1: all six commands, each with the summary `/help` generates from the
+    // AC-1: every command, each with the summary `/help` generates from the
     // dispatch table (BR-7) — asserted as the rendered `/name  summary` pair, so
     // a row that lost its summary fails here.
     for (name, summary) in [
@@ -819,6 +819,18 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
         (
             "/verbose",
             "Toggle the routing and turn-end notices for this session.",
+        ),
+        // REQ-563's two web controls. A command a user cannot find in `/help`
+        // is a command they do not have (BUG-153), and `/web allow` is the only
+        // way out of a taint restriction — so its absence here would be a dead
+        // end, not just a discoverability gap.
+        (
+            "/web allow",
+            "Lift this session's web taint restriction (grants no new tier).",
+        ),
+        (
+            "/web refresh",
+            "Drop a URL's cached copy so the next lookup re-fetches: /web refresh <url>.",
         ),
         ("/quit", "End the session, exactly as Ctrl-D does."),
     ] {

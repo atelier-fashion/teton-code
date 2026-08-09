@@ -80,6 +80,18 @@ pub struct UiContext<'a> {
     /// whether *output* is a terminal, which says nothing about who produced the
     /// line that reached a handler.
     pub typed_input: bool,
+    /// The session a slash command acts on, once one exists (REQ-563).
+    ///
+    /// `None` until `session/create` answers, and on every passive context — a
+    /// `teton cost` in another terminal owns no session, and a command that needs
+    /// one must say so rather than borrow whichever session it can see. `/web
+    /// allow` lifts *a session's* taint restriction, so the id is an argument it
+    /// cannot fabricate.
+    ///
+    /// It rides here for the same reason `typed_input` does: handlers touch the
+    /// world only through this context, and a handler reaching for an ambient
+    /// session id would be a second, invisible seam.
+    pub session_id: Option<teton_protocol::SessionId>,
 }
 
 /// One message read off the socket.
@@ -979,6 +991,7 @@ mod tests {
             answer_model_proposals: true,
             auto_accept_model: false,
             typed_input: true,
+            session_id: None,
         };
 
         let mut teardowns = 0;
@@ -1030,6 +1043,7 @@ mod tests {
             answer_model_proposals: true,
             auto_accept_model: false,
             typed_input: true,
+            session_id: None,
         };
         conn.drain_events(&mut ctx, || {}).expect("drain");
         assert!(
@@ -1054,6 +1068,7 @@ mod tests {
             answer_model_proposals: true,
             auto_accept_model: false,
             typed_input: true,
+            session_id: None,
         };
 
         let mut teardowns = 0;
@@ -1088,6 +1103,7 @@ mod tests {
             answer_model_proposals: true,
             auto_accept_model: false,
             typed_input: true,
+            session_id: None,
         };
         let drained = conn.drain_events(&mut ctx, || {}).expect("not an error");
         assert_eq!(drained.rendered, 0);
@@ -1335,6 +1351,7 @@ mod tests {
             // No command runs under this context; the honest value for a test
             // process is the same check the real edge makes.
             typed_input: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            session_id: None,
         };
         conn.answer_outstanding_model_proposal(&mut ctx)
             .expect("the round-trip completes");

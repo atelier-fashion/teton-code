@@ -29,7 +29,8 @@ use teton_protocol::events::{
     BlockCause, DaemonClientAttach, Event, EventEnvelope, FailureClass, ModelLifecycle,
     ModelSelectionProposed, PermissionOption, PermissionOptionKind, PermissionRequest,
     PhaseTransition, PrivacyAction, PrivacyBlock, ProviderDegraded, RouteDecided,
-    SessionUpdatePayload, ToolCallStatus,
+    SessionUpdatePayload, ToolCallStatus, WebConsentDecided, WebConsentScope, WebLookup,
+    WebLookupKind, WebLookupOutcome, WebTier, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
 use teton_protocol::{Phase, RequestId};
@@ -96,6 +97,83 @@ pub struct SessionState {
     /// indicator fed only from the idle path would keep animating "model
     /// starting" after a `Ready` that landed mid-turn.
     pub loading: crate::loading::LoadingIndicator,
+    /// This session's web-lookup capability, as the event stream reports it
+    /// (REQ-563 BR-7/BR-13).
+    ///
+    /// Folded here for the reason `loading` is: [`render_event`] is the one place
+    /// every web event passes through, so the status field and the notice lines
+    /// are two readings of one fold and cannot disagree about whether the session
+    /// is restricted.
+    pub web: WebState,
+}
+
+/// What the session's web capability currently is, for the status row.
+///
+/// Derived entirely from the event stream rather than from config, and that is
+/// the point: the status row's job is to say what *this session* can do now, and
+/// a config read at startup would keep saying `fetch` through a taint trip that
+/// disabled it. Every field here is written by exactly one event kind.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WebState {
+    /// The highest tier this session has been observed to hold, from consent
+    /// decisions and from lookups that actually ran.
+    ///
+    /// `None` until something proves otherwise, which renders as `off` — the
+    /// honest reading of "nothing in this session has used the web", and the
+    /// default state on every machine (BR-1).
+    granted: Option<WebTier>,
+    /// This session read privacy-boundary content and a model-composed lookup
+    /// has been refused for it (BR-13).
+    restricted: bool,
+    /// The user lifted that restriction with `/web allow` (BR-13, AC-12).
+    overridden: bool,
+}
+
+impl WebState {
+    /// The status-row field: `web: …`.
+    ///
+    /// A pure function of the three fields, so it is testable with no terminal —
+    /// which matters because the row it belongs to is drawn only at a TTY.
+    ///
+    /// Order is precedence, not preference. The restricted and overridden states
+    /// are *about* the tiers rather than alternatives to them, and a row can show
+    /// one field: a session that is restricted has had a capability taken away,
+    /// and saying `web: search` while search is refused would be the status row
+    /// contradicting the notice that preceded it.
+    #[must_use]
+    pub fn status_field(self) -> &'static str {
+        if self.overridden {
+            return "web: overridden";
+        }
+        if self.restricted {
+            return "web: restricted (taint)";
+        }
+        match self.granted {
+            None | Some(WebTier::Off) => "web: off",
+            Some(WebTier::FetchUserUrl | WebTier::FetchAnyUrl) => "web: fetch",
+            Some(WebTier::Search) => "web: search",
+        }
+    }
+
+    /// Whether the status row has anything to say.
+    ///
+    /// False on a machine that never opted in — which is every machine by
+    /// default (BR-1) — so the interactive layout an existing session sees is
+    /// byte-identical until the user turns the capability on. `web: off` is
+    /// still a rendered string ([`Self::status_field`]) because a caller that
+    /// draws a full status row needs the field for it; what is suppressed is the
+    /// row, not the vocabulary.
+    #[must_use]
+    pub fn is_engaged(self) -> bool {
+        self.overridden || self.restricted || matches!(self.granted, Some(t) if t != WebTier::Off)
+    }
+
+    /// Raise the observed ceiling; never lowers it.
+    fn observe_tier(&mut self, tier: WebTier) {
+        if tier != WebTier::Off && self.granted.is_none_or(|held| tier > held) {
+            self.granted = Some(tier);
+        }
+    }
 }
 
 impl SessionState {
@@ -200,20 +278,178 @@ pub fn render_event(
             surface.line(LineKind::Notice, &firstrun::format_decided(decided));
             EventOutcome::Rendered
         }
-        // REQ-563 ships the web-lookup vocabulary before anything emits it: the
-        // protocol variants and the ledger table land first so the egress seam
-        // and the tool have something to speak. Nothing in this build publishes
-        // one, so these arms consume the event rather than draw a surface this
-        // REQ's CLI task has not designed yet (TASK-077 owns the Notice lines,
-        // the status-row field, and the verbose per-lookup line).
-        //
-        // Consuming arms rather than a `_` catch-all, deliberately: the match is
-        // exhaustive so that a *future* event cannot be added without a decision
-        // being made here, which is exactly the discipline that would be lost by
-        // widening it once.
-        Event::WebLookup(_) | Event::WebConsentDecided(_) | Event::WebTaintOverridden(_) => {
+        // REQ-563's three web events. Each folds into `state.web` first — the
+        // status row reads that fold — and then decides whether it also has a
+        // line to draw.
+        Event::WebLookup(lookup) => {
+            if lookup.outcome == WebLookupOutcome::TaintRestricted {
+                state.web.restricted = true;
+            }
+            // A lookup that actually ran proves the tier it needed was held —
+            // including a cache hit, which needed the grant even though nothing
+            // left the machine (BR-12). Refusals prove nothing, so they raise
+            // nothing.
+            if matches!(
+                lookup.outcome,
+                WebLookupOutcome::Completed | WebLookupOutcome::CacheHit
+            ) {
+                state.web.observe_tier(match lookup.kind {
+                    WebLookupKind::Fetch => WebTier::FetchUserUrl,
+                    WebLookupKind::Search => WebTier::Search,
+                });
+            }
+            if let Some(line) = format_web_lookup(lookup, state.verbose) {
+                // Never `LineKind::Error`, for any outcome (BUG-152): a refusal
+                // is this capability working, an unreachable host is transient,
+                // and the turn continues in both cases (BR-9). The line class is
+                // the same one every other control event uses.
+                surface.line(LineKind::Notice, &line);
+            }
             EventOutcome::Rendered
         }
+        Event::WebConsentDecided(decided) => {
+            if decided.granted {
+                state.web.observe_tier(decided.tier);
+            }
+            // Never verbose-gated: a consent decision is the user's own answer
+            // coming back, and the persistent one changed a file on disk.
+            surface.line(LineKind::Notice, &format_web_consent(decided));
+            EventOutcome::Rendered
+        }
+        Event::WebTaintOverridden(overridden) => {
+            state.web.overridden = true;
+            // Verbose-gated *only* because the client that issued `/web allow`
+            // renders the RPC's own answer, which is authoritative about what was
+            // restored and about whether anything was restricted at all. This
+            // line exists for the other attached clients, which saw no command
+            // and would otherwise watch the restriction lift in silence.
+            if state.verbose {
+                surface.line(
+                    LineKind::Notice,
+                    &format_web_taint_overridden(&overridden.tiers_restored),
+                );
+            }
+            EventOutcome::Rendered
+        }
+    }
+}
+
+/// The notice a `web_lookup` draws, or `None` when it is quiet chrome.
+///
+/// The split is which endings a user needs to know about without asking:
+///
+/// - a **completed** or **cache-served** lookup is routine, and its per-lookup
+///   line (host + outcome) is diagnostic chrome behind the same `verbose` flag
+///   the routing notices use (BR-7's `/verbose` clause);
+/// - every **refusal, block, and unreachable host** always renders. Each one is
+///   a thing the model asked for and did not get, so the answer that follows was
+///   composed without it — BR-13's "never silent" rule, and BR-9's for offline.
+fn format_web_lookup(lookup: &WebLookup, verbose: bool) -> Option<String> {
+    let routine = matches!(
+        lookup.outcome,
+        WebLookupOutcome::Completed | WebLookupOutcome::CacheHit
+    );
+    if routine && !verbose {
+        return None;
+    }
+    let kind = match lookup.kind {
+        WebLookupKind::Fetch => "fetch",
+        WebLookupKind::Search => "search",
+    };
+    // The taint refusal is the one ending that gets a sentence rather than a
+    // phrase, because BR-13 requires it to name both the cause and the effect.
+    if lookup.outcome == WebLookupOutcome::TaintRestricted {
+        return Some(format!("web {kind} {} — {TAINT_RESTRICTION}", lookup.host));
+    }
+    let ending = match lookup.outcome {
+        WebLookupOutcome::Completed => format!("completed ({} bytes)", lookup.bytes_in),
+        WebLookupOutcome::CacheHit => format!(
+            "served from the local cache, nothing left this machine ({} bytes)",
+            lookup.bytes_in
+        ),
+        WebLookupOutcome::BlockedPrivacy => {
+            "blocked: the outgoing text derived from privacy-boundary content".to_owned()
+        }
+        WebLookupOutcome::BlockedRedact => {
+            "blocked: the redaction scan refused the outgoing text".to_owned()
+        }
+        WebLookupOutcome::RefusedDomain => {
+            "refused: outside the configured `[web] allowed_domains`".to_owned()
+        }
+        WebLookupOutcome::RefusedTier => {
+            "refused: above the `[web] tier` this machine granted".to_owned()
+        }
+        // Handled above — kept as its own arm so a reordering cannot silently
+        // drop the sentence and fall back to a phrase.
+        WebLookupOutcome::TaintRestricted => TAINT_RESTRICTION.to_owned(),
+        WebLookupOutcome::Offline => "unavailable: offline".to_owned(),
+    };
+    Some(format!("web {kind} {} — {ending}", lookup.host))
+}
+
+/// The BR-13 restriction sentence: the cause, then the effect, then the way out.
+///
+/// Both halves are required by the rule and neither is inferable from the other
+/// — "boundary content was read" without the consequence reads as an FYI, and
+/// "web lookup disabled" without the cause reads as a bug. Kept as one constant
+/// so the copy cannot drift between the per-lookup line and any other surface
+/// that has to state it.
+const TAINT_RESTRICTION: &str = "restricted: this session read privacy-boundary content, so \
+                                 model-composed web lookups (searches, and URLs the model \
+                                 chose) are disabled for the rest of it. URLs you paste \
+                                 yourself still work; `/web allow` lifts the restriction for \
+                                 this session.";
+
+/// The notice a `web_consent_decided` draws.
+fn format_web_consent(decided: &WebConsentDecided) -> String {
+    let tier = web_tier_name(decided.tier);
+    match (decided.granted, decided.scope) {
+        (true, WebConsentScope::Once) => format!("web consent: `{tier}` allowed for this lookup"),
+        (true, WebConsentScope::Session) => {
+            format!("web consent: `{tier}` allowed for the rest of this session")
+        }
+        // The only answer that changed a file, and it says so: BR-4 makes this
+        // the sole consent path that writes config, and a user who picked it
+        // should not have to check the file to learn whether it took.
+        (true, WebConsentScope::Persistent) => format!(
+            "web consent: `{tier}` enabled permanently — written to your config as \
+             `[web] tier = \"{tier}\"`"
+        ),
+        (false, WebConsentScope::Session) => {
+            format!("web consent: `{tier}` declined for the rest of this session")
+        }
+        (false, _) => format!("web consent: `{tier}` declined"),
+    }
+}
+
+/// The notice a `web_taint_overridden` draws.
+fn format_web_taint_overridden(tiers: &[WebTier]) -> String {
+    if tiers.is_empty() {
+        return "web taint restriction lifted for this session; no tiers were granted to \
+                restore."
+            .to_owned();
+    }
+    let named = tiers
+        .iter()
+        .map(|t| format!("`{}`", web_tier_name(*t)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "web taint restriction lifted for this session; model-composed lookups resume at: \
+         {named}."
+    )
+}
+
+/// A tier's config spelling, for a line that has to name one.
+///
+/// The same vocabulary the daemon writes to `[web] tier` — a user reading this
+/// notice and then their config must see one word, not two.
+fn web_tier_name(tier: WebTier) -> &'static str {
+    match tier {
+        WebTier::Off => "off",
+        WebTier::FetchUserUrl => "fetch_user_url",
+        WebTier::FetchAnyUrl => "fetch_any_url",
+        WebTier::Search => "search",
     }
 }
 
@@ -324,10 +560,24 @@ pub fn resolve_permission(
         &format!("permission requested: {tool}{description}"),
     );
 
+    // REQ-563 BR-4: the persistent option exists only on prompts that offer it
+    // (the web tiers), and the question must not advertise a key that answers
+    // nothing. Both the prompt line and the retry hint read this one flag, so
+    // they cannot disagree about what is on offer.
+    let permanent = permanent_option(&req.options);
+    let question = if permanent.is_some() {
+        format!("  allow {tool}? [y]es / [n]o / [a]llow-always / [p]ermanently / [d]eny-always: ")
+    } else {
+        format!("  allow {tool}? [y]es / [n]o / [a]llow-always / [d]eny-always: ")
+    };
+    let retry = if permanent.is_some() {
+        "  please answer y, n, a (allow-always), p (enable permanently), or d (deny-always)"
+    } else {
+        "  please answer y, n, a (allow-always), or d (deny-always)"
+    };
+
     loop {
-        let answer = prompter.ask(&format!(
-            "  allow {tool}? [y]es / [n]o / [a]llow-always / [d]eny-always: "
-        ));
+        let answer = prompter.ask(&question);
         let choice = match answer {
             Some(a) => a.trim().to_lowercase(),
             None => return respond(req, PermissionOutcome::Cancelled), // EOF = cancel
@@ -339,17 +589,43 @@ pub fn resolve_permission(
                 grants.allow_always(tool);
                 return respond(req, allow_outcome(&req.options, true));
             }
+            // Only reachable when the option was offered: on any other prompt
+            // `p` is an unrecognised answer and re-asks, rather than silently
+            // meaning something the user did not pick.
+            "p" | "permanently" => {
+                if let Some(option_id) = permanent.clone() {
+                    // Remembered locally too: the daemon's grant is per-turn, and
+                    // the config write it performs governs the *ceiling*, not
+                    // this session's answer. Without this the user would be
+                    // re-asked on the next lookup despite having said the
+                    // strongest possible yes.
+                    grants.allow_always(tool);
+                    return respond(req, PermissionOutcome::Selected { option_id });
+                }
+                surface.line(LineKind::Prompt, retry);
+            }
             "d" | "deny" => {
                 grants.reject_always(tool);
                 return respond(req, deny_outcome(&req.options));
             }
             "" => return respond(req, PermissionOutcome::Cancelled),
-            _ => surface.line(
-                LineKind::Prompt,
-                "  please answer y, n, a (allow-always), or d (deny-always)",
-            ),
+            _ => surface.line(LineKind::Prompt, retry),
         }
     }
+}
+
+/// The offered persistent-enable option's id, when the prompt carries one.
+///
+/// Selected **by id**, not by [`PermissionOptionKind`]: the ACP kind enum has no
+/// variant for "and write it down", so this option travels as `AllowAlways` and
+/// is indistinguishable from the plain session grant by kind alone. Picking it
+/// by kind would let [`allow_outcome`] reach it by accident — a user answering
+/// "allow for this session" would have edited their config.
+fn permanent_option(options: &[PermissionOption]) -> Option<String> {
+    options
+        .iter()
+        .find(|o| o.option_id == OPTION_ID_ENABLE_PERMANENT)
+        .map(|o| o.option_id.clone())
 }
 
 /// Build a response for `req` with the chosen `outcome`.
@@ -539,7 +815,7 @@ mod tests {
     use crate::render::RecordingSurface;
     use teton_protocol::events::{
         ByteSpan, CostRecord, CostRecorded, ModelSelectionDecided, PlanEntry, PlanEntryStatus,
-        SelectionSource, SessionUpdate,
+        SelectionSource, SessionUpdate, WebTaintOverridden,
     };
     use teton_protocol::{ProviderId, RequestId, SessionId};
 
@@ -1082,5 +1358,403 @@ mod tests {
             }
         );
         assert_eq!(prompter.asked, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-563: web state, web notices, and the persistent consent key
+    // ------------------------------------------------------------------
+
+    fn web_permission_request() -> PermissionRequest {
+        let mut req = permission_request("web_fetch");
+        req.options.insert(
+            2,
+            PermissionOption {
+                option_id: OPTION_ID_ENABLE_PERMANENT.to_owned(),
+                label: "Enable permanently".to_owned(),
+                kind: PermissionOptionKind::AllowAlways,
+            },
+        );
+        req
+    }
+
+    fn lookup(kind: WebLookupKind, outcome: WebLookupOutcome) -> Event {
+        Event::WebLookup(WebLookup {
+            kind,
+            host: "docs.rs".to_owned(),
+            outcome,
+            bytes_in: 4_096,
+        })
+    }
+
+    /// AC-6 / AC-12: the five status strings, and the precedence between them.
+    #[test]
+    fn the_status_field_renders_every_web_state() {
+        let off = WebState::default();
+        assert_eq!(off.status_field(), "web: off");
+        assert!(
+            !off.is_engaged(),
+            "an opted-out session draws no row (BR-1)"
+        );
+
+        let mut fetch = WebState::default();
+        fetch.observe_tier(WebTier::FetchUserUrl);
+        assert_eq!(fetch.status_field(), "web: fetch");
+        fetch.observe_tier(WebTier::FetchAnyUrl);
+        assert_eq!(fetch.status_field(), "web: fetch");
+        assert!(fetch.is_engaged());
+
+        let mut search = fetch;
+        search.observe_tier(WebTier::Search);
+        assert_eq!(search.status_field(), "web: search");
+
+        // A taint trip outranks the tier: saying `web: search` while search is
+        // refused would contradict the notice the user just read.
+        let mut restricted = search;
+        restricted.restricted = true;
+        assert_eq!(restricted.status_field(), "web: restricted (taint)");
+        assert!(restricted.is_engaged());
+
+        // And the override outranks the restriction it lifted.
+        let mut overridden = restricted;
+        overridden.overridden = true;
+        assert_eq!(overridden.status_field(), "web: overridden");
+        assert!(overridden.is_engaged());
+    }
+
+    /// The ceiling only ever rises: a refusal after a grant must not read as a
+    /// downgrade, and `off` is never "observed".
+    #[test]
+    fn the_observed_tier_never_falls() {
+        let mut state = WebState::default();
+        state.observe_tier(WebTier::Search);
+        state.observe_tier(WebTier::FetchUserUrl);
+        assert_eq!(state.status_field(), "web: search");
+        state.observe_tier(WebTier::Off);
+        assert_eq!(state.status_field(), "web: search");
+    }
+
+    /// BR-13's never-silent rule, and BUG-152's class rule in the same test: the
+    /// taint refusal renders without `--verbose`, names the cause and the
+    /// effect, and is a Notice rather than an error.
+    #[test]
+    fn a_taint_restriction_names_cause_and_effect_and_is_not_an_error() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        assert!(!state.verbose, "the default session, deliberately");
+
+        render_event(
+            &envelope(lookup(
+                WebLookupKind::Search,
+                WebLookupOutcome::TaintRestricted,
+            )),
+            &mut surface,
+            &mut state,
+        );
+
+        let notices = surface.lines_of(LineKind::Notice).join("\n");
+        // Cause.
+        assert!(
+            notices.contains("read privacy-boundary content"),
+            "the notice must name what caused the restriction: {notices}"
+        );
+        // Effect.
+        assert!(
+            notices.contains("model-composed web lookups"),
+            "the notice must name what was disabled: {notices}"
+        );
+        assert!(
+            notices.contains("disabled"),
+            "the effect must read as a capability lost: {notices}"
+        );
+        // The way out, so the notice is not a dead end.
+        assert!(notices.contains("/web allow"), "{notices}");
+        // BUG-152: nothing broke, so nothing wears an `error:` prefix.
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "a refusal is this capability working: {:?}",
+            surface.calls
+        );
+        // And the status row reflects it for the rest of the session.
+        assert_eq!(state.web.status_field(), "web: restricted (taint)");
+    }
+
+    /// BR-7's `/verbose` clause: the routine per-lookup line is chrome behind
+    /// the same flag the routing notices use, and every refusal is not.
+    #[test]
+    fn routine_lookups_are_verbose_gated_and_refusals_always_render() {
+        let routine = [WebLookupOutcome::Completed, WebLookupOutcome::CacheHit];
+
+        for outcome in WebLookupOutcome::ALL {
+            let mut quiet = RecordingSurface::new();
+            let mut state = SessionState::new();
+            render_event(
+                &envelope(lookup(WebLookupKind::Fetch, outcome)),
+                &mut quiet,
+                &mut state,
+            );
+            let drew = !quiet.lines_of(LineKind::Notice).is_empty();
+            assert_eq!(
+                drew,
+                !routine.contains(&outcome),
+                "{outcome:?} rendered the wrong way in a default session: {:?}",
+                quiet.calls
+            );
+
+            // With `--verbose` every outcome has a line, and it names the host.
+            let mut loud = RecordingSurface::new();
+            let mut verbose = SessionState::new();
+            verbose.verbose = true;
+            render_event(
+                &envelope(lookup(WebLookupKind::Fetch, outcome)),
+                &mut loud,
+                &mut verbose,
+            );
+            assert!(
+                loud.any_line_contains(LineKind::Notice, "docs.rs"),
+                "{outcome:?} drew no verbose line naming the host: {:?}",
+                loud.calls
+            );
+            assert!(
+                loud.lines_of(LineKind::Error).is_empty(),
+                "{outcome:?} rendered as an error (BUG-152): {:?}",
+                loud.calls
+            );
+        }
+    }
+
+    /// Every outcome gets a line of its own — a renderer that folded two of them
+    /// onto one sentence would make the ledger and the transcript disagree about
+    /// what happened.
+    #[test]
+    fn the_eight_lookup_outcomes_render_as_eight_distinguishable_lines() {
+        let seen: HashSet<String> = WebLookupOutcome::ALL
+            .into_iter()
+            .map(|outcome| {
+                format_web_lookup(
+                    &WebLookup {
+                        kind: WebLookupKind::Fetch,
+                        host: "docs.rs".to_owned(),
+                        outcome,
+                        bytes_in: 0,
+                    },
+                    true,
+                )
+                .expect("verbose renders every outcome")
+            })
+            .collect();
+        assert_eq!(
+            seen.len(),
+            WebLookupOutcome::ALL.len(),
+            "two outcomes render identically: {seen:?}"
+        );
+    }
+
+    /// Only a lookup that ran proves a tier was held. A refusal proves the
+    /// opposite, and must never raise the status row's reading.
+    #[test]
+    fn only_a_lookup_that_ran_raises_the_status_field() {
+        for outcome in WebLookupOutcome::ALL {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            render_event(
+                &envelope(lookup(WebLookupKind::Search, outcome)),
+                &mut surface,
+                &mut state,
+            );
+            let ran = matches!(
+                outcome,
+                WebLookupOutcome::Completed | WebLookupOutcome::CacheHit
+            );
+            if ran {
+                assert_eq!(state.web.status_field(), "web: search", "{outcome:?}");
+            } else if outcome == WebLookupOutcome::TaintRestricted {
+                assert_eq!(state.web.status_field(), "web: restricted (taint)");
+            } else {
+                assert_eq!(
+                    state.web.status_field(),
+                    "web: off",
+                    "{outcome:?} is a refusal and grants nothing"
+                );
+            }
+        }
+    }
+
+    /// A consent decision always renders — it is the user's own answer coming
+    /// back — and the permanent one says that it wrote config.
+    #[test]
+    fn consent_decisions_render_and_the_permanent_one_names_the_write() {
+        for (scope, granted, expect) in [
+            (WebConsentScope::Once, true, "for this lookup"),
+            (WebConsentScope::Session, true, "rest of this session"),
+            (WebConsentScope::Persistent, true, "written to your config"),
+            (WebConsentScope::Once, false, "declined"),
+            (WebConsentScope::Session, false, "declined for the rest"),
+        ] {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            assert!(!state.verbose, "consent is never verbose-gated");
+            render_event(
+                &envelope(Event::WebConsentDecided(WebConsentDecided {
+                    scope,
+                    tier: WebTier::FetchAnyUrl,
+                    granted,
+                })),
+                &mut surface,
+                &mut state,
+            );
+            assert!(
+                surface.any_line_contains(LineKind::Notice, expect),
+                "{scope:?}/{granted} rendered wrongly: {:?}",
+                surface.calls
+            );
+            assert!(
+                surface.any_line_contains(LineKind::Notice, "fetch_any_url"),
+                "a decision must name the tier it concerns: {:?}",
+                surface.calls
+            );
+            assert_eq!(
+                state.web.status_field(),
+                if granted { "web: fetch" } else { "web: off" },
+                "only a grant raises the status field"
+            );
+        }
+    }
+
+    /// The override folds into the status row on every client, and draws its
+    /// line for the ones that did not issue the command.
+    #[test]
+    fn a_taint_override_updates_the_status_row_and_announces_itself_when_verbose() {
+        for verbose in [false, true] {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.verbose = verbose;
+            state.web.restricted = true;
+
+            render_event(
+                &envelope(Event::WebTaintOverridden(WebTaintOverridden {
+                    tiers_restored: vec![WebTier::FetchUserUrl, WebTier::FetchAnyUrl],
+                })),
+                &mut surface,
+                &mut state,
+            );
+
+            assert_eq!(
+                state.web.status_field(),
+                "web: overridden",
+                "the fold happens whether or not the line is drawn"
+            );
+            assert_eq!(
+                surface.any_line_contains(LineKind::Notice, "lifted"),
+                verbose,
+                "the line is verbose-gated: the issuing client renders the RPC's \
+                 own answer"
+            );
+            assert!(surface.lines_of(LineKind::Error).is_empty());
+        }
+    }
+
+    /// A restore list that is empty says so, rather than trailing an empty
+    /// "resume at: ".
+    #[test]
+    fn an_empty_restore_list_reads_as_nothing_restored() {
+        let line = format_web_taint_overridden(&[]);
+        assert!(line.contains("no tiers"), "{line}");
+        assert!(!line.contains("resume at:"), "{line}");
+    }
+
+    /// BR-4's fifth option reaches the daemon by **id**, and only on prompts
+    /// that offered it.
+    #[test]
+    fn the_permanent_key_selects_the_persistent_option_when_offered() {
+        let req = web_permission_request();
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["p"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Selected {
+                option_id: OPTION_ID_ENABLE_PERMANENT.to_owned()
+            }
+        );
+        // The strongest possible yes must not leave the user re-asked next
+        // lookup: the daemon's gate is per-turn, so the client remembers too.
+        assert!(grants.is_allow_always("web_fetch"));
+    }
+
+    /// On a prompt without the option, `p` is an unrecognised answer: it
+    /// re-asks rather than quietly meaning something else.
+    #[test]
+    fn the_permanent_key_is_not_offered_on_an_ordinary_prompt() {
+        let req = permission_request("shell");
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["p", "y"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Selected {
+                option_id: "allow_once".to_owned()
+            }
+        );
+        assert_eq!(
+            prompter.asked, 2,
+            "`p` must have been rejected and re-asked"
+        );
+        assert!(!grants.is_allow_always("shell"));
+    }
+
+    /// "Allow for this session" must never reach the option that writes config —
+    /// the two share a [`PermissionOptionKind`], and only the id tells them
+    /// apart.
+    #[test]
+    fn allow_always_never_selects_the_persistent_option() {
+        let req = web_permission_request();
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["a"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Selected {
+                option_id: "allow_always".to_owned()
+            },
+            "a session grant must not have edited the user's config"
+        );
+    }
+
+    /// The question offers the key exactly when the option exists.
+    #[test]
+    fn the_prompt_advertises_the_permanent_key_only_when_it_is_on_offer() {
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        resolve_permission(
+            &web_permission_request(),
+            &mut surface,
+            &mut prompter,
+            &mut SessionGrants::default(),
+        );
+        assert!(
+            prompter.any_question_contains("[p]ermanently"),
+            "the web prompt must advertise the key: {:?}",
+            prompter.questions
+        );
+
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        resolve_permission(
+            &permission_request("shell"),
+            &mut surface,
+            &mut prompter,
+            &mut SessionGrants::default(),
+        );
+        assert!(
+            !prompter.any_question_contains("[p]ermanently"),
+            "a prompt must not advertise a key that answers nothing: {:?}",
+            prompter.questions
+        );
     }
 }
