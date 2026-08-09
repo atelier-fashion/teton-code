@@ -136,6 +136,17 @@ model.
 - VS Code extension surface (phase 2 client work).
 - `redact-then-remote` privacy mode (charter out-of-scope; unchanged here).
 
+## Product Decisions (verify phase, 2026-08-09)
+
+The reflector's open questions, answered by the product owner:
+
+1. **(1b) No-local-model search behaviour.** Search stays always-installed and blocks-per-query with a kind-aware notice naming the missing local model; it is *not* refused at config load. Making an engine download a precondition for a config to load was the worse trade. (Architecture §5.)
+2. **(2) Fetch/redact parity kept.** The search redaction gate's scan applies to fetch as designed; parity is retained, no change.
+3. **(3) Per-tier re-prompting kept.** The three separately-consented tiers keep their own permission keys; a grant on one tier never fans onto another. (Architecture §7.)
+4. **(4) SSRF posture confirmed.** The address-class floor is the accepted posture; the DNS-name/rebind residual is a tracked gap with a **follow-up filed** to close it with a resolving transport. (Architecture, address-class paragraph.)
+5. **(5a) Cross-session cache consent accepted.** A cache hit in a later session that never consented is served without a prompt, and cache membership is model-probeable — accepted, bounded by `cache_ttl_secs` (default 15 min): the content is already inside the user's trust boundary and no bytes leave the machine on a hit. (Architecture §11.)
+6. **(6a) Web tool cap-exempt.** An explicitly opted-in web tool is exempt from the degraded-profile `max_tools` cap, so it is exposed on every profile above `off`; the now-dead "configured but out of reach" signalling was removed. (Architecture §8.)
+
 ## Retrieved Context
 
 - LESSON-432 (lesson, score 9): Provenance must derive from what a tool touches, not from an argument name

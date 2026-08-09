@@ -197,7 +197,10 @@ resolver, or a pre-resolve-then-connect-to-IP pass — which belongs in the
 transport, not at this seam, because only the thing that opens the socket knows
 the address it opened to. Recorded here as a known gap rather than an assumed
 absence; the cross-reference lives on `address_class_of_host` in
-`egress/lookup.rs`, where anyone tightening the floor would be reading.
+`egress/lookup.rs`, where anyone tightening the floor would be reading. **A
+follow-up is filed to close it with a resolving transport** (product decision
+2026-08-09, SSRF posture confirmed): the DNS-name/rebind residual is an accepted,
+tracked gap for this requirement, not a silent one.
 
 ## AC → Decision Map
 
@@ -263,11 +266,13 @@ wording actually resolves to.
    and a scan that cannot run **blocks the query** (LESSON-492), with a notice
    that names the missing *local model* rather than a generic refusal — so the
    user is told the thing they can act on. The effect BR-14 asks for holds
-   (no query leaves unscanned); the mechanism differs. **Pending a product
-   decision:** whether `[web] tier = "search"` should additionally be refused at
-   *config load* on a machine with no local tier, which would move the failure
-   from per-query to startup. Left open because it would make an engine
-   download a precondition for a config file to load.
+   (no query leaves unscanned); the mechanism differs. **CONFIRMED (product
+   decision 2026-08-09, option 1b):** search stays always-installed and
+   blocks-when-it-cannot-run with the kind-aware honest notice — it is **not**
+   additionally refused at config load on a machine with no local tier. Making an
+   engine download a precondition for a config file to load was the worse
+   trade; the per-query block with a notice that names the missing local model is
+   the shipped and intended behaviour, no longer an open question.
 6. **`[web] permission_allow = [tier, …]` added to D-9's config surface.** D-9
    described the `[web]` table as tier-only. `enable_permanent` (D-5) has to
    have somewhere durable to land the *permission* half of the answer:
@@ -305,16 +310,27 @@ wording actually resolves to.
    sets one key per member — mapping a level to a single `web` row would silently
    re-collapse the three keys, and mapping it to a fan-out over all three would
    re-introduce the breadth violation deviation 6 records.
-8. **The degraded-profile cap is a floor the web tool always loses.**
+8. **The opt-in web tool is exempt from the degraded-profile cap.**
    `DEGRADED_MAX_TOOLS` is 5 and the builtin set is 5, and the web tool
-   registers last precisely so a cap cuts it first (D-1) — so on any provider
-   that is not a `Native` tool-caller the tool is registered and never exposed.
-   That is signalled, not hidden: the model is told by `WEB_CAPPED_CLAUSE` in
-   its own prompt and the user by the status row's `web: unavailable (profile)`,
-   read from one function (`web_tool_is_exposed`) so the two cannot disagree.
-   Changing the cap policy itself — a reserved slot for opt-in capabilities, or
-   a larger degraded budget — is **deferred to a follow-up**; it is a change to
-   BR-6's degradation contract, not to this requirement.
+   registers last — so a plain registration is cut first on any provider that is
+   not a `Native` tool-caller (D-1). Verify shipped that as a floor the tool
+   always lost, signalled by a `WEB_CAPPED_CLAUSE` prompt state and a `web:
+   unavailable (profile)` status row. **RESOLUTION (product decision
+   2026-08-09, option 6a):** an explicitly opted-in capability must never be
+   invisible to the OpenAI-compatible providers and the local engine, so the web
+   tool is now registered **cap-exempt** (`ToolRegistry::register_cap_exempt`):
+   `exposed_names`/`docs` always include it, and the cap applies to the remaining
+   non-exempt tools — the five built-ins are never displaced and the effective
+   exposure budget is raised by exactly one when the web tool is present. The tool
+   is therefore exposed on **every** profile above `off`. The cap still bounds the
+   optional MCP tools around it — the exemption is one tool, not a cap removal.
+   Because an opted-in web tool is now always exposed, the "configured but out of
+   reach" signalling is dead and was removed: the `WEB_CAPPED_CLAUSE` prompt
+   state, the `PromptTurnResult.web_unavailable_in_profile` field and its
+   plumbing, the `web: unavailable (profile)` status state, and the
+   `web_tool_is_exposed` helper all went with it. The system prompt is back to two
+   states — the opt-in clause when `tier = off`, and nothing when the tool is
+   exposed.
 9. **AC-6's `/cost` section shows count and bytes; the host is ledger-side.**
    `/cost` grows a `web lookups:` section, one row per session, carrying the
    lookup count (every ending — cache hits and refusals included, BR-7) and
@@ -335,6 +351,21 @@ wording actually resolves to.
     tier the lookup needed and the tier `[web] tier` is set to, and telling the
     model not to retry (AC-4). The affordance is the pair; the refusal is what
     makes it true.
+11. **Cross-session cache consent — a later-session hit is served without a
+    prompt.** BR-12's cache is keyed by URL, not by session, so a document
+    fetched (and consented to) in one session can be served to a *different*
+    session that never consented — and, because a hit performs no egress and asks
+    no consent (D-3), that later session is handed the page with no prompt.
+    Cache membership is therefore model-probeable: a fetch that returns instantly
+    "served from the local cache" tells the model the URL was fetched before.
+    **ACCEPTED (product decision 2026-08-09, option 5a).** The content is already
+    inside the user's trust boundary — it was fetched onto this machine with the
+    user's consent — and no bytes leave the machine on a hit, so serving it again
+    discloses nothing outward and costs nothing. The exposure is bounded by
+    `cache_ttl_secs` (default 15 min): an entry older than the TTL is a miss and
+    re-consents. A per-session cache would defeat the point of the cache (the same
+    page re-fetched every session) for a probe that reveals only local,
+    already-consented history.
 
 ## Risks / Notes for Implementation
 

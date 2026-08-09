@@ -142,9 +142,7 @@ use crate::egress::{
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
-use crate::harness::tools::web::{
-    register_web_tool, tier_name, SeamError, WebLookupSeam, WEB_TOOL_NAME,
-};
+use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
@@ -2129,15 +2127,6 @@ impl DaemonRuntime {
         let tool_ctx = ToolContext::new(session_cwd.as_deref().unwrap_or(&self.repo_root));
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
-        // REQ-563 BR-6: web lookup configured, but this profile's `max_tools`
-        // cut it. Read here, once, from the same registry and the same profile
-        // `build_system_prompt` reads on the next line — the model's clause and
-        // the user's status field are two readings of one condition, and the
-        // system prompt is built once for the whole turn (a fallback re-runs the
-        // loop against this same `ctx`), so this is the profile the model was
-        // actually told about.
-        let web_unavailable_in_profile = tools.get(WEB_TOOL_NAME).is_some()
-            && !crate::harness::turn_loop::web_tool_is_exposed(&tools, &route.harness);
         let system = build_system_prompt(&tools, &route.harness);
         let mut ctx = ContextManager::new(system, route.harness.context_budget_tokens)
             .with_budget_bytes(route.harness.context_budget_bytes);
@@ -2222,7 +2211,6 @@ impl DaemonRuntime {
                     return Ok(PromptTurnResult {
                         turn_id,
                         stop_reason: outcome.stop_reason,
-                        web_unavailable_in_profile,
                     });
                 }
                 Err(HarnessError::Remote(perr)) if attempts < 2 => {
@@ -13684,7 +13672,6 @@ provider_id = "on-device"
     /// the link that calls the link needs its own mutation).
     mod web_tool_wiring {
         use super::*;
-        use crate::classify::test_support::CountingEngine;
         use crate::harness::tools::WEB_TOOL_NAME;
         use teton_core::config::WebTier;
         use teton_core::{ProviderCapabilities, ToolCallTier};
@@ -13907,98 +13894,6 @@ provider_id = "on-device"
             }
         }
 
-        /// **BR-6: a profile whose `max_tools` cut the web tool says so in the
-        /// turn's own result** (REQ-563 verify wave 2).
-        ///
-        /// `DEGRADED_MAX_TOOLS` is 5 and the builtin set is 5, so on any provider
-        /// that is not a `Native` tool-caller the web tool — registered last,
-        /// precisely so it is cut first (D-1) — is never exposed. That is a fact
-        /// with no event behind it (nothing happened), so it rides
-        /// `PromptTurnResult::web_unavailable_in_profile`, and the CLI folds it
-        /// into the status row (`WebState::observe_profile_exposure`, pinned in
-        /// `session_ui.rs`).
-        ///
-        /// Both legs run the *same* turn against the *same* daemon, differing
-        /// only in the provider's declared `tool_call_tier` — so the flag is
-        /// reading the profile and not the `[web]` table.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_capped_profile_reports_the_web_tool_as_unavailable_for_the_turn() {
-            for (tool_call_tier, capped) in [
-                (ToolCallTier::Degraded, true),
-                (ToolCallTier::Native, false),
-            ] {
-                let runtime = turn_runtime(
-                    local_only_config(tool_call_tier),
-                    WebTier::FetchAnyUrl,
-                    CountingEngine::answering("All set.").handle(),
-                );
-                let events = Arc::new(EventBus::new());
-                let sessions = SessionRegistry::new();
-                let session = sessions
-                    .create(SessionMode::Freeform, None, None)
-                    .expect("a freeform session needs no phase");
-
-                let result = runtime
-                    .run_prompt_turn(
-                        &events,
-                        &sessions,
-                        session.session_id.clone(),
-                        session.mode,
-                        None,
-                        None,
-                        "summarize the plan".to_owned(),
-                    )
-                    .await
-                    .expect("the turn completes");
-
-                assert_eq!(
-                    result.web_unavailable_in_profile, capped,
-                    "a `{tool_call_tier:?}` tool-caller reported the wrong web \
-                     exposure for the turn"
-                );
-            }
-        }
-
-        /// …and the same daemon with `[web] tier = off` reports nothing, because
-        /// there is no capability to have been cut.
-        ///
-        /// The discriminating half of the test above: a flag that were simply
-        /// "this profile caps tools" would fire here too, and the status row
-        /// would tell a user who never opted in that a capability they do not
-        /// have is unavailable.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_capped_profile_reports_nothing_when_web_lookup_is_off() {
-            let runtime = turn_runtime(
-                local_only_config(ToolCallTier::Degraded),
-                WebTier::Off,
-                CountingEngine::answering("All set.").handle(),
-            );
-            let events = Arc::new(EventBus::new());
-            let sessions = SessionRegistry::new();
-            let session = sessions
-                .create(SessionMode::Freeform, None, None)
-                .expect("a freeform session needs no phase");
-
-            let result = runtime
-                .run_prompt_turn(
-                    &events,
-                    &sessions,
-                    session.session_id.clone(),
-                    session.mode,
-                    None,
-                    None,
-                    "summarize the plan".to_owned(),
-                )
-                .await
-                .expect("the turn completes");
-
-            assert!(
-                !result.web_unavailable_in_profile,
-                "a machine that never opted in has no web capability for a \
-                 profile to have taken away (BR-1)"
-            );
-        }
-
         /// **BR-1 / AC-1's structural half, through the real registry builder.**
         ///
         /// `off` is not a tool behind a flag: the registry does not hold one, so
@@ -14028,12 +13923,25 @@ provider_id = "on-device"
                     "tier {tier:?} registered the wrong tool set"
                 );
                 if tier != WebTier::Off {
-                    // BR-6 of the charter: registered last, so `max_tools` cuts
-                    // the opt-in capability before it cuts anything else.
+                    // Added last, so it reads after the built-ins and MCP in the
+                    // exposed tool docs.
                     assert_eq!(tools.names().last().copied(), Some(WEB_TOOL_NAME));
-                    // ...which on the weak-model default means it is not
-                    // exposed at all, and that is deliberate, not a bug.
-                    assert!(!tools.exposed_names(Some(5)).contains(&WEB_TOOL_NAME));
+                    // ...but it is cap-exempt (REQ-563 decision 2026-08-09), so
+                    // even the weak-model default cap of 5 — which equals the
+                    // built-in count — still exposes it. An explicitly opted-in
+                    // capability must reach every provider, and the built-ins are
+                    // never displaced to make room.
+                    let exposed = tools.exposed_names(Some(5));
+                    assert!(
+                        exposed.contains(&WEB_TOOL_NAME),
+                        "the opted-in web tool was cut by the degraded-profile cap: {exposed:?}"
+                    );
+                    for builtin in ["read", "edit", "grep", "glob", "shell"] {
+                        assert!(
+                            exposed.contains(&builtin),
+                            "the cap displaced a built-in to fit web: {exposed:?}"
+                        );
+                    }
                 }
             }
         }

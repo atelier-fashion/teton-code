@@ -398,13 +398,24 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// One tool in a [`ToolRegistry`], carrying whether the degraded-profile tool
+/// cap (BR-6) may displace it.
+struct Registration {
+    /// The tool itself.
+    tool: Arc<dyn Tool>,
+    /// When `true`, the tool is exempt from the `max_tools` cut: it is always
+    /// exposed, and the cap bounds only the remaining (non-exempt) tools — see
+    /// [`ToolRegistry::register_cap_exempt`].
+    cap_exempt: bool,
+}
+
 /// The set of tools available to a session.
 ///
 /// Insertion order is the exposure order: [`ToolRegistry::docs`] can be capped to
-/// the first `max_tools` for a degraded (weak) provider (BR-6), so put the most
-/// load-bearing tools first.
+/// the first `max_tools` non-exempt tools for a degraded (weak) provider (BR-6),
+/// so put the most load-bearing tools first.
 pub struct ToolRegistry {
-    tools: Vec<Arc<dyn Tool>>,
+    tools: Vec<Registration>,
 }
 
 impl ToolRegistry {
@@ -423,8 +434,10 @@ impl ToolRegistry {
     /// registry that always held the tool and hid it behind a flag would make
     /// "absent by construction" a claim about a code path rather than about the
     /// tool set. Its caller adds it with [`register_web_tool`](web::register_web_tool),
-    /// **last** — after the built-ins *and* after any MCP tools — so a degraded
-    /// provider's `max_tools` cap cuts the opt-in capability first (BR-6).
+    /// **cap-exempt** and **last** — after the built-ins *and* after any MCP
+    /// tools — so an explicitly opted-in capability is never displaced by a
+    /// degraded provider's `max_tools` cap (REQ-563 decision 2026-08-09) while
+    /// the cap still bounds the optional MCP tools around it (BR-6).
     #[must_use]
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
@@ -438,20 +451,47 @@ impl ToolRegistry {
 
     /// Add a tool (later registrations with the same name shadow earlier ones on
     /// lookup order but are kept for exposure ordering — register uniquely).
+    ///
+    /// The tool is subject to the degraded-profile `max_tools` cap (BR-6); a tool
+    /// the cap must never displace is registered with
+    /// [`Self::register_cap_exempt`] instead.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.push(tool);
+        self.tools.push(Registration {
+            tool,
+            cap_exempt: false,
+        });
+    }
+
+    /// Add a tool the degraded-profile `max_tools` cap (BR-6) may never displace.
+    ///
+    /// A cap-exempt tool is always exposed by [`Self::exposed_names`]/[`Self::docs`]
+    /// regardless of the cut, and the cap applies to the remaining (non-exempt)
+    /// tools — so exempting one tool raises the effective exposure budget by
+    /// exactly one and never displaces a built-in. Exactly one tool registers
+    /// this way: the opt-in `web` tool (REQ-563 decision 2026-08-09). A user who
+    /// explicitly turned the capability on must reach it on every provider, and
+    /// `DEGRADED_MAX_TOOLS` equals the built-in count, so a plain registration
+    /// would be cut on every non-`Native` profile.
+    pub fn register_cap_exempt(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.push(Registration {
+            tool,
+            cap_exempt: true,
+        });
     }
 
     /// Look up a tool by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
-        self.tools.iter().find(|t| t.name() == name)
+        self.tools
+            .iter()
+            .map(|r| &r.tool)
+            .find(|t| t.name() == name)
     }
 
     /// Every registered tool name, in exposure order.
     #[must_use]
     pub fn names(&self) -> Vec<&str> {
-        self.tools.iter().map(|t| t.name()).collect()
+        self.tools.iter().map(|r| r.tool.name()).collect()
     }
 
     /// Number of registered tools.
@@ -507,12 +547,8 @@ impl ToolRegistry {
     /// when set (BR-6: a degraded provider gets a smaller tool set).
     #[must_use]
     pub fn docs(&self, max_tools: Option<u32>) -> String {
-        let limit = max_tools
-            .map(|n| n as usize)
-            .unwrap_or(self.tools.len())
-            .min(self.tools.len());
         let mut out = String::new();
-        for tool in &self.tools[..limit] {
+        for tool in self.exposed_tools(max_tools) {
             out.push_str(&format!(
                 "- {}: {}\n  arguments: {}\n",
                 tool.name(),
@@ -526,11 +562,32 @@ impl ToolRegistry {
     /// The names actually exposed under a `max_tools` cap (BR-6).
     #[must_use]
     pub fn exposed_names(&self, max_tools: Option<u32>) -> Vec<&str> {
+        self.exposed_tools(max_tools).map(|t| t.name()).collect()
+    }
+
+    /// The tools exposed under a `max_tools` cap (BR-6), in registration order.
+    ///
+    /// A cap-exempt tool ([`Self::register_cap_exempt`]) is always present; the
+    /// cap bounds only the non-exempt tools, so the first `max_tools` of *those*
+    /// are kept and a cap-exempt tool is never one displaced. `None` means no
+    /// cap — every tool is exposed.
+    fn exposed_tools(&self, max_tools: Option<u32>) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        let non_exempt = self.tools.iter().filter(|r| !r.cap_exempt).count();
         let limit = max_tools
             .map(|n| n as usize)
-            .unwrap_or(self.tools.len())
-            .min(self.tools.len());
-        self.tools[..limit].iter().map(|t| t.name()).collect()
+            .unwrap_or(non_exempt)
+            .min(non_exempt);
+        let mut taken = 0usize;
+        self.tools.iter().filter_map(move |r| {
+            if r.cap_exempt {
+                Some(&r.tool)
+            } else if taken < limit {
+                taken += 1;
+                Some(&r.tool)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -624,5 +681,68 @@ mod tests {
         assert_eq!(reg.exposed_names(Some(2)), vec!["read", "edit"]);
         assert!(reg.docs(Some(1)).contains("read"));
         assert!(!reg.docs(Some(1)).contains("shell"));
+    }
+
+    /// A stand-in for any tool, to exercise the registry's exposure rules
+    /// without one of the real built-ins.
+    struct StubTool(&'static str);
+
+    #[async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        fn run(&self, _ctx: &ToolContext, _args: &Value) -> ToolOutcome {
+            ToolOutcome::ok("stub")
+        }
+    }
+
+    /// **REQ-563 decision 2026-08-09: a cap-exempt tool survives the cut that
+    /// bounds the rest.**
+    ///
+    /// `DEGRADED_MAX_TOOLS` equals the built-in count (5), so a plain cap of 5
+    /// would leave no room for an opted-in `web` tool registered after the
+    /// built-ins and MCP. Cap-exemption raises the effective budget by exactly
+    /// one: the five built-ins survive, the optional (non-exempt) MCP tool is
+    /// still cut, and the exempt tool is exposed regardless of the cap.
+    #[test]
+    fn a_cap_exempt_tool_is_never_displaced_by_the_max_tools_cut() {
+        // The registration order the daemon uses: built-ins, then MCP, then the
+        // cap-exempt web tool.
+        let mut reg = ToolRegistry::with_builtins();
+        reg.register(Arc::new(StubTool("mcp")));
+        reg.register_cap_exempt(Arc::new(StubTool("web")));
+
+        let exposed = reg.exposed_names(Some(5));
+        for builtin in ["read", "edit", "grep", "glob", "shell"] {
+            assert!(
+                exposed.contains(&builtin),
+                "the cap displaced a built-in: {exposed:?}"
+            );
+        }
+        assert!(
+            !exposed.contains(&"mcp"),
+            "the cap must still bound optional (non-exempt) tools: {exposed:?}"
+        );
+        assert!(
+            exposed.contains(&"web"),
+            "an explicitly opted-in cap-exempt tool was cut: {exposed:?}"
+        );
+        assert_eq!(
+            exposed.len(),
+            6,
+            "exemption raises the effective budget by exactly one"
+        );
+
+        // docs mirror exposed_names.
+        let docs = reg.docs(Some(5));
+        assert!(docs.contains("web"), "{docs}");
+        assert!(!docs.contains("mcp"), "{docs}");
     }
 }

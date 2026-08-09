@@ -818,8 +818,16 @@ impl Tool for WebTool {
 /// duplicated at two call sites is a condition that will eventually hold at one
 /// of them.
 ///
-/// Call it **last** — after the built-ins and after any MCP tools — so a
-/// degraded provider's `max_tools` cap cuts the opt-in capability first (BR-6).
+/// Registered **cap-exempt** (REQ-563 decision 2026-08-09): a capability the
+/// user explicitly opted into must never be displaced by a degraded provider's
+/// `max_tools` cap — and it would be, because `DEGRADED_MAX_TOOLS` equals the
+/// built-in count, so a plain registration is cut on every non-`Native`
+/// profile. Exemption raises the effective budget by exactly one; the cap still
+/// bounds the optional MCP tools (BR-6).
+///
+/// Still added **last** — after the built-ins and after any MCP tools — so it
+/// reads after them in the exposed tool docs; its exemption is what keeps it
+/// present, not its position.
 pub fn register_web_tool(
     reg: &mut ToolRegistry,
     config: &WebConfig,
@@ -832,7 +840,7 @@ pub fn register_web_tool(
     if config.tier == WebTier::Off {
         return false;
     }
-    reg.register(Arc::new(WebTool::new(
+    reg.register_cap_exempt(Arc::new(WebTool::new(
         config, cache, user_urls, gate, seam, runtime,
     )));
     true

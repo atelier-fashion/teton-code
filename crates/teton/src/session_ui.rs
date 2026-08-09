@@ -127,18 +127,6 @@ pub struct WebState {
     restricted: bool,
     /// The user lifted that restriction with `/web allow` (BR-13, AC-12).
     overridden: bool,
-    /// Web lookup is configured, and the last turn's provider profile could not
-    /// reach the tool — its `max_tools` cap cut it (BR-6).
-    ///
-    /// The one field here **not** written by an event, and the exception is
-    /// stated rather than hidden: there is no event, because nothing happened.
-    /// No lookup ran, no consent was decided, no restriction changed; a
-    /// capability the user configured simply was not offered to the model this
-    /// turn. That is a property of the turn, so it rides the turn's own result
-    /// (`PromptTurnResult::web_unavailable_in_profile`) and is folded in by the
-    /// caller at turn end. It is re-read every turn, so a fallback to a
-    /// full-tool-set provider clears it.
-    unavailable_in_profile: bool,
 }
 
 impl WebState {
@@ -154,15 +142,6 @@ impl WebState {
     /// contradicting the notice that preceded it.
     #[must_use]
     pub fn status_field(self) -> &'static str {
-        // Ahead of everything, because it is the only state in which the model
-        // *cannot call the tool at all*. A row reading `web: search` on a turn
-        // where the tool was not exposed would be the status line contradicting
-        // the answer the user just read ("I can't look that up") — and unlike
-        // the two below, this one is not about a capability being taken away, it
-        // is about one that was never handed over this turn.
-        if self.unavailable_in_profile {
-            return "web: unavailable (profile)";
-        }
         if self.overridden {
             return "web: overridden";
         }
@@ -186,10 +165,7 @@ impl WebState {
     /// row, not the vocabulary.
     #[must_use]
     pub fn is_engaged(self) -> bool {
-        self.unavailable_in_profile
-            || self.overridden
-            || self.restricted
-            || matches!(self.granted, Some(t) if t != WebTier::Off)
+        self.overridden || self.restricted || matches!(self.granted, Some(t) if t != WebTier::Off)
     }
 
     /// Raise the observed ceiling; never lowers it.
@@ -197,15 +173,6 @@ impl WebState {
         if tier != WebTier::Off && self.granted.is_none_or(|held| tier > held) {
             self.granted = Some(tier);
         }
-    }
-
-    /// Record whether the last turn's provider profile could reach the web tool
-    /// (REQ-563 BR-6).
-    ///
-    /// A **set**, not a raise: unlike `granted`, this describes the turn that
-    /// just ended, and a fallback onto a full-tool-set provider must clear it.
-    pub fn observe_profile_exposure(&mut self, unavailable: bool) {
-        self.unavailable_in_profile = unavailable;
     }
 }
 
@@ -1476,7 +1443,7 @@ mod tests {
         })
     }
 
-    /// AC-6 / AC-12: the five status strings, and the precedence between them.
+    /// AC-6 / AC-12: the four status strings, and the precedence between them.
     #[test]
     fn the_status_field_renders_every_web_state() {
         let off = WebState::default();
@@ -1509,25 +1476,6 @@ mod tests {
         overridden.overridden = true;
         assert_eq!(overridden.status_field(), "web: overridden");
         assert!(overridden.is_engaged());
-
-        // BR-6: the profile could not reach the tool at all this turn, which
-        // outranks every state below — those describe a capability the model
-        // *had*, in some condition. This one says it was never offered.
-        let mut capped = overridden;
-        capped.observe_profile_exposure(true);
-        assert_eq!(capped.status_field(), "web: unavailable (profile)");
-        assert!(capped.is_engaged());
-        // It is a set, not a raise: a fallback onto a full-tool-set provider
-        // clears it and the row goes back to describing the capability.
-        capped.observe_profile_exposure(false);
-        assert_eq!(capped.status_field(), "web: overridden");
-
-        // It also engages the row on its own, on a session that has used
-        // nothing yet — which is exactly the case it exists for.
-        let mut only_capped = WebState::default();
-        only_capped.observe_profile_exposure(true);
-        assert!(only_capped.is_engaged());
-        assert_eq!(only_capped.status_field(), "web: unavailable (profile)");
     }
 
     /// The ceiling only ever rises: a refusal after a grant must not read as a
