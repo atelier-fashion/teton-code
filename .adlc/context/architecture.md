@@ -68,6 +68,25 @@
   engine-backed. Asserting an id (`provider_id == "local"`) is not asserting
   locality: a provider registered under that id can be a remote endpoint
   (REQ-558, BUG-156, LESSON-485).
+- **A gate decides on the parse the executor will use** — any check about a
+  destination (allowlist, consent prompt, audit record) runs on the *same*
+  parse the client that issues the request will produce, and the executor is
+  handed that parse's re-serialization rather than the original bytes. Two
+  parsers agreeing on ordinary input is not a property; the adversarial
+  spellings are where they diverge, and a gate on a different parse is
+  bypassable rather than merely weaker (REQ-563, LESSON-494).
+- **A remembered grant is scoped by its key** — a permission answer attaches to
+  its key, not to the sentence the user read, so the key carries every
+  dimension the user was deciding about. Graded capabilities derive the key
+  from the level (`permission_key_for(tier)`), and durable consent is stored in
+  the same shape as the question — a per-level list, never a boolean that fans
+  out (REQ-563, LESSON-495).
+- **Egress owns every destination, not just every provider** — the choke point
+  carries non-provider consumers too (the REQ-563 web lookup), so address-class
+  refusal, redirect bounds, scan gates, timeouts, and one-row-one-event
+  accounting are properties of the seam rather than of each caller. A tool that
+  reaches the network is handed transport; it never constructs one, and the
+  tree-wide `deny_http_client` check keeps that mechanical.
 - **Adapter degradation** — providers with weak tool-calling get a reduced
   harness profile (smaller tool set, shorter loops, mandatory verification)
   rather than the full loop (BR-6).
