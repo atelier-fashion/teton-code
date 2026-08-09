@@ -368,7 +368,10 @@ fn the_status_row_shows_the_session_s_web_capability() {
     writer.flush().ok();
 
     assert!(
-        wait_for(&transcript, "permission requested: web_fetch"),
+        // The model composed this URL (the typed prompt names no link), so the
+        // per-tier key is the any-URL one — asserted in full, so a regression
+        // that collapsed the three keys back to one would be visible here.
+        wait_for(&transcript, "permission requested: web_fetch_any_url"),
         "the lookup never asked for consent; transcript:\n{}",
         snapshot(&transcript)
     );

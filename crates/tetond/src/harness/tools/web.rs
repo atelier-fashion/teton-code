@@ -1565,6 +1565,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A connector that never connects — enough to construct an
+    /// [`McpRegistry`](crate::mcp::McpRegistry) for a handle whose `run` is never
+    /// called. The sweep below asks each tool a question about itself, not about
+    /// its backend.
+    struct UnusedConnector;
+
+    #[async_trait]
+    impl crate::mcp::McpConnector for UnusedConnector {
+        async fn connect(
+            &self,
+            config: &crate::mcp::McpServerConfig,
+        ) -> Result<Arc<dyn crate::mcp::McpConnection>, crate::mcp::McpError> {
+            Err(crate::mcp::McpError::Startup(config.id.clone()))
+        }
+    }
+
+    /// One MCP tool, built exactly as `register_mcp_tools` builds them.
+    fn mcp_tool_handle() -> Arc<dyn Tool> {
+        let registry = Arc::new(crate::mcp::McpRegistry::new(
+            Arc::new(UnusedConnector),
+            Vec::new(),
+        ));
+        let discovered = crate::mcp::DiscoveredTool {
+            server_id: "fs".to_owned(),
+            tool: crate::mcp::McpTool {
+                name: "read_file".to_owned(),
+                description: "read a file".to_owned(),
+                input_schema: json!({ "type": "object" }),
+            },
+        };
+        Arc::new(crate::harness::tools::McpToolHandle::new(
+            &discovered,
+            registry,
+            Handle::current(),
+            false,
+        ))
+    }
+
+    /// **`gates_itself` is the web tool's alone — across every kind of tool the
+    /// registry can hold.**
+    ///
+    /// The surface it opens is fail-open: a tool that answers `true` is *not*
+    /// authorized by the loop, so a second one that started answering `true`
+    /// would run unprompted. The sweep is therefore only as good as the tool set
+    /// it sweeps, and `with_builtins()` is not that set — the daemon also
+    /// registers an [`McpToolHandle`](crate::harness::tools::McpToolHandle) per
+    /// discovered MCP tool, from a *different* `Tool` impl, and a self-gating
+    /// one would be an unprompted subprocess or an unprompted remote call.
+    /// Registering one here means a future `gates_itself` on that impl fails this
+    /// test rather than shipping.
     #[tokio::test]
     async fn the_web_tool_is_the_only_tool_that_gates_itself() {
         // The fail-open surface `gates_itself` opens, bounded by an assertion:
@@ -1582,7 +1632,18 @@ mod tests {
             Arc::clone(&seam) as Arc<dyn WebLookupSeam>,
             Handle::current(),
         ));
-        for name in reg.names() {
+        reg.register(mcp_tool_handle());
+
+        let names = reg.names();
+        // Non-vacuity, both ends: the sweep really did see the web tool and
+        // really did see a second `Tool` impl.
+        assert!(names.contains(&WEB_TOOL_NAME));
+        assert!(
+            names.iter().any(|n| n.starts_with("mcp__")),
+            "the sweep must include an MCP-shaped tool: {names:?}"
+        );
+
+        for name in names {
             let tool = reg.get(name).unwrap();
             assert_eq!(
                 tool.gates_itself(),

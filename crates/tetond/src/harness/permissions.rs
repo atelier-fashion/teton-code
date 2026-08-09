@@ -343,11 +343,14 @@ impl PermissionGate {
     ///   [`WebConsentDecided`] event, at the scope the answer actually achieved.
     ///
     /// `permission_key` stays separate from `tier` because they are different
-    /// questions with different arities: two keys (`web_fetch`, `web_search`)
-    /// carry the session grant, three tiers can be made permanent. A fetch of a
-    /// URL the user pasted and a fetch of one the model chose share a grant key
-    /// and do **not** share a tier — collapsing them would make consenting to
-    /// one silently write the other.
+    /// questions asked of different things. The key names the **subject a
+    /// session grant is remembered under** — one per tier above `off`
+    /// (`web_fetch_user_url`, `web_fetch_any_url`, `web_search`); the tier names
+    /// **what an `enable_permanent` answer writes to config**. They are in step
+    /// today ([`permission_key_for`](super::tools::web::permission_key_for) is
+    /// the one mapping), and the parameters stay separate anyway: the tier here
+    /// is the *lookup's*, already checked against the configured ceiling, so a
+    /// prompt can never offer to persist a tier this lookup was not entitled to.
     pub async fn authorize_web(
         &self,
         permission_key: &str,
@@ -850,9 +853,9 @@ mod tests {
         }
     }
 
-    /// `enable_permanent` writes the tier it was offered for — and the tier is
-    /// the *lookup's*, not the permission key's: `web_fetch` covers two tiers,
-    /// and consenting to a user-pasted-URL fetch must not enable model-chosen
+    /// `enable_permanent` writes the tier it was offered for — the *lookup's*
+    /// tier, taken from the argument rather than re-derived from the permission
+    /// key, so a fetch of a URL the user pasted can never enable model-chosen
     /// ones (BR-3).
     #[tokio::test]
     async fn enable_permanent_writes_the_tier_the_prompt_named() {

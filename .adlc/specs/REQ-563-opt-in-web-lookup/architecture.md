@@ -145,6 +145,31 @@ rationale, config.rs:92).
   flag, user-URL set — all session-scoped, never persisted (permissions.rs
   precedent).
 
+### Egress behaviour the seam owns (added at verify — load-bearing, not detail)
+
+Two properties of `egress::lookup` are part of the design rather than
+implementation colour, and are recorded here because a later change that drops
+either would look local while removing a security floor. **Address-class
+policy (the SSRF floor):** a destination in a non-global address class —
+loopback (including `localhost` and anything under `.localhost`), link-local,
+private, unspecified/`0.0.0.0/8`, and their IPv6 equivalents, with all-digit
+hosts folded to the IPv4 literal they are — is refused *unless the user pasted
+the initial URL themselves* (pointing the daemon at `http://localhost:3000` is
+a thing people do on purpose; a model composing that URL is the SSRF). A
+**redirect hop** carries no such exemption and is checked unconditionally,
+ahead of the caller's allowlist closure, so a permissive allowlist cannot grant
+`169.254.169.254`. The configured `search_endpoint` is exempt for the same
+reason a pasted URL is — it is a value out of the user's own config — and a
+`Fetch` aimed at its origin is refused outright so the endpoint-bound key can
+never ride one. **Timeouts:** the transport carries a *connect* bound
+(`LOOKUP_CONNECT_TIMEOUT`) because a lookup destination is an arbitrary host
+that may accept a connection and then say nothing; the whole attempt — every
+gate, every redirect hop and the body read — is bounded by
+`LOOKUP_TOTAL_TIMEOUT` at the seam, so the bound holds for every transport the
+choke point is built over and not only for the real client. Expiry lands on the
+same `offline` outcome a connect failure does (BR-9/BUG-152 taxonomy), so it is
+never a turn error.
+
 ## AC → Decision Map
 
 | AC | Covered by |
@@ -184,6 +209,84 @@ TASK-074 depends on 072; TASK-075 on 072+073; TASK-076 on 074+075; TASK-077 on
 3. Consent scopes ride the PermissionGate rather than a parallel mechanism
    (D-5) — "separately consented tiers" = ceiling in config + per-tier session
    grants, exactly the spec's Permissions table semantics.
+
+The rest were recorded at verify, once implementation showed what the spec's
+wording actually resolves to.
+
+4. **AC-3's boundary case is realized as `taint_restricted`, not
+   `blocked_privacy`.** The spec's "a lookup in a session that has touched
+   boundary content is blocked" is BR-13's session restriction, and BR-13 is
+   asymmetric — a URL the *user* pasted still goes. So the ending that fires is
+   `taint_restricted`, which names the restriction and the way out of it
+   (`/web allow`), where `blocked_privacy` would name neither. The
+   `blocked_privacy` wire variant is **retained** — the outcome vocabulary is a
+   fixed protocol enum (D-8) and removing a variant is a wire change — but it
+   has **no production producer**; the cross-reference lives on the variant
+   itself in `egress/lookup.rs`, which is where anyone adding a producer would
+   be reading. A lookup does not publish `privacy_block` either, deliberately:
+   refusing to send establishes nothing about the context this session holds,
+   so it must not become a session pin.
+5. **BR-14's "the search tier is not offered at consent time" is realized as
+   always-blocked-with-a-kind-aware-notice.** Not offering a tier at consent
+   time would mean a consent surface that reads the engine slot and hides an
+   option, and the slot changes mid-session (an install can finish thirty
+   seconds in). Instead the search gate is installed whenever `tier = search`
+   and a scan that cannot run **blocks the query** (LESSON-492), with a notice
+   that names the missing *local model* rather than a generic refusal — so the
+   user is told the thing they can act on. The effect BR-14 asks for holds
+   (no query leaves unscanned); the mechanism differs. **Pending a product
+   decision:** whether `[web] tier = "search"` should additionally be refused at
+   *config load* on a machine with no local tier, which would move the failure
+   from per-query to startup. Left open because it would make an engine
+   download a precondition for a config file to load.
+6. **`[web] permission = ask | allow` added to D-9's config surface.** D-9
+   described the `[web]` table as tier-only. `enable_permanent` (D-5) has to
+   have somewhere durable to land the *permission* half of the answer:
+   persisting only the tier left the next daemon start re-prompting for a
+   capability the user had already enabled permanently, which is the one thing
+   that option promises not to do. `permission` is therefore a second `[web]`
+   key, defaulting to `ask`, mapped onto the gate's policy rows by
+   `PermissionConfig::apply_web_permission`.
+7. **Per-tier permission keys replace D-5's single `web` row.** D-5's sketch
+   implied one consent subject. Three ship — `web_fetch_user_url`,
+   `web_fetch_any_url`, `web_search` — because a grant is remembered under
+   exactly the string it was asked about: one key would have made "allow for
+   this session" on a pasted link silently grant every model-composed URL and
+   every search, which is the mixed-authorship case BR-3 names first.
+   `permission_key_for(tier)` is the single tier→key mapping.
+   **Forward note:** REQ-560's named permission levels must fan out through
+   `PermissionConfig::apply_web_permission` — mapping a level to a single `web`
+   row would silently re-collapse the three keys.
+8. **The degraded-profile cap is a floor the web tool always loses.**
+   `DEGRADED_MAX_TOOLS` is 5 and the builtin set is 5, and the web tool
+   registers last precisely so a cap cuts it first (D-1) — so on any provider
+   that is not a `Native` tool-caller the tool is registered and never exposed.
+   That is signalled, not hidden: the model is told by `WEB_CAPPED_CLAUSE` in
+   its own prompt and the user by the status row's `web: unavailable (profile)`,
+   read from one function (`web_tool_is_exposed`) so the two cannot disagree.
+   Changing the cap policy itself — a reserved slot for opt-in capabilities, or
+   a larger degraded budget — is **deferred to a follow-up**; it is a change to
+   BR-6's degradation contract, not to this requirement.
+9. **AC-6's `/cost` section shows count and bytes; the host is ledger-side.**
+   `/cost` grows a `web lookups:` section, one row per session, carrying the
+   lookup count (every ending — cache hits and refusals included, BR-7) and
+   bytes-in. It carries **no host**. Per-lookup hosts live in the `web_lookups`
+   table and on the `web_lookup` event, and reach a person through the ledger
+   and the `/verbose` notices — a cost *summary* that enumerated destinations
+   would be a browsing history in the one surface a user shows someone else.
+   The section is silent when empty, so a machine that never opted in sees the
+   `/cost` output it always saw (BR-1).
+10. **BR-6's ungranted-tier affordance is realized as a runtime refusal that
+    names the missing tier, with the prompt clause beside it and not instead of
+    it.** BR-6 asks that the model be *told* the state and given a legal
+    no-tool ending. The prompt does that (and names `[web] tier`, the key the
+    user would change — LESSON-493), and the tool's description is tier-shaped
+    so a fetch-only ceiling never advertises a search. But a prompt sentence is
+    a claim the model can ignore, so the ceiling is *also* enforced when the
+    call arrives — ahead of any consent prompt — with a refusal naming both the
+    tier the lookup needed and the tier `[web] tier` is set to, and telling the
+    model not to retry (AC-4). The affordance is the pair; the refusal is what
+    makes it true.
 
 ## Risks / Notes for Implementation
 

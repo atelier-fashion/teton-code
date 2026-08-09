@@ -17,8 +17,10 @@
 //! | AC-2 (session) | [`allow_for_this_session_lasts_to_session_end_and_not_beyond`] |
 //! | AC-2 (permanent) | [`enable_permanent_writes_a_ceiling_the_next_daemon_start_honours`] |
 //! | AC-4 | [`tier_gradation_refusals_name_the_missing_tier`] |
-//! | AC-9 | [`the_allowlist_constrains_model_chosen_destinations_only`] |
+//! | AC-9 (initial URL) | [`the_allowlist_constrains_model_chosen_destinations_only`] |
+//! | AC-9 (redirect hop) | [`the_allowlist_constrains_a_redirect_target_through_the_production_hop_closure`] |
 //! | AC-12 (notice, paste, override) | [`the_taint_notice_names_cause_and_effect_and_a_paste_still_works`] |
+//! | AC-12 (cache exemption) | [`a_cached_page_is_served_in_a_tainted_session_and_the_same_url_uncached_is_not`] |
 //! | AC-12 (RPC-only) | [`only_the_client_rpc_can_lift_the_restriction`] |
 //! | AC-12 (no such tool) | [`no_tool_is_named_for_the_override_or_the_refresh`] |
 //! | AC-13 (gate ⇔ tier) | [`a_search_with_no_gate_installed_is_a_block_not_a_skip`] |
@@ -87,6 +89,20 @@ impl LookupCapture {
             script: Arc::new(Mutex::new(
                 std::iter::repeat_n(Ok((200, None, body.as_bytes().to_vec())), 8).collect(),
             )),
+        }
+    }
+
+    /// A transport that answers from `script` in order — what a redirect chain
+    /// needs and [`Self::answering`] cannot express: the `Location` a hop
+    /// follows is per-answer.
+    ///
+    /// An exhausted script keeps answering `200` with an empty body rather than
+    /// panicking, so a test asserting "there was no second request" reports the
+    /// second request rather than "the fixture ran out".
+    fn scripted(script: Vec<ScriptedAnswer>) -> Self {
+        Self {
+            sent: Arc::new(Mutex::new(Vec::new())),
+            script: Arc::new(Mutex::new(script.into_iter().collect())),
         }
     }
 
@@ -342,11 +358,21 @@ struct Fixture {
     ctx: ToolContext,
     dir: PathBuf,
     registered: bool,
+    /// The `[web]` table this fixture's tool was built from, kept so a test can
+    /// open **the same** cache the tool reads — `WebCache::from_config` is a
+    /// path and a TTL, so a second handle over the same directory and config is
+    /// the same cache (the equivalence `web_lookup_egress.rs`'s refresh leg
+    /// relies on).
+    config: WebConfig,
 }
 
 impl Fixture {
     fn run(&self, args: &Value) -> ToolOutcome {
         self.tool.run(&self.ctx, args)
+    }
+
+    fn cache(&self) -> WebCache {
+        WebCache::from_config(&self.dir, &self.config)
     }
 
     fn fetch(&self, url: &str) -> ToolOutcome {
@@ -374,6 +400,9 @@ struct Setup {
     overridden: bool,
     persistence: Option<Arc<FileTierSink>>,
     search_gate: Option<Arc<dyn RedactionGate>>,
+    /// What the network answers, in order. `None` is the default fixture's
+    /// "every request is `200 <a page>`".
+    script: Option<Vec<ScriptedAnswer>>,
 }
 
 impl Setup {
@@ -388,7 +417,14 @@ impl Setup {
             overridden: false,
             persistence: None,
             search_gate: None,
+            script: None,
         }
+    }
+
+    /// Script the network's answers — a redirect chain, in practice.
+    fn answering(mut self, script: Vec<ScriptedAnswer>) -> Self {
+        self.script = Some(script);
+        self
     }
 
     fn policy(mut self, policy: PermissionPolicy) -> Self {
@@ -436,7 +472,10 @@ impl Setup {
             ..WebConfig::default()
         };
 
-        let transport = LookupCapture::answering("<html><body>a page</body></html>");
+        let transport = self.script.map_or_else(
+            || LookupCapture::answering("<html><body>a page</body></html>"),
+            LookupCapture::scripted,
+        );
         let recorder = Arc::new(Recorder::default());
         let mut egress = Egress::new(transport.clone(), Vec::new(), Arc::new(NoopSink))
             .with_lookup_recorder(Arc::clone(&recorder) as Arc<dyn LookupRecorder>);
@@ -499,6 +538,7 @@ impl Setup {
             ctx: ToolContext::new(&dir),
             dir,
             registered,
+            config,
         }
     }
 }
@@ -957,6 +997,108 @@ async fn the_allowlist_constrains_model_chosen_destinations_only() {
     empty.cleanup();
 }
 
+/// AC-9, the **redirect** half: the allowlist governs a destination the *server*
+/// chose, through the production hop closure.
+///
+/// The test above covers the initial URL, which the tool checks itself. A
+/// redirect target is checked somewhere else entirely — by the closure
+/// `WebTool::lookup` binds to the allowlist and hands to the seam — and until
+/// this test nothing in the suite scripted a 3xx, so replacing that closure with
+/// `|_| true` left every assertion green. This is the observation that was
+/// missing.
+///
+/// **Why this host, and why model-composed.** Verify wave 1 put two seam-level
+/// checks *ahead* of the closure: the address-class floor (unconditional on a
+/// hop) and BR-11's user-pasted-host-family exemption (which short-circuits
+/// before it). A loopback or same-family target would therefore be refused with
+/// the closure never consulted, and the test would pass against `|_| true`. The
+/// target here is a **public, unrelated** host and the fetch is
+/// **model-composed**, so the closure is the only thing that can refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_allowlist_constrains_a_redirect_target_through_the_production_hop_closure() {
+    const HOP: &str = "https://elsewhere.example.test/landing";
+
+    // --- refused at the hop ------------------------------------------------
+    let refused = Setup::at(WebTier::FetchAnyUrl)
+        .allowing(&["docs.rs"])
+        .answering(vec![
+            Ok((302, Some(HOP.to_owned()), Vec::new())),
+            // Scripted, and deliberately: if the hop were taken, THIS is what it
+            // would deliver — so a green assertion below is "the second request
+            // never happened", not "the fixture had nothing left to say".
+            Ok((200, None, b"<html><body>hop landed</body></html>".to_vec())),
+        ])
+        .build("hop-refused");
+
+    let out = refused.fetch(DOCS_URL);
+    assert!(
+        out.is_error,
+        "a redirect off the allowlist must not deliver: {}",
+        out.content
+    );
+    assert!(
+        out.content
+            .contains("redirected outside the configured allowlist"),
+        "the model must be told what refused it: {}",
+        out.content
+    );
+    assert_eq!(
+        refused.transport.calls(),
+        1,
+        "the hop was taken: a redirect target outside the allowlist must produce \
+         NO second request; sent {:?}",
+        refused.transport.urls()
+    );
+    assert!(
+        !refused.transport.urls().iter().any(|u| u.contains(HOP)),
+        "the refused destination was contacted: {:?}",
+        refused.transport.urls()
+    );
+    assert_eq!(
+        refused.recorder.outcomes(),
+        vec![WebLookupOutcome::RefusedDomain],
+        "one attempt, one row, naming the destination refusal (BR-7)"
+    );
+
+    // --- falsification: the SAME chain with the target listed --------------
+    //
+    // Only the allowlist differs. Without this leg the count above would be
+    // satisfied by a fixture that could never follow a redirect at all.
+    let followed = Setup::at(WebTier::FetchAnyUrl)
+        .allowing(&["docs.rs", "elsewhere.example.test"])
+        .answering(vec![
+            Ok((302, Some(HOP.to_owned()), Vec::new())),
+            Ok((200, None, b"<html><body>hop landed</body></html>".to_vec())),
+        ])
+        .build("hop-followed");
+
+    let out = followed.fetch(DOCS_URL);
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("hop landed"),
+        "the followed hop must deliver the target's bytes: {}",
+        out.content
+    );
+    assert_eq!(
+        followed.transport.calls(),
+        2,
+        "the chain really is two requests; sent {:?}",
+        followed.transport.urls()
+    );
+    assert!(
+        followed.transport.urls()[1].contains(HOP),
+        "the second request went somewhere else: {:?}",
+        followed.transport.urls()
+    );
+    assert_eq!(
+        followed.recorder.outcomes(),
+        vec![WebLookupOutcome::Completed]
+    );
+
+    refused.cleanup();
+    followed.cleanup();
+}
+
 // ---------------------------------------------------------------------------
 // AC-12 — taint, the notice, and the override
 // ---------------------------------------------------------------------------
@@ -1028,6 +1170,120 @@ async fn the_taint_notice_names_cause_and_effect_and_a_paste_still_works() {
 
     fx.cleanup();
     lifted.cleanup();
+}
+
+/// **BR-13's cache exemption: a stored copy is served in a tainted session, and
+/// the same URL uncached is not.**
+///
+/// The taint gate lives at the choke point, and a cache hit never reaches the
+/// choke point — `WebTool::lookup` answers it two gates earlier. That ordering
+/// is deliberate (a hit performs no egress, so there is nothing for the taint
+/// rule to protect) but it is also invisible: until this test the two facts were
+/// only ever observed apart, and an implementation that had moved the cache
+/// *behind* the taint gate — or the taint check ahead of it — would have passed
+/// the whole suite.
+///
+/// Three legs on **one URL**, so the only difference between the first two is
+/// whether the document is on disk:
+///
+/// 1. tainted, cached → served, zero packets, and **no consent prompt** (a hit
+///    asks for nothing, because nothing is being authorized);
+/// 2. tainted, the same URL evicted → `taint_restricted`, zero packets, and the
+///    one prompt this test ever sees;
+/// 3. untainted, uncached → completes, which is what keeps leg 2 from being
+///    "this fixture never fetches".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cached_page_is_served_in_a_tainted_session_and_the_same_url_uncached_is_not() {
+    let fx = Setup::at(WebTier::FetchAnyUrl)
+        .policy(PermissionPolicy::Ask)
+        .tainted()
+        .build("taint-cache");
+    let answerer = Answerer::spawn(&fx.bus, &fx.pending, vec!["allow_once"]);
+
+    // The stored copy, written through the same cache the tool reads.
+    fx.cache()
+        .put(DOCS_URL, "the stored reduction")
+        .expect("caching a document must succeed");
+
+    // --- leg 1: the hit -----------------------------------------------------
+    let hit = fx.fetch(DOCS_URL);
+    assert!(
+        !hit.is_error,
+        "BR-12/BR-13: a cached document performs no egress, so the restriction \
+         on egress has nothing to refuse: {}",
+        hit.content
+    );
+    assert!(
+        hit.content.contains("served from the local cache"),
+        "the model must be told nothing left the machine: {}",
+        hit.content
+    );
+    assert!(
+        hit.content.contains("the stored reduction"),
+        "the hit serves the stored bytes: {}",
+        hit.content
+    );
+    assert_eq!(fx.transport.calls(), 0, "a cache hit is not a packet");
+    assert_eq!(
+        fx.recorder.outcomes(),
+        vec![WebLookupOutcome::CacheHit],
+        "BR-7: a free lookup is still a row"
+    );
+    assert_eq!(
+        answerer.count(),
+        0,
+        "a cache hit authorizes nothing, so it must ask nothing: {:?}",
+        answerer
+            .prompts()
+            .iter()
+            .map(|p| p.key.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // --- leg 2: the same URL, no stored copy -------------------------------
+    assert!(
+        fx.cache().evict(DOCS_URL).expect("eviction must succeed"),
+        "non-vacuity: there was a stored copy to drop"
+    );
+    let refused = fx.fetch(DOCS_URL);
+    assert!(refused.is_error, "{}", refused.content);
+    assert!(
+        refused.content.contains("privacy") || refused.content.contains("restricted"),
+        "the refusal must name the restriction: {}",
+        refused.content
+    );
+    assert_eq!(
+        fx.transport.calls(),
+        0,
+        "a taint-restricted lookup must put no packet on the wire"
+    );
+    assert_eq!(
+        fx.recorder.outcomes(),
+        vec![
+            WebLookupOutcome::CacheHit,
+            WebLookupOutcome::TaintRestricted
+        ],
+        "the same URL, the same session, one gate apart"
+    );
+    assert_eq!(
+        answerer.count(),
+        1,
+        "exactly one prompt across both legs, and it belongs to the uncached one"
+    );
+
+    // --- leg 3: falsification — the same uncached URL, untainted -----------
+    let clean = Setup::at(WebTier::FetchAnyUrl).build("taint-cache-clean");
+    let out = clean.fetch(DOCS_URL);
+    assert!(
+        !out.is_error,
+        "the uncached fetch above was refused by the taint rule, not by the \
+         fixture: {}",
+        out.content
+    );
+    assert_eq!(clean.transport.calls(), 1);
+
+    fx.cleanup();
+    clean.cleanup();
 }
 
 /// AC-12, the override's channel: the flag the lookup gate reads is flipped by

@@ -1444,8 +1444,10 @@ mod tests {
     // REQ-563: web state, web notices, and the persistent consent key
     // ------------------------------------------------------------------
 
+    /// A web consent prompt as the daemon raises it: the grant key is one of
+    /// the **per-tier** web keys (REQ-563 BR-3), never a single `web_fetch`.
     fn web_permission_request() -> PermissionRequest {
-        let mut req = permission_request("web_fetch");
+        let mut req = permission_request("web_fetch_any_url");
         req.options.insert(
             2,
             PermissionOption {
@@ -1858,7 +1860,7 @@ mod tests {
         );
         // The strongest possible yes must not leave the user re-asked next
         // lookup: the daemon's gate is per-turn, so the client remembers too.
-        assert!(grants.is_allow_always("web_fetch"));
+        assert!(grants.is_allow_always("web_fetch_any_url"));
     }
 
     /// On a prompt without the option, `p` is an unrecognised answer: it

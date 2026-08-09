@@ -2005,8 +2005,10 @@ fn a_web_lookup_is_consented_reported_and_counted_in_the_cost_report() {
     // AC-2 / BR-4: the question was concrete — the verbatim URL and the host —
     // and it offered the persistent choice, which only the web keys get.
     assert!(
-        session.contains("permission requested: web_fetch"),
-        "the lookup must be authorized under its per-tier key; output:\n{session}\nlog:\n{log}"
+        session.contains("permission requested: web_fetch_user_url"),
+        "the lookup must be authorized under its per-tier key — and this URL was \
+         pasted by the user, so it is the user-URL tier's key and not the \
+         any-URL one's; output:\n{session}\nlog:\n{log}"
     );
     assert!(
         session.contains(&url),

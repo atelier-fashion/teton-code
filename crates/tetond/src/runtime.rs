@@ -12470,7 +12470,10 @@ provider_id = "on-device"
     /// one lookup leaves behind.
     mod web_lookup_seam {
         use super::*;
-        use crate::egress::{LookupRecord, TaintView};
+        use crate::classify::test_support::CountingEngine;
+        use crate::egress::{
+            Authorship, LookupContext, LookupDetail, LookupRecord, LookupRequest, TaintView,
+        };
         use crate::harness::{PermissionDecision, PermissionPolicy};
         use teton_core::config::WebTier;
         use teton_protocol::events::{WebLookupKind, WebLookupOutcome, WebTier as WireWebTier};
@@ -12490,6 +12493,144 @@ provider_id = "on-device"
         fn router_for(runtime: &DaemonRuntime) -> Router {
             let config = runtime.config.lock().expect("config mutex").clone();
             build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+        }
+
+        /// A keychain that answers exactly one `(service, account)` pair.
+        ///
+        /// The injection point `keychain.rs` documents (`SecretResolver::with_backend`
+        /// — "tests inject a fake that returns a canned secret so CI never touches
+        /// the real store"), reused here so a `search_key_ref` can be *resolvable*
+        /// in a test. Without a resolver that answers, `search_auth` returns `None`
+        /// for the ordinary reason and the wiring below could not be observed at
+        /// all.
+        struct FakeKeychain {
+            service: &'static str,
+            account: &'static str,
+            secret: &'static str,
+        }
+
+        impl crate::keychain::KeychainBackend for FakeKeychain {
+            fn get(
+                &self,
+                service: &str,
+                account: &str,
+            ) -> Result<String, crate::keychain::BackendError> {
+                if service == self.service && account == self.account {
+                    Ok(self.secret.to_owned())
+                } else {
+                    Err(crate::keychain::BackendError::NotFound)
+                }
+            }
+        }
+
+        /// A loopback HTTP server that records the head of every request it is
+        /// sent and answers each with `200 ok`.
+        ///
+        /// **Real sockets, deliberately.** The credential under test is attached
+        /// by the production [`HttpTransport`] that
+        /// [`DaemonRuntime::web_lookup_egress`] builds and does not hand back, so
+        /// a fake `Transport` cannot see it: substituting one would replace the
+        /// very object whose header behaviour is the claim. The wire is the only
+        /// place `Authorization: Bearer …` exists, so the wire is where it is
+        /// read. Nothing leaves the machine — both ends are `127.0.0.1`.
+        #[derive(Clone)]
+        struct CaptureServer {
+            port: u16,
+            heads: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl CaptureServer {
+            async fn bind() -> Self {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind a loopback port");
+                let port = listener.local_addr().expect("local addr").port();
+                let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = Arc::clone(&heads);
+                tokio::spawn(async move {
+                    while let Ok((mut socket, _)) = listener.accept().await {
+                        let mut head = Vec::new();
+                        let mut chunk = [0_u8; 512];
+                        loop {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => head.extend_from_slice(&chunk[..n]),
+                            }
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        sink.lock()
+                            .expect("capture mutex")
+                            .push(String::from_utf8_lossy(&head).into_owned());
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+                                  Connection: close\r\n\r\nok",
+                            )
+                            .await;
+                        let _ = socket.flush().await;
+                    }
+                });
+                Self { port, heads }
+            }
+
+            fn url(&self, path: &str) -> String {
+                format!("http://127.0.0.1:{}{path}", self.port)
+            }
+
+            fn requests(&self) -> Vec<String> {
+                self.heads.lock().expect("capture mutex").clone()
+            }
+
+            /// Whether request `i` carried an `Authorization` header at all.
+            /// Case-folded, because a header name is case-insensitive and the
+            /// question is about the credential, not about its spelling.
+            fn carried_auth(&self, i: usize) -> bool {
+                self.requests()[i]
+                    .to_ascii_lowercase()
+                    .contains("\r\nauthorization:")
+            }
+        }
+
+        /// A runtime configured to search `endpoint`, with `key_ref` resolvable
+        /// through a fake keychain and an engine loaded so the BR-14 search scan
+        /// can actually run.
+        fn searching_runtime(
+            endpoint: &str,
+            key_ref: Option<&str>,
+            engine: &CountingEngine,
+        ) -> DaemonRuntime {
+            let mut runtime = DaemonRuntime::minimal();
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = WebTier::Search;
+                config.web.search_endpoint = Some(endpoint.to_owned());
+                config.web.search_key_ref = key_ref.map(ToOwned::to_owned);
+            }
+            runtime
+                .engine
+                .install("counting".to_owned(), engine.handle());
+            runtime.local_available.store(true, Ordering::SeqCst);
+            runtime.secret_resolver =
+                crate::keychain::SecretResolver::with_backend(Box::new(FakeKeychain {
+                    service: "teton",
+                    account: "search",
+                    secret: SEARCH_SECRET,
+                }));
+            runtime
+        }
+
+        /// The credential the fake keychain answers with. A value no other
+        /// fixture in this file uses, so finding it on a wire is unambiguous.
+        const SEARCH_SECRET: &str = "srch-secret-4f1c9";
+
+        /// A host check that permits every redirect hop — the *permissive*
+        /// setting, so nothing below can be an accident of a restrictive one.
+        fn allow_any_host(_host: &str) -> bool {
+            true
         }
 
         // -- the search gate's switch (BR-14, D-6) -------------------------
@@ -13272,6 +13413,163 @@ provider_id = "on-device"
                 "a spelling the re-serializer moves must still find its entry"
             );
         }
+
+        // -- the search credential's wiring (BR-7, AC-7) --------------------
+
+        /// **The search key rides the search request, to the search endpoint's
+        /// origin, and nowhere else** (REQ-563 BR-7; REQ-544 M-3's guarantee,
+        /// inherited).
+        ///
+        /// Every other test of this seam configures no `search_key_ref`, so the
+        /// whole of [`DaemonRuntime::search_auth`] — the keychain read, the
+        /// bearer header, the endpoint binding — was reachable only through code
+        /// nothing observed: replacing its body with `None` left the suite green.
+        /// This is the observation it was missing, and it is taken **off the
+        /// wire** rather than off a mock, because the object that attaches the
+        /// header is the production [`HttpTransport`] that `web_lookup_egress`
+        /// builds internally.
+        ///
+        /// Four legs, one runtime each where the configuration differs:
+        ///
+        /// 1. a search → `Authorization: Bearer …` on the request to the
+        ///    endpoint;
+        /// 2. a **user-pasted fetch to a different origin** → no credential of
+        ///    any kind, which is the cross-contamination guarantee;
+        /// 3. a user-pasted fetch **at the endpoint's own origin** → refused
+        ///    before the wire (the confused-deputy leg: verify wave 1 made the
+        ///    origin-match case unreachable, so what used to be "the key would
+        ///    ride a fetch" is now "that fetch does not happen");
+        /// 4. the same search with **no `search_key_ref`** → no credential, so
+        ///    leg 1 is reading the configuration and not a header this transport
+        ///    always adds.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_search_key_rides_only_the_search_request_and_only_to_its_endpoint() {
+            let engine = CountingEngine::answering("NONE");
+            let search = CaptureServer::bind().await;
+            let elsewhere = CaptureServer::bind().await;
+            let endpoint = search.url("/api");
+
+            let runtime = searching_runtime(&endpoint, Some("keychain://teton/search"), &engine);
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let router = router_for(&runtime);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("search-auth");
+            let egress = runtime
+                .web_lookup_egress(&router, &config, &events, &session)
+                .expect("the lookup choke point must build");
+            let taint = runtime.web_taint_view();
+            let ctx = LookupContext::new(session.clone(), taint.as_ref(), &allow_any_host)
+                .with_search_endpoint(&endpoint);
+
+            // --- leg 1: the search carries the key ------------------------
+            let searched = egress
+                .lookup(
+                    &LookupRequest::search("tokio task pinning", Authorship::ModelComposed),
+                    &ctx,
+                )
+                .await;
+            assert_eq!(
+                searched.outcome(),
+                WebLookupOutcome::Completed,
+                "the search must actually reach the endpoint, or there is no \
+                 request to read a header off: {:?}",
+                searched.detail()
+            );
+            assert_eq!(search.requests().len(), 1, "exactly one search went out");
+            let head = search.requests()[0].to_ascii_lowercase();
+            assert!(
+                head.contains(&format!("authorization: bearer {SEARCH_SECRET}")),
+                "the resolved search credential did not ride the search request; \
+                 request head:\n{}",
+                search.requests()[0]
+            );
+
+            // --- leg 2: a fetch elsewhere carries nothing -----------------
+            //
+            // User-pasted, because a model-composed loopback URL is refused by
+            // the address-class floor before any header could be attached — and
+            // the question here is about the *header*, not about that gate.
+            let fetched = egress
+                .lookup(
+                    &LookupRequest::fetch(elsewhere.url("/page"), Authorship::UserPasted),
+                    &ctx,
+                )
+                .await;
+            assert_eq!(
+                fetched.outcome(),
+                WebLookupOutcome::Completed,
+                "the fetch must reach the wire, or its missing header proves \
+                 nothing: {:?}",
+                fetched.detail()
+            );
+            assert_eq!(elsewhere.requests().len(), 1);
+            assert!(
+                !elsewhere.carried_auth(0),
+                "the search credential travelled to a host that is not the search \
+                 endpoint; request head:\n{}",
+                elsewhere.requests()[0]
+            );
+            assert_eq!(
+                search.requests().len(),
+                1,
+                "and the endpoint saw nothing new"
+            );
+
+            // --- leg 3: a fetch AT the endpoint's origin is refused --------
+            //
+            // The origin match is the one case where the transport's binding
+            // would have attached the key to a fetch. The seam closes it a layer
+            // earlier, so the guarantee is now a refusal rather than a header
+            // assertion — and the refusal is what is asserted.
+            let deputy = egress
+                .lookup(
+                    &LookupRequest::fetch(search.url("/api"), Authorship::UserPasted),
+                    &ctx,
+                )
+                .await;
+            assert_eq!(deputy.outcome(), WebLookupOutcome::RefusedDomain);
+            assert_eq!(
+                deputy.detail(),
+                &LookupDetail::SearchEndpointFetch,
+                "a fetch aimed at the search origin must be refused as one"
+            );
+            assert_eq!(
+                search.requests().len(),
+                1,
+                "a refusal that reached the endpoint is not a refusal"
+            );
+
+            // --- leg 4: no key reference, no credential -------------------
+            let unauthenticated = CaptureServer::bind().await;
+            let bare_endpoint = unauthenticated.url("/api");
+            let bare = searching_runtime(&bare_endpoint, None, &engine);
+            let bare_config = bare.config.lock().expect("config mutex").clone();
+            let bare_router = router_for(&bare);
+            let bare_egress = bare
+                .web_lookup_egress(&bare_router, &bare_config, &events, &session)
+                .expect("the lookup choke point must build");
+            let bare_taint = bare.web_taint_view();
+            let bare_ctx = LookupContext::new(session, bare_taint.as_ref(), &allow_any_host)
+                .with_search_endpoint(&bare_endpoint);
+            let unauthenticated_search = bare_egress
+                .lookup(
+                    &LookupRequest::search("tokio task pinning", Authorship::ModelComposed),
+                    &bare_ctx,
+                )
+                .await;
+            assert_eq!(
+                unauthenticated_search.outcome(),
+                WebLookupOutcome::Completed
+            );
+            assert_eq!(unauthenticated.requests().len(), 1);
+            assert!(
+                !unauthenticated.carried_auth(0),
+                "an endpoint with no `search_key_ref` must be reached without a \
+                 credential — an unauthenticated backend is a legitimate \
+                 configuration; request head:\n{}",
+                unauthenticated.requests()[0]
+            );
+        }
     }
 
     /// REQ-563 TASK-076 — the daemon's half of the harness web tool: whether it
@@ -13285,8 +13583,11 @@ provider_id = "on-device"
     /// the link that calls the link needs its own mutation).
     mod web_tool_wiring {
         use super::*;
+        use crate::classify::test_support::CountingEngine;
         use crate::harness::tools::WEB_TOOL_NAME;
         use teton_core::config::WebTier;
+        use teton_core::{ProviderCapabilities, ToolCallTier};
+        use teton_inference::{Completion, Engine, EngineError, GenParams};
 
         fn runtime_at(tier: WebTier) -> Arc<DaemonRuntime> {
             let runtime = DaemonRuntime::minimal();
@@ -13296,6 +13597,305 @@ provider_id = "on-device"
                 config.web.search_endpoint = Some("https://search.example/api".to_owned());
             }
             Arc::new(runtime)
+        }
+
+        // -- the whole turn path, twice (REQ-563 verify wave 2 handoffs) ----
+
+        /// The destination the scripted model asks for.
+        ///
+        /// A loopback address, so the lookup is refused by the SSRF floor at the
+        /// seam — *after* consent, which is the gate these tests are about — and
+        /// no socket is opened. `run_prompt_turn` builds the real
+        /// `web_lookup_egress` over the real `HttpTransport`, so "nothing is
+        /// dialled" has to be a property of the destination rather than of a
+        /// substituted transport.
+        const LOOPBACK_URL: &str = "http://127.0.0.1:9/tokio";
+
+        /// An engine that calls `web` once per turn and then finishes.
+        ///
+        /// Keyed on **what is already in the rendered prompt** rather than on a
+        /// call counter: `run_prompt_turn` also spends this engine on the route
+        /// classification and the session title, so a positional script would be
+        /// consumed by duties instead of by the turn. The marker is the untrusted
+        /// envelope the loop folds every `web` result into (an error result
+        /// included), which exists only after the call has happened.
+        struct WebThenDoneEngine;
+
+        impl Engine for WebThenDoneEngine {
+            fn model_id(&self) -> &str {
+                "web-then-done"
+            }
+
+            fn complete(
+                &self,
+                prompt: &str,
+                _params: &GenParams,
+                _on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                let text = if prompt.contains("<tool-result") {
+                    "Done.".to_owned()
+                } else {
+                    format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{LOOPBACK_URL}\"}}}}")
+                };
+                Ok(Completion {
+                    text,
+                    prompt_tokens: 0,
+                    completion_tokens: 1,
+                })
+            }
+        }
+
+        /// Every tier bound to a declared local provider, so the turn is served
+        /// on this machine rather than resolving to a remote endpoint nothing is
+        /// listening on — the binding `pty_e2e.rs`'s web fixture makes, for the
+        /// same reason.
+        ///
+        /// `tool_call_tier` is the axis the capped-profile test flips: the router
+        /// derives the harness profile from it, and `Degraded` is what caps
+        /// `max_tools`.
+        fn local_only_config(tool_call_tier: ToolCallTier) -> Config {
+            Config {
+                providers: vec![ModelProvider {
+                    id: "local".to_owned(),
+                    kind: ProviderKind::Local,
+                    endpoint: None,
+                    model: None,
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities {
+                        tool_call_tier,
+                        ..ProviderCapabilities::default()
+                    },
+                }],
+                tiers: Tier::ALL
+                    .iter()
+                    .map(|tier| TierBinding {
+                        tier: *tier,
+                        provider_id: "local".to_owned(),
+                        fallback_id: None,
+                    })
+                    .collect(),
+                ..Config::default()
+            }
+        }
+
+        /// A daemon serving `config` from `engine`, with `[web] tier` set.
+        fn turn_runtime(
+            mut config: Config,
+            web_tier: WebTier,
+            engine: Arc<Mutex<dyn Engine>>,
+        ) -> Arc<DaemonRuntime> {
+            config.web.tier = web_tier;
+            let runtime = DaemonRuntime::minimal();
+            *runtime.config.lock().expect("config mutex") = config;
+            runtime.engine.install("scripted".to_owned(), engine);
+            runtime.local_available.store(true, Ordering::SeqCst);
+            Arc::new(runtime)
+        }
+
+        /// Answer every `permission_request` with `first`, then with `rest`,
+        /// counting what was asked. A prompt past the end of the script is
+        /// cancelled, which the gate reads as a denial — visible in the count
+        /// either way, which is the point.
+        fn answer_permission_prompts(
+            runtime: &Arc<DaemonRuntime>,
+            events: &Arc<EventBus>,
+            script: Vec<&'static str>,
+        ) -> (Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+            let mut sub = events.subscribe(64);
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&asked);
+            let pending = Arc::clone(&runtime.pending);
+            let handle = tokio::spawn(async move {
+                let mut script = script.into_iter();
+                while let Some(envelope) = sub.recv().await {
+                    let Event::PermissionRequest(request) = envelope.event else {
+                        continue;
+                    };
+                    seen.lock()
+                        .expect("prompt log mutex")
+                        .push(request.tool_name.clone());
+                    let outcome = match script.next() {
+                        Some(option_id) => teton_protocol::methods::PermissionOutcome::Selected {
+                            option_id: option_id.to_owned(),
+                        },
+                        None => teton_protocol::methods::PermissionOutcome::Cancelled,
+                    };
+                    pending.resolve(&request.request_id, outcome);
+                }
+            });
+            (asked, handle)
+        }
+
+        /// **"Allow for this session" is a promise about the session, observed
+        /// across two whole `run_prompt_turn` calls** (REQ-563 BR-3, verify M-5).
+        ///
+        /// The unit half of this — `permission_gate_for` returning the same
+        /// `Arc` twice — is pinned next door. What it cannot see is whether the
+        /// *turn path* uses that gate: a `run_prompt_turn` that built its own
+        /// gate, or rebuilt the tool with a fresh one, would satisfy the pointer
+        /// assertion and still re-ask. So this drives the real entry point twice,
+        /// with a scripted model that calls `web` in both turns, and counts the
+        /// questions on the bus.
+        ///
+        /// The falsification leg is the same pair of turns answered
+        /// `allow_once`, which asks twice — so "exactly one" is a reading of the
+        /// grant's scope and not of a fixture that can only ever prompt once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn one_session_grant_covers_every_later_run_prompt_turn() {
+            for (script, expected, why) in [
+                (
+                    vec!["allow_always"],
+                    1,
+                    "an allow-for-this-session grant must cover the next turn",
+                ),
+                (
+                    vec!["allow_once", "allow_once"],
+                    2,
+                    "allow-once must NOT cover the next turn — otherwise the count \
+                     above measures a fixture that cannot ask twice",
+                ),
+            ] {
+                let runtime = turn_runtime(
+                    local_only_config(ToolCallTier::Native),
+                    WebTier::FetchAnyUrl,
+                    Arc::new(Mutex::new(WebThenDoneEngine)),
+                );
+                let events = Arc::new(EventBus::new());
+                let (asked, answering) = answer_permission_prompts(&runtime, &events, script);
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                for turn in 0..2 {
+                    runtime
+                        .run_prompt_turn(
+                            &events,
+                            &sessions,
+                            session.session_id.clone(),
+                            session.mode,
+                            None,
+                            None,
+                            "what does the tokio page say about task pinning?".to_owned(),
+                        )
+                        .await
+                        .unwrap_or_else(|e| panic!("turn {turn} failed: {e:?}"));
+                }
+                answering.abort();
+
+                // Non-vacuity: the model really did reach the tool on both turns.
+                // One attempt, one row (BR-7) — so two turns are two rows, and a
+                // turn whose lookup never happened would show up here first.
+                let rows = runtime.ledger.all_web_lookups().expect("read the ledger");
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "the scripted model must have looked something up in BOTH \
+                     turns, or the prompt count below is about one turn: {rows:?}"
+                );
+
+                let asked = asked.lock().expect("prompt log mutex").clone();
+                assert_eq!(asked.len(), expected, "{why}; prompts: {asked:?}");
+                for key in &asked {
+                    assert_eq!(
+                        key,
+                        crate::harness::tools::web::PERMISSION_KEY_FETCH_ANY_URL,
+                        "the question was asked under the wrong grant key"
+                    );
+                }
+            }
+        }
+
+        /// **BR-6: a profile whose `max_tools` cut the web tool says so in the
+        /// turn's own result** (REQ-563 verify wave 2).
+        ///
+        /// `DEGRADED_MAX_TOOLS` is 5 and the builtin set is 5, so on any provider
+        /// that is not a `Native` tool-caller the web tool — registered last,
+        /// precisely so it is cut first (D-1) — is never exposed. That is a fact
+        /// with no event behind it (nothing happened), so it rides
+        /// `PromptTurnResult::web_unavailable_in_profile`, and the CLI folds it
+        /// into the status row (`WebState::observe_profile_exposure`, pinned in
+        /// `session_ui.rs`).
+        ///
+        /// Both legs run the *same* turn against the *same* daemon, differing
+        /// only in the provider's declared `tool_call_tier` — so the flag is
+        /// reading the profile and not the `[web]` table.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_capped_profile_reports_the_web_tool_as_unavailable_for_the_turn() {
+            for (tool_call_tier, capped) in [
+                (ToolCallTier::Degraded, true),
+                (ToolCallTier::Native, false),
+            ] {
+                let runtime = turn_runtime(
+                    local_only_config(tool_call_tier),
+                    WebTier::FetchAnyUrl,
+                    CountingEngine::answering("All set.").handle(),
+                );
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                let result = runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        "summarize the plan".to_owned(),
+                    )
+                    .await
+                    .expect("the turn completes");
+
+                assert_eq!(
+                    result.web_unavailable_in_profile, capped,
+                    "a `{tool_call_tier:?}` tool-caller reported the wrong web \
+                     exposure for the turn"
+                );
+            }
+        }
+
+        /// …and the same daemon with `[web] tier = off` reports nothing, because
+        /// there is no capability to have been cut.
+        ///
+        /// The discriminating half of the test above: a flag that were simply
+        /// "this profile caps tools" would fire here too, and the status row
+        /// would tell a user who never opted in that a capability they do not
+        /// have is unavailable.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_capped_profile_reports_nothing_when_web_lookup_is_off() {
+            let runtime = turn_runtime(
+                local_only_config(ToolCallTier::Degraded),
+                WebTier::Off,
+                CountingEngine::answering("All set.").handle(),
+            );
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase");
+
+            let result = runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session.session_id.clone(),
+                    session.mode,
+                    None,
+                    None,
+                    "summarize the plan".to_owned(),
+                )
+                .await
+                .expect("the turn completes");
+
+            assert!(
+                !result.web_unavailable_in_profile,
+                "a machine that never opted in has no web capability for a \
+                 profile to have taken away (BR-1)"
+            );
         }
 
         /// **BR-1 / AC-1's structural half, through the real registry builder.**

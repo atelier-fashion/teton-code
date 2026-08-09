@@ -363,7 +363,7 @@ mod tests {
             let mut surface = PlainSurface::new(&mut buf);
             surface.line(
                 LineKind::Prompt,
-                "permission requested: web_fetch — fetch https://good.example\
+                "permission requested: web_fetch_any_url — fetch https://good.example\
                  \x1b[2K\x1b[1Afetch https://evil.example",
             );
         }
