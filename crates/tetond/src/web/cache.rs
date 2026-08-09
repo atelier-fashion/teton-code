@@ -38,6 +38,24 @@
 //! Storing the ttl is what makes the second half possible; without it the
 //! recorded fact would be decoration.
 //!
+//! ## The store is bounded, and bounding it is a security property
+//!
+//! A cache that only ever grows is a way for whatever the model reads to fill a
+//! user's disk — the page count is chosen by the pages, not by anyone here — and
+//! it is also a way for the record of what was fetched to outlive by months the
+//! window in which it was useful. So every [`WebCache::put`] ends by enforcing
+//! two bounds over the directory: entries past the configured freshness window
+//! are unlinked (they could never be served again — see [`WebCache::is_fresh`]),
+//! and if the total still exceeds [`MAX_TOTAL_BYTES`] the oldest are dropped
+//! until it does not.
+//!
+//! Enforcement rides on `put` rather than on a timer because `put` is the only
+//! event that can make the directory bigger, and a bound checked exactly when it
+//! can be breached needs no thread, no schedule, and no second component that
+//! could be missing. The pass reads directory metadata only, never entry bodies:
+//! a file's mtime is set by the same write that stamps its `fetched_at_secs`, so
+//! ordering by one is ordering by the other at no I/O cost.
+//!
 //! ## Every failure is a miss
 //!
 //! [`WebCache::get`] returns `Option`, not `Result`. An unreadable file, a
@@ -59,6 +77,33 @@ use super::normalize_url;
 /// The cache directory's name under the daemon data dir — a sibling of
 /// `cost.db`, not a child of it.
 pub const CACHE_DIR_NAME: &str = "web-cache";
+
+/// The ceiling on everything the cache holds, in bytes.
+///
+/// Not a tuning knob and deliberately not a config key: the number a user would
+/// want to set is the freshness window (`cache_ttl_secs`), which is the one that
+/// changes what the cache *does*. This is the backstop for the case the window
+/// cannot bound — a great many documents fetched inside one window — and a
+/// second knob whose only effect is "how much disk may this quietly take" is a
+/// knob nobody can set correctly without knowing the page sizes in advance.
+///
+/// 64 MiB is roughly four thousand reduced pages at the reduction cap, which is
+/// far more than a freshness window's worth of lookups and small enough that
+/// nobody notices it in a state directory.
+const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How long an abandoned temporary file may sit before the next write removes
+/// it.
+///
+/// The only way one survives is a process that died between creating its temp
+/// and renaming it over the entry, so this is not a race window to be won — it
+/// is the age past which "still being written" stops being a possible
+/// explanation. An hour is well past that for a write of at most the reduction
+/// cap, and being generous costs one stale file.
+const ORPHAN_TEMP_MAX_AGE_SECS: u64 = 3_600;
+
+/// The extension [`write_entry`]'s temporary files end in.
+const TEMP_SUFFIX: &str = "part";
 
 /// One cached document.
 ///
@@ -193,18 +238,26 @@ impl WebCache {
     /// [`CacheError`] if the directory cannot be created or the entry cannot be
     /// encoded or written. A caller may reasonably log and continue: a cache
     /// write that fails costs a later refetch and nothing else.
+    ///
+    /// Enforcing the store's bounds afterwards is deliberately **not** part of
+    /// that result: the entry is on disk either way, and a failure to unlink
+    /// someone else's stale file is not a failed write to report to a caller
+    /// whose document was stored.
     pub fn put(&self, url: &str, content: &str) -> Result<(), CacheError> {
         if !self.is_enabled() {
             return Ok(());
         }
+        let now = now_secs();
         let entry = CacheEntry {
             content: content.to_owned(),
-            fetched_at_secs: now_secs(),
+            fetched_at_secs: now,
             ttl_secs: self.ttl_secs,
         };
         let encoded = serde_json::to_vec(&entry).map_err(|_| CacheError::Encode)?;
         prepare_dir(&self.dir)?;
-        write_entry(&self.path_for(url), &encoded)
+        write_entry(&self.path_for(url), &encoded)?;
+        enforce_bounds(&self.dir, self.ttl_secs, MAX_TOTAL_BYTES, now);
+        Ok(())
     }
 
     /// Drop the entry for `url` — the explicit-refresh path (BR-12: "an explicit
@@ -304,10 +357,23 @@ fn write_entry(path: &Path, encoded: &[u8]) -> Result<(), CacheError> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    // The pid keeps two daemons (or a test and a daemon) sharing a data dir from
-    // interleaving into one temporary file. Within a process, a rename is atomic
-    // and the loser simply wins the file back on its next fetch.
-    let temp = path.with_extension(format!("{}.part", std::process::id()));
+    // Every temporary file is named for exactly one write: the pid separates two
+    // processes sharing a data dir, and the counter separates two writes inside
+    // one process.
+    //
+    // The counter is not decoration. Two concurrent `put`s of the same URL used
+    // to name the same `<digest>.<pid>.part`, and `File::create` truncates — so
+    // one writer's `write_all` landed in the other's file, and after the first
+    // rename consumed it the second renamed a path that no longer existed and
+    // failed `NotFound`. Neither writer "wins the file back": the entry on disk
+    // is whichever interleaving happened to finish, and the loser reports an I/O
+    // error for a write that was never racing over anything but a name. A name
+    // per write removes the sharing rather than the symptom, and leaves the
+    // rename as the only place two writers meet — which is where atomicity
+    // already lives.
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("{}-{seq}.{TEMP_SUFFIX}", std::process::id()));
     {
         let mut file = std::fs::File::create(&temp)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -320,6 +386,84 @@ fn write_entry(path: &Path, encoded: &[u8]) -> Result<(), CacheError> {
             Err(err.into())
         }
     }
+}
+
+/// Bring the cache directory back under both of its bounds, best-effort.
+///
+/// Runs after every successful write (see the module doc for why there and not
+/// on a timer). Three passes' worth of work in one walk of the directory:
+///
+/// 1. **Abandoned temporaries** — anything ending in `.part` older than
+///    [`ORPHAN_TEMP_MAX_AGE_SECS`]. Not counted toward the size bound and never
+///    evicted for it: a temp file young enough to be someone's live write must
+///    not be removed by age *or* by pressure, and one old enough is not a live
+///    write at all.
+/// 2. **Entries past the window** — `mtime + ttl_secs` in the past. [`WebCache::get`]
+///    would refuse these, so keeping them spends the size bound on bytes nobody
+///    can be served.
+/// 3. **Oldest-first eviction**, only if what survives still exceeds
+///    `max_total_bytes`.
+///
+/// Every failure is ignored on purpose. A directory that cannot be read, a file
+/// that vanished under a concurrent writer, a permission the daemon does not
+/// have — each means "this pass tidied less than it hoped", and none of them
+/// makes the entry that was just written any less stored. Reporting them upward
+/// would hand the caller an error whose only honest handling is to ignore it.
+fn enforce_bounds(dir: &Path, ttl_secs: u64, max_total_bytes: u64, now: u64) {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // (age-ordering key, size, path) for every entry still eligible to be served.
+    let mut live: Vec<(u64, u64, PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for item in listing.flatten() {
+        let path = item.path();
+        let Ok(meta) = item.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let written_at = written_at_secs(&meta, now);
+        let age = now.saturating_sub(written_at);
+        if path.extension().is_some_and(|ext| ext == TEMP_SUFFIX) {
+            if age >= ORPHAN_TEMP_MAX_AGE_SECS {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        if age >= ttl_secs {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        total = total.saturating_add(meta.len());
+        live.push((written_at, meta.len(), path));
+    }
+    if total <= max_total_bytes {
+        return;
+    }
+    live.sort_unstable_by_key(|(written_at, _, _)| *written_at);
+    for (_, size, path) in live {
+        if total <= max_total_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
+/// When `meta`'s file was written, in Unix seconds, falling back to `now`.
+///
+/// The fallback direction is "assume it was just written", which is the one that
+/// cannot cascade: a filesystem that reports no mtime would otherwise make every
+/// file look infinitely old and turn each write into a wipe of the store. Treated
+/// as new, such a file is still bounded — by the size cap, which needs no clock.
+fn written_at_secs(meta: &std::fs::Metadata, now: u64) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+        .map_or(now, |since_epoch| since_epoch.as_secs())
 }
 
 #[cfg(test)]
@@ -337,6 +481,31 @@ mod tests {
     }
 
     const URL: &str = "https://example.com/docs/page?x=1";
+
+    /// Backdate a file's mtime, which is what [`enforce_bounds`] reads as "when
+    /// this was fetched". Cheaper and far more precise than sleeping out a real
+    /// window, and it lets the ordering tests state exact ages.
+    fn set_written_at(path: &Path, secs: u64) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for set_times");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+        )
+        .expect("set mtime");
+    }
+
+    /// The names currently in the cache directory, sorted.
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read cache dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
 
     #[test]
     fn a_fresh_entry_round_trips_without_touching_the_network_layer() {
@@ -640,6 +809,155 @@ mod tests {
             cache.get("https://other.com/a").is_none(),
             "a different host is a different document"
         );
+    }
+
+    /// Two writers in one process must not share a temporary file. They used to:
+    /// the temp name was `<digest>.<pid>.part` for every write, `File::create`
+    /// truncates, and so one writer's bytes landed in the other's file and the
+    /// writer that renamed second got `NotFound` for a write it had completed.
+    ///
+    /// The same URL from several threads is the shape that produced it — one
+    /// digest, one temp name — and 256 writes is well past the point the old
+    /// code survived.
+    #[test]
+    fn concurrent_writes_of_one_url_do_not_share_a_temporary_file() {
+        let base = scratch_base("concurrent");
+        let cache = WebCache::new(&base, 900);
+        prepare_dir(cache.dir()).expect("dir");
+
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    for round in 0..32 {
+                        cache
+                            .put(URL, &format!("worker {worker} round {round}"))
+                            .expect("a concurrent put must not fail on a shared temp name");
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker thread");
+        }
+
+        // Whichever write landed last is the entry, and it is a *whole* one —
+        // not two writers' bytes interleaved into one file.
+        let hit = cache.get(URL).expect("an entry survives the race");
+        assert!(hit.content.starts_with("worker "), "{:?}", hit.content);
+        // And nothing was left behind: every temporary was consumed by its own
+        // rename.
+        assert_eq!(
+            dir_names(cache.dir()).len(),
+            1,
+            "{:?}",
+            dir_names(cache.dir())
+        );
+    }
+
+    /// The freshness window bounds what can be *served*; on its own it bounds
+    /// nothing on disk, because a stale entry is left where it lies (the read
+    /// path deliberately does not write). The next write is what collects them.
+    #[test]
+    fn a_write_unlinks_entries_that_are_past_the_window() {
+        let base = scratch_base("sweep-stale");
+        let cache = WebCache::new(&base, 900);
+        cache.put("https://example.com/old", "old").expect("put");
+        cache.put("https://example.com/new", "new").expect("put");
+        let old = cache.path_for("https://example.com/old");
+        set_written_at(&old, now_secs() - 7_200);
+
+        cache
+            .put("https://example.com/third", "third")
+            .expect("put");
+
+        assert!(!old.exists(), "an unservable entry must not hold disk");
+        assert_eq!(
+            cache.get("https://example.com/new").expect("hit").content,
+            "new"
+        );
+        assert_eq!(
+            cache.get("https://example.com/third").expect("hit").content,
+            "third"
+        );
+    }
+
+    /// The size bound is the one the freshness window cannot supply: a great
+    /// many documents fetched inside one window. Oldest first, until under the
+    /// cap and no further — evicting the whole store to satisfy it would turn a
+    /// bound into a wipe.
+    #[test]
+    fn the_oldest_entries_are_evicted_until_the_store_is_under_its_total_cap() {
+        let base = scratch_base("size-cap");
+        let cache = WebCache::new(&base, 900);
+        prepare_dir(cache.dir()).expect("dir");
+        let now = now_secs();
+        let payload = vec![b'x'; 1_000];
+        let paths: Vec<PathBuf> = (0..10u64)
+            .map(|n| {
+                let path = cache.dir().join(format!("{n:064x}"));
+                std::fs::write(&path, &payload).expect("write");
+                // Ascending age keys: index 0 is the oldest.
+                set_written_at(&path, now - 100 + n);
+                path
+            })
+            .collect();
+
+        enforce_bounds(cache.dir(), 900, 4_000, now);
+
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(
+                path.exists(),
+                index >= 6,
+                "entry {index} (1 KiB each, 10 KiB stored, 4 KiB cap)"
+            );
+        }
+    }
+
+    /// Under the cap, nothing is evicted — the bound is a ceiling, not a target
+    /// to shrink toward.
+    #[test]
+    fn a_store_inside_its_cap_loses_nothing() {
+        let base = scratch_base("under-cap");
+        let cache = WebCache::new(&base, 900);
+        prepare_dir(cache.dir()).expect("dir");
+        let now = now_secs();
+        for n in 0..4u64 {
+            let path = cache.dir().join(format!("{n:064x}"));
+            std::fs::write(&path, vec![b'x'; 1_000]).expect("write");
+            set_written_at(&path, now - 100 + n);
+        }
+        enforce_bounds(cache.dir(), 900, 64 * 1024, now);
+        assert_eq!(dir_names(cache.dir()).len(), 4);
+    }
+
+    /// A temporary file from a process that died between `create` and `rename`
+    /// would otherwise sit there forever. It is collected by age, never by size
+    /// pressure: a young `.part` may be a live write, and removing one would
+    /// recreate the collision the unique naming just closed.
+    #[test]
+    fn an_abandoned_temporary_is_collected_but_a_live_one_is_left_alone() {
+        let base = scratch_base("orphan-temp");
+        let cache = WebCache::new(&base, 900);
+        prepare_dir(cache.dir()).expect("dir");
+        let now = now_secs();
+        let abandoned = cache.dir().join(format!("{:064x}.999-0.part", 1));
+        let live = cache.dir().join(format!("{:064x}.999-1.part", 2));
+        std::fs::write(&abandoned, b"half-written").expect("write");
+        std::fs::write(&live, b"in flight").expect("write");
+        set_written_at(&abandoned, now - ORPHAN_TEMP_MAX_AGE_SECS - 60);
+
+        cache.put(URL, "text").expect("put");
+
+        assert!(
+            !abandoned.exists(),
+            "an hour-old temporary is not a live write"
+        );
+        assert!(
+            live.exists(),
+            "a temporary young enough to be in flight is untouched"
+        );
+        assert!(cache.get(URL).is_some());
     }
 
     #[test]

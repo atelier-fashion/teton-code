@@ -545,6 +545,16 @@ impl WebTool {
             LookupDetail::RedirectRefused => {
                 "the destination redirected outside the configured allowlist".to_owned()
             }
+            // `..` rather than naming the class: which non-global range a
+            // destination fell in is a fact for the ledger row and the
+            // `web_lookup` event, not a distinction the model can act on.
+            LookupDetail::RefusedAddress { .. } => {
+                "the destination is not a public internet address".to_owned()
+            }
+            LookupDetail::SearchEndpointFetch => {
+                "the configured search backend is reachable through a web search, not a fetch"
+                    .to_owned()
+            }
             // BR-13's notice names the cause and the effect, because a
             // restriction the user cannot see is one they cannot lift.
             LookupDetail::TaintRestricted => "this session has read privacy-boundary content, so \

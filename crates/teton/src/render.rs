@@ -115,13 +115,41 @@ pub fn stdout_surface() -> PlainSurface<io::Stdout> {
     PlainSurface::new(io::stdout())
 }
 
+/// Replace every control character in `text` with a space, keeping tabs.
+///
+/// A terminal reads control characters as *commands*, so text that reaches one
+/// unfiltered is text that can move the cursor, erase rows, and rewrite what the
+/// user already read. That is not a hypothetical for this surface: a permission
+/// description carries a model-composed URL (REQ-563), and
+/// `…https://good.example\x1b[2K\x1b[1A…https://evil.example` redraws the very
+/// line that asked the user to approve a host — the consent prompt then displays
+/// one destination and authorizes another. Neutralizing the escapes leaves the
+/// characters visible as text, which is the honest rendering: the page really
+/// did contain them.
+///
+/// Tabs are kept because they are the one control character that is ordinary
+/// *content* here — a diff line of indented source is a normal thing to render —
+/// and because a tab advances the cursor within a row exactly as a space does.
+/// It cannot move up, erase, or start a new line, which is the whole capability
+/// this is removing.
+///
+/// This is LESSON-474's rule again — sanitize where the parser is. The parser is
+/// the terminal, so the guard belongs at the writer that feeds it rather than at
+/// each of the ~180 call sites that compose a line, any one of which could
+/// forget.
+fn defused(text: &str) -> String {
+    text.chars()
+        .map(|c| if c == '\t' || !c.is_control() { c } else { ' ' })
+        .collect()
+}
+
 impl<W: Write> Surface for PlainSurface<W> {
     fn line(&mut self, kind: LineKind, text: &str) {
         // Close any open streamed line first so the notice starts clean.
         if !self.at_line_start {
             let _ = writeln!(self.out);
         }
-        let _ = writeln!(self.out, "{}{}", Self::prefix(kind), text);
+        let _ = writeln!(self.out, "{}{}", Self::prefix(kind), defused(text));
         self.at_line_start = true;
     }
 
@@ -136,18 +164,12 @@ impl<W: Write> Surface for PlainSurface<W> {
     /// output is still accurate.
     fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) {
         let prefix = Self::prefix(kind);
-        // A repaint claims exactly one row, and the cursor restore assumes it.
-        // `line()` can afford to pass text through — a stray newline there just
-        // makes two log lines — but here it would scroll the frame out from
-        // under `\x1b[u` and leave the entry area shredded. The text is
-        // daemon-supplied (a model id lands in it), which is the same trust
-        // level `render_lifecycle` already prints, but the *consequence* of a
-        // control character differs, so the guard belongs at this writer rather
-        // than at the source (LESSON-474: sanitize where the parser is).
-        let single_row: String = text
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
+        // A repaint claims exactly one row, and the cursor restore assumes it: a
+        // newline here would scroll the frame out from under `\x1b[u` and leave
+        // the entry area shredded. That is the sharper consequence, but it is
+        // not a different rule — [`defused`] is what `line()` uses too, for the
+        // reason written there.
+        let single_row = defused(text);
         let _ = write!(
             self.out,
             "\x1b[s\x1b[{rows_up}A\r\x1b[K{prefix}{single_row}\x1b[u"
@@ -327,6 +349,57 @@ mod tests {
             "the default repaint must be a no-op: {:?}",
             bare.0
         );
+    }
+
+    /// A consent prompt that can be redrawn by the thing it is asking about is
+    /// not a consent prompt. A permission description carries a model-composed
+    /// URL (REQ-563), and an escape sequence in it used to reach the terminal
+    /// intact — enough to erase the row naming the host and print a different
+    /// one over it, so the user approves what they were never shown.
+    #[test]
+    fn a_line_cannot_redraw_the_prompt_it_is_part_of() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            surface.line(
+                LineKind::Prompt,
+                "permission requested: web_fetch — fetch https://good.example\
+                 \x1b[2K\x1b[1Afetch https://evil.example",
+            );
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains('\x1b'),
+            "an escape sequence reached the terminal: {out:?}"
+        );
+        // Exactly one row was claimed — the trailing newline `line()` writes and
+        // nothing else.
+        assert_eq!(out.matches('\n').count(), 1, "{out:?}");
+        // Neutralized, not censored: the text really was on the page, and the
+        // user is better served seeing it than seeing a gap.
+        assert!(out.contains("good.example"), "{out:?}");
+        assert!(out.contains("evil.example"), "{out:?}");
+    }
+
+    /// The C0 set is not just `ESC`: a carriage return alone reprints over the
+    /// line's own start, and a backspace walks back over what was written.
+    #[test]
+    fn every_control_character_a_line_carries_is_neutralized_except_tab() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            surface.line(LineKind::Diff, "+ \tif x {\r\x08\x1b[1A\u{9b}2Kelse {");
+        }
+        let out = String::from_utf8(buf).unwrap();
+        for banned in ['\r', '\x08', '\x1b', '\u{9b}'] {
+            assert!(
+                !out.contains(banned),
+                "{banned:?} survived into a rendered line: {out:?}"
+            );
+        }
+        // A tab is content, not a command: a diff of indented source must still
+        // look indented.
+        assert!(out.contains("+ \tif x {"), "{out:?}");
     }
 
     #[test]

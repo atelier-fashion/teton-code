@@ -333,6 +333,7 @@ mod tests {
         assert!(!surface.any_line_contains(LineKind::Cost, "no price on file"));
         assert!(!surface.any_line_contains(LineKind::Cost, "unpriced"));
     }
+
     /// REQ-563 AC-6: a session with recorded lookups shows the count and the
     /// bytes. Both numbers, because "3 lookups" without a size says nothing
     /// about what came back and a size without a count says nothing about how

@@ -21,17 +21,35 @@
 //!    `UserPasted` URL proceeds: the user authored those bytes. The refusal
 //!    lifts only through the session override, which is a client RPC — see
 //!    [`TaintView::is_overridden`].
-//! 3. **The search redaction gate** (BR-14, D-6). Every `Search` query is
-//!    scanned before a byte leaves, whatever `[privacy] redact` says, and a
+//! 3. **Destination policy** — the two things about *where* a lookup points
+//!    that no earlier gate can have checked:
+//!    * the [address class](AddressClass) of the destination. A model-composed
+//!      fetch may not aim at loopback, link-local, private or unique-local
+//!      space, and **no** hop of any chain may, whoever authored the original
+//!      URL. This is the SSRF floor: an allowlist is a statement about names,
+//!      and `127.0.0.1` defeats one by not being a name anybody thought to
+//!      list.
+//!    * the **search endpoint's origin**, which a `Fetch` may not target at
+//!      all. The search key is bound to that origin by the transport
+//!      ([`LookupContext::with_search_endpoint`]), so a fetch aimed there would
+//!      carry the credential *and* skip the unconditional search scan — the
+//!      search tier through the fetch tier's door.
+//! 4. **The redaction gates** (BR-2, BR-13, BR-14, D-6). Every `Search` query
+//!    is scanned before a byte leaves, whatever `[privacy] redact` says, and a
 //!    search with **no gate installed at all** is refused rather than sent
-//!    unscanned. `Fetch` is never scanned by this gate (BR-2's parity clause:
-//!    fetch tiers get provider-payload parity, search gets the unconditional
-//!    scan).
-//! 4. **The wire**, through the transport this choke point already owns.
+//!    unscanned. Every `Fetch` URL is scanned by the *parity* gate — the one
+//!    `[privacy] redact` installs, on the same switch and with the same gate
+//!    the provider payload path uses — and when `redact` is off, neither the
+//!    provider payload nor the fetch URL is scanned. Parity means parity.
+//! 5. **The wire**, through the transport this choke point already owns, under
+//!    a total wall-clock bound ([`LOOKUP_TOTAL_TIMEOUT`]).
 //!
 //! The order is the same load-bearing one `send()` uses: the cheap refusal
 //! returns before the model call, so a lookup nobody was going to allow costs
-//! zero inferences (AC-11's argument, applied to the lookup path).
+//! zero inferences (AC-11's argument, applied to the lookup path). That is why
+//! destination policy sits *above* the scan and not below it: a destination this
+//! seam will refuse is refused before an inference is spent deciding whether its
+//! URL contains a secret.
 //!
 //! ## What this seam does not do
 //!
@@ -44,7 +62,8 @@
 //! `Provenance` no caller can honestly supply would be a guard on a distinction
 //! that cannot occur. [`WebLookupOutcome::BlockedPrivacy`] is still minted, but
 //! from the one place it can genuinely arise: an inner transport that is itself
-//! guarded and refuses.
+//! guarded and refuses — see [`outcome_for`] for why the variant survives with
+//! no production producer.
 //!
 //! ## A blocked lookup does not taint the session
 //!
@@ -57,7 +76,8 @@
 //! and the daemon refused to send establishes nothing about the *context* the
 //! session is holding — which is the fact a pin is a claim about.
 
-use std::time::Instant;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 
@@ -90,6 +110,78 @@ pub const MAX_REDIRECT_HOPS: usize = 3;
 /// memory this daemon spends, and 2 MiB is far past any page the reducer will
 /// keep while still being a bound.
 pub const LOOKUP_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// How long a lookup may spend getting a connection up.
+///
+/// Applied by [`HttpTransport::for_lookup`](super::HttpTransport::for_lookup)
+/// and by nothing else, so the provider `send()` path keeps the behavior it has
+/// always had: a long completion is not a stalled connection, and a bound tuned
+/// for a page fetch would cut one off. Ten seconds is far past any reachable
+/// host's TCP+TLS handshake and short enough that a black-holed destination
+/// fails while the user is still watching.
+pub const LOOKUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The wall-clock bound on **one whole lookup**: redirects, headers and body
+/// read included.
+///
+/// [`LOOKUP_MAX_BODY_BYTES`] bounds how many bytes a destination may make this
+/// daemon hold; it does not bound how *long* it may take to send them. A server
+/// that accepts the connection, returns a 200, and then emits one byte a minute
+/// stays inside every byte cap in this module while parking the turn forever —
+/// a slow loris, aimed at a turn rather than at a socket. So the bound is on
+/// elapsed time, it is enforced at the seam rather than in the client (it has to
+/// hold for every transport this choke point is built over, test doubles
+/// included), and it covers the redirect loop as a whole rather than each hop,
+/// because three hops of 59 seconds each is the same attack.
+///
+/// Expiry is reported as [`TransportError::Timeout`] and therefore as
+/// [`WebLookupOutcome::Offline`]: nothing answered in the time allowed, which is
+/// what "offline" means in this seam's taxonomy (BUG-152). Sixty seconds is
+/// generous for a document fetch and finite, which is the only property that
+/// matters here.
+pub const LOOKUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A destination address class this seam will not send to.
+///
+/// The names are the classes' own (RFC 1122, 1918, 3927, 4193, 4291), not
+/// invented ones, because the refusal a user reads should be checkable against
+/// the thing it names. There is deliberately no `Global` variant: this enum
+/// exists to answer "which non-global class is this", and the global case is
+/// `None` from [`address_class_of_host`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AddressClass {
+    /// `127.0.0.0/8`, `::1`, `localhost`, and the `.localhost` TLD (RFC 6761).
+    /// The daemon's own machine — every service bound to a "safe because it is
+    /// only reachable locally" port.
+    Loopback,
+    /// `169.254.0.0/16`, `fe80::/10`. The cloud metadata endpoint
+    /// (`169.254.169.254`) lives here, which is the single most valuable target
+    /// an SSRF has.
+    LinkLocal,
+    /// RFC 1918: `10/8`, `172.16/12`, `192.168/16`. The user's LAN — routers,
+    /// NAS boxes, printers, an internal wiki.
+    Private,
+    /// RFC 4193 `fc00::/7`: IPv6's answer to RFC 1918.
+    UniqueLocal,
+    /// `0.0.0.0`, `::`. Not a destination; on several stacks it resolves to
+    /// loopback, which is exactly the case a naive check misses.
+    Unspecified,
+}
+
+impl AddressClass {
+    /// A short, content-free name for the class — safe for any surface, since
+    /// it names a *class* and never the destination.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AddressClass::Loopback => "loopback",
+            AddressClass::LinkLocal => "link-local",
+            AddressClass::Private => "private",
+            AddressClass::UniqueLocal => "unique-local",
+            AddressClass::Unspecified => "unspecified",
+        }
+    }
+}
 
 /// Who authored the bytes about to leave (BR-13, architecture D-4).
 ///
@@ -225,13 +317,30 @@ pub struct LookupContext<'a> {
 impl<'a> LookupContext<'a> {
     /// Context for `session_id`.
     ///
-    /// `host_check` is consulted for **every redirect hop and no other URL**.
-    /// Not for the initial destination: that one the caller already cleared
-    /// against the tier and the allowlist, and BR-11 exempts a user-pasted URL
-    /// from the allowlist entirely — so re-running the check here would refuse
-    /// exactly the case the requirement exempts. A redirect target has no such
+    /// `host_check` is consulted for **redirect hops and no other URL**. Not
+    /// for the initial destination: that one the caller already cleared against
+    /// the tier and the allowlist, and BR-11 exempts a user-pasted URL from the
+    /// allowlist entirely — so re-running the check here would refuse exactly
+    /// the case the requirement exempts. A redirect target has no such
     /// exemption, because the user did not choose it and the model did not
     /// either: the *destination* did.
+    ///
+    /// ## Two hops it is not consulted for
+    ///
+    /// * A hop the [address-class policy](AddressClass) already refused. That
+    ///   one is refused whatever the check would have said — a closure bound to
+    ///   an allowlist cannot be asked to have an opinion about `127.0.0.1`,
+    ///   and a permissive closure must not be able to grant one.
+    /// * A hop that stays on the **user's own pasted host** — same host, or a
+    ///   dotted parent or child of it (`example.com` → `www.example.com`). The
+    ///   caller binds this closure to the allowlist, and BR-11 exempts a pasted
+    ///   URL from the allowlist; without this the exemption would survive hop
+    ///   zero and die at the `http → https → www` redirect every second site
+    ///   performs. The bypass is deliberately narrow: it is the *user's own
+    ///   host*, not the user's own registrable domain (no public-suffix list
+    ///   here, so `example.com → evil.example.com` is allowed only because a
+    ///   subdomain of the pasted host is the operator the user chose to trust,
+    ///   while `example.com → evil.com` still goes to the closure).
     pub fn new(
         session_id: impl Into<SessionId>,
         taint: &'a dyn TaintView,
@@ -291,6 +400,26 @@ pub enum LookupDetail {
     /// A redirect pointed somewhere the caller's host check refused, or
     /// somewhere with no readable host at all.
     RedirectRefused,
+    /// The destination is in an address class this seam does not send to
+    /// (SSRF floor — see [`AddressClass`]).
+    ///
+    /// Folds onto [`WebLookupOutcome::RefusedDomain`] rather than adding a wire
+    /// variant: the wire vocabulary is fixed at eight values (D-8) and this is
+    /// a destination refusal, which is what `RefusedDomain` already names. The
+    /// finer reading — *which* class, and so what the user should change —
+    /// lives here, which is the split [`Ending`] documents.
+    RefusedAddress {
+        /// The class that refused it. Names a class, never the destination.
+        class: AddressClass,
+    },
+    /// A `Fetch` aimed at the configured search endpoint's origin.
+    ///
+    /// Its own detail because the thing to say is specific: that origin is
+    /// reachable through the **search tier**, which scans every query and
+    /// carries the endpoint-bound key, and reaching it through the fetch tier
+    /// would have both skipped the scan and taken the credential along.
+    /// Also folds onto [`WebLookupOutcome::RefusedDomain`].
+    SearchEndpointFetch,
     /// Nothing answered: DNS, connect, or timeout.
     Unreachable {
         /// The transport's failure class. Carries no URL and no query — the
@@ -553,10 +682,32 @@ impl<T: Transport> Egress<T> {
     /// below, on the one path out of this function. "Exactly one row and one
     /// event per attempt" is therefore a property of the control flow rather
     /// than of remembering to call a helper on each of nine return sites.
+    ///
+    /// ## And exactly one clock
+    ///
+    /// [`LOOKUP_TOTAL_TIMEOUT`] wraps the whole of `attempt` — every gate, every
+    /// redirect hop and the body read — rather than any single request, because
+    /// the thing being bounded is *the turn's exposure to a remote party's
+    /// pace*, and that is a property of the chain and not of a hop. Expiry
+    /// drops the in-flight future (which cancels the request) and lands on the
+    /// same [`WebLookupOutcome::Offline`] a connect failure does, through the
+    /// same [`outcome_for`] fold. The host such a row names is the destination
+    /// the lookup *intended*, since the cancelled chain took its own record of
+    /// where it had got to with it.
     pub async fn lookup(&self, request: &LookupRequest, ctx: &LookupContext<'_>) -> LookupOutcome {
         let started = Instant::now();
         let kind = request.wire_kind();
-        let (host, ending) = self.attempt(request, ctx).await;
+        let (host, ending) =
+            match tokio::time::timeout(LOOKUP_TOTAL_TIMEOUT, self.attempt(request, ctx)).await {
+                Ok(reached) => reached,
+                Err(_elapsed) => (
+                    self.intended_host(request, ctx),
+                    Ending::refused(
+                        outcome_for(TransportError::Timeout),
+                        detail_for(TransportError::Timeout),
+                    ),
+                ),
+            };
         let bytes_in = ending.body.len() as u64;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -615,7 +766,7 @@ impl<T: Transport> Egress<T> {
 
         match &request.kind {
             LookupKind::Search { query } => self.search(query, ctx).await,
-            LookupKind::Fetch { url } => self.fetch(url, ctx).await,
+            LookupKind::Fetch { url } => self.fetch(url, request.authorship, ctx).await,
         }
     }
 
@@ -634,6 +785,15 @@ impl<T: Transport> Egress<T> {
     /// tree, and following a redirect off it would carry the endpoint-bound key
     /// toward a host the user never named — the exact hazard ADR-004 closed for
     /// providers.
+    ///
+    /// No [address-class](AddressClass) check either, and for the same reason
+    /// the initial fetch destination is exempt when the user pasted it: the
+    /// search endpoint is a value out of the user's own config file. A user who
+    /// writes `search_endpoint = "http://localhost:8888/search"` is running a
+    /// local backend, which is a configuration to support rather than a
+    /// destination to refuse. There is also no model-composed spelling of this
+    /// destination to guard against — the model supplies the query, never the
+    /// endpoint.
     async fn search(&self, query: &str, ctx: &LookupContext<'_>) -> (String, Ending) {
         let endpoint_host = ctx.search_endpoint.and_then(host_of).unwrap_or_default();
 
@@ -705,19 +865,103 @@ impl<T: Transport> Egress<T> {
         (endpoint_host, self.wire(request).await)
     }
 
-    /// Fetch: a bounded, host-checked redirect loop over the transport.
+    /// Fetch: a bounded, destination-checked redirect loop over the transport.
     ///
     /// The transport never follows a redirect itself (ADR-004), so each hop is
-    /// taken here, deliberately, and the caller's host check runs **before**
-    /// every one of them. That ordering is the whole point: a check run after
+    /// taken here, deliberately, and every check runs **before** the request
+    /// that would act on it. That ordering is the whole point: a check run after
     /// the request has gone out is a report, not a gate.
-    async fn fetch(&self, url: &str, ctx: &LookupContext<'_>) -> (String, Ending) {
+    ///
+    /// ## Whose choice was this destination
+    ///
+    /// The loop's checks split on one question, and only that question:
+    ///
+    /// | | initial URL | every redirect hop |
+    /// |---|---|---|
+    /// | address class | refused iff `ModelComposed` | always refused |
+    /// | search endpoint origin | always refused | always refused |
+    /// | caller's host check | never | unless the hop stays on a user-pasted host |
+    ///
+    /// A user pointing this daemon at `http://localhost:3000` is pointing it at
+    /// their own dev server, which is a thing people do on purpose; a *model*
+    /// composing that URL is the SSRF, and a *redirect* to it is the SSRF
+    /// wearing a legitimate first hop, which is why the hop row has no
+    /// exemption at all. Nothing about who typed the first URL is evidence
+    /// about a destination the first URL's server picked.
+    async fn fetch(
+        &self,
+        url: &str,
+        authorship: Authorship,
+        ctx: &LookupContext<'_>,
+    ) -> (String, Ending) {
         let Some(mut host) = host_of(url) else {
             return (
                 String::new(),
                 Ending::refused(WebLookupOutcome::RefusedDomain, LookupDetail::Malformed),
             );
         };
+        // Gate 3 — destination policy on the initial URL. Before the scan, so a
+        // destination this seam was never going to reach costs zero inferences
+        // (AC-11's argument again).
+        if authorship == Authorship::ModelComposed {
+            if let Some(class) = address_class_of_host(&host) {
+                return (host, refused_address(class));
+            }
+        }
+        if targets_search_endpoint(url, ctx) {
+            return (
+                host,
+                Ending::refused(
+                    WebLookupOutcome::RefusedDomain,
+                    LookupDetail::SearchEndpointFetch,
+                ),
+            );
+        }
+
+        // Gate 4 — the provider-parity redaction scan (BR-2, BR-13).
+        //
+        // The scanned string is the URL that goes on the wire, character for
+        // character: `TransportRequest.url` below is `current`, which starts as
+        // this value (LESSON-485 — no projection that could drift from what is
+        // sent). Authorship is irrelevant here and deliberately so: BR-13 says
+        // a user-pasted fetch is "still redact-scanned", which is the whole
+        // point of parity — the provider path does not ask who typed the
+        // context either.
+        //
+        // Absent gate means `[privacy] redact` is off, and then nothing is
+        // scanned — not this URL and not a provider payload. That is the same
+        // "off", which is what parity means; contrast `search()`, where an
+        // absent gate is a refusal because BR-14 conditions the search tier's
+        // existence on the scan.
+        //
+        // Only the initial URL is scanned, not each hop: a hop's bytes are the
+        // *destination's* composition, not the user's or the model's, and the
+        // outgoing text this gate exists to inspect is the text a party in this
+        // session wrote. Redirect targets are governed by the destination
+        // policy and the host check above instead.
+        if let Some(gate) = &self.fetch_redaction {
+            let verdict = gate.scan(url).await;
+            if redact::decide(&verdict) == redact::EgressDecision::Block {
+                return (
+                    host,
+                    Ending::refused(
+                        WebLookupOutcome::BlockedRedact,
+                        LookupDetail::Blocked {
+                            cause: block_cause(&verdict),
+                        },
+                    ),
+                );
+            }
+            for line in redact::forwarded_findings_report(&verdict) {
+                eprintln!("{line}");
+            }
+        }
+
+        // The host the *user* named, kept for the hop exemption below. Fixed at
+        // hop zero rather than tracked across the chain: the exemption is about
+        // the destination the user chose, and a chain that has already left it
+        // has left it.
+        let pasted_host = host.clone();
         let mut current = url.to_owned();
 
         for hop in 0..=MAX_REDIRECT_HOPS {
@@ -781,9 +1025,34 @@ impl<T: Transport> Egress<T> {
                     ),
                 );
             };
-            // The gate, before the hop. The destination chose this host, so
-            // neither the tier grant nor BR-11's user-paste exemption covers it.
-            if !(ctx.host_check)(&next_host) {
+            // The gates, before the hop. The destination chose this host, so
+            // neither the tier grant nor BR-11's user-paste exemption covers
+            // it — with the one narrow exception spelled out below.
+            //
+            // Address class first, and unconditionally: an allowlist is a
+            // statement about names, and a redirect to `169.254.169.254` is not
+            // a name anybody listed. A permissive host check must not be able
+            // to grant this, so the class check is not an argument to it.
+            if let Some(class) = address_class_of_host(&next_host) {
+                return (host, refused_address(class));
+            }
+            if targets_search_endpoint(&next, ctx) {
+                return (
+                    host,
+                    Ending::refused(
+                        WebLookupOutcome::RefusedDomain,
+                        LookupDetail::SearchEndpointFetch,
+                    ),
+                );
+            }
+            // The user-pasted host exemption (BR-11, carried past hop zero).
+            // Short-circuits *before* the closure, which is the observable
+            // property: the caller binds the closure to the allowlist, so a
+            // pasted `example.com` redirecting to `www.example.com` would
+            // otherwise be refused by an allowlist BR-11 exempts it from.
+            let stays_on_pasted_host =
+                authorship == Authorship::UserPasted && same_host_family(&pasted_host, &next_host);
+            if !stays_on_pasted_host && !(ctx.host_check)(&next_host) {
                 return (
                     host,
                     Ending::refused(
@@ -827,14 +1096,220 @@ fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
+/// The ending an address-class refusal produces — stated once so the initial
+/// destination and every hop cannot drift into reporting it differently.
+fn refused_address(class: AddressClass) -> Ending {
+    Ending::refused(
+        WebLookupOutcome::RefusedDomain,
+        LookupDetail::RefusedAddress { class },
+    )
+}
+
+/// Whether `url` targets the origin the search endpoint lives on.
+///
+/// Origin, not host: `scheme://host:port`, computed by the same `origin_of` the
+/// transport's endpoint-auth binding uses to decide whether to attach the search
+/// key. That the two agree is the point — this refusal exists to make the case
+/// where the credential *would* attach unreachable, and a laxer or stricter
+/// comparison here would leave a gap on one side or refuse innocent destinations
+/// on the other. A different port or a different scheme is a different origin,
+/// carries no credential, and is not refused.
+fn targets_search_endpoint(url: &str, ctx: &LookupContext<'_>) -> bool {
+    let Some(endpoint) = ctx.search_endpoint else {
+        return false;
+    };
+    match (super::origin_of(endpoint), super::origin_of(url)) {
+        (Some(bound), Some(target)) => bound == target,
+        // No tuple origin on one side or the other: nothing to match, and the
+        // credential would not attach either (`origin_of` returning `None` is
+        // what makes `EndpointAuth` fail closed). Let the other gates speak.
+        _ => false,
+    }
+}
+
+/// Whether `hop` stays inside the family of the user's pasted `original` host.
+///
+/// "Family" is deliberately the *dotted-suffix* relation and not the registrable
+/// domain: `example.com` ↔ `www.example.com` in both directions, and nothing
+/// else. Resolving a registrable domain needs a public-suffix list this daemon
+/// does not carry, and guessing at one is how `foo.co.uk` and `bar.co.uk`
+/// become the same trust decision. The conservative relation covers the case
+/// that actually breaks users — the `apex → www` redirect — and refers every
+/// other hop to the caller's check.
+///
+/// Host strings arrive from `Url::host_str`, which lower-cases domains, so the
+/// comparison is exact rather than case-insensitive by accident.
+fn same_host_family(original: &str, hop: &str) -> bool {
+    if original.is_empty() || hop.is_empty() {
+        return false;
+    }
+    if original == hop {
+        return true;
+    }
+    // The dot is part of the test on purpose: without it `evilexample.com`
+    // would end with `example.com` and pass.
+    hop.strip_suffix(original)
+        .is_some_and(|prefix| prefix.ends_with('.'))
+        || original
+            .strip_suffix(hop)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// The non-global [`AddressClass`] of `host`, or `None` when it names something
+/// globally routable (or something this seam cannot classify).
+///
+/// ## What is checked, and what is not
+///
+/// `host` comes from `Url::host_str`, which has already run the WHATWG host
+/// parser: `http://2130706433/` arrives here as `127.0.0.1` and `http://[::1]/`
+/// as `[::1]`, so the decimal, octal and hex spellings of an IPv4 literal are
+/// one case rather than four. The bare-integer fallback below is belt and
+/// braces for a host string that reached this function without that
+/// normalization.
+///
+/// **Names that resolve into these ranges are not caught here**, and cannot be:
+/// this seam sees a host string, the transport does the DNS, and no API on that
+/// transport exposes the resolved addresses. `localhost` and the `.localhost`
+/// TLD are special-cased because RFC 6761 makes them loopback *by definition*
+/// rather than by resolution, but an attacker-controlled `evil.example` with an
+/// `A` record of `127.0.0.1` — and the rebinding variant, where the record is
+/// global at check time and loopback at connect time — is a **residual**. The
+/// closure of it is a resolving transport that refuses non-global answers at
+/// connect time (a `reqwest` custom resolver, or a pre-resolve + connect-to-IP
+/// pass), which belongs in the transport and not at this seam. Recorded here so
+/// the gap is a known one rather than an assumed absence.
+fn address_class_of_host(host: &str) -> Option<AddressClass> {
+    // `host_str` brackets an IPv6 literal; `IpAddr` does not want the brackets.
+    let literal = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+    if let Ok(ip) = literal.unwrap_or(host).parse::<IpAddr>() {
+        return address_class_of_ip(ip);
+    }
+    if literal.is_some() {
+        // Bracketed and not an IP: not a host any resolver will make sense of.
+        // Nothing to classify, and the URL parser would not have produced it.
+        return None;
+    }
+    // A host that is all digits is an IPv4 literal per the URL standard, so a
+    // parser that did not fold it is still describing 127.0.0.1 when it says
+    // `2130706433`.
+    if let Ok(packed) = host.parse::<u32>() {
+        return address_class_of_ip(IpAddr::V4(Ipv4Addr::from(packed)));
+    }
+    // RFC 6761: `localhost` and anything under `.localhost` are loopback by
+    // definition. The trailing-dot spelling (`localhost.`) is the same name.
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.eq_ignore_ascii_case("localhost") || ends_with_label(name, "localhost") {
+        return Some(AddressClass::Loopback);
+    }
+    None
+}
+
+/// Whether `name` is a subdomain of `suffix` (ASCII-case-insensitively).
+fn ends_with_label(name: &str, suffix: &str) -> bool {
+    name.len() > suffix.len() + 1
+        && name.as_bytes()[name.len() - suffix.len() - 1] == b'.'
+        && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// The non-global class of a resolved address, or `None` when it is global.
+fn address_class_of_ip(ip: IpAddr) -> Option<AddressClass> {
+    match ip {
+        IpAddr::V4(v4) => address_class_of_ipv4(v4),
+        IpAddr::V6(v6) => address_class_of_ipv6(v6),
+    }
+}
+
+fn address_class_of_ipv4(ip: Ipv4Addr) -> Option<AddressClass> {
+    if ip.is_unspecified() {
+        return Some(AddressClass::Unspecified);
+    }
+    if ip.is_loopback() {
+        return Some(AddressClass::Loopback);
+    }
+    if ip.is_link_local() {
+        return Some(AddressClass::LinkLocal);
+    }
+    if ip.is_private() {
+        return Some(AddressClass::Private);
+    }
+    // `0.0.0.0/8` — "this network" (RFC 1122). `is_unspecified` covers only the
+    // single address; the rest of the block is not a destination either.
+    if ip.octets()[0] == 0 {
+        return Some(AddressClass::Unspecified);
+    }
+    None
+}
+
+fn address_class_of_ipv6(ip: Ipv6Addr) -> Option<AddressClass> {
+    // Before the IPv4 folds below, because `::1` and `::` both sit inside the
+    // IPv4-compatible block and folding them first would call `::1` "0.0.0.1".
+    if ip.is_unspecified() {
+        return Some(AddressClass::Unspecified);
+    }
+    if ip.is_loopback() {
+        return Some(AddressClass::Loopback);
+    }
+    // Written as masks rather than as `is_unique_local` / `is_unicast_link_local`
+    // so the check does not depend on when those stabilized, and so the RFC each
+    // one comes from is readable at the point of use.
+    let first = ip.segments()[0];
+    if first & 0xffc0 == 0xfe80 {
+        // fe80::/10 (RFC 4291).
+        return Some(AddressClass::LinkLocal);
+    }
+    if first & 0xfe00 == 0xfc00 {
+        // fc00::/7 (RFC 4193).
+        return Some(AddressClass::UniqueLocal);
+    }
+    // An IPv4-**mapped** address (`::ffff:127.0.0.1`) *is* the IPv4 destination
+    // it embeds; classifying it as "some IPv6 nobody listed" is how
+    // `::ffff:169.254.169.254` reaches the metadata service.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return address_class_of_ipv4(v4);
+    }
+    // An IPv4-**compatible** address (`::127.0.0.1`) is deprecated outright
+    // (RFC 4291 §2.5.5.1) and routes nowhere, so it is refused whatever it
+    // embeds rather than folded onto a class it might not have.
+    if ip.to_ipv4().is_some() {
+        return Some(AddressClass::Unspecified);
+    }
+    None
+}
+
 /// The wire outcome a transport failure folds onto.
 ///
-/// [`TransportError::PrivacyBlocked`] is the one that is not a network fault:
-/// it means an inner transport is itself guarded and refused, which is
-/// `BlockedPrivacy` and not `Offline`. The production lookup transport is
-/// unguarded, so this arm is a correctness statement about composition rather
-/// than a path today — but reporting a refusal as "offline" is precisely the
-/// mislabel BUG-152 is about, and the arm costs one line.
+/// ## `BlockedPrivacy` has no production producer, and the variant stays
+///
+/// [`TransportError::PrivacyBlocked`] is the one failure here that is not a
+/// network fault: it means an *inner* transport is itself guarded and refused.
+/// The production lookup transport
+/// ([`HttpTransport::for_lookup`](super::HttpTransport::for_lookup)) is
+/// unguarded, so **no production lookup can reach this arm** — it is reachable
+/// only when this choke point is composed over another guarded one, which today
+/// happens only in tests.
+///
+/// The variant is kept rather than removed for three reasons, in descending
+/// order of force:
+///
+/// 1. [`WebLookupOutcome`] is a **wire** enum (D-8). Removing a variant is a
+///    protocol change, and a client that already understands eight values
+///    should not have to learn seven.
+/// 2. Composition is the property, not the current wiring: the arm is what
+///    makes "a guarded inner transport's refusal is reported as a refusal"
+///    true of the *seam* rather than of one construction of it. Folding it into
+///    `Offline` would be BUG-152's mislabel — a settled refusal wearing a
+///    transient network fault's name — reintroduced for the sake of deleting
+///    one line.
+/// 3. It costs one match arm.
+///
+/// **What a production lookup does with AC-3's boundary case** is therefore not
+/// this: a lookup that would carry boundary-derived content is refused by the
+/// taint gate as [`WebLookupOutcome::TaintRestricted`], per architecture D-4,
+/// because the model's only route to boundary content is a context that has
+/// already tainted the session. That is the whole of the lookup path's answer to
+/// AC-3, and it is recorded as a deviation in the architecture document's
+/// Deviations section — see it for the argument that the two are the same
+/// guarantee reached by a different gate.
 fn outcome_for(error: TransportError) -> WebLookupOutcome {
     match error {
         TransportError::PrivacyBlocked(_) => WebLookupOutcome::BlockedPrivacy,
@@ -869,13 +1344,21 @@ fn join(base: &str, location: &str) -> Option<String> {
     base.join(location).ok().map(String::from)
 }
 
-/// The search request: the configured endpoint with the query appended as `q`.
+/// The search request: the configured endpoint carrying the query as `q`.
 ///
 /// There is no blessed search backend (BR-8), so a shape has to be assumed, and
 /// this is the common one — a GET whose query string carries the terms. The
-/// endpoint's own query parameters (an API version, a result count) survive:
-/// `append_pair` adds to them rather than replacing them, so a user can
-/// configure `…/search?count=5` and get both.
+/// endpoint's own query parameters (an API version, a result count) survive, in
+/// their configured order, so a user can configure `…/search?count=5` and get
+/// both.
+///
+/// An endpoint that already carries a `q` has it **replaced** rather than
+/// duplicated. Config validation rejects such an endpoint before it reaches
+/// here, so this is the seam declining to assume validation ran — and the
+/// failure mode it forecloses is not cosmetic: `?q=preset&q=<query>` is read as
+/// the *first* value by some backends and the last by others, so a duplicate
+/// turns "which query did this session send" into a question about the
+/// backend's parser.
 ///
 /// No credential header is built here. The key is attached by the transport,
 /// bound to this endpoint's origin (see
@@ -883,7 +1366,15 @@ fn join(base: &str, location: &str) -> Option<String> {
 fn search_request(endpoint: &str, query: &str) -> Option<TransportRequest> {
     let mut url = reqwest::Url::parse(endpoint).ok()?;
     url.host_str()?;
-    url.query_pairs_mut().append_pair("q", query);
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(name, _)| name != "q")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(kept)
+        .append_pair("q", query);
     Some(TransportRequest {
         method: HttpMethod::Get,
         url: String::from(url),
@@ -901,7 +1392,11 @@ async fn drain_capped(mut body: ByteStream, cap: usize) -> Result<(Vec<u8>, bool
     let mut bytes = Vec::new();
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
-        if bytes.len() + chunk.len() >= cap {
+        // Strictly greater, not `>=`: a body of *exactly* `cap` bytes fits, and
+        // reporting it as truncated would tell the user content was dropped
+        // when none was. `truncated` is a claim about bytes this seam threw
+        // away, so it is true only when there were some.
+        if bytes.len() + chunk.len() > cap {
             let room = cap.saturating_sub(bytes.len());
             bytes.extend_from_slice(&chunk[..room.min(chunk.len())]);
             return Ok((bytes, true));
@@ -1118,6 +1613,83 @@ mod tests {
         }
     }
 
+    /// A transport that accepts the call and then never answers — the slow
+    /// loris, in the smallest form that reproduces it.
+    struct SleepingTransport {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Transport for SleepingTransport {
+        async fn execute(
+            &self,
+            _request: TransportRequest,
+        ) -> Result<TransportResponse, TransportError> {
+            *self.calls.lock().unwrap() += 1;
+            // Far past the total bound. Under `start_paused` the runtime jumps
+            // to the earliest deadline, so this costs no real time.
+            tokio::time::sleep(Duration::from_secs(3_600)).await;
+            Ok(TransportResponse {
+                status: 200,
+                location: None,
+                body: Box::pin(futures::stream::empty()),
+            })
+        }
+    }
+
+    /// A transport that answers 200 promptly and then stalls **mid-body** —
+    /// the case a byte cap cannot see, because no further byte ever arrives.
+    struct StallingBodyTransport;
+
+    #[async_trait]
+    impl Transport for StallingBodyTransport {
+        async fn execute(
+            &self,
+            _request: TransportRequest,
+        ) -> Result<TransportResponse, TransportError> {
+            let body: ByteStream = Box::pin(
+                futures::stream::once(async { Ok(b"partial".to_vec()) })
+                    .chain(futures::stream::pending()),
+            );
+            Ok(TransportResponse {
+                status: 200,
+                location: None,
+                body,
+            })
+        }
+    }
+
+    /// A host check that records every host it was asked about.
+    ///
+    /// The instrument for the hop-exemption tests: "allowed without consulting
+    /// the closure" is a claim about a call that did *not* happen, and a
+    /// boolean-returning function cannot express it.
+    #[derive(Clone)]
+    struct RecordingHostCheck {
+        seen: Arc<Mutex<Vec<String>>>,
+        answer: bool,
+    }
+
+    impl RecordingHostCheck {
+        fn answering(answer: bool) -> Self {
+            Self {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                answer,
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        fn as_check(&self) -> impl Fn(&str) -> bool + Send + Sync + '_ {
+            move |host: &str| {
+                self.seen.lock().unwrap().push(host.to_owned());
+                self.answer
+            }
+        }
+    }
+
     fn allow_any_host(_host: &str) -> bool {
         true
     }
@@ -1261,15 +1833,28 @@ mod tests {
     // -- the search redaction gate (BR-14, AC-13) --------------------------
 
     #[tokio::test]
-    async fn every_search_query_is_scanned_and_no_fetch_is() {
-        // BR-2's parity clause, by call count on one gate: search scans, fetch
-        // does not, and the same installed gate proves both.
-        let inner = CaptureTransport::new(vec![
+    async fn a_search_is_always_scanned_and_a_fetch_is_scanned_iff_the_parity_gate_is_installed() {
+        // The two clauses BR-2 and BR-14 make, side by side, distinguished by
+        // gate call count on one choke point:
+        //
+        // * search scans through its own fail-closed slot, whatever
+        //   `[privacy] redact` says;
+        // * fetch scans through the **parity** slot, which is exactly what
+        //   `[privacy] redact` installs — so `redact` off means the fetch URL
+        //   is unscanned, the same "off" a provider payload gets, and `redact`
+        //   on means it is scanned (BR-13: a user-pasted URL "is still
+        //   redact-scanned").
+        //
+        // A test that asserted "no fetch is ever scanned" would pass on an
+        // implementation that has no parity gate at all, which is the bug this
+        // replaces.
+        let redact_off = CaptureTransport::new(vec![
             Ok((200, None, b"{}".to_vec())),
             Ok((200, None, b"<html/>".to_vec())),
         ]);
-        let gate = CountingGate::new(RedactionVerdict::clean());
-        let egress = egress_over(inner.clone()).with_search_redaction_gate(gate.clone());
+        let search_gate = CountingGate::new(RedactionVerdict::clean());
+        let egress =
+            egress_over(redact_off.clone()).with_search_redaction_gate(search_gate.clone());
         let flags = Flags::clean();
         let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
@@ -1280,12 +1865,164 @@ mod tests {
                 &ctx,
             )
             .await;
-        assert_eq!(gate.calls(), 1);
+        assert_eq!(search_gate.calls(), 1);
         assert_eq!(
-            gate.payloads(),
+            search_gate.payloads(),
             vec!["rust lifetimes".to_owned()],
             "the scanned string is the query itself, not a wrapper around it"
         );
+
+        let unscanned = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+        assert_eq!(unscanned.outcome(), WebLookupOutcome::Completed);
+        assert_eq!(
+            search_gate.calls(),
+            1,
+            "the search slot is not the fetch slot: a fetch never reaches it"
+        );
+        assert_eq!(redact_off.calls(), 2, "and both lookups went out");
+
+        // Now the same fetch on a choke point built the way the daemon builds
+        // it when `[privacy] redact` is on.
+        let redact_on = CaptureTransport::answering(200, "<html/>");
+        let fetch_gate = CountingGate::new(RedactionVerdict::clean());
+        let guarded = egress_over(redact_on.clone())
+            .with_search_redaction_gate(CountingGate::new(RedactionVerdict::clean()))
+            .with_fetch_redaction_gate(fetch_gate.clone());
+
+        let scanned = guarded
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(scanned.outcome(), WebLookupOutcome::Completed);
+        assert_eq!(
+            fetch_gate.calls(),
+            1,
+            "parity means the fetch URL is scanned"
+        );
+        assert_eq!(
+            fetch_gate.payloads(),
+            vec!["https://docs.rs/x".to_owned()],
+            "and the scanned string is the URL that goes on the wire"
+        );
+        assert_eq!(redact_on.urls(), vec!["https://docs.rs/x".to_owned()]);
+    }
+
+    // -- the fetch parity gate (BR-2, BR-13) -------------------------------
+
+    #[tokio::test]
+    async fn a_high_finding_in_a_fetch_url_blocks_it_before_the_wire() {
+        // A secret pasted into a URL's query string is a secret leaving, and
+        // BR-2's parity clause is the promise that the fetch path treats it the
+        // way the provider path treats one in a payload.
+        for authorship in [Authorship::UserPasted, Authorship::ModelComposed] {
+            let inner = CaptureTransport::answering(200, "<html/>");
+            let gate = CountingGate::new(a_high_finding());
+            let egress = egress_over(inner.clone()).with_fetch_redaction_gate(gate.clone());
+            let flags = Flags::clean();
+            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+            let outcome = egress
+                .lookup(
+                    &LookupRequest::fetch("https://docs.rs/x?key=sk-ant-0000000", authorship),
+                    &ctx,
+                )
+                .await;
+
+            assert_eq!(outcome.outcome(), WebLookupOutcome::BlockedRedact);
+            assert!(matches!(
+                outcome.detail(),
+                LookupDetail::Blocked {
+                    cause: BlockCause::Redaction { .. }
+                }
+            ));
+            assert_eq!(gate.calls(), 1);
+            assert_eq!(
+                inner.calls(),
+                0,
+                "{authorship:?}: and not a byte of it left — authorship does not \
+                 exempt a URL from the scan (BR-13)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_verdict_blocks_a_fetch_rather_than_skipping_it() {
+        // LESSON-492 on the fetch path: a guard that ran and could not decide
+        // is a block, exactly as it is for a search query and for a provider
+        // payload.
+        let inner = CaptureTransport::answering(200, "<html/>");
+        let egress = egress_over(inner.clone())
+            .with_fetch_redaction_gate(CountingGate::new(RedactionVerdict::unavailable()));
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.outcome(), WebLookupOutcome::BlockedRedact);
+        assert_eq!(
+            outcome.detail(),
+            &LookupDetail::Blocked {
+                cause: BlockCause::ScanUnavailable
+            }
+        );
+        assert_eq!(inner.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_fetch_gate_does_not_satisfy_the_search_gate() {
+        // Two slots, not one: installing the parity gate must not make a
+        // search look scanned. If this ever passes as `Completed`, BR-14's
+        // coupling has become bypassable by turning `[privacy] redact` on and
+        // the search tier's own gate off.
+        let inner = CaptureTransport::answering(200, "{}");
+        let fetch_gate = CountingGate::new(RedactionVerdict::clean());
+        let egress = egress_over(inner.clone()).with_fetch_redaction_gate(fetch_gate.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+            .with_search_endpoint("https://search.example/api");
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::search("anything", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.outcome(), WebLookupOutcome::BlockedRedact);
+        assert_eq!(
+            outcome.detail(),
+            &LookupDetail::Blocked {
+                cause: BlockCause::ScanUnavailable
+            }
+        );
+        assert_eq!(fetch_gate.calls(), 0);
+        assert_eq!(inner.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_fetch_scan_runs_before_the_wire_not_after_it() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let egress = Egress::new(
+            OrderingTransport { log: log.clone() },
+            boundaries(),
+            Arc::new(NoopSink),
+        )
+        .with_fetch_redaction_gate(Arc::new(OrderingGate { log: log.clone() }));
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
 
         egress
             .lookup(
@@ -1293,11 +2030,33 @@ mod tests {
                 &ctx,
             )
             .await;
-        assert_eq!(
-            gate.calls(),
-            1,
-            "fetch is not this gate's business (BR-2 parity clause)"
-        );
+
+        assert_eq!(log.lock().unwrap().as_slice(), ["scan", "wire"]);
+    }
+
+    #[tokio::test]
+    async fn a_destination_the_seam_refuses_costs_zero_scanner_calls() {
+        // The gate order, as AC-11's argument states it: a lookup nobody was
+        // going to allow must not spend an inference deciding whether its URL
+        // held a secret.
+        let inner = CaptureTransport::answering(200, "<html/>");
+        let gate = CountingGate::new(RedactionVerdict::clean());
+        let egress = egress_over(inner.clone()).with_fetch_redaction_gate(gate.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+            .with_search_endpoint("https://search.example/api");
+
+        for url in [
+            "http://169.254.169.254/latest",
+            "https://search.example/api",
+        ] {
+            let outcome = egress
+                .lookup(&LookupRequest::fetch(url, Authorship::ModelComposed), &ctx)
+                .await;
+            assert_eq!(outcome.outcome(), WebLookupOutcome::RefusedDomain);
+        }
+        assert_eq!(gate.calls(), 0);
+        assert_eq!(inner.calls(), 0);
     }
 
     #[tokio::test]
@@ -1604,6 +2363,597 @@ mod tests {
         assert_eq!(inner.calls(), 1);
     }
 
+    // -- the address-class policy (SSRF floor) -----------------------------
+
+    /// Every spelling of "somewhere that is not on the public internet" this
+    /// seam is expected to recognize, with the class it should name.
+    ///
+    /// The decimal form is in here because it is the one a reviewer's mental
+    /// model of "check for 127." misses, and the `.localhost` TLD because RFC
+    /// 6761 makes it loopback by definition rather than by resolution.
+    const NON_GLOBAL_URLS: &[(&str, AddressClass)] = &[
+        ("http://127.0.0.1/x", AddressClass::Loopback),
+        ("http://127.1.2.3/x", AddressClass::Loopback),
+        ("http://[::1]/x", AddressClass::Loopback),
+        ("http://localhost/x", AddressClass::Loopback),
+        ("http://localhost:3000/x", AddressClass::Loopback),
+        ("http://api.localhost/x", AddressClass::Loopback),
+        ("http://2130706433/x", AddressClass::Loopback),
+        ("http://[::ffff:127.0.0.1]/x", AddressClass::Loopback),
+        (
+            "http://169.254.169.254/latest/meta-data/",
+            AddressClass::LinkLocal,
+        ),
+        ("http://[fe80::1]/x", AddressClass::LinkLocal),
+        ("http://10.0.0.1/x", AddressClass::Private),
+        ("http://172.16.0.1/x", AddressClass::Private),
+        ("http://192.168.1.1/x", AddressClass::Private),
+        ("http://[fc00::1]/x", AddressClass::UniqueLocal),
+        ("http://[fd00::1]/x", AddressClass::UniqueLocal),
+        ("http://0.0.0.0/x", AddressClass::Unspecified),
+        ("http://[::]/x", AddressClass::Unspecified),
+    ];
+
+    #[tokio::test]
+    async fn a_model_composed_fetch_to_a_non_global_address_never_reaches_the_wire() {
+        // The SSRF floor. An allowlist is a statement about *names*; none of
+        // these is a name anybody thought to list, and the metadata endpoint in
+        // the middle of the table is the single most valuable thing an SSRF
+        // reaches.
+        for (url, class) in NON_GLOBAL_URLS {
+            let inner = CaptureTransport::answering(200, "secrets");
+            let egress = egress_over(inner.clone());
+            let flags = Flags::clean();
+            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+            let outcome = egress
+                .lookup(&LookupRequest::fetch(*url, Authorship::ModelComposed), &ctx)
+                .await;
+
+            assert_eq!(
+                outcome.outcome(),
+                WebLookupOutcome::RefusedDomain,
+                "{url} should be refused"
+            );
+            assert_eq!(
+                outcome.detail(),
+                &LookupDetail::RefusedAddress { class: *class },
+                "{url} should be refused as {}",
+                class.as_str()
+            );
+            assert_eq!(inner.calls(), 0, "{url}: a refusal that reached the wire");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_user_pasted_fetch_to_a_local_address_is_allowed() {
+        // The other half of the split, and the reason the initial check is
+        // authorship-gated at all: pointing this daemon at your own dev server
+        // is a thing people do on purpose, and BR-11 is the requirement that
+        // says the user's own destination is the user's own business.
+        for url in [
+            "http://127.0.0.1:3000/x",
+            "http://localhost:8080/docs",
+            "http://192.168.1.10/wiki",
+        ] {
+            let inner = CaptureTransport::answering(200, "my dev server");
+            let egress = egress_over(inner.clone());
+            let flags = Flags::clean();
+            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+            let outcome = egress
+                .lookup(&LookupRequest::fetch(url, Authorship::UserPasted), &ctx)
+                .await;
+
+            assert_eq!(outcome.outcome(), WebLookupOutcome::Completed, "{url}");
+            assert_eq!(inner.calls(), 1, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_hop_to_a_non_global_address_is_refused_whoever_pasted_the_original() {
+        // A redirect target is *always* chosen by the destination, so the
+        // user-paste exemption cannot reach it: `https://docs.rs/x` →
+        // `http://169.254.169.254/` is the metadata endpoint wearing a
+        // legitimate first hop.
+        for (url, class) in NON_GLOBAL_URLS {
+            for authorship in [Authorship::UserPasted, Authorship::ModelComposed] {
+                let inner = CaptureTransport::new(vec![
+                    Ok((302, Some((*url).to_owned()), Vec::new())),
+                    Ok((200, None, b"secrets".to_vec())),
+                ]);
+                let egress = egress_over(inner.clone());
+                let flags = Flags::clean();
+                let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+                let outcome = egress
+                    .lookup(&LookupRequest::fetch("https://docs.rs/x", authorship), &ctx)
+                    .await;
+
+                assert_eq!(
+                    outcome.detail(),
+                    &LookupDetail::RefusedAddress { class: *class },
+                    "{url} as a hop, {authorship:?}"
+                );
+                assert_eq!(
+                    inner.urls(),
+                    vec!["https://docs.rs/x".to_owned()],
+                    "{url} as a hop, {authorship:?}: the hop must never be requested"
+                );
+                assert_eq!(outcome.host(), "docs.rs");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_permissive_host_check_cannot_grant_a_hop_to_loopback() {
+        // The class check is not an argument to the caller's closure, and this
+        // is why: a closure bound to a permissive allowlist must not be able to
+        // hand out the local network.
+        let inner = CaptureTransport::new(vec![
+            Ok((
+                302,
+                Some("http://127.0.0.1:9200/_all".to_owned()),
+                Vec::new(),
+            )),
+            Ok((200, None, b"your search index".to_vec())),
+        ]);
+        let egress = egress_over(inner.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(
+            outcome.detail(),
+            &LookupDetail::RefusedAddress {
+                class: AddressClass::Loopback
+            }
+        );
+        assert_eq!(inner.calls(), 1);
+    }
+
+    #[test]
+    fn the_address_classifier_lets_globally_routable_hosts_through() {
+        // The negative half — a classifier that refused everything would pass
+        // every test above and break every real lookup.
+        for host in [
+            "docs.rs",
+            "example.com",
+            "localhosting.example",
+            "notlocalhost",
+            "8.8.8.8",
+            "93.184.216.34",
+            "172.32.0.1",  // just outside 172.16/12
+            "169.253.0.1", // just outside 169.254/16
+            "128.0.0.1",
+            "[2606:4700::1111]",
+        ] {
+            assert_eq!(address_class_of_host(host), None, "{host} is global");
+        }
+    }
+
+    #[test]
+    fn the_address_classifier_names_the_class_it_refuses_on() {
+        for (url, class) in NON_GLOBAL_URLS {
+            let host = reqwest::Url::parse(url)
+                .expect("fixture URL parses")
+                .host_str()
+                .expect("fixture URL has a host")
+                .to_owned();
+            assert_eq!(
+                address_class_of_host(&host),
+                Some(*class),
+                "{url} (host `{host}`)"
+            );
+        }
+    }
+
+    // -- the search endpoint is not a fetch destination --------------------
+
+    #[tokio::test]
+    async fn a_fetch_at_the_search_endpoint_origin_is_refused() {
+        // The bypass this closes: the search key is bound to the endpoint's
+        // *origin*, so a `Fetch` aimed there would carry the credential and
+        // skip the unconditional search scan — the search tier reached through
+        // the fetch tier's door. Authorship is irrelevant: the credential does
+        // not care who typed the URL.
+        for authorship in [Authorship::UserPasted, Authorship::ModelComposed] {
+            for url in [
+                "https://search.example/api",
+                "https://search.example/api?q=leak",
+                "https://search.example/",
+                "https://search.example/some/other/path",
+            ] {
+                let inner = CaptureTransport::answering(200, "{}");
+                let egress = egress_over(inner.clone());
+                let flags = Flags::clean();
+                let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+                    .with_search_endpoint("https://search.example/api");
+
+                let outcome = egress
+                    .lookup(&LookupRequest::fetch(url, authorship), &ctx)
+                    .await;
+
+                assert_eq!(
+                    outcome.outcome(),
+                    WebLookupOutcome::RefusedDomain,
+                    "{url} ({authorship:?})"
+                );
+                assert_eq!(
+                    outcome.detail(),
+                    &LookupDetail::SearchEndpointFetch,
+                    "{url} ({authorship:?})"
+                );
+                assert_eq!(inner.calls(), 0, "{url} ({authorship:?})");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_different_origin_on_the_same_search_host_is_still_fetchable() {
+        // Origin, not host — the same comparison that decides whether the
+        // credential attaches. A different port or scheme carries no key, so
+        // refusing it would be refusing an innocent destination.
+        for url in [
+            "https://search.example:8443/docs",
+            "http://search.example/docs",
+        ] {
+            let inner = CaptureTransport::answering(200, "docs");
+            let egress = egress_over(inner.clone());
+            let flags = Flags::clean();
+            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+                .with_search_endpoint("https://search.example/api");
+
+            let outcome = egress
+                .lookup(&LookupRequest::fetch(url, Authorship::UserPasted), &ctx)
+                .await;
+
+            assert_eq!(outcome.outcome(), WebLookupOutcome::Completed, "{url}");
+            assert_eq!(inner.calls(), 1, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_onto_the_search_origin_is_refused_too() {
+        // The hop form of the same bypass: a destination that redirects to the
+        // search endpoint would otherwise walk the credential there.
+        let inner = CaptureTransport::new(vec![
+            Ok((
+                302,
+                Some("https://search.example/api?q=leak".to_owned()),
+                Vec::new(),
+            )),
+            Ok((200, None, b"{}".to_vec())),
+        ]);
+        let egress = egress_over(inner.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+            .with_search_endpoint("https://search.example/api");
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.detail(), &LookupDetail::SearchEndpointFetch);
+        assert_eq!(inner.urls(), vec!["https://docs.rs/x".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn with_no_search_endpoint_configured_no_fetch_is_refused_for_one() {
+        let inner = CaptureTransport::answering(200, "docs");
+        let egress = egress_over(inner.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://search.example/api", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.outcome(), WebLookupOutcome::Completed);
+        assert_eq!(inner.calls(), 1);
+    }
+
+    // -- the user-pasted hop exemption (BR-11, past hop zero) --------------
+
+    #[tokio::test]
+    async fn a_user_pasted_hop_that_stays_on_the_pasted_host_skips_the_closure() {
+        // The `apex → www` redirect every second site performs. The caller
+        // binds the closure to the allowlist, and BR-11 exempts a pasted URL
+        // from the allowlist — so consulting it here would kill the exemption
+        // at hop one. "Without consulting the closure" is the observable claim,
+        // which is why the check records rather than merely answers.
+        for (from, to) in [
+            ("https://example.com/x", "https://www.example.com/x"),
+            ("https://www.example.com/x", "https://example.com/x"),
+            ("https://example.com/x", "https://example.com/y"),
+            ("http://example.com/x", "https://example.com/x"),
+        ] {
+            let inner = CaptureTransport::new(vec![
+                Ok((301, Some(to.to_owned()), Vec::new())),
+                Ok((200, None, b"landed".to_vec())),
+            ]);
+            let check = RecordingHostCheck::answering(false);
+            let closure = check.as_check();
+            let egress = egress_over(inner.clone());
+            let flags = Flags::clean();
+            let ctx = LookupContext::new("sess-1", &flags, &closure);
+
+            let outcome = egress
+                .lookup(&LookupRequest::fetch(from, Authorship::UserPasted), &ctx)
+                .await;
+
+            assert_eq!(
+                outcome.outcome(),
+                WebLookupOutcome::Completed,
+                "{from} -> {to}"
+            );
+            assert_eq!(outcome.body(), b"landed", "{from} -> {to}");
+            assert!(
+                check.asked().is_empty(),
+                "{from} -> {to}: the closure was consulted anyway: {:?}",
+                check.asked()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_user_pasted_hop_that_leaves_the_pasted_host_goes_through_the_closure() {
+        // The exemption is the user's *own host*, not a licence. `evilexample.com`
+        // is in the table because a suffix test without the dot would let it
+        // through.
+        for to in [
+            "https://evil.example/x",
+            "https://evilexample.com/x",
+            "https://example.com.evil.test/x",
+        ] {
+            let inner = CaptureTransport::new(vec![
+                Ok((302, Some(to.to_owned()), Vec::new())),
+                Ok((200, None, b"never".to_vec())),
+            ]);
+            let check = RecordingHostCheck::answering(false);
+            let closure = check.as_check();
+            let egress = egress_over(inner.clone());
+            let flags = Flags::clean();
+            let ctx = LookupContext::new("sess-1", &flags, &closure);
+
+            let outcome = egress
+                .lookup(
+                    &LookupRequest::fetch("https://example.com/x", Authorship::UserPasted),
+                    &ctx,
+                )
+                .await;
+
+            assert_eq!(
+                outcome.outcome(),
+                WebLookupOutcome::RefusedDomain,
+                "-> {to}"
+            );
+            assert_eq!(outcome.detail(), &LookupDetail::RedirectRefused, "-> {to}");
+            assert_eq!(check.asked().len(), 1, "-> {to}: the closure decided it");
+            assert_eq!(inner.calls(), 1, "-> {to}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_composed_hop_always_goes_through_the_closure() {
+        // No exemption for a model-composed original, even onto its own host:
+        // there is no user paste to be exempt on behalf of.
+        let inner = CaptureTransport::new(vec![
+            Ok((
+                301,
+                Some("https://www.example.com/x".to_owned()),
+                Vec::new(),
+            )),
+            Ok((200, None, b"landed".to_vec())),
+        ]);
+        let check = RecordingHostCheck::answering(true);
+        let closure = check.as_check();
+        let egress = egress_over(inner.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &closure);
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://example.com/x", Authorship::ModelComposed),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.outcome(), WebLookupOutcome::Completed);
+        assert_eq!(check.asked(), vec!["www.example.com".to_owned()]);
+    }
+
+    #[test]
+    fn the_pasted_host_family_is_the_dotted_suffix_relation_and_nothing_wider() {
+        assert!(same_host_family("example.com", "example.com"));
+        assert!(same_host_family("example.com", "www.example.com"));
+        assert!(same_host_family("www.example.com", "example.com"));
+        assert!(same_host_family("example.com", "a.b.example.com"));
+
+        assert!(!same_host_family("example.com", "evilexample.com"));
+        assert!(!same_host_family("example.com", "example.com.evil.test"));
+        assert!(!same_host_family("example.com", "evil.com"));
+        // No public-suffix list here, deliberately: two unrelated sites under
+        // one registry must not become one trust decision.
+        assert!(!same_host_family("foo.co.uk", "bar.co.uk"));
+        assert!(!same_host_family("", "example.com"));
+        assert!(!same_host_family("example.com", ""));
+    }
+
+    // -- the wall-clock bound (slow loris) ---------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_destination_that_never_answers_is_bounded_by_the_total_timeout() {
+        // Without this the turn parks forever: `drain_capped` bounds *bytes*,
+        // and a destination that accepts the connection and then says nothing
+        // sends no bytes at all.
+        let calls = Arc::new(Mutex::new(0));
+        let recorder = CapturingRecorder::new();
+        let egress = Egress::new(
+            SleepingTransport {
+                calls: calls.clone(),
+            },
+            boundaries(),
+            Arc::new(NoopSink),
+        )
+        .with_lookup_recorder(recorder.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+        let started = tokio::time::Instant::now();
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.outcome(), WebLookupOutcome::Offline);
+        assert_eq!(
+            outcome.detail(),
+            &LookupDetail::Unreachable {
+                error: TransportError::Timeout
+            },
+            "expiry is reported as the timeout it is, not as a new ending"
+        );
+        assert!(started.elapsed() >= LOOKUP_TOTAL_TIMEOUT);
+        assert!(
+            started.elapsed() < LOOKUP_TOTAL_TIMEOUT * 2,
+            "the bound is a bound, not a suggestion"
+        );
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(
+            outcome.host(),
+            "docs.rs",
+            "and the row still names where it was headed"
+        );
+        assert_eq!(
+            recorder.records().len(),
+            1,
+            "one row for a timed-out attempt, like every other ending"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_stalls_mid_stream_is_bounded_too() {
+        // The byte cap cannot see this one: the destination answered 200,
+        // delivered seven bytes, and then stopped. `LOOKUP_MAX_BODY_BYTES` is
+        // never reached, so only a clock ends it.
+        let egress = Egress::new(StallingBodyTransport, boundaries(), Arc::new(NoopSink));
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.outcome(), WebLookupOutcome::Offline);
+        assert_eq!(
+            outcome.bytes_in(),
+            0,
+            "a partial body the seam abandoned is not content it brought back"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_of_individually_legal_hops_cannot_outlast_the_bound_by_multiplying() {
+        // Why the clock wraps the *attempt* and not each request: four hops of
+        // 40 seconds each are individually unremarkable and together park the
+        // turn for nearly three minutes. A per-hop bound would pass every one
+        // of them.
+        struct SlowRedirects {
+            calls: Arc<Mutex<usize>>,
+        }
+
+        #[async_trait]
+        impl Transport for SlowRedirects {
+            async fn execute(
+                &self,
+                _request: TransportRequest,
+            ) -> Result<TransportResponse, TransportError> {
+                *self.calls.lock().unwrap() += 1;
+                tokio::time::sleep(Duration::from_secs(40)).await;
+                Ok(TransportResponse {
+                    status: 302,
+                    location: Some("https://docs.rs/next".to_owned()),
+                    body: Box::pin(futures::stream::empty()),
+                })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(0));
+        let egress = Egress::new(
+            SlowRedirects {
+                calls: calls.clone(),
+            },
+            boundaries(),
+            Arc::new(NoopSink),
+        );
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+        let started = tokio::time::Instant::now();
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.outcome(), WebLookupOutcome::Offline);
+        assert!(started.elapsed() >= LOOKUP_TOTAL_TIMEOUT);
+        assert!(
+            started.elapsed() < LOOKUP_TOTAL_TIMEOUT * 2,
+            "the chain is cut mid-flight, not allowed to finish its hops"
+        );
+        assert!(
+            *calls.lock().unwrap() < MAX_REDIRECT_HOPS + 1,
+            "and the hops it never got to were never requested"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_before_the_wire_does_not_wait_on_the_clock() {
+        // The wrapper bounds the attempt; it must not delay one. A gate refusal
+        // returns at once, which is the property AC-11's "costs nothing"
+        // argument rests on.
+        let egress = Egress::new(
+            SleepingTransport {
+                calls: Arc::new(Mutex::new(0)),
+            },
+            boundaries(),
+            Arc::new(NoopSink),
+        );
+        let flags = Flags::tainted();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+        let started = tokio::time::Instant::now();
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::ModelComposed),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.outcome(), WebLookupOutcome::TaintRestricted);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
     // -- offline and HTTP status (BR-9, AC-8, BUG-152) ---------------------
 
     #[tokio::test]
@@ -1670,97 +3020,101 @@ mod tests {
             name: &'static str,
             script: Vec<ScriptedAnswer>,
             gate: Option<RedactionVerdict>,
+            fetch_gate: Option<RedactionVerdict>,
             endpoint: Option<&'static str>,
             search: bool,
+            /// Overrides the default fetch URL. The default carries a path and
+            /// a query string precisely so the BR-7 leak assertion has
+            /// something to catch; an override should carry the same shape.
+            fetch_url: Option<&'static str>,
             tainted: bool,
             host_check: fn(&str) -> bool,
             expected: WebLookupOutcome,
         }
 
+        impl Case {
+            /// The common case: a fetch with no gates and no endpoint.
+            fn fetch(name: &'static str, script: Vec<ScriptedAnswer>) -> Self {
+                Self {
+                    name,
+                    script,
+                    gate: None,
+                    fetch_gate: None,
+                    endpoint: None,
+                    search: false,
+                    fetch_url: None,
+                    tainted: false,
+                    host_check: allow_any_host,
+                    expected: WebLookupOutcome::Completed,
+                }
+            }
+
+            fn expecting(mut self, expected: WebLookupOutcome) -> Self {
+                self.expected = expected;
+                self
+            }
+
+            fn at(mut self, url: &'static str) -> Self {
+                self.fetch_url = Some(url);
+                self
+            }
+        }
+
         let cases = vec![
+            Case::fetch("delivered fetch", vec![Ok((200, None, b"hello".to_vec()))]),
+            Case::fetch("http error", vec![Ok((500, None, Vec::new()))]),
+            Case::fetch("offline", vec![Err(TransportError::Connect)])
+                .expecting(WebLookupOutcome::Offline),
             Case {
-                name: "delivered fetch",
-                script: vec![Ok((200, None, b"hello".to_vec()))],
-                gate: None,
-                endpoint: None,
-                search: false,
-                tainted: false,
-                host_check: allow_any_host,
-                expected: WebLookupOutcome::Completed,
-            },
-            Case {
-                name: "http error",
-                script: vec![Ok((500, None, Vec::new()))],
-                gate: None,
-                endpoint: None,
-                search: false,
-                tainted: false,
-                host_check: allow_any_host,
-                expected: WebLookupOutcome::Completed,
-            },
-            Case {
-                name: "offline",
-                script: vec![Err(TransportError::Connect)],
-                gate: None,
-                endpoint: None,
-                search: false,
-                tainted: false,
-                host_check: allow_any_host,
-                expected: WebLookupOutcome::Offline,
-            },
-            Case {
-                name: "taint restricted",
-                script: vec![],
-                gate: None,
-                endpoint: None,
-                search: false,
                 tainted: true,
-                host_check: allow_any_host,
-                expected: WebLookupOutcome::TaintRestricted,
+                ..Case::fetch("taint restricted", vec![])
+                    .expecting(WebLookupOutcome::TaintRestricted)
             },
             Case {
-                name: "refused redirect",
-                script: vec![Ok((
-                    302,
-                    Some("https://evil.example/x".to_owned()),
-                    Vec::new(),
-                ))],
-                gate: None,
-                endpoint: None,
-                search: false,
-                tainted: false,
                 host_check: deny_any_host,
-                expected: WebLookupOutcome::RefusedDomain,
+                ..Case::fetch(
+                    "refused redirect",
+                    vec![Ok((
+                        302,
+                        Some("https://evil.example/x".to_owned()),
+                        Vec::new(),
+                    ))],
+                )
+                .expecting(WebLookupOutcome::RefusedDomain)
+            },
+            // The refusal kinds this seam gained on review: each is a fresh
+            // return path through `attempt`, and each has to come back through
+            // the one emission site like every other ending.
+            Case::fetch("refused address", vec![])
+                .at("http://169.254.169.254/secret/path?token=abc")
+                .expecting(WebLookupOutcome::RefusedDomain),
+            Case {
+                endpoint: Some("https://search.example/api"),
+                ..Case::fetch("fetch at the search origin", vec![])
+                    .at("https://search.example/secret/path?token=abc")
+                    .expecting(WebLookupOutcome::RefusedDomain)
             },
             Case {
-                name: "blocked search",
-                script: vec![],
+                fetch_gate: Some(a_high_finding()),
+                ..Case::fetch("blocked fetch", vec![]).expecting(WebLookupOutcome::BlockedRedact)
+            },
+            Case {
                 gate: Some(a_high_finding()),
                 endpoint: Some("https://search.example/api"),
                 search: true,
-                tainted: false,
-                host_check: allow_any_host,
-                expected: WebLookupOutcome::BlockedRedact,
+                ..Case::fetch("blocked search", vec![]).expecting(WebLookupOutcome::BlockedRedact)
             },
             Case {
-                name: "unconfigured search",
-                script: vec![],
                 gate: Some(RedactionVerdict::clean()),
-                endpoint: None,
                 search: true,
-                tainted: false,
-                host_check: allow_any_host,
-                expected: WebLookupOutcome::RefusedTier,
+                ..Case::fetch("unconfigured search", vec![])
+                    .expecting(WebLookupOutcome::RefusedTier)
             },
             Case {
-                name: "delivered search",
-                script: vec![Ok((200, None, b"{}".to_vec()))],
                 gate: Some(RedactionVerdict::clean()),
                 endpoint: Some("https://search.example/api"),
                 search: true,
-                tainted: false,
-                host_check: allow_any_host,
-                expected: WebLookupOutcome::Completed,
+                ..Case::fetch("delivered search", vec![Ok((200, None, b"{}".to_vec()))])
             },
         ];
 
@@ -1770,6 +3124,9 @@ mod tests {
             let mut egress = egress_over(inner).with_lookup_recorder(recorder.clone());
             if let Some(verdict) = case.gate {
                 egress = egress.with_search_redaction_gate(CountingGate::new(verdict));
+            }
+            if let Some(verdict) = case.fetch_gate {
+                egress = egress.with_fetch_redaction_gate(CountingGate::new(verdict));
             }
             let flags: &dyn TaintView = if case.tainted {
                 &flags_tainted
@@ -1785,7 +3142,8 @@ mod tests {
                 LookupRequest::search("some query text", Authorship::ModelComposed)
             } else {
                 LookupRequest::fetch(
-                    "https://docs.rs/secret/path?token=abc",
+                    case.fetch_url
+                        .unwrap_or("https://docs.rs/secret/path?token=abc"),
                     Authorship::ModelComposed,
                 )
             };
@@ -1892,6 +3250,79 @@ mod tests {
 
         assert!(outcome.truncated());
         assert_eq!(outcome.bytes_in(), LOOKUP_MAX_BODY_BYTES as u64);
+    }
+
+    #[tokio::test]
+    async fn a_body_of_exactly_the_cap_is_kept_whole_and_not_called_truncated() {
+        // The off-by-one. `truncated` is a claim about bytes this seam threw
+        // away, and a body that fits exactly had none thrown away — reporting
+        // it as truncated tells the user content is missing when none is, and
+        // the reducer downstream renders that as a caveat on a complete page.
+        for (len, expected_truncation) in [
+            (LOOKUP_MAX_BODY_BYTES - 1, false),
+            (LOOKUP_MAX_BODY_BYTES, false),
+            (LOOKUP_MAX_BODY_BYTES + 1, true),
+        ] {
+            let inner = CaptureTransport::new(vec![Ok((200, None, vec![b'x'; len]))]);
+            let egress = egress_over(inner);
+            let flags = Flags::clean();
+            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+            let outcome = egress
+                .lookup(
+                    &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                    &ctx,
+                )
+                .await;
+
+            assert_eq!(
+                outcome.truncated(),
+                expected_truncation,
+                "a {len}-byte body against a {LOOKUP_MAX_BODY_BYTES}-byte cap"
+            );
+            assert_eq!(
+                outcome.bytes_in(),
+                len.min(LOOKUP_MAX_BODY_BYTES) as u64,
+                "a {len}-byte body against a {LOOKUP_MAX_BODY_BYTES}-byte cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_already_carries_a_q_has_it_replaced_not_duplicated() {
+        // Config validation rejects such an endpoint, so this is the seam
+        // declining to assume validation ran. A duplicate `q` is not cosmetic:
+        // some backends read the first value and some the last, so it turns
+        // "which query did this session send" into a question about the
+        // backend's parser.
+        let inner = CaptureTransport::answering(200, "{}");
+        let egress = egress_over(inner.clone())
+            .with_search_redaction_gate(CountingGate::new(RedactionVerdict::clean()));
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+            .with_search_endpoint("https://search.example/api?q=preset&count=5");
+
+        egress
+            .lookup(
+                &LookupRequest::search("rust lifetimes", Authorship::ModelComposed),
+                &ctx,
+            )
+            .await;
+
+        let sent = &inner.urls()[0];
+        let parsed = reqwest::Url::parse(sent).expect("the request URL parses");
+        let qs: Vec<String> = parsed
+            .query_pairs()
+            .filter(|(name, _)| name == "q")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        assert_eq!(qs, vec!["rust lifetimes".to_owned()], "sent: {sent}");
+        assert!(
+            parsed
+                .query_pairs()
+                .any(|(name, value)| name == "count" && value == "5"),
+            "the endpoint's other parameters survive: {sent}"
+        );
     }
 
     #[test]

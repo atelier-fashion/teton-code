@@ -794,6 +794,63 @@ pub enum ConfigError {
     )]
     WebSearchTierWithoutEndpoint,
 
+    /// `[web] search_endpoint` is set to something that is not an absolute
+    /// http(s) URL (REQ-563 BR-8).
+    ///
+    /// Checked wherever the key is set rather than only at `tier = "search"`: a
+    /// value that could never be requested is a mistake at the moment it is
+    /// written, and finding out about it when the tier is *raised* — the one
+    /// moment the user is trying to do something else — is the worse of the two
+    /// times to be told.
+    ///
+    /// The value is not echoed, for [`ConfigError::InvalidAllowedDomain`]'s
+    /// reason: the likeliest malformed endpoint is one carrying a key in its
+    /// query string, and this message is loggable.
+    #[error(
+        "[web] search_endpoint is not a usable URL. It must be an absolute http/https URL \
+         including a host, e.g. \"https://search.example.com/search\". (The value is not echoed: \
+         an endpoint can carry a credential in its query string, and this message is loggable — \
+         BR-7.)"
+    )]
+    InvalidWebSearchEndpoint,
+
+    /// `[web] search_key_ref` is set beside a cleartext `http://` endpoint on a
+    /// non-loopback host (REQ-563 BR-7).
+    ///
+    /// The key resolved from that reference is sent as a bearer credential, so
+    /// an `http://` endpoint puts it on the wire in the clear for every hop to
+    /// read. A config that names both is asking for that, almost certainly
+    /// without meaning to — and the honest place to say so is the load, not a
+    /// packet capture.
+    ///
+    /// Loopback is exempt because there is no wire: a self-hosted backend on
+    /// `http://127.0.0.1:8888` is an ordinary setup, and refusing it would push
+    /// people toward a self-signed certificate for no gain.
+    #[error(
+        "[web] search_key_ref is set, but search_endpoint is a cleartext http:// URL on a \
+         non-loopback host — the search key would be sent in the clear. Use https://, or point \
+         search_endpoint at a loopback address if the backend runs on this machine (BR-7)."
+    )]
+    WebSearchKeyOverCleartextEndpoint,
+
+    /// `[web] search_endpoint` already carries a `q` query parameter (REQ-563
+    /// BR-2, BR-8).
+    ///
+    /// The search seam appends the query as `q`, so an endpoint that already has
+    /// one produces a URL with two — and which of them the backend honours is
+    /// its business, not something this machine can know. That matters beyond
+    /// tidiness: the redaction scan (BR-14) runs on the query string this daemon
+    /// composed, and if the backend answers the *other* `q` then the string that
+    /// was scanned is not the string that decided the request. A parameter name
+    /// the seam owns is not one a config may also set.
+    #[error(
+        "[web] search_endpoint already carries a `q` parameter, and the search query is sent as \
+         `q`. Two would leave which one the backend honours undefined — and the scanned query \
+         would not be the effective one. Remove `q` from the endpoint URL (its other parameters \
+         are kept)."
+    )]
+    WebSearchEndpointCarriesQueryParam,
+
     /// `[web] search_key_ref` is not a recognized credential *reference*
     /// (REQ-563 BR-8). Like [`ConfigError::UnrecognizedAuthRef`], the message
     /// names the accepted forms and never the value.
@@ -1342,11 +1399,15 @@ impl Config {
 
     /// Validates the `[web]` table (REQ-563).
     ///
-    /// Three rules, each of which is as interesting for what it does *not*
-    /// check:
+    /// The rules, each of which is as interesting for what it does *not* check:
     ///
     /// - `tier = "search"` requires a `search_endpoint`. An unset endpoint below
     ///   that tier is not checked at all — BR-8 makes it the ordinary state.
+    /// - a `search_endpoint` that *is* set must be an absolute http(s) URL, must
+    ///   not already carry the `q` parameter the search seam appends, and must
+    ///   not be cleartext to a remote host when a `search_key_ref` sits beside
+    ///   it. These are checked at every tier, because a value that could never
+    ///   be requested is wrong when it is written, not when it is first used.
     /// - `search_key_ref`, when present, must be a reference rather than a
     ///   secret, by the same predicate a provider `auth_ref` faces. It is not
     ///   *required* at any tier: an unauthenticated backend is a legitimate
@@ -1366,16 +1427,31 @@ impl Config {
 
         // A blank endpoint is as unset as an absent one — the same reading
         // `MissingEndpoint` gives a provider's, so `search_endpoint = ""` cannot
-        // satisfy the tier by being technically present.
-        if web.tier == WebTier::Search
-            && web
-                .search_endpoint
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-        {
+        // satisfy the tier by being technically present. The same reading is why
+        // the shape checks below skip a blank value rather than calling it
+        // malformed: "not configured" is one state, not two.
+        let endpoint = web
+            .search_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if web.tier == WebTier::Search && endpoint.is_none() {
             return Err(ConfigError::WebSearchTierWithoutEndpoint);
+        }
+
+        if let Some(endpoint) = endpoint {
+            if !is_absolute_http_url(endpoint) {
+                return Err(ConfigError::InvalidWebSearchEndpoint);
+            }
+            if url_query_names(endpoint).any(|name| name == SEARCH_QUERY_PARAM) {
+                return Err(ConfigError::WebSearchEndpointCarriesQueryParam);
+            }
+            // A key beside a cleartext endpoint is the credential going out in
+            // the clear, so the pair is refused rather than the endpoint alone —
+            // `http://` to a backend that wants no key is a user's own call.
+            if web.search_key_ref.is_some() && is_cleartext_to_a_remote_host(endpoint) {
+                return Err(ConfigError::WebSearchKeyOverCleartextEndpoint);
+            }
         }
 
         // BR-7, by the provider path's own predicate rather than a second
@@ -1463,6 +1539,71 @@ fn is_absolute_http_url(value: &str) -> bool {
     };
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     !host.is_empty() && !host.starts_with(':')
+}
+
+/// The query parameter the search seam sends the user's query as (REQ-563).
+///
+/// Named here rather than only at the seam because the config check and the
+/// request builder have to agree about which name is spoken for: a constant in
+/// one crate and a string literal in the other is exactly the pair that drifts.
+const SEARCH_QUERY_PARAM: &str = "q";
+
+/// The parameter *names* in `url`'s query string, in order.
+///
+/// Names only — a value is never yielded, because a query string is the likeliest
+/// place in a URL for a credential to be sitting and this iterator feeds error
+/// paths. The fragment is cut first: `#` ends the query, and a `?` after one
+/// belongs to the fragment and is never sent.
+fn url_query_names(url: &str) -> impl Iterator<Item = &str> {
+    url.split('#')
+        .next()
+        .and_then(|before_fragment| before_fragment.split_once('?'))
+        .map_or("", |(_, query)| query)
+        .split('&')
+        .map(|pair| pair.split('=').next().unwrap_or_default())
+        .filter(|name| !name.is_empty())
+}
+
+/// The host of an absolute http(s) URL, without userinfo, port, or brackets.
+///
+/// Deliberately not a URL parser: it answers one question — which host would be
+/// contacted — for a string [`is_absolute_http_url`] has already accepted. The
+/// userinfo strip uses the *last* `@`, because a password may contain one and
+/// the authority ends at the last.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, after)| after);
+    let host = host_port.strip_prefix('[').map_or_else(
+        || host_port.split(':').next().unwrap_or_default(),
+        |bracketed| bracketed.split(']').next().unwrap_or_default(),
+    );
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether `url` would put bytes on a wire in the clear.
+///
+/// `http://` to loopback is not that: nothing leaves the machine, so a
+/// self-hosted backend on `http://127.0.0.1:8888` is an ordinary configuration
+/// and not a credential exposure. Anything else `http://` is.
+///
+/// A host that cannot be extracted counts as remote — the failing-safe reading,
+/// though [`is_absolute_http_url`] has already refused the hostless shapes.
+fn is_cleartext_to_a_remote_host(url: &str) -> bool {
+    url.starts_with("http://") && !url_host(url).is_some_and(is_loopback_host)
+}
+
+/// Whether `host` names this machine: `localhost`, or any address in a loopback
+/// range (`127.0.0.0/8` is loopback in its entirety, not just `127.0.0.1`).
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// Whether `value` is shaped like a bare domain pattern for the BR-11 allowlist
@@ -3729,6 +3870,198 @@ cache_ttl_secs = 60
         // at the search tier would make it unconfigurable.
         Config::load("[web]\ntier = \"search\"\nsearch_endpoint = \"https://searx.internal\"\n")
             .expect("an unauthenticated search backend must be configurable");
+    }
+
+    /// A `search_endpoint` that could never be requested is a mistake at the
+    /// moment it is written. Every one of these used to load cleanly and fail
+    /// later — at daemon start, or at the first search, whichever came first.
+    #[test]
+    fn a_search_endpoint_that_is_not_an_absolute_http_url_is_rejected() {
+        for bad in [
+            "search.example/api",             // no scheme
+            "//search.example/api",           // protocol-relative
+            "ftp://search.example/api",       // wrong scheme
+            "file:///etc/passwd",             // wrong scheme, and a local read
+            "https://",                       // no host
+            "https:///api",                   // no host, with a path
+            "https://:8443/api",              // port with no host
+            "javascript:alert(1)",            // not a URL at all
+            "https://search example/api",     // whitespace
+            "https://search.example/\u{7}pi", // control character
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*bad).to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::InvalidWebSearchEndpoint,
+                "accepted as an endpoint: {bad:?}"
+            );
+        }
+
+        // The rejection is checked at every tier, not only at `search`: an
+        // endpoint written today is wrong today, whatever tier it is waiting for.
+        for tier in [WebTier::Off, WebTier::FetchUserUrl, WebTier::FetchAnyUrl] {
+            let cfg = web_config(WebConfig {
+                tier,
+                search_endpoint: Some("not-a-url".to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::InvalidWebSearchEndpoint,
+                "{tier:?} skipped the endpoint check"
+            );
+        }
+
+        // ...and the shapes that are usable endpoints.
+        for good in [
+            "https://search.example",
+            "https://search.example/search",
+            "http://127.0.0.1:8888/search",
+            "https://search.example/search?format=json&safe=1",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*good).to_owned()),
+                ..WebConfig::default()
+            });
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{good} is a usable endpoint: {e}"));
+        }
+    }
+
+    /// The rejection is loggable, and a malformed endpoint is most often one
+    /// with a key pasted into its query string — so it names the field and
+    /// nothing else, the same trade [`ConfigError::InvalidAllowedDomain`] makes.
+    #[test]
+    fn the_endpoint_rejection_names_the_field_and_never_the_value() {
+        let leaky = "search.example/api?api_key=sk-live-DO-NOT-LOG";
+        let cfg = web_config(WebConfig {
+            search_endpoint: Some(leaky.to_owned()),
+            ..WebConfig::default()
+        });
+        let msg = cfg.validate().unwrap_err().to_string();
+        assert!(
+            !msg.contains("sk-live-DO-NOT-LOG"),
+            "the error echoed a credential: {msg}"
+        );
+        assert!(!msg.contains(leaky), "the error echoed the value: {msg}");
+        assert!(
+            msg.contains("search_endpoint"),
+            "the error must name the field: {msg}"
+        );
+    }
+
+    /// The key resolved from `search_key_ref` goes out as a bearer credential,
+    /// so a cleartext endpoint puts it on the wire for every hop to read. The
+    /// pair is what is refused — `http://` with no key is the user's own call.
+    #[test]
+    fn a_search_key_beside_a_cleartext_remote_endpoint_is_refused() {
+        for remote in [
+            "http://search.example/api",
+            "http://192.0.2.10:8888/search",
+            "http://user@search.example/api",
+            "http://[2001:db8::1]/search",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*remote).to_owned()),
+                search_key_ref: Some("keychain:teton-search".to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::WebSearchKeyOverCleartextEndpoint,
+                "a key was allowed to travel in the clear to {remote}"
+            );
+        }
+
+        // Loopback is exempt: there is no wire, and refusing it would push a
+        // self-hosted backend toward a self-signed certificate for no gain.
+        for local in [
+            "http://localhost:8888/search",
+            "http://LOCALHOST:8888/search",
+            "http://127.0.0.1:8888/search",
+            "http://127.9.9.9/search",
+            "http://[::1]:8888/search",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*local).to_owned()),
+                search_key_ref: Some("keychain:teton-search".to_owned()),
+                ..WebConfig::default()
+            });
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{local} is loopback and needs no TLS: {e}"));
+        }
+
+        // https is fine anywhere, and cleartext with no key is not this rule's
+        // business.
+        for (endpoint, key) in [
+            ("https://search.example/api", Some("keychain:teton-search")),
+            ("http://search.example/api", None),
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some(endpoint.to_owned()),
+                search_key_ref: key.map(str::to_owned),
+                ..WebConfig::default()
+            });
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{endpoint} with key {key:?} must validate: {e}"));
+        }
+
+        let msg = ConfigError::WebSearchKeyOverCleartextEndpoint.to_string();
+        assert!(msg.contains("search_key_ref"), "{msg}");
+        assert!(msg.contains("search_endpoint"), "{msg}");
+    }
+
+    /// The seam appends the query as `q`. An endpoint that already carries one
+    /// would produce two, and which the backend honours is its business — so the
+    /// string this daemon scanned would not be the string that decided the
+    /// request. The name the seam owns is not one a config may also set.
+    #[test]
+    fn an_endpoint_that_already_carries_a_q_parameter_is_rejected() {
+        for bad in [
+            "https://search.example/api?q=",
+            "https://search.example/api?q=preset",
+            "https://search.example/api?format=json&q=preset",
+            "https://search.example/api?format=json&q=preset&safe=1",
+            "https://search.example/api?q", // valueless, still the name
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*bad).to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::WebSearchEndpointCarriesQueryParam,
+                "accepted an endpoint that already sets q: {bad:?}"
+            );
+        }
+
+        // Other parameters are the backend's business and are kept — only the
+        // one name the seam owns is refused. A `q` inside a *value*, a path, or
+        // a fragment is not a parameter named `q`.
+        for good in [
+            "https://search.example/api?format=json&safe=1",
+            "https://search.example/api?query=preset",
+            "https://search.example/api?format=q",
+            "https://search.example/q/api",
+            "https://search.example/api#q=notsent",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*good).to_owned()),
+                ..WebConfig::default()
+            });
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{good} sets no q parameter: {e}"));
+        }
+
+        let msg = ConfigError::WebSearchEndpointCarriesQueryParam.to_string();
+        assert!(msg.contains("search_endpoint"), "{msg}");
+        assert!(
+            !msg.contains("preset"),
+            "the message must not echo the value: {msg}"
+        );
     }
 
     #[test]

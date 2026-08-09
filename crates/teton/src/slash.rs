@@ -50,7 +50,6 @@
 //! and names `teton model set` as the auditable surface for the unattended case.
 //! Every other command is pipe-friendly exactly as BR-9 says.
 
-use teton_protocol::events::WebTier;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     ModelStatusParams, PromptBlock, PromptTurnParams, WebOverrideParams, WebOverrideResult,
@@ -61,6 +60,7 @@ use teton_protocol::SessionId;
 use crate::client::{Connection, UiContext};
 use crate::model_ui;
 use crate::render::{LineKind, Surface};
+use crate::session_ui::web_tier_name;
 
 /// The one line `/help` prints about the `//` escape hatch (BR-1b).
 const ESCAPE_FOOTER: &str =
@@ -761,16 +761,6 @@ fn render_web_override(result: &WebOverrideResult) -> String {
     )
 }
 
-/// A tier's config spelling — the same vocabulary `[web] tier` uses.
-fn web_tier_name(tier: WebTier) -> &'static str {
-    match tier {
-        WebTier::Off => "off",
-        WebTier::FetchUserUrl => "fetch_user_url",
-        WebTier::FetchAnyUrl => "fetch_any_url",
-        WebTier::Search => "search",
-    }
-}
-
 /// Unwrap a `web/override` answer, reporting a daemon too old to have the method
 /// as a notice and any other failure as an error.
 ///
@@ -906,6 +896,9 @@ mod tests {
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
     use crate::session_ui::SessionState;
+    // Only the tests name a tier now: the tier vocabulary itself moved to
+    // `session_ui`, so the production code here never mentions the type.
+    use teton_protocol::events::WebTier;
 
     /// The session's own context (D-4). No answers are scripted: none of the
     /// client-local commands asks a question.
@@ -1643,15 +1636,5 @@ mod tests {
         assert_ne!(WEB_REFRESH_EVICTED, WEB_REFRESH_ABSENT);
         assert!(WEB_REFRESH_EVICTED.contains("re-fetches"));
         assert!(WEB_REFRESH_ABSENT.contains("nothing was stored"));
-    }
-
-    /// The tier vocabulary these lines use is the config vocabulary, so a user
-    /// reading a notice and then their config sees one word.
-    #[test]
-    fn the_command_lines_name_tiers_the_way_the_config_does() {
-        assert_eq!(web_tier_name(WebTier::Off), "off");
-        assert_eq!(web_tier_name(WebTier::FetchUserUrl), "fetch_user_url");
-        assert_eq!(web_tier_name(WebTier::FetchAnyUrl), "fetch_any_url");
-        assert_eq!(web_tier_name(WebTier::Search), "search");
     }
 }

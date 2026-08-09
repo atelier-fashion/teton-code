@@ -3,12 +3,13 @@
   "branch": "feat/REQ-563-opt-in-web-lookup",
   "startedAt": "2026-08-08T22:15:00Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -35,6 +36,12 @@
       "name": "Validate Architecture & Tasks",
       "completedAt": "2026-08-08T23:00:00Z",
       "note": "PASS after 1 fix loop: DAG valid (5 tiers, max 2 deps/task), all 13 ACs covered by >=1 task, 2 ownership gaps fixed (protocol method types; UserUrls ingestion wiring)"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-09T01:30:00Z",
+      "note": "7/7 tasks complete in 5 tiers; workspace 1684 tests green, zero clippy warnings, deny_http_client green; known BR-14 consent-time-demotion delta carried to Phase 5"
     }
   ],
   "repos": {
@@ -56,14 +63,15 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-078",
+    "currentTask": null,
     "completedTasks": [
       "TASK-072",
       "TASK-073",
       "TASK-074",
       "TASK-075",
       "TASK-076",
-      "TASK-077"
+      "TASK-077",
+      "TASK-078"
     ],
     "failedTasks": []
   }

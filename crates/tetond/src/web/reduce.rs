@@ -194,13 +194,34 @@ fn skip_markup(html: &str, at: usize, out: &str, pending_space: &mut bool) -> us
 fn dropped_element_at(rest: &str) -> Option<&'static str> {
     let after_bracket = rest.strip_prefix('<')?;
     DROPPED_ELEMENTS.into_iter().find(|name| {
-        after_bracket.len() >= name.len()
-            && after_bracket[..name.len()].eq_ignore_ascii_case(name)
-            && after_bracket[name.len()..]
+        starts_with_ascii_ignore_case(after_bracket, name) && {
+            // Reachable only when the first `name.len()` bytes matched an ASCII
+            // element name, which is what makes this index a `char` boundary —
+            // the terminator can then be read as a `char` without a second
+            // boundary check.
+            after_bracket[name.len()..]
                 .chars()
                 .next()
                 .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+        }
     })
+}
+
+/// Whether `haystack` begins with `needle`, comparing ASCII case-insensitively
+/// **on bytes**.
+///
+/// Byte comparison rather than `haystack[..needle.len()].eq_ignore_ascii_case`
+/// because the slice form panics the moment `needle.len()` lands inside a
+/// multi-byte character — and the input here is an arbitrary web page, where
+/// `<p>café` puts a `é` exactly there. `str` slicing at an attacker-chosen
+/// offset is the wrong primitive for "does this prefix match"; `[u8]` has no
+/// such precondition, and a match on ASCII bytes is a `char`-boundary proof by
+/// construction (every matched byte is < 0x80).
+fn starts_with_ascii_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .get(..needle.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 /// Index just past `</name…>` at or after `from`, or the end of the document
@@ -210,9 +231,9 @@ fn skip_to_close(html: &str, from: usize, name: &str) -> usize {
     while let Some(offset) = html[cursor..].find('<') {
         let candidate = cursor + offset;
         let rest = &html[candidate..];
-        let closes = rest.strip_prefix("</").is_some_and(|tail| {
-            tail.len() >= name.len() && tail[..name.len()].eq_ignore_ascii_case(name)
-        });
+        let closes = rest
+            .strip_prefix("</")
+            .is_some_and(|tail| starts_with_ascii_ignore_case(tail, name));
         if closes {
             return match rest.find('>') {
                 Some(end) => candidate + end + 1,
@@ -234,7 +255,7 @@ fn decode_entity(html: &str, at: usize) -> Option<(char, usize)> {
     let rest = &html[at..];
     ENTITIES
         .into_iter()
-        .find(|(name, _)| rest.len() >= name.len() && rest[..name.len()].eq_ignore_ascii_case(name))
+        .find(|(name, _)| starts_with_ascii_ignore_case(rest, name))
         .map(|(name, decoded)| (decoded, at + name.len()))
 }
 
@@ -468,5 +489,66 @@ mod tests {
     #[test]
     fn an_unterminated_tag_terminates() {
         assert_eq!(reduce("text<div class=\"x", REDUCED_MAX_BYTES), "text");
+    }
+
+    /// The whole of the web is not ASCII. Every one of these used to abort the
+    /// daemon's reduction with a slice-not-on-a-char-boundary panic, because the
+    /// prefix matchers sliced `&str` at `"script".len()` / `"&quot;".len()`
+    /// bytes past a `<` or `&` and an accented character can sit exactly there.
+    #[test]
+    fn accented_text_after_a_tag_or_an_ampersand_does_not_panic() {
+        assert_eq!(
+            reduce("<p>café au lait</p>", REDUCED_MAX_BYTES),
+            "café au lait"
+        );
+        assert_eq!(reduce("a & b — c", REDUCED_MAX_BYTES), "a & b — c");
+        assert_eq!(reduce("&amp;é", REDUCED_MAX_BYTES), "&é");
+        assert_eq!(reduce("<span>Ü</span>", REDUCED_MAX_BYTES), "Ü");
+        // The close-tag scan has the same shape and the same hazard.
+        assert_eq!(reduce("<script>x</é>y</script>z", REDUCED_MAX_BYTES), "z");
+    }
+
+    /// Bodies arrive through `String::from_utf8_lossy`, so U+FFFD — three bytes,
+    /// and one the page never wrote — appears at offsets nobody chose. It is the
+    /// same boundary hazard arriving by a different door.
+    #[test]
+    fn a_lossily_decoded_body_does_not_panic() {
+        // Invalid continuation bytes right where a prefix match would slice.
+        let raw = b"<\xff\xfe\xfd>text<script>\xc3\x28 hidden</script>&\xff\xfe\xfd;tail";
+        let lossy = String::from_utf8_lossy(raw);
+        let out = reduce(&lossy, REDUCED_MAX_BYTES);
+        assert!(out.contains("text"), "{out:?}");
+        assert!(!out.contains("hidden"), "script body leaked: {out:?}");
+    }
+
+    /// The panic was offset-dependent, so the guard is too: walk a multi-byte
+    /// character across every position a prefix match could slice at, after both
+    /// of the two characters that start a match (`<` and `&`).
+    #[test]
+    fn a_multi_byte_character_at_every_offset_after_a_lead_byte_is_survivable() {
+        for lead in ['<', '&'] {
+            for multi in ['é', '日', '😀', '\u{fffd}'] {
+                for pad in 0..8usize {
+                    let filler = "a".repeat(pad);
+                    for tail in ["", ">rest", ";rest", "/>rest"] {
+                        let html = format!("head{lead}{filler}{multi}{tail}");
+                        // The assertion is mostly that this returns at all —
+                        // every one of these panicked before the byte-wise
+                        // matchers — but the text before the lead byte is
+                        // ordinary prose and must survive whatever follows it.
+                        let out = reduce(&html, REDUCED_MAX_BYTES);
+                        assert!(out.starts_with("head"), "{html:?} reduced to {out:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A dropped element whose name is followed by a multi-byte character is not
+    /// that element — and finding that out must not slice mid-character.
+    #[test]
+    fn a_tag_named_like_a_dropped_one_but_continued_in_unicode_is_an_ordinary_tag() {
+        assert_eq!(reduce("a<scriptée>b</scriptée>c", 64), "a b c");
+        assert_eq!(reduce("a<styleé>b</styleé>c", 64), "a b c");
     }
 }

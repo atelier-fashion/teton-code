@@ -82,6 +82,7 @@ pub mod provenance;
 pub mod redact;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -102,8 +103,8 @@ use crate::cost::{CostAttribution, CostMeter};
 
 pub use inspector::{inspect, Inspection, Violation};
 pub use lookup::{
-    to_protocol_web_tier, Authorship, LookupContext, LookupDetail, LookupKind, LookupOutcome,
-    LookupRecord, LookupRecorder, LookupRequest, NoopLookupRecorder, TaintView,
+    to_protocol_web_tier, AddressClass, Authorship, LookupContext, LookupDetail, LookupKind,
+    LookupOutcome, LookupRecord, LookupRecorder, LookupRequest, NoopLookupRecorder, TaintView,
 };
 pub use provenance::{assembled_provenance, ContextBlock, Provenance};
 pub use redact::{RedactionGate, RedactionVerdict};
@@ -437,6 +438,21 @@ pub struct Egress<T: Transport> {
     /// Absent, a `Search` lookup is **refused**, not sent unscanned — see
     /// [`Egress::lookup`].
     search_redaction: Option<Arc<dyn RedactionGate>>,
+    /// The REQ-563 **fetch** scanner: the provider-parity slot (BR-2, BR-13).
+    ///
+    /// A third slot rather than a second reader of `redaction` for the same
+    /// reason `search_redaction` is a second: the slots record *which promise*
+    /// installed them, and a gate that answered to two switches could not be
+    /// removed from one of them. This one is governed by `[privacy] redact`
+    /// exactly as the provider gate is — parity means parity — so a lookup
+    /// choke point built with `redact` off scans no fetch URL at all, which is
+    /// the same "off" a provider payload gets.
+    ///
+    /// Absent is genuinely **off** here, unlike [`Self::search_redaction`]: the
+    /// unconditional-scan promise BR-14 makes is about the *search* tier, and
+    /// extending fail-closed behavior to fetch would refuse every fetch on a
+    /// daemon with `redact = false`, which is a configuration BR-2 blesses.
+    fetch_redaction: Option<Arc<dyn RedactionGate>>,
     /// Where a completed lookup attempt is recorded (BR-7) and announced (D-8).
     /// Absent means neither happens; it never changes a decision.
     lookup_recorder: Option<Arc<dyn lookup::LookupRecorder>>,
@@ -458,6 +474,7 @@ impl<T: Transport> Egress<T> {
             cost: None,
             redaction: None,
             search_redaction: None,
+            fetch_redaction: None,
             lookup_recorder: None,
         }
     }
@@ -503,6 +520,34 @@ impl<T: Transport> Egress<T> {
         self
     }
 
+    /// Install the **fetch** redaction scanner: the provider-parity gate
+    /// (REQ-563 BR-2, BR-13).
+    ///
+    /// BR-2 promises that a fetch tier gets "the same treatment a provider
+    /// payload gets", and BR-13 says a user-pasted URL is "still
+    /// redact-scanned". Both are one sentence: whenever `[privacy] redact` is
+    /// on, the outgoing *URL string* of a `Fetch` is scanned before a byte of it
+    /// reaches the wire, whatever authored it. The daemon therefore calls this
+    /// from the same switch it calls [`Self::with_redaction_gate`] from, and
+    /// with the same composite gate.
+    ///
+    /// Absent is **off**, not fail-closed — the opposite of
+    /// [`Self::with_search_redaction_gate`]. The asymmetry is the requirements'
+    /// own: BR-14 couples *search* egress to the scan unconditionally because
+    /// the search tier's existence is conditioned on it, while BR-2 couples
+    /// *fetch* to whatever `[privacy] redact` says. Making fetch fail closed
+    /// would refuse every lookup on a `redact = false` daemon, which is a
+    /// configuration the requirement blesses.
+    ///
+    /// Wave-2 wiring note: `DaemonRuntime::web_lookup_egress` must call this
+    /// whenever `config.privacy.redact` is set, passing the same gate
+    /// `redaction_gate` builds for the provider path.
+    #[must_use]
+    pub fn with_fetch_redaction_gate(mut self, gate: Arc<dyn RedactionGate>) -> Self {
+        self.fetch_redaction = Some(gate);
+        self
+    }
+
     /// Install the web-lookup recorder (REQ-563 BR-7, D-7/D-8): every lookup
     /// attempt, whatever its ending, becomes one `web_lookups` row and one
     /// `web_lookup` event.
@@ -539,6 +584,17 @@ impl<T: Transport> Egress<T> {
             self.search_redaction.is_some(),
             self.lookup_recorder.is_some(),
         )
+    }
+
+    /// Whether the fetch-parity redaction gate is installed.
+    ///
+    /// A separate accessor rather than a fourth element on [`Self::installed`]
+    /// so that adding the slot did not rewrite every existing assertion about
+    /// the other three. Same test-only rationale as that one.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn fetch_redaction_installed(&self) -> bool {
+        self.fetch_redaction.is_some()
     }
 
     /// Dispatch `request` for the context assembled with `provenance`.
@@ -801,7 +857,7 @@ impl HttpTransport {
     /// Build a transport with a fresh HTTP client and no injected credential.
     /// This is the MCP egress path's transport — it never carries provider auth.
     pub fn new() -> Result<Self, EgressError> {
-        Self::build(None)
+        Self::build(None, None)
     }
 
     /// Build a transport that injects `headers` (a resolved provider credential,
@@ -812,20 +868,81 @@ impl HttpTransport {
         endpoint: &str,
         headers: Vec<(String, String)>,
     ) -> Result<Self, EgressError> {
-        Self::build(Some(EndpointAuth::new(endpoint, headers)))
+        Self::build(Some(EndpointAuth::new(endpoint, headers)), None)
     }
 
-    fn build(injected: Option<EndpointAuth>) -> Result<Self, EgressError> {
+    /// Build the **web-lookup** transport: no credential, and a connect timeout
+    /// (REQ-563).
+    ///
+    /// The distinction from [`Self::new`] is the timeout, and it exists because
+    /// the two paths face different destinations. A provider endpoint is one
+    /// host the user configured and the daemon talks to constantly; a lookup
+    /// destination is an arbitrary host a model or a user named once, and an
+    /// arbitrary host is entitled to accept a connection and then say nothing.
+    /// Without a connect bound, a single such destination parks the turn
+    /// forever.
+    ///
+    /// This bounds the *connect* phase only. The bound on the whole attempt —
+    /// redirects, headers and body read included — is
+    /// [`lookup::LOOKUP_TOTAL_TIMEOUT`], enforced at the seam rather than here,
+    /// because it has to hold for every transport this choke point is built
+    /// over (the test doubles included) and not only for the real client.
+    ///
+    /// Wave-2 wiring note: `DaemonRuntime::web_lookup_egress` must build its
+    /// transport from this and from
+    /// [`Self::for_lookup_with_endpoint_auth`] rather than from [`Self::new`]
+    /// and [`Self::with_endpoint_auth`]. The seam-level bound holds either way;
+    /// what is lost by not switching is the connect bound, which is the one
+    /// that fails a black-holed destination fast instead of at the sixty-second
+    /// ceiling.
+    ///
+    /// # Errors
+    /// [`EgressError::ClientInit`] if the HTTP client cannot be constructed.
+    pub fn for_lookup() -> Result<Self, EgressError> {
+        Self::build(None, Some(lookup::LOOKUP_CONNECT_TIMEOUT))
+    }
+
+    /// The lookup transport with a search credential bound to `endpoint`'s
+    /// origin (REQ-563 BR-7): [`Self::for_lookup`]'s timeouts,
+    /// [`Self::with_endpoint_auth`]'s binding.
+    ///
+    /// The binding is one of the two things keeping the search key off a page
+    /// fetch. The other is at the seam: [`Egress::lookup`] refuses a `Fetch`
+    /// whose destination origin *is* the search endpoint's, so the case where
+    /// the origin match would have attached the key never reaches this
+    /// transport at all.
+    ///
+    /// # Errors
+    /// [`EgressError::ClientInit`] if the HTTP client cannot be constructed.
+    pub fn for_lookup_with_endpoint_auth(
+        endpoint: &str,
+        headers: Vec<(String, String)>,
+    ) -> Result<Self, EgressError> {
+        Self::build(
+            Some(EndpointAuth::new(endpoint, headers)),
+            Some(lookup::LOOKUP_CONNECT_TIMEOUT),
+        )
+    }
+
+    fn build(
+        injected: Option<EndpointAuth>,
+        connect_timeout: Option<Duration>,
+    ) -> Result<Self, EgressError> {
         // REQ-544 security (Low): do NOT auto-follow redirects. The daemon POSTs to
         // a single known provider/MCP endpoint and needs no redirect handling.
         // reqwest strips `Authorization` on a cross-host redirect but NOT custom
         // credential headers like `x-api-key`, so following a redirect could carry
         // a provider secret to an attacker-influenced host. Refusing redirects
         // outright closes that path (the caller sees the 3xx and stops).
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| EgressError::ClientInit)?;
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        // Applied only where a caller asked for it, so the provider `send()`
+        // path's behavior is byte-for-byte what it was: a long-running
+        // completion is not a stalled connection, and a bound tuned for a page
+        // fetch would cut one off (REQ-563 review).
+        if let Some(connect_timeout) = connect_timeout {
+            builder = builder.connect_timeout(connect_timeout);
+        }
+        let client = builder.build().map_err(|_| EgressError::ClientInit)?;
         Ok(Self { client, injected })
     }
 
@@ -1804,6 +1921,48 @@ mod tests {
         let evil =
             transport.outbound_headers("https://api-anthropic.com.evil.test/v1/messages", &[]);
         assert!(!evil.iter().any(|(n, _)| n == "x-api-key"));
+    }
+
+    #[test]
+    fn the_three_redaction_slots_are_installed_independently() {
+        // Three switches, three slots (REQ-563 D-6): `[privacy] redact`
+        // installs the provider gate *and* the fetch-parity gate, the `search`
+        // tier installs the search gate. Sharing a slot would make the coupling
+        // BR-14 requires bypassable by turning `[privacy] redact` off, and
+        // reading one flag twice would make BR-2's parity clause unstateable.
+        let gate = CountingGate::new(RedactionVerdict::clean());
+        let build = || {
+            Egress::new(
+                CaptureTransport::default(),
+                boundaries(),
+                Arc::new(CapturingSink::default()),
+            )
+        };
+
+        let bare = build();
+        assert_eq!(bare.installed(), (false, false, false));
+        assert!(!bare.fetch_redaction_installed());
+
+        let provider_only = build().with_redaction_gate(gate.clone());
+        assert_eq!(provider_only.installed(), (true, false, false));
+        assert!(
+            !provider_only.fetch_redaction_installed(),
+            "the provider slot is not the fetch slot: the daemon installs both \
+             from one switch, and each has to be asked for"
+        );
+
+        let parity = build()
+            .with_redaction_gate(gate.clone())
+            .with_fetch_redaction_gate(gate.clone());
+        assert_eq!(parity.installed(), (true, false, false));
+        assert!(parity.fetch_redaction_installed());
+
+        let searching = build().with_search_redaction_gate(gate);
+        assert_eq!(searching.installed(), (false, true, false));
+        assert!(
+            !searching.fetch_redaction_installed(),
+            "and the search tier's own gate does not stand in for parity"
+        );
     }
 }
 

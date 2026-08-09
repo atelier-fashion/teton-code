@@ -443,8 +443,11 @@ fn format_web_taint_overridden(tiers: &[WebTier]) -> String {
 /// A tier's config spelling, for a line that has to name one.
 ///
 /// The same vocabulary the daemon writes to `[web] tier` — a user reading this
-/// notice and then their config must see one word, not two.
-fn web_tier_name(tier: WebTier) -> &'static str {
+/// notice and then their config must see one word, not two. Which is exactly why
+/// there is one of these and it is shared with [`crate::slash`]: two copies of a
+/// vocabulary are two places for it to drift, and the drift would show up as the
+/// event stream and the command output naming the same tier differently.
+pub(crate) fn web_tier_name(tier: WebTier) -> &'static str {
     match tier {
         WebTier::Off => "off",
         WebTier::FetchUserUrl => "fetch_user_url",
@@ -1651,6 +1654,18 @@ mod tests {
             );
             assert!(surface.lines_of(LineKind::Error).is_empty());
         }
+    }
+
+    /// The tier vocabulary these lines use is the config vocabulary, so a user
+    /// reading a notice and then their config sees one word. Asserted here
+    /// because this is now the only definition — `slash.rs` had a byte-identical
+    /// copy, which is exactly how two spellings of one vocabulary get started.
+    #[test]
+    fn tiers_are_named_the_way_the_config_names_them() {
+        assert_eq!(web_tier_name(WebTier::Off), "off");
+        assert_eq!(web_tier_name(WebTier::FetchUserUrl), "fetch_user_url");
+        assert_eq!(web_tier_name(WebTier::FetchAnyUrl), "fetch_any_url");
+        assert_eq!(web_tier_name(WebTier::Search), "search");
     }
 
     /// A restore list that is empty says so, rather than trailing an empty
