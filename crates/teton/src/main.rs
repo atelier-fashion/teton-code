@@ -44,7 +44,7 @@ mod uninstall;
 use client::{Connection, UiContext};
 use keychain::Keychain;
 use prompt::{FramedStdinPrompter, Prompter, StdinPrompter};
-use render::{stdout_surface, LineKind, Surface};
+use render::{stdout_surface, stdout_surface_with_color, LineKind, Surface};
 use session_ui::SessionState;
 use teton_protocol::socket_path::{self, DaemonPaths};
 
@@ -523,27 +523,29 @@ fn render_turn_failure(err: &RpcError, surface: &mut dyn Surface) {
 /// requests and model proposals, and `auto_accept` (`--yes`) makes the latter
 /// unattended (BR-5).
 fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow::Result<()> {
-    let mut surface = stdout_surface();
+    // The banner is for humans at a terminal. Piped stdout (the e2e suites,
+    // shell composition) sees the same byte stream it always did.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    // Colour is the surface's to apply, so it is decided before the surface
+    // exists — the banner names its line classes and the surface draws them.
+    let color = interactive && banner::color_enabled();
+
+    let mut surface = stdout_surface_with_color(color);
     let mut state = SessionState::new();
     state.verbose = verbose;
     let mut prompter = StdinPrompter::new();
 
-    // The banner is for humans at a terminal. Piped stdout (the e2e suites,
-    // shell composition) sees the same byte stream it always did.
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
     // The *other* half of "interactive", read once here at the edge and carried
     // on the context (REQ-555): where the entry lines come from, which is what
     // the `/model set` gate turns on. Two different questions — a session may
     // well have a piped stdin and a terminal stdout — so neither flag is
     // derivable from the other, and a handler must never read either itself.
     let typed_input = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let color = interactive && banner::color_enabled();
     if interactive {
         banner::print(
             &mut surface,
             env!("CARGO_PKG_VERSION"),
             banner::cwd_display().as_deref(),
-            color,
         );
     }
 

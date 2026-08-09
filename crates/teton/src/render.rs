@@ -35,6 +35,34 @@ pub enum LineKind {
     Info,
     /// An error line.
     Error,
+    /// A row of the startup banner's skyline art.
+    BannerArt,
+    /// The banner's identity line — product, version, tagline.
+    BannerTitle,
+    /// A secondary banner line, subordinate to the title (the working directory).
+    BannerMeta,
+}
+
+impl LineKind {
+    /// The SGR parameters this class is drawn with, or `None` for classes that
+    /// carry no styling of their own.
+    ///
+    /// Styling lives here rather than in the text a caller hands to
+    /// [`Surface::line`] because [`neutralized`] deliberately strips every escape
+    /// out of that text — a caller that embeds `\x1b[36m` in its own string gets
+    /// the ESC replaced by a space and the bare `[36m` printed as literal
+    /// characters. That is the guard working as designed; the escape it refuses is
+    /// indistinguishable from the ones a fetched page tries to smuggle through.
+    /// So the surface authors the escape itself, from a fixed table, after the
+    /// text has been defused.
+    fn sgr(self) -> Option<&'static str> {
+        match self {
+            LineKind::BannerArt => Some("36"),
+            LineKind::BannerTitle => Some("1"),
+            LineKind::BannerMeta => Some("2"),
+            _ => None,
+        }
+    }
 }
 
 /// The rendering target. See the module docs for the contract.
@@ -83,14 +111,25 @@ pub trait Surface {
 pub struct PlainSurface<W: Write> {
     out: W,
     at_line_start: bool,
+    color: bool,
 }
 
 impl<W: Write> PlainSurface<W> {
-    /// Wraps `out` in a surface. Starts assuming a fresh line.
+    /// Wraps `out` in a surface that emits no colour. Starts assuming a fresh
+    /// line.
     pub fn new(out: W) -> Self {
+        Self::with_color(out, false)
+    }
+
+    /// Wraps `out` in a surface that draws styled line classes with SGR when
+    /// `color`. Whether the target can take colour is a property of the target,
+    /// so it is the surface that holds the answer — the callers composing lines
+    /// never need to know.
+    pub fn with_color(out: W, color: bool) -> Self {
         Self {
             out,
             at_line_start: true,
+            color,
         }
     }
 
@@ -105,14 +144,21 @@ impl<W: Write> PlainSurface<W> {
             LineKind::Cost => "",
             LineKind::Info => "",
             LineKind::Error => "error: ",
+            LineKind::BannerArt | LineKind::BannerTitle | LineKind::BannerMeta => "",
         }
     }
 }
 
-/// A convenience constructor for the common case: a surface over stdout.
+/// A convenience constructor for the common case: a plain surface over stdout.
 #[must_use]
 pub fn stdout_surface() -> PlainSurface<io::Stdout> {
     PlainSurface::new(io::stdout())
+}
+
+/// A surface over stdout that draws styled line classes in colour when `color`.
+#[must_use]
+pub fn stdout_surface_with_color(color: bool) -> PlainSurface<io::Stdout> {
+    PlainSurface::with_color(io::stdout(), color)
 }
 
 /// Whether `c` is not a C0/C1 control but steers a terminal's *display* the same
@@ -203,12 +249,40 @@ fn defused_multiline(text: &str) -> String {
 }
 
 impl<W: Write> Surface for PlainSurface<W> {
+    /// The styling wraps the *defused* text and is drawn from
+    /// [`LineKind::sgr`], never from the argument — so a caller cannot colour a
+    /// line by embedding escapes in its string, and a fetched page cannot either.
+    /// The reset is unconditional, so no styled line can leak its attribute onto
+    /// the row below.
     fn line(&mut self, kind: LineKind, text: &str) {
+        // A styled class is composed by this binary from fixed strings, so an
+        // ESC in its text is not an attack — it is a caller reaching for SGR by
+        // hand, which is the bug this styling table replaced: `defused` would
+        // eat the ESC and print the bare `[36m` to the user. Silent cosmetic
+        // debris is exactly the kind of thing that ships, so fail loudly in
+        // development instead.
+        //
+        // Deliberately *not* a check on every class. `Prompt` and `Diff` carry
+        // model-composed and file-derived text, where an escape is the hostile
+        // input the guard exists to neutralize (REQ-563) — asserting there would
+        // hand a fetched page a debug-build panic through the guard itself. The
+        // constraint this places on a future styled class is the flip side: do
+        // not tag untrusted text with one.
+        debug_assert!(
+            kind.sgr().is_none() || !text.contains('\x1b'),
+            "{kind:?} is styled by the surface; it must not carry its own escapes \
+             (they will be neutralized into visible debris): {text:?}"
+        );
+
         // Close any open streamed line first so the notice starts clean.
         if !self.at_line_start {
             let _ = writeln!(self.out);
         }
-        let _ = writeln!(self.out, "{}{}", Self::prefix(kind), defused(text));
+        let body = defused(text);
+        let _ = match kind.sgr().filter(|_| self.color) {
+            Some(sgr) => writeln!(self.out, "\x1b[{sgr}m{}{body}\x1b[0m", Self::prefix(kind)),
+            None => writeln!(self.out, "{}{body}", Self::prefix(kind)),
+        };
         self.at_line_start = true;
     }
 
@@ -336,6 +410,103 @@ impl Surface for RecordingSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered(color: bool, kind: LineKind, text: &str) -> String {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::with_color(&mut buf, color);
+            surface.line(kind, text);
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// A styled class reaches the terminal as a real SGR sequence, opened and
+    /// closed. The banner used to spell these escapes into its own line text,
+    /// where [`defused`] correctly ate them and printed the remains — so the
+    /// styling has to be authored *here*, past the guard, or not at all.
+    #[test]
+    fn a_styled_line_is_wrapped_in_sgr_and_always_reset() {
+        for (kind, sgr) in [
+            (LineKind::BannerArt, "\x1b[36m"),
+            (LineKind::BannerTitle, "\x1b[1m"),
+            (LineKind::BannerMeta, "\x1b[2m"),
+        ] {
+            let out = rendered(true, kind, "ridge");
+            assert!(out.starts_with(sgr), "not opened with {sgr:?}: {out:?}");
+            assert!(out.contains("ridge"), "text lost: {out:?}");
+            assert_eq!(
+                out.trim_end_matches('\n').rfind("\x1b["),
+                out.rfind("\x1b[0m")
+            );
+        }
+    }
+
+    /// The colour gate is the surface's, and when it is shut the styled classes
+    /// are byte-identical to plain text — no escape, and no literal `[36m`
+    /// debris standing in for one.
+    #[test]
+    fn an_uncolored_surface_emits_no_escapes_for_styled_classes() {
+        for kind in [
+            LineKind::BannerArt,
+            LineKind::BannerTitle,
+            LineKind::BannerMeta,
+        ] {
+            let out = rendered(false, kind, "ridge");
+            assert_eq!(out, "ridge\n", "styling leaked with colour off: {out:?}");
+        }
+    }
+
+    /// Styling a class does not open a hole in the guard: the escapes come from
+    /// a fixed table keyed on the class, and the *text* is defused exactly as it
+    /// is for every other class. A caller cannot smuggle a cursor move through a
+    /// banner line, and the row still cannot be repainted from underneath.
+    ///
+    /// Driven with the single-byte C1 CSI (`\u{9b}`) and a bare `\r` rather than
+    /// `\x1b`, because the debug assertion in `line()` rejects an ESC on a styled
+    /// class outright. These are the same capability by a different byte — which
+    /// is the point: the assertion is a development guard against one authoring
+    /// mistake, and `defused` is the guarantee that holds in release regardless.
+    #[test]
+    fn a_styled_line_still_defuses_its_text() {
+        let out = rendered(true, LineKind::BannerArt, "ridge\u{9b}2K\u{9b}1A\rspoofed");
+        assert!(out.starts_with("\x1b[36m"), "lost its styling: {out:?}");
+        let body = out
+            .trim_start_matches("\x1b[36m")
+            .trim_end()
+            .trim_end_matches("\x1b[0m");
+        assert!(
+            !body.contains('\u{9b}') && !body.contains('\r') && !body.contains('\x1b'),
+            "a control character reached the terminal through a styled line: {body:?}"
+        );
+        assert!(body.contains("ridge"), "text lost: {body:?}");
+    }
+
+    /// The authoring mistake this whole table replaced: styling a line by
+    /// spelling the SGR into its text. `defused` would eat the ESC and print the
+    /// bare `[36m` to the user — cosmetic, silent, and it shipped once already.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must not carry its own escapes")]
+    fn a_styled_line_that_spells_its_own_sgr_trips_in_development() {
+        let _ = rendered(true, LineKind::BannerArt, "\x1b[36mridge\x1b[0m");
+    }
+
+    /// The assertion is scoped to styled classes precisely so it cannot fire on
+    /// the hostile input the guard exists for. A permission prompt carrying a
+    /// model-composed URL with an escape in it is REQ-563's case: it must be
+    /// neutralized and rendered, never panicked on.
+    #[test]
+    fn an_unstyled_class_may_carry_escapes_and_is_merely_defused() {
+        let out = rendered(
+            true,
+            LineKind::Prompt,
+            "fetch https://good\x1b[2K\x1b[1Aevil",
+        );
+        assert!(
+            !out.contains('\x1b'),
+            "escape reached the terminal: {out:?}"
+        );
+    }
 
     /// REQ-556 ADR-556-4 / AC-5. The animation must repaint its row **in
     /// place** — save, move, clear, write, restore — and must not disturb the
