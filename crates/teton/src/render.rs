@@ -255,6 +255,25 @@ impl<W: Write> Surface for PlainSurface<W> {
     /// The reset is unconditional, so no styled line can leak its attribute onto
     /// the row below.
     fn line(&mut self, kind: LineKind, text: &str) {
+        // A styled class is composed by this binary from fixed strings, so an
+        // ESC in its text is not an attack — it is a caller reaching for SGR by
+        // hand, which is the bug this styling table replaced: `defused` would
+        // eat the ESC and print the bare `[36m` to the user. Silent cosmetic
+        // debris is exactly the kind of thing that ships, so fail loudly in
+        // development instead.
+        //
+        // Deliberately *not* a check on every class. `Prompt` and `Diff` carry
+        // model-composed and file-derived text, where an escape is the hostile
+        // input the guard exists to neutralize (REQ-563) — asserting there would
+        // hand a fetched page a debug-build panic through the guard itself. The
+        // constraint this places on a future styled class is the flip side: do
+        // not tag untrusted text with one.
+        debug_assert!(
+            kind.sgr().is_none() || !text.contains('\x1b'),
+            "{kind:?} is styled by the surface; it must not carry its own escapes \
+             (they will be neutralized into visible debris): {text:?}"
+        );
+
         // Close any open streamed line first so the notice starts clean.
         if !self.at_line_start {
             let _ = writeln!(self.out);
@@ -438,18 +457,45 @@ mod tests {
     /// a fixed table keyed on the class, and the *text* is defused exactly as it
     /// is for every other class. A caller cannot smuggle a cursor move through a
     /// banner line, and the row still cannot be repainted from underneath.
+    ///
+    /// Driven with the single-byte C1 CSI (`\u{9b}`) and a bare `\r` rather than
+    /// `\x1b`, because the debug assertion in `line()` rejects an ESC on a styled
+    /// class outright. These are the same capability by a different byte — which
+    /// is the point: the assertion is a development guard against one authoring
+    /// mistake, and `defused` is the guarantee that holds in release regardless.
     #[test]
     fn a_styled_line_still_defuses_its_text() {
-        let out = rendered(true, LineKind::BannerArt, "ridge\x1b[2K\x1b[1Aspoofed");
+        let out = rendered(true, LineKind::BannerArt, "ridge\u{9b}2K\u{9b}1A\rspoofed");
         assert!(out.starts_with("\x1b[36m"), "lost its styling: {out:?}");
         let body = out
             .trim_start_matches("\x1b[36m")
             .trim_end()
             .trim_end_matches("\x1b[0m");
         assert!(
-            !body.contains('\x1b'),
-            "an escape reached the terminal through a styled line: {body:?}"
+            !body.contains('\u{9b}') && !body.contains('\r') && !body.contains('\x1b'),
+            "a control character reached the terminal through a styled line: {body:?}"
         );
+        assert!(body.contains("ridge"), "text lost: {body:?}");
+    }
+
+    /// The authoring mistake this whole table replaced: styling a line by
+    /// spelling the SGR into its text. `defused` would eat the ESC and print the
+    /// bare `[36m` to the user — cosmetic, silent, and it shipped once already.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must not carry its own escapes")]
+    fn a_styled_line_that_spells_its_own_sgr_trips_in_development() {
+        let _ = rendered(true, LineKind::BannerArt, "\x1b[36mridge\x1b[0m");
+    }
+
+    /// The assertion is scoped to styled classes precisely so it cannot fire on
+    /// the hostile input the guard exists for. A permission prompt carrying a
+    /// model-composed URL with an escape in it is REQ-563's case: it must be
+    /// neutralized and rendered, never panicked on.
+    #[test]
+    fn an_unstyled_class_may_carry_escapes_and_is_merely_defused() {
+        let out = rendered(true, LineKind::Prompt, "fetch https://good\x1b[2K\x1b[1Aevil");
+        assert!(!out.contains('\x1b'), "escape reached the terminal: {out:?}");
     }
 
     /// REQ-556 ADR-556-4 / AC-5. The animation must repaint its row **in
