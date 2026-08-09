@@ -132,8 +132,25 @@ impl UserUrls {
     ///
     /// Same caution as [`UserUrls::record_user_message`]: the caller is
     /// asserting the user authored this.
+    ///
+    /// **Two** spellings are stored, not one: the URL as written, and its
+    /// [`canonical_lookup_url`](super::canonical_lookup_url) re-serialization —
+    /// which is what the web tool asks about, because that is the string the
+    /// tool checks, shows and sends (REQ-563 verify, C-1). Without the second, a
+    /// user who pastes `https://docs.rs` would have their own link classified as
+    /// model-composed the moment the re-serializer added the empty path's `/`.
+    ///
+    /// This widens the set by exactly one alias per paste, and the alias names
+    /// the same destination by construction — the re-serialization of a string
+    /// is not a different place — so BR-3's "not one the model composed" is
+    /// untouched. It is deliberately the *only* widening; nothing derives an
+    /// alias from a URL the user did not write.
     pub fn insert(&mut self, url: &str) -> bool {
-        self.normalized.insert(normalize_url(url))
+        let fresh = self.normalized.insert(normalize_url(url));
+        match super::canonical_lookup_url(url) {
+            Some((canonical, _)) => self.normalized.insert(normalize_url(&canonical)) || fresh,
+            None => fresh,
+        }
     }
 
     /// Whether `url` appeared verbatim in a user message of this session
@@ -143,7 +160,12 @@ impl UserUrls {
         self.normalized.contains(&normalize_url(url))
     }
 
-    /// How many distinct URLs the user has pasted.
+    /// How many distinct spellings this set answers `contains` for.
+    ///
+    /// Not "how many URLs the user pasted": [`UserUrls::insert`] stores a
+    /// canonical alias beside the written form when the two differ, so a paste
+    /// whose re-serialization moves contributes two. It exists for tests and
+    /// diagnostics — nothing decides anything from this number.
     #[must_use]
     pub fn len(&self) -> usize {
         self.normalized.len()

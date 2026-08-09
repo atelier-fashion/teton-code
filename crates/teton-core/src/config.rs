@@ -196,6 +196,41 @@ impl WebTier {
     }
 }
 
+/// Whether a web lookup inside the configured ceiling still asks (REQ-563 BR-4).
+///
+/// A **second, orthogonal** question to [`WebTier`], and the two are not
+/// collapsible: the tier says *how far* this machine may ever reach, and this
+/// says *whether the user is asked each time* within that reach. `tier =
+/// "search"` with `permission = "ask"` is the ordinary opted-in posture; the
+/// same tier with `permission = "allow"` is the user who answered "enable
+/// permanently" at a prompt and does not want to be asked again.
+///
+/// It exists because the `enable_permanent` consent option previously had
+/// nothing durable to write in the common case. The tier ceiling is enforced
+/// *before* the prompt, so a lookup that reaches a prompt is already at or below
+/// the configured tier — which made the raise-only `[web] tier` write a no-op
+/// while the decision was still reported as `Persistent`. This key is the thing
+/// that answer actually changes.
+///
+/// Deliberately **not** a per-tier table. REQ-560's named permission levels are
+/// the place a finer answer belongs; when they land, a named level maps onto the
+/// three web permission keys (`web_fetch_user_url`, `web_fetch_any_url`,
+/// `web_search`) by fanning out, and this key is the two-valued shape that
+/// mapping subsumes rather than a third vocabulary it has to reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebPermission {
+    /// Prompt for every lookup — the default, and BR-4's baseline.
+    #[default]
+    Ask,
+    /// Do not prompt: a lookup inside the configured ceiling runs.
+    ///
+    /// Never a *ceiling* raise. Everything `[web] tier` refuses is still
+    /// refused, and refused before any prompt would have been raised — this key
+    /// only answers prompts the ceiling already permitted to be asked.
+    Allow,
+}
+
 /// Opt-in web lookup (the `[web]` table, REQ-563).
 ///
 /// # Why the tier is the only switch (D-9)
@@ -235,6 +270,22 @@ pub struct WebConfig {
     /// its posture rather than leaving a reader to infer it from an absent key.
     #[serde(default)]
     pub tier: WebTier,
+    /// Whether a lookup **inside** the ceiling still prompts (BR-4).
+    ///
+    /// Defaults to [`WebPermission::Ask`], which is the requirement: BR-4 asks
+    /// per lookup, and `allow` exists only because the consent prompt offers
+    /// "enable permanently" and that answer has to become something durable.
+    /// Serialized unconditionally within the table, like [`Self::tier`]: a
+    /// config that names `[web]` states its consent posture rather than leaving
+    /// a reader to infer it.
+    ///
+    /// It cannot widen [`Self::tier`]. The ceiling is checked before any prompt
+    /// is raised, so `allow` answers only the prompts the ceiling had already
+    /// permitted to exist — which is why `permission = "allow"` with `tier =
+    /// "off"` is not a contradiction to validate away, it is simply a consent
+    /// posture for a capability that is not enabled.
+    #[serde(default)]
+    pub permission: WebPermission,
     /// The search backend's endpoint. **No default ships** (BR-8): there is no
     /// blessed search provider, so an unset endpoint is the ordinary state and
     /// validates cleanly at every tier below `search` — the tier is simply not
@@ -300,6 +351,7 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             tier: WebTier::Off,
+            permission: WebPermission::Ask,
             search_endpoint: None,
             search_key_ref: None,
             allowed_domains: None,
@@ -3700,6 +3752,50 @@ cache_ttl_secs = 60
         assert_eq!(
             Config::load("[web]\n").expect("must load").web,
             WebConfig::default()
+        );
+    }
+
+    /// **`[web] permission` defaults to `ask` and reads both spellings.**
+    ///
+    /// BR-4 asks per lookup, so `ask` is the requirement rather than a taste;
+    /// `allow` exists because the consent prompt offers "enable permanently" and
+    /// that answer needs something durable to become. It is orthogonal to the
+    /// ceiling: `permission = "allow"` with `tier = "off"` is not a
+    /// contradiction, it is a consent posture for a capability nobody enabled.
+    #[test]
+    fn the_web_permission_defaults_to_ask_and_reads_both_spellings() {
+        assert_eq!(WebConfig::default().permission, WebPermission::Ask);
+        assert_eq!(
+            Config::load("[web]\n").expect("must load").web.permission,
+            WebPermission::Ask,
+            "a table that names no permission asks — the shipped posture (BR-4)"
+        );
+        for (spelling, permission) in [("ask", WebPermission::Ask), ("allow", WebPermission::Allow)]
+        {
+            let cfg = Config::load(&format!(
+                "[web]\ntier = \"fetch_any_url\"\npermission = \"{spelling}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("{spelling} must load: {e}"));
+            assert_eq!(cfg.web.permission, permission, "{spelling}");
+            // It never widens the ceiling: that is a separate key and stays put.
+            assert_eq!(cfg.web.tier, WebTier::FetchAnyUrl);
+        }
+
+        // `allow` beside `off` loads: two orthogonal keys, not two encodings of
+        // one fact (contrast D-9's `enabled` bool, which is why there is none).
+        let off = Config::load("[web]\npermission = \"allow\"\n").expect("must load");
+        assert_eq!(off.web.tier, WebTier::Off);
+        assert_eq!(off.web.permission, WebPermission::Allow);
+
+        // And it survives a round-trip, written unconditionally like `tier`.
+        let toml_text = off.to_toml().expect("serialize");
+        assert!(
+            toml_text.contains("permission = \"allow\""),
+            "toml: {toml_text}"
+        );
+        assert_eq!(
+            Config::from_toml(&toml_text).expect("deserialize").web,
+            off.web
         );
     }
 

@@ -127,6 +127,18 @@ pub struct WebState {
     restricted: bool,
     /// The user lifted that restriction with `/web allow` (BR-13, AC-12).
     overridden: bool,
+    /// Web lookup is configured, and the last turn's provider profile could not
+    /// reach the tool — its `max_tools` cap cut it (BR-6).
+    ///
+    /// The one field here **not** written by an event, and the exception is
+    /// stated rather than hidden: there is no event, because nothing happened.
+    /// No lookup ran, no consent was decided, no restriction changed; a
+    /// capability the user configured simply was not offered to the model this
+    /// turn. That is a property of the turn, so it rides the turn's own result
+    /// (`PromptTurnResult::web_unavailable_in_profile`) and is folded in by the
+    /// caller at turn end. It is re-read every turn, so a fallback to a
+    /// full-tool-set provider clears it.
+    unavailable_in_profile: bool,
 }
 
 impl WebState {
@@ -142,6 +154,15 @@ impl WebState {
     /// contradicting the notice that preceded it.
     #[must_use]
     pub fn status_field(self) -> &'static str {
+        // Ahead of everything, because it is the only state in which the model
+        // *cannot call the tool at all*. A row reading `web: search` on a turn
+        // where the tool was not exposed would be the status line contradicting
+        // the answer the user just read ("I can't look that up") — and unlike
+        // the two below, this one is not about a capability being taken away, it
+        // is about one that was never handed over this turn.
+        if self.unavailable_in_profile {
+            return "web: unavailable (profile)";
+        }
         if self.overridden {
             return "web: overridden";
         }
@@ -165,7 +186,10 @@ impl WebState {
     /// row, not the vocabulary.
     #[must_use]
     pub fn is_engaged(self) -> bool {
-        self.overridden || self.restricted || matches!(self.granted, Some(t) if t != WebTier::Off)
+        self.unavailable_in_profile
+            || self.overridden
+            || self.restricted
+            || matches!(self.granted, Some(t) if t != WebTier::Off)
     }
 
     /// Raise the observed ceiling; never lowers it.
@@ -173,6 +197,15 @@ impl WebState {
         if tier != WebTier::Off && self.granted.is_none_or(|held| tier > held) {
             self.granted = Some(tier);
         }
+    }
+
+    /// Record whether the last turn's provider profile could reach the web tool
+    /// (REQ-563 BR-6).
+    ///
+    /// A **set**, not a raise: unlike `granted`, this describes the turn that
+    /// just ended, and a fallback onto a full-tool-set provider must clear it.
+    pub fn observe_profile_exposure(&mut self, unavailable: bool) {
+        self.unavailable_in_profile = unavailable;
     }
 }
 
@@ -370,9 +403,17 @@ fn format_web_lookup(lookup: &WebLookup, verbose: bool) -> Option<String> {
         WebLookupOutcome::BlockedPrivacy => {
             "blocked: the outgoing text derived from privacy-boundary content".to_owned()
         }
-        WebLookupOutcome::BlockedRedact => {
-            "blocked: the redaction scan refused the outgoing text".to_owned()
-        }
+        // BR-14's honesty half. `blocked_redact` folds two facts that send a
+        // user to two different places, and the event's `cause` is what tells
+        // them apart: a scan that *ran* and refused the text, and a scan that
+        // could not run at all. The second is the ordinary state of a build with
+        // no local model loaded — and told the first, a user goes hunting for a
+        // secret in a query that contained none while the actual fix is never
+        // named.
+        WebLookupOutcome::BlockedRedact => match lookup.cause {
+            Some(BlockCause::ScanUnavailable) => scan_unavailable(lookup.kind).to_owned(),
+            _ => "blocked: the redaction scan refused the outgoing text".to_owned(),
+        },
         WebLookupOutcome::RefusedDomain => {
             "refused: outside the configured `[web] allowed_domains`".to_owned()
         }
@@ -385,6 +426,42 @@ fn format_web_lookup(lookup: &WebLookup, verbose: bool) -> Option<String> {
         WebLookupOutcome::Offline => "unavailable: offline".to_owned(),
     };
     Some(format!("web {kind} {} — {ending}", lookup.host))
+}
+
+/// What a `blocked_redact` whose cause is `scan_unavailable` actually means
+/// (REQ-563 BR-14).
+///
+/// The search tier exists **because** every query is scanned first, and the scan
+/// is pinned to the local model — so a machine with no local model loaded has no
+/// scanner, and BR-14's coupling turns that into a refusal rather than an
+/// unscanned query leaving. That is the capability working exactly as specified,
+/// and the sentence has to say so: the previous wording ("the redaction scan
+/// refused the outgoing text") described a scan that ran and found something,
+/// which is a different problem with a different fix, and sent the user looking
+/// for a secret in a query that contained none.
+///
+/// One function, like [`TAINT_RESTRICTION`] beside it, so the copy cannot drift
+/// between this surface and any other that has to state the same thing.
+///
+/// **Two sentences, because the two tiers have two different remedies.** A
+/// search is coupled to the scan unconditionally (BR-14: the tier exists because
+/// every query is scanned), so the only way out is to make the scanner
+/// available. A *fetch* is scanned at provider parity (BR-2), under `[privacy]
+/// redact` — so a user who does not want that coupling has a switch, and telling
+/// them the search story would send them to install a model they may not need.
+fn scan_unavailable(kind: WebLookupKind) -> &'static str {
+    match kind {
+        WebLookupKind::Search => {
+            "blocked: web search scans every query before it leaves, and that scan runs on \
+             the local model — which is not loaded on this machine, so the query was not \
+             sent. Install or start the local model to use search."
+        }
+        WebLookupKind::Fetch => {
+            "blocked: `[privacy] redact` scans the outgoing URL before it leaves, and that \
+             scan runs on the local model — which is not loaded on this machine, so nothing \
+             was sent. Install or start the local model, or turn `[privacy] redact` off."
+        }
+    }
 }
 
 /// The BR-13 restriction sentence: the cause, then the effect, then the way out.
@@ -817,8 +894,8 @@ mod tests {
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
     use teton_protocol::events::{
-        ByteSpan, CostRecord, CostRecorded, ModelSelectionDecided, PlanEntry, PlanEntryStatus,
-        SelectionSource, SessionUpdate, WebTaintOverridden,
+        ByteSpan, CostRecord, CostRecorded, FindingKind, ModelSelectionDecided, PlanEntry,
+        PlanEntryStatus, SelectionSource, SessionUpdate, WebTaintOverridden,
     };
     use teton_protocol::{ProviderId, RequestId, SessionId};
 
@@ -1386,6 +1463,7 @@ mod tests {
             host: "docs.rs".to_owned(),
             outcome,
             bytes_in: 4_096,
+            cause: None,
         })
     }
 
@@ -1422,6 +1500,25 @@ mod tests {
         overridden.overridden = true;
         assert_eq!(overridden.status_field(), "web: overridden");
         assert!(overridden.is_engaged());
+
+        // BR-6: the profile could not reach the tool at all this turn, which
+        // outranks every state below — those describe a capability the model
+        // *had*, in some condition. This one says it was never offered.
+        let mut capped = overridden;
+        capped.observe_profile_exposure(true);
+        assert_eq!(capped.status_field(), "web: unavailable (profile)");
+        assert!(capped.is_engaged());
+        // It is a set, not a raise: a fallback onto a full-tool-set provider
+        // clears it and the row goes back to describing the capability.
+        capped.observe_profile_exposure(false);
+        assert_eq!(capped.status_field(), "web: overridden");
+
+        // It also engages the row on its own, on a session that has used
+        // nothing yet — which is exactly the case it exists for.
+        let mut only_capped = WebState::default();
+        only_capped.observe_profile_exposure(true);
+        assert!(only_capped.is_engaged());
+        assert_eq!(only_capped.status_field(), "web: unavailable (profile)");
     }
 
     /// The ceiling only ever rises: a refusal after a grant must not read as a
@@ -1539,6 +1636,7 @@ mod tests {
                         host: "docs.rs".to_owned(),
                         outcome,
                         bytes_in: 0,
+                        cause: None,
                     },
                     true,
                 )
@@ -1549,6 +1647,71 @@ mod tests {
             seen.len(),
             WebLookupOutcome::ALL.len(),
             "two outcomes render identically: {seen:?}"
+        );
+    }
+
+    /// **BR-14's honesty half: a scan that could not run is not a scan that
+    /// refused the text.**
+    ///
+    /// `blocked_redact` folds two facts with two different fixes. Told "the
+    /// redaction scan refused the outgoing text" when the truth is "no local
+    /// model is loaded", the user goes hunting for a secret in a query that
+    /// contained none — and the actual remedy, which is the one thing they can
+    /// act on, is never named.
+    #[test]
+    fn a_blocked_search_names_the_missing_local_model_rather_than_a_refusal() {
+        let line = |kind, cause| {
+            format_web_lookup(
+                &WebLookup {
+                    kind,
+                    host: "search.example".to_owned(),
+                    outcome: WebLookupOutcome::BlockedRedact,
+                    bytes_in: 0,
+                    cause,
+                },
+                false,
+            )
+            .expect("a block always renders, verbose or not")
+        };
+
+        let unavailable = line(WebLookupKind::Search, Some(BlockCause::ScanUnavailable));
+        assert!(
+            unavailable.contains("local model"),
+            "the cause the user can act on is unnamed: {unavailable}"
+        );
+        assert!(
+            !unavailable.contains("refused the outgoing text"),
+            "the scan did not refuse anything — it never ran: {unavailable}"
+        );
+
+        // The other reading keeps its own sentence, so the two do not collapse.
+        let found = line(
+            WebLookupKind::Search,
+            Some(BlockCause::Redaction {
+                kind: FindingKind::Secret,
+                span: ByteSpan { start: 0, end: 8 },
+            }),
+        );
+        assert!(found.contains("refused the outgoing text"), "{found}");
+        assert_ne!(unavailable, found, "the two causes read identically");
+
+        // A daemon that sends no cause (an older build, or a path with none)
+        // falls back to the general sentence rather than claiming a diagnosis.
+        assert_eq!(line(WebLookupKind::Search, None), found);
+
+        // A **fetch** whose scan could not run has a different remedy: it is
+        // scanned at provider parity under `[privacy] redact`, not because of
+        // BR-14's search coupling, so the search sentence would send the user to
+        // install a model they may not need.
+        let fetch = line(WebLookupKind::Fetch, Some(BlockCause::ScanUnavailable));
+        assert!(fetch.contains("local model"), "{fetch}");
+        assert!(
+            fetch.contains("[privacy] redact"),
+            "a fetch block must name the switch that turned the scan on: {fetch}"
+        );
+        assert!(
+            !fetch.contains("web search"),
+            "a fetch was explained as a search: {fetch}"
         );
     }
 

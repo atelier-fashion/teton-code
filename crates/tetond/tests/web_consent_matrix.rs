@@ -59,7 +59,7 @@ use tetond::harness::permissions::{
     PendingPermissions, PermissionConfig, PermissionGate, PermissionPolicy, WebTierPersistence,
 };
 use tetond::harness::tools::web::{
-    register_web_tool, SeamError, WebLookupSeam, PERMISSION_KEY_FETCH, WEB_TOOL_NAME,
+    register_web_tool, SeamError, WebLookupSeam, PERMISSION_KEY_FETCH_ANY_URL, WEB_TOOL_NAME,
 };
 use tetond::harness::{Tool, ToolContext, ToolOutcome, ToolRegistry};
 use tetond::router::Router;
@@ -544,8 +544,9 @@ async fn a_denied_lookup_puts_no_packet_on_the_wire() {
     assert_eq!(prompts.len(), 1, "exactly one question was asked");
     let asked = &prompts[0];
     assert_eq!(
-        asked.key, PERMISSION_KEY_FETCH,
-        "BR-3: the grant key is the tier's, never the tool's name"
+        asked.key, PERMISSION_KEY_FETCH_ANY_URL,
+        "BR-3: the grant key is the tier's, never the tool's name — and the model \
+         composed this URL, so it is the any-url tier's key and not the pasted one's"
     );
     assert!(
         asked.description.contains(DOCS_URL),
@@ -1051,18 +1052,34 @@ fn only_the_client_rpc_can_lift_the_restriction() {
         "non-vacuity: nothing is lifted before the RPC"
     );
 
+    // An override of a session that was never restricted is answered honestly
+    // and **changes nothing** — the CLI renders it as "web lookups were never
+    // disabled" rather than a false confirmation, and, just as importantly, the
+    // flag stays down so a boundary read later in the same session still
+    // engages BR-13 (REQ-563 verify: the lift used to be pre-armed here).
+    let clean = runtime.web_override(
+        &WebOverrideParams {
+            session_id: session.clone(),
+        },
+        &events,
+    );
+    assert!(!clean.was_restricted);
+    assert!(clean.tiers_restored.is_empty());
+    assert!(
+        !view.is_overridden(&session),
+        "an override of nothing pre-armed the flag, disarming the restriction \
+         that has not arrived yet"
+    );
+
+    // Now the restriction exists, and the RPC lifts it.
+    runtime.session_taint().mark(&session);
     let result = runtime.web_override(
         &WebOverrideParams {
             session_id: session.clone(),
         },
         &events,
     );
-    // This runtime's session was never tainted, so nothing was restricted and
-    // nothing is restored — the honest answer, and the one the CLI renders as
-    // "web lookups were never disabled" rather than a false confirmation.
-    assert!(!result.was_restricted);
-    assert!(result.tiers_restored.is_empty());
-
+    assert!(result.was_restricted);
     assert!(
         view.is_overridden(&session),
         "the RPC flipped the flag the lookup gate reads"

@@ -560,6 +560,16 @@ pub struct LookupRecord {
     pub bytes_in: u64,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
+    /// Which inspection refused a blocked attempt, `None` for every other
+    /// ending (REQ-563 BR-14's honesty half).
+    ///
+    /// The one part of [`LookupDetail`] the recorder is given, and it is here
+    /// for a reason the rest are not: `BlockedRedact` folds "the scan refused
+    /// the text" together with "the scan could not run", and those two send a
+    /// user to two different places. The wire outcome stays at its eight fixed
+    /// values (D-8); this rides beside it so the notice can name the cause the
+    /// way a `privacy_block` notice already does.
+    pub cause: Option<BlockCause>,
 }
 
 /// The seam the choke point calls once per lookup, whatever the ending.
@@ -717,6 +727,7 @@ impl<T: Transport> Egress<T> {
             outcome: ending.outcome,
             bytes_in,
             duration_ms,
+            cause: block_cause_of(&ending.detail),
         };
         // The one emission. A `BlockedRedact` here publishes a `web_lookup` and
         // NOTHING else — in particular no `privacy_block`, which is the event
@@ -1333,9 +1344,26 @@ fn detail_for(error: TransportError) -> LookupDetail {
     }
 }
 
+/// The block cause a detail carries, or `None` when the ending was not a block.
+///
+/// A one-arm projection rather than a `From` impl, because that is all the
+/// ledger and the event are entitled to: the rest of [`LookupDetail`] — which
+/// address class, which HTTP status, which transport error — stays daemon-side,
+/// where BR-7's "a host and nothing finer" rule governs what may be recorded.
+fn block_cause_of(detail: &LookupDetail) -> Option<BlockCause> {
+    match detail {
+        LookupDetail::Blocked { cause } => Some(*cause),
+        _ => None,
+    }
+}
+
 /// The host of `url`, or `None` when it does not parse to one.
+///
+/// Delegates to [`crate::web::canonical_host_of`] so the seam, the tool's gates
+/// and the consent prompt read **one** parser (REQ-563 verify, C-1) rather than
+/// three copies of the same call that can be edited apart.
 fn host_of(url: &str) -> Option<String> {
-    reqwest::Url::parse(url).ok()?.host_str().map(str::to_owned)
+    crate::web::canonical_host_of(url)
 }
 
 /// Resolve `location` against `base`, absolute or relative.

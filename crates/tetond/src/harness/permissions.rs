@@ -18,6 +18,23 @@
 //! A `*_always` answer is remembered for the **session only** ([`PermissionGate`]
 //! holds the grants), so the user is asked once per tool per session and never
 //! persisted to disk.
+//!
+//! ## The subject is a *key*, not always a tool (REQ-563)
+//!
+//! Everything above says "tool" because for every built-in and every MCP tool
+//! the subject of a permission question is the tool. Web lookup is the exception
+//! the model was widened for: BR-3 grades the capability into three tiers and
+//! requires each to be **separately consented**, so the subject is one of the
+//! three keys in
+//! [`WEB_PERMISSION_KEYS`](crate::harness::tools::web::WEB_PERMISSION_KEYS) —
+//! `web_fetch_user_url`, `web_fetch_any_url`, `web_search` — and never the `web`
+//! tool name. [`PermissionGate::decide`] is key-based throughout, which is what
+//! makes that claim true rather than aspirational: the grant map, the policy
+//! table and the prompt's `tool_name` all read the same string, so a grant can
+//! never be wider than the question it answered.
+//!
+//! The one thing keyed on the *tier* rather than the key is the fifth prompt
+//! option, `enable_permanent` — see [`options_for`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 
-use teton_core::config::WebTier;
+use teton_core::config::{WebPermission, WebTier};
 use teton_protocol::events::{
     Event, PermissionOption, PermissionOptionKind, PermissionRequest, WebConsentDecided,
     WebConsentScope, OPTION_ID_ENABLE_PERMANENT,
@@ -35,7 +52,7 @@ use teton_protocol::{RequestId, SessionId};
 
 use crate::broadcast::EventBus;
 use crate::egress::to_protocol_web_tier;
-use crate::harness::tools::web::{tier_name, PERMISSION_KEY_FETCH, PERMISSION_KEY_SEARCH};
+use crate::harness::tools::web::{tier_name, WEB_PERMISSION_KEYS};
 
 /// Policy for a single tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,8 +75,16 @@ pub enum PermissionDecision {
 }
 
 /// A remembered, session-scoped answer for a tool.
+///
+/// Public because a caller that can reach a decision **without** prompting still
+/// has to honour one that was already made: REQ-563's cache hit performs no
+/// egress and therefore asks nothing, but a user who answered "reject for this
+/// session" has refused the *capability*, not the packet, and serving them a
+/// cached page would be the one path around their own answer. See
+/// [`PermissionGate::remembered`], which is a read — it never prompts, never
+/// records, and never turns an absent answer into one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Grant {
+pub enum RememberedGrant {
     /// Always allow for the rest of the session.
     AllowAlways,
     /// Always reject for the rest of the session.
@@ -95,11 +120,48 @@ impl PermissionConfig {
         cfg
     }
 
-    /// A config that allows every tool (used by the offline demo path where the
-    /// operator has pre-approved the local, jailed tool set).
+    /// A config that allows every **local, jailed** tool — the offline demo
+    /// path, where the operator has pre-approved that tool set.
+    ///
+    /// The three web keys are excluded and stay [`PermissionPolicy::Ask`]
+    /// (REQ-563 verify): the sentence above is the justification for this
+    /// constructor, and a web lookup is neither local nor jailed. Pre-approving
+    /// them here would have made "allow every tool" quietly mean "and talk to
+    /// the internet without asking" on the one path that exists precisely
+    /// because nothing should leave the machine.
+    ///
+    /// A machine that genuinely wants unprompted web lookups says so in config,
+    /// with `[web] permission = "allow"`, which the daemon maps onto these same
+    /// three keys.
     #[must_use]
     pub fn permissive() -> Self {
-        Self::with_default(PermissionPolicy::Allow)
+        let mut cfg = Self::with_default(PermissionPolicy::Allow);
+        for key in WEB_PERMISSION_KEYS {
+            cfg.set(key, PermissionPolicy::Ask);
+        }
+        cfg
+    }
+
+    /// Map `[web] permission` onto the three web consent keys (REQ-563 BR-4).
+    ///
+    /// The **one** place a config value becomes a web policy row, so the "did
+    /// enable-permanent actually change anything" question has one answer. It is
+    /// a fan-out and not a single row because the keys are per tier and the
+    /// config value is not: `allow` means "do not ask me about web lookups",
+    /// which is a statement about every tier the ceiling already permits.
+    ///
+    /// It never *widens* the ceiling — `[web] tier` is checked before any prompt
+    /// exists to answer — and it is where REQ-560's named permission levels will
+    /// attach when they land: a level maps to a [`PermissionPolicy`] and fans out
+    /// here, rather than growing a fourth vocabulary.
+    pub fn apply_web_permission(&mut self, permission: WebPermission) {
+        let policy = match permission {
+            WebPermission::Ask => PermissionPolicy::Ask,
+            WebPermission::Allow => PermissionPolicy::Allow,
+        };
+        for key in WEB_PERMISSION_KEYS {
+            self.set(key, policy);
+        }
     }
 
     /// Override the policy for a tool.
@@ -202,7 +264,7 @@ pub trait WebTierPersistence: Send + Sync {
 pub struct PermissionGate {
     session_id: SessionId,
     config: PermissionConfig,
-    grants: Mutex<HashMap<String, Grant>>,
+    grants: Mutex<HashMap<String, RememberedGrant>>,
     events: Arc<EventBus>,
     pending: Arc<PendingPermissions>,
     counter: AtomicU64,
@@ -310,8 +372,8 @@ impl PermissionGate {
         // turn one decision into a stream of them.
         if let Some(grant) = self.session_grant(tool_name) {
             return match grant {
-                Grant::AllowAlways => PermissionDecision::Allowed,
-                Grant::RejectAlways => PermissionDecision::Denied,
+                RememberedGrant::AllowAlways => PermissionDecision::Allowed,
+                RememberedGrant::RejectAlways => PermissionDecision::Denied,
             };
         }
 
@@ -363,7 +425,7 @@ impl PermissionGate {
             PermissionOutcome::Selected { option_id } => match option_id.as_str() {
                 OPTION_ALLOW_ONCE => (PermissionDecision::Allowed, WebConsentScope::Once),
                 OPTION_ALLOW_ALWAYS => {
-                    self.remember(tool_name, Grant::AllowAlways);
+                    self.remember(tool_name, RememberedGrant::AllowAlways);
                     (PermissionDecision::Allowed, WebConsentScope::Session)
                 }
                 // Only reachable when the option was offered, which is only when
@@ -374,12 +436,12 @@ impl PermissionGate {
                     // lands: the user said yes to this session either way, and
                     // making the answer contingent on a filesystem would re-ask
                     // a question already answered.
-                    self.remember(tool_name, Grant::AllowAlways);
+                    self.remember(tool_name, RememberedGrant::AllowAlways);
                     let scope = self.persist_web_tier(web.unwrap_or(WebTier::Off));
                     (PermissionDecision::Allowed, scope)
                 }
                 OPTION_REJECT_ALWAYS => {
-                    self.remember(tool_name, Grant::RejectAlways);
+                    self.remember(tool_name, RememberedGrant::RejectAlways);
                     (PermissionDecision::Denied, WebConsentScope::Session)
                 }
                 // reject_once and any unknown id: deny this once.
@@ -429,7 +491,22 @@ impl PermissionGate {
         }
     }
 
-    fn session_grant(&self, tool_name: &str) -> Option<Grant> {
+    /// The session answer already recorded for `tool_name`, if any — a **read**,
+    /// with no prompt, no policy consultation and no side effect.
+    ///
+    /// For the one caller that reaches a decision without going through
+    /// [`Self::decide`]: REQ-563's cache hit, which performs no egress and so
+    /// asks no consent, but must still refuse when the user has said "reject for
+    /// this session". It deliberately does *not* fold in
+    /// [`PermissionConfig::policy_for`] — a `deny` policy row is a different
+    /// fact from a user's answer, and a caller that wants the full decision has
+    /// [`Self::authorize_web`] for it.
+    #[must_use]
+    pub fn remembered(&self, tool_name: &str) -> Option<RememberedGrant> {
+        self.session_grant(tool_name)
+    }
+
+    fn session_grant(&self, tool_name: &str) -> Option<RememberedGrant> {
         self.grants
             .lock()
             .expect("permission grants mutex poisoned")
@@ -437,7 +514,7 @@ impl PermissionGate {
             .copied()
     }
 
-    fn remember(&self, tool_name: &str, grant: Grant) {
+    fn remember(&self, tool_name: &str, grant: RememberedGrant) {
         self.grants
             .lock()
             .expect("permission grants mutex poisoned")
@@ -452,12 +529,15 @@ const OPTION_REJECT_ALWAYS: &str = "reject_always";
 
 /// Whether `tool_name` is one of the web tiers' consent keys (REQ-563 BR-3).
 ///
-/// Two keys and not one: a grant is remembered under exactly the string it was
-/// asked about, so `web` as a single key would have made one "allow for this
-/// session" on a page fetch silently grant every search.
+/// **Three** keys and not one: a grant is remembered under exactly the string it
+/// was asked about, so `web` as a single key would have made one "allow for this
+/// session" on a page fetch silently grant every search — and `web_fetch` as a
+/// shared fetch key would have made one answer about a URL the *user pasted*
+/// grant every URL the *model composes*, which is the mixed-authorship case BR-3
+/// names first.
 #[must_use]
 pub fn is_web_permission_key(tool_name: &str) -> bool {
-    tool_name == PERMISSION_KEY_FETCH || tool_name == PERMISSION_KEY_SEARCH
+    WEB_PERMISSION_KEYS.contains(&tool_name)
 }
 
 /// The options offered on a prompt: the four standard ones, plus the persistent
@@ -511,6 +591,11 @@ fn options_for(web: Option<WebTier>) -> Vec<PermissionOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::harness::tools::web::{
+        permission_key_for, PERMISSION_KEY_FETCH_ANY_URL, PERMISSION_KEY_FETCH_USER_URL,
+        PERMISSION_KEY_SEARCH,
+    };
 
     fn gate(config: PermissionConfig) -> (Arc<EventBus>, Arc<PendingPermissions>, PermissionGate) {
         let bus = Arc::new(EventBus::new());
@@ -705,7 +790,7 @@ mod tests {
     async fn only_the_web_keys_are_offered_the_persistent_option() {
         let (bus, pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Ask));
 
-        for key in [PERMISSION_KEY_FETCH, PERMISSION_KEY_SEARCH] {
+        for key in WEB_PERMISSION_KEYS {
             let (_, options, _) = answer_web(
                 &gate,
                 &bus,
@@ -783,11 +868,10 @@ mod tests {
             )
             .with_web_persistence(Arc::clone(&sink) as Arc<dyn WebTierPersistence>);
 
-            let key = if tier == WebTier::Search {
-                PERMISSION_KEY_SEARCH
-            } else {
-                PERMISSION_KEY_FETCH
-            };
+            // The key is a function of the tier, through the one mapping —
+            // never a hand-written `if`, which is what let the two fetch tiers
+            // share a grant.
+            let key = permission_key_for(tier).expect("every tier above off has a key");
             let (decision, _, events) =
                 answer_web(&gate, &bus, &pending, key, tier, OPTION_ID_ENABLE_PERMANENT).await;
 
@@ -867,7 +951,7 @@ mod tests {
             &gate,
             &bus,
             &pending,
-            PERMISSION_KEY_FETCH,
+            PERMISSION_KEY_FETCH_ANY_URL,
             WebTier::FetchAnyUrl,
             OPTION_ID_ENABLE_PERMANENT,
         )
@@ -900,7 +984,7 @@ mod tests {
                 &gate,
                 &bus,
                 &pending,
-                PERMISSION_KEY_FETCH,
+                PERMISSION_KEY_FETCH_USER_URL,
                 WebTier::FetchUserUrl,
                 option_id,
             )
@@ -976,7 +1060,7 @@ mod tests {
             &gate,
             &bus,
             &pending,
-            PERMISSION_KEY_FETCH,
+            PERMISSION_KEY_FETCH_ANY_URL,
             WebTier::FetchAnyUrl,
             OPTION_ALLOW_ALWAYS,
         )
@@ -985,7 +1069,7 @@ mod tests {
 
         let mut sub = bus.subscribe(16);
         assert_eq!(
-            gate.authorize_web(PERMISSION_KEY_FETCH, None, WebTier::FetchAnyUrl)
+            gate.authorize_web(PERMISSION_KEY_FETCH_ANY_URL, None, WebTier::FetchAnyUrl)
                 .await,
             PermissionDecision::Allowed
         );
@@ -999,13 +1083,60 @@ mod tests {
     /// `allow`/`deny` row is configuration, and nobody decided anything now.
     #[tokio::test]
     async fn a_policy_answer_publishes_no_consent_event() {
-        let (bus, _pending, gate) = gate(PermissionConfig::permissive());
+        let mut config = PermissionConfig::permissive();
+        // `permissive()` deliberately leaves the web keys asking, so the row
+        // this test is about has to be set explicitly.
+        config.apply_web_permission(WebPermission::Allow);
+        let (bus, _pending, gate) = gate(config);
         let mut sub = bus.subscribe(16);
         assert_eq!(
-            gate.authorize_web(PERMISSION_KEY_FETCH, None, WebTier::FetchAnyUrl)
+            gate.authorize_web(PERMISSION_KEY_FETCH_ANY_URL, None, WebTier::FetchAnyUrl)
                 .await,
             PermissionDecision::Allowed
         );
         assert!(sub.try_recv().is_none());
+    }
+
+    /// **`permissive()` is about the local, jailed tool set — which web is not.**
+    ///
+    /// The constructor's own doc is the justification for it, and a web lookup
+    /// satisfies neither half. Pre-approving the web keys there made "allow
+    /// every tool" quietly mean "and talk to the internet without asking", on
+    /// the one path that exists precisely because nothing should leave the
+    /// machine.
+    #[test]
+    fn permissive_allows_the_local_tools_and_still_asks_about_the_web() {
+        let config = PermissionConfig::permissive();
+        for tool in ["shell", "edit", "read", "grep", "glob", "anything-else"] {
+            assert_eq!(config.policy_for(tool), PermissionPolicy::Allow, "{tool}");
+        }
+        for key in WEB_PERMISSION_KEYS {
+            assert_eq!(
+                config.policy_for(key),
+                PermissionPolicy::Ask,
+                "`{key}` was pre-approved by a constructor that means \"local and jailed\""
+            );
+        }
+    }
+
+    /// `[web] permission` is a fan-out over the three keys, in both directions,
+    /// and it touches nothing else.
+    #[test]
+    fn the_web_permission_config_maps_onto_exactly_the_three_web_keys() {
+        for (permission, expected) in [
+            (WebPermission::Allow, PermissionPolicy::Allow),
+            (WebPermission::Ask, PermissionPolicy::Ask),
+        ] {
+            let mut config = PermissionConfig::with_default(PermissionPolicy::Deny);
+            config.apply_web_permission(permission);
+            for key in WEB_PERMISSION_KEYS {
+                assert_eq!(config.policy_for(key), expected, "{key}");
+            }
+            assert_eq!(
+                config.policy_for("shell"),
+                PermissionPolicy::Deny,
+                "a web config value reached a non-web tool"
+            );
+        }
     }
 }

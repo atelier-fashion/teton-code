@@ -1131,6 +1131,28 @@ pub struct WebLookup {
     /// Bytes of content the lookup brought back. `0` for every outcome that
     /// transferred nothing — a refusal, a block, or an unreachable host.
     pub bytes_in: u64,
+    /// **Which** inspection refused a blocked lookup, in the same vocabulary a
+    /// [`PrivacyBlock`] uses (REQ-563 BR-14's honesty half).
+    ///
+    /// `None` for every outcome that is not a block, and the field is omitted
+    /// from the wire then — a client written before this existed reads the same
+    /// bytes it always did.
+    ///
+    /// It exists because [`WebLookupOutcome::BlockedRedact`] folds two facts a
+    /// user must act on differently: the scan *ran and refused the text*, and
+    /// the scan *could not run at all* (no local model loaded, which is the
+    /// ordinary state on a loaderless build). Told the first when the truth is
+    /// the second, a user goes looking for a secret in a query that contained
+    /// none, while the actual fix — install or load the local model the search
+    /// tier depends on — is never named. The wire outcome stays at its fixed
+    /// eight values (architecture D-8); this is the finer reading beside it, the
+    /// same split [`LookupDetail`](../../tetond/egress/enum.LookupDetail.html)
+    /// makes daemon-side.
+    ///
+    /// It carries no more than a `privacy_block` already does: a cause and, for
+    /// a located finding, its kind and byte span. No query, no URL, no text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<BlockCause>,
 }
 
 /// How long a consent decision holds (spec BR-4's offered scopes).
@@ -1389,6 +1411,7 @@ mod tests {
                     host: "docs.rs".to_owned(),
                     outcome: WebLookupOutcome::Completed,
                     bytes_in: 4096,
+                    cause: None,
                 }),
                 "web_lookup",
             ),
@@ -2116,6 +2139,15 @@ mod tests {
                         WebLookupOutcome::Completed | WebLookupOutcome::CacheHit => 4096,
                         _ => 0,
                     },
+                    // The finer reading of a block, carried only by the two
+                    // blocking outcomes — and swept on both, so the optional
+                    // field round-trips beside every outcome rather than only
+                    // beside its absence.
+                    cause: match outcome {
+                        WebLookupOutcome::BlockedRedact => Some(BlockCause::ScanUnavailable),
+                        WebLookupOutcome::BlockedPrivacy => Some(BlockCause::Boundary),
+                        _ => None,
+                    },
                 };
                 round_trip(&lookup);
                 let wire = envelope_wire(Event::WebLookup(lookup));
@@ -2199,6 +2231,7 @@ mod tests {
                 host: "search.example.com".to_owned(),
                 outcome: WebLookupOutcome::Completed,
                 bytes_in: 2048,
+                cause: None,
             }),
             ["bytes_in", "host", "kind", "outcome"]
         );
@@ -2228,6 +2261,7 @@ mod tests {
             host: "search.example.com".to_owned(),
             outcome: WebLookupOutcome::Completed,
             bytes_in: 2048,
+            cause: None,
         })
         .unwrap();
         for forbidden in ["://", "url", "query", "token", "secret", "auth", "key", "?"] {

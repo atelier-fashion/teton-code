@@ -97,6 +97,19 @@ CREATE TRIGGER IF NOT EXISTS web_lookups_no_update
 CREATE TRIGGER IF NOT EXISTS web_lookups_no_delete
     BEFORE DELETE ON web_lookups
     BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS web_overrides (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at_ms INTEGER NOT NULL,
+    session_id     TEXT    NOT NULL,
+    tiers_restored TEXT    NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS web_overrides_no_update
+    BEFORE UPDATE ON web_overrides
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS web_overrides_no_delete
+    BEFORE DELETE ON web_overrides
+    BEGIN SELECT RAISE(ABORT, 'cost ledger is append-only'); END;
 ";
 
 /// Columns [`SCHEMA`] creates on a fresh ledger but an older build's file does
@@ -224,6 +237,39 @@ pub struct WebLookupRow {
     /// no migration then (D-7).
     pub usd_micros: Option<i64>,
 }
+
+/// One row of the `web_overrides` table — the other half of BR-13's account
+/// (REQ-563).
+///
+/// The `web_lookups` table records what a session *reached*; without this one it
+/// could not record the moment a session's model-composed lookups were
+/// re-enabled, which is the single most consequential thing a user can do to
+/// this capability. Both tables are append-only under the same triggers, so
+/// "when did this session stop being restricted" has an answer that no later
+/// write can revise.
+///
+/// Content-free by the same rule as [`WebLookupRow`]: a session id and a list of
+/// tier *names* out of the config vocabulary. There is no column that could hold
+/// a URL, a query, or a reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebOverrideRow {
+    /// Session whose restriction was lifted.
+    pub session_id: String,
+    /// The tiers the lift restored, lowest first, in the `[web] tier` spelling.
+    ///
+    /// A list rather than a single ceiling because that is what the user was
+    /// told: the `web_taint_overridden` event names the same tiers, and a row
+    /// that recorded only the ceiling would not match the sentence the user
+    /// read.
+    pub tiers_restored: Vec<&'static str>,
+}
+
+/// The separator between tier names in the `tiers_restored` column.
+///
+/// One column holding a short, closed list beats a join table for a value that
+/// is read by a human and never queried by element: the vocabulary is four
+/// words, and none of them contains this character.
+const TIER_LIST_SEPARATOR: char = ',';
 
 /// The append-only cost ledger: a bundled-SQLite store plus the price table used
 /// to cost each call and the sink that broadcasts `cost_recorded`.
@@ -381,6 +427,60 @@ impl CostLedger {
             ],
         )?;
         Ok(())
+    }
+
+    /// Append one `web_overrides` row (REQ-563 BR-13).
+    ///
+    /// Storage only, exactly like [`CostLedger::record_web_lookup`]: the
+    /// `web_taint_overridden` event is published by the RPC handler, which is
+    /// the layer that knows whether the lift was a transition at all.
+    ///
+    /// # Errors
+    /// [`LedgerError`] if the insert fails or the mutex is poisoned.
+    pub fn record_web_override(&self, row: &WebOverrideRow) -> Result<(), LedgerError> {
+        let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
+        guard.execute(
+            "INSERT INTO web_overrides (recorded_at_ms, session_id, tiers_restored)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                now_ms(),
+                row.session_id,
+                row.tiers_restored.join(&TIER_LIST_SEPARATOR.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every recorded web override, in insertion order.
+    ///
+    /// The stored tier names are handed back as owned strings rather than
+    /// re-resolved to the `&'static str` vocabulary: a name this build does not
+    /// recognize is a hand-edited store, and reporting what is actually written
+    /// there is more useful than dropping the row (the posture
+    /// [`CostLedger::all_web_lookups`] takes for a whole row, at the granularity
+    /// this column allows).
+    ///
+    /// # Errors
+    /// [`LedgerError`] if the query fails or the mutex is poisoned.
+    pub fn all_web_overrides(&self) -> Result<Vec<(String, Vec<String>)>, LedgerError> {
+        let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
+        let mut stmt =
+            guard.prepare("SELECT session_id, tiers_restored FROM web_overrides ORDER BY id")?;
+        let rows = stmt
+            .query_map([], |r| {
+                let session_id: String = r.get(0)?;
+                let tiers: String = r.get(1)?;
+                Ok((
+                    session_id,
+                    tiers
+                        .split(TIER_LIST_SEPARATOR)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Every recorded web lookup, in insertion order.
@@ -1380,6 +1480,106 @@ CREATE TRIGGER cost_records_no_delete
             guard.execute("DELETE FROM web_lookups", []).is_err(),
             "DELETE must be rejected by the append-only trigger"
         );
+    }
+
+    /// The `web_overrides` table round-trips a lift, and is append-only under
+    /// the same triggers its two neighbours are (REQ-563 BR-13's ledger half).
+    ///
+    /// A row here says a session's model-composed lookups were re-enabled on the
+    /// user's say-so — the most consequential thing a person can do to this
+    /// capability — so a later write must not be able to revise or erase it.
+    #[test]
+    fn the_web_overrides_table_records_a_lift_and_is_append_only() {
+        let (ledger, _sink) = ledger();
+        ledger
+            .record_web_override(&WebOverrideRow {
+                session_id: "sess-web".to_owned(),
+                tiers_restored: vec!["fetch_user_url", "fetch_any_url"],
+            })
+            .expect("record");
+
+        assert_eq!(
+            ledger.all_web_overrides().expect("read"),
+            vec![(
+                "sess-web".to_owned(),
+                vec!["fetch_user_url".to_owned(), "fetch_any_url".to_owned()]
+            )]
+        );
+
+        // An empty restore list reads back as empty rather than as one blank
+        // tier — the degenerate split a naive `split(',')` would produce.
+        ledger
+            .record_web_override(&WebOverrideRow {
+                session_id: "sess-none".to_owned(),
+                tiers_restored: Vec::new(),
+            })
+            .expect("record");
+        assert_eq!(
+            ledger.all_web_overrides().expect("read")[1].1,
+            Vec::<String>::new()
+        );
+
+        let guard = ledger.conn.lock().unwrap();
+        assert!(
+            guard
+                .execute("UPDATE web_overrides SET session_id = 'x'", [])
+                .is_err(),
+            "UPDATE must be rejected by the append-only trigger"
+        );
+        assert!(
+            guard.execute("DELETE FROM web_overrides", []).is_err(),
+            "DELETE must be rejected by the append-only trigger"
+        );
+    }
+
+    /// The override table holds no column that could carry an utterance either
+    /// — the same rule `web_lookups` is held to, asserted the same way.
+    #[test]
+    fn the_web_overrides_table_has_no_column_that_could_hold_an_utterance() {
+        let (ledger, _sink) = ledger();
+        let guard = ledger.conn.lock().unwrap();
+        let mut stmt = guard
+            .prepare("SELECT name FROM pragma_table_info('web_overrides') ORDER BY name")
+            .expect("prepare");
+        let columns: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            columns,
+            vec!["id", "recorded_at_ms", "session_id", "tiers_restored"],
+            "the override schema gained a column: {columns:?}"
+        );
+    }
+
+    /// A `cost.db` written before `web_overrides` existed gains the table on
+    /// open, for the reason `web_lookups` does: `CREATE TABLE IF NOT EXISTS`
+    /// reaches an existing file, so a new *table* needs no `ADDITIVE_COLUMNS`
+    /// entry.
+    #[test]
+    fn a_ledger_written_before_web_overrides_gains_the_table_on_open() {
+        let path = scratch_db("pre-overrides");
+        let _ = std::fs::remove_file(&path);
+        {
+            let old = Connection::open(&path).expect("create pre-REQ-563 ledger");
+            old.execute_batch(PRE_REQ_SCHEMA).expect("pre-REQ schema");
+        }
+        let ledger = CostLedger::open(
+            &path,
+            PriceTable::bundled(),
+            Arc::new(CapturingSink::default()),
+        )
+        .expect("open an older ledger");
+        assert!(ledger.all_web_overrides().expect("read").is_empty());
+        ledger
+            .record_web_override(&WebOverrideRow {
+                session_id: "s".to_owned(),
+                tiers_restored: vec!["search"],
+            })
+            .expect("append after the table arrives");
+        assert_eq!(ledger.all_web_overrides().expect("read").len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

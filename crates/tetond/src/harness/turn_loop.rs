@@ -831,6 +831,21 @@ const WEB_OPT_IN_CLAUSE: &str =
      the opt-in — `[web] tier` in Teton's config — instead of searching the repository for \
      the answer.\n";
 
+/// The ending for the *other* off-state: web lookup is configured, and this
+/// turn's provider profile cannot reach it (REQ-563 BR-6).
+///
+/// A distinct sentence because it is a distinct fact with a distinct action.
+/// [`WEB_OPT_IN_CLAUSE`] tells the user to set `[web] tier` — advice that does
+/// nothing for someone who already set it and is running on a degraded profile
+/// whose `max_tools` cap cut the tool (which it cuts first, by registration
+/// order). Told the opt-in clause, that model would either hunt the repository
+/// for a config key that is already correct or report the capability as off when
+/// it is on. One sentence, for the same budget reason the clause above is one.
+const WEB_CAPPED_CLAUSE: &str =
+    "Web lookup is configured on this machine but is not available in this model's \
+     reduced tool set, so say that rather than searching the repository for a live \
+     fact.\n";
+
 /// Build the system prompt: the agent's instructions, Teton's bundled
 /// self-configuration guide, the exposed tool docs, and the tool-call format
 /// the local model must follow.
@@ -854,22 +869,50 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
              with the shell tool) before finishing.\n",
         );
     }
-    // REQ-563 BR-6/D-1. The condition is *registration*, not exposure: the tool
-    // is registered exactly when `[web] tier` is above `off`, so its absence
-    // here means the capability was never opted into and the opt-in is the
-    // honest thing to name. A tool that IS registered but sits past a degraded
-    // provider's `max_tools` cap is a different state with a different answer —
-    // web lookup is on, this profile just cannot reach it — and telling that
-    // user to edit a config key they already set would be advice that does
-    // nothing (BR-6 of the charter, the ordinary cap behaviour every tool has).
+    // REQ-563 BR-6/D-1. **Three** states, not two, and the difference between
+    // the last two is the whole point of this branch:
+    //
+    // - not registered — `[web] tier` is `off`, the capability was never opted
+    //   into, and naming the opt-in is the honest and actionable thing to say;
+    // - registered and exposed — nothing to say; the tool's own docs are below;
+    // - registered and **capped out** — the tool exists but sits past this
+    //   profile's `max_tools` (it registers last, so a cap cuts it first).
+    //
+    // Keying the clause on registration alone collapsed the last two: a model on
+    // a degraded profile saw no web tool, no clause, and no described ending for
+    // "what is the current version of tokio" — which is exactly the BUG-160
+    // shape this clause exists to close, reached from the other side. Telling
+    // *that* model to set `[web] tier` would be worse still: the key is already
+    // set, so the advice sends the user to change nothing.
     if tools.get(WEB_TOOL_NAME).is_none() {
         s.push_str(WEB_OPT_IN_CLAUSE);
+    } else if !web_tool_is_exposed(tools, config) {
+        s.push_str(WEB_CAPPED_CLAUSE);
     }
     s.push('\n');
     s.push_str(SELF_CONFIG_GUIDE);
     s.push_str("\nAvailable tools:\n");
     s.push_str(&tools.docs(config.max_tools));
     s
+}
+
+/// Whether the web tool is inside this profile's exposure window (REQ-563 BR-6).
+///
+/// Reads [`ToolRegistry::exposed_names`] rather than re-deriving the cap, so the
+/// prompt's claim about what the model can reach and the list of tools the model
+/// is actually offered come from one function. A second `max_tools` arithmetic
+/// here would be a second chance to be off by one — in the direction of telling
+/// the model a capability is unavailable while handing it the tool, or the
+/// reverse.
+///
+/// `pub(crate)` because the daemon needs the same answer for the user-facing
+/// signal: the model being told and the status row saying so are two readings of
+/// one fact (REQ-563 verify).
+#[must_use]
+pub(crate) fn web_tool_is_exposed(tools: &ToolRegistry, config: &HarnessConfig) -> bool {
+    tools
+        .exposed_names(config.max_tools)
+        .contains(&WEB_TOOL_NAME)
 }
 
 /// The request this turn is serving.
@@ -946,7 +989,12 @@ fn path_arg(arguments: &Value) -> Option<String> {
 /// output for tool calls, never a tool result — the framing makes that contract
 /// explicit so an injection planted in a repo file (read/grep/glob/shell output)
 /// cannot be read as an instruction that fires an allowlisted tool.
-fn frame_untrusted_builtin(tool: &str, text: &str) -> String {
+///
+/// `pub(crate)` so `render`'s AC-5 coverage can call the **real** function
+/// instead of a copy of it: a hand-mirrored `frame_untrusted_like_the_loop` in a
+/// test module proves the containment of whatever that copy does, and goes on
+/// passing after this one is changed (REQ-563 verify).
+pub(crate) fn frame_untrusted_builtin(tool: &str, text: &str) -> String {
     // BUG-148: the envelope is only a frame if the content cannot write one.
     // A repo file with a flush-left `</tool-result>` would otherwise close this
     // block early and let its remaining bytes read as harness-authored prose.
@@ -1513,6 +1561,57 @@ mod tests {
         // And the tool's own docs are what tell the model it exists — no extra
         // prose is added for the present case.
         assert!(system.contains(WEB_TOOL_NAME), "{system}");
+    }
+
+    /// **The third state: registered, but past this profile's `max_tools`.**
+    ///
+    /// The web tool registers last so a cap cuts it first (BR-6). Keying the
+    /// clause on registration alone left the model on a degraded profile with no
+    /// web tool, no clause, and no described ending for a question needing the
+    /// live web — BUG-160's failure reached from the other side. The opt-in
+    /// clause is not the right answer either: `[web] tier` is already set, so
+    /// that advice sends the user to change nothing.
+    #[test]
+    fn a_capped_out_web_tool_gets_its_own_clause_and_never_the_opt_in_one() {
+        let tools = registry_with_web("x");
+        // The default (weak-model) profile caps at 5 tools and the web tool is
+        // registered last, so it is outside the window.
+        let capped = HarnessConfig::default();
+        assert!(
+            !web_tool_is_exposed(&tools, &capped),
+            "non-vacuity: this profile really does cut the web tool"
+        );
+        let system = build_system_prompt(&tools, &capped);
+        assert!(
+            system.contains("Web lookup is configured on this machine but is not available"),
+            "a model that cannot reach the web tool was told nothing about it. If this \
+             clause was reworded deliberately, update this test to the new wording; do \
+             not just delete the assertion.\n{system}"
+        );
+        assert!(
+            !system.contains("Web lookup is off"),
+            "the opt-in clause tells a user who already set `[web] tier` to set it \
+             again:\n{system}"
+        );
+
+        // …and the uncapped profile says neither: the tool's own docs are there.
+        let full = HarnessConfig::for_strong_model();
+        assert!(web_tool_is_exposed(&tools, &full));
+        let system = build_system_prompt(&tools, &full);
+        assert!(!system.contains("Web lookup is off"), "{system}");
+        assert!(
+            !system.contains("Web lookup is configured on this machine but is not available"),
+            "{system}"
+        );
+
+        // And the off case keeps the opt-in clause and not this one — the three
+        // states are three, and none of them borrows another's sentence.
+        let off = build_system_prompt(&ToolRegistry::with_builtins(), &capped);
+        assert!(off.contains("Web lookup is off"), "{off}");
+        assert!(
+            !off.contains("Web lookup is configured on this machine but is not available"),
+            "{off}"
+        );
     }
 
     /// **AC-1's structural half.** Absent is absent: the registry does not

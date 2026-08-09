@@ -51,27 +51,67 @@ use teton_core::config::{WebConfig, WebTier};
 use teton_protocol::events::{WebLookupKind, WebLookupOutcome};
 
 use crate::egress::{Authorship, LookupDetail, LookupOutcome, LookupRecord, LookupRequest};
-use crate::harness::permissions::{PermissionDecision, PermissionGate};
-use crate::web::{host_of, reduce, DomainAllowlist, UserUrls, WebCache, REDUCED_MAX_BYTES};
+use crate::harness::permissions::{PermissionDecision, PermissionGate, RememberedGrant};
+use crate::web::{
+    canonical_host_of, canonical_lookup_url, reduce, DomainAllowlist, UserUrls, WebCache,
+    REDUCED_MAX_BYTES,
+};
 
 use super::{Tool, ToolContext, ToolError, ToolOutcome, ToolRegistry};
 
 /// The name the model calls this tool by.
 pub const WEB_TOOL_NAME: &str = "web";
 
-/// The permission subject a **fetch** is authorized under.
+/// The permission subject a fetch of a **user-pasted** URL is authorized under.
 ///
-/// Deliberately not the tool name: BR-3 grades the capability and consents each
-/// tier separately, and [`PermissionGate`] remembers an `allow_always` under
-/// exactly the string it was asked about. Keyed on the tool name, one
-/// "allow for this session" on a page fetch would silently have granted every
-/// search for the rest of the session — the grant would have been *wider than
-/// the question the user answered*.
-pub const PERMISSION_KEY_FETCH: &str = "web_fetch";
+/// Deliberately not the tool name, and deliberately **one key per tier**: BR-3
+/// grades the capability and consents each tier separately, and
+/// [`PermissionGate`] remembers an `allow_always` under exactly the string it
+/// was asked about. Keyed on the tool name, one "allow for this session" on a
+/// page fetch would silently have granted every search for the rest of the
+/// session; keyed on the tool *kind*, one grant on a URL the user pasted would
+/// have granted every URL the model composes — the mixed-authorship case, and
+/// the one BR-3 names first. The grant must never be wider than the question the
+/// user answered, so the key is a function of
+/// [`Call::needed_tier`] and nothing else.
+pub const PERMISSION_KEY_FETCH_USER_URL: &str = "web_fetch_user_url";
 
-/// The permission subject a **search** is authorized under — see
-/// [`PERMISSION_KEY_FETCH`] for why the two are separate strings.
+/// The permission subject a fetch of a **model-composed** URL is authorized
+/// under — see [`PERMISSION_KEY_FETCH_USER_URL`] for why the tiers do not share.
+pub const PERMISSION_KEY_FETCH_ANY_URL: &str = "web_fetch_any_url";
+
+/// The permission subject a **search** is authorized under.
 pub const PERMISSION_KEY_SEARCH: &str = "web_search";
+
+/// Every web permission key, so a sweep over them — the gate's `is_web_*`
+/// predicate, the `permissive()` exclusion, the config-driven policy mapping —
+/// cannot miss one a later tier adds.
+///
+/// Ordered like [`WebTier::ALL`] above `off`, because that is the order the keys
+/// *are*: [`permission_key_for`] is the total function from tier to key, and a
+/// list that disagreed with it would be a second mapping to keep in step.
+pub const WEB_PERMISSION_KEYS: [&str; 3] = [
+    PERMISSION_KEY_FETCH_USER_URL,
+    PERMISSION_KEY_FETCH_ANY_URL,
+    PERMISSION_KEY_SEARCH,
+];
+
+/// The consent key a lookup needing `tier` is authorized under (BR-3).
+///
+/// The **one** definition of the tier→key mapping, so the tool, the gate and any
+/// config-driven policy row cannot disagree about which grant answers which
+/// lookup. [`WebTier::Off`] has no key — nothing is ever consented at a tier
+/// that names the absence of the capability — and it answers `None` rather than
+/// borrowing a neighbouring key, which would be a grant at a tier nobody holds.
+#[must_use]
+pub fn permission_key_for(tier: WebTier) -> Option<&'static str> {
+    match tier {
+        WebTier::Off => None,
+        WebTier::FetchUserUrl => Some(PERMISSION_KEY_FETCH_USER_URL),
+        WebTier::FetchAnyUrl => Some(PERMISSION_KEY_FETCH_ANY_URL),
+        WebTier::Search => Some(PERMISSION_KEY_SEARCH),
+    }
+}
 
 /// The two schemes a fetch may name.
 ///
@@ -186,11 +226,16 @@ impl Call {
     }
 
     /// The permission subject (BR-3: one per tier, never one per tool).
+    ///
+    /// Derived from [`Self::needed_tier`] through the single
+    /// [`permission_key_for`] mapping rather than matched on the call shape: the
+    /// two fetch tiers are *different capabilities*, and a match on
+    /// `Call::Fetch { .. }` collapses them back into one grant. `Off` is
+    /// unreachable here — `needed_tier` never yields it — and the fallback picks
+    /// the **narrowest** key rather than panicking, so a tier added to the ladder
+    /// without a key fails closed instead of sharing a broader one.
     fn permission_key(&self) -> &'static str {
-        match self {
-            Call::Fetch { .. } => PERMISSION_KEY_FETCH,
-            Call::Search { .. } => PERMISSION_KEY_SEARCH,
-        }
+        permission_key_for(self.needed_tier()).unwrap_or(PERMISSION_KEY_FETCH_USER_URL)
     }
 
     /// The request handed to the choke point.
@@ -258,7 +303,12 @@ impl WebTool {
                 .allowed_domains
                 .as_ref()
                 .map(|patterns| DomainAllowlist::new(patterns)),
-            search_host: config.search_endpoint.as_deref().and_then(host_of),
+            // The same parser the seam reads the endpoint with, so the host the
+            // prompt names is the host the request reaches (C-1).
+            search_host: config
+                .search_endpoint
+                .as_deref()
+                .and_then(canonical_host_of),
             cache,
             user_urls,
             gate,
@@ -306,8 +356,25 @@ impl WebTool {
         // --- gate: the cache (BR-12). A hit performs no egress, so it asks no
         // consent: there is nothing for the user to authorize. It is still a
         // lookup, so it is still a ledger row. ---
+        //
+        // "Asks no consent" is not "ignores consent". A standing
+        // `reject_always` is an answer about the **capability**, not about the
+        // packet — the user said "stop doing web lookups this session" — and
+        // serving a cached page past it would be the one path around their own
+        // answer, invisible precisely because it is free. So the remembered
+        // grant is *read* (never prompted for, never recorded) before the entry
+        // is handed over.
         if let Call::Fetch { url, host, .. } = &call {
             if let Some(entry) = self.cache.get(url) {
+                if self.gate.remembered(call.permission_key())
+                    == Some(RememberedGrant::RejectAlways)
+                {
+                    return ToolOutcome::error(
+                        "Permission denied: the user declined web fetches for this session. Do \
+                         not retry it; take a different approach or finish."
+                            .to_owned(),
+                    );
+                }
                 self.record_local(&call, WebLookupOutcome::CacheHit);
                 return ToolOutcome::ok(format!(
                     "web fetch {url} (host {host}; served from the local cache, nothing \
@@ -363,27 +430,50 @@ impl WebTool {
     }
 
     /// Read the model's arguments into a [`Call`], resolving authorship.
+    ///
+    /// ## One parser, and the URL that leaves is the URL that was checked
+    ///
+    /// The `url` argument is parsed by [`canonical_lookup_url`] — `reqwest::Url`,
+    /// the transport's own parser — and everything downstream uses its
+    /// **re-serialized** output: the host the allowlist and the consent prompt
+    /// name, the string the prompt echoes, the string the cache keys, the string
+    /// handed to the seam. A model-supplied spelling whose re-serialization
+    /// differs is not a hazard, because the re-serialized form is what is sent;
+    /// what *was* a hazard is checking one reading and sending another, which is
+    /// what `https://evil.example\@allowed.example/x` does to any splitter that
+    /// is not the socket's (REQ-563 verify, C-1).
+    ///
+    /// The scheme check runs on the parsed scheme rather than a prefix of the
+    /// raw string, for the same reason: a lowercase prefix test on the model's
+    /// bytes is a second reading of the input.
     fn parse(&self, args: &Value) -> Result<Call, ToolError> {
         let url = super::opt_str_arg(args, "url").filter(|s| !s.trim().is_empty());
         let query = super::opt_str_arg(args, "query").filter(|s| !s.trim().is_empty());
         match (url, query) {
-            (Some(url), None) => {
-                let url = url.trim().to_owned();
-                // A closed scheme list and a readable host, checked here rather
-                // than at the transport: `file:///etc/passwd` is not a lookup
-                // that fails, it is not a lookup.
-                let lowered = url.to_ascii_lowercase();
+            (Some(raw), None) => {
+                let (url, host) = canonical_lookup_url(&raw)
+                    .ok_or_else(|| ToolError::args("`url` has no host to look up"))?;
+                // A closed scheme list, checked here rather than at the
+                // transport: `file:///etc/passwd` is not a lookup that fails, it
+                // is not a lookup.
                 if !FETCHABLE_SCHEMES
                     .iter()
-                    .any(|scheme| lowered.starts_with(scheme))
+                    .any(|scheme| url.starts_with(scheme))
                 {
                     return Err(ToolError::args(
                         "`url` must be an absolute http:// or https:// URL",
                     ));
                 }
-                let host =
-                    host_of(&url).ok_or_else(|| ToolError::args("`url` has no host to look up"))?;
-                let authorship = if self.user_pasted(&url) {
+                // Authorship is asked of the canonical spelling *and* of what
+                // the model wrote. The first is the ordinary case (the paste is
+                // ingested through the same canonicalization); the second keeps
+                // a URL whose raw spelling the user typed verbatim from losing
+                // its exemption to a re-serialization difference. Neither
+                // widens: two strings that normalize alike differ only in
+                // scheme/host case and fragment, so they name the same
+                // destination — the substitution BR-3 forbids is not reachable
+                // from here.
+                let authorship = if self.user_pasted(&url) || self.user_pasted(&raw) {
                     Authorship::UserPasted
                 } else {
                     Authorship::ModelComposed
@@ -476,6 +566,9 @@ impl WebTool {
             outcome,
             bytes_in: 0,
             duration_ms: 0,
+            // No inspection ran: these are the endings decided *before* the
+            // choke point, so there is no block and no cause to name.
+            cause: None,
         });
     }
 
@@ -501,7 +594,19 @@ impl WebTool {
     /// fields are the choke point's to set and have no public constructor —
     /// deliberately, and not a gap to widen from this side.
     fn deliver(&self, call: &Call, body: &[u8], bytes_in: u64, truncated: bool) -> ToolOutcome {
-        let text = reduce(&String::from_utf8_lossy(body), REDUCED_MAX_BYTES);
+        let raw = String::from_utf8_lossy(body);
+        // BR-10's reduction is an **HTML→text** extractor, and it is applied to
+        // the one body that is HTML. A search backend answers JSON: run through
+        // `reduce`, `<script` inside a snippet is treated as a tag to strip,
+        // `Vec<T>` in a code result loses `<T>`, and `&amp;` in a URL field is
+        // decoded — the result is neither the JSON that was received nor a
+        // faithful rendering of it. A search body therefore takes the same byte
+        // cap and nothing else; the cap is the same constant, so what enters
+        // context is bounded identically either way (REQ-563 verify).
+        let text = match call {
+            Call::Fetch { .. } => reduce(&raw, REDUCED_MAX_BYTES),
+            Call::Search { .. } => cap_bytes(&raw, REDUCED_MAX_BYTES),
+        };
         let cut = if truncated { ", truncated" } else { "" };
         match call {
             Call::Fetch { url, host, .. } => {
@@ -545,14 +650,31 @@ impl WebTool {
             LookupDetail::RedirectRefused => {
                 "the destination redirected outside the configured allowlist".to_owned()
             }
-            // `..` rather than naming the class: which non-global range a
-            // destination fell in is a fact for the ledger row and the
-            // `web_lookup` event, not a distinction the model can act on.
+            // `..` rather than naming the class, deliberately. *Which*
+            // non-global range a destination fell in — loopback, link-local,
+            // private, unspecified — is a fact for the ledger row and the
+            // `web_lookup` event, where a person can act on it. Handed back to
+            // the model it is a four-way oracle on an input the model controls:
+            // sweep an address space, read which class each answer names, and
+            // the refusal has mapped the host's network for you. The one thing
+            // the model can act on is "stop trying to reach addresses like this
+            // one", and that is what the sentence says.
             LookupDetail::RefusedAddress { .. } => {
-                "the destination is not a public internet address".to_owned()
+                "this destination is not reachable from web lookup — it is not a public \
+                 internet address. Do not try other addresses in the same family"
+                    .to_owned()
             }
+            // This one *does* name its cause, and the contrast with the arm
+            // above is the rule rather than an exception to it: the search
+            // endpoint is a value out of the user's own config, so naming it
+            // discloses nothing the model could not read off `[web]`, and the
+            // fact is directly actionable — the same destination is reachable
+            // by supplying `query` instead of `url`. Saying only "refused"
+            // would leave the model retrying a fetch that can never succeed.
             LookupDetail::SearchEndpointFetch => {
-                "the configured search backend is reachable through a web search, not a fetch"
+                "that host is the configured search backend, which is reached with the \
+                 `query` argument (the search tier scans every query and carries the \
+                 backend's credential) and never with `url`"
                     .to_owned()
             }
             // BR-13's notice names the cause and the effect, because a
@@ -656,6 +778,26 @@ pub fn register_web_tool(
     true
 }
 
+/// `text` truncated to at most `cap` **bytes**, never mid-character.
+///
+/// The whole of what a non-HTML body gets instead of [`reduce`]: the point of
+/// the cap is to bound what enters context, and every other thing `reduce` does
+/// is an HTML transform that a JSON document is only damaged by. Cutting on a
+/// `char_indices` boundary rather than slicing at `cap` is what keeps the result
+/// a `String` at all — a byte slice through a multi-byte character panics.
+fn cap_bytes(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let end = text
+        .char_indices()
+        .map(|(at, _)| at)
+        .take_while(|at| *at <= cap)
+        .last()
+        .unwrap_or(0);
+    text[..end].to_owned()
+}
+
 /// The config spelling of a tier, for a refusal that has to name it (AC-4).
 ///
 /// A match rather than a `Display` impl on the core enum: this is the `[web]
@@ -705,6 +847,9 @@ mod tests {
     struct FakeSeam {
         calls: AtomicUsize,
         records: Mutex<Vec<LookupRecord>>,
+        /// The URL (or query) of every request that reached the seam — what
+        /// would have gone on the wire, which is the string C-1 is about.
+        requests: Mutex<Vec<String>>,
     }
 
     impl FakeSeam {
@@ -712,6 +857,7 @@ mod tests {
             Arc::new(Self {
                 calls: AtomicUsize::new(0),
                 records: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
             })
         }
 
@@ -722,16 +868,24 @@ mod tests {
         fn recorded(&self) -> Vec<LookupRecord> {
             self.records.lock().unwrap().clone()
         }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl WebLookupSeam for FakeSeam {
         async fn lookup(
             &self,
-            _request: &LookupRequest,
+            request: &LookupRequest,
             _hop_allowed: &(dyn for<'h> Fn(&'h str) -> bool + Send + Sync),
         ) -> Result<LookupOutcome, SeamError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(match &request.kind {
+                crate::egress::LookupKind::Fetch { url } => url.clone(),
+                crate::egress::LookupKind::Search { query } => query.clone(),
+            });
             Err(SeamError::Unavailable("test seam".to_owned()))
         }
 
@@ -1168,7 +1322,7 @@ mod tests {
                 "the prompt must name the destination host: {description}"
             );
             assert_eq!(
-                request.tool_name, PERMISSION_KEY_FETCH,
+                request.tool_name, PERMISSION_KEY_FETCH_ANY_URL,
                 "a fetch must be authorized under its own tier's key"
             );
             fx.pending.resolve(
@@ -1268,7 +1422,7 @@ mod tests {
             let Event::PermissionRequest(request) = env.event else {
                 panic!("expected a permission_request");
             };
-            assert_eq!(request.tool_name, PERMISSION_KEY_FETCH);
+            assert_eq!(request.tool_name, PERMISSION_KEY_FETCH_ANY_URL);
             pending.resolve(
                 &request.request_id,
                 PermissionOutcome::Selected {
@@ -1649,5 +1803,411 @@ mod tests {
         assert!(tainted.contains("restrict"), "{tainted}");
         assert!(tainted.contains("pasted"), "{tainted}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The address-class refusal names no class, and the search-endpoint one
+    /// names the routing — the asymmetry is deliberate (REQ-563 verify).
+    #[tokio::test]
+    async fn a_refused_address_names_no_class_and_a_search_endpoint_fetch_names_the_tier() {
+        use crate::egress::AddressClass;
+
+        let fx = fixture(
+            "sentences-2",
+            web_config(WebTier::Search),
+            PermissionPolicy::Allow,
+            &[],
+        );
+
+        // A four-way oracle on an input the model controls is a network map;
+        // every class must read identically.
+        let sentences: Vec<String> = [
+            AddressClass::Loopback,
+            AddressClass::LinkLocal,
+            AddressClass::Private,
+            AddressClass::Unspecified,
+        ]
+        .into_iter()
+        .map(|class| {
+            fx.tool
+                .failure_sentence(&LookupDetail::RefusedAddress { class })
+        })
+        .collect();
+        for sentence in &sentences {
+            assert_eq!(sentence, &sentences[0], "the address class leaked");
+            for word in ["loopback", "link", "private", "unspecified", "range"] {
+                assert!(
+                    !sentence.to_lowercase().contains(word),
+                    "`{word}` reached the model: {sentence}"
+                );
+            }
+        }
+        assert!(
+            sentences[0].contains("public internet address"),
+            "{}",
+            sentences[0]
+        );
+
+        // The search endpoint, by contrast, is a value out of the user's own
+        // config and the fact is directly actionable — so it names the route.
+        let endpoint = fx.tool.failure_sentence(&LookupDetail::SearchEndpointFetch);
+        assert!(endpoint.contains("query"), "{endpoint}");
+        assert!(endpoint.contains("search backend"), "{endpoint}");
+        assert!(
+            endpoint.contains("url"),
+            "the model must be told which argument it used wrongly: {endpoint}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // One parser (REQ-563 verify, C-1)
+    // -----------------------------------------------------------------------
+
+    /// Drive one `Ask` prompt to `option_id`, returning the outcome and the
+    /// request the client actually received.
+    async fn ask(
+        fx: &Fixture,
+        args: Value,
+        option_id: &str,
+    ) -> (ToolOutcome, teton_protocol::events::PermissionRequest) {
+        let mut sub = fx.bus.subscribe(16);
+        let run = fx.tool.lookup(&args);
+        let answer = async {
+            let request = loop {
+                let env = sub.recv().await.expect("no permission_request was raised");
+                if let Event::PermissionRequest(request) = env.event {
+                    break request;
+                }
+            };
+            fx.pending.resolve(
+                &request.request_id,
+                PermissionOutcome::Selected {
+                    option_id: option_id.to_owned(),
+                },
+            );
+            request
+        };
+        tokio::join!(run, answer)
+    }
+
+    /// **The gate, the prompt and the wire read one parser.**
+    ///
+    /// Each of these spellings has an authority that a hand-written splitter
+    /// reads differently from the socket. The tool must gate on — and show, and
+    /// send — the socket's reading, so an allowlist naming the *decoy* refuses
+    /// them all and the refusal names the host the bytes would actually reach.
+    #[tokio::test]
+    async fn a_spoofed_authority_is_gated_on_the_host_the_socket_would_reach() {
+        let cases = [
+            // WHATWG treats `\` as a path separator, so the `@` is a path byte
+            // and the authority ends at the backslash.
+            ("https://evil.example\\@allowed.example/x", "evil.example"),
+            // Userinfo is not a host, however much it is spelled like one.
+            ("https://allowed.example@evil.example/x", "evil.example"),
+            // A decimal integer is an IPv4 address.
+            ("http://2130706433/admin", "127.0.0.1"),
+            // An IPv6 literal keeps its brackets, which is the wire spelling.
+            ("http://[::1]:8080/admin", "[::1]"),
+        ];
+        for (raw, real_host) in cases {
+            let fx = fixture(
+                "spoof",
+                allowlisted(WebTier::FetchAnyUrl, &["allowed.example"]),
+                // Allow, so a refusal can only be the allowlist's.
+                PermissionPolicy::Allow,
+                &[],
+            );
+            let out = fx.tool.lookup(&json!({ "url": raw })).await;
+            assert!(out.is_error, "{raw} was not refused");
+            assert!(
+                out.content.contains(real_host),
+                "{raw}: the refusal must name the host the request would reach, got {}",
+                out.content
+            );
+            assert!(
+                out.content.contains("allowed_domains"),
+                "{raw}: {}",
+                out.content
+            );
+            assert_eq!(fx.seam.calls(), 0, "{raw} reached the seam");
+        }
+    }
+
+    /// …and the consent prompt asks about the same string that would be sent.
+    ///
+    /// The half the allowlist test above cannot cover: with no allowlist the
+    /// spoof proceeds to the prompt, and what the user is shown has to be the
+    /// re-serialized URL and the real host — not the decoy the model wrote.
+    #[tokio::test]
+    async fn the_prompt_shows_the_reserialized_url_and_the_real_host() {
+        let fx = fixture(
+            "spoof-prompt",
+            web_config(WebTier::FetchAnyUrl),
+            PermissionPolicy::Ask,
+            &[],
+        );
+        let (out, request) = ask(
+            &fx,
+            json!({ "url": "https://evil.example\\@allowed.example/x" }),
+            "reject_once",
+        )
+        .await;
+        let description = request.description.clone().unwrap_or_default();
+        assert!(
+            description.contains("(host evil.example)"),
+            "the prompt named the decoy host: {description}"
+        );
+        assert!(
+            description.contains("https://evil.example/@allowed.example/x"),
+            "the prompt must echo the URL as it would be sent: {description}"
+        );
+        assert!(out.is_error);
+        assert_eq!(fx.seam.calls(), 0);
+    }
+
+    /// The string handed to the seam is the re-serialized one, so "checked",
+    /// "shown" and "sent" are one value rather than three readings.
+    #[tokio::test]
+    async fn the_seam_receives_the_reserialized_url() {
+        let fx = fixture(
+            "reserialized",
+            web_config(WebTier::FetchAnyUrl),
+            PermissionPolicy::Allow,
+            &[],
+        );
+        // No allowlist, so this reaches the seam; the fake seam records the
+        // request it was handed.
+        let _ = fx
+            .tool
+            .lookup(&json!({ "url": "HTTPS://Docs.RS:443/tokio" }))
+            .await;
+        assert_eq!(fx.seam.requests(), vec!["https://docs.rs/tokio".to_owned()]);
+    }
+
+    /// A URL the user pasted keeps its exemption when the re-serializer moves
+    /// it — the ordinary case, not an edge one: `https://docs.rs` gains a `/`.
+    #[tokio::test]
+    async fn a_pasted_url_whose_reserialization_moves_is_still_pasted() {
+        let fx = fixture(
+            "reserialize-pasted",
+            web_config(WebTier::FetchUserUrl),
+            PermissionPolicy::Allow,
+            &["https://docs.rs"],
+        );
+        let out = fx.tool.lookup(&json!({ "url": "https://docs.rs" })).await;
+        assert!(
+            !out.content.contains("tier"),
+            "the ceiling refused the user's own link: {}",
+            out.content
+        );
+        assert_eq!(fx.seam.calls(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-tier permission keys (REQ-563 verify, C-2)
+    // -----------------------------------------------------------------------
+
+    /// **Mixed authorship: a grant on a pasted URL does not cover a composed
+    /// one.**
+    ///
+    /// The case BR-3 names first, and the one a shared `web_fetch` key made
+    /// silently wrong: the user pastes a link, allows fetches "for this
+    /// session", and the model then composes a URL of its own — which must
+    /// raise its own prompt, because the question the user answered was about a
+    /// URL they chose.
+    #[tokio::test]
+    async fn a_session_grant_on_a_pasted_fetch_does_not_grant_a_composed_one() {
+        let fx = fixture(
+            "mixed-authorship",
+            web_config(WebTier::FetchAnyUrl),
+            PermissionPolicy::Ask,
+            &["https://docs.rs/pasted"],
+        );
+
+        let (_, first) = ask(
+            &fx,
+            json!({ "url": "https://docs.rs/pasted" }),
+            "allow_always",
+        )
+        .await;
+        assert_eq!(first.tool_name, PERMISSION_KEY_FETCH_USER_URL);
+
+        // A second pasted fetch rides the grant with no prompt…
+        let mut sub = fx.bus.subscribe(16);
+        let _ = fx
+            .tool
+            .lookup(&json!({ "url": "https://docs.rs/pasted" }))
+            .await;
+        assert!(
+            !std::iter::from_fn(|| sub.try_recv())
+                .any(|env| matches!(env.event, Event::PermissionRequest(_))),
+            "the grant did not answer a second lookup at its own tier"
+        );
+
+        // …and a model-composed one asks again, under its own key.
+        let (out, second) = ask(
+            &fx,
+            json!({ "url": "https://docs.rs/composed" }),
+            "reject_once",
+        )
+        .await;
+        assert_eq!(
+            second.tool_name, PERMISSION_KEY_FETCH_ANY_URL,
+            "a composed fetch must be authorized under the tier it needs"
+        );
+        assert!(out.is_error, "the reject was not honoured");
+    }
+
+    /// The mapping itself: one key per tier above `off`, all distinct, and
+    /// nothing for `off`.
+    #[test]
+    fn every_tier_above_off_has_its_own_distinct_permission_key() {
+        assert_eq!(permission_key_for(WebTier::Off), None);
+        let keys: Vec<&str> = WebTier::ALL
+            .into_iter()
+            .filter_map(permission_key_for)
+            .collect();
+        assert_eq!(keys, WEB_PERMISSION_KEYS.to_vec());
+        assert_eq!(
+            keys.iter().collect::<std::collections::HashSet<_>>().len(),
+            keys.len(),
+            "two tiers share a consent key, so one grant answers both"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A cache hit honours a standing denial (REQ-563 verify)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_cache_hit_is_refused_after_a_reject_for_this_session() {
+        const URL: &str = "https://docs.rs/tokio/latest";
+        let config = web_config(WebTier::FetchAnyUrl);
+        let dir = temp_dir("cache-denied");
+        let cache = WebCache::from_config(&dir, &config);
+        cache.put(URL, "the reduced page text").unwrap();
+
+        let seam = FakeSeam::new();
+        let (bus, pending, gate) = gate(PermissionPolicy::Ask);
+        let tool = WebTool::new(
+            &config,
+            cache,
+            Arc::new(Mutex::new(UserUrls::new())),
+            Arc::clone(&gate),
+            Arc::clone(&seam) as Arc<dyn WebLookupSeam>,
+            Handle::current(),
+        );
+
+        // The user refuses the capability for the session, on an uncached URL.
+        let mut sub = bus.subscribe(16);
+        let other = json!({ "url": "https://docs.rs/other" });
+        let run = tool.lookup(&other);
+        let answer = async {
+            let request = loop {
+                let env = sub.recv().await.unwrap();
+                if let Event::PermissionRequest(request) = env.event {
+                    break request;
+                }
+            };
+            pending.resolve(
+                &request.request_id,
+                PermissionOutcome::Selected {
+                    option_id: "reject_always".to_owned(),
+                },
+            );
+        };
+        let (denied, ()) = tokio::join!(run, answer);
+        assert!(denied.is_error);
+
+        // The cached URL must not become the way around that answer — and it
+        // must not raise a prompt either: the answer is already on file.
+        let out = tool.lookup(&json!({ "url": URL })).await;
+        assert!(out.is_error, "a cache hit served past a standing denial");
+        assert!(
+            !out.content.contains("the reduced page text"),
+            "{}",
+            out.content
+        );
+        assert_eq!(pending.pending_count(), 0, "a cache hit raised a prompt");
+        assert_eq!(seam.calls(), 0);
+        assert!(
+            !seam
+                .recorded()
+                .iter()
+                .any(|r| r.outcome == WebLookupOutcome::CacheHit),
+            "a refused cache hit was recorded as one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Reduction applies to pages, not to search bodies (REQ-563 verify)
+    // -----------------------------------------------------------------------
+
+    /// A search backend answers JSON, and `reduce` is an HTML→text extractor:
+    /// run over a result body it eats `<script` as a tag, eats `<T>` out of
+    /// `Vec<T>`, and decodes entities inside URL fields. The search half takes
+    /// the byte cap and nothing else.
+    #[tokio::test]
+    async fn a_search_body_is_capped_but_never_html_reduced() {
+        let fx = fixture(
+            "search-body",
+            web_config(WebTier::Search),
+            PermissionPolicy::Allow,
+            &[],
+        );
+        const BODY: &str = r#"{"results":[{"title":"Vec<T> and <script> in Rust",
+"url":"https://docs.rs/x?a=1&amp;b=2"}]}"#;
+
+        let out = fx.tool.deliver(
+            &Call::Search {
+                query: "vec".to_owned(),
+            },
+            BODY.as_bytes(),
+            BODY.len() as u64,
+            false,
+        );
+        assert!(!out.is_error);
+        assert!(
+            out.content.contains(BODY),
+            "the search body was rewritten:\n{}",
+            out.content
+        );
+
+        // Non-vacuity: the same bytes through the fetch path really are mangled,
+        // which is why the two are split.
+        let mangled = fx.tool.deliver(
+            &Call::Fetch {
+                url: "https://docs.rs/x".to_owned(),
+                host: "docs.rs".to_owned(),
+                authorship: Authorship::ModelComposed,
+            },
+            BODY.as_bytes(),
+            BODY.len() as u64,
+            false,
+        );
+        assert!(
+            !mangled.content.contains(BODY),
+            "the fetch path left the JSON intact, so this test proves nothing"
+        );
+    }
+
+    /// The cap is a byte cap and it never cuts a character in half.
+    #[test]
+    fn the_search_cap_stops_on_a_character_boundary() {
+        // Three-byte characters against a cap that lands mid-character.
+        let text = "日".repeat(10);
+        for cap in 0..text.len() + 2 {
+            let capped = cap_bytes(&text, cap);
+            assert!(
+                capped.len() <= cap || cap >= text.len(),
+                "cap {cap} produced {} bytes",
+                capped.len()
+            );
+            assert!(
+                text.starts_with(&capped),
+                "cap {cap} produced foreign bytes"
+            );
+        }
+        assert_eq!(cap_bytes("abc", 10), "abc");
     }
 }

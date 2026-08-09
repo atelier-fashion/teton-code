@@ -42,6 +42,18 @@
 //! together are a hole, so none are here. The cost is a cache miss and an
 //! occasional refusal to treat a trivially-different spelling as pasted; both
 //! fail in the direction of doing less.
+//!
+//! ## …and exactly one parser for every gate
+//!
+//! That narrowing bias is safe for "have I seen this before" and unsafe for
+//! "where would this go". [`normalize_url`] and `user_urls_host_of` answer the
+//! first question and are doc-fenced against the second; [`canonical_lookup_url`]
+//! answers the second, using `reqwest::Url` — the parser the transport itself
+//! uses — and returns the URL **re-serialized**, so the string that is checked,
+//! the string shown at the consent prompt, and the string that goes on the wire
+//! are one string. Anything else admits a spelling
+//! (`https://evil.example\@allowed.example/x`) whose host reads one way to a
+//! splitter and another way to a socket.
 
 pub mod allowlist;
 pub mod cache;
@@ -55,9 +67,9 @@ pub use user_urls::{extract_urls, UserUrls};
 
 /// A URL decomposed far enough to normalize it, and no further.
 ///
-/// Not a URL type: it exists so [`normalize_url`] and [`host_of`] locate the
-/// authority the *same* way. A second parser here would be the same drift
-/// hazard the module doc describes, one level down.
+/// Not a URL type: it exists so [`normalize_url`] and `user_urls_host_of`
+/// locate the authority the *same* way. A second parser here would be the same
+/// drift hazard the module doc describes, one level down.
 struct Split<'a> {
     /// The scheme, as written (lowercased by the caller).
     scheme: &'a str,
@@ -162,18 +174,29 @@ pub fn normalize_host(host: &str) -> String {
     host.to_ascii_lowercase()
 }
 
-/// The bare host of `url` — no scheme, no userinfo, no port, no path.
+/// The bare host of `url` by the **narrowing** splitter above — `#[cfg(test)]`,
+/// and that is the fence (REQ-563 verify, C-1).
 ///
-/// This is what [`DomainAllowlist::matches`] takes and what the ledger's `host`
-/// column records (D-7: there is deliberately no column that could hold a full
-/// URL). It lives beside [`normalize_url`] and shares its splitter so the
-/// allowlist and the cache can never disagree about where the host ends.
+/// It shares [`split`] with [`normalize_url`], which is what made the cache key
+/// and the pasted-URL check agree about where the host ends. That splitter is
+/// narrowing by design (see the module doc) and therefore exactly the thing a
+/// gate must not be built on — it read `https://evil.example\@allowed.example/x`
+/// as `allowed.example` while the socket went to `evil.example`. Rather than
+/// document that and hope, the function is compiled only into the test binary,
+/// so "nobody uses this for a security decision" is a fact about which symbols
+/// exist. Its one surviving caller is
+/// `the_two_parsers_disagree_exactly_where_a_gate_must_use_the_transports`,
+/// which pins the disagreement so a future reader can see why the fence is
+/// there.
 ///
-/// An IPv6 literal is returned **without** its brackets, so `[::1]` reads as
-/// `::1`: the brackets are URL syntax separating the address from the port, not
-/// part of the name, and a configured allowlist entry spells the address.
+/// The parser every gate uses is [`canonical_lookup_url`] — the transport's own.
+///
+/// An IPv6 literal is returned here **without** its brackets, so `[::1]` reads
+/// as `::1`; [`canonical_lookup_url`] keeps them, because that is what the wire
+/// serialization carries.
+#[cfg(test)]
 #[must_use]
-pub fn host_of(url: &str) -> Option<String> {
+fn user_urls_host_of(url: &str) -> Option<String> {
     let parts = split(url)?;
     let raw = parts.host_port;
     let host = if let Some(inner) = raw.strip_prefix('[') {
@@ -188,6 +211,45 @@ pub fn host_of(url: &str) -> Option<String> {
     } else {
         Some(host)
     }
+}
+
+/// Parse `url` with the **transport's own** parser, answering with the URL as it
+/// would be serialized on the wire and the host it would be sent to.
+///
+/// The single definition of "what does this URL mean", and the whole of REQ-563
+/// verify's C-1: every gate — the allowlist, the consent prompt's `(host …)`,
+/// the ledger row, the address-class floor at the seam — must read the *same*
+/// authority the socket does, or a spelling exists that is checked as one
+/// destination and sent to another. `https://evil.example\@allowed.example/x` is
+/// the canonical instance: a hand-written splitter that stops the authority at
+/// the first `/` or `?` reads the host as `allowed.example`, and `reqwest`
+/// (WHATWG URL, which treats `\` as a segment separator) sends it to
+/// `evil.example`.
+///
+/// The answer is therefore a **pair**, and the caller is expected to use both:
+/// the re-serialized string is what is handed to the seam and shown at the
+/// prompt, so "checked" and "sent" and "displayed" are one string rather than
+/// three readings of one input. A re-serialization that differs from what the
+/// model wrote is not a hazard for the same reason — the re-serialized form *is*
+/// what leaves.
+///
+/// `None` when the string is not an absolute URL with a host. The scheme is not
+/// filtered here: [`FETCHABLE_SCHEMES`](crate::harness::tools::web) is the
+/// caller's closed list, and this function's job is parsing, not policy.
+#[must_use]
+pub fn canonical_lookup_url(url: &str) -> Option<(String, String)> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    let host = parsed.host_str()?.to_owned();
+    if host.is_empty() {
+        return None;
+    }
+    Some((String::from(parsed), host))
+}
+
+/// The host [`canonical_lookup_url`] reads, for callers that need only that.
+#[must_use]
+pub fn canonical_host_of(url: &str) -> Option<String> {
+    canonical_lookup_url(url).map(|(_, host)| host)
 }
 
 #[cfg(test)]
@@ -292,21 +354,93 @@ mod tests {
     #[test]
     fn host_extraction_drops_scheme_userinfo_port_and_path() {
         assert_eq!(
-            host_of("https://User:Pw@API.Example.com:8443/v1/x?q=1#f").as_deref(),
+            user_urls_host_of("https://User:Pw@API.Example.com:8443/v1/x?q=1#f").as_deref(),
             Some("api.example.com")
         );
         assert_eq!(
-            host_of("http://example.com").as_deref(),
+            user_urls_host_of("http://example.com").as_deref(),
             Some("example.com")
         );
         assert_eq!(
-            host_of("https://example.com.").as_deref(),
+            user_urls_host_of("https://example.com.").as_deref(),
             Some("example.com")
         );
-        assert_eq!(host_of("[::1]/x"), None);
-        assert_eq!(host_of("https://[::1]:8080/x").as_deref(), Some("::1"));
-        assert_eq!(host_of("not a url"), None);
-        assert_eq!(host_of("https:///just-a-path"), None);
+        assert_eq!(user_urls_host_of("[::1]/x"), None);
+        assert_eq!(
+            user_urls_host_of("https://[::1]:8080/x").as_deref(),
+            Some("::1")
+        );
+        assert_eq!(user_urls_host_of("not a url"), None);
+        assert_eq!(user_urls_host_of("https:///just-a-path"), None);
+    }
+
+    /// The reason `user_urls_host_of` is doc-fenced: on the one spelling that
+    /// matters it and the transport's parser **disagree**, and the transport
+    /// wins because the transport is what opens the socket.
+    ///
+    /// A backslash is a path separator to the WHATWG URL parser, so everything
+    /// after it is path — which makes the `@` a path byte rather than a userinfo
+    /// delimiter, and the authority `evil.example`. The narrowing splitter reads
+    /// the authority to the first `/` or `?`, sees no `/`, and takes the last
+    /// `@` as the delimiter: `allowed.example`. Anything gated on the second
+    /// answer is gated on a host the request never reaches.
+    #[test]
+    fn the_two_parsers_disagree_exactly_where_a_gate_must_use_the_transports() {
+        const SPOOF: &str = "https://evil.example\\@allowed.example/x";
+        assert_eq!(
+            user_urls_host_of(SPOOF).as_deref(),
+            Some("allowed.example"),
+            "the narrowing splitter's answer — non-vacuity for the fence"
+        );
+        assert_eq!(
+            canonical_host_of(SPOOF).as_deref(),
+            Some("evil.example"),
+            "the transport's answer is where the bytes go"
+        );
+    }
+
+    /// The canonical parse hands back the URL **as it will be serialized**, so
+    /// the checked string and the sent string are the same bytes.
+    #[test]
+    fn the_canonical_parse_returns_the_reserialized_url_and_its_host() {
+        for (raw, url, host) in [
+            (
+                "https://evil.example\\@allowed.example/x",
+                "https://evil.example/@allowed.example/x",
+                "evil.example",
+            ),
+            // Userinfo is not a host, however much it looks like one.
+            (
+                "https://allowed.example@evil.example/x",
+                "https://allowed.example@evil.example/x",
+                "evil.example",
+            ),
+            // A decimal IP is an IP; the wire form is dotted-quad.
+            ("http://2130706433/", "http://127.0.0.1/", "127.0.0.1"),
+            // An IPv6 literal keeps its brackets — that IS the serialization.
+            ("http://[::1]:8080/x", "http://[::1]:8080/x", "[::1]"),
+            // An empty path gains its `/`; the default port goes.
+            ("https://docs.rs:443", "https://docs.rs/", "docs.rs"),
+            ("HTTPS://Docs.RS/Tokio", "https://docs.rs/Tokio", "docs.rs"),
+            // A third slash is skipped, not treated as an empty authority — so
+            // this names a host, and the narrowing splitter's `None` for the
+            // same string is precisely the disagreement the fence is about.
+            (
+                "https:///just-a-path",
+                "https://just-a-path/",
+                "just-a-path",
+            ),
+        ] {
+            assert_eq!(
+                canonical_lookup_url(raw),
+                Some((url.to_owned(), host.to_owned())),
+                "{raw}"
+            );
+        }
+        assert_eq!(canonical_lookup_url("not a url"), None);
+        // A scheme with no host to send to is not a lookup destination; the
+        // *scheme* filter is the caller's, but there is nothing here to answer.
+        assert_eq!(canonical_lookup_url("file:///etc/passwd"), None);
     }
 
     #[test]

@@ -1967,6 +1967,13 @@ fn the_two_web_commands_reach_the_daemon_and_render_its_answer() {
 /// choosing it — an offline ending is a *lookup that happened*, so it exercises
 /// consent, the choke point, the ledger row and every rendering surface, while
 /// reaching nothing.
+///
+/// **The user pastes the URL, and that is load-bearing.** The seam's SSRF floor
+/// refuses a loopback destination the *model* composed, which is correct and is
+/// tested where it lives; a URL the user typed is exempt, because a person
+/// pointing this daemon at `127.0.0.1` is pointing it at their own machine on
+/// purpose. Without the paste this fixture would never reach the wire and would
+/// be measuring the address gate rather than the offline ending it is named for.
 #[test]
 fn a_web_lookup_is_consented_reported_and_counted_in_the_cost_report() {
     let Some(daemon) = daemon_or_skip() else {
@@ -1985,12 +1992,13 @@ fn a_web_lookup_is_consented_reported_and_counted_in_the_cost_report() {
     );
     let teton = teton_bin();
 
-    // Line 1 is the prompt; line 2 answers the permission question the lookup
+    // Line 1 is the prompt — carrying the URL verbatim, which is what makes the
+    // fetch user-authored; line 2 answers the permission question the lookup
     // raises; line 3 asks for the cost report the lookup should be in.
     let session = daemon.run_cli_with_stdin(
         &teton,
         &[],
-        "what does the tokio page say about task pinning?\ny\n/cost\n",
+        &format!("what does {url} say about task pinning?\ny\n/cost\n"),
     );
     let log = daemon.log();
 

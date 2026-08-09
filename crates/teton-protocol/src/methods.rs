@@ -173,6 +173,22 @@ pub struct PromptTurnResult {
     pub turn_id: TurnId,
     /// Why the turn ended.
     pub stop_reason: StopReason,
+    /// Web lookup is configured on this machine, but the tool fell outside this
+    /// turn's provider profile `max_tools` window (REQ-563 BR-6).
+    ///
+    /// `false` on every turn where the capability is off (there is nothing to be
+    /// unavailable) or reachable, and omitted from the wire then, so a client
+    /// written before this existed reads unchanged bytes.
+    ///
+    /// It rides the turn **result** rather than the event stream, unlike every
+    /// other web signal, and the reason is that there is nothing to announce: no
+    /// lookup happened, no consent was decided, no restriction changed. What
+    /// happened is that a capability the user configured was not offered to the
+    /// model this turn — a property of the turn, which is what this type is.
+    /// The model is told the same fact in its own prompt (`WEB_CAPPED_CLAUSE`),
+    /// so the two surfaces are two readings of one condition.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub web_unavailable_in_profile: bool,
 }
 
 impl RpcMethod for PromptTurnParams {
@@ -1272,6 +1288,14 @@ mod tests {
         round_trip(&PromptTurnResult {
             turn_id: TurnId::from("t1"),
             stop_reason: StopReason::EndTurn,
+            web_unavailable_in_profile: false,
+        });
+        // The set half, so the field survives the wire in both states rather
+        // than only in the one where it is omitted.
+        round_trip(&PromptTurnResult {
+            turn_id: TurnId::from("t2"),
+            stop_reason: StopReason::EndTurn,
+            web_unavailable_in_profile: true,
         });
     }
 

@@ -51,7 +51,7 @@ use teton_providers::transport::TransportResponse;
 
 use crate::broadcast::EventBus;
 
-pub use ledger::{CostLedger, LedgerError, LedgerRow, WebLookupRow};
+pub use ledger::{CostLedger, LedgerError, LedgerRow, WebLookupRow, WebOverrideRow};
 pub use prices::{ModelPrice, PriceTable};
 pub use report::{CostReport, GroupTotals, SavingsEstimate, UnpricedTotals, WebTotals};
 

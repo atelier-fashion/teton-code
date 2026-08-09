@@ -50,7 +50,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::runtime::Handle;
 
-use teton_core::config::{WebConfig, WebTier};
+use teton_core::config::{WebConfig, WebPermission, WebTier};
 use teton_protocol::events::{BlockCause, WebLookupKind, WebLookupOutcome};
 use teton_protocol::SessionId;
 use teton_providers::transport::{Transport, TransportError, TransportRequest, TransportResponse};
@@ -440,11 +440,17 @@ async fn scripted_session(
     // --- the harness -------------------------------------------------------
     let bus = Arc::new(EventBus::new());
     let pending = Arc::new(PendingPermissions::new());
-    // Permissive: consent is `web_consent_matrix.rs`'s subject, and a prompt
-    // here would make every assertion in this file depend on answering it.
+    // Permissive **and** `[web] permission = "allow"`: consent is
+    // `web_consent_matrix.rs`'s subject, and a prompt here would make every
+    // assertion in this file depend on answering it. The two are separate calls
+    // because `permissive()` deliberately leaves the web keys asking — it means
+    // "the local, jailed tool set is pre-approved", which a web lookup is not —
+    // so the unprompted posture this fixture wants has to be stated.
+    let mut permissions = PermissionConfig::permissive();
+    permissions.apply_web_permission(WebPermission::Allow);
     let gate = Arc::new(PermissionGate::new(
         session_id.clone(),
-        PermissionConfig::permissive(),
+        permissions,
         Arc::clone(&bus),
         Arc::clone(&pending),
     ));
@@ -949,9 +955,13 @@ async fn a_second_lookup_is_served_from_cache_with_zero_transport_calls() {
     });
 
     let bus = Arc::new(EventBus::new());
+    // As above: `permissive()` leaves the web keys asking, so the fixture that
+    // wants no prompt says so explicitly.
+    let mut permissions = PermissionConfig::permissive();
+    permissions.apply_web_permission(WebPermission::Allow);
     let gate = Arc::new(PermissionGate::new(
         session_id,
-        PermissionConfig::permissive(),
+        permissions,
         Arc::clone(&bus),
         Arc::new(PendingPermissions::new()),
     ));

@@ -100,10 +100,15 @@ impl DomainAllowlist {
 
     /// Whether `host` is allowed.
     ///
-    /// Takes a **bare host** — see [`host_of`](super::host_of), which is how the
-    /// caller gets one out of a URL. A value carrying a port or a scheme simply
-    /// fails to match every pattern, which is the direction a matcher should
-    /// fail in when it is handed something other than what it asked for.
+    /// Takes a **bare host**, and specifically the one
+    /// [`canonical_lookup_url`](super::canonical_lookup_url) reads — the
+    /// transport's own parse. It must never be handed
+    /// `user_urls_host_of`'s answer: that splitter is
+    /// narrowing by design and disagrees with the socket on exactly the
+    /// spellings an allowlist exists to catch. A value carrying a port or a
+    /// scheme simply fails to match every pattern, which is the direction a
+    /// matcher should fail in when it is handed something other than what it
+    /// asked for.
     #[must_use]
     pub fn matches(&self, host: &str) -> bool {
         let host = normalize_host(host);

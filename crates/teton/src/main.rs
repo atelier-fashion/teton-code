@@ -673,6 +673,15 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             let params = slash::prompt_turn_params(&session_id, prompt_text);
             match conn.call(params, &mut ctx)? {
                 Ok(res) => {
+                    // REQ-563 BR-6: the one web fact with no event behind it —
+                    // the tool exists but this turn's provider profile could not
+                    // reach it. Folded here because this is where the turn's own
+                    // result arrives, and re-read every turn so a fallback onto
+                    // a full-tool-set provider clears the state rather than
+                    // leaving the row stuck.
+                    ctx.state
+                        .web
+                        .observe_profile_exposure(res.web_unavailable_in_profile);
                     // Gated on session state, not on the `--verbose` flag, so
                     // `/verbose` governs this line and the routing notices from
                     // one source of truth (D-5); the flag only initialises it.
@@ -2793,6 +2802,7 @@ mod tests {
                     host: "search.example".to_owned(),
                     outcome: WebLookupOutcome::Completed,
                     bytes_in: 10,
+                    cause: None,
                 }),
             ),
             ctx.surface,
