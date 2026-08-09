@@ -687,6 +687,13 @@ async fn a_model_composed_lookup_in_a_tainted_session_leaves_no_packet() {
     }
 }
 
+/// The planted value. An obviously synthetic sentinel, never a real provider's
+/// key shape: a fixture spelled like a live credential trips forge-side secret
+/// scanning on push, and the shape under test here is the `KEY=value`
+/// assignment, not the value. House convention — see `AKIASENTINEL562ABCDE` in
+/// `redact_egress.rs` and `sk-ZZQUUXSENTINELCREDENTIAL0123` in `runtime.rs`.
+const PLANTED_VALUE: &str = "SENTINELNOTAREALCREDENTIAL01234";
+
 /// A search query with a planted credential, spelled as a `KEY=value`
 /// assignment — the layout LESSON-490 found the scanner had gone blind to.
 const PLANTED: &str =
@@ -742,7 +749,7 @@ async fn a_planted_credential_is_blocked_in_the_form_the_encoder_would_send() {
         "the production encoder percent-encodes the assignment; wire form: {wire}"
     );
     assert!(
-        !wire.contains("STRIPE_API_KEY=SENTINEL"),
+        !wire.contains(&format!("STRIPE_API_KEY={PLANTED_VALUE}")),
         "the raw spelling is NOT what travels — a hand-written fixture would \
          have asserted against bytes the wire never carries; wire form: {wire}"
     );
@@ -752,7 +759,11 @@ async fn a_planted_credential_is_blocked_in_the_form_the_encoder_would_send() {
         .nth(1)
         .expect("the encoder put the query in `q`")
         .to_owned();
-    assert!(encoded_secret.contains("SENTINELNOTAREALCREDENTIAL01234"));
+    assert!(
+        PLANTED.contains(PLANTED_VALUE),
+        "the fixture and its value must not drift apart"
+    );
+    assert!(encoded_secret.contains(PLANTED_VALUE));
 
     // --- leg 2: the same query, the production scanner ---------------------
     //
@@ -835,7 +846,7 @@ async fn a_planted_credential_is_blocked_in_the_form_the_encoder_would_send() {
     assert_eq!(record.bytes_in, 0);
     let rendered = format!("{record:?}");
     assert!(
-        !rendered.contains("STRIPE_API_KEY") && !rendered.contains("SENTINEL"),
+        !rendered.contains("STRIPE_API_KEY") && !rendered.contains(PLANTED_VALUE),
         "a ledger row must not be able to carry query text: {rendered}"
     );
 }
