@@ -18,6 +18,59 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.13] - 2026-08-09
+
+### Added
+
+- **Web lookup, off by default (REQ-563).** Teton can now fetch a page or run a
+  search when a question cannot be answered from its weights or from your
+  files. **Upgrading changes nothing on its own**: with no `[web]` section in
+  your config the tool is not registered at all, so a session makes zero lookup
+  requests — that absence is structural, not a policy the agent is asked to
+  respect. Turning it on is a deliberate edit plus a consent prompt.
+
+  What the capability is, when you do enable it:
+
+  - **Three tiers you opt into separately** — `fetch_user_url` (fetch a link
+    *you* pasted), `fetch_any_url` (let the model choose the destination), and
+    `search` (free-text queries to a backend you configure). A grant at one
+    tier never answers for a higher one, so allowing a fetch of your own link
+    does not authorize the model's choices.
+  - **Every lookup is egress and goes through the same choke point as a
+    provider call.** The tool holds no HTTP client of its own; it hands the
+    request to the egress module, which applies your privacy boundaries, the
+    redaction scan when `[privacy] redact` is on, an address screen that
+    refuses loopback/link-local/private destinations, bounded redirects, and
+    connect/total timeouts — then records the lookup in the cost ledger with
+    the destination host, never the URL or query.
+  - **The consent prompt shows the exact query or URL that will leave**, and
+    the destination host is derived from the same parse the request is sent
+    with.
+  - **`search` requires the local model**, because enabling search enables the
+    redaction scan as one decision; there is no configuration that sends
+    unscanned queries. On a machine with no local tier every search is
+    blocked, and the notice says so.
+  - **Fetched pages are treated as untrusted data** — reduced to text locally,
+    never shipped raw to a remote model, and framed by the same containment
+    that already covers tool results.
+  - **A local cache** (15-minute default) serves repeat lookups with no network
+    request; `/web refresh <url>` forces a re-fetch.
+  - **After Teton reads privacy-boundary content**, model-composed lookups stop
+    for the rest of the session with a notice naming the cause; links you paste
+    still work, and `/web allow` lifts the restriction for that session only.
+
+  Config lives in a new `[web]` table (`tier`, `search_endpoint`,
+  `search_key_ref`, `allowed_domains`, `cache_ttl_secs`, `permission`). Search
+  keys are keychain references, never values.
+
+### Changed
+
+- **Permission keys for the web tool are per-tier** — `web_fetch_user_url`,
+  `web_fetch_any_url`, `web_search`. Only relevant if you consume
+  `permission_request` frames programmatically (an ACP-style client): there is
+  no single `web` key, and a tool-name match on `web_fetch` will not fire. No
+  effect on the CLI or on existing tools.
+
 ## [0.1.12] - 2026-08-08
 
 ### Fixed
