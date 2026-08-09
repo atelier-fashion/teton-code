@@ -61,7 +61,8 @@ use tetond::harness::permissions::{
     PendingPermissions, PermissionConfig, PermissionGate, PermissionPolicy, WebTierPersistence,
 };
 use tetond::harness::tools::web::{
-    register_web_tool, SeamError, WebLookupSeam, PERMISSION_KEY_FETCH_ANY_URL, WEB_TOOL_NAME,
+    register_web_tool, SeamError, WebLookupSeam, PERMISSION_KEY_FETCH_ANY_URL,
+    PERMISSION_KEY_FETCH_USER_URL, WEB_TOOL_NAME,
 };
 use tetond::harness::{Tool, ToolContext, ToolOutcome, ToolRegistry};
 use tetond::router::Router;
@@ -243,10 +244,21 @@ struct FileTierSink {
 }
 
 impl WebTierPersistence for FileTierSink {
+    /// Mirrors `DaemonRuntime::persist_web_tier`'s two effects: the tier is
+    /// **appended** to the per-tier consent list (never fanned out), and the
+    /// ceiling is raised only if it was lower.
     fn persist_web_tier(&self, tier: WebTier) -> Result<(), String> {
         self.asked.lock().unwrap().push(tier);
-        let mut config = Config::default();
-        config.web.tier = tier;
+        let mut config = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|text| Config::load(&text).ok())
+            .unwrap_or_default();
+        if !config.web.permission_allow.contains(&tier) {
+            config.web.permission_allow.push(tier);
+        }
+        if config.web.tier < tier {
+            config.web.tier = tier;
+        }
         let toml = config.to_toml().map_err(|e| e.to_string())?;
         std::fs::write(&self.path, toml).map_err(|e| e.to_string())?;
         Ok(())
@@ -260,6 +272,10 @@ struct Prompt {
     key: String,
     description: String,
     options: Vec<String>,
+    /// The human-readable label beside each option id, in the same order. What a
+    /// user actually reads — and therefore the thing an "enable permanently"
+    /// promise has to be honest in.
+    labels: Vec<String>,
 }
 
 /// A task that answers permission prompts the way a client does.
@@ -298,6 +314,7 @@ impl Answerer {
                         .iter()
                         .map(|o| o.option_id.clone())
                         .collect(),
+                    labels: request.options.iter().map(|o| o.label.clone()).collect(),
                 });
                 answer(&pending, &request.request_id, script.next());
             }
@@ -399,6 +416,9 @@ struct Setup {
     tainted: bool,
     overridden: bool,
     persistence: Option<Arc<FileTierSink>>,
+    /// `[web] permission_allow` as a restarted daemon would read it — the tiers
+    /// an earlier `enable_permanent` already answered for.
+    consented: Vec<WebTier>,
     search_gate: Option<Arc<dyn RedactionGate>>,
     /// What the network answers, in order. `None` is the default fixture's
     /// "every request is `200 <a page>`".
@@ -416,6 +436,7 @@ impl Setup {
             tainted: false,
             overridden: false,
             persistence: None,
+            consented: Vec::new(),
             search_gate: None,
             script: None,
         }
@@ -463,6 +484,13 @@ impl Setup {
         self
     }
 
+    /// Start this session as a restarted daemon would, having read
+    /// `[web] permission_allow` from config.
+    fn consented(mut self, allow: &[WebTier]) -> Self {
+        self.consented = allow.to_vec();
+        self
+    }
+
     fn build(self, tag: &str) -> Fixture {
         let dir = scratch(tag);
         let config = WebConfig {
@@ -497,9 +525,13 @@ impl Setup {
 
         let bus = Arc::new(EventBus::new());
         let pending = Arc::new(PendingPermissions::new());
+        // The production fold: config's consent list becomes policy rows here
+        // and nowhere else, one listed tier to its own key.
+        let mut permissions = PermissionConfig::with_default(self.policy);
+        permissions.apply_web_permission(&self.consented);
         let mut gate = PermissionGate::new(
             session_id,
-            PermissionConfig::with_default(self.policy),
+            permissions,
             Arc::clone(&bus),
             Arc::clone(&pending),
         );
@@ -828,6 +860,130 @@ async fn enable_permanent_writes_a_ceiling_the_next_daemon_start_honours() {
     );
 
     fx.cleanup();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **The `enable_permanent` label names the key that is actually written, and
+/// the answer un-asks exactly the tier it was given at** (REQ-563 BR-3, BR-4).
+///
+/// Two defects, one round trip, because they were one defect: the option
+/// promised `[web] tier = "…"` — the raise-only ceiling, which is checked
+/// *before* any prompt exists and so is a guaranteed no-op for every prompt a
+/// user can reach — while the thing that actually changed was the consent
+/// posture, and that change applied to **all three** tiers at once. A user who
+/// answered a question about a URL they had pasted themselves got, permanently
+/// and on every future session, no more questions about URLs the *model*
+/// composes or about searches.
+///
+/// So the assertion is in two halves that have to agree: what the label claims,
+/// and what a restart reads back. A label naming a key nothing writes is exactly
+/// as bad as a write nobody was told about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enable_permanent_names_the_key_it_writes_and_un_asks_only_that_tier() {
+    let dir = scratch("permanent-per-tier");
+    let config_path = dir.join("config.toml");
+    let sink = Arc::new(FileTierSink {
+        path: config_path.clone(),
+        asked: Mutex::new(Vec::new()),
+    });
+
+    // A machine at the top of the ladder, so nothing below is refused by tier:
+    // whatever still prompts, prompts because consent says so. The ceiling is
+    // already in the file, as it would be on a real machine — the sink appends
+    // to what is there rather than writing a config out of nothing.
+    std::fs::write(
+        &config_path,
+        "[web]\ntier = \"search\"\nsearch_endpoint = \"https://search.example/api\"\n",
+    )
+    .expect("seed the config");
+
+    const PASTED: &str = "https://pasted.example/doc";
+    let fx = Setup::at(WebTier::Search)
+        .policy(PermissionPolicy::Ask)
+        .pasted(PASTED)
+        .persisting(Arc::clone(&sink))
+        .build("permanent-per-tier-session");
+    let answerer = Answerer::spawn(&fx.bus, &fx.pending, vec![OPTION_ID_ENABLE_PERMANENT]);
+
+    let out = fx.fetch(PASTED);
+    assert!(!out.is_error, "{}", out.content);
+
+    // --- half one: the label ----------------------------------------------
+    let prompt = answerer.prompts().first().cloned().expect("one prompt");
+    assert_eq!(
+        prompt.key, PERMISSION_KEY_FETCH_USER_URL,
+        "the question was asked under the pasted-URL key"
+    );
+    let permanent = prompt
+        .options
+        .iter()
+        .position(|id| id == OPTION_ID_ENABLE_PERMANENT)
+        .map(|at| prompt.labels[at].clone())
+        .expect("the permanent option is offered when a tier is in hand");
+    assert!(
+        permanent.contains("permission_allow"),
+        "the label must name the key the answer writes: {permanent}"
+    );
+    assert!(
+        !permanent.contains("tier ="),
+        "the label promises `[web] tier`, which this answer does not change: {permanent}"
+    );
+    assert!(
+        permanent.contains("fetch_user_url"),
+        "and the tier it writes, so consent is concrete (BR-4): {permanent}"
+    );
+
+    // --- half two: what the file says, and what a restart does with it -----
+    assert_eq!(
+        sink.asked.lock().unwrap().as_slice(),
+        &[WebTier::FetchUserUrl]
+    );
+    let written = std::fs::read_to_string(&config_path).expect("the config was written");
+    let reloaded = Config::load(&written).expect("the written config loads and validates");
+    assert_eq!(
+        reloaded.web.permission_allow,
+        vec![WebTier::FetchUserUrl],
+        "one answer, one tier; file:\n{written}"
+    );
+
+    // The restart: a fresh session built from what the file says. The consented
+    // tier runs with no prompt at all...
+    let next = Setup::at(reloaded.web.tier)
+        .policy(PermissionPolicy::Ask)
+        .consented(&reloaded.web.permission_allow)
+        .pasted(PASTED)
+        .searching("https://search.example/api", Arc::new(ForwardingGate))
+        .build("permanent-per-tier-restart");
+    let next_answerer = Answerer::spawn(&next.bus, &next.pending, vec!["reject_once"]);
+
+    let unprompted = next.fetch(PASTED);
+    assert!(!unprompted.is_error, "{}", unprompted.content);
+    assert_eq!(
+        next_answerer.count(),
+        0,
+        "the tier the user enabled permanently asked again"
+    );
+
+    // ...and the two tiers nobody answered for still ask. Answered `reject_once`
+    // above, so the refusal here *is* the prompt having been raised.
+    let model_composed = next.fetch("https://model-chose.example/page");
+    assert!(
+        model_composed.is_error && model_composed.content.contains("Permission denied"),
+        "a `fetch_user_url` consent silently granted `fetch_any_url`: {}",
+        model_composed.content
+    );
+    assert_eq!(next_answerer.count(), 1);
+
+    let searched = next.search("rust lifetimes");
+    assert!(
+        searched.is_error && searched.content.contains("Permission denied"),
+        "a `fetch_user_url` consent silently granted `search`: {}",
+        searched.content
+    );
+    assert_eq!(next_answerer.count(), 2);
+
+    fx.cleanup();
+    next.cleanup();
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1202,7 +1358,7 @@ async fn a_cached_page_is_served_in_a_tainted_session_and_the_same_url_uncached_
 
     // The stored copy, written through the same cache the tool reads.
     fx.cache()
-        .put(DOCS_URL, "the stored reduction")
+        .put(DOCS_URL, "the stored reduction", false)
         .expect("caching a document must succeed");
 
     // --- leg 1: the hit -----------------------------------------------------

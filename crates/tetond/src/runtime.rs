@@ -94,7 +94,7 @@ use teton_core::category::{
     category_for_phase, BindingSource as CoreBindingSource, Category, CategoryOverride,
     CategoryResolution, CategoryTable, ConfigurableCategory, Tier, TierBinding,
 };
-use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebPermission, WebTier};
+use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebTier};
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
 };
@@ -2443,9 +2443,9 @@ impl DaemonRuntime {
     ///
     /// ## The config read happens once, at creation
     ///
-    /// `[web] permission` is folded into the policy table here, so a session
-    /// started after `enable_permanent` wrote `allow` does not prompt, and one
-    /// started before it keeps the posture it began with. That is the same
+    /// `[web] permission_allow` is folded into the policy table here, so a
+    /// session started after `enable_permanent` listed a tier does not prompt for
+    /// *that* tier, and one started before it keeps the posture it began with. That is the same
     /// stability every other session-scoped fact has (a grant, the taint flag),
     /// and the alternative — re-reading config per turn — would let a config
     /// edit silently *narrow* a session mid-conversation, which is the one
@@ -2467,10 +2467,10 @@ impl DaemonRuntime {
             .expect("session gate mutex poisoned");
         Arc::clone(gates.entry(session_id.clone()).or_insert_with(|| {
             let mut permissions = self.permission_config.clone();
-            // REQ-563 BR-4: `[web] permission = "allow"` is what an
+            // REQ-563 BR-4: `[web] permission_allow` is what an
             // `enable_permanent` answer becomes on disk, and this is the one
-            // place it becomes a policy again.
-            permissions.apply_web_permission(config.web.permission);
+            // place it becomes a policy again — one listed tier, one key.
+            permissions.apply_web_permission(&config.web.permission_allow);
             Arc::new(
                 PermissionGate::new(
                     session_id.clone(),
@@ -3009,12 +3009,6 @@ impl DaemonRuntime {
         }))
     }
 
-    /// The two session flags the lookup taint gate reads (REQ-563 BR-13).
-    ///
-    /// Handed to the choke point as a `&dyn TaintView` so it can decide without
-    /// depending on this runtime — and, just as importantly, so what it holds is
-    /// a *read* interface: there is no `mark` and no `lift` on the other side of
-    /// this seam.
     /// The session-taint set itself, for a caller that needs to **mark**.
     ///
     /// Deliberately asymmetric with [`Self::web_taint_view`], which is the
@@ -3029,6 +3023,12 @@ impl DaemonRuntime {
         Arc::clone(&self.session_taint)
     }
 
+    /// The two session flags the lookup taint gate reads (REQ-563 BR-13).
+    ///
+    /// Handed to the choke point as a `&dyn TaintView` so it can decide without
+    /// depending on this runtime — and, just as importantly, so what it holds is
+    /// a *read* interface: there is no `mark` and no `lift` on the other side of
+    /// this seam.
     #[must_use]
     pub fn web_taint_view(&self) -> Arc<SessionTaintView> {
         Arc::new(SessionTaintView {
@@ -3308,14 +3308,21 @@ impl DaemonRuntime {
     ///
     /// ## Two effects, and the second is the one that fires
     ///
-    /// **`[web] permission = "allow"`** is the durable form of the answer. This
-    /// used to write only the tier, raise-only, which meant it wrote *nothing*
-    /// in the case that actually occurs: the ceiling is checked before any
-    /// prompt exists, so every lookup that reaches a prompt is already at or
+    /// **`[web] permission_allow += tier`** is the durable form of the answer.
+    /// This used to write only the tier ceiling, raise-only, which meant it wrote
+    /// *nothing* in the case that actually occurs: the ceiling is checked before
+    /// any prompt exists, so every lookup that reaches a prompt is already at or
     /// below the configured tier and the raise was always a no-op — while the
     /// decision was still reported to the user as `Persistent` and the CLI still
-    /// said "written to your config". The permission key is what the user was
-    /// promised: next session, this does not ask again.
+    /// said "written to your config". The consent list is what the user was
+    /// promised: next session, this tier does not ask again.
+    ///
+    /// **Exactly the one tier**, appended, never a fan-out. The answer was given
+    /// at a prompt about one capability, and BR-3 grades the three deliberately:
+    /// consenting once to fetch a URL *the user pasted* must not also stop the
+    /// prompts for URLs the **model** composes, or for searches. An idempotent
+    /// append rather than a set-and-replace, so an earlier answer about another
+    /// tier is not silently revoked by this one.
     ///
     /// **The tier raise** stays, unchanged and still raise-only, as the second
     /// effect: consenting to fetch a page on a machine configured for `search`
@@ -3323,8 +3330,9 @@ impl DaemonRuntime {
     /// ceiling (there is none today) would need exactly this. A config already
     /// at or above `tier` is left byte-for-byte alone on that axis.
     ///
-    /// An answer whose durable state is **already true** — permission `allow`
-    /// and the tier already high enough — writes nothing and reports success,
+    /// An answer whose durable state is **already true** — the tier already
+    /// listed and the ceiling already high enough — writes nothing and reports
+    /// success,
     /// because the user's ask is already satisfied on disk. That is the one
     /// no-write success, and it is honest: the file says what the user asked it
     /// to say.
@@ -3345,7 +3353,11 @@ impl DaemonRuntime {
     pub fn persist_web_tier(&self, tier: WebTier) -> Result<(), String> {
         let mut config = self.config.lock().expect("config mutex poisoned");
         let mut candidate = config.clone();
-        candidate.web.permission = WebPermission::Allow;
+        // Append, and only this tier — see "exactly the one tier" above. The
+        // membership test keeps a repeated answer from growing the list.
+        if !candidate.web.permission_allow.contains(&tier) {
+            candidate.web.permission_allow.push(tier);
+        }
         // Raise-only, as documented above.
         if candidate.web.tier < tier {
             candidate.web.tier = tier;
@@ -13154,11 +13166,15 @@ provider_id = "on-device"
                 WebTier::Search
             );
             // The *tier* axis is untouched. The write itself is not a no-op —
-            // the answer's durable form is `permission = "allow"`, which is the
-            // thing the user was actually promised — but nothing here demotes.
+            // the answer's durable form is the consent list, which is the thing
+            // the user was actually promised — but nothing here demotes.
             let reloaded = load_config(Some(&config_path)).expect("loads");
             assert_eq!(reloaded.web.tier, WebTier::Search);
-            assert_eq!(reloaded.web.permission, WebPermission::Allow);
+            assert_eq!(
+                reloaded.web.permission_allow,
+                vec![WebTier::FetchUserUrl],
+                "the answer was about `fetch_user_url` and nothing else"
+            );
         }
 
         /// **`enable_permanent` writes something a restart can act on.**
@@ -13168,8 +13184,8 @@ provider_id = "on-device"
         /// configured tier — which made the raise-only tier write a guaranteed
         /// no-op, while the decision was still reported as `Persistent` and the
         /// CLI still said "written to your config". The durable form of the
-        /// answer is `[web] permission = "allow"`, and a daemon that reloads
-        /// this file must not prompt again.
+        /// answer is `[web] permission_allow`, and a daemon that reloads this
+        /// file must not prompt again *about that tier*.
         #[test]
         fn enable_permanent_writes_a_permission_a_restart_reads_back() {
             let (runtime, config_path, _dir) = runtime_on_disk("persist-permission");
@@ -13179,10 +13195,15 @@ provider_id = "on-device"
                 let mut config = runtime.config.lock().expect("config mutex");
                 config.web.tier = WebTier::FetchAnyUrl;
             }
-            assert_eq!(
-                runtime.config.lock().expect("config mutex").web.permission,
-                WebPermission::Ask,
-                "non-vacuity: the default really is `ask` (BR-4)"
+            assert!(
+                runtime
+                    .config
+                    .lock()
+                    .expect("config mutex")
+                    .web
+                    .permission_allow
+                    .is_empty(),
+                "non-vacuity: the default really is ask-about-everything (BR-4)"
             );
 
             runtime
@@ -13191,22 +13212,95 @@ provider_id = "on-device"
 
             let reloaded = load_config(Some(&config_path)).expect("the written config loads");
             assert_eq!(
-                reloaded.web.permission,
-                WebPermission::Allow,
+                reloaded.web.permission_allow,
+                vec![WebTier::FetchAnyUrl],
                 "the one thing `enable_permanent` durably changes did not reach the file"
             );
 
             // And a gate built from the reloaded config does not ask: this is
             // the restart, expressed as the thing a restart produces.
             let mut permissions = PermissionConfig::with_default(PermissionPolicy::Ask);
-            permissions.apply_web_permission(reloaded.web.permission);
-            for key in crate::harness::tools::web::WEB_PERMISSION_KEYS {
+            permissions.apply_web_permission(&reloaded.web.permission_allow);
+            assert_eq!(
+                permissions.policy_for(crate::harness::tools::web::PERMISSION_KEY_FETCH_ANY_URL),
+                PermissionPolicy::Allow,
+                "the consented tier would still prompt after the user enabled it permanently"
+            );
+        }
+
+        /// **One answer un-asks one tier, across a restart** (REQ-563 BR-3).
+        ///
+        /// The durable half of BR-3's breadth rule, and the reason the config key
+        /// is a per-tier list rather than a two-valued switch. Answering "enable
+        /// permanently" at a prompt about a URL *the user pasted* used to write
+        /// `permission = "allow"`, which the daemon fanned onto all three consent
+        /// keys — so one answer about the narrowest capability permanently
+        /// stopped the prompts for URLs the **model** composes and for searches
+        /// too, on every future session, from a file the user never re-read.
+        ///
+        /// The restart is simulated by the only thing a restart does with this
+        /// file: load it, and build a gate from what it says.
+        #[test]
+        fn enable_permanent_at_one_tier_leaves_the_other_two_asking_after_a_restart() {
+            let (runtime, config_path, _dir) = runtime_on_disk("per-tier-consent");
+            {
+                // The ceiling is at the top, so nothing here is refused by tier —
+                // whatever is still asked is asked because consent says so.
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = WebTier::Search;
+                config.web.search_endpoint = Some("https://search.example/api".to_owned());
+            }
+
+            // The answer: given at a `fetch_user_url` prompt, about a URL the
+            // user pasted.
+            runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect("the write must land");
+
+            let reloaded = load_config(Some(&config_path)).expect("the written config loads");
+            assert_eq!(reloaded.web.permission_allow, vec![WebTier::FetchUserUrl]);
+
+            let mut permissions = PermissionConfig::with_default(PermissionPolicy::Ask);
+            permissions.apply_web_permission(&reloaded.web.permission_allow);
+            assert_eq!(
+                permissions.policy_for(crate::harness::tools::web::PERMISSION_KEY_FETCH_USER_URL),
+                PermissionPolicy::Allow,
+                "the tier the user actually answered for still prompts"
+            );
+            for unanswered in [
+                crate::harness::tools::web::PERMISSION_KEY_FETCH_ANY_URL,
+                crate::harness::tools::web::PERMISSION_KEY_SEARCH,
+            ] {
                 assert_eq!(
-                    permissions.policy_for(key),
-                    PermissionPolicy::Allow,
-                    "`{key}` would still prompt after the user enabled it permanently"
+                    permissions.policy_for(unanswered),
+                    PermissionPolicy::Ask,
+                    "`{unanswered}` was permanently un-asked by an answer about a different \
+                     capability"
                 );
             }
+
+            // A second answer, at a different tier, *adds* — it does not replace
+            // the first, and it does not fan out either.
+            runtime
+                .persist_web_tier(WebTier::Search)
+                .expect("the second write must land");
+            let after = load_config(Some(&config_path)).expect("loads");
+            assert_eq!(
+                after.web.permission_allow,
+                vec![WebTier::FetchUserUrl, WebTier::Search]
+            );
+
+            // And answering the same tier twice does not grow the list.
+            runtime
+                .persist_web_tier(WebTier::Search)
+                .expect("idempotent");
+            assert_eq!(
+                load_config(Some(&config_path))
+                    .expect("loads")
+                    .web
+                    .permission_allow,
+                vec![WebTier::FetchUserUrl, WebTier::Search]
+            );
         }
 
         /// The gate builds from the **live** config, so the mapping above is
@@ -13215,10 +13309,16 @@ provider_id = "on-device"
         async fn the_session_gate_reads_the_configured_web_permission() {
             use crate::harness::tools::web::PERMISSION_KEY_SEARCH;
 
-            // `allow`: the gate decides with no prompt at all, which is what
-            // the user bought by answering "enable permanently" last session.
+            // A listed tier: the gate decides with no prompt at all, which is
+            // what the user bought by answering "enable permanently" last
+            // session.
             let runtime = Arc::new(runtime_with(WebTier::Search, false));
-            runtime.config.lock().expect("config mutex").web.permission = WebPermission::Allow;
+            runtime
+                .config
+                .lock()
+                .expect("config mutex")
+                .web
+                .permission_allow = vec![WebTier::Search];
             let config = runtime.config.lock().expect("config mutex").clone();
             let events = Arc::new(EventBus::new());
             let gate = runtime.permission_gate_for(&SessionId::from("s"), &events, &config);
@@ -13226,7 +13326,7 @@ provider_id = "on-device"
                 gate.authorize_web(PERMISSION_KEY_SEARCH, None, WebTier::Search)
                     .await,
                 PermissionDecision::Allowed,
-                "`[web] permission = \"allow\"` did not reach the gate"
+                "`[web] permission_allow = [\"search\"]` did not reach the gate"
             );
 
             // Non-vacuity: the default posture prompts instead. Observed as the
@@ -13234,10 +13334,9 @@ provider_id = "on-device"
             // the decision, which would never return with nobody to answer.
             let asking = Arc::new(runtime_with(WebTier::Search, false));
             let ask_config = asking.config.lock().expect("config mutex").clone();
-            assert_eq!(
-                ask_config.web.permission,
-                WebPermission::Ask,
-                "the shipped default is `ask` (BR-4)"
+            assert!(
+                ask_config.web.permission_allow.is_empty(),
+                "the shipped default asks about every tier (BR-4)"
             );
             let ask_events = Arc::new(EventBus::new());
             let ask_gate =
@@ -13343,7 +13442,7 @@ provider_id = "on-device"
             let (runtime, _config_path, dir) = runtime_on_disk("refresh");
             let url = "https://docs.rs/serde";
             let cache = WebCache::new(&dir, 900);
-            cache.put(url, "the cached reduction").expect("put");
+            cache.put(url, "the cached reduction", false).expect("put");
             assert!(
                 cache.get(url).is_some(),
                 "non-vacuity: there is a hit to evict"
@@ -13384,7 +13483,9 @@ provider_id = "on-device"
                 &dir,
                 &runtime.config.lock().expect("config mutex").web.clone(),
             );
-            cache.put("https://docs.rs/serde", "body").expect("put");
+            cache
+                .put("https://docs.rs/serde", "body", false)
+                .expect("put");
 
             let result = runtime
                 .web_refresh(&WebRefreshParams {
@@ -13401,7 +13502,7 @@ provider_id = "on-device"
             // the re-serialized URL, so `https://docs.rs` (no path) has to reach
             // the entry `https://docs.rs/` wrote — otherwise `/web refresh`
             // silently reports `absent` for a document that is on disk.
-            cache.put("https://docs.rs/", "body").expect("put");
+            cache.put("https://docs.rs/", "body", false).expect("put");
             let bare = runtime
                 .web_refresh(&WebRefreshParams {
                     url: "https://docs.rs".to_owned(),

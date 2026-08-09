@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 
-use teton_core::config::{WebPermission, WebTier};
+use teton_core::config::WebTier;
 use teton_protocol::events::{
     Event, PermissionOption, PermissionOptionKind, PermissionRequest, WebConsentDecided,
     WebConsentScope, OPTION_ID_ENABLE_PERMANENT,
@@ -52,7 +52,7 @@ use teton_protocol::{RequestId, SessionId};
 
 use crate::broadcast::EventBus;
 use crate::egress::to_protocol_web_tier;
-use crate::harness::tools::web::{tier_name, WEB_PERMISSION_KEYS};
+use crate::harness::tools::web::{permission_key_for, tier_name, WEB_PERMISSION_KEYS};
 
 /// Policy for a single tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,8 +131,8 @@ impl PermissionConfig {
     /// because nothing should leave the machine.
     ///
     /// A machine that genuinely wants unprompted web lookups says so in config,
-    /// with `[web] permission = "allow"`, which the daemon maps onto these same
-    /// three keys.
+    /// with `[web] permission_allow`, which the daemon maps onto these same three
+    /// keys — one member, one key.
     #[must_use]
     pub fn permissive() -> Self {
         let mut cfg = Self::with_default(PermissionPolicy::Allow);
@@ -142,25 +142,39 @@ impl PermissionConfig {
         cfg
     }
 
-    /// Map `[web] permission` onto the three web consent keys (REQ-563 BR-4).
+    /// Map `[web] permission_allow` onto the web consent keys (REQ-563 BR-3/BR-4).
     ///
     /// The **one** place a config value becomes a web policy row, so the "did
-    /// enable-permanent actually change anything" question has one answer. It is
-    /// a fan-out and not a single row because the keys are per tier and the
-    /// config value is not: `allow` means "do not ask me about web lookups",
-    /// which is a statement about every tier the ceiling already permits.
+    /// enable-permanent actually change anything" question has one answer.
+    ///
+    /// ## One member, one key — never a fan-out
+    ///
+    /// Each listed tier sets **its own** key and no other, through the single
+    /// [`permission_key_for`](super::tools::web::permission_key_for) mapping. A
+    /// tier not listed is left exactly as it was, which for the three web keys
+    /// means `ask`.
+    ///
+    /// This used to be a two-valued `[web] permission` that fanned onto all three
+    /// keys at once, and the fan-out was the bug: one `enable_permanent` answered
+    /// at a `web_fetch_user_url` prompt permanently stopped asking about
+    /// `web_fetch_any_url` and `web_search` too. BR-3 requires the three tiers to
+    /// be separately consented precisely because they are different capabilities
+    /// — a URL the user pasted is not a URL the model composed — and a durable
+    /// answer that crosses them is the breadth violation BR-3 names, with a
+    /// config file behind it.
     ///
     /// It never *widens* the ceiling — `[web] tier` is checked before any prompt
     /// exists to answer — and it is where REQ-560's named permission levels will
-    /// attach when they land: a level maps to a [`PermissionPolicy`] and fans out
-    /// here, rather than growing a fourth vocabulary.
-    pub fn apply_web_permission(&mut self, permission: WebPermission) {
-        let policy = match permission {
-            WebPermission::Ask => PermissionPolicy::Ask,
-            WebPermission::Allow => PermissionPolicy::Allow,
-        };
-        for key in WEB_PERMISSION_KEYS {
-            self.set(key, policy);
+    /// attach when they land: a level names a set of tiers, which is the shape
+    /// this already reads.
+    pub fn apply_web_permission(&mut self, allow: &[WebTier]) {
+        for tier in allow {
+            // `Off` has no key (config validation refuses it as a member, and
+            // `permission_key_for` answers `None`), so an unmappable member
+            // silently changes nothing rather than borrowing a neighbour's key.
+            if let Some(key) = permission_key_for(*tier) {
+                self.set(key, PermissionPolicy::Allow);
+            }
         }
     }
 
@@ -569,11 +583,20 @@ fn options_for(web: Option<WebTier>) -> Vec<PermissionOption> {
         // Named in the label, because BR-4 wants consent concrete: "enable
         // permanently" alone does not say what is being enabled, and the two
         // fetch tiers are a distinction a user has to be able to see.
+        //
+        // The label names the key that is actually written. It used to promise
+        // `[web] tier = "…"`, which is the raise-only ceiling — and the ceiling
+        // is checked *before* any prompt exists, so the tier write was a no-op in
+        // every case a user could reach this option. The durable effect is the
+        // consent list, and the label says so, including the "+=" that makes the
+        // per-tier append visible: this answer adds one tier, and leaves the
+        // other two asking.
+        let name = tier_name(tier);
         options.push(PermissionOption {
             option_id: OPTION_ID_ENABLE_PERMANENT.to_owned(),
             label: format!(
-                "Enable permanently (writes `[web] tier = \"{}\"` to your config)",
-                tier_name(tier)
+                "Enable permanently (writes `[web] permission_allow += \"{name}\"` — stop asking \
+                 about {name} lookups on this machine)"
             ),
             kind: PermissionOptionKind::AllowAlways,
         });
@@ -1089,7 +1112,7 @@ mod tests {
         let mut config = PermissionConfig::permissive();
         // `permissive()` deliberately leaves the web keys asking, so the row
         // this test is about has to be set explicitly.
-        config.apply_web_permission(WebPermission::Allow);
+        config.apply_web_permission(&[WebTier::FetchAnyUrl]);
         let (bus, _pending, gate) = gate(config);
         let mut sub = bus.subscribe(16);
         assert_eq!(
@@ -1122,23 +1145,60 @@ mod tests {
         }
     }
 
-    /// `[web] permission` is a fan-out over the three keys, in both directions,
-    /// and it touches nothing else.
+    /// **`[web] permission_allow` maps one member onto one key** (REQ-563 BR-3).
+    ///
+    /// The narrowness is the requirement, not an implementation detail: a member
+    /// sets *its* key, leaves the other two web keys asking, and touches no
+    /// non-web tool at all. The predecessor of this mapping was a two-valued
+    /// `[web] permission` that fanned onto all three keys, which made one durable
+    /// answer about a pasted URL a durable answer about model-composed URLs and
+    /// searches as well.
     #[test]
-    fn the_web_permission_config_maps_onto_exactly_the_three_web_keys() {
-        for (permission, expected) in [
-            (WebPermission::Allow, PermissionPolicy::Allow),
-            (WebPermission::Ask, PermissionPolicy::Ask),
-        ] {
+    fn the_web_permission_config_maps_each_member_onto_exactly_its_own_key() {
+        for tier in [WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search] {
+            let listed = permission_key_for(tier).expect("every tier above off has a key");
             let mut config = PermissionConfig::with_default(PermissionPolicy::Deny);
-            config.apply_web_permission(permission);
+            config.apply_web_permission(&[tier]);
             for key in WEB_PERMISSION_KEYS {
-                assert_eq!(config.policy_for(key), expected, "{key}");
+                let expected = if key == listed {
+                    PermissionPolicy::Allow
+                } else {
+                    // Untouched — which for a `Deny` default means `Deny`, and
+                    // is the point: this mapping writes one row, not three.
+                    PermissionPolicy::Deny
+                };
+                assert_eq!(config.policy_for(key), expected, "{tier:?} -> {key}");
             }
             assert_eq!(
                 config.policy_for("shell"),
                 PermissionPolicy::Deny,
                 "a web config value reached a non-web tool"
+            );
+        }
+
+        // An empty list — the shipped default — changes nothing at all.
+        let mut untouched = PermissionConfig::permissive();
+        untouched.apply_web_permission(&[]);
+        for key in WEB_PERMISSION_KEYS {
+            assert_eq!(untouched.policy_for(key), PermissionPolicy::Ask, "{key}");
+        }
+
+        // Every member is honoured when several are listed.
+        let mut all = PermissionConfig::with_default(PermissionPolicy::Deny);
+        all.apply_web_permission(&[WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search]);
+        for key in WEB_PERMISSION_KEYS {
+            assert_eq!(all.policy_for(key), PermissionPolicy::Allow, "{key}");
+        }
+
+        // `Off` has no key, so it cannot borrow a neighbour's. Config validation
+        // refuses it as a member; this is the second line of that defence.
+        let mut off = PermissionConfig::permissive();
+        off.apply_web_permission(&[WebTier::Off]);
+        for key in WEB_PERMISSION_KEYS {
+            assert_eq!(
+                off.policy_for(key),
+                PermissionPolicy::Ask,
+                "`off` granted `{key}`"
             );
         }
     }

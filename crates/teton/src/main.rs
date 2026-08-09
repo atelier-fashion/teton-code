@@ -704,7 +704,19 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                     );
                     break;
                 }
-                Err(err) => render_turn_failure(&err, ctx.surface),
+                Err(err) => {
+                    // The same fold as the success arm, and it has to be here
+                    // too. `web: unavailable (profile)` describes *the turn
+                    // that just ended*; a failed turn carries no such fact, so
+                    // leaving the flag alone would pin the row to whatever the
+                    // last successful turn happened to say — a user told the
+                    // web tool is out of reach on a profile the daemon has
+                    // since fallen back off, with no further turn to correct it
+                    // because the correction only ran on the path that
+                    // succeeded.
+                    ctx.state.web.observe_profile_exposure(false);
+                    render_turn_failure(&err, ctx.surface);
+                }
             }
         }
     }

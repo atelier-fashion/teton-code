@@ -187,7 +187,16 @@ pub enum SeamError {
 enum Call {
     /// Retrieve one URL.
     Fetch {
-        /// The URL as the model wrote it — echoed verbatim at the prompt (BR-4).
+        /// The URL **as the transport will serialize it** — the canonical form
+        /// [`canonical_lookup_url`] returns, not the model's raw bytes.
+        ///
+        /// This string is what the prompt echoes (BR-4), what the gates read,
+        /// and what is handed to the seam, so "approved", "checked" and "sent"
+        /// are one string rather than three readings of one input (REQ-563
+        /// verify, C-1). Echoing the raw spelling would put the *user's*
+        /// approval on a string that is not the one that leaves — which is the
+        /// whole of the `https://evil.example\@allowed.example/x` hazard, aimed
+        /// at a person instead of at a splitter.
         url: String,
         /// The destination host, extracted once.
         host: String,
@@ -230,12 +239,28 @@ impl Call {
     /// Derived from [`Self::needed_tier`] through the single
     /// [`permission_key_for`] mapping rather than matched on the call shape: the
     /// two fetch tiers are *different capabilities*, and a match on
-    /// `Call::Fetch { .. }` collapses them back into one grant. `Off` is
-    /// unreachable here — `needed_tier` never yields it — and the fallback picks
-    /// the **narrowest** key rather than panicking, so a tier added to the ladder
-    /// without a key fails closed instead of sharing a broader one.
+    /// `Call::Fetch { .. }` collapses them back into one grant.
+    ///
+    /// [`WebTier::Off`] is the one tier with no key, and [`Self::needed_tier`]
+    /// cannot produce it: every arm of that match names a tier above `off`. So
+    /// the `None` here is not a case to handle — it is a case that does not
+    /// exist, and `unreachable!` is what says so.
+    ///
+    /// It used to fall back on the narrowest key instead, which reads as
+    /// failing-closed and is not: a *new* tier added to the ladder without a key
+    /// would silently be authorized under `web_fetch_user_url` — a real grant,
+    /// under a question about a different capability, with no test failing and
+    /// nothing in the ledger to say the wrong subject was consulted. A panic on
+    /// an unreachable branch is the honest version: the mapping is total by
+    /// construction, and if that ever stops being true it must stop loudly
+    /// rather than quietly re-key someone's consent.
     fn permission_key(&self) -> &'static str {
-        permission_key_for(self.needed_tier()).unwrap_or(PERMISSION_KEY_FETCH_USER_URL)
+        match permission_key_for(self.needed_tier()) {
+            Some(key) => key,
+            None => unreachable!(
+                "`needed_tier` never yields `WebTier::Off`, the only tier without a consent key"
+            ),
+        }
     }
 
     /// The request handed to the choke point.
@@ -376,8 +401,15 @@ impl WebTool {
                     );
                 }
                 self.record_local(&call, WebLookupOutcome::CacheHit);
+                // The truncation caveat is re-emitted, because the *document*
+                // is truncated and this hit serves that same partial document.
+                // Announced only on the fetch, the caveat would last one turn
+                // and the page would read as complete for the rest of the TTL —
+                // a model told, once, that it was missing the end, and then
+                // handed the same text with no such note every time after.
+                let cut = if entry.truncated { ", truncated" } else { "" };
                 return ToolOutcome::ok(format!(
-                    "web fetch {url} (host {host}; served from the local cache, nothing \
+                    "web fetch {url} (host {host}{cut}; served from the local cache, nothing \
                      left this machine)\n\n{}",
                     entry.content
                 ));
@@ -537,17 +569,41 @@ impl WebTool {
         ))
     }
 
-    /// The consent prompt's description: the **verbatim** query or URL and the
-    /// destination host (BR-4, AC-2).
+    /// The consent prompt's description: the query or URL and the destination
+    /// host (BR-4, AC-2).
     ///
     /// Verbatim is the point. A normalized, shortened or host-only rendering
     /// would ask the user to approve something other than what would leave, and
-    /// the whole of BR-4 is that consent is concrete.
+    /// the whole of BR-4 is that consent is concrete. (The URL here is already
+    /// the canonical re-serialization — see [`Call::Fetch::url`] — which is the
+    /// string that leaves, so "verbatim" means verbatim about *that*.)
+    ///
+    /// ## The one bound, and why it does not cost the guarantee
+    ///
+    /// The URL and the query are both model-authored and both unbounded, and a
+    /// prompt is a fixed number of rows on somebody's terminal. A 40 KB `url`
+    /// argument is a consent prompt whose question has scrolled off the top of
+    /// the window by the time the options are on screen — the answer is still
+    /// "y" or "n", but nobody read what they answered. So the model's text is
+    /// capped at [`DESCRIBED_MAX_CHARS`] with the **middle** removed and the
+    /// removal named.
+    ///
+    /// Middle rather than tail because both ends carry the destination: a URL's
+    /// authority is at the front and its path and query at the back, and a
+    /// search's terms run to the end. And the `(host …)` clause is appended
+    /// *after* the cap and never elided, so the one fact a user most needs is
+    /// structurally out of reach of any padding the model composes.
     fn describe(&self, call: &Call) -> String {
         match call {
-            Call::Fetch { url, host, .. } => format!("web fetch {url} (host {host})"),
+            Call::Fetch { url, host, .. } => {
+                format!(
+                    "web fetch {} (host {host})",
+                    elide_middle(url, DESCRIBED_MAX_CHARS)
+                )
+            }
             Call::Search { query } => format!(
-                "web search {query} (host {})",
+                "web search {} (host {})",
+                elide_middle(query, DESCRIBED_MAX_CHARS),
                 self.search_host.as_deref().unwrap_or("<none configured>")
             ),
         }
@@ -614,7 +670,11 @@ impl WebTool {
                 // hand, and the only cost of an uncached document is fetching
                 // it again. Named on stderr, never folded into the model's
                 // context as if the page had a problem.
-                if let Err(err) = self.cache.put(url, &text) {
+                //
+                // `truncated` is stored with the text because it is a fact
+                // about the *document*, and every later hit serves that same
+                // partial document — see `CacheEntry::truncated`.
+                if let Err(err) = self.cache.put(url, &text, truncated) {
                     eprintln!("teton: a fetched page could not be cached ({err})");
                 }
                 ToolOutcome::ok(format!(
@@ -796,6 +856,38 @@ fn cap_bytes(text: &str, cap: usize) -> String {
         .last()
         .unwrap_or(0);
     text[..end].to_owned()
+}
+
+/// The longest run of **model-authored** text a consent description carries.
+///
+/// A bound on the prompt, not on the lookup: the URL that goes out is whatever
+/// the model wrote, and this governs only how much of it is read aloud to the
+/// user. 300 characters is longer than essentially every real URL and every real
+/// query, and short enough that the question, the host clause and the options
+/// share one screen — which is the property being protected. See
+/// [`WebTool::describe`].
+const DESCRIBED_MAX_CHARS: usize = 300;
+
+/// `text` if it fits in `max_chars`, otherwise its head and tail with the middle
+/// replaced by a marker that says how much is missing.
+///
+/// Counted in `char`s rather than bytes because the thing being bounded is what
+/// a person reads, and cut in the middle rather than at the end because both
+/// ends of a URL carry destination: the authority is at the front, the path and
+/// query at the back. The marker names the count so an elision can never be
+/// mistaken for the text itself — an ellipsis alone would let a model compose a
+/// URL that *ends* in one and have its own padding read as this function's.
+fn elide_middle(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_owned();
+    }
+    let tail = max_chars / 2;
+    let head = max_chars - tail;
+    let elided = total - max_chars;
+    let head_text: String = text.chars().take(head).collect();
+    let tail_text: String = text.chars().skip(total - tail).collect();
+    format!("{head_text} […{elided} characters elided…] {tail_text}")
 }
 
 /// The config spelling of a tier, for a refusal that has to name it (AC-4).
@@ -1202,7 +1294,7 @@ mod tests {
         let config = web_config(WebTier::FetchAnyUrl);
         let dir = temp_dir("cache-hit");
         let cache = WebCache::from_config(&dir, &config);
-        cache.put(URL, "the reduced page text").unwrap();
+        cache.put(URL, "the reduced page text", false).unwrap();
 
         let seam = FakeSeam::new();
         // `Ask` with **no client attached**: any prompt at all would hang this
@@ -1243,6 +1335,73 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **A truncated page stays truncated across the cache.**
+    ///
+    /// Truncation used to be announced exactly once, on the fetch that hit the
+    /// body cap. Every hit for the rest of the TTL served the same partial text
+    /// with no caveat at all — so a model that had been told "this page is cut
+    /// short" in one turn was handed the identical bytes as a whole document in
+    /// the next, and reasoned about an ending it was never given. The caveat is
+    /// a fact about the *document* on disk, so it is stored with it.
+    #[tokio::test]
+    async fn a_cache_hit_re_emits_the_truncation_caveat() {
+        const URL: &str = "https://docs.rs/enormous";
+        let config = web_config(WebTier::FetchAnyUrl);
+        let dir = temp_dir("cache-truncated");
+        let cache = WebCache::from_config(&dir, &config);
+        cache.put(URL, "the first two megabytes", true).unwrap();
+
+        let seam = FakeSeam::new();
+        let (_bus, _pending, gate) = gate(PermissionPolicy::Allow);
+        let tool = WebTool::new(
+            &config,
+            cache,
+            Arc::new(Mutex::new(UserUrls::new())),
+            gate,
+            Arc::clone(&seam) as Arc<dyn WebLookupSeam>,
+            Handle::current(),
+        );
+
+        let out = tool.lookup(&json!({ "url": URL })).await;
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("local cache"), "{}", out.content);
+        assert!(
+            out.content.contains("truncated"),
+            "a partial document was served as a whole one: {}",
+            out.content
+        );
+        assert_eq!(seam.calls(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Non-vacuity for the test above: a page that was *not* truncated does not
+    /// grow a caveat it has no right to.
+    #[tokio::test]
+    async fn a_cache_hit_on_a_whole_page_carries_no_truncation_caveat() {
+        const URL: &str = "https://docs.rs/small";
+        let config = web_config(WebTier::FetchAnyUrl);
+        let dir = temp_dir("cache-whole");
+        let cache = WebCache::from_config(&dir, &config);
+        cache.put(URL, "the whole page", false).unwrap();
+
+        let seam = FakeSeam::new();
+        let (_bus, _pending, gate) = gate(PermissionPolicy::Allow);
+        let tool = WebTool::new(
+            &config,
+            cache,
+            Arc::new(Mutex::new(UserUrls::new())),
+            gate,
+            Arc::clone(&seam) as Arc<dyn WebLookupSeam>,
+            Handle::current(),
+        );
+
+        let out = tool.lookup(&json!({ "url": URL })).await;
+
+        assert!(!out.content.contains("truncated"), "{}", out.content);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn a_cache_miss_takes_the_normal_flow() {
         // Non-vacuity for the test above: the same tool, a URL that is not
@@ -1269,7 +1428,7 @@ mod tests {
         let config = web_config(WebTier::FetchUserUrl);
         let dir = temp_dir("cache-order");
         let cache = WebCache::from_config(&dir, &config);
-        cache.put(URL, "the reduced page text").unwrap();
+        cache.put(URL, "the reduced page text", false).unwrap();
 
         let seam = FakeSeam::new();
         let (_bus, _pending, gate) = gate(PermissionPolicy::Allow);
@@ -1335,6 +1494,97 @@ mod tests {
         let (out, ()) = tokio::join!(ask, answer);
         assert!(out.is_error);
         assert_eq!(fx.seam.calls(), 0, "a declined lookup reached the wire");
+    }
+
+    /// **A model cannot push the destination off the user's screen.**
+    ///
+    /// The URL and the query are both model-authored and both unbounded, and a
+    /// consent prompt is a fixed number of rows on somebody's terminal. Forty
+    /// kilobytes of padding in the `url` argument scrolls the question out of
+    /// the window before the options render: the answer is still "y" or "n",
+    /// but nobody read what they answered — consent by exhaustion, which is not
+    /// BR-4's consent.
+    ///
+    /// So the model's text is capped with the middle removed and the removal
+    /// *named* — an unnamed ellipsis would let a model compose a URL ending in
+    /// one and have its own padding read as the daemon's. The `(host …)` clause
+    /// is appended after the cap and is structurally out of reach.
+    #[tokio::test]
+    async fn a_padded_url_cannot_scroll_the_host_off_the_prompt() {
+        let padded = format!("https://evil.example/{}?x=1#end", "a".repeat(40_000));
+        let fx = fixture(
+            "desc-padded",
+            web_config(WebTier::FetchAnyUrl),
+            PermissionPolicy::Ask,
+            &[],
+        );
+        let mut sub = fx.bus.subscribe(16);
+
+        let args = json!({ "url": padded });
+        let ask = fx.tool.lookup(&args);
+        let answer = async {
+            let env = sub.recv().await.unwrap();
+            let Event::PermissionRequest(request) = env.event else {
+                panic!("expected a permission_request");
+            };
+            let description = request.description.clone().unwrap_or_default();
+            assert!(
+                description.chars().count() < DESCRIBED_MAX_CHARS + 200,
+                "the prompt carried the model's padding: {} chars",
+                description.chars().count()
+            );
+            assert!(
+                description.contains("(host evil.example)"),
+                "the host clause is appended after the cap and is never elided: {description}"
+            );
+            // Both ends of the URL survive, so what was cut is visibly the
+            // middle rather than the part that says where this goes.
+            assert!(
+                description.contains("https://evil.example/aaa"),
+                "the authority must survive: {description}"
+            );
+            assert!(
+                description.contains("?x=1#end"),
+                "and so must the tail: {description}"
+            );
+            assert!(
+                description.contains("characters elided"),
+                "an elision the user cannot see is a lie about what they approved: {description}"
+            );
+            fx.pending.resolve(
+                &request.request_id,
+                PermissionOutcome::Selected {
+                    option_id: "reject_once".to_owned(),
+                },
+            );
+        };
+        let (out, ()) = tokio::join!(ask, answer);
+        assert!(out.is_error);
+    }
+
+    /// The cap is a cap on the *prompt*, not on the lookup, and it does not fire
+    /// on anything a person would actually type.
+    #[test]
+    fn the_description_cap_leaves_ordinary_urls_and_queries_untouched() {
+        let ordinary = "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html?x=1";
+        assert_eq!(elide_middle(ordinary, DESCRIBED_MAX_CHARS), ordinary);
+        assert_eq!(
+            elide_middle("how do I pin a tokio task to a thread", DESCRIBED_MAX_CHARS),
+            "how do I pin a tokio task to a thread"
+        );
+
+        // Counted in characters, not bytes, because the thing being bounded is
+        // what a person reads — and a byte cut through a multi-byte character
+        // would not even be a `String`.
+        let wide = "→".repeat(500);
+        let elided = elide_middle(&wide, DESCRIBED_MAX_CHARS);
+        assert!(elided.starts_with('→'));
+        assert!(elided.ends_with('→'));
+        assert!(elided.contains("200 characters elided"), "{elided}");
+
+        // Exactly at the cap is not over it.
+        let exact = "x".repeat(DESCRIBED_MAX_CHARS);
+        assert_eq!(elide_middle(&exact, DESCRIBED_MAX_CHARS), exact);
     }
 
     #[tokio::test]
@@ -2145,7 +2395,7 @@ mod tests {
         let config = web_config(WebTier::FetchAnyUrl);
         let dir = temp_dir("cache-denied");
         let cache = WebCache::from_config(&dir, &config);
-        cache.put(URL, "the reduced page text").unwrap();
+        cache.put(URL, "the reduced page text", false).unwrap();
 
         let seam = FakeSeam::new();
         let (bus, pending, gate) = gate(PermissionPolicy::Ask);

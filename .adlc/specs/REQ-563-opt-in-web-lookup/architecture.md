@@ -152,23 +152,52 @@ implementation colour, and are recorded here because a later change that drops
 either would look local while removing a security floor. **Address-class
 policy (the SSRF floor):** a destination in a non-global address class —
 loopback (including `localhost` and anything under `.localhost`), link-local,
-private, unspecified/`0.0.0.0/8`, and their IPv6 equivalents, with all-digit
-hosts folded to the IPv4 literal they are — is refused *unless the user pasted
-the initial URL themselves* (pointing the daemon at `http://localhost:3000` is
-a thing people do on purpose; a model composing that URL is the SSRF). A
-**redirect hop** carries no such exemption and is checked unconditionally,
-ahead of the caller's allowlist closure, so a permissive allowlist cannot grant
-`169.254.169.254`. The configured `search_endpoint` is exempt for the same
-reason a pasted URL is — it is a value out of the user's own config — and a
+private (RFC 1918 plus CGNAT `100.64.0.0/10` and benchmarking
+`198.18.0.0/15`), unspecified/`0.0.0.0/8`, and their IPv6 equivalents, with
+all-digit hosts folded to the IPv4 literal they are and every IPv6 transition
+prefix that embeds an IPv4 address (`::ffff:` mapped, `64:ff9b::/96` NAT64,
+`2002::/16` 6to4) folded onto the address it carries — is refused. The **only**
+exemption is a user-pasted *initial* URL, and it covers only loopback, private
+and unique-local: those three have a story a paste can be an instance of
+("fetch my dev server on `localhost:3000`", "read the wiki on the box in the
+next room"), while link-local and unspecified have none — `169.254.169.254` is
+the cloud metadata service and `0.0.0.0` is not a destination — so those two are
+refused at hop zero whoever typed them. This matters because `UserPasted` means
+only "the URL appeared in a user message", which a pasted stack trace or log
+line satisfies. A **redirect hop** carries no exemption at all and is checked
+unconditionally, ahead of the caller's allowlist closure, so a permissive
+allowlist cannot grant `169.254.169.254`; a hop is also held to the `http`/`https`
+scheme list explicitly at this seam rather than relying on the current client
+happening to refuse `ftp://`. The configured `search_endpoint` is exempt for the
+same reason a pasted URL is — it is a value out of the user's own config — and a
 `Fetch` aimed at its origin is refused outright so the endpoint-bound key can
 never ride one. **Timeouts:** the transport carries a *connect* bound
 (`LOOKUP_CONNECT_TIMEOUT`) because a lookup destination is an arbitrary host
 that may accept a connection and then say nothing; the whole attempt — every
 gate, every redirect hop and the body read — is bounded by
 `LOOKUP_TOTAL_TIMEOUT` at the seam, so the bound holds for every transport the
-choke point is built over and not only for the real client. Expiry lands on the
-same `offline` outcome a connect failure does (BR-9/BUG-152 taxonomy), so it is
-never a turn error.
+choke point is built over and not only for the real client. Expiry is attributed
+to the **phase** it fired in: on the wire it is the same `offline` outcome a
+connect failure produces (BR-9/BUG-152 taxonomy), but while the redaction gate
+is still thinking it is `blocked_redact` / `scan_unavailable` — a guard that
+cannot finish is a guard that did not run (LESSON-492), and calling a stalled
+local scanner "the destination could not be reached" is BUG-152's mislabel
+pointing the other way. Neither is ever a turn error.
+
+**Residual: name-based non-global destinations.** The floor above reads a *host
+string*; the transport does the DNS, and no API on it exposes the resolved
+addresses. So `127.0.0.1.nip.io`, or any attacker-controlled name with an `A`
+record inside a refused range, passes the literal check and is dialled — as does
+the rebinding variant, where the record is global when this seam looks and
+loopback when the socket connects. `localhost` and the `.localhost` TLD are
+special-cased only because RFC 6761 makes them loopback *by definition* rather
+than by resolution; that is not a general answer. **The closure is a resolving
+transport that refuses non-global answers at connect time** — a `reqwest` custom
+resolver, or a pre-resolve-then-connect-to-IP pass — which belongs in the
+transport, not at this seam, because only the thing that opens the socket knows
+the address it opened to. Recorded here as a known gap rather than an assumed
+absence; the cross-reference lives on `address_class_of_host` in
+`egress/lookup.rs`, where anyone tightening the floor would be reading.
 
 ## AC → Decision Map
 
@@ -239,24 +268,43 @@ wording actually resolves to.
    *config load* on a machine with no local tier, which would move the failure
    from per-query to startup. Left open because it would make an engine
    download a precondition for a config file to load.
-6. **`[web] permission = ask | allow` added to D-9's config surface.** D-9
+6. **`[web] permission_allow = [tier, …]` added to D-9's config surface.** D-9
    described the `[web]` table as tier-only. `enable_permanent` (D-5) has to
    have somewhere durable to land the *permission* half of the answer:
    persisting only the tier left the next daemon start re-prompting for a
    capability the user had already enabled permanently, which is the one thing
-   that option promises not to do. `permission` is therefore a second `[web]`
-   key, defaulting to `ask`, mapped onto the gate's policy rows by
-   `PermissionConfig::apply_web_permission`.
+   that option promises not to do — and worse, the tier write is raise-only and
+   the ceiling is checked *before* any prompt exists, so it was a guaranteed
+   no-op for every prompt a user could actually reach. `permission_allow` is
+   therefore a second `[web]` key, defaulting to the empty list, mapped onto the
+   gate's policy rows by `PermissionConfig::apply_web_permission`.
+   It is a **list of tiers and not a two-valued switch**, because BR-3 grades the
+   capability into three separately-consented tiers: a single `permission =
+   "allow"` fanned onto all three keys, so one "enable permanently" answered at a
+   prompt about a URL *the user pasted* permanently stopped the prompts for URLs
+   the model composes and for searches too — the breadth violation BR-3 forbids,
+   made durable in a file the user never re-reads. Each listed tier maps to **its
+   own** key through `permission_key_for` and no other; `"off"` is refused at
+   config load, since it names the absence of a tier and no prompt can produce
+   it. The `enable_permanent` option label names `[web] permission_allow +=
+   "<tier>"` — the key that is actually written, with the append visible.
 7. **Per-tier permission keys replace D-5's single `web` row.** D-5's sketch
    implied one consent subject. Three ship — `web_fetch_user_url`,
    `web_fetch_any_url`, `web_search` — because a grant is remembered under
    exactly the string it was asked about: one key would have made "allow for
    this session" on a pasted link silently grant every model-composed URL and
    every search, which is the mixed-authorship case BR-3 names first.
-   `permission_key_for(tier)` is the single tier→key mapping.
-   **Forward note:** REQ-560's named permission levels must fan out through
-   `PermissionConfig::apply_web_permission` — mapping a level to a single `web`
-   row would silently re-collapse the three keys.
+   `permission_key_for(tier)` is the single tier→key mapping, and it is *total*
+   over the tiers a lookup can need: `Call::permission_key` treats a `None` from
+   it as `unreachable!` rather than falling back on the narrowest key, because a
+   fallback reads as failing-closed and is not — a new tier added to the ladder
+   without a key would be silently authorized under `web_fetch_user_url`, a real
+   grant under a question about a different capability.
+   **Forward note:** REQ-560's named permission levels must map through
+   `PermissionConfig::apply_web_permission`, which reads a *set of tiers* and
+   sets one key per member — mapping a level to a single `web` row would silently
+   re-collapse the three keys, and mapping it to a fan-out over all three would
+   re-introduce the breadth violation deviation 6 records.
 8. **The degraded-profile cap is a floor the web tool always loses.**
    `DEGRADED_MAX_TOOLS` is 5 and the builtin set is 5, and the web tool
    registers last precisely so a cap cuts it first (D-1) — so on any provider

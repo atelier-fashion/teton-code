@@ -196,41 +196,6 @@ impl WebTier {
     }
 }
 
-/// Whether a web lookup inside the configured ceiling still asks (REQ-563 BR-4).
-///
-/// A **second, orthogonal** question to [`WebTier`], and the two are not
-/// collapsible: the tier says *how far* this machine may ever reach, and this
-/// says *whether the user is asked each time* within that reach. `tier =
-/// "search"` with `permission = "ask"` is the ordinary opted-in posture; the
-/// same tier with `permission = "allow"` is the user who answered "enable
-/// permanently" at a prompt and does not want to be asked again.
-///
-/// It exists because the `enable_permanent` consent option previously had
-/// nothing durable to write in the common case. The tier ceiling is enforced
-/// *before* the prompt, so a lookup that reaches a prompt is already at or below
-/// the configured tier — which made the raise-only `[web] tier` write a no-op
-/// while the decision was still reported as `Persistent`. This key is the thing
-/// that answer actually changes.
-///
-/// Deliberately **not** a per-tier table. REQ-560's named permission levels are
-/// the place a finer answer belongs; when they land, a named level maps onto the
-/// three web permission keys (`web_fetch_user_url`, `web_fetch_any_url`,
-/// `web_search`) by fanning out, and this key is the two-valued shape that
-/// mapping subsumes rather than a third vocabulary it has to reconcile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WebPermission {
-    /// Prompt for every lookup — the default, and BR-4's baseline.
-    #[default]
-    Ask,
-    /// Do not prompt: a lookup inside the configured ceiling runs.
-    ///
-    /// Never a *ceiling* raise. Everything `[web] tier` refuses is still
-    /// refused, and refused before any prompt would have been raised — this key
-    /// only answers prompts the ceiling already permitted to be asked.
-    Allow,
-}
-
 /// Opt-in web lookup (the `[web]` table, REQ-563).
 ///
 /// # Why the tier is the only switch (D-9)
@@ -270,22 +235,37 @@ pub struct WebConfig {
     /// its posture rather than leaving a reader to infer it from an absent key.
     #[serde(default)]
     pub tier: WebTier,
-    /// Whether a lookup **inside** the ceiling still prompts (BR-4).
+    /// The tiers a lookup **inside** the ceiling no longer prompts for (BR-4).
     ///
-    /// Defaults to [`WebPermission::Ask`], which is the requirement: BR-4 asks
-    /// per lookup, and `allow` exists only because the consent prompt offers
-    /// "enable permanently" and that answer has to become something durable.
-    /// Serialized unconditionally within the table, like [`Self::tier`]: a
-    /// config that names `[web]` states its consent posture rather than leaving
-    /// a reader to infer it.
+    /// Defaults to **empty**, which is the requirement: BR-4 asks per lookup, and
+    /// this list exists only because the consent prompt offers "enable
+    /// permanently" and that answer has to become something durable. Serialized
+    /// unconditionally within the table, like [`Self::tier`]: a config that names
+    /// `[web]` states its consent posture rather than leaving a reader to infer
+    /// it from an absent key.
+    ///
+    /// # Why a set and not a two-valued switch
+    ///
+    /// BR-3's whole point is that the three tiers are *separately* consented: a
+    /// URL the user pasted, a URL the model composed, and a search are three
+    /// different capabilities, and one answer about one of them is not an answer
+    /// about the other two. A single `permission = "allow"` key made
+    /// `enable_permanent` at a `fetch_user_url` prompt permanently stop asking
+    /// about `fetch_any_url` and `search` as well — the exact breadth violation
+    /// BR-3 forbids, made durable. This list holds precisely the tiers the user
+    /// answered for, and [`WebTier::Off`] is not a member any answer can produce.
     ///
     /// It cannot widen [`Self::tier`]. The ceiling is checked before any prompt
-    /// is raised, so `allow` answers only the prompts the ceiling had already
-    /// permitted to exist — which is why `permission = "allow"` with `tier =
-    /// "off"` is not a contradiction to validate away, it is simply a consent
-    /// posture for a capability that is not enabled.
+    /// is raised, so a listed tier answers only the prompts the ceiling had
+    /// already permitted to exist — which is why naming a tier here above `[web]
+    /// tier` is not a contradiction to validate away, it is a consent posture for
+    /// a capability that is not enabled.
+    ///
+    /// REQ-560's named permission levels attach here: a level names the tiers it
+    /// covers, which is the shape this already is, rather than a second
+    /// vocabulary to reconcile.
     #[serde(default)]
-    pub permission: WebPermission,
+    pub permission_allow: Vec<WebTier>,
     /// The search backend's endpoint. **No default ships** (BR-8): there is no
     /// blessed search provider, so an unset endpoint is the ordinary state and
     /// validates cleanly at every tier below `search` — the tier is simply not
@@ -351,7 +331,7 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             tier: WebTier::Off,
-            permission: WebPermission::Ask,
+            permission_allow: Vec::new(),
             search_endpoint: None,
             search_key_ref: None,
             allowed_domains: None,
@@ -902,6 +882,22 @@ pub enum ConfigError {
          are kept)."
     )]
     WebSearchEndpointCarriesQueryParam,
+
+    /// `[web] permission_allow` names `"off"` (REQ-563 BR-3, BR-4).
+    ///
+    /// The list names tiers the user has answered "stop asking" for, and
+    /// [`WebTier::Off`] names the *absence* of a tier — there is no consent key
+    /// for it, no prompt that could produce it, and nothing an entry would
+    /// switch off. Left unvalidated it would be a member the daemon silently
+    /// drops, which is the shape of a setting that does nothing (REQ-558's
+    /// lesson). Refused at load instead, where the user is still looking at the
+    /// file they just edited.
+    #[error(
+        "[web] permission_allow lists \"off\", which is not a tier a lookup can be consented at. \
+         Remove it — an empty list is the default and means \"ask about every lookup\". Valid \
+         members are \"fetch_user_url\", \"fetch_any_url\" and \"search\"."
+    )]
+    WebPermissionAllowNamesOff,
 
     /// `[web] search_key_ref` is not a recognized credential *reference*
     /// (REQ-563 BR-8). Like [`ConfigError::UnrecognizedAuthRef`], the message
@@ -1468,6 +1464,10 @@ impl Config {
     ///   absent list is not checked (BR-11: unrestricted is valid), and an empty
     ///   one is not an error — it is the most restrictive setting available, not
     ///   a malformed one.
+    /// - every `permission_allow` member must be a tier a lookup can actually be
+    ///   consented at. An unknown spelling is refused by `serde` before this runs
+    ///   (the field is typed as [`WebTier`], not as a string), and `"off"` — the
+    ///   one spelling that parses but names nothing — is refused here.
     ///
     /// Nothing here validates the *tier* against the rest of the machine (is
     /// there a local tier for BR-10's reduction? is the redact scan on?). Those
@@ -1525,6 +1525,10 @@ impl Config {
             }
         }
 
+        if web.permission_allow.contains(&WebTier::Off) {
+            return Err(ConfigError::WebPermissionAllowNamesOff);
+        }
+
         Ok(())
     }
 
@@ -1573,24 +1577,73 @@ fn is_model_name_shaped(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
+/// Strip `prefix` from `value` ASCII-case-insensitively.
+///
+/// A URL scheme is case-insensitive (RFC 3986 §3.1) and every real parser folds
+/// it, so a check that does not is a check a different reading of the same string
+/// passes — the split-parser hazard this file exists to avoid, in miniature.
+fn strip_scheme_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
+}
+
+/// Split an absolute http(s) URL into "is this cleartext" and the text after the
+/// scheme, or `None` when it is neither.
+///
+/// The **one** place the two schemes are recognized, so
+/// [`is_absolute_http_url`], [`url_host`] and [`is_cleartext_to_a_remote_host`]
+/// cannot disagree about whether a given string is an `http://` URL. They used
+/// to each spell the prefix test themselves, and making only one of them
+/// case-insensitive would have been strictly worse than leaving all three
+/// case-sensitive: `HTTP://evil.example` would validate as a URL and then fail
+/// the cleartext test, putting a search key on the wire in the clear.
+fn split_http_scheme(value: &str) -> Option<(bool, &str)> {
+    if let Some(rest) = strip_scheme_ci(value, "https://") {
+        return Some((false, rest));
+    }
+    strip_scheme_ci(value, "http://").map(|rest| (true, rest))
+}
+
+/// The authority region of an absolute http(s) URL — everything after the scheme
+/// and before the path, query or fragment.
+///
+/// **A backslash ends the authority too**, and that is the load-bearing part.
+/// WHATWG treats `\` as `/` in a special scheme, so `http://evil.example\@127.0.0.1/x`
+/// is a request to `evil.example` with `\@127.0.0.1/x` as its path — while a
+/// splitter that only knows `/?#` reads the whole thing as an authority, takes
+/// the userinfo off at the last `@`, and concludes the host is `127.0.0.1`. That
+/// is two parsers disagreeing about the destination, which is exactly how a
+/// cleartext-loopback exemption gets handed a remote host. Rather than teach this
+/// crate the WHATWG grammar — it is the pure-logic core and carries no URL
+/// dependency — the shape is refused outright by [`is_absolute_http_url`], so no
+/// later reader has to be right about it.
+fn url_authority(rest: &str) -> &str {
+    rest.split(['/', '?', '#', '\\']).next().unwrap_or_default()
+}
+
 /// Whether `value` is an absolute `http`/`https` URL with a non-empty host.
 ///
 /// Deliberately hand-rolled rather than pulling in a URL parser: this crate is
 /// the pure-logic core and the check it needs is narrow — a scheme, a host, and
 /// no embedded whitespace. Full URL semantics are the download client's problem
 /// (`tetond`), which parses it for real before fetching anything.
+///
+/// The one place that narrowness is not enough is the backslash: see
+/// [`url_authority`]. An authority containing one is refused here rather than
+/// interpreted, because the two available interpretations name two different
+/// hosts and this crate is not the parser that settles it.
 fn is_absolute_http_url(value: &str) -> bool {
     if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return false;
     }
-    let Some(rest) = value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"))
-    else {
+    let Some((_, rest)) = split_http_scheme(value) else {
         return false;
     };
+    // Computed with `/?#` only, so a `\` *inside* the region those delimiters
+    // bound is seen and refused rather than silently ending the authority early.
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !host.is_empty() && !host.starts_with(':')
+    !host.is_empty() && !host.starts_with(':') && !host.contains('\\')
 }
 
 /// The query parameter the search seam sends the user's query as (REQ-563).
@@ -1622,11 +1675,14 @@ fn url_query_names(url: &str) -> impl Iterator<Item = &str> {
 /// contacted — for a string [`is_absolute_http_url`] has already accepted. The
 /// userinfo strip uses the *last* `@`, because a password may contain one and
 /// the authority ends at the last.
+///
+/// The authority is taken by [`url_authority`], which ends at a backslash as well
+/// — belt and braces, since `is_absolute_http_url` has already refused a URL
+/// whose authority contains one, and the two readings must not be able to drift
+/// apart if that order ever changes.
 fn url_host(url: &str) -> Option<&str> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (_, rest) = split_http_scheme(url)?;
+    let authority = url_authority(rest);
     let host_port = authority
         .rsplit_once('@')
         .map_or(authority, |(_, after)| after);
@@ -1646,7 +1702,8 @@ fn url_host(url: &str) -> Option<&str> {
 /// A host that cannot be extracted counts as remote — the failing-safe reading,
 /// though [`is_absolute_http_url`] has already refused the hostless shapes.
 fn is_cleartext_to_a_remote_host(url: &str) -> bool {
-    url.starts_with("http://") && !url_host(url).is_some_and(is_loopback_host)
+    split_http_scheme(url).is_some_and(|(cleartext, _)| cleartext)
+        && !url_host(url).is_some_and(is_loopback_host)
 }
 
 /// Whether `host` names this machine: `localhost`, or any address in a loopback
@@ -3755,48 +3812,91 @@ cache_ttl_secs = 60
         );
     }
 
-    /// **`[web] permission` defaults to `ask` and reads both spellings.**
+    /// **`[web] permission_allow` defaults to empty and holds tiers, one each.**
     ///
-    /// BR-4 asks per lookup, so `ask` is the requirement rather than a taste;
-    /// `allow` exists because the consent prompt offers "enable permanently" and
-    /// that answer needs something durable to become. It is orthogonal to the
-    /// ceiling: `permission = "allow"` with `tier = "off"` is not a
-    /// contradiction, it is a consent posture for a capability nobody enabled.
+    /// BR-4 asks per lookup, so "ask about everything" is the requirement rather
+    /// than a taste, and an empty list is what says it. A member exists only
+    /// because the consent prompt offers "enable permanently" and that answer
+    /// needs something durable to become — and it is a *list of tiers* rather
+    /// than a two-valued switch because BR-3 grades the capability into three
+    /// separately-consented tiers. It is orthogonal to the ceiling: a tier listed
+    /// here with `tier = "off"` is not a contradiction, it is a consent posture
+    /// for a capability nobody enabled.
     #[test]
-    fn the_web_permission_defaults_to_ask_and_reads_both_spellings() {
-        assert_eq!(WebConfig::default().permission, WebPermission::Ask);
-        assert_eq!(
-            Config::load("[web]\n").expect("must load").web.permission,
-            WebPermission::Ask,
-            "a table that names no permission asks — the shipped posture (BR-4)"
+    fn the_web_permission_allow_list_defaults_to_empty_and_holds_one_tier_per_answer() {
+        assert!(WebConfig::default().permission_allow.is_empty());
+        assert!(
+            Config::load("[web]\n")
+                .expect("must load")
+                .web
+                .permission_allow
+                .is_empty(),
+            "a table that names no consent list asks about everything (BR-4)"
         );
-        for (spelling, permission) in [("ask", WebPermission::Ask), ("allow", WebPermission::Allow)]
-        {
-            let cfg = Config::load(&format!(
-                "[web]\ntier = \"fetch_any_url\"\npermission = \"{spelling}\"\n"
-            ))
-            .unwrap_or_else(|e| panic!("{spelling} must load: {e}"));
-            assert_eq!(cfg.web.permission, permission, "{spelling}");
-            // It never widens the ceiling: that is a separate key and stays put.
-            assert_eq!(cfg.web.tier, WebTier::FetchAnyUrl);
-        }
 
-        // `allow` beside `off` loads: two orthogonal keys, not two encodings of
-        // one fact (contrast D-9's `enabled` bool, which is why there is none).
-        let off = Config::load("[web]\npermission = \"allow\"\n").expect("must load");
-        assert_eq!(off.web.tier, WebTier::Off);
-        assert_eq!(off.web.permission, WebPermission::Allow);
+        let cfg = Config::load(
+            "[web]\ntier = \"fetch_any_url\"\npermission_allow = [\"fetch_user_url\"]\n",
+        )
+        .expect("must load");
+        assert_eq!(cfg.web.permission_allow, vec![WebTier::FetchUserUrl]);
+        // It never widens the ceiling: that is a separate key and stays put.
+        assert_eq!(cfg.web.tier, WebTier::FetchAnyUrl);
+
+        // Every tier above `off` is a legal member, and members do not imply
+        // each other — the list holds exactly what was answered for.
+        let all = Config::load(
+            "[web]\npermission_allow = [\"fetch_user_url\", \"fetch_any_url\", \"search\"]\n",
+        )
+        .expect("must load");
+        assert_eq!(all.web.tier, WebTier::Off);
+        assert_eq!(
+            all.web.permission_allow,
+            vec![WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search]
+        );
 
         // And it survives a round-trip, written unconditionally like `tier`.
-        let toml_text = off.to_toml().expect("serialize");
+        let toml_text = all.to_toml().expect("serialize");
         assert!(
-            toml_text.contains("permission = \"allow\""),
+            toml_text.contains("permission_allow = [") && toml_text.contains("\"search\","),
             "toml: {toml_text}"
         );
         assert_eq!(
             Config::from_toml(&toml_text).expect("deserialize").web,
-            off.web
+            all.web
         );
+    }
+
+    /// **A member that names no tier is refused at load, not silently dropped.**
+    ///
+    /// Two spellings reach this. An unknown one (`"fetch"`, a typo) is refused by
+    /// `serde` because the field is typed as [`WebTier`] rather than as a string
+    /// — which is the reason it is typed that way. `"off"` parses and then names
+    /// the *absence* of a tier: there is no consent key for it and no prompt that
+    /// could produce it, so an entry would be a setting that does nothing, which
+    /// is the defect REQ-558 spent an ADR removing.
+    #[test]
+    fn a_permission_allow_member_that_names_no_tier_is_refused_at_load() {
+        for spelling in ["fetch", "FETCH_USER_URL", "web_search", "\"\""] {
+            let err = Config::load(&format!("[web]\npermission_allow = [{spelling:?}]\n"));
+            assert!(
+                err.is_err(),
+                "{spelling:?} loaded as a consent tier: {err:?}"
+            );
+        }
+
+        let err = Config::load("[web]\ntier = \"fetch_any_url\"\npermission_allow = [\"off\"]\n")
+            .expect_err("\"off\" is not a tier a lookup can be consented at");
+        assert!(
+            format!("{err}").contains("permission_allow"),
+            "the message must name the key the user has to edit: {err}"
+        );
+
+        // And the same list without `off` is fine — the rule is about the
+        // member, not about the key being present.
+        assert!(Config::load(
+            "[web]\ntier = \"fetch_any_url\"\npermission_allow = [\"fetch_user_url\"]\n"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -4108,6 +4208,102 @@ cache_ttl_secs = 60
         let msg = ConfigError::WebSearchKeyOverCleartextEndpoint.to_string();
         assert!(msg.contains("search_key_ref"), "{msg}");
         assert!(msg.contains("search_endpoint"), "{msg}");
+    }
+
+    /// **The cleartext exemption cannot be reached by a second reading of the
+    /// authority.**
+    ///
+    /// `http://evil.example\@127.0.0.1/x` is two URLs depending on who parses it.
+    /// WHATWG treats `\` as `/` in a special scheme, so the authority ends at the
+    /// backslash and the host is `evil.example` — which is what `reqwest` binds
+    /// the search key to, and what the packet reaches. A splitter that only knows
+    /// `/?#` reads the whole thing as an authority, takes the userinfo off at the
+    /// last `@`, and concludes the host is `127.0.0.1` — loopback, therefore
+    /// exempt from the cleartext rule, therefore a bearer key on the open wire to
+    /// a host the validator never saw.
+    ///
+    /// This crate carries no URL parser and is not going to grow one for this, so
+    /// the shape is refused rather than interpreted: a backslash in the authority
+    /// means the two available readings disagree, and neither is this crate's to
+    /// pick.
+    #[test]
+    fn an_endpoint_whose_authority_carries_a_backslash_is_refused_outright() {
+        for split_brain in [
+            "http://evil.example\\@127.0.0.1/x",
+            "https://evil.example\\@localhost/search",
+            "http://evil.example\\127.0.0.1/x",
+            "http://\\@127.0.0.1/x",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*split_brain).to_owned()),
+                // With a key beside it, so a validator that let this through
+                // would be letting the credential out too.
+                search_key_ref: Some("keychain:teton-search".to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::InvalidWebSearchEndpoint,
+                "two parsers were allowed to disagree about the host of {split_brain:?}"
+            );
+        }
+
+        // A backslash *after* the authority is somebody's path and no business
+        // of this rule — the two readings agree about the host there.
+        let pathy = web_config(WebConfig {
+            search_endpoint: Some("https://search.example/a\\b".to_owned()),
+            ..WebConfig::default()
+        });
+        pathy
+            .validate()
+            .expect("a backslash in the path names no second host");
+    }
+
+    /// **A URL scheme is case-insensitive, and every reader here agrees about
+    /// it.**
+    ///
+    /// The hazard is not `HTTP://` being rejected — it is one reader folding the
+    /// case and another not. `is_absolute_http_url` accepting `HTTP://evil.example`
+    /// while `is_cleartext_to_a_remote_host` tested `starts_with("http://")` would
+    /// have validated a cleartext endpoint as if it were TLS and sent the search
+    /// key out in the clear. The three readers share one scheme split, and this
+    /// pins the shared answer at both ends.
+    #[test]
+    fn the_scheme_check_folds_case_for_every_reader() {
+        // Accepted as a URL...
+        let upper = web_config(WebConfig {
+            search_endpoint: Some("HTTPS://search.example/api".to_owned()),
+            search_key_ref: Some("keychain:teton-search".to_owned()),
+            ..WebConfig::default()
+        });
+        upper
+            .validate()
+            .expect("HTTPS:// is https:// — the scheme is case-insensitive");
+
+        // ...and the cleartext rule reads the same fold, so an upper-case
+        // `http://` is still cleartext.
+        for shouty in ["HTTP://search.example/api", "Http://search.example/api"] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*shouty).to_owned()),
+                search_key_ref: Some("keychain:teton-search".to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::WebSearchKeyOverCleartextEndpoint,
+                "{shouty} was read as a URL by one check and not by the other"
+            );
+        }
+
+        // The loopback exemption folds the same way.
+        let local = web_config(WebConfig {
+            search_endpoint: Some("HTTP://127.0.0.1:8888/search".to_owned()),
+            search_key_ref: Some("keychain:teton-search".to_owned()),
+            ..WebConfig::default()
+        });
+        local
+            .validate()
+            .expect("loopback is loopback whatever case the scheme is written in");
     }
 
     /// The seam appends the query as `q`. An endpoint that already carries one

@@ -77,6 +77,7 @@
 //! session is holding — which is the fact a pin is a claim about.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -134,12 +135,78 @@ pub const LOOKUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// included), and it covers the redirect loop as a whole rather than each hop,
 /// because three hops of 59 seconds each is the same attack.
 ///
-/// Expiry is reported as [`TransportError::Timeout`] and therefore as
-/// [`WebLookupOutcome::Offline`]: nothing answered in the time allowed, which is
-/// what "offline" means in this seam's taxonomy (BUG-152). Sixty seconds is
-/// generous for a document fetch and finite, which is the only property that
-/// matters here.
+/// Expiry on the **wire** is reported as [`TransportError::Timeout`] and
+/// therefore as [`WebLookupOutcome::Offline`]: nothing answered in the time
+/// allowed, which is what "offline" means in this seam's taxonomy (BUG-152).
+/// Sixty seconds is generous for a document fetch and finite, which is the only
+/// property that matters here.
+///
+/// Expiry during the **redaction scan** is a different fact and gets a different
+/// name — see [`ScanPhase`]. The clock wraps every gate as well as the wire, so a
+/// stalled local scanner would otherwise be announced as "the destination could
+/// not be reached", which is BUG-152's mislabel pointing the other way: a user
+/// sent to check their network because the thing that hung was on their own
+/// machine and had nothing to do with the network at all.
 pub const LOOKUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Which phase of an attempt the [`LOOKUP_TOTAL_TIMEOUT`] deadline fired in.
+///
+/// The deadline wraps the whole of [`Egress::attempt`] — deliberately, since the
+/// thing being bounded is the turn's total exposure and not any one hop — but
+/// when it fires, the future is dropped and takes its own record of where it had
+/// got to with it. So the phase is written down *as it is entered*, into a flag
+/// the timing wrapper still holds after the cancellation.
+///
+/// Two phases, because two honest answers exist:
+///
+/// * **scan** — the redaction gate was in flight. Nothing had left the machine,
+///   and nothing was going to until the scan answered. A guard that cannot finish
+///   is a guard that did not run, which is a block and not a skip (LESSON-492),
+///   so this folds to [`WebLookupOutcome::BlockedRedact`] with
+///   [`BlockCause::ScanUnavailable`] — the same ending an absent gate produces,
+///   because it is the same fact.
+/// * **wire** — everything else: the gates that cost no I/O, the request, the
+///   redirect chain, the body read. A deadline here really is "nothing answered
+///   in the time allowed", so it stays [`WebLookupOutcome::Offline`].
+///
+/// A plain [`AtomicBool`] rather than a channel or a shared future state: the
+/// only writer is the attempt itself, the only reader runs after the attempt has
+/// been dropped, and there is no ordering to establish beyond "the write happened
+/// before the drop".
+#[derive(Debug, Default)]
+struct ScanPhase(AtomicBool);
+
+impl ScanPhase {
+    /// Record that the redaction scan is now in flight.
+    fn entered(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Record that the scan has answered and the attempt is back on the wire
+    /// path. Called on the *forwarding* side only — a scan that blocked returns
+    /// straight out of `attempt`, and the flag it leaves behind is never read
+    /// because the deadline did not fire.
+    fn left(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
+    /// The ending a deadline fired in this phase produces.
+    fn expiry_ending(&self) -> Ending {
+        if self.0.load(Ordering::SeqCst) {
+            Ending::refused(
+                WebLookupOutcome::BlockedRedact,
+                LookupDetail::Blocked {
+                    cause: BlockCause::ScanUnavailable,
+                },
+            )
+        } else {
+            Ending::refused(
+                outcome_for(TransportError::Timeout),
+                detail_for(TransportError::Timeout),
+            )
+        }
+    }
+}
 
 /// A destination address class this seam will not send to.
 ///
@@ -179,6 +246,33 @@ impl AddressClass {
             AddressClass::Private => "private",
             AddressClass::UniqueLocal => "unique-local",
             AddressClass::Unspecified => "unspecified",
+        }
+    }
+
+    /// Whether a **user-pasted** initial URL in this class is let through.
+    ///
+    /// The question is not "did the user type this" — `UserPasted` only means the
+    /// URL appeared in a user message, and a pasted stack trace, issue thread or
+    /// log file is full of URLs a third party wrote. The question is whether the
+    /// class has a legitimate story a paste could be an instance of:
+    ///
+    /// * **yes** for loopback, private and unique-local. "Fetch my dev server on
+    ///   `localhost:3000`" and "read the wiki on the box in the next room" are
+    ///   ordinary requests, and refusing them would make the floor tier useless
+    ///   to the people it is for.
+    /// * **no** for link-local and unspecified. `169.254.169.254` is the cloud
+    ///   metadata service — the single most valuable SSRF target there is — and
+    ///   `0.0.0.0` is not a destination at all. Neither has a version where a
+    ///   user meant to fetch it, so neither gets an exemption to hide behind.
+    ///
+    /// Only the *initial* URL asks this. A redirect hop is the destination's
+    /// choice, never the user's, and is refused in every class (see
+    /// [`Egress::fetch`]).
+    #[must_use]
+    pub fn is_paste_exemptible(self) -> bool {
+        match self {
+            AddressClass::Loopback | AddressClass::Private | AddressClass::UniqueLocal => true,
+            AddressClass::LinkLocal | AddressClass::Unspecified => false,
         }
     }
 }
@@ -500,6 +594,15 @@ impl LookupOutcome {
     /// fetch it is the host that served the content, and on a refused hop it is
     /// the host that did the redirecting — which is the one this session
     /// actually talked to.
+    ///
+    /// **One exception, and it is structural.** When [`LOOKUP_TOTAL_TIMEOUT`]
+    /// fires, the in-flight future is dropped and its record of how far down the
+    /// chain it had got goes with it, so there is no "last contacted" left to
+    /// report. Such a row names the host the lookup *intended*
+    /// ([`Egress::intended_host`]): the initial URL's host for a fetch, the
+    /// configured endpoint's for a search. On a chain that had already taken a
+    /// hop, that is the first host rather than the last — a deliberate
+    /// under-report, because the alternative is naming no host at all.
     #[must_use]
     pub fn host(&self) -> &str {
         &self.host
@@ -699,24 +802,27 @@ impl<T: Transport> Egress<T> {
     /// redirect hop and the body read — rather than any single request, because
     /// the thing being bounded is *the turn's exposure to a remote party's
     /// pace*, and that is a property of the chain and not of a hop. Expiry
-    /// drops the in-flight future (which cancels the request) and lands on the
-    /// same [`WebLookupOutcome::Offline`] a connect failure does, through the
-    /// same [`outcome_for`] fold. The host such a row names is the destination
-    /// the lookup *intended*, since the cancelled chain took its own record of
-    /// where it had got to with it.
+    /// drops the in-flight future, which cancels whatever was in flight. The
+    /// host such a row names is the destination the lookup *intended*, since the
+    /// cancelled chain took its own record of where it had got to with it.
+    ///
+    /// **Which ending an expiry produces depends on where it fired** — see
+    /// [`ScanPhase`]. A deadline that lands on the wire is
+    /// [`WebLookupOutcome::Offline`], through the same [`outcome_for`] fold a
+    /// connect failure takes; a deadline that lands while the redaction gate is
+    /// still thinking is a guard that did not finish, which is a block. The flag
+    /// is held *here*, outside the future being timed, precisely because the
+    /// future is gone by the time the answer is needed.
     pub async fn lookup(&self, request: &LookupRequest, ctx: &LookupContext<'_>) -> LookupOutcome {
         let started = Instant::now();
         let kind = request.wire_kind();
+        let phase = ScanPhase::default();
         let (host, ending) =
-            match tokio::time::timeout(LOOKUP_TOTAL_TIMEOUT, self.attempt(request, ctx)).await {
+            match tokio::time::timeout(LOOKUP_TOTAL_TIMEOUT, self.attempt(request, ctx, &phase))
+                .await
+            {
                 Ok(reached) => reached,
-                Err(_elapsed) => (
-                    self.intended_host(request, ctx),
-                    Ending::refused(
-                        outcome_for(TransportError::Timeout),
-                        detail_for(TransportError::Timeout),
-                    ),
-                ),
+                Err(_elapsed) => (self.intended_host(request, ctx), phase.expiry_ending()),
             };
         let bytes_in = ending.body.len() as u64;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -756,7 +862,16 @@ impl<T: Transport> Egress<T> {
     /// Returns the last host this attempt actually contacted alongside the
     /// ending, because on a redirect chain those two are decided at different
     /// points and only the loop knows both.
-    async fn attempt(&self, request: &LookupRequest, ctx: &LookupContext<'_>) -> (String, Ending) {
+    ///
+    /// `phase` is written *through* this call rather than returned from it: a
+    /// cancelled future returns nothing at all, and where it got to is exactly
+    /// what the caller needs when the deadline fires (see [`ScanPhase`]).
+    async fn attempt(
+        &self,
+        request: &LookupRequest,
+        ctx: &LookupContext<'_>,
+        phase: &ScanPhase,
+    ) -> (String, Ending) {
         // Gate 1 — authorship / taint (BR-13, D-4). First, and before anything
         // that costs a model call or a packet: a lookup this session may not
         // perform is refused for free. `UserPasted` never reaches the taint
@@ -776,8 +891,8 @@ impl<T: Transport> Egress<T> {
         }
 
         match &request.kind {
-            LookupKind::Search { query } => self.search(query, ctx).await,
-            LookupKind::Fetch { url } => self.fetch(url, request.authorship, ctx).await,
+            LookupKind::Search { query } => self.search(query, ctx, phase).await,
+            LookupKind::Fetch { url } => self.fetch(url, request.authorship, ctx, phase).await,
         }
     }
 
@@ -805,7 +920,12 @@ impl<T: Transport> Egress<T> {
     /// destination to refuse. There is also no model-composed spelling of this
     /// destination to guard against — the model supplies the query, never the
     /// endpoint.
-    async fn search(&self, query: &str, ctx: &LookupContext<'_>) -> (String, Ending) {
+    async fn search(
+        &self,
+        query: &str,
+        ctx: &LookupContext<'_>,
+        phase: &ScanPhase,
+    ) -> (String, Ending) {
         let endpoint_host = ctx.search_endpoint.and_then(host_of).unwrap_or_default();
 
         // Gate 2 — the search redaction gate (BR-14, D-6), unconditional.
@@ -838,6 +958,12 @@ impl<T: Transport> Egress<T> {
         // The scan's own caps are REQ-562's and are measured on the *rendered*
         // prompt rather than on this text (LESSON-491); nothing here re-derives
         // them, which is why there is no second cap to keep in step.
+        //
+        // Bracketed by the phase flag: a gate that never answers must be
+        // reported as the block it is rather than as an unreachable
+        // destination, and the deadline that fires here takes the future — and
+        // its own idea of where it was — with it (see [`ScanPhase`]).
+        phase.entered();
         let verdict = gate.scan(query).await;
         if redact::decide(&verdict) == redact::EgressDecision::Block {
             return (
@@ -850,6 +976,7 @@ impl<T: Transport> Egress<T> {
                 ),
             );
         }
+        phase.left();
         // A forwarding verdict with low-confidence findings still goes to the
         // daemon log — kind, confidence and span, never text — for the same
         // reason `send()` does it: a finding computed and discarded is
@@ -889,7 +1016,7 @@ impl<T: Transport> Egress<T> {
     ///
     /// | | initial URL | every redirect hop |
     /// |---|---|---|
-    /// | address class | refused iff `ModelComposed` | always refused |
+    /// | address class | always refused; `UserPasted` is exempt for the two classes with a dev-server story | always refused |
     /// | search endpoint origin | always refused | always refused |
     /// | caller's host check | never | unless the hop stays on a user-pasted host |
     ///
@@ -899,11 +1026,26 @@ impl<T: Transport> Egress<T> {
     /// wearing a legitimate first hop, which is why the hop row has no
     /// exemption at all. Nothing about who typed the first URL is evidence
     /// about a destination the first URL's server picked.
+    ///
+    /// ### Why the paste exemption stops at two classes
+    ///
+    /// `UserPasted` means the URL appeared in the text of a user message, which
+    /// is a weaker claim than "the user chose this destination": a pasted stack
+    /// trace, a quoted GitHub issue, a copied log line all carry URLs somebody
+    /// *else* wrote, and pasting the log is not choosing them. The exemption is
+    /// therefore sized to the story that justifies it. [`AddressClass::Loopback`],
+    /// [`AddressClass::Private`] and [`AddressClass::UniqueLocal`] have one — "my
+    /// own dev server", "the box on my LAN" — and keep it.
+    /// [`AddressClass::LinkLocal`] and [`AddressClass::Unspecified`] have none:
+    /// `169.254.169.254` is the cloud metadata service and `0.0.0.0` is not a
+    /// destination at all, so no paste makes either of them a thing a user meant
+    /// to fetch. Those two are refused at hop zero whoever typed them.
     async fn fetch(
         &self,
         url: &str,
         authorship: Authorship,
         ctx: &LookupContext<'_>,
+        phase: &ScanPhase,
     ) -> (String, Ending) {
         let Some(mut host) = host_of(url) else {
             return (
@@ -914,8 +1056,8 @@ impl<T: Transport> Egress<T> {
         // Gate 3 — destination policy on the initial URL. Before the scan, so a
         // destination this seam was never going to reach costs zero inferences
         // (AC-11's argument again).
-        if authorship == Authorship::ModelComposed {
-            if let Some(class) = address_class_of_host(&host) {
+        if let Some(class) = address_class_of_host(&host) {
+            if authorship == Authorship::ModelComposed || !class.is_paste_exemptible() {
                 return (host, refused_address(class));
             }
         }
@@ -950,7 +1092,12 @@ impl<T: Transport> Egress<T> {
         // outgoing text this gate exists to inspect is the text a party in this
         // session wrote. Redirect targets are governed by the destination
         // policy and the host check above instead.
+        //
+        // Bracketed by the phase flag for the same reason `search` is: an
+        // expiry while this gate is thinking is a guard that did not finish,
+        // and a guard that did not finish is a block (see [`ScanPhase`]).
         if let Some(gate) = &self.fetch_redaction {
+            phase.entered();
             let verdict = gate.scan(url).await;
             if redact::decide(&verdict) == redact::EgressDecision::Block {
                 return (
@@ -963,6 +1110,7 @@ impl<T: Transport> Egress<T> {
                     ),
                 );
             }
+            phase.left();
             for line in redact::forwarded_findings_report(&verdict) {
                 eprintln!("{line}");
             }
@@ -1140,13 +1288,28 @@ fn targets_search_endpoint(url: &str, ctx: &LookupContext<'_>) -> bool {
 
 /// Whether `hop` stays inside the family of the user's pasted `original` host.
 ///
-/// "Family" is deliberately the *dotted-suffix* relation and not the registrable
-/// domain: `example.com` ↔ `www.example.com` in both directions, and nothing
-/// else. Resolving a registrable domain needs a public-suffix list this daemon
-/// does not carry, and guessing at one is how `foo.co.uk` and `bar.co.uk`
-/// become the same trust decision. The conservative relation covers the case
-/// that actually breaks users — the `apex → www` redirect — and refers every
-/// other hop to the caller's check.
+/// Two relations, and they are deliberately **not** symmetric.
+///
+/// * **Downward** — `hop` is any subdomain of `original`. The user named a
+///   name; everything under it is served by whoever controls that name, so a
+///   redirect deeper into it stays inside the thing they pointed at.
+/// * **Upward** — `hop` is `original` with exactly one leading `www.` removed,
+///   and nothing else.
+///
+/// The asymmetry is the whole of this function's safety. Going *up* a level
+/// leaves the name the user chose and lands on one they did not, and one level
+/// up from a hosting domain is the hosting *provider*: a pasted
+/// `alice.blogspot.com` one-label-stripped is `blogspot.com`, and calling those
+/// two the same family would let one tenant's page redirect to the shared apex
+/// with the user's paste exemption still attached. The case that genuinely
+/// breaks users is `www.example.com → example.com`, which is not "one label up"
+/// in general — it is that one label. So that one label is what is allowed, by
+/// name.
+///
+/// Nothing here resolves a registrable domain: that needs a public-suffix list
+/// this daemon does not carry, and guessing at one is how `foo.co.uk` and
+/// `bar.co.uk` become the same trust decision. Every hop these two relations do
+/// not cover is referred to the caller's check.
 ///
 /// Host strings arrive from `Url::host_str`, which lower-cases domains, so the
 /// comparison is exact rather than case-insensitive by accident.
@@ -1157,13 +1320,20 @@ fn same_host_family(original: &str, hop: &str) -> bool {
     if original == hop {
         return true;
     }
-    // The dot is part of the test on purpose: without it `evilexample.com`
-    // would end with `example.com` and pass.
-    hop.strip_suffix(original)
+    // Downward: `hop` is `<something>.original`. The dot is part of the test on
+    // purpose — without it `evilexample.com` would end with `example.com` and
+    // pass.
+    if hop
+        .strip_suffix(original)
         .is_some_and(|prefix| prefix.ends_with('.'))
-        || original
-            .strip_suffix(hop)
-            .is_some_and(|prefix| prefix.ends_with('.'))
+    {
+        return true;
+    }
+    // Upward: exactly `www.` and no other label. `original.strip_prefix` rather
+    // than a general one-label strip, because "the label that was removed" is
+    // the entire question and any other answer to it is a hop to a name the
+    // user did not choose.
+    original.strip_prefix("www.") == Some(hop)
 }
 
 /// The non-global [`AddressClass`] of `host`, or `None` when it names something
@@ -1245,10 +1415,30 @@ fn address_class_of_ipv4(ip: Ipv4Addr) -> Option<AddressClass> {
     }
     // `0.0.0.0/8` — "this network" (RFC 1122). `is_unspecified` covers only the
     // single address; the rest of the block is not a destination either.
-    if ip.octets()[0] == 0 {
+    let octets = ip.octets();
+    if octets[0] == 0 {
         return Some(AddressClass::Unspecified);
     }
+    // `100.64.0.0/10` — carrier-grade NAT shared address space (RFC 6598).
+    // Not in RFC 1918 and so not caught by `is_private`, but it is exactly as
+    // internal: on any CGNAT-ed network these addresses name the provider's own
+    // infrastructure and the subscriber boxes beside this one. `Private` is the
+    // class it belongs to — same story, later RFC.
+    if octets[0] == 100 && (64..128).contains(&octets[1]) {
+        return Some(AddressClass::Private);
+    }
+    // `198.18.0.0/15` — benchmarking (RFC 2544). Reserved for test equipment on
+    // a lab network, never globally routed, and present on real networks often
+    // enough to be worth naming rather than leaving to fall through as "global".
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        return Some(AddressClass::Private);
+    }
     None
+}
+
+/// The IPv4 address a pair of IPv6 segments carries.
+fn embedded_ipv4(hi: u16, lo: u16) -> Ipv4Addr {
+    Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo))
 }
 
 fn address_class_of_ipv6(ip: Ipv6Addr) -> Option<AddressClass> {
@@ -1277,6 +1467,26 @@ fn address_class_of_ipv6(ip: Ipv6Addr) -> Option<AddressClass> {
     // `::ffff:169.254.169.254` reaches the metadata service.
     if let Some(v4) = ip.to_ipv4_mapped() {
         return address_class_of_ipv4(v4);
+    }
+    // The two other transition formats that embed an IPv4 destination in an
+    // IPv6 address. Both are the same hazard as the mapped form wearing a
+    // different prefix: the packet ends up at the embedded address, so the
+    // embedded address is what has to be classified. A fold that stopped at
+    // `::ffff:` would refuse `::ffff:169.254.169.254` and wave
+    // `64:ff9b::a9fe:a9fe` through to the same metadata service.
+    //
+    // `64:ff9b::/96` — the NAT64 well-known prefix (RFC 6052 §2.1). The low 32
+    // bits are the IPv4 address a NAT64 gateway will translate to.
+    let segments = ip.segments();
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6].iter().all(|&seg| seg == 0)
+    {
+        return address_class_of_ipv4(embedded_ipv4(segments[6], segments[7]));
+    }
+    // `2002::/16` — 6to4 (RFC 3056). The next 32 bits are the IPv4 address of
+    // the 6to4 relay endpoint the traffic is encapsulated to; `2002:7f00:1::`
+    // is a route to 127.0.0.1.
+    if segments[0] == 0x2002 {
+        return address_class_of_ipv4(embedded_ipv4(segments[1], segments[2]));
     }
     // An IPv4-**compatible** address (`::127.0.0.1`) is deprecated outright
     // (RFC 4291 §2.5.5.1) and routes nowhere, so it is refused whatever it
@@ -1366,10 +1576,26 @@ fn host_of(url: &str) -> Option<String> {
     crate::web::canonical_host_of(url)
 }
 
-/// Resolve `location` against `base`, absolute or relative.
+/// Resolve `location` against `base`, absolute or relative — and only when what
+/// comes out is still a URL this seam fetches.
+///
+/// The **scheme gate is stated here** rather than left to the transport. A
+/// `Location: ftp://evil.example/x` joins perfectly well against an `https`
+/// base, and so do `file:///etc/passwd` and a `data:` URL; today `reqwest`
+/// happens to refuse to execute the result, but that is a property of the
+/// current client and not of this choke point, and a transport that was more
+/// accommodating — or a test double, which is most of what this seam is
+/// exercised over — would turn a redirect into a local file read with no gate
+/// having had an opinion. The initial URL is held to the same closed list by
+/// [`FETCHABLE_SCHEMES`](crate::harness::tools::web), one layer up; this is that
+/// rule surviving a hop the destination chose.
+///
+/// `None` reads to the caller as `RedirectRefused`, which is what a hop to a
+/// scheme this daemon does not fetch is.
 fn join(base: &str, location: &str) -> Option<String> {
     let base = reqwest::Url::parse(base).ok()?;
-    base.join(location).ok().map(String::from)
+    let next = base.join(location).ok()?;
+    matches!(next.scheme(), "http" | "https").then(|| String::from(next))
 }
 
 /// The search request: the configured endpoint carrying the query as `q`.
@@ -1553,6 +1779,22 @@ mod tests {
         async fn scan(&self, _payload: &str) -> RedactionVerdict {
             self.log.lock().unwrap().push("scan");
             RedactionVerdict::clean()
+        }
+    }
+
+    /// A redaction gate that is asked and never answers.
+    ///
+    /// Distinct from an *absent* gate and from one that answers
+    /// `RedactionVerdict::unavailable()`: those are both decisions, taken
+    /// promptly. This is a local scanner that has stalled — an engine still
+    /// loading, a model call that will not return — which is the case
+    /// [`LOOKUP_TOTAL_TIMEOUT`] has to attribute to the right phase.
+    struct HangingGate;
+
+    #[async_trait]
+    impl RedactionGate for HangingGate {
+        async fn scan(&self, _payload: &str) -> RedactionVerdict {
+            std::future::pending().await
         }
     }
 
@@ -2391,6 +2633,70 @@ mod tests {
         assert_eq!(inner.calls(), 1);
     }
 
+    /// **A hop to a scheme this seam does not fetch is refused here, by this
+    /// seam.**
+    ///
+    /// The initial URL is held to `http`/`https` one layer up, in the tool. A
+    /// redirect target is not, and `Location: ftp://…` joins against an `https`
+    /// base perfectly well — as do `file:///etc/passwd` and a `data:` URL. The
+    /// current client happens to refuse to execute the result, which is a
+    /// property of `reqwest` and not of this choke point: every test double this
+    /// seam is exercised over would have taken the hop, and so would a
+    /// transport that was more accommodating. So the gate is stated rather than
+    /// inherited.
+    #[tokio::test]
+    async fn a_redirect_to_a_scheme_this_seam_does_not_fetch_is_refused() {
+        for location in [
+            "ftp://evil.example/x",
+            "file:///etc/passwd",
+            "data:text/html,<p>hi</p>",
+            "javascript:alert(1)",
+        ] {
+            let inner = CaptureTransport::new(vec![
+                Ok((302, Some(location.to_owned()), Vec::new())),
+                Ok((200, None, b"secrets".to_vec())),
+            ]);
+            let egress = egress_over(inner.clone());
+            let flags = Flags::clean();
+            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+            let outcome = egress
+                .lookup(
+                    &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                    &ctx,
+                )
+                .await;
+
+            assert_eq!(
+                outcome.detail(),
+                &LookupDetail::RedirectRefused,
+                "Location: {location}"
+            );
+            assert_eq!(
+                inner.calls(),
+                1,
+                "Location: {location} — the hop must never be requested"
+            );
+        }
+
+        // Non-vacuity: the two schemes it *does* fetch still redirect.
+        let inner = CaptureTransport::new(vec![
+            Ok((302, Some("http://docs.rs/plain".to_owned()), Vec::new())),
+            Ok((200, None, b"the page".to_vec())),
+        ]);
+        let egress = egress_over(inner.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+        assert_eq!(outcome.outcome(), WebLookupOutcome::Completed);
+        assert_eq!(inner.calls(), 2);
+    }
+
     // -- the address-class policy (SSRF floor) -----------------------------
 
     /// Every spelling of "somewhere that is not on the public internet" this
@@ -2478,6 +2784,58 @@ mod tests {
         }
     }
 
+    /// **The paste exemption stops at the two classes with no story** (BR-11,
+    /// REQ-563 verify).
+    ///
+    /// `UserPasted` means "this URL appeared in the text of a user message",
+    /// which is weaker than "the user chose this destination" — a pasted stack
+    /// trace, a quoted issue thread or a copied log line all carry URLs somebody
+    /// else wrote. So the exemption is sized to the story that justifies it. "My
+    /// dev server on localhost" and "the box on my LAN" are real; there is no
+    /// version of `http://169.254.169.254/latest/meta-data/` that a user meant
+    /// to fetch, and `0.0.0.0` is not a destination at all. Those two are
+    /// refused at hop zero whoever typed them.
+    ///
+    /// The failure this closes is concrete: get a metadata URL in front of the
+    /// user in text they paste back — an error message to debug, a log line to
+    /// explain — and the exemption carried it straight through the SSRF floor.
+    #[tokio::test]
+    async fn a_pasted_url_gets_no_exemption_for_link_local_or_unspecified() {
+        for (url, class) in [
+            (
+                "http://169.254.169.254/latest/meta-data/",
+                AddressClass::LinkLocal,
+            ),
+            ("http://[fe80::1]/x", AddressClass::LinkLocal),
+            ("http://0.0.0.0:8000/x", AddressClass::Unspecified),
+            ("http://[::]/x", AddressClass::Unspecified),
+        ] {
+            let inner = CaptureTransport::answering(200, "iam credentials");
+            let egress = egress_over(inner.clone());
+            let flags = Flags::clean();
+            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+            let outcome = egress
+                .lookup(&LookupRequest::fetch(url, Authorship::UserPasted), &ctx)
+                .await;
+
+            assert_eq!(
+                outcome.detail(),
+                &LookupDetail::RefusedAddress { class },
+                "{url} was let through because it appeared in a user message"
+            );
+            assert_eq!(inner.calls(), 0, "{url}: a refusal that reached the wire");
+        }
+
+        // Non-vacuity in the other direction: the classes that *do* have a
+        // story keep it, so this narrowing did not simply refuse everything.
+        assert!(AddressClass::Loopback.is_paste_exemptible());
+        assert!(AddressClass::Private.is_paste_exemptible());
+        assert!(AddressClass::UniqueLocal.is_paste_exemptible());
+        assert!(!AddressClass::LinkLocal.is_paste_exemptible());
+        assert!(!AddressClass::Unspecified.is_paste_exemptible());
+    }
+
     #[tokio::test]
     async fn every_hop_to_a_non_global_address_is_refused_whoever_pasted_the_original() {
         // A redirect target is *always* chosen by the destination, so the
@@ -2563,6 +2921,89 @@ mod tests {
             "[2606:4700::1111]",
         ] {
             assert_eq!(address_class_of_host(host), None, "{host} is global");
+        }
+    }
+
+    /// **An IPv4 destination wrapped in an IPv6 transition prefix is still that
+    /// destination.**
+    ///
+    /// `::ffff:` is the fold everybody remembers. There are two more, and each
+    /// is a working route to the embedded address on a real network: a NAT64
+    /// gateway translates `64:ff9b::/96` and forwards to the low 32 bits, and a
+    /// 6to4 relay encapsulates to the IPv4 address in `2002:V4::`. A floor that
+    /// folded only the mapped form would refuse `::ffff:169.254.169.254` and
+    /// wave `64:ff9b::a9fe:a9fe` through to the same metadata service — a
+    /// rewrite of one address, not a different destination.
+    #[test]
+    fn the_transition_prefixes_fold_onto_the_ipv4_address_they_carry() {
+        for (host, class) in [
+            // NAT64 well-known prefix (RFC 6052). `a9fe:a9fe` = 169.254.169.254.
+            ("[64:ff9b::a9fe:a9fe]", AddressClass::LinkLocal),
+            ("[64:ff9b::7f00:1]", AddressClass::Loopback),
+            ("[64:ff9b::c0a8:1]", AddressClass::Private),
+            // 6to4 (RFC 3056). `2002:7f00:1::` is a route to 127.0.0.1.
+            ("[2002:7f00:1::1]", AddressClass::Loopback),
+            ("[2002:a9fe:a9fe::1]", AddressClass::LinkLocal),
+            ("[2002:c0a8:101::1]", AddressClass::Private),
+        ] {
+            assert_eq!(
+                address_class_of_host(host),
+                Some(class),
+                "{host} did not fold onto the IPv4 destination it carries"
+            );
+        }
+
+        // The prefixes are not blanket refusals: one wrapping a *global* IPv4
+        // address is a globally routable destination and stays one.
+        for global in ["[64:ff9b::808:808]", "[2002:0808:0808::1]"] {
+            assert_eq!(
+                address_class_of_host(global),
+                None,
+                "{global} carries 8.8.8.8, which is on the public internet"
+            );
+        }
+
+        // And a neighbour of the NAT64 prefix is not the NAT64 prefix: the
+        // check is `64:ff9b::/96`, so the bits past it matter.
+        assert_eq!(address_class_of_host("[64:ff9c::7f00:1]"), None);
+        assert_eq!(address_class_of_host("[64:ff9b:1::7f00:1]"), None);
+    }
+
+    /// **Two IPv4 ranges that are internal without being RFC 1918.**
+    ///
+    /// `100.64.0.0/10` is carrier-grade NAT shared space (RFC 6598): on any
+    /// CGNAT-ed network these addresses name the provider's own infrastructure
+    /// and the subscriber boxes beside this one, which is the same story RFC
+    /// 1918 tells with a later number. `198.18.0.0/15` is benchmarking (RFC
+    /// 2544) — lab equipment, never globally routed. `is_private` knows neither.
+    #[test]
+    fn the_classifier_knows_the_two_private_ranges_that_are_not_rfc_1918() {
+        for host in [
+            "100.64.0.1",
+            "100.100.100.100",
+            "100.127.255.254",
+            "198.18.0.1",
+            "198.19.255.254",
+        ] {
+            assert_eq!(
+                address_class_of_host(host),
+                Some(AddressClass::Private),
+                "{host} is not on the public internet"
+            );
+        }
+
+        // The edges, so the masks are the masks and not "starts with 100".
+        for global in [
+            "100.63.255.255",
+            "100.128.0.1",
+            "198.17.255.255",
+            "198.20.0.1",
+        ] {
+            assert_eq!(
+                address_class_of_host(global),
+                None,
+                "{global} is outside the reserved range and must stay reachable"
+            );
         }
     }
 
@@ -2803,12 +3244,41 @@ mod tests {
         assert_eq!(check.asked(), vec!["www.example.com".to_owned()]);
     }
 
+    /// The relation is asymmetric, and the asymmetry is the security property.
+    ///
+    /// Downward — deeper into the name the user pasted — is unrestricted: they
+    /// named it, and everything under it is served by whoever holds it. Upward
+    /// is `www.` and only `www.`, because one label up from a *hosting* domain
+    /// is the hosting provider: `alice.blogspot.com` stripped of one label is
+    /// `blogspot.com`, and a general one-label rule would have carried the
+    /// user's paste exemption from a single tenant's page onto the shared apex
+    /// — a redirect the tenant chose, to a name the user never did.
     #[test]
-    fn the_pasted_host_family_is_the_dotted_suffix_relation_and_nothing_wider() {
+    fn the_pasted_host_family_goes_down_freely_and_up_only_past_www() {
         assert!(same_host_family("example.com", "example.com"));
+
+        // Down: any depth.
         assert!(same_host_family("example.com", "www.example.com"));
-        assert!(same_host_family("www.example.com", "example.com"));
         assert!(same_host_family("example.com", "a.b.example.com"));
+        assert!(same_host_family(
+            "alice.blogspot.com",
+            "cdn.alice.blogspot.com"
+        ));
+
+        // Up: the one label that breaks users, and no other.
+        assert!(same_host_family("www.example.com", "example.com"));
+        assert!(
+            !same_host_family("alice.blogspot.com", "blogspot.com"),
+            "one tenant's page redirected to the shared apex with a paste exemption attached"
+        );
+        assert!(!same_host_family("docs.example.com", "example.com"));
+        assert!(!same_host_family("a.b.example.com", "b.example.com"));
+        // Two labels up is not one label up, even when the first of them is
+        // `www` — the relation is a single named strip, not a loop.
+        assert!(!same_host_family("www.docs.example.com", "example.com"));
+        // And `www` as an ordinary *label* is not the prefix strip: nothing is
+        // removed from the front here.
+        assert!(!same_host_family("evil.www.example.com", "example.com"));
 
         assert!(!same_host_family("example.com", "evilexample.com"));
         assert!(!same_host_family("example.com", "example.com.evil.test"));
@@ -2980,6 +3450,157 @@ mod tests {
 
         assert_eq!(outcome.outcome(), WebLookupOutcome::TaintRestricted);
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    // -- which phase the deadline fired in ---------------------------------
+
+    /// **A scan that never finishes is a block, not an unreachable host.**
+    ///
+    /// The clock wraps every gate as well as the wire, so a stalled *local*
+    /// scanner used to come back as `offline` — "the destination could not be
+    /// reached" — about a destination this daemon never dialled. That is
+    /// BUG-152's mislabel pointing the other way: a settled local refusal
+    /// wearing a transient network fault's name, sending the user to check
+    /// their network for a thing that hung on their own machine.
+    ///
+    /// A guard that cannot finish is a guard that did not run, which is a block
+    /// (LESSON-492) — the same ending an absent gate produces, because it is the
+    /// same fact.
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_scan_that_never_answers_is_reported_as_a_block() {
+        // The transport answers instantly, so nothing but the gate can be what
+        // ran out of time — and `calls() == 0` proves it never got that far.
+        let inner = CaptureTransport::answering(200, "<p>hi</p>");
+        let egress = egress_over(inner.clone()).with_fetch_redaction_gate(Arc::new(HangingGate));
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+        let started = tokio::time::Instant::now();
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(
+            outcome.outcome(),
+            WebLookupOutcome::BlockedRedact,
+            "a stalled local scan was announced as an unreachable destination"
+        );
+        assert_eq!(
+            outcome.detail(),
+            &LookupDetail::Blocked {
+                cause: BlockCause::ScanUnavailable
+            },
+            "and it names the cause an absent gate names, because it is the same fact"
+        );
+        assert_eq!(inner.calls(), 0, "nothing left the machine");
+        assert!(started.elapsed() >= LOOKUP_TOTAL_TIMEOUT);
+        assert!(started.elapsed() < LOOKUP_TOTAL_TIMEOUT * 2);
+    }
+
+    /// The same, on the search path — where the gate is unconditional (BR-14)
+    /// and so the stall is the more likely of the two to be met.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_scan_that_never_answers_is_reported_as_a_block() {
+        let inner = CaptureTransport::answering(200, "{}");
+        let egress = egress_over(inner.clone()).with_search_redaction_gate(Arc::new(HangingGate));
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+            .with_search_endpoint("https://search.example/api");
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::search("my api key", Authorship::ModelComposed),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(outcome.outcome(), WebLookupOutcome::BlockedRedact);
+        assert_eq!(
+            outcome.detail(),
+            &LookupDetail::Blocked {
+                cause: BlockCause::ScanUnavailable
+            }
+        );
+        assert_eq!(
+            inner.calls(),
+            0,
+            "the query reached the endpoint while its own scan was still running"
+        );
+        assert_eq!(
+            outcome.host(),
+            "search.example",
+            "and the row names the endpoint it was going to"
+        );
+    }
+
+    /// **The flag is cleared when the scan answers.** The other half, and the
+    /// one a missing `ScanPhase::left` would break silently: a scan that
+    /// finished cleanly and a wire that then stalled is an *offline* lookup, and
+    /// reporting it as `blocked_redact` would tell a user their privacy gate
+    /// refused a request it had in fact approved.
+    #[tokio::test(start_paused = true)]
+    async fn a_wire_stall_after_a_clean_scan_is_still_offline() {
+        let gate = CountingGate::new(RedactionVerdict::clean());
+        let egress = Egress::new(
+            SleepingTransport {
+                calls: Arc::new(Mutex::new(0)),
+            },
+            boundaries(),
+            Arc::new(NoopSink),
+        )
+        .with_fetch_redaction_gate(gate.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(gate.calls(), 1, "non-vacuity: the scan really did run");
+        assert_eq!(
+            outcome.outcome(),
+            WebLookupOutcome::Offline,
+            "a destination that never answered was blamed on the local scanner"
+        );
+        assert_eq!(
+            outcome.detail(),
+            &LookupDetail::Unreachable {
+                error: TransportError::Timeout
+            }
+        );
+    }
+
+    /// The same for search: gate answers, endpoint stalls, ending is `offline`.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_endpoint_that_stalls_after_a_clean_scan_is_offline() {
+        let gate = CountingGate::new(RedactionVerdict::clean());
+        let egress = Egress::new(
+            SleepingTransport {
+                calls: Arc::new(Mutex::new(0)),
+            },
+            boundaries(),
+            Arc::new(NoopSink),
+        )
+        .with_search_redaction_gate(gate.clone());
+        let flags = Flags::clean();
+        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+            .with_search_endpoint("https://search.example/api");
+
+        let outcome = egress
+            .lookup(
+                &LookupRequest::search("rust lifetimes", Authorship::ModelComposed),
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(gate.calls(), 1);
+        assert_eq!(outcome.outcome(), WebLookupOutcome::Offline);
     }
 
     // -- offline and HTTP status (BR-9, AC-8, BUG-152) ---------------------

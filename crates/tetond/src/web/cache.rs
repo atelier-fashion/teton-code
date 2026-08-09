@@ -121,6 +121,24 @@ pub struct CacheEntry {
     /// The freshness window in force when this entry was written, in seconds.
     /// Read together with the cache's current window — the stricter wins.
     pub ttl_secs: u64,
+    /// Whether the fetch this entry came from hit [the body
+    /// cap](crate::egress::lookup::LOOKUP_MAX_BODY_BYTES) and stopped short.
+    ///
+    /// Stored because it is a property **of the document**, not of the request
+    /// that fetched it: the reduction on disk is the same partial text on every
+    /// later hit, so the caveat that goes with it has to survive the write.
+    /// Without this field a truncated page was announced as truncated exactly
+    /// once — on the fetch — and then served silently complete for the rest of
+    /// the TTL, which is a model reasoning about the end of a document it was
+    /// never given.
+    ///
+    /// `#[serde(default)]` so an entry written by an earlier build still
+    /// deserializes. The default is `false`, which is the wrong answer for a
+    /// truncated legacy entry and the right one for every other — and the
+    /// alternative, treating an old entry as unreadable, would flush a whole
+    /// cache to add a caveat to a handful of pages.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// A failure to *write* the cache. Reads have no error surface by design.
@@ -229,6 +247,10 @@ impl WebCache {
 
     /// Store `content` as the current reduction of `url`.
     ///
+    /// `truncated` rides along rather than defaulting, so a caller that has a
+    /// partial document cannot store it as a whole one by omission — see
+    /// [`CacheEntry::truncated`].
+    ///
     /// A disabled cache stores nothing and reports success: "no cache" is a
     /// configuration, not a failure, and a caller that had to distinguish the
     /// two would end up re-implementing [`WebCache::is_enabled`] at every call
@@ -243,7 +265,7 @@ impl WebCache {
     /// that result: the entry is on disk either way, and a failure to unlink
     /// someone else's stale file is not a failed write to report to a caller
     /// whose document was stored.
-    pub fn put(&self, url: &str, content: &str) -> Result<(), CacheError> {
+    pub fn put(&self, url: &str, content: &str, truncated: bool) -> Result<(), CacheError> {
         if !self.is_enabled() {
             return Ok(());
         }
@@ -252,6 +274,7 @@ impl WebCache {
             content: content.to_owned(),
             fetched_at_secs: now,
             ttl_secs: self.ttl_secs,
+            truncated,
         };
         let encoded = serde_json::to_vec(&entry).map_err(|_| CacheError::Encode)?;
         prepare_dir(&self.dir)?;
@@ -511,7 +534,7 @@ mod tests {
     fn a_fresh_entry_round_trips_without_touching_the_network_layer() {
         let base = scratch_base("fresh");
         let cache = WebCache::new(&base, 900);
-        cache.put(URL, "reduced page text").expect("put");
+        cache.put(URL, "reduced page text", false).expect("put");
         let hit = cache.get(URL).expect("fresh hit");
         assert_eq!(hit.content, "reduced page text");
         assert_eq!(hit.ttl_secs, 900);
@@ -523,13 +546,63 @@ mod tests {
         assert!(cache.get(URL).is_none());
     }
 
+    /// **The truncation flag survives the write**, because it describes the
+    /// document rather than the fetch. Stored only in the fetching turn's
+    /// sentence, the caveat would last one turn while the partial text on disk
+    /// lasted the whole TTL — a page announced as cut short once, then served as
+    /// complete every time after.
+    #[test]
+    fn the_truncation_flag_rides_with_the_document_it_describes() {
+        let base = scratch_base("truncated");
+        let cache = WebCache::new(&base, 900);
+
+        cache
+            .put(URL, "the first two megabytes", true)
+            .expect("put");
+        assert!(cache.get(URL).expect("hit").truncated);
+
+        cache
+            .put("https://example.com/whole", "all of it", false)
+            .expect("put");
+        assert!(
+            !cache
+                .get("https://example.com/whole")
+                .expect("hit")
+                .truncated
+        );
+    }
+
+    /// **An entry written before the field existed still reads.**
+    ///
+    /// `#[serde(default)]` rather than a version bump: the alternative — a
+    /// missing field making the entry undeserializable — silently flushes every
+    /// cache in existence to add a caveat that applies to a handful of pages.
+    /// `false` is the wrong answer for a truncated legacy entry and the right
+    /// one for every other, and each of them expires inside the freshness
+    /// window anyway.
+    #[test]
+    fn an_entry_from_before_the_flag_existed_still_deserializes() {
+        let base = scratch_base("legacy-entry");
+        let cache = WebCache::new(&base, 900);
+        prepare_dir(cache.dir()).expect("mkdir");
+        let legacy = format!(
+            r#"{{"content":"old text","fetched_at_secs":{},"ttl_secs":900}}"#,
+            now_secs()
+        );
+        write_entry(&cache.path_for(URL), legacy.as_bytes()).expect("write");
+
+        let hit = cache.get(URL).expect("a legacy entry must still be a hit");
+        assert_eq!(hit.content, "old text");
+        assert!(!hit.truncated);
+    }
+
     /// The cache lives beside the ledger, not inside it and not somewhere else.
     #[test]
     fn entries_live_in_web_cache_beside_the_ledger_db() {
         let base = scratch_base("layout");
         let cache = WebCache::new(&base, 900);
         assert_eq!(cache.dir(), base.join("web-cache"));
-        cache.put(URL, "text").expect("put");
+        cache.put(URL, "text", false).expect("put");
         let names: Vec<_> = std::fs::read_dir(cache.dir())
             .expect("read cache dir")
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
@@ -545,7 +618,7 @@ mod tests {
     fn a_stored_entry_records_no_url() {
         let base = scratch_base("no-url");
         let cache = WebCache::new(&base, 900);
-        cache.put(URL, "text").expect("put");
+        cache.put(URL, "text", false).expect("put");
         for entry in std::fs::read_dir(cache.dir()).expect("read cache dir") {
             let path = entry.expect("entry").path();
             let raw = std::fs::read_to_string(&path).expect("read entry");
@@ -567,6 +640,7 @@ mod tests {
             content: "text".to_owned(),
             fetched_at_secs: 1_000,
             ttl_secs: 60,
+            truncated: false,
         };
         assert!(cache.is_fresh(&entry, 1_000), "just fetched");
         assert!(
@@ -588,6 +662,7 @@ mod tests {
             content: "old".to_owned(),
             fetched_at_secs: 1,
             ttl_secs: 900,
+            truncated: false,
         };
         write_entry(
             &cache.path_for(URL),
@@ -605,6 +680,7 @@ mod tests {
             content: "text".to_owned(),
             fetched_at_secs: 1_000,
             ttl_secs: 600,
+            truncated: false,
         };
         let tightened = WebCache::new(Path::new("/nonexistent"), 60);
         assert!(!tightened.is_fresh(&entry, 1_100), "config lowered to 60s");
@@ -624,6 +700,7 @@ mod tests {
             content: "text".to_owned(),
             fetched_at_secs: 9_000,
             ttl_secs: 900,
+            truncated: false,
         };
         assert!(!cache.is_fresh(&entry, 1_000));
     }
@@ -632,7 +709,7 @@ mod tests {
     fn evict_removes_the_entry_and_is_idempotent() {
         let base = scratch_base("evict");
         let cache = WebCache::new(&base, 900);
-        cache.put(URL, "text").expect("put");
+        cache.put(URL, "text", false).expect("put");
         assert!(cache.get(URL).is_some());
         assert!(
             cache.evict(URL).expect("evict"),
@@ -653,7 +730,7 @@ mod tests {
     fn evicting_a_stale_but_present_entry_reports_a_removal() {
         let base = scratch_base("evict-stale");
         let cache = WebCache::new(&base, 1);
-        cache.put(URL, "text").expect("put");
+        cache.put(URL, "text", false).expect("put");
         // Age it past its own window without waiting for a real second.
         let aged = WebCache::new(&base, 900);
         let path = aged.path_for(URL);
@@ -661,6 +738,7 @@ mod tests {
             content: "text".to_owned(),
             fetched_at_secs: 1,
             ttl_secs: 1,
+            truncated: false,
         };
         std::fs::write(&path, serde_json::to_vec(&entry).expect("encode")).expect("write");
 
@@ -678,7 +756,9 @@ mod tests {
     #[test]
     fn a_disabled_cache_still_evicts_what_an_enabled_one_wrote() {
         let base = scratch_base("evict-disabled");
-        WebCache::new(&base, 900).put(URL, "text").expect("put");
+        WebCache::new(&base, 900)
+            .put(URL, "text", false)
+            .expect("put");
         let disabled = WebCache::new(&base, 0);
         assert!(!disabled.is_enabled());
         assert!(
@@ -696,7 +776,7 @@ mod tests {
         let cache = WebCache::new(&base, 0);
         assert!(!cache.is_enabled());
         cache
-            .put(URL, "text")
+            .put(URL, "text", false)
             .expect("put on a disabled cache succeeds");
         assert!(
             !cache.dir().exists(),
@@ -710,7 +790,9 @@ mod tests {
     #[test]
     fn zeroing_the_ttl_retires_entries_already_on_disk() {
         let base = scratch_base("zero-retires");
-        WebCache::new(&base, 900).put(URL, "text").expect("put");
+        WebCache::new(&base, 900)
+            .put(URL, "text", false)
+            .expect("put");
         assert!(WebCache::new(&base, 900).get(URL).is_some());
         assert!(WebCache::new(&base, 0).get(URL).is_none());
     }
@@ -721,7 +803,7 @@ mod tests {
 
         let base = scratch_base("perms");
         let cache = WebCache::new(&base, 900);
-        cache.put(URL, "text").expect("put");
+        cache.put(URL, "text", false).expect("put");
         let dir_mode = std::fs::metadata(cache.dir())
             .expect("dir metadata")
             .permissions()
@@ -746,7 +828,7 @@ mod tests {
         std::fs::create_dir_all(cache.dir()).expect("pre-create");
         std::fs::set_permissions(cache.dir(), std::fs::Permissions::from_mode(0o755))
             .expect("loosen");
-        cache.put(URL, "text").expect("put");
+        cache.put(URL, "text", false).expect("put");
         let mode = std::fs::metadata(cache.dir())
             .expect("dir metadata")
             .permissions()
@@ -763,10 +845,10 @@ mod tests {
 
         let base = scratch_base("overwrite");
         let cache = WebCache::new(&base, 900);
-        cache.put(URL, "first").expect("put");
+        cache.put(URL, "first", false).expect("put");
         std::fs::set_permissions(cache.path_for(URL), std::fs::Permissions::from_mode(0o644))
             .expect("loosen entry");
-        cache.put(URL, "second").expect("re-put");
+        cache.put(URL, "second", false).expect("re-put");
         assert_eq!(cache.get(URL).expect("hit").content, "second");
         let mode = std::fs::metadata(cache.path_for(URL))
             .expect("entry metadata")
@@ -795,7 +877,7 @@ mod tests {
         let base = scratch_base("key");
         let cache = WebCache::new(&base, 900);
         cache
-            .put("HTTPS://Example.com/a#frag", "text")
+            .put("HTTPS://Example.com/a#frag", "text", false)
             .expect("put");
         assert!(
             cache.get("https://example.com/a").is_some(),
@@ -831,7 +913,7 @@ mod tests {
                 std::thread::spawn(move || {
                     for round in 0..32 {
                         cache
-                            .put(URL, &format!("worker {worker} round {round}"))
+                            .put(URL, &format!("worker {worker} round {round}"), false)
                             .expect("a concurrent put must not fail on a shared temp name");
                     }
                 })
@@ -862,13 +944,17 @@ mod tests {
     fn a_write_unlinks_entries_that_are_past_the_window() {
         let base = scratch_base("sweep-stale");
         let cache = WebCache::new(&base, 900);
-        cache.put("https://example.com/old", "old").expect("put");
-        cache.put("https://example.com/new", "new").expect("put");
+        cache
+            .put("https://example.com/old", "old", false)
+            .expect("put");
+        cache
+            .put("https://example.com/new", "new", false)
+            .expect("put");
         let old = cache.path_for("https://example.com/old");
         set_written_at(&old, now_secs() - 7_200);
 
         cache
-            .put("https://example.com/third", "third")
+            .put("https://example.com/third", "third", false)
             .expect("put");
 
         assert!(!old.exists(), "an unservable entry must not hold disk");
@@ -947,7 +1033,7 @@ mod tests {
         std::fs::write(&live, b"in flight").expect("write");
         set_written_at(&abandoned, now - ORPHAN_TEMP_MAX_AGE_SECS - 60);
 
-        cache.put(URL, "text").expect("put");
+        cache.put(URL, "text", false).expect("put");
 
         assert!(
             !abandoned.exists(),

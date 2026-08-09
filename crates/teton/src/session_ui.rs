@@ -488,9 +488,16 @@ fn format_web_consent(decided: &WebConsentDecided) -> String {
         // The only answer that changed a file, and it says so: BR-4 makes this
         // the sole consent path that writes config, and a user who picked it
         // should not have to check the file to learn whether it took.
+        //
+        // The key named here is the key that was written. It used to name `[web]
+        // tier`, which is the raise-only ceiling and is a no-op for every prompt
+        // a user can actually reach; the durable effect is the per-tier consent
+        // list, and naming the wrong key sent anyone who went looking to a line
+        // that had not changed. The `+=` is deliberate: this answer adds one
+        // tier and leaves the other two asking (BR-3).
         (true, WebConsentScope::Persistent) => format!(
             "web consent: `{tier}` enabled permanently — written to your config as \
-             `[web] tier = \"{tier}\"`"
+             `[web] permission_allow += \"{tier}\"`"
         ),
         (false, WebConsentScope::Session) => {
             format!("web consent: `{tier}` declined for the rest of this session")
@@ -1785,6 +1792,23 @@ mod tests {
                 if granted { "web: fetch" } else { "web: off" },
                 "only a grant raises the status field"
             );
+            // And it names the key that was written. It used to name `[web]
+            // tier`, the raise-only ceiling — which is checked *before* any
+            // prompt exists and so is a no-op for every prompt a user can
+            // reach, sending anyone who went looking to a line that had not
+            // changed. The durable effect is the per-tier consent list.
+            if scope == WebConsentScope::Persistent && granted {
+                assert!(
+                    surface.any_line_contains(LineKind::Notice, "permission_allow"),
+                    "the notice must name the key the answer wrote: {:?}",
+                    surface.calls
+                );
+                assert!(
+                    !surface.any_line_contains(LineKind::Notice, "tier ="),
+                    "the notice points at a key this answer does not change: {:?}",
+                    surface.calls
+                );
+            }
         }
     }
 
