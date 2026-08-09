@@ -34,8 +34,9 @@
 //! terminal — is therefore **not covered here**; see the REQ's verification
 //! notes.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -127,7 +128,26 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn spawn(daemon: &Path) -> Self {
-        let root = PathBuf::from("/tmp").join(format!("tcpty{:x}", std::process::id()));
+        Self::spawn_with(daemon, "", &["scripted reply"])
+    }
+
+    /// A daemon whose config carries `extra` (one more TOML table) and whose
+    /// scripted tier replays `replies`, one per model call.
+    ///
+    /// REQ-563 needs both: `[web] tier` is config rather than a flag (web lookup
+    /// is off by default, BR-1), and a lookup only happens if the scripted tier
+    /// emits the tool call that asks for one.
+    fn spawn_with(daemon: &Path, extra: &str, replies: &[&str]) -> Self {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        // Per-daemon, so two tests in this file never share a root, a socket, or
+        // the single-instance flock — and so neither `drop` deletes the other's
+        // working directory. Short, because the root becomes an
+        // `XDG_RUNTIME_DIR` and the socket under it has to fit in `SUN_LEN`.
+        let root = PathBuf::from("/tmp").join(format!(
+            "tcpty{:x}-{:x}",
+            std::process::id() & 0xffff,
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
         let runtime_dir = root.join("x");
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let config_path = root.join("config.toml");
@@ -135,15 +155,18 @@ impl TestDaemon {
         // and no weights are needed for what this file asserts.
         std::fs::write(
             &config_path,
-            "[[providers]]\nid = \"deepseek\"\nkind = \"openai-compatible\"\n\
-             endpoint = \"https://api.deepseek.com\"\n\n\
-             [local_model]\nauto_accept = false\nbase_url = \"http://127.0.0.1:9\"\n",
+            format!(
+                "[[providers]]\nid = \"deepseek\"\nkind = \"openai-compatible\"\n\
+                 endpoint = \"https://api.deepseek.com\"\n\n\
+                 [local_model]\nauto_accept = false\nbase_url = \"http://127.0.0.1:9\"\n\n\
+                 {extra}"
+            ),
         )
         .unwrap();
         // A scripted tier: the engine is present from construction, so no
         // consent prompt stands between the session and the entry prompt.
         let script = root.join("local_script.txt");
-        std::fs::write(&script, "scripted reply").unwrap();
+        std::fs::write(&script, replies.join("\n---\n")).unwrap();
 
         let log = std::fs::File::create(root.join("tetond.log")).unwrap();
         let child = std::process::Command::new(daemon)
@@ -264,4 +287,111 @@ fn an_idle_session_renders_an_event_with_nothing_typed() {
          screen — the entry loop is not draining events between turns (BR-1). \
          Nothing was typed into the pty. Transcript:\n{final_transcript}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-563 AC-6: the web capability's status row (TASK-078)
+// ---------------------------------------------------------------------------
+
+/// AC-6's status-line clause, at a real terminal.
+///
+/// `main::paint_status` draws the web row above the framed entry prompt, and the
+/// framed prompter exists only at a TTY — REQ-556 BR-2 keeps a piped run
+/// byte-identical to what it was, so `cli_e2e.rs` is *structurally* blind to
+/// this row and this file is the only place it can be observed.
+///
+/// The row is deliberately absent until the capability is engaged (BR-1: a
+/// machine that never opted in must see the layout it always saw), so the test
+/// has to engage it: a scripted turn asks for a page, the user answers the
+/// consent prompt, and the `web_consent_decided` that comes back is what raises
+/// the field. The fetch target is a loopback port nothing listens on, so
+/// nothing reaches a network.
+#[test]
+fn the_status_row_shows_the_session_s_web_capability() {
+    let Some(daemon_path) = daemon_or_skip() else {
+        return;
+    };
+    let url = format!("http://127.0.0.1:{}/tokio", closed_port());
+    let tool_call = format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{url}\"}}}}");
+    // Every tier bound to the local (scripted) tier, so the turn is served here
+    // rather than resolving to the unreachable remote provider — the same
+    // binding `cli_e2e`'s fixture makes, for the same REQ-558 reason.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!(
+        "[[providers]]\nid = \"local\"\nkind = \"local\"\n\n\
+         {tiers}\
+         [web]\ntier = \"fetch_any_url\"\n"
+    );
+    let daemon = TestDaemon::spawn_with(
+        &daemon_path,
+        &config,
+        &[&tool_call, "I could not reach that page."],
+    );
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    // Non-vacuity: nothing has engaged the capability yet, so no row is drawn.
+    assert!(
+        !snapshot(&transcript).contains("web:"),
+        "the status row must be absent until the capability is engaged (BR-1); \
+         transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer
+        .write_all(b"what does the tokio page say about task pinning?\r")
+        .expect("type the prompt");
+    writer.flush().ok();
+
+    assert!(
+        wait_for(&transcript, "permission requested: web_fetch"),
+        "the lookup never asked for consent; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    writer.write_all(b"y\r").expect("answer the prompt");
+    writer.flush().ok();
+
+    let shown = wait_for(&transcript, "web: fetch");
+    let final_transcript = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(
+        shown,
+        "the status row never reported this session's web capability (AC-6); \
+         transcript:\n{final_transcript}\ndaemon log:\n{}",
+        std::fs::read_to_string(daemon.root.join("tetond.log")).unwrap_or_default()
+    );
+}
+
+/// A loopback port with nothing listening on it.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
 }

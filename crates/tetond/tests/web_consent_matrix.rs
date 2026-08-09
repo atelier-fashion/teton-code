@@ -1,0 +1,1327 @@
+//! REQ-563 acceptance: the consent, gradation, allowlist, taint and
+//! search/redact-coupling matrix (TASK-078).
+//!
+//! Its sibling `web_lookup_egress.rs` asks "did bytes leave"; this file asks
+//! "who said they could". Both instruments are the same — a recording
+//! `Transport` behind the real choke point, and a real
+//! [`PermissionGate`](tetond::harness::permissions::PermissionGate) driven by a
+//! task that answers its prompts the way a client does — because every claim
+//! here is ultimately about a packet that did or did not happen.
+//!
+//! ## AC → test map
+//!
+//! | AC | Test |
+//! |----|------|
+//! | AC-2 (deny) | [`a_denied_lookup_puts_no_packet_on_the_wire`] |
+//! | AC-2 (once) | [`allow_once_permits_exactly_one_lookup_and_asks_again`] |
+//! | AC-2 (session) | [`allow_for_this_session_lasts_to_session_end_and_not_beyond`] |
+//! | AC-2 (permanent) | [`enable_permanent_writes_a_ceiling_the_next_daemon_start_honours`] |
+//! | AC-4 | [`tier_gradation_refusals_name_the_missing_tier`] |
+//! | AC-9 | [`the_allowlist_constrains_model_chosen_destinations_only`] |
+//! | AC-12 (notice, paste, override) | [`the_taint_notice_names_cause_and_effect_and_a_paste_still_works`] |
+//! | AC-12 (RPC-only) | [`only_the_client_rpc_can_lift_the_restriction`] |
+//! | AC-12 (no such tool) | [`no_tool_is_named_for_the_override_or_the_refresh`] |
+//! | AC-13 (gate ⇔ tier) | [`a_search_with_no_gate_installed_is_a_block_not_a_skip`] |
+//! | AC-13 (Unavailable) | [`an_unavailable_scan_blocks_the_query_and_sends_nothing`] |
+//! | AC-13 (loaderless) | [`on_a_loaderless_build_the_real_search_gate_refuses_every_query`] |
+//!
+//! ## Falsification (LESSON-479)
+//!
+//! Every refusal below is paired in the same test with the *permissive* run of
+//! the same scenario, and that run asserts the lookup genuinely reached the
+//! transport. Only the thing under test is flipped — a tier, an allowlist, a
+//! session flag, a consent answer — and never production code.
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use tokio::runtime::Handle;
+
+use teton_core::category::CategoryTable;
+use teton_core::config::{Config, WebConfig, WebTier};
+use teton_protocol::events::{
+    BlockCause, Event, WebConsentScope, WebLookupOutcome, OPTION_ID_ENABLE_PERMANENT,
+};
+use teton_protocol::methods::{PermissionOutcome, WebOverrideParams};
+use teton_protocol::{RequestId, SessionId};
+use teton_providers::transport::{Transport, TransportError, TransportRequest, TransportResponse};
+
+use tetond::broadcast::EventBus;
+use tetond::egress::{
+    Authorship, Egress, LookupContext, LookupDetail, LookupRecord, LookupRecorder, LookupRequest,
+    NoopSink, RedactionGate, RedactionVerdict, TaintView,
+};
+use tetond::harness::permissions::{
+    PendingPermissions, PermissionConfig, PermissionGate, PermissionPolicy, WebTierPersistence,
+};
+use tetond::harness::tools::web::{
+    register_web_tool, SeamError, WebLookupSeam, PERMISSION_KEY_FETCH, WEB_TOOL_NAME,
+};
+use tetond::harness::{Tool, ToolContext, ToolOutcome, ToolRegistry};
+use tetond::router::Router;
+use tetond::runtime::DaemonRuntime;
+use tetond::web::{UserUrls, WebCache};
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+type ScriptedAnswer = Result<(u16, Option<String>, Vec<u8>), TransportError>;
+
+/// A `Transport` that records every request instead of sending it — the
+/// `egress_capture.rs` instrument, with a script so a lookup can be answered.
+#[derive(Clone, Default)]
+struct LookupCapture {
+    sent: Arc<Mutex<Vec<TransportRequest>>>,
+    script: Arc<Mutex<VecDeque<ScriptedAnswer>>>,
+}
+
+impl LookupCapture {
+    fn answering(body: &str) -> Self {
+        Self {
+            sent: Arc::new(Mutex::new(Vec::new())),
+            script: Arc::new(Mutex::new(
+                std::iter::repeat_n(Ok((200, None, body.as_bytes().to_vec())), 8).collect(),
+            )),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.sent.lock().unwrap().len()
+    }
+
+    fn urls(&self) -> Vec<String> {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.url.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Transport for LookupCapture {
+    async fn execute(
+        &self,
+        request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
+        self.sent.lock().unwrap().push(request);
+        let next = self
+            .script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok((200, None, Vec::new())));
+        let (status, location, body) = next?;
+        Ok(TransportResponse {
+            status,
+            location,
+            body: Box::pin(futures::stream::once(async move { Ok(body) })),
+        })
+    }
+}
+
+/// The two session flags the taint gate reads.
+#[derive(Default)]
+struct Flags {
+    tainted: bool,
+    overridden: bool,
+}
+
+impl TaintView for Flags {
+    fn is_tainted(&self, _session: &SessionId) -> bool {
+        self.tainted
+    }
+
+    fn is_overridden(&self, _session: &SessionId) -> bool {
+        self.overridden
+    }
+}
+
+#[derive(Default)]
+struct Recorder {
+    records: Mutex<Vec<LookupRecord>>,
+}
+
+impl Recorder {
+    fn outcomes(&self) -> Vec<WebLookupOutcome> {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.outcome)
+            .collect()
+    }
+}
+
+impl LookupRecorder for Recorder {
+    fn web_lookup(&self, _session_id: &SessionId, record: &LookupRecord) {
+        self.records.lock().unwrap().push(record.clone());
+    }
+}
+
+/// The harness-facing seam over the real choke point.
+struct CaptureSeam {
+    egress: Egress<LookupCapture>,
+    taint: Flags,
+    session: SessionId,
+    endpoint: Option<String>,
+    recorder: Arc<Recorder>,
+}
+
+#[async_trait]
+impl WebLookupSeam for CaptureSeam {
+    async fn lookup(
+        &self,
+        request: &LookupRequest,
+        hop_allowed: &(dyn for<'h> Fn(&'h str) -> bool + Send + Sync),
+    ) -> Result<tetond::egress::LookupOutcome, SeamError> {
+        let mut ctx = LookupContext::new(self.session.clone(), &self.taint, hop_allowed);
+        if let Some(endpoint) = &self.endpoint {
+            ctx = ctx.with_search_endpoint(endpoint);
+        }
+        Ok(self.egress.lookup(request, &ctx).await)
+    }
+
+    fn record_without_egress(&self, record: &LookupRecord) {
+        self.recorder.web_lookup(&self.session, record);
+    }
+}
+
+/// A gate that forwards everything.
+struct ForwardingGate;
+
+#[async_trait]
+impl RedactionGate for ForwardingGate {
+    async fn scan(&self, _payload: &str) -> RedactionVerdict {
+        RedactionVerdict::clean()
+    }
+}
+
+/// A gate whose scan **could not run** — the verdict a loaderless machine's
+/// composite scanner mints (runtime.rs pins that equivalence).
+struct UnavailableGate;
+
+#[async_trait]
+impl RedactionGate for UnavailableGate {
+    async fn scan(&self, _payload: &str) -> RedactionVerdict {
+        RedactionVerdict::unavailable()
+    }
+}
+
+/// Records the tier `enable_permanent` asked to persist, and writes it to a
+/// real config file through the **production** serializer.
+///
+/// The daemon's own sink is `DaemonRuntime::persist_web_tier` (whose atomic
+/// write and validation are covered by its unit tests). What this proves is the
+/// half a unit test of that function cannot: that the tier the *consent round
+/// trip* hands over is the tier a later start reads back.
+struct FileTierSink {
+    path: PathBuf,
+    asked: Mutex<Vec<WebTier>>,
+}
+
+impl WebTierPersistence for FileTierSink {
+    fn persist_web_tier(&self, tier: WebTier) -> Result<(), String> {
+        self.asked.lock().unwrap().push(tier);
+        let mut config = Config::default();
+        config.web.tier = tier;
+        let toml = config.to_toml().map_err(|e| e.to_string())?;
+        std::fs::write(&self.path, toml).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// One consent question, as it reached a client: the grant key it was asked
+/// under, the description the user reads, and the option ids on offer.
+#[derive(Clone)]
+struct Prompt {
+    key: String,
+    description: String,
+    options: Vec<String>,
+}
+
+/// A task that answers permission prompts the way a client does.
+///
+/// It records every prompt it saw — the tool name, the description, and the
+/// option ids — which is what AC-2's "the prompt shows the verbatim query/URL
+/// and the destination host" is asserted against.
+struct Answerer {
+    prompts: Arc<Mutex<Vec<Prompt>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Answerer {
+    /// Answer prompts with `script`, in order; a prompt past the end of the
+    /// script is cancelled (which the gate reads as a denial).
+    fn spawn(
+        bus: &Arc<EventBus>,
+        pending: &Arc<PendingPermissions>,
+        script: Vec<&'static str>,
+    ) -> Self {
+        let mut sub = bus.subscribe(64);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&prompts);
+        let pending = Arc::clone(pending);
+        let handle = tokio::spawn(async move {
+            let mut script = script.into_iter();
+            while let Some(envelope) = sub.recv().await {
+                let Event::PermissionRequest(request) = envelope.event else {
+                    continue;
+                };
+                seen.lock().unwrap().push(Prompt {
+                    key: request.tool_name.clone(),
+                    description: request.description.clone().unwrap_or_default(),
+                    options: request
+                        .options
+                        .iter()
+                        .map(|o| o.option_id.clone())
+                        .collect(),
+                });
+                answer(&pending, &request.request_id, script.next());
+            }
+        });
+        Self { prompts, handle }
+    }
+
+    fn prompts(&self) -> Vec<Prompt> {
+        self.prompts.lock().unwrap().clone()
+    }
+
+    fn count(&self) -> usize {
+        self.prompts.lock().unwrap().len()
+    }
+}
+
+impl Drop for Answerer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn answer(pending: &PendingPermissions, id: &RequestId, option: Option<&'static str>) {
+    let outcome = match option {
+        Some(option_id) => PermissionOutcome::Selected {
+            option_id: option_id.to_owned(),
+        },
+        None => PermissionOutcome::Cancelled,
+    };
+    pending.resolve(id, outcome);
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "teton-webconsent-{tag}-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A tool, its transport, its recorder, and everything needed to answer its
+/// prompts — the whole of one machine's web capability, assembled from the real
+/// parts.
+struct Fixture {
+    tool: Arc<dyn Tool>,
+    tools: ToolRegistry,
+    transport: LookupCapture,
+    recorder: Arc<Recorder>,
+    bus: Arc<EventBus>,
+    pending: Arc<PendingPermissions>,
+    ctx: ToolContext,
+    dir: PathBuf,
+    registered: bool,
+}
+
+impl Fixture {
+    fn run(&self, args: &Value) -> ToolOutcome {
+        self.tool.run(&self.ctx, args)
+    }
+
+    fn fetch(&self, url: &str) -> ToolOutcome {
+        self.run(&json!({ "url": url }))
+    }
+
+    fn search(&self, query: &str) -> ToolOutcome {
+        self.run(&json!({ "query": query }))
+    }
+
+    fn cleanup(self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+/// How a fixture's machine is configured. Each field is one thing an assertion
+/// below flips.
+struct Setup {
+    tier: WebTier,
+    policy: PermissionPolicy,
+    allowed_domains: Option<Vec<String>>,
+    search_endpoint: Option<String>,
+    pasted: Vec<String>,
+    tainted: bool,
+    overridden: bool,
+    persistence: Option<Arc<FileTierSink>>,
+    search_gate: Option<Arc<dyn RedactionGate>>,
+}
+
+impl Setup {
+    fn at(tier: WebTier) -> Self {
+        Self {
+            tier,
+            policy: PermissionPolicy::Allow,
+            allowed_domains: None,
+            search_endpoint: None,
+            pasted: Vec::new(),
+            tainted: false,
+            overridden: false,
+            persistence: None,
+            search_gate: None,
+        }
+    }
+
+    fn policy(mut self, policy: PermissionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    fn allowing(mut self, domains: &[&str]) -> Self {
+        self.allowed_domains = Some(domains.iter().map(|d| (*d).to_owned()).collect());
+        self
+    }
+
+    fn pasted(mut self, url: &str) -> Self {
+        self.pasted.push(url.to_owned());
+        self
+    }
+
+    fn tainted(mut self) -> Self {
+        self.tainted = true;
+        self
+    }
+
+    fn overridden(mut self) -> Self {
+        self.overridden = true;
+        self
+    }
+
+    fn searching(mut self, endpoint: &str, gate: Arc<dyn RedactionGate>) -> Self {
+        self.search_endpoint = Some(endpoint.to_owned());
+        self.search_gate = Some(gate);
+        self
+    }
+
+    fn persisting(mut self, sink: Arc<FileTierSink>) -> Self {
+        self.persistence = Some(sink);
+        self
+    }
+
+    fn build(self, tag: &str) -> Fixture {
+        let dir = scratch(tag);
+        let config = WebConfig {
+            tier: self.tier,
+            allowed_domains: self.allowed_domains,
+            search_endpoint: self.search_endpoint.clone(),
+            ..WebConfig::default()
+        };
+
+        let transport = LookupCapture::answering("<html><body>a page</body></html>");
+        let recorder = Arc::new(Recorder::default());
+        let mut egress = Egress::new(transport.clone(), Vec::new(), Arc::new(NoopSink))
+            .with_lookup_recorder(Arc::clone(&recorder) as Arc<dyn LookupRecorder>);
+        if let Some(gate) = self.search_gate {
+            egress = egress.with_search_redaction_gate(gate);
+        }
+
+        let session_id = SessionId::from("web-consent");
+        let seam = Arc::new(CaptureSeam {
+            egress,
+            taint: Flags {
+                tainted: self.tainted,
+                overridden: self.overridden,
+            },
+            session: session_id.clone(),
+            endpoint: self.search_endpoint,
+            recorder: Arc::clone(&recorder),
+        });
+
+        let bus = Arc::new(EventBus::new());
+        let pending = Arc::new(PendingPermissions::new());
+        let mut gate = PermissionGate::new(
+            session_id,
+            PermissionConfig::with_default(self.policy),
+            Arc::clone(&bus),
+            Arc::clone(&pending),
+        );
+        if let Some(sink) = self.persistence {
+            gate = gate.with_web_persistence(sink as Arc<dyn WebTierPersistence>);
+        }
+
+        let mut urls = UserUrls::new();
+        for url in &self.pasted {
+            urls.insert(url);
+        }
+
+        let mut tools = ToolRegistry::with_builtins();
+        let registered = register_web_tool(
+            &mut tools,
+            &config,
+            WebCache::from_config(&dir, &config),
+            Arc::new(Mutex::new(urls)),
+            Arc::new(gate),
+            Arc::clone(&seam) as Arc<dyn WebLookupSeam>,
+            Handle::current(),
+        );
+        let tool = Arc::clone(
+            tools
+                .get(WEB_TOOL_NAME)
+                .expect("a tier above `off` registers the tool"),
+        );
+
+        Fixture {
+            tool,
+            tools,
+            transport,
+            recorder,
+            bus,
+            pending,
+            ctx: ToolContext::new(&dir),
+            dir,
+            registered,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC-2 — the consent scopes
+// ---------------------------------------------------------------------------
+
+const DOCS_URL: &str = "https://docs.rs/tokio/latest/tokio/";
+
+/// AC-2, deny: the user declines and **no packet leaves** — plus the prompt
+/// they declined showed the verbatim URL and the destination host.
+///
+/// Falsified in place: the same fixture, the same URL, answered `allow_once`
+/// instead, does reach the transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_denied_lookup_puts_no_packet_on_the_wire() {
+    let fx = Setup::at(WebTier::FetchAnyUrl)
+        .policy(PermissionPolicy::Ask)
+        .build("deny");
+    let answerer = Answerer::spawn(&fx.bus, &fx.pending, vec!["reject_once", "allow_once"]);
+
+    // --- the denial --------------------------------------------------------
+    let denied = fx.fetch(DOCS_URL);
+    assert!(denied.is_error, "a declined lookup is not a result");
+    assert!(
+        denied.content.contains("Permission denied"),
+        "{}",
+        denied.content
+    );
+    assert_eq!(
+        fx.transport.calls(),
+        0,
+        "AC-2: a denied lookup must put no packet on the wire"
+    );
+    assert!(
+        fx.recorder.outcomes().is_empty(),
+        "a refusal the user made is the `permission_request`'s record, not a lookup row"
+    );
+
+    // BR-4: the question was concrete — the verbatim URL and the host.
+    let prompts = answerer.prompts();
+    assert_eq!(prompts.len(), 1, "exactly one question was asked");
+    let asked = &prompts[0];
+    assert_eq!(
+        asked.key, PERMISSION_KEY_FETCH,
+        "BR-3: the grant key is the tier's, never the tool's name"
+    );
+    assert!(
+        asked.description.contains(DOCS_URL),
+        "the prompt must show the verbatim URL: {}",
+        asked.description
+    );
+    assert!(
+        asked.description.contains("docs.rs"),
+        "the prompt must name the destination host: {}",
+        asked.description
+    );
+    assert!(
+        asked
+            .options
+            .contains(&OPTION_ID_ENABLE_PERMANENT.to_owned()),
+        "BR-4's four choices include enabling permanently: {:?}",
+        asked.options
+    );
+
+    // --- falsification: the same lookup, allowed ---------------------------
+    let allowed = fx.fetch(DOCS_URL);
+    assert!(!allowed.is_error, "{}", allowed.content);
+    assert_eq!(
+        fx.transport.calls(),
+        1,
+        "the allow leg has to send, or the zero above measures nothing"
+    );
+    assert_eq!(
+        answerer.count(),
+        2,
+        "and it was asked again, not remembered"
+    );
+
+    fx.cleanup();
+}
+
+/// AC-2, allow-once: one answer buys exactly one lookup, and the next one asks
+/// again.
+///
+/// The second question is the falsification: a grant that had silently widened
+/// to the session would show one prompt and two lookups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_once_permits_exactly_one_lookup_and_asks_again() {
+    let fx = Setup::at(WebTier::FetchAnyUrl)
+        .policy(PermissionPolicy::Ask)
+        .build("once");
+    // One `allow_once`, then nothing: the second prompt is cancelled.
+    let answerer = Answerer::spawn(&fx.bus, &fx.pending, vec!["allow_once"]);
+
+    let first = fx.fetch(DOCS_URL);
+    assert!(!first.is_error, "{}", first.content);
+    assert_eq!(fx.transport.calls(), 1);
+
+    // The cache would answer the second lookup for free, so ask for a
+    // *different* URL — otherwise this would be measuring BR-12, not BR-3.
+    let second = fx.fetch("https://docs.rs/serde/latest/serde/");
+    assert!(second.is_error, "an unanswered prompt must not allow");
+    assert_eq!(
+        fx.transport.calls(),
+        1,
+        "allow-once bought exactly one lookup"
+    );
+    assert_eq!(answerer.count(), 2, "and the second lookup asked again");
+
+    fx.cleanup();
+}
+
+/// AC-2, allow-for-session: the grant lasts to session end **and not beyond**.
+///
+/// "Not beyond" is asserted against a second gate — which is what a second
+/// session is, since grants live on the gate and nowhere else. It is the
+/// falsification leg too: without it, "no second prompt" could be a gate that
+/// stopped prompting altogether.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_for_this_session_lasts_to_session_end_and_not_beyond() {
+    let fx = Setup::at(WebTier::FetchAnyUrl)
+        .policy(PermissionPolicy::Ask)
+        .build("session");
+    let answerer = Answerer::spawn(&fx.bus, &fx.pending, vec!["allow_always"]);
+
+    let first = fx.fetch(DOCS_URL);
+    assert!(!first.is_error, "{}", first.content);
+    let second = fx.fetch("https://docs.rs/serde/latest/serde/");
+    assert!(!second.is_error, "{}", second.content);
+
+    assert_eq!(fx.transport.calls(), 2, "both lookups ran");
+    assert_eq!(
+        answerer.count(),
+        1,
+        "the second lookup was covered by the session grant"
+    );
+
+    // A grant is remembered under the *key it was asked about*, so a search
+    // never inherits a fetch's answer (BR-3). Asked here because the whole
+    // point of two keys is that this stays false.
+    let searched = fx.search("tokio task pinning");
+    assert!(
+        searched.is_error,
+        "a fetch grant must not authorize a search: {}",
+        searched.content
+    );
+
+    // --- "not beyond": a fresh session is a fresh gate --------------------
+    let next_session = Setup::at(WebTier::FetchAnyUrl)
+        .policy(PermissionPolicy::Ask)
+        .build("session-next");
+    let next_answerer = Answerer::spawn(
+        &next_session.bus,
+        &next_session.pending,
+        vec!["reject_once"],
+    );
+    let after = next_session.fetch(DOCS_URL);
+    assert!(
+        after.is_error,
+        "a session grant must not survive the session: {}",
+        after.content
+    );
+    assert_eq!(
+        next_answerer.count(),
+        1,
+        "the new session asked the question again"
+    );
+    assert_eq!(next_session.transport.calls(), 0);
+
+    fx.cleanup();
+    next_session.cleanup();
+}
+
+/// AC-2, enable-permanently: the answer writes the ceiling to config, the
+/// decision is announced at the scope it actually achieved, and a **later
+/// start reading that file** has the capability.
+///
+/// The last clause is the one that matters and the one a memory-only test could
+/// not make: the written bytes are parsed back through the production loader,
+/// and `register_web_tool` — the single place the "is this machine opted in"
+/// condition is expressed (D-1) — is asked about the reloaded config. It
+/// answered `false` before the consent and must answer `true` after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enable_permanent_writes_a_ceiling_the_next_daemon_start_honours() {
+    let dir = scratch("permanent");
+    let config_path = dir.join("config.toml");
+    let sink = Arc::new(FileTierSink {
+        path: config_path.clone(),
+        asked: Mutex::new(Vec::new()),
+    });
+
+    // Non-vacuity: this machine is genuinely opted out before the answer.
+    let mut before = ToolRegistry::with_builtins();
+    assert!(
+        !register_web_tool(
+            &mut before,
+            &WebConfig::default(),
+            WebCache::from_config(&dir, &WebConfig::default()),
+            Arc::new(Mutex::new(UserUrls::new())),
+            Arc::new(PermissionGate::new(
+                SessionId::from("before"),
+                PermissionConfig::permissive(),
+                Arc::new(EventBus::new()),
+                Arc::new(PendingPermissions::new()),
+            )),
+            Arc::new(CaptureSeam {
+                egress: Egress::new(LookupCapture::default(), Vec::new(), Arc::new(NoopSink)),
+                taint: Flags::default(),
+                session: SessionId::from("before"),
+                endpoint: None,
+                recorder: Arc::new(Recorder::default()),
+            }) as Arc<dyn WebLookupSeam>,
+            Handle::current(),
+        ),
+        "BR-1: a default machine has no web tool"
+    );
+
+    // The session that answers "permanently". Its own ceiling is `fetch_any_url`
+    // — the consent option can only ever persist a tier the lookup was already
+    // entitled to.
+    let fx = Setup::at(WebTier::FetchAnyUrl)
+        .policy(PermissionPolicy::Ask)
+        .persisting(Arc::clone(&sink))
+        .build("permanent-session");
+    let mut events = fx.bus.subscribe(32);
+    let answerer = Answerer::spawn(&fx.bus, &fx.pending, vec![OPTION_ID_ENABLE_PERMANENT]);
+
+    let out = fx.fetch(DOCS_URL);
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(fx.transport.calls(), 1);
+    assert_eq!(answerer.count(), 1);
+
+    // The tier handed to the sink is the one this lookup needed.
+    assert_eq!(
+        sink.asked.lock().unwrap().as_slice(),
+        &[WebTier::FetchAnyUrl],
+        "the write must be about the tier the user was asked about"
+    );
+
+    // The decision is announced at the scope it achieved — `persistent`, because
+    // the write landed.
+    let mut decided = None;
+    while let Some(envelope) = events.try_recv() {
+        if let Event::WebConsentDecided(d) = envelope.event {
+            decided = Some(d);
+        }
+    }
+    let decided = decided.expect("a web consent decision was published");
+    assert!(decided.granted);
+    assert_eq!(decided.scope, WebConsentScope::Persistent);
+
+    // --- the restart ------------------------------------------------------
+    let written = std::fs::read_to_string(&config_path).expect("the config was written");
+    let reloaded = Config::load(&written).expect("the written config loads and validates");
+    assert_eq!(
+        reloaded.web.tier,
+        WebTier::FetchAnyUrl,
+        "`[web] tier` did not survive the round trip; file:\n{written}"
+    );
+
+    let mut after = ToolRegistry::with_builtins();
+    assert!(
+        register_web_tool(
+            &mut after,
+            &reloaded.web,
+            WebCache::from_config(&dir, &reloaded.web),
+            Arc::new(Mutex::new(UserUrls::new())),
+            Arc::new(PermissionGate::new(
+                SessionId::from("after"),
+                PermissionConfig::permissive(),
+                Arc::new(EventBus::new()),
+                Arc::new(PendingPermissions::new()),
+            )),
+            Arc::new(CaptureSeam {
+                egress: Egress::new(LookupCapture::default(), Vec::new(), Arc::new(NoopSink)),
+                taint: Flags::default(),
+                session: SessionId::from("after"),
+                endpoint: None,
+                recorder: Arc::new(Recorder::default()),
+            }) as Arc<dyn WebLookupSeam>,
+            Handle::current(),
+        ),
+        "the next start must honour the ceiling the consent wrote"
+    );
+
+    fx.cleanup();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// AC-4 — tier gradation
+// ---------------------------------------------------------------------------
+
+/// AC-4: a lookup above the configured ceiling is refused **naming the missing
+/// tier**, before any prompt and before any packet.
+///
+/// Both rungs of the ladder, and both falsified by the rung above: the same
+/// call at the next tier up proceeds, so the refusal is the ceiling's and not
+/// the tool's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tier_gradation_refusals_name_the_missing_tier() {
+    // --- fetch_user_url refuses a model-composed URL -----------------------
+    let floor = Setup::at(WebTier::FetchUserUrl)
+        .policy(PermissionPolicy::Ask)
+        .build("tier-floor");
+    let floor_answerer = Answerer::spawn(&floor.bus, &floor.pending, vec!["allow_once"]);
+
+    let refused = floor.fetch(DOCS_URL);
+    assert!(refused.is_error);
+    assert!(
+        refused.content.contains("fetch_any_url"),
+        "the refusal must name the tier this needs: {}",
+        refused.content
+    );
+    assert!(
+        refused.content.contains("fetch_user_url"),
+        "and the tier the machine granted: {}",
+        refused.content
+    );
+    assert_eq!(floor.transport.calls(), 0);
+    assert_eq!(
+        floor_answerer.count(),
+        0,
+        "a lookup nobody was going to allow costs zero prompts (D-5)"
+    );
+    assert_eq!(
+        floor.recorder.outcomes(),
+        vec![WebLookupOutcome::RefusedTier],
+        "AC-4's refusal is invisible unless it is recorded"
+    );
+
+    // Falsification A: the same URL, pasted by the user, clears the same floor.
+    let pasted = Setup::at(WebTier::FetchUserUrl)
+        .pasted(DOCS_URL)
+        .build("tier-pasted");
+    let allowed = pasted.fetch(DOCS_URL);
+    assert!(!allowed.is_error, "{}", allowed.content);
+    assert_eq!(pasted.transport.calls(), 1);
+
+    // --- fetch_any_url refuses a search ------------------------------------
+    let middle = Setup::at(WebTier::FetchAnyUrl).build("tier-middle");
+    let no_search = middle.search("tokio task pinning");
+    assert!(no_search.is_error);
+    assert!(
+        no_search.content.contains("search"),
+        "{}",
+        no_search.content
+    );
+    assert!(
+        no_search.content.contains("fetch_any_url"),
+        "{}",
+        no_search.content
+    );
+    assert_eq!(middle.transport.calls(), 0);
+
+    // Falsification B: the same query at the search tier goes out.
+    let top = Setup::at(WebTier::Search)
+        .searching(
+            "https://search.example.test/api",
+            Arc::new(ForwardingGate) as Arc<dyn RedactionGate>,
+        )
+        .build("tier-top");
+    let searched = top.search("tokio task pinning");
+    assert!(!searched.is_error, "{}", searched.content);
+    assert_eq!(top.transport.calls(), 1);
+
+    floor.cleanup();
+    pasted.cleanup();
+    middle.cleanup();
+    top.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// AC-9 — the allowlist
+// ---------------------------------------------------------------------------
+
+/// AC-9: `allowed_domains` constrains **model-chosen** destinations only.
+///
+/// Three legs, one host: refused when the model chose it, allowed when the user
+/// pasted it (BR-11's exemption — their explicit act is its own
+/// authorization), and allowed on the tier grant alone when no allowlist is
+/// configured. The second and third are each other's falsification: an
+/// implementation that refused everything, or one that refused nothing, fails a
+/// different leg.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_allowlist_constrains_model_chosen_destinations_only() {
+    let outside = "https://evil.example.test/page";
+
+    // --- model-chosen, outside the list: refused ---------------------------
+    let listed = Setup::at(WebTier::FetchAnyUrl)
+        .allowing(&["docs.rs"])
+        .build("allow-refuse");
+    let refused = listed.fetch(outside);
+    assert!(refused.is_error);
+    assert!(
+        refused.content.contains("allowed_domains"),
+        "the refusal must name the allowlist: {}",
+        refused.content
+    );
+    assert!(
+        refused.content.contains("docs.rs"),
+        "and say what it does permit: {}",
+        refused.content
+    );
+    assert_eq!(listed.transport.calls(), 0, "and send nothing");
+    assert_eq!(
+        listed.recorder.outcomes(),
+        vec![WebLookupOutcome::RefusedDomain]
+    );
+
+    // Non-vacuity within the same fixture: a host *on* the list goes out.
+    let permitted = listed.fetch(DOCS_URL);
+    assert!(!permitted.is_error, "{}", permitted.content);
+    assert_eq!(listed.transport.calls(), 1);
+
+    // --- the same host, pasted by the user: exempt -------------------------
+    let exempt = Setup::at(WebTier::FetchAnyUrl)
+        .allowing(&["docs.rs"])
+        .pasted(outside)
+        .build("allow-exempt");
+    let out = exempt.fetch(outside);
+    assert!(
+        !out.is_error,
+        "BR-11 exempts a URL the user pasted: {}",
+        out.content
+    );
+    assert_eq!(exempt.transport.calls(), 1);
+
+    // --- no allowlist at all: the tier grant governs alone -----------------
+    let unrestricted = Setup::at(WebTier::FetchAnyUrl).build("allow-none");
+    let out = unrestricted.fetch(outside);
+    assert!(
+        !out.is_error,
+        "BR-11: an absent allowlist is a valid, unrestricted configuration: {}",
+        out.content
+    );
+    assert_eq!(unrestricted.transport.calls(), 1);
+
+    // --- and an allowlist that lists nothing permits nothing ---------------
+    let empty = Setup::at(WebTier::FetchAnyUrl)
+        .allowing(&[])
+        .build("allow-empty");
+    let out = empty.fetch(outside);
+    assert!(
+        out.is_error,
+        "an empty allowlist is the most restrictive posture"
+    );
+    assert_eq!(empty.transport.calls(), 0);
+
+    listed.cleanup();
+    exempt.cleanup();
+    unrestricted.cleanup();
+    empty.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// AC-12 — taint, the notice, and the override
+// ---------------------------------------------------------------------------
+
+/// AC-12: after a boundary read the next model-composed lookup is blocked with
+/// a notice naming **cause and effect**, a user-pasted URL still works in the
+/// same session, and lifting the restriction restores the composed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_taint_notice_names_cause_and_effect_and_a_paste_still_works() {
+    let composed = "https://docs.rs/tokio/latest/tokio/";
+    let pasted = "https://docs.rs/serde/latest/serde/";
+
+    let fx = Setup::at(WebTier::FetchAnyUrl)
+        .tainted()
+        .pasted(pasted)
+        .build("taint");
+
+    // --- the block, and what it says ---------------------------------------
+    let blocked = fx.fetch(composed);
+    assert!(blocked.is_error);
+    let notice = &blocked.content;
+    assert!(
+        notice.contains("privacy-boundary content"),
+        "the notice must name the CAUSE: {notice}"
+    );
+    assert!(
+        notice.contains("model-composed web lookups are restricted"),
+        "the notice must name the EFFECT: {notice}"
+    );
+    assert!(
+        notice.contains("a URL the user pasted still works"),
+        "and what still works: {notice}"
+    );
+    assert!(
+        notice.contains("only the user can lift the restriction"),
+        "and who can lift it: {notice}"
+    );
+    // BUG-152's taxonomy: a restriction is this capability working, never an
+    // error the user is told to debug.
+    assert!(!notice.contains("error:"), "{notice}");
+    assert_eq!(fx.transport.calls(), 0, "and nothing left the machine");
+    assert_eq!(
+        fx.recorder.outcomes(),
+        vec![WebLookupOutcome::TaintRestricted],
+        "the status row reads this event; a silent restriction is invisible"
+    );
+
+    // --- the same tainted session: the user's own paste proceeds -----------
+    let survives = fx.fetch(pasted);
+    assert!(
+        !survives.is_error,
+        "BR-13: the user authored those bytes: {}",
+        survives.content
+    );
+    assert_eq!(fx.transport.calls(), 1, "exactly one of the two went out");
+
+    // --- falsification: the same composed URL with the restriction lifted --
+    let lifted = Setup::at(WebTier::FetchAnyUrl)
+        .tainted()
+        .overridden()
+        .build("taint-lifted");
+    let restored = lifted.fetch(composed);
+    assert!(
+        !restored.is_error,
+        "the override restores model-composed lookups: {}",
+        restored.content
+    );
+    assert_eq!(lifted.transport.calls(), 1);
+
+    fx.cleanup();
+    lifted.cleanup();
+}
+
+/// AC-12, the override's channel: the flag the lookup gate reads is flipped by
+/// the **client RPC** and by nothing a model can reach.
+///
+/// `WebTaintOverride::lift` carries no `pub`, so the only way to reach it from
+/// outside the daemon module is `DaemonRuntime::web_override` — the `web/override`
+/// RPC's handler. That is asserted here by *doing* it: the view the choke point
+/// reads reports the session lifted afterwards, and reports a different session
+/// unlifted (the restriction is session-scoped and never persists — a fresh
+/// session starts restricted-on-taint again).
+#[test]
+fn only_the_client_rpc_can_lift_the_restriction() {
+    let runtime = DaemonRuntime::minimal();
+    let events = Arc::new(EventBus::new());
+    let session = SessionId::from("lift-me");
+    let other = SessionId::from("some-other-session");
+
+    let view = runtime.web_taint_view();
+    assert!(
+        !view.is_overridden(&session),
+        "non-vacuity: nothing is lifted before the RPC"
+    );
+
+    let result = runtime.web_override(
+        &WebOverrideParams {
+            session_id: session.clone(),
+        },
+        &events,
+    );
+    // This runtime's session was never tainted, so nothing was restricted and
+    // nothing is restored — the honest answer, and the one the CLI renders as
+    // "web lookups were never disabled" rather than a false confirmation.
+    assert!(!result.was_restricted);
+    assert!(result.tiers_restored.is_empty());
+
+    assert!(
+        view.is_overridden(&session),
+        "the RPC flipped the flag the lookup gate reads"
+    );
+    assert!(
+        !view.is_overridden(&other),
+        "and only for that session — a fresh session is restricted on taint again"
+    );
+
+    // Session-scoped, never persisted: a new process is a new set.
+    let restarted = DaemonRuntime::minimal();
+    assert!(
+        !restarted.web_taint_view().is_overridden(&session),
+        "the override must never outlive the process (BR-13)"
+    );
+}
+
+/// AC-12, the other half of the RPC-only property: **no tool has these names.**
+///
+/// The registry is the whole surface a model's tool call can reach. A tool
+/// named `web_override` would make "the override is rejected when issued by the
+/// model" a runtime check someone has to remember; its absence is what makes
+/// the rejection structural. Asserted with the web tool *registered*, because
+/// the interesting claim is about the state in which the capability exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_tool_is_named_for_the_override_or_the_refresh() {
+    let fx = Setup::at(WebTier::Search)
+        .searching(
+            "https://search.example.test/api",
+            Arc::new(ForwardingGate) as Arc<dyn RedactionGate>,
+        )
+        .build("no-such-tool");
+
+    assert!(fx.registered, "non-vacuity: the web capability IS present");
+    assert!(
+        fx.tools.get(WEB_TOOL_NAME).is_some(),
+        "and the model can reach the lookup tool"
+    );
+
+    for forbidden in [
+        "web_override",
+        "web override",
+        "override",
+        "web/override",
+        "web_refresh",
+        "web refresh",
+        "refresh",
+        "web/refresh",
+    ] {
+        assert!(
+            fx.tools.get(forbidden).is_none(),
+            "`{forbidden}` is reachable from tool dispatch, so a model could issue it"
+        );
+    }
+    // Belt and braces over the whole namespace: no registered tool mentions
+    // either verb, whatever it is spelled.
+    for name in fx.tools.names() {
+        assert!(
+            !name.contains("override") && !name.contains("refresh"),
+            "`{name}` is a tool the model can call, and it names a user-only action"
+        );
+    }
+
+    fx.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// AC-13 — the search/redact coupling
+// ---------------------------------------------------------------------------
+
+const SEARCH_ENDPOINT: &str = "https://search.example.test/api";
+
+/// AC-13: the search gate's presence is the difference between a query that
+/// goes out and one that does not — a guard that cannot run is a **block**, not
+/// a skip (LESSON-492).
+///
+/// This is the observable form of "the gate is installed exactly when the tier
+/// is `search`": the daemon installs it on that condition (pinned in
+/// `runtime.rs` against `Egress::installed`, which is crate-private and so
+/// cannot be read from here), and what an absent gate then *does* is this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_with_no_gate_installed_is_a_block_not_a_skip() {
+    let transport = LookupCapture::answering("{\"results\":[]}");
+    let recorder = Arc::new(Recorder::default());
+    // No `with_search_redaction_gate` — the choke point a non-`search` tier
+    // builds.
+    let ungated = Egress::new(transport.clone(), Vec::new(), Arc::new(NoopSink))
+        .with_lookup_recorder(Arc::clone(&recorder) as Arc<dyn LookupRecorder>);
+    let clean = Flags::default();
+    let ctx = LookupContext::new("sess-13", &clean, &allow_any_host)
+        .with_search_endpoint(SEARCH_ENDPOINT);
+
+    let refused = ungated
+        .lookup(
+            &LookupRequest::search("tokio task pinning", Authorship::ModelComposed),
+            &ctx,
+        )
+        .await;
+
+    assert_eq!(refused.outcome(), WebLookupOutcome::BlockedRedact);
+    assert_eq!(
+        refused.detail(),
+        &LookupDetail::Blocked {
+            cause: BlockCause::ScanUnavailable
+        },
+        "a missing guard is the strongest form of a guard that cannot run"
+    );
+    assert_eq!(transport.calls(), 0, "an unscanned query must not leave");
+    assert_eq!(recorder.outcomes(), vec![WebLookupOutcome::BlockedRedact]);
+
+    // --- falsification: the same choke point WITH the gate installed -------
+    let gated_transport = LookupCapture::answering("{\"results\":[]}");
+    let gated = Egress::new(gated_transport.clone(), Vec::new(), Arc::new(NoopSink))
+        .with_search_redaction_gate(Arc::new(ForwardingGate));
+    let ctx = LookupContext::new("sess-13", &clean, &allow_any_host)
+        .with_search_endpoint(SEARCH_ENDPOINT);
+    let sent = gated
+        .lookup(
+            &LookupRequest::search("tokio task pinning", Authorship::ModelComposed),
+            &ctx,
+        )
+        .await;
+    assert_eq!(sent.outcome(), WebLookupOutcome::Completed);
+    assert_eq!(gated_transport.calls(), 1);
+    assert!(
+        gated_transport.urls()[0].contains("q=tokio"),
+        "and it is the query that went: {:?}",
+        gated_transport.urls()
+    );
+}
+
+/// AC-13: a transient scan failure blocks **that query** while the turn
+/// completes — the model is told, in one sentence, and continues.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unavailable_scan_blocks_the_query_and_sends_nothing() {
+    let fx = Setup::at(WebTier::Search)
+        .searching(
+            SEARCH_ENDPOINT,
+            Arc::new(UnavailableGate) as Arc<dyn RedactionGate>,
+        )
+        .build("scan-unavailable");
+
+    let out = fx.search("tokio task pinning");
+    assert!(
+        out.is_error,
+        "a query that could not be scanned must not run"
+    );
+    assert_eq!(fx.transport.calls(), 0);
+    assert_eq!(
+        fx.recorder.outcomes(),
+        vec![WebLookupOutcome::BlockedRedact]
+    );
+    // BR-9: still a sentence the model can continue from, never a turn error.
+    assert!(
+        out.content.contains("State that and continue"),
+        "the model must be able to carry on: {}",
+        out.content
+    );
+
+    // --- falsification: the same query, the same tier, a scan that ran -----
+    let ok = Setup::at(WebTier::Search)
+        .searching(
+            SEARCH_ENDPOINT,
+            Arc::new(ForwardingGate) as Arc<dyn RedactionGate>,
+        )
+        .build("scan-available");
+    let out = ok.search("tokio task pinning");
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(ok.transport.calls(), 1);
+
+    fx.cleanup();
+    ok.cleanup();
+}
+
+/// AC-13's local-tier-absent leg, on the **default (loaderless) build**.
+///
+/// This build compiles no engine (`llama` is non-default), so `EngineSlot` on a
+/// fresh runtime is honestly empty — the machine BR-14 is about. The choke
+/// point is built by the daemon's own `web_lookup_egress`, with the daemon's own
+/// composite search gate on it, and every search query blocks. That is what
+/// "the search tier is not offered there" amounts to in behaviour: the tier
+/// cannot perform a single query, and the block is a stated outcome rather than
+/// an error.
+///
+/// Hermetic despite holding a real `HttpTransport`: the query is refused before
+/// the wire, and the endpoint is a loopback port nobody listens on, so even a
+/// regression that forwarded could reach no network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_a_loaderless_build_the_real_search_gate_refuses_every_query() {
+    let runtime = DaemonRuntime::minimal();
+    let events = Arc::new(EventBus::new());
+    let session = SessionId::from("loaderless");
+    let endpoint = format!("http://127.0.0.1:{}/search", closed_port());
+
+    // The config a machine that opted into `search` would be running.
+    let mut config = Config::default();
+    config.web.tier = WebTier::Search;
+    config.web.search_endpoint = Some(endpoint.clone());
+
+    let router = Router::new(CategoryTable::new(), None);
+    let egress = runtime
+        .web_lookup_egress(&router, &config, &events, &session)
+        .expect("the lookup choke point builds");
+
+    let clean = Flags::default();
+    let ctx = LookupContext::new(session.clone(), &clean, &allow_any_host)
+        .with_search_endpoint(&endpoint);
+    let refused = egress
+        .lookup(
+            &LookupRequest::search("tokio task pinning", Authorship::ModelComposed),
+            &ctx,
+        )
+        .await;
+
+    assert_eq!(
+        refused.outcome(),
+        WebLookupOutcome::BlockedRedact,
+        "with no local tier the scan cannot run, so the query is blocked (LESSON-492)"
+    );
+    assert_eq!(
+        refused.detail(),
+        &LookupDetail::Blocked {
+            cause: BlockCause::ScanUnavailable
+        },
+        "and the block says the scan was unavailable — not that anything was found"
+    );
+    assert_eq!(refused.bytes_in(), 0);
+
+    // Falsification: the *fetch* tiers are unaffected by the coupling (BR-14's
+    // last sentence). The same runtime, the same absent engine — a fetch is not
+    // refused by the scan, it is refused by the unreachable host, which is a
+    // different ending entirely.
+    let fetched = egress
+        .lookup(
+            &LookupRequest::fetch(
+                format!("http://127.0.0.1:{}/page", closed_port()),
+                Authorship::UserPasted,
+            ),
+            &ctx,
+        )
+        .await;
+    assert_eq!(
+        fetched.outcome(),
+        WebLookupOutcome::Offline,
+        "a fetch on a loaderless machine reaches the wire and finds nothing there, \
+         which is not a scan refusal: {:?}",
+        fetched.detail()
+    );
+}
+
+fn allow_any_host(_host: &str) -> bool {
+    true
+}
+
+/// A loopback port with nothing listening on it: bound to learn a free number,
+/// then released.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
