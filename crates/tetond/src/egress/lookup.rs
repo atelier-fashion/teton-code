@@ -76,10 +76,12 @@
 //! and the daemon refused to send establishes nothing about the *context* the
 //! session is holding — which is the fact a pin is a claim about.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use futures::StreamExt;
 
 use teton_core::config::WebTier as CoreWebTier;
@@ -1348,17 +1350,19 @@ fn same_host_family(original: &str, hop: &str) -> bool {
 /// braces for a host string that reached this function without that
 /// normalization.
 ///
-/// **Names that resolve into these ranges are not caught here**, and cannot be:
-/// this seam sees a host string, the transport does the DNS, and no API on that
-/// transport exposes the resolved addresses. `localhost` and the `.localhost`
-/// TLD are special-cased because RFC 6761 makes them loopback *by definition*
-/// rather than by resolution, but an attacker-controlled `evil.example` with an
-/// `A` record of `127.0.0.1` — and the rebinding variant, where the record is
-/// global at check time and loopback at connect time — is a **residual**. The
-/// closure of it is a resolving transport that refuses non-global answers at
-/// connect time (a `reqwest` custom resolver, or a pre-resolve + connect-to-IP
-/// pass), which belongs in the transport and not at this seam. Recorded here so
-/// the gap is a known one rather than an assumed absence.
+/// **Names that resolve into these ranges are not caught here**: this seam sees
+/// a host string, the transport does the DNS, and no API on that transport
+/// exposes the resolved addresses. `localhost` and the `.localhost` TLD are
+/// special-cased because RFC 6761 makes them loopback *by definition* rather than
+/// by resolution, but an attacker-controlled `evil.example` with an `A` record of
+/// `127.0.0.1` — and the rebinding variant, where the record is global at check
+/// time and loopback at connect time — cannot be. That residual is closed one
+/// layer down by [`GlobalOnlyResolver`], the lookup transport's own DNS resolver:
+/// it screens the resolved addresses at connect time (where a rebind has nowhere
+/// left to hide) and defers to *this* function for the `localhost` family it
+/// already classifies, so the pasted-`localhost:3000` exemption survives. What
+/// stays true here is the boundary — a string floor cannot see a resolved
+/// address — which is why the closure lives in the resolver and not at this seam.
 fn address_class_of_host(host: &str) -> Option<AddressClass> {
     // `host_str` brackets an IPv6 literal; `IpAddr` does not want the brackets.
     let literal = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
@@ -1495,6 +1499,159 @@ fn address_class_of_ipv6(ip: Ipv6Addr) -> Option<AddressClass> {
         return Some(AddressClass::Unspecified);
     }
     None
+}
+
+// -- the resolving transport (REQ-563: the recorded SSRF residual's closure) --
+//
+// `address_class_of_host` above screens a host *string*, which catches every
+// spelling of an IP literal and nothing about a *name*. The residual it records
+// — a global-looking name whose `A`/`AAAA` record points inside a refused range,
+// and the rebinding variant that is global when a pre-check looks and loopback
+// when the socket opens — is closed here, at the one place that knows the address
+// the socket went to: `reqwest`'s own resolver seam. The addresses this resolver
+// returns are the addresses `reqwest` dials, with no second resolution in
+// between for a rebind to slip through.
+
+/// The raw name→address step a [`GlobalOnlyResolver`] screens.
+///
+/// Behind a trait for one reason: the screen is the security-critical half and
+/// has to be tested against loopback and metadata answers with no network, while
+/// production reaches real DNS. Tests supply a map; production supplies
+/// [`SystemResolver`].
+#[async_trait]
+pub(super) trait ResolveHost: std::fmt::Debug + Send + Sync {
+    /// Resolve `host` to zero or more addresses. An empty answer is a name that
+    /// did not resolve — a connect failure on its own, not a policy refusal.
+    /// Ports are irrelevant to the class screen and are dropped.
+    async fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>>;
+}
+
+/// The production name→address step: the OS resolver by way of
+/// `tokio::net::lookup_host` — the same `getaddrinfo` path `reqwest`'s own
+/// default resolver takes, so screening changes which answers are *accepted*,
+/// never how a name is looked up.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SystemResolver;
+
+#[async_trait]
+impl ResolveHost for SystemResolver {
+    async fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+        // Port 0: `lookup_host` wants a `host:port`, the port is discarded here,
+        // and `reqwest` supplies the URL's real port when it connects (a
+        // resolver's port is advisory — see `reqwest::dns::Resolve`).
+        let addrs = tokio::net::lookup_host((host, 0u16)).await?;
+        Ok(addrs.map(|socket| socket.ip()).collect())
+    }
+}
+
+/// Screen resolved addresses against the same policy the literal-host floor uses
+/// ([`address_class_of_ip`]): `Err(class)` on the first non-global answer, `Ok`
+/// when every address is globally routable.
+///
+/// First-non-global rather than all-non-global: one loopback answer among a
+/// dozen globals is still an answer the connector may dial, and refusing the
+/// whole resolution is the only screen that holds when the caller does not choose
+/// which address the connector picks. An empty slice is `Ok` — a name that
+/// resolved to nothing fails to connect on its own.
+fn screen_resolved_addresses(addrs: &[IpAddr]) -> Result<(), AddressClass> {
+    for &ip in addrs {
+        if let Some(class) = address_class_of_ip(ip) {
+            return Err(class);
+        }
+    }
+    Ok(())
+}
+
+/// The error a [`GlobalOnlyResolver`] hands the connector for a name that
+/// resolved to a non-global address. Its whole job is to fail the connect;
+/// `reqwest` folds it into a connect-class error, which the seam reports as an
+/// offline ending — truthfully, since no socket was opened. It carries the class
+/// for a log line only: the seam speaks [`TransportError`], which has no SSRF
+/// variant, so nothing finer crosses that boundary.
+#[derive(Debug)]
+struct ResolvedAddressRefused {
+    class: AddressClass,
+}
+
+impl std::fmt::Display for ResolvedAddressRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Names the class, never the host or address (BR-1 / logging convention:
+        // nothing content-bearing). `as_str` is a fixed enum word.
+        write!(
+            f,
+            "web lookup refused a {} resolved address",
+            self.class.as_str()
+        )
+    }
+}
+
+impl std::error::Error for ResolvedAddressRefused {}
+
+/// The web-lookup DNS resolver: resolve a name the ordinary way, then refuse the
+/// resolution outright if any answer is non-global — the connect-time closure the
+/// [`address_class_of_host`] residual comment records as owed.
+///
+/// ## Why it defers on a host the string floor already classified
+///
+/// The only host that reaches this resolver already recognized by
+/// [`address_class_of_host`] is the RFC 6761 `localhost` family — IP literals
+/// never reach a resolver at all. And the only way one arrives here is past the
+/// seam that already made the authorship-aware call about it: a model-composed
+/// `http://localhost/…` and a redirect *to* one are refused at the seam, and a
+/// *user-pasted* one is let through on purpose (BR-11 — "fetch my dev server on
+/// `localhost:3000`"). Re-screening it here would refuse exactly that pasted
+/// dev-server URL. So a host the floor classifies is deferred to the seam; a host
+/// it returns `None` for is the residual — a global-looking name — and its
+/// resolved addresses are screened.
+///
+/// The configured search endpoint rides the same seam. `localhost` (the
+/// documented example) and an IP-literal endpoint are unaffected — the first is
+/// deferred, the second never reaches a resolver — but a search endpoint set to a
+/// non-localhost *name* that resolves into a refused range is screened like any
+/// other; that narrowing of the config exemption is recorded in the REQ-563
+/// architecture Deviations.
+///
+/// Installed only on the lookup transport
+/// ([`HttpTransport::for_lookup`](super::HttpTransport::for_lookup) and
+/// [`for_lookup_with_endpoint_auth`](super::HttpTransport::for_lookup_with_endpoint_auth));
+/// the provider `send()` path keeps `reqwest`'s default resolver, because its
+/// destination is one endpoint the operator configured, not a name a model
+/// composed.
+#[derive(Debug)]
+pub(super) struct GlobalOnlyResolver<R: ResolveHost = SystemResolver> {
+    inner: Arc<R>,
+}
+
+impl GlobalOnlyResolver<SystemResolver> {
+    /// The production resolver, over the OS name lookup.
+    pub(super) fn system() -> Self {
+        Self {
+            inner: Arc::new(SystemResolver),
+        }
+    }
+}
+
+impl<R: ResolveHost + 'static> reqwest::dns::Resolve for GlobalOnlyResolver<R> {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let addrs = inner.resolve_host(&host).await?;
+            // Defer to the seam for a host its string floor already classified
+            // (the `localhost` family); screen the residual — a `None`-classified
+            // name — against the addresses `reqwest` is about to dial.
+            if address_class_of_host(&host).is_none() {
+                screen_resolved_addresses(&addrs)
+                    .map_err(|class| ResolvedAddressRefused { class })?;
+            }
+            // Port 0: `reqwest` replaces it with the URL's port (or the scheme
+            // default). Handing back the screened set is the point — `reqwest`
+            // dials these and only these.
+            Ok::<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>>(Box::new(
+                addrs.into_iter().map(|ip| SocketAddr::new(ip, 0)),
+            ))
+        })
+    }
 }
 
 /// The wire outcome a transport failure folds onto.
@@ -3021,6 +3178,211 @@ mod tests {
                 "{url} (host `{host}`)"
             );
         }
+    }
+
+    // -- the resolving transport (REQ-563 SSRF residual closure) -----------
+
+    /// A [`ResolveHost`] backed by a fixed name→addresses map, plus a record of
+    /// every host it was asked about. The record is the instrument that proves
+    /// the class screen runs *after* the name lookup rather than instead of it.
+    #[derive(Debug, Clone)]
+    struct FakeResolver {
+        map: Arc<std::collections::HashMap<String, Vec<IpAddr>>>,
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeResolver {
+        fn new(entries: &[(&str, &[IpAddr])]) -> Self {
+            let map = entries
+                .iter()
+                .map(|(host, addrs)| ((*host).to_owned(), addrs.to_vec()))
+                .collect();
+            Self {
+                map: Arc::new(map),
+                asked: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Wrap this fake in the screening resolver under test. Consumes a clone,
+        /// so the caller keeps a handle whose shared `asked` log sees every
+        /// lookup the resolver drives.
+        fn resolver(&self) -> GlobalOnlyResolver<FakeResolver> {
+            GlobalOnlyResolver {
+                inner: Arc::new(self.clone()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("asked lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ResolveHost for FakeResolver {
+        async fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            self.asked.lock().expect("asked lock").push(host.to_owned());
+            self.map.get(host).cloned().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host in fake resolver",
+                )
+            })
+        }
+    }
+
+    fn ip4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    /// Drive the screening resolver as `reqwest` would: hand it a parsed `Name`,
+    /// await the resolution, and reduce it to the addresses or a refusal.
+    async fn resolve_via(
+        resolver: &GlobalOnlyResolver<FakeResolver>,
+        host: &str,
+    ) -> Result<Vec<IpAddr>, ()> {
+        let name: reqwest::dns::Name = host.parse().expect("test host parses as a DNS name");
+        match reqwest::dns::Resolve::resolve(resolver, name).await {
+            Ok(addrs) => Ok(addrs.map(|socket| socket.ip()).collect()),
+            Err(_) => Err(()),
+        }
+    }
+
+    #[test]
+    fn the_address_screen_passes_a_set_of_global_addresses() {
+        assert_eq!(
+            screen_resolved_addresses(&[ip4(93, 184, 216, 34), ip4(1, 1, 1, 1)]),
+            Ok(())
+        );
+        // Empty is a name that did not resolve, not a refusal — it fails to
+        // connect on its own.
+        assert_eq!(screen_resolved_addresses(&[]), Ok(()));
+    }
+
+    #[test]
+    fn the_address_screen_refuses_the_first_non_global_answer() {
+        assert_eq!(
+            screen_resolved_addresses(&[ip4(127, 0, 0, 1)]),
+            Err(AddressClass::Loopback)
+        );
+        assert_eq!(
+            screen_resolved_addresses(&[ip4(169, 254, 169, 254)]),
+            Err(AddressClass::LinkLocal)
+        );
+        assert_eq!(
+            screen_resolved_addresses(&[ip4(10, 0, 0, 5)]),
+            Err(AddressClass::Private)
+        );
+        // A global answer ahead of a loopback one does not launder it: one
+        // dialable internal address is enough to refuse the whole resolution,
+        // because the connector, not this code, picks which address it dials.
+        assert_eq!(
+            screen_resolved_addresses(&[ip4(93, 184, 216, 34), ip4(127, 0, 0, 1)]),
+            Err(AddressClass::Loopback)
+        );
+        // The IPv6 spellings that embed an IPv4 destination are folded here too,
+        // because the fold lives in `address_class_of_ip` — the same policy the
+        // literal floor uses.
+        let mapped_loopback: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(
+            screen_resolved_addresses(&[mapped_loopback]),
+            Err(AddressClass::Loopback)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_resolves_to_loopback_is_refused() {
+        // The residual made concrete: `internal.example` is a global-looking
+        // name — the string floor returns `None`, so nothing at the seam catches
+        // it — whose `A` record points at the daemon's own machine. That is what
+        // this resolver refuses, for a model-composed fetch or any other.
+        let fake = FakeResolver::new(&[("internal.example", &[ip4(127, 0, 0, 1)])]);
+        assert_eq!(
+            resolve_via(&fake.resolver(), "internal.example").await,
+            Err(())
+        );
+        assert_eq!(
+            fake.asked(),
+            vec!["internal.example".to_owned()],
+            "the name was looked up before the screen decided",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_resolves_to_the_metadata_service_is_refused() {
+        let fake = FakeResolver::new(&[("metadata.example", &[ip4(169, 254, 169, 254)])]);
+        assert_eq!(
+            resolve_via(&fake.resolver(), "metadata.example").await,
+            Err(())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_public_name_resolves_normally() {
+        let fake = FakeResolver::new(&[("example.com", &[ip4(93, 184, 216, 34)])]);
+        assert_eq!(
+            resolve_via(&fake.resolver(), "example.com").await,
+            Ok(vec![ip4(93, 184, 216, 34)]),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_decision_is_the_resolved_address_not_the_host_string() {
+        // The property the closure exists for, stated as a test: a host the
+        // *string* floor waves through is refused because its *resolved* address
+        // is loopback. `address_class_of_host` is `None` for the name, and the
+        // refusal still happens — so the decision is post-DNS, by construction.
+        assert_eq!(address_class_of_host("looks-global.example"), None);
+        let fake = FakeResolver::new(&[("looks-global.example", &[ip4(127, 0, 0, 1)])]);
+        assert_eq!(
+            resolve_via(&fake.resolver(), "looks-global.example").await,
+            Err(())
+        );
+        assert_eq!(fake.asked(), vec!["looks-global.example".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_localhost_name_is_deferred_to_the_seam() {
+        // `localhost` is the one non-literal the string floor classifies (RFC
+        // 6761), and it only reaches this resolver on the path the seam allows
+        // on purpose: a user-pasted `http://localhost:3000`. Screening it here
+        // would refuse exactly that dev-server URL, so it is deferred — resolved,
+        // but not screened, even though it lands on loopback.
+        assert_eq!(
+            address_class_of_host("localhost"),
+            Some(AddressClass::Loopback)
+        );
+        let fake = FakeResolver::new(&[("localhost", &[ip4(127, 0, 0, 1)])]);
+        assert_eq!(
+            resolve_via(&fake.resolver(), "localhost").await,
+            Ok(vec![ip4(127, 0, 0, 1)]),
+        );
+        assert_eq!(
+            fake.asked(),
+            vec!["localhost".to_owned()],
+            "the defer still resolves the name; it only skips the screen",
+        );
+    }
+
+    #[tokio::test]
+    async fn reqwest_dials_only_what_the_resolver_returns() {
+        // End-to-end through a real `reqwest` client with the resolver installed
+        // exactly as `for_lookup` installs it: a name resolving to loopback is
+        // refused during resolution, so `send()` never opens a socket. No
+        // network is touched — the request fails before any connect.
+        let fake = FakeResolver::new(&[("internal.example", &[ip4(127, 0, 0, 1)])]);
+        let client = reqwest::Client::builder()
+            .dns_resolver(Arc::new(fake.resolver()))
+            .build()
+            .expect("client builds");
+        let result = client.get("http://internal.example/admin").send().await;
+        assert!(
+            result.is_err(),
+            "a name resolving to loopback must not reach a socket",
+        );
+        assert!(
+            fake.asked().iter().any(|host| host == "internal.example"),
+            "reqwest resolved the name through the screening resolver",
+        );
     }
 
     // -- the search endpoint is not a fetch destination --------------------
