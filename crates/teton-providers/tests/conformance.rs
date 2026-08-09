@@ -70,6 +70,7 @@ impl Transport for MockTransport {
         let chunks = self.chunks.clone();
         let body = futures::stream::iter(chunks.into_iter().map(Ok::<Vec<u8>, TransportError>));
         Ok(TransportResponse {
+            location: None,
             status: self.status,
             body: Box::pin(body),
         })
@@ -384,6 +385,7 @@ fn mid_stream_transport_error_is_surfaced() {
                 Err(TransportError::Io),
             ];
             Ok(TransportResponse {
+                location: None,
                 status: 200,
                 body: Box::pin(futures::stream::iter(items)),
             })

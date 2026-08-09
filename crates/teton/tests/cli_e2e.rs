@@ -73,7 +73,7 @@ impl TestDaemon {
     /// A daemon with no local engine: the first-run consent gate is live, and a
     /// proposal is outstanding when a client attaches.
     fn spawn(daemon: &Path) -> Self {
-        Self::spawn_with_script(daemon, None)
+        Self::spawn_with_script(daemon, None, "")
     }
 
     /// A daemon whose local tier is the `TETON_LOCAL_SCRIPT` scripted engine,
@@ -87,10 +87,22 @@ impl TestDaemon {
     /// turn, so a prompt produces a real `route_decided` event and a real turn
     /// end — which is what makes AC-4's `/verbose` toggle observable at all.
     fn spawn_scripted(daemon: &Path, replies: &[&str]) -> Self {
-        Self::spawn_with_script(daemon, Some(replies))
+        Self::spawn_with_script(daemon, Some(replies), "")
     }
 
-    fn spawn_with_script(daemon: &Path, replies: Option<&[&str]>) -> Self {
+    /// A scripted daemon whose config carries `extra` — one more TOML table
+    /// appended to the fixture config.
+    ///
+    /// REQ-563's `[web]` table is the first thing any test here has needed to
+    /// vary: web lookup is off by default (BR-1), so a session that exercises it
+    /// has to be told to, and the switch is config rather than a flag or an
+    /// environment seam. Appended rather than templated in, so every existing
+    /// fixture's bytes are unchanged.
+    fn spawn_scripted_with_config(daemon: &Path, replies: &[&str], extra: &str) -> Self {
+        Self::spawn_with_script(daemon, Some(replies), extra)
+    }
+
+    fn spawn_with_script(daemon: &Path, replies: Option<&[&str]>, extra_config: &str) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         // The `-` is load-bearing: without it `tc{pid}{seq}` is ambiguous — pid
@@ -137,7 +149,8 @@ impl TestDaemon {
                  endpoint = \"https://api.deepseek.com\"\n\n\
                  [[providers]]\nid = \"local\"\nkind = \"local\"\n\n\
                  {tiers}\
-                 [local_model]\nauto_accept = false\nbase_url = \"http://127.0.0.1:{}\"\n",
+                 [local_model]\nauto_accept = false\nbase_url = \"http://127.0.0.1:{}\"\n\n\
+                 {extra_config}",
                 closed_port()
             ),
         )
@@ -802,7 +815,7 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
         "the hint must point at /help; output:\n{session}"
     );
 
-    // AC-1: all six commands, each with the summary `/help` generates from the
+    // AC-1: every command, each with the summary `/help` generates from the
     // dispatch table (BR-7) — asserted as the rendered `/name  summary` pair, so
     // a row that lost its summary fails here.
     for (name, summary) in [
@@ -819,6 +832,18 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
         (
             "/verbose",
             "Toggle the routing and turn-end notices for this session.",
+        ),
+        // REQ-563's two web controls. A command a user cannot find in `/help`
+        // is a command they do not have (BUG-153), and `/web allow` is the only
+        // way out of a taint restriction — so its absence here would be a dead
+        // end, not just a discoverability gap.
+        (
+            "/web allow",
+            "Lift this session's web taint restriction (grants no new tier).",
+        ),
+        (
+            "/web refresh",
+            "Drop a URL's cached copy so the next lookup re-fetches: /web refresh <url>.",
         ),
         ("/quit", "End the session, exactly as Ctrl-D does."),
     ] {
@@ -1863,5 +1888,176 @@ fn policy_show_renders_the_daemons_resolved_table() {
     assert!(
         shown.contains("judgment_default"),
         "the declared default must be reported; output:\n{shown}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-563 — the client surfaces of opt-in web lookup (TASK-078)
+// ---------------------------------------------------------------------------
+//
+// AC → test map for this section:
+//
+//   AC-10 (`/web refresh`) + AC-12 (`/web allow`)
+//       → `the_two_web_commands_reach_the_daemon_and_render_its_answer`
+//   AC-2 (the consent prompt at Ask) + AC-6 (`/cost` counts every lookup) +
+//   AC-8 (offline is a notice, the turn completes)
+//       → `a_web_lookup_is_consented_reported_and_counted_in_the_cost_report`
+//
+// AC-6's `/help` half is asserted in `slash_help_lists_every_command_and_no_turn_is_attempted`
+// above, which lists both `/web` rows with their summaries.
+//
+// The status **row** (`web: fetch`) is not assertable from this file: it is
+// drawn by `main::paint_status` above the framed entry prompt, which exists only
+// at a TTY (REQ-556 BR-2 keeps a piped run byte-identical to what it was). Its
+// pty leg lives in `pty_e2e.rs`.
+
+/// AC-12 and AC-10's client half: both `/web` commands are real round trips to
+/// the daemon, and each renders the daemon's own answer.
+///
+/// They are user-only actions on purpose — the model reaches the tool registry,
+/// which has no tool by either name (asserted in `tetond`'s
+/// `web_consent_matrix`) — so the client command *is* the surface, and a command
+/// that silently did nothing would look exactly like one that worked.
+#[test]
+fn the_two_web_commands_reach_the_daemon_and_render_its_answer() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "/web allow\n/web refresh https://docs.rs/tokio/latest/tokio/\n/web refresh\n",
+    );
+
+    // `/web allow` on a session that never read boundary content: the honest
+    // answer is that nothing was restricted, not a false confirmation that
+    // something was lifted (BR-13).
+    assert!(
+        session.contains("this session has not read privacy-boundary content"),
+        "`/web allow` must render the daemon's `was_restricted: false` answer; \
+         output:\n{session}"
+    );
+
+    // `/web refresh <url>` on a URL with nothing stored: a fact, not a failure.
+    assert!(
+        session.contains("web cache: nothing was stored for that URL"),
+        "`/web refresh` must distinguish absent from evicted; output:\n{session}"
+    );
+
+    // A bare `/web refresh` is an argument error the dispatch table catches
+    // before any RPC — it names the usage rather than guessing a URL.
+    assert!(
+        session.contains("/web refresh <url>"),
+        "a bare `/web refresh` must name its usage; output:\n{session}"
+    );
+
+    // Neither command spent a model call (BR-7's "commands are not prompts").
+    assert_no_turn_ran(&session, "the two /web commands");
+}
+
+/// AC-2 + AC-6 + AC-8, end to end through the shipped binaries: a scripted turn
+/// asks for a page, the user is asked in concrete terms, the destination is
+/// unreachable, the turn finishes anyway, and `/cost` counts the lookup.
+///
+/// Hermetic: the fetch target is a loopback port nothing listens on, so the
+/// lookup ends `offline` without touching a network. That is the whole point of
+/// choosing it — an offline ending is a *lookup that happened*, so it exercises
+/// consent, the choke point, the ledger row and every rendering surface, while
+/// reaching nothing.
+///
+/// **The user pastes the URL, and that is load-bearing.** The seam's SSRF floor
+/// refuses a loopback destination the *model* composed, which is correct and is
+/// tested where it lives; a URL the user typed is exempt, because a person
+/// pointing this daemon at `127.0.0.1` is pointing it at their own machine on
+/// purpose. Without the paste this fixture would never reach the wire and would
+/// be measuring the address gate rather than the offline ending it is named for.
+#[test]
+fn a_web_lookup_is_consented_reported_and_counted_in_the_cost_report() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    // A port nobody is listening on: the fetch connects to nothing.
+    let url = format!("http://127.0.0.1:{}/tokio", closed_port());
+    let tool_call = format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{url}\"}}}}");
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon,
+        &[
+            &tool_call,
+            "I could not reach that page, so here is what I know.",
+        ],
+        "[web]\ntier = \"fetch_any_url\"\n",
+    );
+    let teton = teton_bin();
+
+    // Line 1 is the prompt — carrying the URL verbatim, which is what makes the
+    // fetch user-authored; line 2 answers the permission question the lookup
+    // raises; line 3 asks for the cost report the lookup should be in.
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        &format!("what does {url} say about task pinning?\ny\n/cost\n"),
+    );
+    let log = daemon.log();
+
+    // AC-2 / BR-4: the question was concrete — the verbatim URL and the host —
+    // and it offered the persistent choice, which only the web keys get.
+    assert!(
+        session.contains("permission requested: web_fetch_user_url"),
+        "the lookup must be authorized under its per-tier key — and this URL was \
+         pasted by the user, so it is the user-URL tier's key and not the \
+         any-URL one's; output:\n{session}\nlog:\n{log}"
+    );
+    assert!(
+        session.contains(&url),
+        "the prompt must show the verbatim URL; output:\n{session}"
+    );
+    assert!(
+        session.contains("host 127.0.0.1"),
+        "the prompt must name the destination host; output:\n{session}"
+    );
+    assert!(
+        session.contains("[p]ermanently"),
+        "a web prompt offers enabling permanently (BR-4); output:\n{session}"
+    );
+
+    // AC-8 / BR-9: an unreachable destination is a transient-shaped notice, and
+    // the turn finished — the scripted engine's closing reply is on screen.
+    assert!(
+        session.contains("web fetch 127.0.0.1 — unavailable: offline"),
+        "an unreachable host must render as the offline notice; output:\n{session}\nlog:\n{log}"
+    );
+    assert!(
+        session.contains("I could not reach that page"),
+        "the turn must complete despite the failed lookup; output:\n{session}\nlog:\n{log}"
+    );
+    assert!(
+        !session.contains("prompt failed"),
+        "a lookup failure is never a turn error (BR-9); output:\n{session}"
+    );
+
+    // AC-6 / BR-7: every lookup lands in the ledger, including the free ones,
+    // and `/cost` shows it. The section is silent when empty, so its presence is
+    // itself the assertion.
+    let report = cost_report_from_first_marker(&session, "`/cost` after a web lookup");
+    assert!(
+        report.contains("web lookups:"),
+        "`/cost` must render the web-lookup roll-up; report:\n{report}"
+    );
+    assert!(
+        report.contains("1 lookup(s)"),
+        "one lookup was attempted, so one must be counted; report:\n{report}"
+    );
+
+    // Non-vacuity for the section's presence: a session that performed no
+    // lookup renders no such section at all (the default state, BR-1).
+    let quiet_daemon = TestDaemon::spawn_scripted(&daemon_bin(), TURN_REPLIES);
+    let quiet = quiet_daemon.run_cli_with_stdin(&teton, &[], "/cost\n");
+    assert!(
+        !quiet.contains("web lookups:"),
+        "a machine that never looked anything up must not grow a web section; \
+         output:\n{quiet}"
     );
 }

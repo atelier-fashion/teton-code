@@ -213,6 +213,13 @@ pub(crate) struct ScriptedPrompter {
     /// How many times [`ask`](Prompter::ask) was actually called — lets a test
     /// prove an auto-decision consumed no prompt.
     pub asked: usize,
+    /// Every question put to the user, in order.
+    ///
+    /// The question is as user-facing as the answer: it is where a prompt
+    /// advertises which keys mean something, and a prompter that dropped it left
+    /// that wording assertable only through an e2e (REQ-563 BR-4 — the
+    /// persistent key must be offered on exactly the prompts that honour it).
+    pub questions: Vec<String>,
 }
 
 #[cfg(test)]
@@ -222,14 +229,21 @@ impl ScriptedPrompter {
         Self {
             answers: answers.iter().map(|s| (*s).to_owned()).collect(),
             asked: 0,
+            questions: Vec::new(),
         }
+    }
+
+    /// Whether any question asked so far contained `needle`.
+    pub fn any_question_contains(&self, needle: &str) -> bool {
+        self.questions.iter().any(|q| q.contains(needle))
     }
 }
 
 #[cfg(test)]
 impl Prompter for ScriptedPrompter {
-    fn ask(&mut self, _question: &str) -> Option<String> {
+    fn ask(&mut self, question: &str) -> Option<String> {
         self.asked += 1;
+        self.questions.push(question.to_owned());
         self.answers.pop_front()
     }
 }

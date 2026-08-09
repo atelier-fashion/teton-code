@@ -50,12 +50,17 @@
 //! and names `teton model set` as the auditable surface for the unattended case.
 //! Every other command is pipe-friendly exactly as BR-9 says.
 
-use teton_protocol::methods::{ModelStatusParams, PromptBlock, PromptTurnParams};
+use teton_protocol::jsonrpc::{error_code, RpcError};
+use teton_protocol::methods::{
+    ModelStatusParams, PromptBlock, PromptTurnParams, WebOverrideParams, WebOverrideResult,
+    WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
+};
 use teton_protocol::SessionId;
 
 use crate::client::{Connection, UiContext};
 use crate::model_ui;
 use crate::render::{LineKind, Surface};
+use crate::session_ui::web_tier_name;
 
 /// The one line `/help` prints about the `//` escape hatch (BR-1b).
 const ESCAPE_FOOTER: &str =
@@ -206,6 +211,26 @@ const COMMANDS: &[CommandSpec] = &[
         summary: "Toggle the routing and turn-end notices for this session.",
         args: Args::None,
         handler: handle_verbose,
+    },
+    // REQ-563's two user-only web actions. Both are client commands rather than
+    // harness tools, and that placement is the enforcement: tool dispatch and
+    // this table are structurally distinct channels, so a model emitting a tool
+    // call named `web allow` reaches nothing (AC-12). Listed here — and
+    // therefore in `/help` — because a command a user cannot discover is a
+    // command they do not have (BUG-153).
+    CommandSpec {
+        name: "web allow",
+        aliases: &[],
+        summary: "Lift this session's web taint restriction (grants no new tier).",
+        args: Args::None,
+        handler: handle_web_allow,
+    },
+    CommandSpec {
+        name: "web refresh",
+        aliases: &[],
+        summary: "Drop a URL's cached copy so the next lookup re-fetches: /web refresh <url>.",
+        args: Args::Required("a URL — `/web refresh <url>`"),
+        handler: handle_web_refresh,
     },
     CommandSpec {
         name: "quit",
@@ -617,6 +642,179 @@ fn handle_model_set(
     Ok(CommandOutcome::Continue)
 }
 
+/// The `/web allow` handler: lift this session's taint restriction (REQ-563
+/// BR-13 / AC-12).
+///
+/// User-only **by construction**, not by check. The restriction is lifted by a
+/// client RPC, and tool dispatch has no path to one — a model that emits a tool
+/// call named `web allow` reaches the tool registry and finds no such tool. There
+/// is no "reject if the model asked" branch here because there is no way for the
+/// model to have asked.
+///
+/// It grants nothing. The tiers it names are the ones the machine's `[web] tier`
+/// already allows, consent still runs per lookup, and nothing is written to
+/// config — a fresh session starts restricted-on-taint again.
+///
+/// The daemon's answer, not the event, is what this renders: `was_restricted`
+/// distinguishes "the restriction is gone" from "there was none", and a client
+/// that could not tell those apart would confirm a lift that never happened.
+fn handle_web_allow(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    _args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let Some(params) = web_override_params(ctx.session_id.clone()) else {
+        ctx.surface.line(LineKind::Error, WEB_NEEDS_A_SESSION);
+        return Ok(CommandOutcome::Continue);
+    };
+    let answered = conn.call(params, ctx)?;
+    if let Some(result) = web_override_or_report(answered, ctx.surface) {
+        ctx.surface
+            .line(LineKind::Notice, &render_web_override(&result));
+    }
+    Ok(CommandOutcome::Continue)
+}
+
+/// The `/web refresh <url>` handler: drop a cached document (BR-12 / AC-10).
+///
+/// The URL is the user's own typed argument and travels to the daemon verbatim;
+/// it is never echoed back, and the daemon's answer names an outcome alone.
+/// Sent unvalidated on purpose — the cache is keyed by a normalization the
+/// daemon owns, and a client-side opinion about what a URL is would be a second
+/// definition that could disagree with the one the entry was written under.
+fn handle_web_refresh(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    // A bare `/web refresh` never reaches here: `Args::Required` rejects it at
+    // resolve time with the usage line.
+    let answered = conn.call(
+        WebRefreshParams {
+            url: args.trim().to_owned(),
+        },
+        ctx,
+    )?;
+    if let Some(result) = web_refresh_or_report(answered, ctx.surface) {
+        ctx.surface.line(
+            LineKind::Notice,
+            match result.outcome {
+                WebRefreshOutcome::Evicted => WEB_REFRESH_EVICTED,
+                WebRefreshOutcome::Absent => WEB_REFRESH_ABSENT,
+            },
+        );
+    }
+    Ok(CommandOutcome::Continue)
+}
+
+/// The `web/override` request for a session, or `None` when there is no session
+/// to name.
+///
+/// Split out so the refusal is testable without a socket — the same reason
+/// [`crate::cost_report_or_report`] is split out. The `None` arm is the one a
+/// test process can otherwise not reach, and it is the arm that guarantees no
+/// session id is ever fabricated.
+fn web_override_params(session_id: Option<SessionId>) -> Option<WebOverrideParams> {
+    session_id.map(|session_id| WebOverrideParams { session_id })
+}
+
+/// What `/web allow` says when no session exists to lift a restriction on.
+///
+/// Reachable only from a context that owns no session — `teton cost` and the
+/// other passive commands run no slash handlers, so in practice this is the
+/// guard that keeps the id from being fabricated rather than a line users meet.
+const WEB_NEEDS_A_SESSION: &str =
+    "`/web allow` needs a session to act on, and this command owns none.";
+
+/// `/web refresh` found and removed a stored copy.
+const WEB_REFRESH_EVICTED: &str =
+    "web cache: the stored copy was dropped; the next lookup of that URL re-fetches.";
+
+/// `/web refresh` found nothing — a fact, not a failure.
+const WEB_REFRESH_ABSENT: &str = "web cache: nothing was stored for that URL; the next lookup \
+                                  was already going to fetch it fresh.";
+
+/// The line `/web allow` renders from the daemon's answer.
+///
+/// Split out for the reason [`crate::cost_report_or_report`] is: the wording is
+/// the behaviour, and both arms are asserted without a socket.
+fn render_web_override(result: &WebOverrideResult) -> String {
+    if !result.was_restricted {
+        return "nothing was restricted: this session has not read privacy-boundary content, \
+                so model-composed web lookups were never disabled."
+            .to_owned();
+    }
+    if result.tiers_restored.is_empty() {
+        return "web taint restriction lifted for this session. No web tier is configured, so \
+                nothing resumed — set `[web] tier` to grant one."
+            .to_owned();
+    }
+    let named = result
+        .tiers_restored
+        .iter()
+        .map(|t| format!("`{}`", web_tier_name(*t)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "web taint restriction lifted for this session; model-composed lookups resume at: \
+         {named}. This granted no new tier, and a fresh session starts restricted again."
+    )
+}
+
+/// Unwrap a `web/override` answer, reporting a daemon too old to have the method
+/// as a notice and any other failure as an error.
+///
+/// The three-arm split is [`crate::cost_report_or_report`]'s, for its reason: a
+/// build without the method is a version fact and not a failure, so it must not
+/// wear an `error:` prefix (BUG-152).
+fn web_override_or_report(
+    answered: Result<WebOverrideResult, RpcError>,
+    surface: &mut dyn Surface,
+) -> Option<WebOverrideResult> {
+    match answered {
+        Ok(result) => Some(result),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
+            surface.line(LineKind::Notice, WEB_METHODS_UNAVAILABLE);
+            None
+        }
+        Err(err) => {
+            surface.line(
+                LineKind::Error,
+                &format!(
+                    "the web taint restriction could not be lifted: {}",
+                    err.message
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Unwrap a `web/refresh` answer; same three arms as [`web_override_or_report`].
+fn web_refresh_or_report(
+    answered: Result<WebRefreshResult, RpcError>,
+    surface: &mut dyn Surface,
+) -> Option<WebRefreshResult> {
+    match answered {
+        Ok(result) => Some(result),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
+            surface.line(LineKind::Notice, WEB_METHODS_UNAVAILABLE);
+            None
+        }
+        Err(err) => {
+            surface.line(
+                LineKind::Error,
+                &format!("the cached document could not be dropped: {}", err.message),
+            );
+            None
+        }
+    }
+}
+
+/// What both web commands say to a daemon built before REQ-563.
+const WEB_METHODS_UNAVAILABLE: &str =
+    "this daemon build does not expose the web lookup controls yet.";
+
 /// What [`model_set_gate`] decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelSetGate {
@@ -698,6 +896,9 @@ mod tests {
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
     use crate::session_ui::SessionState;
+    // Only the tests name a tier now: the tier vocabulary itself moved to
+    // `session_ui`, so the production code here never mentions the type.
+    use teton_protocol::events::WebTier;
 
     /// The session's own context (D-4). No answers are scripted: none of the
     /// client-local commands asks a question.
@@ -720,6 +921,7 @@ mod tests {
             answer_model_proposals: true,
             auto_accept_model: false,
             typed_input: true,
+            session_id: None,
         }
     }
 
@@ -821,22 +1023,34 @@ mod tests {
     #[test]
     fn the_table_carries_every_command_this_req_promises() {
         let names: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
-        let promised = ["help", "cost", "model", "model set", "verbose", "quit"];
+        let promised = [
+            "help",
+            "cost",
+            "model",
+            "model set",
+            "verbose",
+            "quit",
+            // REQ-563 BR-13 / BR-12: the two user-only web actions. Added here
+            // first, deliberately — this list is where a new row is declared to
+            // be a spec decision rather than a drive-by.
+            "web allow",
+            "web refresh",
+        ];
         for expected in promised {
             assert!(
                 names.contains(&expected),
                 "/{expected} is missing from the dispatch table: {names:?}"
             );
         }
-        // The count closes the third direction: the loop above proves the six
-        // are present and the reachability loop proves each row dispatches, but
-        // neither notices a *seventh* row. The REQ scopes the surface at six
-        // deliberately ("the command set is deliberately small"), so a new row
-        // is a spec decision and lands here first.
+        // The count closes the third direction: the loop above proves the named
+        // rows are present and the reachability loop proves each row dispatches,
+        // but neither notices an *unlisted* row. The command surface is
+        // deliberately small, so a new row is a spec decision and lands in the
+        // list above first.
         assert_eq!(
             COMMANDS.len(),
             promised.len(),
-            "the table grew past the six commands this REQ scopes: {names:?}"
+            "the table grew past the commands the specs scope: {names:?}"
         );
     }
 
@@ -1243,5 +1457,184 @@ mod tests {
         };
         assert_eq!((name, args), ("model", "extra"));
         assert!(matches!(resolve(name, args), Resolution::Rejected(_)));
+    }
+    // ------------------------------------------------------------------
+    // REQ-563: the two web commands (BR-12 / BR-13, AC-10 / AC-12)
+    // ------------------------------------------------------------------
+
+    /// BUG-153's discoverability rule, applied to the new rows: a command a user
+    /// cannot find in `/help` is a command they do not have. The generic help
+    /// test proves every row renders; this names the two this REQ adds, so
+    /// deleting a row fails here rather than quietly shrinking the listing.
+    #[test]
+    fn help_lists_both_web_commands_with_their_usage() {
+        let mut surface = RecordingSurface::new();
+        render_help(&mut surface);
+        let listing = surface.lines_of(LineKind::Info).join("\n");
+
+        assert!(listing.contains("/web allow"), "{listing}");
+        assert!(listing.contains("/web refresh"), "{listing}");
+        // The refresh row has to show it takes a URL, or the argument is a
+        // secret the user has to guess.
+        assert!(listing.contains("/web refresh <url>"), "{listing}");
+        // And `/web allow`'s summary must not imply it grants anything (BR-13).
+        assert!(listing.contains("grants no new tier"), "{listing}");
+    }
+
+    /// Both spellings parse to their own row, and the argument rules are the
+    /// ones the table declares — rejected at resolve time, before any RPC.
+    #[test]
+    fn the_web_commands_parse_and_police_their_arguments() {
+        let Input::Command { name, args } = classify("/web allow") else {
+            panic!("`/web allow` did not classify as a command");
+        };
+        assert_eq!((name, args), ("web allow", ""));
+        assert!(matches!(resolve(name, args), Resolution::Run(_, "")));
+
+        // `/web allow` takes nothing: a trailing word is a typo, not a tier.
+        let Input::Command { name, args } = classify("/web allow search") else {
+            panic!("did not classify as a command");
+        };
+        let Resolution::Rejected(hint) = resolve(name, args) else {
+            panic!("`/web allow search` reached the handler");
+        };
+        assert!(hint.contains("takes no arguments"), "{hint}");
+
+        // The URL reaches the handler verbatim — the daemon owns URL
+        // normalization, so nothing here second-guesses it.
+        let Input::Command { name, args } = classify("/web refresh https://docs.rs/serde") else {
+            panic!("did not classify as a command");
+        };
+        assert_eq!((name, args), ("web refresh", "https://docs.rs/serde"));
+        let Resolution::Run(spec, run_args) = resolve(name, args) else {
+            panic!("a well-formed `/web refresh` was rejected");
+        };
+        assert_eq!(spec.name, "web refresh");
+        assert_eq!(run_args, "https://docs.rs/serde");
+
+        // A bare refresh gets the usage line, not an RPC with an empty URL.
+        let Input::Command { name, args } = classify("/web refresh") else {
+            panic!("did not classify as a command");
+        };
+        let Resolution::Rejected(hint) = resolve(name, args) else {
+            panic!("a bare `/web refresh` reached the handler");
+        };
+        assert!(hint.contains("/web refresh"), "{hint}");
+        assert!(hint.contains("<url>"), "{hint}");
+        assert!(hint.contains("/help"), "{hint}");
+    }
+
+    /// The longest-match rule keeps `/web allow` and `/web refresh` apart, and
+    /// leaves a bare `/web` an unknown command rather than a silent alias for
+    /// one of them.
+    #[test]
+    fn a_bare_web_is_not_a_command() {
+        let Input::Command { name, args } = classify("/web") else {
+            panic!("`/web` did not classify as a command line");
+        };
+        let Resolution::Rejected(hint) = resolve(name, args) else {
+            panic!("`/web` reached a handler");
+        };
+        assert!(hint.contains("unknown command"), "{hint}");
+        assert!(hint.contains("/help"), "{hint}");
+    }
+
+    /// AC-12's two answers. `was_restricted` is what tells "the restriction is
+    /// gone" from "there was none", and the CLI must not confirm a lift that
+    /// never happened.
+    #[test]
+    fn web_allow_confirms_a_lift_and_says_so_when_nothing_was_restricted() {
+        let lifted = render_web_override(&WebOverrideResult {
+            was_restricted: true,
+            tiers_restored: vec![WebTier::FetchUserUrl, WebTier::FetchAnyUrl],
+        });
+        assert!(lifted.contains("lifted"), "{lifted}");
+        assert!(lifted.contains("fetch_user_url"), "{lifted}");
+        assert!(lifted.contains("fetch_any_url"), "{lifted}");
+        // BR-13: it restores, it never grants — and it does not persist.
+        assert!(lifted.contains("granted no new tier"), "{lifted}");
+        assert!(
+            lifted.contains("fresh session starts restricted"),
+            "{lifted}"
+        );
+
+        let nothing = render_web_override(&WebOverrideResult::default());
+        assert!(
+            nothing.contains("nothing was restricted"),
+            "an unrestricted session must not be told a restriction was lifted: {nothing}"
+        );
+        assert!(!nothing.contains("lifted"), "{nothing}");
+
+        // Restricted, but holding no tiers: a real lift that restores nothing.
+        // Distinct from both of the above, which is the whole reason
+        // `was_restricted` is a separate field.
+        let empty = render_web_override(&WebOverrideResult {
+            was_restricted: true,
+            tiers_restored: Vec::new(),
+        });
+        assert!(empty.contains("lifted"), "{empty}");
+        assert!(empty.contains("nothing resumed"), "{empty}");
+        assert!(!empty.contains("nothing was restricted"), "{empty}");
+    }
+
+    /// `/web allow` never fabricates a session id: with no session there is no
+    /// request to build, so nothing is sent.
+    #[test]
+    fn web_allow_without_a_session_builds_no_request() {
+        assert!(
+            web_override_params(None).is_none(),
+            "a command with no session must not invent one to act on"
+        );
+        assert!(WEB_NEEDS_A_SESSION.contains("needs a session"));
+
+        let named = web_override_params(Some(SessionId::from("sess-7")))
+            .expect("a session is all this request needs");
+        assert_eq!(named.session_id, SessionId::from("sess-7"));
+    }
+
+    /// Both web commands report a daemon too old to know them as a **notice**,
+    /// not an `error:` line — a version fact is not a failure (BUG-152).
+    #[test]
+    fn a_daemon_without_the_web_methods_is_a_notice_not_an_error() {
+        let too_old = || RpcError::new(error_code::METHOD_NOT_FOUND, "no such method");
+
+        let mut surface = RecordingSurface::new();
+        assert!(web_override_or_report(Err(too_old()), &mut surface).is_none());
+        assert!(web_refresh_or_report(Err(too_old()), &mut surface).is_none());
+        assert_eq!(
+            surface.lines_of(LineKind::Notice).len(),
+            2,
+            "both commands report it, and both as notices: {:?}",
+            surface.calls
+        );
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "a build without a method is not a failure: {:?}",
+            surface.calls
+        );
+
+        // Any other failure keeps the error line.
+        let mut surface = RecordingSurface::new();
+        assert!(web_override_or_report(
+            Err(RpcError::new(error_code::INTERNAL_ERROR, "boom")),
+            &mut surface
+        )
+        .is_none());
+        assert!(web_refresh_or_report(
+            Err(RpcError::new(error_code::INTERNAL_ERROR, "boom")),
+            &mut surface
+        )
+        .is_none());
+        assert_eq!(surface.lines_of(LineKind::Error).len(), 2);
+    }
+
+    /// AC-10: the two refresh answers are different sentences, and neither is an
+    /// error — "there was never a copy" is a fact about why the next fetch is
+    /// live, not a failure.
+    #[test]
+    fn the_two_refresh_outcomes_read_differently() {
+        assert_ne!(WEB_REFRESH_EVICTED, WEB_REFRESH_ABSENT);
+        assert!(WEB_REFRESH_EVICTED.contains("re-fetches"));
+        assert!(WEB_REFRESH_ABSENT.contains("nothing was stored"));
     }
 }

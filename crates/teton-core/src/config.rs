@@ -1,16 +1,20 @@
 //! The on-disk TOML configuration schema and its validation.
 //!
 //! The config file declares providers, the tier → provider table with its
-//! per-category overrides (REQ-558), and privacy boundaries. The pre-REQ-558
-//! phase → provider table (`[[routing]]`) is still *read* here so TASK-055's
-//! migration has something to migrate; nothing dispatches on it.
+//! per-category overrides (REQ-558), privacy boundaries, and the opt-in
+//! web-lookup ceiling (REQ-563). The pre-REQ-558 phase → provider table
+//! (`[[routing]]`) is still *read* here so TASK-055's migration has something to
+//! migrate; nothing dispatches on it.
 //!
 //! It never holds a raw credential (BR-7): providers carry
 //! an `auth_ref` — a reference into the OS keychain (or an `env:`/`op://`
 //! reference) — and [`Config::validate`] accepts an `auth_ref` only if it matches
 //! a recognized reference form (a positive scheme allowlist), rejecting anything
 //! else — a raw key or a fake-scheme value — so a credential can never be
-//! persisted to a plaintext config.
+//! persisted to a plaintext config. The `[web] search_key_ref` key (REQ-563
+//! BR-8) is a second credential-bearing field and is held to the same rule by
+//! the *same* predicate — one definition of "this is a reference, not a secret",
+//! so the newer field cannot drift into a weaker one.
 //!
 //! Validation error messages deliberately **never echo the offending
 //! credential value** — only the provider id — so a config error can be logged
@@ -125,6 +129,227 @@ impl PrivacyConfig {
     }
 }
 
+/// The web-lookup capability ceiling, ordered so that each tier includes the
+/// ones below it (REQ-563 BR-3).
+///
+/// The ordering is the rule, not a convenience. BR-3 grades the capability —
+/// `fetch_user_url` < `fetch_any_url` < `search` — and every "may this lookup
+/// happen?" question is a comparison against this ceiling, so declaration order
+/// (which *is* the derived [`Ord`]) is load-bearing: a variant inserted at the
+/// wrong position silently changes what an existing grant permits. A new tier
+/// belongs at the position its capability warrants, and
+/// `web_tiers_are_ordered_and_each_tier_includes_the_ones_below` fails if the
+/// order moves.
+///
+/// This is the **configured ceiling**, not a grant. BR-3 also requires each tier
+/// to be *separately consented*, and that consent is session state carried by
+/// the permission gate. A config naming `search` says "search is the most this
+/// machine may ever do", never "search is allowed now".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebTier {
+    /// No web lookup at all — the default (BR-1), and the *only* disabled state
+    /// (D-9: there is no separate `enabled` bool to disagree with it).
+    #[default]
+    Off,
+    /// Fetch a URL that appeared verbatim in a user message of the current
+    /// session. The floor of the graded capability because the user's paste is
+    /// its own authorization — the same reason BR-11's allowlist, which
+    /// constrains *model-chosen* destinations, does not constrain this tier.
+    FetchUserUrl,
+    /// Fetch a URL the model composed.
+    FetchAnyUrl,
+    /// Query the user-configured search backend and follow its results.
+    Search,
+}
+
+impl WebTier {
+    /// Every tier, lowest first.
+    ///
+    /// Exists so a sweep over the ladder — "which tiers does this ceiling
+    /// permit", a renderer's match, the daemon's mirror test against the wire
+    /// twin — cannot miss one a later REQ adds. A hand-kept list at each of
+    /// those sites is a list that goes stale at a different time in each of
+    /// them; the wire twin (`teton_protocol::events::WebTier::ALL`) carries the
+    /// same constant for the same reason, and the daemon's conversion test
+    /// sweeps both so the two ladders cannot drift in length either.
+    pub const ALL: [WebTier; 4] = [
+        WebTier::Off,
+        WebTier::FetchUserUrl,
+        WebTier::FetchAnyUrl,
+        WebTier::Search,
+    ];
+
+    /// Whether this ceiling permits a lookup that needs `needed` — BR-3's
+    /// each-tier-includes-the-ones-below rule, as one predicate rather than a
+    /// comparison every caller re-derives.
+    ///
+    /// [`WebTier::Off`] is never allowed, *including by itself*. `Off` names the
+    /// absence of a capability rather than one, so `Off.allows(Off) == true`
+    /// would hand permission to a caller whose required tier came out `Off` — a
+    /// default never overwritten, a mapping that fell through — on a machine
+    /// that opted into nothing. That is the one comparison here with no honest
+    /// affirmative answer, so it fails closed.
+    #[must_use]
+    pub fn allows(self, needed: Self) -> bool {
+        needed != Self::Off && self >= needed
+    }
+}
+
+/// Opt-in web lookup (the `[web]` table, REQ-563).
+///
+/// # Why the tier is the only switch (D-9)
+///
+/// The spec's system model carried an `enabled` bool *and* a `tier`: one fact in
+/// two encodings, and therefore two encodings that can disagree. `enabled =
+/// false` beside `tier = "search"` has no honest reading — whichever key the
+/// code happened to check would be the real setting while the other silently did
+/// nothing, which is exactly the "the knob did nothing" defect REQ-558 spent an
+/// ADR removing. [`WebTier::Off`] *is* the disabled state, so the contradiction
+/// is unrepresentable rather than resolved at read time.
+///
+/// # Why this is its own table
+///
+/// The same reason `[privacy]` is (REQ-562 BR-10 — see [`PrivacyConfig`]): this
+/// is a capability question, not a routing one. The table names a ceiling, a
+/// backend, and a cache window, and deliberately carries **no provider, model,
+/// or tier-binding key**. Routing stays in `[[tiers]]`/`[[categories]]`, and
+/// BR-10's rule that page reduction is pinned to the local tier *by property* is
+/// not something a key here could re-open.
+///
+/// BR-14's search ⇒ redact-scan coupling is likewise **not** encoded here as a
+/// cross-check against `[privacy] redact`. The scan is unconditional for search
+/// egress at the choke point (BR-2) — a property no second config writer can
+/// bypass. A validation rule saying the same thing would be a weaker copy of a
+/// guarantee that already holds, and the weaker copy is the one a reader would
+/// trust.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebConfig {
+    /// The capability ceiling. **Defaults to [`WebTier::Off`]**, and that
+    /// default is the requirement rather than an implementation detail: BR-1
+    /// puts web lookup off on a fresh install, with enabling an explicit user
+    /// act.
+    ///
+    /// Serialized unconditionally within the table (no `skip_serializing_if`),
+    /// like [`PrivacyConfig::redact`]: a config that names `[web]` at all states
+    /// its posture rather than leaving a reader to infer it from an absent key.
+    #[serde(default)]
+    pub tier: WebTier,
+    /// The tiers a lookup **inside** the ceiling no longer prompts for (BR-4).
+    ///
+    /// Defaults to **empty**, which is the requirement: BR-4 asks per lookup, and
+    /// this list exists only because the consent prompt offers "enable
+    /// permanently" and that answer has to become something durable. Serialized
+    /// unconditionally within the table, like [`Self::tier`]: a config that names
+    /// `[web]` states its consent posture rather than leaving a reader to infer
+    /// it from an absent key.
+    ///
+    /// # Why a set and not a two-valued switch
+    ///
+    /// BR-3's whole point is that the three tiers are *separately* consented: a
+    /// URL the user pasted, a URL the model composed, and a search are three
+    /// different capabilities, and one answer about one of them is not an answer
+    /// about the other two. A single `permission = "allow"` key made
+    /// `enable_permanent` at a `fetch_user_url` prompt permanently stop asking
+    /// about `fetch_any_url` and `search` as well — the exact breadth violation
+    /// BR-3 forbids, made durable. This list holds precisely the tiers the user
+    /// answered for, and [`WebTier::Off`] is not a member any answer can produce.
+    ///
+    /// It cannot widen [`Self::tier`]. The ceiling is checked before any prompt
+    /// is raised, so a listed tier answers only the prompts the ceiling had
+    /// already permitted to exist — which is why naming a tier here above `[web]
+    /// tier` is not a contradiction to validate away, it is a consent posture for
+    /// a capability that is not enabled.
+    ///
+    /// REQ-560's named permission levels attach here: a level names the tiers it
+    /// covers, which is the shape this already is, rather than a second
+    /// vocabulary to reconcile.
+    #[serde(default)]
+    pub permission_allow: Vec<WebTier>,
+    /// The search backend's endpoint. **No default ships** (BR-8): there is no
+    /// blessed search provider, so an unset endpoint is the ordinary state and
+    /// validates cleanly at every tier below `search` — the tier is simply not
+    /// offered. Only `tier = "search"` *with* no endpoint is a contradiction,
+    /// and [`ConfigError::WebSearchTierWithoutEndpoint`] names the missing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_endpoint: Option<String>,
+    /// A **reference** to the search backend's key — never the key itself (BR-7,
+    /// BR-8). Checked by the same predicate as a provider's `auth_ref`, and the
+    /// rejection names neither the value nor any substring of it.
+    ///
+    /// Optional even at `tier = "search"`: a self-hosted backend may need no
+    /// credential, and requiring one here would make an unauthenticated endpoint
+    /// unconfigurable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_key_ref: Option<String>,
+    /// An optional allowlist constraining **model-chosen** destinations only
+    /// (BR-11).
+    ///
+    /// Three states, all valid and all distinct — which is why this is an
+    /// `Option<Vec<_>>` rather than a `Vec<_>`:
+    ///
+    /// - **absent** (`None`): unrestricted; tier grants alone govern. BR-11 is
+    ///   explicit that this is a valid configuration and not a warning state.
+    /// - **listed**: a model-composed destination outside the list is refused,
+    ///   with the allowlist named.
+    /// - **present but empty** (`Some([])`): an allowlist that lists nothing
+    ///   allows nothing — the most restrictive model-chosen posture, and
+    ///   deliberately *not* collapsed into "unrestricted", which is its
+    ///   opposite.
+    ///
+    /// A user-pasted URL is exempt in all three (BR-11: the user's explicit act
+    /// is its own authorization).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    /// How long a cached document stays fresh, in seconds (BR-12). Defaults to
+    /// 900 — fifteen minutes.
+    ///
+    /// Zero is valid and means **no caching** rather than "cache forever": every
+    /// entry is stale the moment it is written, so a lookup always re-fetches.
+    /// That reading is why [`WebConfig`] hand-writes its [`Default`] instead of
+    /// deriving it — a derived default would zero this field and quietly mean
+    /// something else.
+    ///
+    /// Serialized unconditionally, for the same reason as [`Self::tier`].
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+}
+
+/// The default cache freshness window (BR-12): fifteen minutes.
+const DEFAULT_CACHE_TTL_SECS: u64 = 900;
+
+/// `serde`'s default for [`WebConfig::cache_ttl_secs`]. Needed as a function
+/// because the bare `#[serde(default)]` on a `u64` would supply zero, which this
+/// type gives a different meaning to.
+const fn default_cache_ttl_secs() -> u64 {
+    DEFAULT_CACHE_TTL_SECS
+}
+
+impl Default for WebConfig {
+    /// Off, with no backend and the default cache window — the fresh-install
+    /// state (BR-1).
+    fn default() -> Self {
+        Self {
+            tier: WebTier::Off,
+            permission_allow: Vec::new(),
+            search_endpoint: None,
+            search_key_ref: None,
+            allowed_domains: None,
+            cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
+        }
+    }
+}
+
+impl WebConfig {
+    /// Whether every field still holds its default, used to keep the `[web]`
+    /// table out of a config that never opted in — the same treatment
+    /// [`PrivacyConfig::is_unset`] gives `[privacy]`.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Top-level configuration document.
 ///
 /// Field order matters for TOML serialization: the scalar `pinned_local_model`
@@ -152,6 +377,13 @@ pub struct Config {
     /// switch is here rather than in [`Config::categories`].
     #[serde(default, skip_serializing_if = "PrivacyConfig::is_unset")]
     pub privacy: PrivacyConfig,
+    /// Opt-in web lookup (`[web]`): the capability ceiling, the search backend,
+    /// and the cache window (REQ-563). Absent means `tier = "off"` and no code
+    /// path performs a lookup (BR-1) — see [`WebConfig`] for why the ceiling is
+    /// the only switch. Declared here among the tables, before the
+    /// array-of-table fields, for the TOML-ordering reason above.
+    #[serde(default, skip_serializing_if = "WebConfig::is_unset")]
+    pub web: WebConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -576,6 +808,129 @@ pub enum ConfigError {
         /// The offending value (user-authored, never a credential).
         base_url: String,
     },
+
+    /// `[web] tier = "search"` names no `search_endpoint` (REQ-563 BR-8, AC-7).
+    ///
+    /// BR-8's "with no endpoint configured, the search tier is simply not
+    /// offered — its absence is not an error" governs the config that does not
+    /// *ask* for search: below that tier an unset endpoint is the ordinary
+    /// state and validates cleanly. This variant is the other case — a config
+    /// that names the tier while naming no backend to serve it. That is a
+    /// request for something unserveable rather than an absence, and it is
+    /// reported at load with the missing key named, rather than surfacing later
+    /// as a tier that mysteriously never appears in the consent prompt.
+    #[error(
+        "[web] tier = \"search\" requires a `search_endpoint`, and none is set. Add your search \
+         backend's URL as `[web] search_endpoint`, or lower `[web] tier` to \"fetch_any_url\" — \
+         no default search endpoint ships (BR-8)."
+    )]
+    WebSearchTierWithoutEndpoint,
+
+    /// `[web] search_endpoint` is set to something that is not an absolute
+    /// http(s) URL (REQ-563 BR-8).
+    ///
+    /// Checked wherever the key is set rather than only at `tier = "search"`: a
+    /// value that could never be requested is a mistake at the moment it is
+    /// written, and finding out about it when the tier is *raised* — the one
+    /// moment the user is trying to do something else — is the worse of the two
+    /// times to be told.
+    ///
+    /// The value is not echoed, for [`ConfigError::InvalidAllowedDomain`]'s
+    /// reason: the likeliest malformed endpoint is one carrying a key in its
+    /// query string, and this message is loggable.
+    #[error(
+        "[web] search_endpoint is not a usable URL. It must be an absolute http/https URL \
+         including a host, e.g. \"https://search.example.com/search\". (The value is not echoed: \
+         an endpoint can carry a credential in its query string, and this message is loggable — \
+         BR-7.)"
+    )]
+    InvalidWebSearchEndpoint,
+
+    /// `[web] search_key_ref` is set beside a cleartext `http://` endpoint on a
+    /// non-loopback host (REQ-563 BR-7).
+    ///
+    /// The key resolved from that reference is sent as a bearer credential, so
+    /// an `http://` endpoint puts it on the wire in the clear for every hop to
+    /// read. A config that names both is asking for that, almost certainly
+    /// without meaning to — and the honest place to say so is the load, not a
+    /// packet capture.
+    ///
+    /// Loopback is exempt because there is no wire: a self-hosted backend on
+    /// `http://127.0.0.1:8888` is an ordinary setup, and refusing it would push
+    /// people toward a self-signed certificate for no gain.
+    #[error(
+        "[web] search_key_ref is set, but search_endpoint is a cleartext http:// URL on a \
+         non-loopback host — the search key would be sent in the clear. Use https://, or point \
+         search_endpoint at a loopback address if the backend runs on this machine (BR-7)."
+    )]
+    WebSearchKeyOverCleartextEndpoint,
+
+    /// `[web] search_endpoint` already carries a `q` query parameter (REQ-563
+    /// BR-2, BR-8).
+    ///
+    /// The search seam appends the query as `q`, so an endpoint that already has
+    /// one produces a URL with two — and which of them the backend honours is
+    /// its business, not something this machine can know. That matters beyond
+    /// tidiness: the redaction scan (BR-14) runs on the query string this daemon
+    /// composed, and if the backend answers the *other* `q` then the string that
+    /// was scanned is not the string that decided the request. A parameter name
+    /// the seam owns is not one a config may also set.
+    #[error(
+        "[web] search_endpoint already carries a `q` parameter, and the search query is sent as \
+         `q`. Two would leave which one the backend honours undefined — and the scanned query \
+         would not be the effective one. Remove `q` from the endpoint URL (its other parameters \
+         are kept)."
+    )]
+    WebSearchEndpointCarriesQueryParam,
+
+    /// `[web] permission_allow` names `"off"` (REQ-563 BR-3, BR-4).
+    ///
+    /// The list names tiers the user has answered "stop asking" for, and
+    /// [`WebTier::Off`] names the *absence* of a tier — there is no consent key
+    /// for it, no prompt that could produce it, and nothing an entry would
+    /// switch off. Left unvalidated it would be a member the daemon silently
+    /// drops, which is the shape of a setting that does nothing (REQ-558's
+    /// lesson). Refused at load instead, where the user is still looking at the
+    /// file they just edited.
+    #[error(
+        "[web] permission_allow lists \"off\", which is not a tier a lookup can be consented at. \
+         Remove it — an empty list is the default and means \"ask about every lookup\". Valid \
+         members are \"fetch_user_url\", \"fetch_any_url\" and \"search\"."
+    )]
+    WebPermissionAllowNamesOff,
+
+    /// `[web] search_key_ref` is not a recognized credential *reference*
+    /// (REQ-563 BR-8). Like [`ConfigError::UnrecognizedAuthRef`], the message
+    /// names the accepted forms and never the value.
+    #[error(
+        "[web] search_key_ref is not a recognized credential reference. Config files must store \
+         only a reference to the secret, never the credential itself: use a keychain reference \
+         (\"keychain://<service>/<account>\" or \"keychain:<account>\"), an environment reference \
+         (\"env:<VAR>\"), or a 1Password reference (\"op://<vault>/<item>\"). Put the search key \
+         in your OS keychain and name it here (BR-7)."
+    )]
+    UnrecognizedWebSearchKeyRef,
+
+    /// A `[web] allowed_domains` entry is not shaped like a bare domain pattern
+    /// (REQ-563 BR-11).
+    ///
+    /// The entry is located by **position, not by value**, which is the one
+    /// place this enum's no-echo rule differs from
+    /// [`ConfigError::InvalidBoundaryGlob`]: a *rejected* allowlist entry is by
+    /// definition not a domain, and the likeliest thing it is instead is a
+    /// pasted URL — which can carry a credential in its query string. The
+    /// position is the locator the user actually needs to find the line.
+    #[error(
+        "[web] allowed_domains entry {position} is not a bare domain pattern. Entries are hosts \
+         or wildcards such as \"docs.rs\" or \"*.example.com\" — letters, digits, '.', '-' and \
+         '*' only, with no scheme, no path, and no \"..\". (The value is not echoed: a mis-pasted \
+         URL can carry a credential in its query string, and this message is loggable — BR-7.)"
+    )]
+    InvalidAllowedDomain {
+        /// The 1-based position of the offending entry — the locator, since the
+        /// value itself is deliberately not echoed.
+        position: usize,
+    },
 }
 
 impl Config {
@@ -615,6 +970,7 @@ impl Config {
     /// Returns the first [`ConfigError`] found.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_local_model()?;
+        self.validate_web()?;
 
         let mut ids: HashSet<&str> = HashSet::with_capacity(self.providers.len());
         for p in &self.providers {
@@ -1089,6 +1445,93 @@ impl Config {
         Ok(())
     }
 
+    /// Validates the `[web]` table (REQ-563).
+    ///
+    /// The rules, each of which is as interesting for what it does *not* check:
+    ///
+    /// - `tier = "search"` requires a `search_endpoint`. An unset endpoint below
+    ///   that tier is not checked at all — BR-8 makes it the ordinary state.
+    /// - a `search_endpoint` that *is* set must be an absolute http(s) URL, must
+    ///   not already carry the `q` parameter the search seam appends, and must
+    ///   not be cleartext to a remote host when a `search_key_ref` sits beside
+    ///   it. These are checked at every tier, because a value that could never
+    ///   be requested is wrong when it is written, not when it is first used.
+    /// - `search_key_ref`, when present, must be a reference rather than a
+    ///   secret, by the same predicate a provider `auth_ref` faces. It is not
+    ///   *required* at any tier: an unauthenticated backend is a legitimate
+    ///   configuration, and demanding a key would make one unconfigurable.
+    /// - every `allowed_domains` entry must be shaped like a domain pattern. An
+    ///   absent list is not checked (BR-11: unrestricted is valid), and an empty
+    ///   one is not an error — it is the most restrictive setting available, not
+    ///   a malformed one.
+    /// - every `permission_allow` member must be a tier a lookup can actually be
+    ///   consented at. An unknown spelling is refused by `serde` before this runs
+    ///   (the field is typed as [`WebTier`], not as a string), and `"off"` — the
+    ///   one spelling that parses but names nothing — is refused here.
+    ///
+    /// Nothing here validates the *tier* against the rest of the machine (is
+    /// there a local tier for BR-10's reduction? is the redact scan on?). Those
+    /// are runtime conditions, answered where the lookup happens — a tier that
+    /// cannot be served today is a stated absence, not a config that fails to
+    /// load (BR-8, BR-14).
+    fn validate_web(&self) -> Result<(), ConfigError> {
+        let web = &self.web;
+
+        // A blank endpoint is as unset as an absent one — the same reading
+        // `MissingEndpoint` gives a provider's, so `search_endpoint = ""` cannot
+        // satisfy the tier by being technically present. The same reading is why
+        // the shape checks below skip a blank value rather than calling it
+        // malformed: "not configured" is one state, not two.
+        let endpoint = web
+            .search_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if web.tier == WebTier::Search && endpoint.is_none() {
+            return Err(ConfigError::WebSearchTierWithoutEndpoint);
+        }
+
+        if let Some(endpoint) = endpoint {
+            if !is_absolute_http_url(endpoint) {
+                return Err(ConfigError::InvalidWebSearchEndpoint);
+            }
+            if url_query_names(endpoint).any(|name| name == SEARCH_QUERY_PARAM) {
+                return Err(ConfigError::WebSearchEndpointCarriesQueryParam);
+            }
+            // A key beside a cleartext endpoint is the credential going out in
+            // the clear, so the pair is refused rather than the endpoint alone —
+            // `http://` to a backend that wants no key is a user's own call.
+            if web.search_key_ref.is_some() && is_cleartext_to_a_remote_host(endpoint) {
+                return Err(ConfigError::WebSearchKeyOverCleartextEndpoint);
+            }
+        }
+
+        // BR-7, by the provider path's own predicate rather than a second
+        // spelling of it: a raw key here would be a plaintext secret exactly as
+        // it would be in an `auth_ref`.
+        if let Some(key_ref) = &web.search_key_ref {
+            if !is_recognized_auth_ref(key_ref) {
+                return Err(ConfigError::UnrecognizedWebSearchKeyRef);
+            }
+        }
+
+        if let Some(domains) = &web.allowed_domains {
+            for (index, domain) in domains.iter().enumerate() {
+                if !is_domain_pattern_shaped(domain) {
+                    return Err(ConfigError::InvalidAllowedDomain {
+                        position: index + 1,
+                    });
+                }
+            }
+        }
+
+        if web.permission_allow.contains(&WebTier::Off) {
+            return Err(ConfigError::WebPermissionAllowNamesOff);
+        }
+
+        Ok(())
+    }
+
     /// The model the user pinned, from the `[local_model] pinned` key.
     ///
     /// REQ-544's top-level `pinned_local_model` is hard-deprecated — a config that
@@ -1134,24 +1577,168 @@ fn is_model_name_shaped(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
+/// Strip `prefix` from `value` ASCII-case-insensitively.
+///
+/// A URL scheme is case-insensitive (RFC 3986 §3.1) and every real parser folds
+/// it, so a check that does not is a check a different reading of the same string
+/// passes — the split-parser hazard this file exists to avoid, in miniature.
+fn strip_scheme_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
+}
+
+/// Split an absolute http(s) URL into "is this cleartext" and the text after the
+/// scheme, or `None` when it is neither.
+///
+/// The **one** place the two schemes are recognized, so
+/// [`is_absolute_http_url`], [`url_host`] and [`is_cleartext_to_a_remote_host`]
+/// cannot disagree about whether a given string is an `http://` URL. They used
+/// to each spell the prefix test themselves, and making only one of them
+/// case-insensitive would have been strictly worse than leaving all three
+/// case-sensitive: `HTTP://evil.example` would validate as a URL and then fail
+/// the cleartext test, putting a search key on the wire in the clear.
+fn split_http_scheme(value: &str) -> Option<(bool, &str)> {
+    if let Some(rest) = strip_scheme_ci(value, "https://") {
+        return Some((false, rest));
+    }
+    strip_scheme_ci(value, "http://").map(|rest| (true, rest))
+}
+
+/// The authority region of an absolute http(s) URL — everything after the scheme
+/// and before the path, query or fragment.
+///
+/// **A backslash ends the authority too**, and that is the load-bearing part.
+/// WHATWG treats `\` as `/` in a special scheme, so `http://evil.example\@127.0.0.1/x`
+/// is a request to `evil.example` with `\@127.0.0.1/x` as its path — while a
+/// splitter that only knows `/?#` reads the whole thing as an authority, takes
+/// the userinfo off at the last `@`, and concludes the host is `127.0.0.1`. That
+/// is two parsers disagreeing about the destination, which is exactly how a
+/// cleartext-loopback exemption gets handed a remote host. Rather than teach this
+/// crate the WHATWG grammar — it is the pure-logic core and carries no URL
+/// dependency — the shape is refused outright by [`is_absolute_http_url`], so no
+/// later reader has to be right about it.
+fn url_authority(rest: &str) -> &str {
+    rest.split(['/', '?', '#', '\\']).next().unwrap_or_default()
+}
+
 /// Whether `value` is an absolute `http`/`https` URL with a non-empty host.
 ///
 /// Deliberately hand-rolled rather than pulling in a URL parser: this crate is
 /// the pure-logic core and the check it needs is narrow — a scheme, a host, and
 /// no embedded whitespace. Full URL semantics are the download client's problem
 /// (`tetond`), which parses it for real before fetching anything.
+///
+/// The one place that narrowness is not enough is the backslash: see
+/// [`url_authority`]. An authority containing one is refused here rather than
+/// interpreted, because the two available interpretations name two different
+/// hosts and this crate is not the parser that settles it.
 fn is_absolute_http_url(value: &str) -> bool {
     if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return false;
     }
-    let Some(rest) = value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"))
-    else {
+    let Some((_, rest)) = split_http_scheme(value) else {
         return false;
     };
+    // Computed with `/?#` only, so a `\` *inside* the region those delimiters
+    // bound is seen and refused rather than silently ending the authority early.
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !host.is_empty() && !host.starts_with(':')
+    !host.is_empty() && !host.starts_with(':') && !host.contains('\\')
+}
+
+/// The query parameter the search seam sends the user's query as (REQ-563).
+///
+/// Named here rather than only at the seam because the config check and the
+/// request builder have to agree about which name is spoken for: a constant in
+/// one crate and a string literal in the other is exactly the pair that drifts.
+const SEARCH_QUERY_PARAM: &str = "q";
+
+/// The parameter *names* in `url`'s query string, in order.
+///
+/// Names only — a value is never yielded, because a query string is the likeliest
+/// place in a URL for a credential to be sitting and this iterator feeds error
+/// paths. The fragment is cut first: `#` ends the query, and a `?` after one
+/// belongs to the fragment and is never sent.
+fn url_query_names(url: &str) -> impl Iterator<Item = &str> {
+    url.split('#')
+        .next()
+        .and_then(|before_fragment| before_fragment.split_once('?'))
+        .map_or("", |(_, query)| query)
+        .split('&')
+        .map(|pair| pair.split('=').next().unwrap_or_default())
+        .filter(|name| !name.is_empty())
+}
+
+/// The host of an absolute http(s) URL, without userinfo, port, or brackets.
+///
+/// Deliberately not a URL parser: it answers one question — which host would be
+/// contacted — for a string [`is_absolute_http_url`] has already accepted. The
+/// userinfo strip uses the *last* `@`, because a password may contain one and
+/// the authority ends at the last.
+///
+/// The authority is taken by [`url_authority`], which ends at a backslash as well
+/// — belt and braces, since `is_absolute_http_url` has already refused a URL
+/// whose authority contains one, and the two readings must not be able to drift
+/// apart if that order ever changes.
+fn url_host(url: &str) -> Option<&str> {
+    let (_, rest) = split_http_scheme(url)?;
+    let authority = url_authority(rest);
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, after)| after);
+    let host = host_port.strip_prefix('[').map_or_else(
+        || host_port.split(':').next().unwrap_or_default(),
+        |bracketed| bracketed.split(']').next().unwrap_or_default(),
+    );
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether `url` would put bytes on a wire in the clear.
+///
+/// `http://` to loopback is not that: nothing leaves the machine, so a
+/// self-hosted backend on `http://127.0.0.1:8888` is an ordinary configuration
+/// and not a credential exposure. Anything else `http://` is.
+///
+/// A host that cannot be extracted counts as remote — the failing-safe reading,
+/// though [`is_absolute_http_url`] has already refused the hostless shapes.
+fn is_cleartext_to_a_remote_host(url: &str) -> bool {
+    split_http_scheme(url).is_some_and(|(cleartext, _)| cleartext)
+        && !url_host(url).is_some_and(is_loopback_host)
+}
+
+/// Whether `host` names this machine: `localhost`, or any address in a loopback
+/// range (`127.0.0.0/8` is loopback in its entirety, not just `127.0.0.1`).
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// Whether `value` is shaped like a bare domain pattern for the BR-11 allowlist
+/// — a host (`docs.rs`) or a wildcard (`*.example.com`).
+///
+/// The charset `[A-Za-z0-9.*-]` does the work of several rules at once, which is
+/// why it is stated as one: "no scheme" and "no path" fall out of it because
+/// `:` and `/` are not in it, and so do the credential-bearing parts a
+/// mis-pasted URL would bring along (`?`, `#`, `@`). Two rules the charset
+/// cannot express are checked separately — a non-empty value, and no `..`, an
+/// empty label that matches no host and is likelier a half-finished edit or a
+/// relative-path fragment than an intent.
+///
+/// The 253-byte cap is the maximum length of a DNS name, so no pattern that
+/// could name a real host is refused by it.
+///
+/// This is a *shape* check, in the spirit of [`is_model_name_shaped`]: whether a
+/// pattern matches a given destination is the matcher's question, and whether
+/// the host resolves is the network's.
+fn is_domain_pattern_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '*'))
 }
 
 /// Error from [`Config::load`] — either the TOML failed to parse or the parsed
@@ -1461,6 +2048,8 @@ auth_ref = "keychain:anthropic"
             // the opt-in has its own tests, and every caller here is asserting
             // something else.
             privacy: PrivacyConfig::default(),
+            // REQ-563: likewise off, for the same reason.
+            web: WebConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),
@@ -3078,5 +3667,843 @@ mode = "local-only"
         assert_eq!(cfg.local_model.pinned.as_deref(), Some("qwen2.5-coder-3b"));
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.legacy_routing[0].phase, Phase::Architect);
+    }
+
+    // ---- REQ-563: the `[web]` ceiling (BR-3, BR-8, BR-11, AC-7) ------------
+
+    /// A fully-configured `[web]` table at the top tier — the fixture for the
+    /// round-trip test, which needs every key present at once.
+    const WEB_SEARCH_TOML: &str = r#"
+[web]
+tier = "search"
+search_endpoint = "https://search.example/api"
+search_key_ref = "keychain:teton-search"
+allowed_domains = ["docs.rs", "*.example.com"]
+cache_ttl_secs = 300
+"#;
+
+    /// A config whose only setting is the `[web]` table. The validation tests
+    /// have nothing to say about providers or routing, and struct-update syntax
+    /// keeps them honest about which field they are actually varying.
+    fn web_config(web: WebConfig) -> Config {
+        Config {
+            web,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn web_tiers_are_ordered_and_each_tier_includes_the_ones_below() {
+        // BR-3 grades the capability. The order is asserted directly because
+        // `Ord` here is derived from *declaration* order: a variant moved or
+        // inserted mid-list changes what an existing grant permits, silently.
+        assert!(WebTier::Off < WebTier::FetchUserUrl);
+        assert!(WebTier::FetchUserUrl < WebTier::FetchAnyUrl);
+        assert!(WebTier::FetchAnyUrl < WebTier::Search);
+
+        // Inclusion: a ceiling allows its own tier and every tier below it.
+        assert!(WebTier::Search.allows(WebTier::Search));
+        assert!(WebTier::Search.allows(WebTier::FetchAnyUrl));
+        assert!(WebTier::Search.allows(WebTier::FetchUserUrl));
+        assert!(WebTier::FetchAnyUrl.allows(WebTier::FetchAnyUrl));
+        assert!(WebTier::FetchAnyUrl.allows(WebTier::FetchUserUrl));
+        assert!(WebTier::FetchUserUrl.allows(WebTier::FetchUserUrl));
+
+        // And nothing above it — the half BR-3 actually legislates: "a grant at
+        // a lower tier never implies a higher tier".
+        assert!(!WebTier::FetchUserUrl.allows(WebTier::FetchAnyUrl));
+        assert!(!WebTier::FetchUserUrl.allows(WebTier::Search));
+        assert!(!WebTier::FetchAnyUrl.allows(WebTier::Search));
+    }
+
+    #[test]
+    fn the_off_tier_allows_nothing_including_itself() {
+        for needed in [WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search] {
+            assert!(!WebTier::Off.allows(needed), "off permitted {needed:?}");
+        }
+
+        // The deliberate case: `Off` names the absence of a capability, not one,
+        // so it is never *allowed* either. A caller whose required tier came out
+        // `Off` — an unset default, a mapping that fell through — must not read
+        // permission out of a machine that opted into nothing.
+        assert!(!WebTier::Off.allows(WebTier::Off));
+        for ceiling in [WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search] {
+            assert!(!ceiling.allows(WebTier::Off), "{ceiling:?} allowed off");
+        }
+    }
+
+    #[test]
+    fn a_config_with_no_web_table_leaves_web_lookup_off() {
+        // BR-1's off-by-default leg, asserted on documents that predate the
+        // table entirely — every config authored before this REQ is in exactly
+        // that state, and must load to "off" rather than fail on a missing key.
+        for (label, toml_text) in [
+            ("pre-REQ-557", PRE_REQ_557_TOML),
+            ("the tier table", TIER_TABLE_TOML),
+            ("the empty document", ""),
+        ] {
+            let cfg = Config::load(toml_text).expect("must load");
+            assert_eq!(cfg.web, WebConfig::default(), "{label}");
+            assert_eq!(cfg.web.tier, WebTier::Off, "{label}: web lookup was on");
+            assert!(
+                !cfg.web.tier.allows(WebTier::FetchUserUrl),
+                "{label}: a config that never named [web] permitted a lookup"
+            );
+        }
+        // The struct default must agree with the parsed default.
+        assert_eq!(Config::default().web.tier, WebTier::Off);
+        assert!(Config::default().web.is_unset());
+    }
+
+    #[test]
+    fn the_web_table_reads_its_values_rather_than_defaulting_them() {
+        // LESSON-485: a fixture that cannot discriminate is not a test. "It
+        // loads" would pass against fields wired to constants, so read a
+        // document that sets every key to a non-default and assert each value
+        // survived the load.
+        let configured = Config::load(
+            r#"
+[web]
+tier = "fetch_any_url"
+search_endpoint = "https://search.example/api"
+search_key_ref = "keychain:teton-search"
+allowed_domains = ["docs.rs", "*.example.com"]
+cache_ttl_secs = 60
+"#,
+        )
+        .expect("must load");
+        assert_eq!(configured.web.tier, WebTier::FetchAnyUrl);
+        assert_eq!(
+            configured.web.search_endpoint.as_deref(),
+            Some("https://search.example/api")
+        );
+        assert_eq!(
+            configured.web.search_key_ref.as_deref(),
+            Some("keychain:teton-search")
+        );
+        assert_eq!(
+            configured.web.allowed_domains,
+            Some(vec!["docs.rs".to_owned(), "*.example.com".to_owned()])
+        );
+        assert_eq!(configured.web.cache_ttl_secs, 60);
+        assert_ne!(configured.web, WebConfig::default());
+
+        // Every tier spelling parses to its variant, so the ceiling a user
+        // writes is the ceiling the system holds.
+        for (spelling, tier) in [
+            ("off", WebTier::Off),
+            ("fetch_user_url", WebTier::FetchUserUrl),
+            ("fetch_any_url", WebTier::FetchAnyUrl),
+            ("search", WebTier::Search),
+        ] {
+            let cfg = Config::load(&format!(
+                "[web]\ntier = \"{spelling}\"\nsearch_endpoint = \"https://search.example/api\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("{spelling} must load: {e}"));
+            assert_eq!(cfg.web.tier, tier, "{spelling} parsed to the wrong tier");
+        }
+
+        // A present-but-empty table is the off state: every key carries a serde
+        // default, so an author who writes the header and nothing else has
+        // configured nothing.
+        assert_eq!(
+            Config::load("[web]\n").expect("must load").web,
+            WebConfig::default()
+        );
+    }
+
+    /// **`[web] permission_allow` defaults to empty and holds tiers, one each.**
+    ///
+    /// BR-4 asks per lookup, so "ask about everything" is the requirement rather
+    /// than a taste, and an empty list is what says it. A member exists only
+    /// because the consent prompt offers "enable permanently" and that answer
+    /// needs something durable to become — and it is a *list of tiers* rather
+    /// than a two-valued switch because BR-3 grades the capability into three
+    /// separately-consented tiers. It is orthogonal to the ceiling: a tier listed
+    /// here with `tier = "off"` is not a contradiction, it is a consent posture
+    /// for a capability nobody enabled.
+    #[test]
+    fn the_web_permission_allow_list_defaults_to_empty_and_holds_one_tier_per_answer() {
+        assert!(WebConfig::default().permission_allow.is_empty());
+        assert!(
+            Config::load("[web]\n")
+                .expect("must load")
+                .web
+                .permission_allow
+                .is_empty(),
+            "a table that names no consent list asks about everything (BR-4)"
+        );
+
+        let cfg = Config::load(
+            "[web]\ntier = \"fetch_any_url\"\npermission_allow = [\"fetch_user_url\"]\n",
+        )
+        .expect("must load");
+        assert_eq!(cfg.web.permission_allow, vec![WebTier::FetchUserUrl]);
+        // It never widens the ceiling: that is a separate key and stays put.
+        assert_eq!(cfg.web.tier, WebTier::FetchAnyUrl);
+
+        // Every tier above `off` is a legal member, and members do not imply
+        // each other — the list holds exactly what was answered for.
+        let all = Config::load(
+            "[web]\npermission_allow = [\"fetch_user_url\", \"fetch_any_url\", \"search\"]\n",
+        )
+        .expect("must load");
+        assert_eq!(all.web.tier, WebTier::Off);
+        assert_eq!(
+            all.web.permission_allow,
+            vec![WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search]
+        );
+
+        // And it survives a round-trip, written unconditionally like `tier`.
+        let toml_text = all.to_toml().expect("serialize");
+        assert!(
+            toml_text.contains("permission_allow = [") && toml_text.contains("\"search\","),
+            "toml: {toml_text}"
+        );
+        assert_eq!(
+            Config::from_toml(&toml_text).expect("deserialize").web,
+            all.web
+        );
+    }
+
+    /// **A member that names no tier is refused at load, not silently dropped.**
+    ///
+    /// Two spellings reach this. An unknown one (`"fetch"`, a typo) is refused by
+    /// `serde` because the field is typed as [`WebTier`] rather than as a string
+    /// — which is the reason it is typed that way. `"off"` parses and then names
+    /// the *absence* of a tier: there is no consent key for it and no prompt that
+    /// could produce it, so an entry would be a setting that does nothing, which
+    /// is the defect REQ-558 spent an ADR removing.
+    #[test]
+    fn a_permission_allow_member_that_names_no_tier_is_refused_at_load() {
+        for spelling in ["fetch", "FETCH_USER_URL", "web_search", "\"\""] {
+            let err = Config::load(&format!("[web]\npermission_allow = [{spelling:?}]\n"));
+            assert!(
+                err.is_err(),
+                "{spelling:?} loaded as a consent tier: {err:?}"
+            );
+        }
+
+        let err = Config::load("[web]\ntier = \"fetch_any_url\"\npermission_allow = [\"off\"]\n")
+            .expect_err("\"off\" is not a tier a lookup can be consented at");
+        assert!(
+            format!("{err}").contains("permission_allow"),
+            "the message must name the key the user has to edit: {err}"
+        );
+
+        // And the same list without `off` is fine — the rule is about the
+        // member, not about the key being present.
+        assert!(Config::load(
+            "[web]\ntier = \"fetch_any_url\"\npermission_allow = [\"fetch_user_url\"]\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_web_table_round_trips_and_stays_out_of_a_config_that_never_configured_it() {
+        // The REQ-557 round-trip rule: what the daemon writes back must be what
+        // a user could have authored.
+        let cfg = Config::load(WEB_SEARCH_TOML).expect("must load");
+        let toml_text = cfg.to_toml().expect("serialize");
+        assert!(toml_text.contains("[web]"), "toml: {toml_text}");
+        // The two unconditionally-serialized keys: a written-out `[web]` states
+        // its posture rather than leaving a reader to infer it from an absence.
+        assert!(toml_text.contains("tier = \"search\""), "toml: {toml_text}");
+        assert!(toml_text.contains("cache_ttl_secs"), "toml: {toml_text}");
+        let back = Config::from_toml(&toml_text).expect("deserialize");
+        assert_eq!(cfg, back, "round-trip mismatch; toml was:\n{toml_text}");
+        Config::load(&toml_text).expect("a re-serialized config must still validate");
+
+        // And a config that never configured web lookup does not grow the
+        // table, exactly as `[privacy]` stays out of one that never opted in.
+        let untouched = Config::load(TIER_TABLE_TOML).expect("must load");
+        let written = untouched.to_toml().expect("serialize");
+        assert!(
+            !written.contains("[web]"),
+            "an unset ceiling was written into the user's config: {written}"
+        );
+        assert_eq!(
+            Config::from_toml(&written).expect("deserialize").web,
+            WebConfig::default()
+        );
+    }
+
+    #[test]
+    fn the_search_tier_without_an_endpoint_is_rejected_naming_the_missing_field() {
+        // AC-7 / BR-8: a config that asks for search while naming no backend is
+        // a contradiction, caught at load rather than surfacing later as a tier
+        // that mysteriously never appears in the consent prompt.
+        let err = Config::load("[web]\ntier = \"search\"\n")
+            .expect_err("the search tier with no endpoint must not validate");
+        assert!(
+            matches!(
+                err,
+                LoadError::Validate(ConfigError::WebSearchTierWithoutEndpoint)
+            ),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("search_endpoint"),
+            "the error must name the missing field: {msg}"
+        );
+
+        // A blank endpoint is as unset as an absent one — it cannot satisfy the
+        // tier by being technically present.
+        for blank in ["\"\"", "\"   \""] {
+            let err = Config::load(&format!(
+                "[web]\ntier = \"search\"\nsearch_endpoint = {blank}\n"
+            ))
+            .expect_err("a blank endpoint is not an endpoint");
+            assert!(
+                matches!(
+                    err,
+                    LoadError::Validate(ConfigError::WebSearchTierWithoutEndpoint)
+                ),
+                "{blank}: {err:?}"
+            );
+        }
+
+        // With an endpoint, the same tier is a valid configuration.
+        Config::load(
+            "[web]\ntier = \"search\"\nsearch_endpoint = \"https://search.example/api\"\n",
+        )
+        .expect("search with an endpoint must validate");
+    }
+
+    #[test]
+    fn a_missing_search_endpoint_below_the_search_tier_is_not_an_error() {
+        // BR-8's other half, and the easy one to over-implement into a warning:
+        // with no endpoint the search tier is simply not offered, and every
+        // lower tier is a perfectly valid configuration without one.
+        for tier in ["off", "fetch_user_url", "fetch_any_url"] {
+            let cfg = Config::load(&format!("[web]\ntier = \"{tier}\"\n"))
+                .unwrap_or_else(|e| panic!("{tier} must load without a search endpoint: {e}"));
+            assert!(cfg.web.search_endpoint.is_none());
+            assert!(
+                !cfg.web.tier.allows(WebTier::Search),
+                "{tier} reached the search tier"
+            );
+        }
+    }
+
+    #[test]
+    fn a_credential_shaped_search_key_ref_is_rejected_without_echoing_it() {
+        // BR-7 reaching the second credential-bearing field. Same posture as
+        // `rejection_message_points_at_keychain_and_never_echoes_the_secret`,
+        // because it is the same rule.
+        let secret = "sk-ant-api03-TOPSECRETshouldNeverLeak0000";
+        let err = Config::load(&format!(
+            "[web]\ntier = \"search\"\nsearch_endpoint = \"https://search.example/api\"\n\
+             search_key_ref = \"{secret}\"\n"
+        ))
+        .expect_err("a raw key in search_key_ref must be refused");
+        assert!(
+            matches!(
+                err,
+                LoadError::Validate(ConfigError::UnrecognizedWebSearchKeyRef)
+            ),
+            "{err:?}"
+        );
+
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(secret),
+            "the error echoed the raw credential: {msg}"
+        );
+        assert!(
+            !msg.contains("TOPSECRET"),
+            "the error echoed part of the credential: {msg}"
+        );
+        assert!(
+            msg.contains("keychain"),
+            "the fix must be readable from the message: {msg}"
+        );
+        assert!(msg.contains("BR-7"), "message should cite BR-7: {msg}");
+
+        // The same predicate as a provider's `auth_ref`, so the shapes REQ-544
+        // MED-3 named are refused here too rather than only there. Checked at
+        // `tier = "off"`: a secret written into a plaintext config is a leak
+        // whether or not the capability it belongs to is enabled.
+        for raw in [
+            "sk-1234567890abcdefghijklmnop",
+            "AKIAIOSFODNN7EXAMPLE",
+            "foo:AKIAIOSFODNN7EXAMPLE",
+            "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0",
+            "keychain:",
+            "env:",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_key_ref: Some(raw.to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::UnrecognizedWebSearchKeyRef,
+                "accepted as a reference: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reference_shaped_search_key_ref_is_accepted() {
+        for good in [
+            "keychain://teton/search", // the shape the CLI emits
+            "keychain:teton-search",   // shorthand
+            "env:TETON_SEARCH_KEY",
+            "op://vault/search-key", // 1Password
+        ] {
+            let cfg = web_config(WebConfig {
+                search_key_ref: Some(good.to_owned()),
+                ..WebConfig::default()
+            });
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{good} is a recognized reference: {e}"));
+        }
+
+        // And a key reference is never *required*: an unauthenticated backend
+        // (a self-hosted one) is a legitimate configuration, so demanding a key
+        // at the search tier would make it unconfigurable.
+        Config::load("[web]\ntier = \"search\"\nsearch_endpoint = \"https://searx.internal\"\n")
+            .expect("an unauthenticated search backend must be configurable");
+    }
+
+    /// A `search_endpoint` that could never be requested is a mistake at the
+    /// moment it is written. Every one of these used to load cleanly and fail
+    /// later — at daemon start, or at the first search, whichever came first.
+    #[test]
+    fn a_search_endpoint_that_is_not_an_absolute_http_url_is_rejected() {
+        for bad in [
+            "search.example/api",             // no scheme
+            "//search.example/api",           // protocol-relative
+            "ftp://search.example/api",       // wrong scheme
+            "file:///etc/passwd",             // wrong scheme, and a local read
+            "https://",                       // no host
+            "https:///api",                   // no host, with a path
+            "https://:8443/api",              // port with no host
+            "javascript:alert(1)",            // not a URL at all
+            "https://search example/api",     // whitespace
+            "https://search.example/\u{7}pi", // control character
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*bad).to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::InvalidWebSearchEndpoint,
+                "accepted as an endpoint: {bad:?}"
+            );
+        }
+
+        // The rejection is checked at every tier, not only at `search`: an
+        // endpoint written today is wrong today, whatever tier it is waiting for.
+        for tier in [WebTier::Off, WebTier::FetchUserUrl, WebTier::FetchAnyUrl] {
+            let cfg = web_config(WebConfig {
+                tier,
+                search_endpoint: Some("not-a-url".to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::InvalidWebSearchEndpoint,
+                "{tier:?} skipped the endpoint check"
+            );
+        }
+
+        // ...and the shapes that are usable endpoints.
+        for good in [
+            "https://search.example",
+            "https://search.example/search",
+            "http://127.0.0.1:8888/search",
+            "https://search.example/search?format=json&safe=1",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*good).to_owned()),
+                ..WebConfig::default()
+            });
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{good} is a usable endpoint: {e}"));
+        }
+    }
+
+    /// The rejection is loggable, and a malformed endpoint is most often one
+    /// with a key pasted into its query string — so it names the field and
+    /// nothing else, the same trade [`ConfigError::InvalidAllowedDomain`] makes.
+    #[test]
+    fn the_endpoint_rejection_names_the_field_and_never_the_value() {
+        let leaky = "search.example/api?api_key=sk-live-DO-NOT-LOG";
+        let cfg = web_config(WebConfig {
+            search_endpoint: Some(leaky.to_owned()),
+            ..WebConfig::default()
+        });
+        let msg = cfg.validate().unwrap_err().to_string();
+        assert!(
+            !msg.contains("sk-live-DO-NOT-LOG"),
+            "the error echoed a credential: {msg}"
+        );
+        assert!(!msg.contains(leaky), "the error echoed the value: {msg}");
+        assert!(
+            msg.contains("search_endpoint"),
+            "the error must name the field: {msg}"
+        );
+    }
+
+    /// The key resolved from `search_key_ref` goes out as a bearer credential,
+    /// so a cleartext endpoint puts it on the wire for every hop to read. The
+    /// pair is what is refused — `http://` with no key is the user's own call.
+    #[test]
+    fn a_search_key_beside_a_cleartext_remote_endpoint_is_refused() {
+        for remote in [
+            "http://search.example/api",
+            "http://192.0.2.10:8888/search",
+            "http://user@search.example/api",
+            "http://[2001:db8::1]/search",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*remote).to_owned()),
+                search_key_ref: Some("keychain:teton-search".to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::WebSearchKeyOverCleartextEndpoint,
+                "a key was allowed to travel in the clear to {remote}"
+            );
+        }
+
+        // Loopback is exempt: there is no wire, and refusing it would push a
+        // self-hosted backend toward a self-signed certificate for no gain.
+        for local in [
+            "http://localhost:8888/search",
+            "http://LOCALHOST:8888/search",
+            "http://127.0.0.1:8888/search",
+            "http://127.9.9.9/search",
+            "http://[::1]:8888/search",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*local).to_owned()),
+                search_key_ref: Some("keychain:teton-search".to_owned()),
+                ..WebConfig::default()
+            });
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{local} is loopback and needs no TLS: {e}"));
+        }
+
+        // https is fine anywhere, and cleartext with no key is not this rule's
+        // business.
+        for (endpoint, key) in [
+            ("https://search.example/api", Some("keychain:teton-search")),
+            ("http://search.example/api", None),
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some(endpoint.to_owned()),
+                search_key_ref: key.map(str::to_owned),
+                ..WebConfig::default()
+            });
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{endpoint} with key {key:?} must validate: {e}"));
+        }
+
+        let msg = ConfigError::WebSearchKeyOverCleartextEndpoint.to_string();
+        assert!(msg.contains("search_key_ref"), "{msg}");
+        assert!(msg.contains("search_endpoint"), "{msg}");
+    }
+
+    /// **The cleartext exemption cannot be reached by a second reading of the
+    /// authority.**
+    ///
+    /// `http://evil.example\@127.0.0.1/x` is two URLs depending on who parses it.
+    /// WHATWG treats `\` as `/` in a special scheme, so the authority ends at the
+    /// backslash and the host is `evil.example` — which is what `reqwest` binds
+    /// the search key to, and what the packet reaches. A splitter that only knows
+    /// `/?#` reads the whole thing as an authority, takes the userinfo off at the
+    /// last `@`, and concludes the host is `127.0.0.1` — loopback, therefore
+    /// exempt from the cleartext rule, therefore a bearer key on the open wire to
+    /// a host the validator never saw.
+    ///
+    /// This crate carries no URL parser and is not going to grow one for this, so
+    /// the shape is refused rather than interpreted: a backslash in the authority
+    /// means the two available readings disagree, and neither is this crate's to
+    /// pick.
+    #[test]
+    fn an_endpoint_whose_authority_carries_a_backslash_is_refused_outright() {
+        for split_brain in [
+            "http://evil.example\\@127.0.0.1/x",
+            "https://evil.example\\@localhost/search",
+            "http://evil.example\\127.0.0.1/x",
+            "http://\\@127.0.0.1/x",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*split_brain).to_owned()),
+                // With a key beside it, so a validator that let this through
+                // would be letting the credential out too.
+                search_key_ref: Some("keychain:teton-search".to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::InvalidWebSearchEndpoint,
+                "two parsers were allowed to disagree about the host of {split_brain:?}"
+            );
+        }
+
+        // A backslash *after* the authority is somebody's path and no business
+        // of this rule — the two readings agree about the host there.
+        let pathy = web_config(WebConfig {
+            search_endpoint: Some("https://search.example/a\\b".to_owned()),
+            ..WebConfig::default()
+        });
+        pathy
+            .validate()
+            .expect("a backslash in the path names no second host");
+    }
+
+    /// **A URL scheme is case-insensitive, and every reader here agrees about
+    /// it.**
+    ///
+    /// The hazard is not `HTTP://` being rejected — it is one reader folding the
+    /// case and another not. `is_absolute_http_url` accepting `HTTP://evil.example`
+    /// while `is_cleartext_to_a_remote_host` tested `starts_with("http://")` would
+    /// have validated a cleartext endpoint as if it were TLS and sent the search
+    /// key out in the clear. The three readers share one scheme split, and this
+    /// pins the shared answer at both ends.
+    #[test]
+    fn the_scheme_check_folds_case_for_every_reader() {
+        // Accepted as a URL...
+        let upper = web_config(WebConfig {
+            search_endpoint: Some("HTTPS://search.example/api".to_owned()),
+            search_key_ref: Some("keychain:teton-search".to_owned()),
+            ..WebConfig::default()
+        });
+        upper
+            .validate()
+            .expect("HTTPS:// is https:// — the scheme is case-insensitive");
+
+        // ...and the cleartext rule reads the same fold, so an upper-case
+        // `http://` is still cleartext.
+        for shouty in ["HTTP://search.example/api", "Http://search.example/api"] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*shouty).to_owned()),
+                search_key_ref: Some("keychain:teton-search".to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::WebSearchKeyOverCleartextEndpoint,
+                "{shouty} was read as a URL by one check and not by the other"
+            );
+        }
+
+        // The loopback exemption folds the same way.
+        let local = web_config(WebConfig {
+            search_endpoint: Some("HTTP://127.0.0.1:8888/search".to_owned()),
+            search_key_ref: Some("keychain:teton-search".to_owned()),
+            ..WebConfig::default()
+        });
+        local
+            .validate()
+            .expect("loopback is loopback whatever case the scheme is written in");
+    }
+
+    /// The seam appends the query as `q`. An endpoint that already carries one
+    /// would produce two, and which the backend honours is its business — so the
+    /// string this daemon scanned would not be the string that decided the
+    /// request. The name the seam owns is not one a config may also set.
+    #[test]
+    fn an_endpoint_that_already_carries_a_q_parameter_is_rejected() {
+        for bad in [
+            "https://search.example/api?q=",
+            "https://search.example/api?q=preset",
+            "https://search.example/api?format=json&q=preset",
+            "https://search.example/api?format=json&q=preset&safe=1",
+            "https://search.example/api?q", // valueless, still the name
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*bad).to_owned()),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::WebSearchEndpointCarriesQueryParam,
+                "accepted an endpoint that already sets q: {bad:?}"
+            );
+        }
+
+        // Other parameters are the backend's business and are kept — only the
+        // one name the seam owns is refused. A `q` inside a *value*, a path, or
+        // a fragment is not a parameter named `q`.
+        for good in [
+            "https://search.example/api?format=json&safe=1",
+            "https://search.example/api?query=preset",
+            "https://search.example/api?format=q",
+            "https://search.example/q/api",
+            "https://search.example/api#q=notsent",
+        ] {
+            let cfg = web_config(WebConfig {
+                search_endpoint: Some((*good).to_owned()),
+                ..WebConfig::default()
+            });
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{good} sets no q parameter: {e}"));
+        }
+
+        let msg = ConfigError::WebSearchEndpointCarriesQueryParam.to_string();
+        assert!(msg.contains("search_endpoint"), "{msg}");
+        assert!(
+            !msg.contains("preset"),
+            "the message must not echo the value: {msg}"
+        );
+    }
+
+    #[test]
+    fn allowlist_entries_are_charset_checked() {
+        // BR-11 entries are bare hosts or wildcards. The charset does most of
+        // the work — a scheme brings `:`, a path brings `/`, and a mis-pasted
+        // URL brings both plus its query string.
+        for bad in [
+            "https://docs.rs",             // scheme
+            "docs.rs/std",                 // path
+            "docs.rs:443",                 // port
+            "example..com",                // empty label
+            "..",                          // relative-path fragment
+            "",                            // empty
+            "exa mple.com",                // whitespace
+            "user@example.com",            // userinfo
+            "example.com?key=sk-not-real", // query string
+            "exämple.com",                 // non-ASCII (punycode is the spelling)
+        ] {
+            let cfg = web_config(WebConfig {
+                allowed_domains: Some(vec![bad.to_owned()]),
+                ..WebConfig::default()
+            });
+            assert_eq!(
+                cfg.validate().unwrap_err(),
+                ConfigError::InvalidAllowedDomain { position: 1 },
+                "accepted as a domain pattern: {bad:?}"
+            );
+        }
+
+        // ...and the shapes that are patterns.
+        let cfg = web_config(WebConfig {
+            allowed_domains: Some(
+                [
+                    "docs.rs",
+                    "example.com",
+                    "*.example.com",
+                    "sub.domain.example-host.io",
+                    "*",
+                ]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            ),
+            ..WebConfig::default()
+        });
+        cfg.validate()
+            .expect("bare hosts and wildcards must be accepted");
+    }
+
+    #[test]
+    fn the_allowlist_rejection_locates_the_entry_without_echoing_it() {
+        // The one place this enum trades the offending value for a position: a
+        // *rejected* allowlist entry is by definition not a domain, and the
+        // likeliest thing it is instead is a pasted URL — which can carry a
+        // credential in its query string, into a message that gets logged.
+        let leaky = "https://search.example/api?key=sk-live-DO-NOT-LOG";
+        let cfg = web_config(WebConfig {
+            allowed_domains: Some(vec![
+                "docs.rs".to_owned(),
+                "*.example.com".to_owned(),
+                leaky.to_owned(),
+            ]),
+            ..WebConfig::default()
+        });
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidAllowedDomain { position: 3 },
+            "the position must locate the third entry"
+        );
+
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("sk-live-DO-NOT-LOG"),
+            "the error echoed a credential: {msg}"
+        );
+        assert!(!msg.contains(leaky), "the error echoed the entry: {msg}");
+        // The position is what replaces the value, so it has to be *in* the
+        // message — an unlocatable rejection in a twenty-entry list is worse
+        // than useless.
+        assert!(
+            msg.contains('3'),
+            "the message must locate the entry: {msg}"
+        );
+        assert!(
+            msg.contains("allowed_domains"),
+            "the message must name the key: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_absent_allowlist_and_an_empty_one_are_valid_and_are_not_the_same_thing() {
+        // BR-11: absent means unrestricted, and is explicitly a valid
+        // configuration rather than a warning state.
+        let unrestricted = Config::load("[web]\ntier = \"fetch_any_url\"\n").expect("must load");
+        assert!(unrestricted.web.allowed_domains.is_none());
+
+        // An empty list is the opposite posture — an allowlist that lists
+        // nothing allows nothing — and is the most restrictive model-chosen
+        // setting, not a malformed one. The two must not collapse together.
+        let nothing_allowed =
+            Config::load("[web]\ntier = \"fetch_any_url\"\nallowed_domains = []\n")
+                .expect("an empty allowlist is a setting, not an error");
+        assert_eq!(nothing_allowed.web.allowed_domains, Some(Vec::new()));
+        assert_ne!(
+            unrestricted.web, nothing_allowed.web,
+            "unrestricted and allow-nothing collapsed into one state"
+        );
+
+        // And the distinction survives a write/read cycle, which is where an
+        // `Option` that is really a `Vec` usually loses it.
+        let written = nothing_allowed.to_toml().expect("serialize");
+        assert_eq!(
+            Config::from_toml(&written)
+                .expect("deserialize")
+                .web
+                .allowed_domains,
+            Some(Vec::new()),
+            "an explicit empty allowlist came back as unrestricted: {written}"
+        );
+    }
+
+    #[test]
+    fn the_cache_ttl_defaults_to_fifteen_minutes_and_zero_is_a_valid_setting() {
+        assert_eq!(WebConfig::default().cache_ttl_secs, 900);
+        assert_eq!(
+            Config::load("[web]\ntier = \"fetch_user_url\"\n")
+                .expect("must load")
+                .web
+                .cache_ttl_secs,
+            900,
+            "a table that omits the key must get the declared default, not zero"
+        );
+
+        // Zero is a *setting*, not an absence: it means no caching (every entry
+        // is stale as written), which is why `Default` is hand-written rather
+        // than derived and why the key is serialized unconditionally.
+        let no_cache = Config::load("[web]\ntier = \"fetch_user_url\"\ncache_ttl_secs = 0\n")
+            .expect("must load");
+        assert_eq!(no_cache.web.cache_ttl_secs, 0);
+        assert_ne!(no_cache.web, WebConfig::default());
+        let written = no_cache.to_toml().expect("serialize");
+        assert_eq!(
+            Config::from_toml(&written)
+                .expect("deserialize")
+                .web
+                .cache_ttl_secs,
+            0,
+            "an explicit zero came back as the default: {written}"
+        );
     }
 }

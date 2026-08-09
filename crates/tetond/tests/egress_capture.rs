@@ -62,7 +62,11 @@ impl Transport for CaptureTransport {
         let body: ByteStream = Box::pin(futures::stream::once(async {
             Ok(b"{\"ok\":true}".to_vec())
         }));
-        Ok(TransportResponse { status: 200, body })
+        Ok(TransportResponse {
+            status: 200,
+            location: None,
+            body,
+        })
     }
 }
 

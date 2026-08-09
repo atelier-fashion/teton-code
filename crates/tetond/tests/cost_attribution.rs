@@ -63,6 +63,7 @@ impl Transport for ScriptedTransport {
     ) -> Result<TransportResponse, TransportError> {
         let (input, output) = self.usages.lock().unwrap().pop_front().unwrap_or((0, 0));
         Ok(TransportResponse {
+            location: None,
             status: 200,
             body: anthropic_body(input, output),
         })

@@ -115,19 +115,124 @@ pub fn stdout_surface() -> PlainSurface<io::Stdout> {
     PlainSurface::new(io::stdout())
 }
 
+/// Whether `c` is not a C0/C1 control but steers a terminal's *display* the same
+/// way, and is therefore neutralized alongside them.
+///
+/// Three families, one hazard. The bidi controls (`U+202A`–`U+202E`, the
+/// isolates `U+2066`–`U+2069`, and the marks `U+200E`/`U+200F`/`U+061C`) reorder
+/// a row's glyphs without changing its bytes, so `https://good.example` can be
+/// made to *read* as a different host than the one the consent prompt is about —
+/// the Trojan-Source trick, aimed at a person rather than at a compiler. The line
+/// and paragraph separators (`U+2028`/`U+2029`) are line breaks to enough
+/// terminals to hand a one-row verb a second row it does not own. The zero-width
+/// and joiner set (`U+200B`–`U+200D`, `U+2060`–`U+2064`, `U+00AD`, `U+FEFF`)
+/// hides the seam where a spoofed host is spliced together.
+///
+/// Written as an explicit list rather than "every `Cf`" because `char` carries
+/// no category table in `std`, and pulling a Unicode-tables crate into the CLI
+/// to reach the remaining format characters — none of which reorder or break a
+/// row — would cost more than the gap is worth. The list is the cheap part of
+/// the category, which is the part that matters here.
+fn is_display_steering(c: char) -> bool {
+    matches!(c,
+        '\u{00ad}'                  // SOFT HYPHEN
+        | '\u{061c}'                // ARABIC LETTER MARK
+        | '\u{200b}'..='\u{200f}'   // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | '\u{2028}' | '\u{2029}'   // LINE SEPARATOR, PARAGRAPH SEPARATOR
+        | '\u{202a}'..='\u{202e}'   // LRE, RLE, PDF, LRO, RLO
+        | '\u{2060}'..='\u{2064}'   // WORD JOINER and the invisible operators
+        | '\u{2066}'..='\u{2069}'   // LRI, RLI, FSI, PDI
+        | '\u{feff}'                // ZERO WIDTH NO-BREAK SPACE (BOM)
+    )
+}
+
+/// Replace every character that *commands* a terminal with a space, keeping tabs
+/// — and, when `keep_newlines`, keeping `\n`.
+///
+/// A terminal reads control characters as *commands*, so text that reaches one
+/// unfiltered is text that can move the cursor, erase rows, and rewrite what the
+/// user already read. That is not a hypothetical for this surface: a permission
+/// description carries a model-composed URL (REQ-563), and
+/// `…https://good.example\x1b[2K\x1b[1A…https://evil.example` redraws the very
+/// line that asked the user to approve a host — the consent prompt then displays
+/// one destination and authorizes another. Neutralizing the escapes leaves the
+/// characters visible as text, which is the honest rendering: the page really
+/// did contain them.
+///
+/// Tabs are kept because they are the one control character that is ordinary
+/// *content* here — a diff line of indented source is a normal thing to render —
+/// and because a tab advances the cursor within a row exactly as a space does.
+/// It cannot move up, erase, or start a new line, which is the whole capability
+/// this is removing.
+///
+/// `keep_newlines` is the one axis on which the two verbs differ.
+/// [`Surface::line`] and [`Surface::repaint_row_above`] each own exactly one
+/// row, so a `\n` in their text is a row they did not claim; a
+/// [`Surface::fragment`] is streamed prose whose newlines are ordinary content,
+/// and stripping them would reflow every multi-paragraph answer into one line. A
+/// newline can only *start* a row — it cannot move up, erase, or overwrite one
+/// already written — so keeping it costs the fragment path none of the guarantee.
+///
+/// This is LESSON-474's rule again — sanitize where the parser is. The parser is
+/// the terminal, so the guard belongs at the writer that feeds it rather than at
+/// each of the ~180 call sites that compose a line, any one of which could
+/// forget.
+fn neutralized(text: &str, keep_newlines: bool) -> String {
+    text.chars()
+        .map(|c| {
+            if c == '\t' || (keep_newlines && c == '\n') {
+                c
+            } else if c.is_control() || is_display_steering(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// [`neutralized`] for a verb that owns exactly one row: no newline survives.
+fn defused(text: &str) -> String {
+    neutralized(text, false)
+}
+
+/// [`neutralized`] for streamed prose: newlines survive, everything else that
+/// commands the terminal does not.
+fn defused_multiline(text: &str) -> String {
+    neutralized(text, true)
+}
+
 impl<W: Write> Surface for PlainSurface<W> {
     fn line(&mut self, kind: LineKind, text: &str) {
         // Close any open streamed line first so the notice starts clean.
         if !self.at_line_start {
             let _ = writeln!(self.out);
         }
-        let _ = writeln!(self.out, "{}{}", Self::prefix(kind), text);
+        let _ = writeln!(self.out, "{}{}", Self::prefix(kind), defused(text));
         self.at_line_start = true;
     }
 
+    /// Streamed assistant text, defused on the way out.
+    ///
+    /// The escapes a fetched page can steer this text into are the same escapes
+    /// [`Surface::line`] refuses, aimed at the same target: a model that has just
+    /// read an attacker's page can be made to emit `\x1b[2K\x1b[1A` mid-sentence
+    /// and repaint the consent prompt sitting above it — a prompt whose whole job
+    /// is to name the destination the *next* fetch would reach. Leaving this verb
+    /// undefused would have made `line()`'s guard a guard on one of the two ways
+    /// text reaches this terminal.
+    ///
+    /// Newlines survive here and nowhere else — see [`neutralized`] for why that
+    /// costs the guarantee nothing.
+    ///
+    /// `at_line_start` reads the **defused** text, not the argument: a fragment
+    /// ending in a bare `\r` would otherwise leave the bookkeeping claiming a
+    /// fresh row while the cursor sat mid-row, and the next `line()` would print
+    /// over the streamed text instead of below it.
     fn fragment(&mut self, text: &str) {
-        let _ = write!(self.out, "{text}");
-        self.at_line_start = text.ends_with('\n');
+        let shown = defused_multiline(text);
+        let _ = write!(self.out, "{shown}");
+        self.at_line_start = shown.ends_with('\n');
     }
 
     /// Save the cursor, step up, clear that row, write, restore. `at_line_start`
@@ -136,18 +241,12 @@ impl<W: Write> Surface for PlainSurface<W> {
     /// output is still accurate.
     fn repaint_row_above(&mut self, rows_up: usize, kind: LineKind, text: &str) {
         let prefix = Self::prefix(kind);
-        // A repaint claims exactly one row, and the cursor restore assumes it.
-        // `line()` can afford to pass text through — a stray newline there just
-        // makes two log lines — but here it would scroll the frame out from
-        // under `\x1b[u` and leave the entry area shredded. The text is
-        // daemon-supplied (a model id lands in it), which is the same trust
-        // level `render_lifecycle` already prints, but the *consequence* of a
-        // control character differs, so the guard belongs at this writer rather
-        // than at the source (LESSON-474: sanitize where the parser is).
-        let single_row: String = text
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
+        // A repaint claims exactly one row, and the cursor restore assumes it: a
+        // newline here would scroll the frame out from under `\x1b[u` and leave
+        // the entry area shredded. That is the sharper consequence, but it is
+        // not a different rule — [`defused`] is what `line()` uses too, for the
+        // reason written there.
+        let single_row = defused(text);
         let _ = write!(
             self.out,
             "\x1b[s\x1b[{rows_up}A\r\x1b[K{prefix}{single_row}\x1b[u"
@@ -326,6 +425,135 @@ mod tests {
             bare.0.is_empty(),
             "the default repaint must be a no-op: {:?}",
             bare.0
+        );
+    }
+
+    /// A consent prompt that can be redrawn by the thing it is asking about is
+    /// not a consent prompt. A permission description carries a model-composed
+    /// URL (REQ-563), and an escape sequence in it used to reach the terminal
+    /// intact — enough to erase the row naming the host and print a different
+    /// one over it, so the user approves what they were never shown.
+    #[test]
+    fn a_line_cannot_redraw_the_prompt_it_is_part_of() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            surface.line(
+                LineKind::Prompt,
+                "permission requested: web_fetch_any_url — fetch https://good.example\
+                 \x1b[2K\x1b[1Afetch https://evil.example",
+            );
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains('\x1b'),
+            "an escape sequence reached the terminal: {out:?}"
+        );
+        // Exactly one row was claimed — the trailing newline `line()` writes and
+        // nothing else.
+        assert_eq!(out.matches('\n').count(), 1, "{out:?}");
+        // Neutralized, not censored: the text really was on the page, and the
+        // user is better served seeing it than seeing a gap.
+        assert!(out.contains("good.example"), "{out:?}");
+        assert!(out.contains("evil.example"), "{out:?}");
+    }
+
+    /// The C0 set is not just `ESC`: a carriage return alone reprints over the
+    /// line's own start, and a backspace walks back over what was written.
+    #[test]
+    fn every_control_character_a_line_carries_is_neutralized_except_tab() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            surface.line(LineKind::Diff, "+ \tif x {\r\x08\x1b[1A\u{9b}2Kelse {");
+        }
+        let out = String::from_utf8(buf).unwrap();
+        for banned in ['\r', '\x08', '\x1b', '\u{9b}'] {
+            assert!(
+                !out.contains(banned),
+                "{banned:?} survived into a rendered line: {out:?}"
+            );
+        }
+        // A tab is content, not a command: a diff of indented source must still
+        // look indented.
+        assert!(out.contains("+ \tif x {"), "{out:?}");
+    }
+
+    /// The other half of the same guard. Streamed assistant text is the one
+    /// thing on this surface a *fetched page* can steer: the model reads the
+    /// page, the page tells it what to say, and the text lands here. An escape
+    /// that survives can erase the consent prompt printed above it and print a
+    /// different destination in its place — so `fragment` defuses exactly what
+    /// `line` does, minus the newlines that are its ordinary content.
+    #[test]
+    fn a_streamed_fragment_cannot_redraw_the_prompt_above_it() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            // `\x1b[8m` is "conceal" — it makes the row invisible rather than
+            // wrong, which is the version of this a reader does not notice.
+            // `\u{9b}` is the single-byte CSI: the same command with no `ESC`
+            // in the text at all, which is what a filter looking only for
+            // `\x1b` misses.
+            surface.fragment("here is the page\x1b[8m\u{9b}2K\u{9b}1Aapprove evil.example\n");
+            surface.fragment("second line\n");
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains('\x1b') && !out.contains('\u{9b}'),
+            "a terminal command survived streamed text: {out:?}"
+        );
+        // Neutralized, not censored — the model really did say this.
+        assert!(out.contains("here is the page"), "{out:?}");
+        assert!(out.contains("approve evil.example"), "{out:?}");
+        // Newlines are content on this verb and must survive: two fragments,
+        // each ending in one, are two rows.
+        assert_eq!(out.matches('\n').count(), 2, "{out:?}");
+        assert!(out.ends_with("second line\n"), "{out:?}");
+    }
+
+    /// Reordering a row is the same attack as redrawing it, done with characters
+    /// that are not controls at all: the bidi overrides make
+    /// `https://evil.example` *read* as something else without changing a byte
+    /// of it, and the zero-width set hides the seam.
+    #[test]
+    fn bidi_and_zero_width_steering_is_neutralized_on_both_verbs() {
+        let steering = [
+            '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}',
+            '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{2028}', '\u{2029}', '\u{200b}',
+            '\u{00ad}', '\u{061c}', '\u{feff}',
+        ];
+        for steer in steering {
+            let text = format!("fetch https://good.example{steer}elpmaxe.live//:sptth");
+            let mut buf = Vec::new();
+            {
+                let mut surface = PlainSurface::new(&mut buf);
+                surface.line(LineKind::Prompt, &text);
+                surface.fragment(&text);
+            }
+            let out = String::from_utf8(buf).unwrap();
+            assert!(!out.contains(steer), "{steer:?} survived a render: {out:?}");
+            assert!(out.contains("good.example"), "{steer:?}: {out:?}");
+        }
+    }
+
+    /// The bookkeeping has to read what was *written*, not what was asked for.
+    /// A fragment ending in a bare `\r` leaves the cursor at the start of a row
+    /// it has already written to; recording that as "at line start" would make
+    /// the next `line()` print over the streamed text instead of below it.
+    #[test]
+    fn line_bookkeeping_reads_the_defused_text() {
+        let mut buf = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut buf);
+            surface.fragment("streamed\r");
+            surface.line(LineKind::Notice, "routed to local");
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains('\r'), "{out:?}");
+        assert!(
+            out.starts_with("streamed \n"),
+            "the open row was closed before the notice: {out:?}"
         );
     }
 

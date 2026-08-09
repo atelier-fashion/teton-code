@@ -2,8 +2,11 @@
 //!
 //! Pure functions over ledger rows: no I/O, no clock, no randomness, so the
 //! whole report is deterministic and table-testable. [`aggregate`] rolls the
-//! rows up three ways — per session, per phase, per provider — and computes the
-//! headline savings-vs-frontier figure the CLI shows at session end.
+//! provider-call rows up three ways — per session, per phase, per provider —
+//! computes the headline savings-vs-frontier figure the CLI shows at session
+//! end, and rolls the `web_lookups` rows up per session alongside them
+//! ([`WebTotals`], REQ-563 BR-7). The two roll-ups never merge: a lookup is not
+//! a call and must not be counted as one.
 //!
 //! ## What the meter is allowed to claim (BR-2)
 //!
@@ -27,7 +30,7 @@ use serde::Serialize;
 
 use teton_protocol::Phase;
 
-use super::ledger::LedgerRow;
+use super::ledger::{LedgerRow, WebLookupRow};
 use super::prices::PriceTable;
 
 /// A rolled-up total for one grouping key (a session id, a phase, or a provider).
@@ -65,6 +68,25 @@ pub struct UnpricedTotals {
     /// A `BTreeSet` rather than a `Vec` so the rendering and the tests are
     /// deterministic without sorting at the call site.
     pub models: BTreeSet<String>,
+}
+
+/// Per-session web-lookup totals (REQ-563 BR-7 / AC-6).
+///
+/// A separate roll-up rather than columns on [`GroupTotals`], for the reason
+/// `web_lookups` is a separate table: a lookup has no tokens and no cost to add
+/// to a call's, and "calls" and "lookups" are different counts a reader must not
+/// see summed. Only the per-session grouping exists because only the session is
+/// a key both tables share — a lookup has no phase, no provider, and no model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WebTotals {
+    /// The session id.
+    pub key: String,
+    /// Lookups this session performed, whatever their outcome — blocked,
+    /// refused, and cache-served ones included (BR-7: every lookup lands here).
+    pub lookups: u64,
+    /// Bytes those lookups brought back. `0` from every ending that transferred
+    /// nothing, so this is content received and not traffic attempted.
+    pub bytes_in: u64,
 }
 
 /// Whole-ledger totals.
@@ -123,6 +145,13 @@ pub struct CostReport {
     pub per_phase: Vec<GroupTotals>,
     /// Per-provider roll-up, ordered by provider id.
     pub per_provider: Vec<GroupTotals>,
+    /// Per-session web-lookup roll-up, ordered by session id (REQ-563 AC-6).
+    ///
+    /// Sessions with no lookups do not appear — the common case is every
+    /// session, since web lookup is off by default (BR-1), and an empty list is
+    /// the honest shape of "this build did no web lookups" rather than a wall of
+    /// zeroes.
+    pub web_per_session: Vec<WebTotals>,
 }
 
 /// A running accumulator for one grouping key.
@@ -174,10 +203,22 @@ fn phase_key(phase: Option<Phase>) -> String {
     .to_owned()
 }
 
-/// Roll `rows` up into a [`CostReport`], pricing the savings baseline against
-/// `prices`. Deterministic: group orderings are sorted by key.
+/// A running accumulator for one session's web lookups.
+#[derive(Default)]
+struct WebAccum {
+    lookups: u64,
+    bytes_in: u64,
+}
+
+/// Roll `rows` (provider calls) and `web_rows` (web lookups) up into a
+/// [`CostReport`], pricing the savings baseline against `prices`.
+/// Deterministic: group orderings are sorted by key.
+///
+/// The two row kinds arrive as separate slices, and stay separate in the report:
+/// they answer different questions and a reader must never see a lookup counted
+/// as a call (REQ-563 D-7).
 #[must_use]
-pub fn aggregate(rows: &[LedgerRow], prices: &PriceTable) -> CostReport {
+pub fn aggregate(rows: &[LedgerRow], web_rows: &[WebLookupRow], prices: &PriceTable) -> CostReport {
     use std::collections::BTreeMap;
 
     let mut total = Accum::default();
@@ -232,6 +273,13 @@ pub fn aggregate(rows: &[LedgerRow], prices: &PriceTable) -> CostReport {
         }
     }
 
+    let mut web_by_session: BTreeMap<String, WebAccum> = BTreeMap::new();
+    for row in web_rows {
+        let accum = web_by_session.entry(row.session_id.clone()).or_default();
+        accum.lookups = accum.lookups.saturating_add(1);
+        accum.bytes_in = accum.bytes_in.saturating_add(row.bytes_in);
+    }
+
     let methodology = methodology_string(prices, has_baseline);
     let savings = SavingsEstimate {
         baseline_model: prices.baseline_label(),
@@ -258,6 +306,14 @@ pub fn aggregate(rows: &[LedgerRow], prices: &PriceTable) -> CostReport {
         per_session: into_groups(by_session),
         per_phase: into_groups(by_phase),
         per_provider: into_groups(by_provider),
+        web_per_session: web_by_session
+            .into_iter()
+            .map(|(key, accum)| WebTotals {
+                key,
+                lookups: accum.lookups,
+                bytes_in: accum.bytes_in,
+            })
+            .collect(),
     }
 }
 
@@ -330,7 +386,7 @@ mod tests {
                 prices.price("claude-opus-4", 1000, 500),
             ),
         ];
-        let report = aggregate(&rows, &prices);
+        let report = aggregate(&rows, &[], &prices);
 
         assert_eq!(report.unpriced.calls, 3);
         assert_eq!(
@@ -405,7 +461,7 @@ mod tests {
                 prices.price("free-tier-model", 1000, 500),
             ),
         ];
-        let report = aggregate(&rows, &prices);
+        let report = aggregate(&rows, &[], &prices);
 
         // Both contribute zero dollars, but for opposite reasons, and the report
         // keeps them apart: one is priced-at-zero, the other has no price at all.
@@ -455,7 +511,7 @@ mod tests {
                 cost,
             ),
         ];
-        let report = aggregate(&rows, &prices);
+        let report = aggregate(&rows, &[], &prices);
 
         assert_eq!(report.total.priced_calls, 2);
         assert!(report.unpriced.models.is_empty());
@@ -476,7 +532,7 @@ mod tests {
 
     #[test]
     fn empty_ledger_reports_zeros_and_no_savings_signal() {
-        let report = aggregate(&[], &PriceTable::bundled());
+        let report = aggregate(&[], &[], &PriceTable::bundled());
         assert_eq!(report.total.calls, 0);
         assert_eq!(report.savings.actual_usd_micros, 0);
         assert_eq!(report.savings.baseline_usd_micros, 0);
@@ -518,7 +574,7 @@ mod tests {
                 None, // unpriced
             ),
         ];
-        let report = aggregate(&rows, &prices);
+        let report = aggregate(&rows, &[], &prices);
 
         assert_eq!(report.total.calls, 3);
         assert_eq!(report.total.priced_calls, 2);
@@ -566,7 +622,7 @@ mod tests {
             5000,
             cheap_cost,
         )];
-        let report = aggregate(&rows, &prices);
+        let report = aggregate(&rows, &[], &prices);
 
         // Actual: deepseek-chat at $0.27/$1.10 per Mtok.
         //   10_000 * 0.27 + 5_000 * 1.10 = 2_700 + 5_500 = 8_200 micro-USD
@@ -592,7 +648,7 @@ mod tests {
             1000,
             cost,
         )];
-        let report = aggregate(&rows, &prices);
+        let report = aggregate(&rows, &[], &prices);
         assert_eq!(
             report.savings.actual_usd_micros,
             report.savings.baseline_usd_micros
@@ -600,9 +656,87 @@ mod tests {
         assert_eq!(report.savings.savings_usd_micros, 0);
     }
 
+    /// REQ-563 AC-6: a session with recorded lookups reports how many it made
+    /// and how many bytes came back — and none of that leaks into the call
+    /// counts, which is the whole reason `web_lookups` is a sibling table.
+    #[test]
+    fn lookups_roll_up_per_session_without_touching_the_call_totals() {
+        use teton_protocol::events::{WebLookupKind, WebLookupOutcome};
+
+        let prices = PriceTable::bundled();
+        let calls = vec![row(
+            "s1",
+            Some(Phase::Implement),
+            "deepseek",
+            "deepseek-chat",
+            4000,
+            2000,
+            prices.price("deepseek-chat", 4000, 2000),
+        )];
+        let lookup = |session: &str, outcome, bytes_in| WebLookupRow {
+            session_id: session.to_owned(),
+            kind: WebLookupKind::Fetch,
+            host: "docs.rs".to_owned(),
+            bytes_in,
+            duration_ms: 120,
+            outcome,
+            usd_micros: Some(0),
+        };
+        let lookups = vec![
+            lookup("s1", WebLookupOutcome::Completed, 4096),
+            lookup("s1", WebLookupOutcome::CacheHit, 4096),
+            // BR-7: a refused lookup is still a lookup. It brought back nothing,
+            // so it adds to the count and not to the bytes.
+            lookup("s1", WebLookupOutcome::RefusedDomain, 0),
+            lookup("s2", WebLookupOutcome::Completed, 100),
+        ];
+
+        let report = aggregate(&calls, &lookups, &prices);
+
+        let s1 = report
+            .web_per_session
+            .iter()
+            .find(|w| w.key == "s1")
+            .expect("s1 made lookups");
+        assert_eq!(s1.lookups, 3);
+        assert_eq!(s1.bytes_in, 8192);
+        let s2 = report
+            .web_per_session
+            .iter()
+            .find(|w| w.key == "s2")
+            .expect("s2 made a lookup");
+        assert_eq!(s2.lookups, 1);
+        assert_eq!(s2.bytes_in, 100);
+        // Ordered by session id, deterministically.
+        let keys: Vec<&str> = report
+            .web_per_session
+            .iter()
+            .map(|w| w.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["s1", "s2"]);
+
+        // The call side is untouched: one call, in one session. A session that
+        // only looked things up appears in the web roll-up and NOT in the call
+        // roll-up, because it made no calls.
+        assert_eq!(report.total.calls, 1);
+        let call_sessions: Vec<&str> = report.per_session.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(call_sessions, vec!["s1"], "a lookup is not a call");
+    }
+
+    /// The default state (BR-1: web lookup is off) reports no web roll-up at
+    /// all, rather than a row of zeroes per session.
+    #[test]
+    fn a_ledger_with_no_lookups_reports_no_web_rollup() {
+        let prices = PriceTable::bundled();
+        let rows = vec![row("s1", None, "deepseek", "deepseek-chat", 10, 5, Some(1))];
+        let report = aggregate(&rows, &[], &prices);
+        assert!(report.web_per_session.is_empty());
+        assert_eq!(report.per_session.len(), 1);
+    }
+
     #[test]
     fn methodology_names_the_baseline_and_flags_estimate() {
-        let report = aggregate(&[], &PriceTable::bundled());
+        let report = aggregate(&[], &[], &PriceTable::bundled());
         assert!(report.methodology.contains("Estimate"));
         assert!(report.methodology.contains("anthropic/claude-opus-4"));
         assert!(report.savings.is_estimate);

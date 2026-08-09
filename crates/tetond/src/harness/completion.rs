@@ -620,6 +620,7 @@ mod tests {
             _request: TransportRequest,
         ) -> Result<TransportResponse, TransportError> {
             Ok(TransportResponse {
+                location: None,
                 status: 200,
                 body: Box::pin(futures::stream::empty()),
             })

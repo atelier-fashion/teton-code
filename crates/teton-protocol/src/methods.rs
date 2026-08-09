@@ -9,7 +9,9 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::events::{CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource};
+use crate::events::{
+    CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource, WebTier,
+};
 use crate::jsonrpc::{Id, Request};
 use crate::{
     BindingSource, Category, ConfigurableCategory, Phase, PrivacyMode, ProviderId, ProviderKind,
@@ -977,6 +979,39 @@ pub struct CostReportView {
     pub per_phase: Vec<CostGroupView>,
     /// Per-provider roll-up, ordered by provider id.
     pub per_provider: Vec<CostGroupView>,
+    /// Per-session web-lookup roll-up, ordered by session id (REQ-563 BR-7 /
+    /// AC-6).
+    ///
+    /// A separate list rather than columns on [`CostGroupView`], mirroring the
+    /// separate ledger table it comes from: a lookup has no tokens and no cost
+    /// to add to a call's, and "calls" and "lookups" are different counts a
+    /// reader must not see summed.
+    ///
+    /// `#[serde(default)]`, like [`Self::unpriced_models`]: a daemon built
+    /// before REQ-563 sends no such key, and a client reading one must get an
+    /// empty roll-up rather than a deserialization failure.
+    #[serde(default)]
+    pub web_per_session: Vec<WebTotalsView>,
+}
+
+/// One session's web-lookup totals inside a [`CostReportView`] (REQ-563 AC-6).
+///
+/// Carries no host and no URL. The per-lookup destination is on the
+/// [`crate::events::WebLookup`] event and in the ledger row; a roll-up's job is
+/// how many and how much, and adding a destination list here would put an
+/// outgoing-utterance trace in the one surface a user is most likely to paste
+/// into a bug report (BR-7).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebTotalsView {
+    /// The session id.
+    pub key: String,
+    /// Lookups this session performed, whatever their outcome — blocked,
+    /// refused, and cache-served ones included (BR-7: every lookup is counted,
+    /// including the free ones).
+    pub lookups: u64,
+    /// Bytes those lookups brought back. `0` from every ending that transferred
+    /// nothing, so this is content received and not traffic attempted.
+    pub bytes_in: u64,
 }
 
 /// Result of [`CostQueryParams`].
@@ -989,6 +1024,106 @@ pub struct CostQueryResult {
 impl RpcMethod for CostQueryParams {
     const METHOD: &'static str = "cost/query";
     type Result = CostQueryResult;
+}
+
+// ---------------------------------------------------------------------------
+// web lookup control (REQ-563)
+// ---------------------------------------------------------------------------
+//
+// Two user-only actions on a session's web capability. Both are **client** RPCs
+// rather than harness tools, and that placement is the enforcement rather than a
+// convention: tool dispatch and the client socket are structurally distinct
+// channels, so a model that emits a tool call named `web/override` reaches
+// nothing at all (architecture D-4, AC-12). There is no check to forget.
+//
+// Types only — the handlers, the session flag, and the cache eviction they drive
+// land with the daemon's web module.
+
+/// Lift a session's web taint restriction (BR-13 / AC-12).
+///
+/// Restores model-composed lookups at the tiers this session was **already**
+/// granted: it grants nothing new, is never written to config, and resets with
+/// the session. Surfaced as a command the user types, never as a tool.
+///
+/// It carries a `session_id` even though the restriction is "this session's":
+/// the flag is session-scoped state and the daemon holds many sessions, so the
+/// call has to name the one it means. Architecture D-4 calls the RPC
+/// parameterless in the sense that there is nothing to *choose* — no scope, no
+/// tier, no degree — only a session to name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebOverrideParams {
+    /// The session whose restriction is lifted.
+    pub session_id: SessionId,
+}
+
+/// Result of [`WebOverrideParams`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebOverrideResult {
+    /// Whether a taint restriction was actually in force when the override
+    /// arrived.
+    ///
+    /// Not redundant with an empty [`Self::tiers_restored`], and the difference
+    /// is user-visible: a restricted session holding no grants restores nothing,
+    /// and a session that was never restricted also restores nothing. A client
+    /// that could not tell those apart would confirm a lift that never happened,
+    /// so the daemon says which it was and the CLI can answer "nothing was
+    /// restricted" instead of a false confirmation.
+    pub was_restricted: bool,
+    /// The tiers model-composed lookups resume at — the same list the
+    /// [`crate::events::WebTaintOverridden`] event carries, ascending, and never
+    /// including [`WebTier::Off`].
+    pub tiers_restored: Vec<WebTier>,
+}
+
+impl RpcMethod for WebOverrideParams {
+    const METHOD: &'static str = "web/override";
+    type Result = WebOverrideResult;
+}
+
+/// Evict a cached document so the next lookup of that URL re-fetches (BR-12's
+/// explicit-refresh clause, AC-10).
+///
+/// This type holds a full `url` where the events and the ledger may hold only a
+/// host (BR-7), and the asymmetry is the rule working rather than an exception
+/// to it: BR-7 constrains what the daemon **records and broadcasts**, and this
+/// is the user's own typed argument travelling client→daemon on the way in. It
+/// is never echoed back — [`WebRefreshResult`] answers with an outcome alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebRefreshParams {
+    /// The URL whose cached document is evicted.
+    pub url: String,
+}
+
+/// What a refresh found in the cache.
+///
+/// A **closed** enum with no catch-all, like [`ModelConfirmOutcome`]: an outcome
+/// this build does not know is a deserialization error rather than a silent
+/// reading of one of these two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebRefreshOutcome {
+    /// A cached document was present and has been removed.
+    Evicted,
+    /// Nothing was cached for that URL.
+    ///
+    /// A fact, not a failure: an uncached URL is already going to be fetched
+    /// fresh, so the user got what they asked for. The two are still separate
+    /// values because "there was a stale copy and it is gone" and "there was
+    /// never a copy" are different answers to *why* the next fetch is live.
+    Absent,
+}
+
+/// Result of [`WebRefreshParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebRefreshResult {
+    /// What the refresh found. Carries no URL back: the client already knows
+    /// what it asked about, and the daemon has no reason to repeat it (BR-7).
+    pub outcome: WebRefreshOutcome,
+}
+
+impl RpcMethod for WebRefreshParams {
+    const METHOD: &'static str = "web/refresh";
+    type Result = WebRefreshResult;
 }
 
 #[cfg(test)]
@@ -1812,8 +1947,37 @@ mod tests {
                     output_tokens: 2_000,
                     usd_micros: 3_000,
                 }],
+                web_per_session: vec![WebTotalsView {
+                    key: "sess-1".to_owned(),
+                    lookups: 2,
+                    bytes_in: 8_192,
+                }],
             },
         });
+    }
+
+    /// A `cost/query` answer from a daemon built before REQ-563 carries no
+    /// `web_per_session` key at all. It must deserialize into an empty roll-up
+    /// rather than fail: the field is additive, and a client refusing the whole
+    /// report over a missing web section would break `teton cost` against every
+    /// older daemon.
+    #[test]
+    fn a_cost_report_without_the_web_roll_up_still_deserializes() {
+        let without_web = serde_json::json!({
+            "total_usd_micros": 0,
+            "total_calls": 0,
+            "priced_calls": 0,
+            "unpriced_calls": 0,
+            "savings_usd_micros": 0,
+            "baseline_usd_micros": 0,
+            "baseline_model": "anthropic/claude-opus-4",
+            "methodology": "Estimate, not a measurement.",
+            "per_phase": [],
+            "per_provider": [],
+        });
+        let decoded: CostReportView =
+            serde_json::from_value(without_web).expect("an older report still decodes");
+        assert!(decoded.web_per_session.is_empty());
     }
 
     #[test]
@@ -1828,10 +1992,62 @@ mod tests {
         assert_eq!(ModelListParams::METHOD, "model/list");
         assert_eq!(ModelSetParams::METHOD, "model/set");
         assert_eq!(ModelStatusParams::METHOD, "model/status");
+        assert_eq!(WebOverrideParams::METHOD, "web/override");
+        assert_eq!(WebRefreshParams::METHOD, "web/refresh");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
             "model/status"
         );
+    }
+
+    /// The two user-only web actions round-trip, and the override answers the
+    /// "nothing was restricted" case distinguishably from "restricted, but no
+    /// tiers to restore" — the distinction TASK-077's no-op notice rests on.
+    #[test]
+    fn web_control_methods_round_trip() {
+        round_trip(&WebOverrideParams {
+            session_id: SessionId::from("s1"),
+        });
+        round_trip(&WebOverrideResult {
+            was_restricted: true,
+            tiers_restored: vec![WebTier::FetchUserUrl, WebTier::FetchAnyUrl],
+        });
+        // Restricted, but the session had been granted nothing to restore.
+        round_trip(&WebOverrideResult {
+            was_restricted: true,
+            tiers_restored: vec![],
+        });
+        // Never restricted — same empty list, different answer.
+        round_trip(&WebOverrideResult::default());
+        assert!(!WebOverrideResult::default().was_restricted);
+
+        round_trip(&WebRefreshParams {
+            url: "https://docs.rs/serde/latest/serde/".to_owned(),
+        });
+        for outcome in [WebRefreshOutcome::Evicted, WebRefreshOutcome::Absent] {
+            round_trip(&WebRefreshResult { outcome });
+        }
+    }
+
+    /// BR-7's boundary drawn where it actually is: the request may name a URL
+    /// (the user typed it), the **answer** may not echo one back. Asserted on
+    /// the result's key set so a later `url` field turns this red.
+    #[test]
+    fn a_refresh_answers_with_an_outcome_and_never_echoes_the_url() {
+        let wire = serde_json::to_value(WebRefreshResult {
+            outcome: WebRefreshOutcome::Evicted,
+        })
+        .unwrap();
+        let keys: Vec<&String> = wire.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["outcome"]);
+        assert_eq!(wire["outcome"], "evicted");
+
+        // Non-vacuity: the URL really was in the request this answers.
+        let asked = serde_json::to_value(WebRefreshParams {
+            url: "https://docs.rs/serde/latest/serde/".to_owned(),
+        })
+        .unwrap();
+        assert!(asked["url"].as_str().unwrap().contains("docs.rs"));
     }
 
     #[test]

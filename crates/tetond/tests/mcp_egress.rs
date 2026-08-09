@@ -173,7 +173,11 @@ impl Transport for CaptureTransport {
                     .to_vec(),
             )
         }));
-        Ok(TransportResponse { status: 200, body })
+        Ok(TransportResponse {
+            status: 200,
+            location: None,
+            body,
+        })
     }
 }
 

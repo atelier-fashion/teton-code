@@ -108,6 +108,7 @@ pub fn render_report_view(report: &CostReportView, surface: &mut dyn Surface) {
 
     render_group(surface, "per phase", &report.per_phase);
     render_group(surface, "per provider", &report.per_provider);
+    render_web_lookups(surface, &report.web_per_session);
 
     surface.line(
         LineKind::Cost,
@@ -154,11 +155,42 @@ fn render_group(
     }
 }
 
+/// Render the per-session web-lookup roll-up (REQ-563 BR-7 / AC-6).
+///
+/// Its own section rather than a column on the call tables, mirroring the
+/// separate ledger table it comes from: calls and lookups are different counts,
+/// and a reader must not see them summed. Every lookup is here whatever its
+/// ending — including the cache hits and the refusals, which cost nothing and
+/// are exactly what BR-7's "including zero-cost ones" is about.
+///
+/// Silent when empty, unlike [`render_group`]'s "(no attributed calls)". Web
+/// lookup is off by default (BR-1), so on almost every machine this list is
+/// empty forever; a permanent "(none)" line would be noise on a surface people
+/// read for their spending. The section appearing at all is itself information.
+fn render_web_lookups(
+    surface: &mut dyn Surface,
+    groups: &[teton_protocol::methods::WebTotalsView],
+) {
+    if groups.is_empty() {
+        return;
+    }
+    surface.line(LineKind::Cost, "web lookups:");
+    for row in groups {
+        surface.line(
+            LineKind::Cost,
+            &format!(
+                "  {:<12} {:>4} lookup(s)  {:>9} bytes in",
+                row.key, row.lookups, row.bytes_in,
+            ),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::render::RecordingSurface;
-    use teton_protocol::methods::CostGroupView;
+    use teton_protocol::methods::{CostGroupView, WebTotalsView};
     use teton_protocol::{ProviderId, SessionId};
 
     fn record(phase: Option<teton_protocol::Phase>, usd_micros: i64) -> CostRecord {
@@ -220,6 +252,7 @@ mod tests {
                 output_tokens: 2_000,
                 usd_micros: 3_000,
             }],
+            web_per_session: Vec::new(),
         };
 
         let mut surface = RecordingSurface::new();
@@ -254,6 +287,7 @@ mod tests {
             methodology: "Estimate, not a measurement.".to_owned(),
             per_phase: Vec::new(),
             per_provider: Vec::new(),
+            web_per_session: Vec::new(),
         };
 
         let mut surface = RecordingSurface::new();
@@ -290,6 +324,7 @@ mod tests {
             methodology: "Estimate, not a measurement.".to_owned(),
             per_phase: Vec::new(),
             per_provider: Vec::new(),
+            web_per_session: Vec::new(),
         };
 
         let mut surface = RecordingSurface::new();
@@ -297,5 +332,80 @@ mod tests {
 
         assert!(!surface.any_line_contains(LineKind::Cost, "no price on file"));
         assert!(!surface.any_line_contains(LineKind::Cost, "unpriced"));
+    }
+
+    /// REQ-563 AC-6: a session with recorded lookups shows the count and the
+    /// bytes. Both numbers, because "3 lookups" without a size says nothing
+    /// about what came back and a size without a count says nothing about how
+    /// often the machine talked to the network.
+    #[test]
+    fn web_lookups_render_with_their_count_and_bytes() {
+        let report = CostReportView {
+            web_per_session: vec![
+                WebTotalsView {
+                    key: "sess-1".to_owned(),
+                    lookups: 3,
+                    bytes_in: 12_345,
+                },
+                WebTotalsView {
+                    key: "sess-2".to_owned(),
+                    lookups: 1,
+                    bytes_in: 0,
+                },
+            ],
+            ..fully_priced()
+        };
+
+        let mut surface = RecordingSurface::new();
+        render_report_view(&report, &mut surface);
+
+        assert!(surface.any_line_contains(LineKind::Cost, "web lookups:"));
+        assert!(surface.any_line_contains(LineKind::Cost, "sess-1"));
+        assert!(surface.any_line_contains(LineKind::Cost, "3 lookup(s)"));
+        assert!(surface.any_line_contains(LineKind::Cost, "12345 bytes in"));
+        // Every session with a row appears, not just the first.
+        assert!(surface.any_line_contains(LineKind::Cost, "sess-2"));
+        // A lookup that brought nothing back is still a lookup (BR-7).
+        assert!(surface.any_line_contains(LineKind::Cost, "1 lookup(s)"));
+        // Lookups are never folded into the call counts: they are different
+        // things and a reader must not see them summed.
+        assert!(!surface.any_line_contains(LineKind::Cost, "3 call(s)"));
+    }
+
+    /// Web lookup is off by default (BR-1), so on almost every machine this
+    /// section would be a permanent empty heading on a surface people read for
+    /// their spending. It is simply absent instead.
+    #[test]
+    fn a_report_with_no_lookups_says_nothing_about_the_web() {
+        let mut surface = RecordingSurface::new();
+        render_report_view(&fully_priced(), &mut surface);
+        assert!(!surface.any_line_contains(LineKind::Cost, "web lookups"));
+        // …unlike the call roll-ups, which do announce themselves when empty.
+        assert!(surface.any_line_contains(LineKind::Cost, "per phase:"));
+    }
+
+    /// A report with nothing else in it, so the web assertions above are about
+    /// the web lines and not about whatever else happened to be rendered.
+    fn fully_priced() -> CostReportView {
+        CostReportView {
+            total_usd_micros: 3_000,
+            total_calls: 1,
+            priced_calls: 1,
+            unpriced_calls: 0,
+            unpriced_models: Vec::new(),
+            savings_usd_micros: 0,
+            baseline_usd_micros: 3_000,
+            baseline_model: "anthropic/claude-opus-4".to_owned(),
+            methodology: "Estimate, not a measurement.".to_owned(),
+            per_phase: vec![CostGroupView {
+                key: "implement".to_owned(),
+                calls: 1,
+                input_tokens: 10,
+                output_tokens: 10,
+                usd_micros: 3_000,
+            }],
+            per_provider: Vec::new(),
+            web_per_session: Vec::new(),
+        }
     }
 }

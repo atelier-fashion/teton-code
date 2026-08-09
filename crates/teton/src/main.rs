@@ -402,7 +402,7 @@ fn next_interactive_line(
     // frame through the `Prompter` seam, in that order, so the indicator sits
     // immediately above the frame's top rule (ADR-556-4). `status_rows` is how
     // many rows that added, which is what `erase` needs to take back.
-    let mut status_rows = paint_indicator(ctx, *tick);
+    let mut status_rows = paint_status(ctx, *tick);
     entry.draw(entry_prompt);
     loop {
         if prompt::stdin_ready(FRAME_INTERVAL) {
@@ -416,7 +416,7 @@ fn next_interactive_line(
         let rows = status_rows;
         let drained = conn.drain_events(ctx, || entry.erase(rows))?;
         if drained.rendered > 0 {
-            status_rows = paint_indicator(ctx, *tick);
+            status_rows = paint_status(ctx, *tick);
             entry.draw(entry_prompt);
             continue;
         }
@@ -434,14 +434,39 @@ fn next_interactive_line(
         if ctx.state.loading.tick() {
             *tick = tick.wrapping_add(1);
             if let Some(line) = ctx.state.loading.frame(*tick) {
-                // Two rows up: the layout is [status][top rule][input row ←
-                // cursor][bottom rule].
+                // Two rows up: the layout is [web?][indicator][top rule][input
+                // row ← cursor][bottom rule]. The indicator sits directly above
+                // the top rule whether or not a web row precedes it, so the
+                // offset is unchanged — but the row *count* is not, and it is
+                // what `erase` takes back.
                 ctx.surface
                     .repaint_row_above(STATUS_ROWS_ABOVE_CURSOR, LineKind::Notice, &line);
-                status_rows = 1;
+                status_rows = usize::from(ctx.state.web.is_engaged()) + 1;
             }
         }
     }
+}
+
+/// Draw the status area above the entry frame, returning how many rows it
+/// occupies — which is what [`prompt::FramedStdinPrompter::erase`] takes back.
+///
+/// Two rows at most, in this order: the session's web capability (REQ-563 BR-7)
+/// and then REQ-556's loading indicator. The indicator stays **last** so it
+/// remains directly above the frame's top rule, which is the geometry
+/// [`STATUS_ROWS_ABOVE_CURSOR`] encodes for its in-place animation repaint.
+///
+/// The web row is drawn only when the capability is engaged — never on a machine
+/// that has not opted in, which is every machine by default (BR-1). A session
+/// that never touches the web therefore sees the layout it always saw, and this
+/// row is not a permanent `web: off` reminder of a feature nobody turned on.
+fn paint_status(ctx: &mut UiContext<'_>, tick: u64) -> usize {
+    let mut rows = 0;
+    if ctx.state.web.is_engaged() {
+        let field = ctx.state.web.status_field();
+        ctx.surface.line(LineKind::Notice, field);
+        rows += 1;
+    }
+    rows + paint_indicator(ctx, tick)
 }
 
 /// Draw the indicator's row, if it has anything to say. Returns how many rows
@@ -536,6 +561,10 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             answer_model_proposals: true,
             auto_accept_model: auto_accept,
             typed_input,
+            // Filled in below, the moment `session/create` answers: until then
+            // there is no session for a command to act on, and `None` is that
+            // fact rather than a placeholder.
+            session_id: None,
         };
 
         // A proposal raised before this client attached is never replayed as an
@@ -563,6 +592,10 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                 return Ok(());
             }
         };
+        // The slash handlers act on this session and reach it only through the
+        // context (REQ-563: `/web allow` names the session whose restriction it
+        // lifts).
+        ctx.session_id = Some(session_id.clone());
         ctx.surface.line(
             LineKind::Info,
             &format!(
@@ -662,7 +695,9 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                     );
                     break;
                 }
-                Err(err) => render_turn_failure(&err, ctx.surface),
+                Err(err) => {
+                    render_turn_failure(&err, ctx.surface);
+                }
             }
         }
     }
@@ -767,6 +802,7 @@ fn passive_ctx<'a>(
         answer_model_proposals: false,
         auto_accept_model: false,
         typed_input: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        session_id: None,
     }
 }
 
@@ -2677,6 +2713,7 @@ mod tests {
                 answer_model_proposals: true,
                 auto_accept_model: false,
                 typed_input: true,
+                session_id: None,
             };
 
             // Nothing observed yet: nothing drawn, no rows to take back.
@@ -2714,6 +2751,85 @@ mod tests {
             surface.any_line_contains(LineKind::Notice, "model starting"),
             "the drawn row is the loading motion: {:?}",
             surface.calls
+        );
+    }
+
+    /// REQ-563 BR-7: the status area gains the session's web capability, and it
+    /// costs an opted-out session nothing.
+    ///
+    /// The row count is what `erase` takes back, so it is asserted alongside the
+    /// content: a status area that drew two rows and reported one would shred
+    /// the entry frame above it.
+    #[test]
+    fn the_status_area_shows_the_web_state_and_stays_empty_when_it_is_off() {
+        use teton_protocol::events::{
+            Event, EventEnvelope, ModelLifecycleStage, WebLookup, WebLookupKind, WebLookupOutcome,
+        };
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        let mut ctx = UiContext {
+            surface: &mut surface,
+            state: &mut state,
+            prompter: &mut prompter,
+            answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+            typed_input: true,
+            session_id: None,
+        };
+
+        // BR-1: a machine that never opted in draws exactly what it drew before
+        // this REQ — no row, and no `web: off` reminder of a feature nobody
+        // turned on.
+        assert_eq!(paint_status(&mut ctx, 0), 0);
+
+        // A lookup that ran proves the tier, and the row appears.
+        session_ui::render_event(
+            &EventEnvelope::new(
+                1,
+                None,
+                Event::WebLookup(WebLookup {
+                    kind: WebLookupKind::Search,
+                    host: "search.example".to_owned(),
+                    outcome: WebLookupOutcome::Completed,
+                    bytes_in: 10,
+                    cause: None,
+                }),
+            ),
+            ctx.surface,
+            ctx.state,
+        );
+        assert_eq!(paint_status(&mut ctx, 0), 1);
+
+        // With the loading indicator up too, the area is two rows — and the
+        // indicator is still the last one drawn, which is the geometry
+        // `STATUS_ROWS_ABOVE_CURSOR` encodes.
+        ctx.state.loading.observe(
+            "qwen3-coder-30b-a3b",
+            &ModelLifecycleStage::Benchmark {
+                first_token_ms: 368,
+                tokens_per_sec: 73.0,
+            },
+        );
+        assert_eq!(paint_status(&mut ctx, 0), 2);
+
+        let notices = surface.lines_of(LineKind::Notice);
+        assert_eq!(
+            notices.iter().filter(|l| **l == "web: search").count(),
+            2,
+            "one row from each of the two engaged paints — the first paint, \
+             before any lookup, drew nothing at all: {notices:?}"
+        );
+        let web_at = notices.iter().position(|l| *l == "web: search").unwrap();
+        let motion_at = notices
+            .iter()
+            .rposition(|l| l.contains("model starting"))
+            .expect("the indicator drew its row");
+        assert!(
+            web_at < motion_at,
+            "the indicator must stay last, directly above the frame: {notices:?}"
         );
     }
 

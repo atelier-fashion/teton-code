@@ -28,6 +28,7 @@ pub mod grep;
 pub mod mcp;
 pub mod read;
 pub mod shell;
+pub mod web;
 
 pub use edit::EditTool;
 pub use glob::GlobTool;
@@ -35,6 +36,7 @@ pub use grep::GrepTool;
 pub use mcp::{register_mcp_tools, McpToolHandle};
 pub use read::ReadTool;
 pub use shell::ShellTool;
+pub use web::{register_web_tool, WebTool, WEB_TOOL_NAME};
 
 /// Shared execution context for every tool: the repo-root jail.
 ///
@@ -338,6 +340,35 @@ pub trait Tool: Send + Sync {
     /// Run the tool against `args`, jailed to `ctx`.
     fn run(&self, ctx: &ToolContext, args: &Value) -> ToolOutcome;
 
+    /// Whether this tool raises its **own** permission prompt inside
+    /// [`Tool::run`], so the loop must not raise one on its behalf.
+    ///
+    /// **The default is `false`, and that is the safe answer**: a tool that says
+    /// nothing is authorized by the loop, by name, before it runs — which is
+    /// what every built-in and every MCP tool wants, because for them the tool
+    /// name *is* the whole consent question.
+    ///
+    /// It is asked of the tool rather than decided from a list of names for the
+    /// same reason [`Tool::refine`] is (BR-1): the thing that knows how a call
+    /// is authorized is the thing that performs it. Today exactly one tool
+    /// answers `true` — [`web`](web::WebTool) — and only because its consent
+    /// question is **finer than its name and is not always asked**:
+    ///
+    /// - fetching a URL and searching the web are separately consented
+    ///   capabilities (REQ-563 BR-3), so one session grant on a fetch must not
+    ///   silently grant a search;
+    /// - a lookup above the configured ceiling is refused *before* any prompt
+    ///   (AC-4), and a lookup already in the local cache performs no egress and
+    ///   must not prompt at all (BR-12).
+    ///
+    /// Both of those are facts only the tool holds, and both are decided inside
+    /// the same `run` that would perform the lookup — which is what keeps the
+    /// "no egress without consent" pairing atomic instead of split across two
+    /// calls that could come to disagree.
+    fn gates_itself(&self) -> bool {
+        false
+    }
+
     /// Refine this tool's own `outcome` through the harness duty this tool owns,
     /// given the `request` the turn is serving and the `args` it was called with.
     ///
@@ -367,13 +398,24 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// One tool in a [`ToolRegistry`], carrying whether the degraded-profile tool
+/// cap (BR-6) may displace it.
+struct Registration {
+    /// The tool itself.
+    tool: Arc<dyn Tool>,
+    /// When `true`, the tool is exempt from the `max_tools` cut: it is always
+    /// exposed, and the cap bounds only the remaining (non-exempt) tools — see
+    /// [`ToolRegistry::register_cap_exempt`].
+    cap_exempt: bool,
+}
+
 /// The set of tools available to a session.
 ///
 /// Insertion order is the exposure order: [`ToolRegistry::docs`] can be capped to
-/// the first `max_tools` for a degraded (weak) provider (BR-6), so put the most
-/// load-bearing tools first.
+/// the first `max_tools` non-exempt tools for a degraded (weak) provider (BR-6),
+/// so put the most load-bearing tools first.
 pub struct ToolRegistry {
-    tools: Vec<Arc<dyn Tool>>,
+    tools: Vec<Registration>,
 }
 
 impl ToolRegistry {
@@ -385,6 +427,17 @@ impl ToolRegistry {
 
     /// A registry with the full built-in tool set, in weak-model priority order:
     /// read, edit, grep, glob, shell.
+    ///
+    /// The **opt-in** `web` tool is deliberately not here (REQ-563 D-1): it
+    /// exists only on a machine whose `[web] tier` is above `off`, which is a
+    /// config fact this constructor does not have and should not acquire — a
+    /// registry that always held the tool and hid it behind a flag would make
+    /// "absent by construction" a claim about a code path rather than about the
+    /// tool set. Its caller adds it with [`register_web_tool`](web::register_web_tool),
+    /// **cap-exempt** and **last** — after the built-ins *and* after any MCP
+    /// tools — so an explicitly opted-in capability is never displaced by a
+    /// degraded provider's `max_tools` cap (REQ-563 decision 2026-08-09) while
+    /// the cap still bounds the optional MCP tools around it (BR-6).
     #[must_use]
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
@@ -398,20 +451,47 @@ impl ToolRegistry {
 
     /// Add a tool (later registrations with the same name shadow earlier ones on
     /// lookup order but are kept for exposure ordering — register uniquely).
+    ///
+    /// The tool is subject to the degraded-profile `max_tools` cap (BR-6); a tool
+    /// the cap must never displace is registered with
+    /// [`Self::register_cap_exempt`] instead.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.push(tool);
+        self.tools.push(Registration {
+            tool,
+            cap_exempt: false,
+        });
+    }
+
+    /// Add a tool the degraded-profile `max_tools` cap (BR-6) may never displace.
+    ///
+    /// A cap-exempt tool is always exposed by [`Self::exposed_names`]/[`Self::docs`]
+    /// regardless of the cut, and the cap applies to the remaining (non-exempt)
+    /// tools — so exempting one tool raises the effective exposure budget by
+    /// exactly one and never displaces a built-in. Exactly one tool registers
+    /// this way: the opt-in `web` tool (REQ-563 decision 2026-08-09). A user who
+    /// explicitly turned the capability on must reach it on every provider, and
+    /// `DEGRADED_MAX_TOOLS` equals the built-in count, so a plain registration
+    /// would be cut on every non-`Native` profile.
+    pub fn register_cap_exempt(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.push(Registration {
+            tool,
+            cap_exempt: true,
+        });
     }
 
     /// Look up a tool by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
-        self.tools.iter().find(|t| t.name() == name)
+        self.tools
+            .iter()
+            .map(|r| &r.tool)
+            .find(|t| t.name() == name)
     }
 
     /// Every registered tool name, in exposure order.
     #[must_use]
     pub fn names(&self) -> Vec<&str> {
-        self.tools.iter().map(|t| t.name()).collect()
+        self.tools.iter().map(|r| r.tool.name()).collect()
     }
 
     /// Number of registered tools.
@@ -467,12 +547,8 @@ impl ToolRegistry {
     /// when set (BR-6: a degraded provider gets a smaller tool set).
     #[must_use]
     pub fn docs(&self, max_tools: Option<u32>) -> String {
-        let limit = max_tools
-            .map(|n| n as usize)
-            .unwrap_or(self.tools.len())
-            .min(self.tools.len());
         let mut out = String::new();
-        for tool in &self.tools[..limit] {
+        for tool in self.exposed_tools(max_tools) {
             out.push_str(&format!(
                 "- {}: {}\n  arguments: {}\n",
                 tool.name(),
@@ -486,11 +562,32 @@ impl ToolRegistry {
     /// The names actually exposed under a `max_tools` cap (BR-6).
     #[must_use]
     pub fn exposed_names(&self, max_tools: Option<u32>) -> Vec<&str> {
+        self.exposed_tools(max_tools).map(|t| t.name()).collect()
+    }
+
+    /// The tools exposed under a `max_tools` cap (BR-6), in registration order.
+    ///
+    /// A cap-exempt tool ([`Self::register_cap_exempt`]) is always present; the
+    /// cap bounds only the non-exempt tools, so the first `max_tools` of *those*
+    /// are kept and a cap-exempt tool is never one displaced. `None` means no
+    /// cap — every tool is exposed.
+    fn exposed_tools(&self, max_tools: Option<u32>) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        let non_exempt = self.tools.iter().filter(|r| !r.cap_exempt).count();
         let limit = max_tools
             .map(|n| n as usize)
-            .unwrap_or(self.tools.len())
-            .min(self.tools.len());
-        self.tools[..limit].iter().map(|t| t.name()).collect()
+            .unwrap_or(non_exempt)
+            .min(non_exempt);
+        let mut taken = 0usize;
+        self.tools.iter().filter_map(move |r| {
+            if r.cap_exempt {
+                Some(&r.tool)
+            } else if taken < limit {
+                taken += 1;
+                Some(&r.tool)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -584,5 +681,68 @@ mod tests {
         assert_eq!(reg.exposed_names(Some(2)), vec!["read", "edit"]);
         assert!(reg.docs(Some(1)).contains("read"));
         assert!(!reg.docs(Some(1)).contains("shell"));
+    }
+
+    /// A stand-in for any tool, to exercise the registry's exposure rules
+    /// without one of the real built-ins.
+    struct StubTool(&'static str);
+
+    #[async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        fn run(&self, _ctx: &ToolContext, _args: &Value) -> ToolOutcome {
+            ToolOutcome::ok("stub")
+        }
+    }
+
+    /// **REQ-563 decision 2026-08-09: a cap-exempt tool survives the cut that
+    /// bounds the rest.**
+    ///
+    /// `DEGRADED_MAX_TOOLS` equals the built-in count (5), so a plain cap of 5
+    /// would leave no room for an opted-in `web` tool registered after the
+    /// built-ins and MCP. Cap-exemption raises the effective budget by exactly
+    /// one: the five built-ins survive, the optional (non-exempt) MCP tool is
+    /// still cut, and the exempt tool is exposed regardless of the cap.
+    #[test]
+    fn a_cap_exempt_tool_is_never_displaced_by_the_max_tools_cut() {
+        // The registration order the daemon uses: built-ins, then MCP, then the
+        // cap-exempt web tool.
+        let mut reg = ToolRegistry::with_builtins();
+        reg.register(Arc::new(StubTool("mcp")));
+        reg.register_cap_exempt(Arc::new(StubTool("web")));
+
+        let exposed = reg.exposed_names(Some(5));
+        for builtin in ["read", "edit", "grep", "glob", "shell"] {
+            assert!(
+                exposed.contains(&builtin),
+                "the cap displaced a built-in: {exposed:?}"
+            );
+        }
+        assert!(
+            !exposed.contains(&"mcp"),
+            "the cap must still bound optional (non-exempt) tools: {exposed:?}"
+        );
+        assert!(
+            exposed.contains(&"web"),
+            "an explicitly opted-in cap-exempt tool was cut: {exposed:?}"
+        );
+        assert_eq!(
+            exposed.len(),
+            6,
+            "exemption raises the effective budget by exactly one"
+        );
+
+        // docs mirror exposed_names.
+        let docs = reg.docs(Some(5));
+        assert!(docs.contains("web"), "{docs}");
+        assert!(!docs.contains("mcp"), "{docs}");
     }
 }

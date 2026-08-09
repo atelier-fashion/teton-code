@@ -94,7 +94,7 @@ use teton_core::category::{
     category_for_phase, BindingSource as CoreBindingSource, Category, CategoryOverride,
     CategoryResolution, CategoryTable, ConfigurableCategory, Tier, TierBinding,
 };
-use teton_core::config::{Config, LocalModelConfig, RoutingMigration};
+use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebTier};
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
 };
@@ -108,13 +108,15 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 
 use teton_protocol::events::{
     BlockCause, Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction, SessionTitled,
+    WebLookup, WebTaintOverridden,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
-    TierRouteView,
+    TierRouteView, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
+    WebRefreshResult, WebTotalsView,
 };
 use teton_protocol::{
     BindingSource, ConfigurableCategory as ProtoConfigurableCategory, Phase as ProtoPhase,
@@ -131,18 +133,22 @@ use teton_providers::{
 use crate::broadcast::EventBus;
 use crate::call_sites::has_call_site;
 use crate::classify::Classification;
-use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable};
+use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable, WebLookupRow, WebOverrideRow};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
 use crate::egress::{
-    inspect, origin_of, Egress, HttpTransport, Provenance, RedactionGate, RedactionVerdict,
+    inspect, origin_of, to_protocol_web_tier, Egress, EgressError, HttpTransport, LookupContext,
+    LookupOutcome, LookupRecord, LookupRecorder, LookupRequest, Provenance, RedactionGate,
+    RedactionVerdict, TaintView,
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
+use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolDuties,
-    ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
+    ToolRegistry, WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY,
+    TITLE_DUTY, TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -156,6 +162,7 @@ use crate::router::{
 };
 use crate::selection_store::SelectionStore;
 use crate::sessions::SessionRegistry;
+use crate::web::{UserUrls, WebCache};
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
 const SCRIPT_SEPARATOR: &str = "---";
@@ -557,6 +564,201 @@ impl SessionTaint {
     }
 }
 
+/// Per-session lift of the BR-13 restriction on **model-composed** web lookups
+/// (REQ-563, architecture D-4).
+///
+/// A sibling of [`SessionTaint`] and deliberately not a field on it: taint is a
+/// privacy fact the daemon establishes about a session, and this is a decision
+/// the *user* made about that fact. Folding the second into the first would let
+/// anything that can mark taint also unmark its consequence.
+///
+/// ## The setter is private, which is the whole of AC-12
+///
+/// [`Self::lift`] carries no `pub`, so it is reachable from this module and its
+/// children and from nowhere else in the crate — in particular not from
+/// `crate::harness::tools`, where a model's tool call lands. The single caller
+/// is [`DaemonRuntime::web_override`], which is only reached from the
+/// `web/override` client RPC. "The override is rejected when issued by the
+/// model" is therefore not a runtime check that could be forgotten; a
+/// model-issued override does not compile.
+///
+/// Session-scoped and never persisted (BR-13): a fresh session starts
+/// restricted-on-taint again, because this lives in a process-lifetime set with
+/// no writer to config.
+#[derive(Debug, Default)]
+pub struct WebTaintOverride {
+    lifted: Mutex<HashSet<SessionId>>,
+}
+
+impl WebTaintOverride {
+    /// An empty set — nothing lifted.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lift the restriction for `session`, returning whether this call was the
+    /// restricted→lifted transition.
+    ///
+    /// Idempotent, and the returned transition is what keeps the announcement
+    /// honest the way [`SessionTaint::mark`]'s does: a second override of an
+    /// already-lifted session is not a second lifting.
+    ///
+    /// **Intentionally not `pub`** — see the type docs.
+    fn lift(&self, session: &SessionId) -> bool {
+        self.lifted
+            .lock()
+            .expect("web override mutex poisoned")
+            .insert(session.clone())
+    }
+
+    /// Whether the user has lifted the restriction for `session`.
+    #[must_use]
+    pub fn is_lifted(&self, session: &SessionId) -> bool {
+        self.lifted
+            .lock()
+            .expect("web override mutex poisoned")
+            .contains(session)
+    }
+}
+
+/// The lookup seam's read of the two session flags (REQ-563 BR-13).
+///
+/// The choke point takes a [`TaintView`] rather than these two handles so it
+/// does not depend on the daemon runtime — the same inversion
+/// [`PrivacyEventSink`](crate::egress::PrivacyEventSink) uses. This is the
+/// production implementation, and it only ever *reads*: the lookup gate has no
+/// path to `mark` or to `lift`.
+pub struct SessionTaintView {
+    taint: Arc<SessionTaint>,
+    overridden: Arc<WebTaintOverride>,
+}
+
+impl TaintView for SessionTaintView {
+    fn is_tainted(&self, session: &SessionId) -> bool {
+        self.taint.is_tainted(session)
+    }
+
+    fn is_overridden(&self, session: &SessionId) -> bool {
+        self.overridden.is_lifted(session)
+    }
+}
+
+/// Writes one `web_lookups` row and publishes one `web_lookup` event per lookup
+/// attempt (REQ-563 BR-7, D-7/D-8).
+///
+/// Both obligations behind one call, because "exactly one row and exactly one
+/// event per attempt" is one invariant: two separately-installable hooks could
+/// be wired independently and then disagree about how many lookups a session
+/// performed, which is precisely the question the ledger exists to answer.
+///
+/// ## No `privacy_block`, deliberately
+///
+/// A web block is announced here as a `web_lookup` carrying
+/// `blocked_redact`, and **not** as a `privacy_block`. That is not an omission:
+/// `privacy_block` is the event [`TaintingPrivacySink`] turns into a session-wide
+/// local-tier pin, and a query the daemon refused to send establishes nothing
+/// about the context this session is holding. Taint semantics stay owned by that
+/// sink's rules (REQ-544 C-2, REQ-562's cause gate); the lookup path observes
+/// them and never writes them.
+struct WebLookupRecorder {
+    ledger: CostLedger,
+    events: Arc<EventBus>,
+}
+
+impl LookupRecorder for WebLookupRecorder {
+    fn web_lookup(&self, session_id: &SessionId, record: &LookupRecord) {
+        // `Some(0)`: every lookup this build performs is genuinely free, and a
+        // measured zero is not the guess REQ-557 BR-9 forbids. A metered search
+        // backend arrives as a price, not as a schema change (D-7).
+        let row = WebLookupRow {
+            session_id: session_id.to_string(),
+            kind: record.kind,
+            host: record.host.clone(),
+            bytes_in: record.bytes_in,
+            duration_ms: record.duration_ms,
+            outcome: record.outcome,
+            usd_micros: Some(0),
+        };
+        if let Err(err) = self.ledger.record_web_lookup(&row) {
+            // The lookup already happened; a ledger that could not be written is
+            // an accounting failure, not a reason to fail the turn (BR-9). The
+            // line names the failure class and no part of the destination.
+            eprintln!("teton: a web lookup could not be recorded in the cost ledger ({err})");
+        }
+        self.events.publish(
+            Some(session_id.clone()),
+            Event::WebLookup(WebLookup {
+                kind: record.kind,
+                host: record.host.clone(),
+                outcome: record.outcome,
+                bytes_in: record.bytes_in,
+                // REQ-563 BR-14's honesty half: a `blocked_redact` whose cause
+                // is `scan_unavailable` must not be reported to the user as
+                // "the scan refused your text". The ledger row keeps the fixed
+                // eight-value outcome; the event carries the finer reading.
+                cause: record.cause,
+            }),
+        );
+    }
+}
+
+/// The daemon's implementation of the harness web tool's egress seam
+/// (REQ-563 D-2/D-5).
+///
+/// It exists so the tool depends on a **trait** rather than on this runtime:
+/// the harness must not reach for the router, the config or the keychain, and a
+/// test of the tool's gate order must be able to say "this lookup reached
+/// nothing" without standing a daemon up. Everything privileged lives on this
+/// side of the seam.
+///
+/// One field per thing [`DaemonRuntime::web_lookup_egress`] needs, snapshotted
+/// for the turn the tools were built for — which is the same lifetime
+/// `run_one_attempt` gives its own `config`, because the registry is rebuilt on
+/// every prompt turn. The *credential* is not snapshotted: it is resolved
+/// inside `web_lookup_egress` as the choke point is built, per lookup (ADR-007).
+struct RuntimeLookupSeam {
+    runtime: Arc<DaemonRuntime>,
+    router: Router,
+    config: Config,
+    events: Arc<EventBus>,
+    session_id: SessionId,
+}
+
+#[async_trait::async_trait]
+impl WebLookupSeam for RuntimeLookupSeam {
+    async fn lookup(
+        &self,
+        request: &LookupRequest,
+        hop_allowed: &(dyn for<'h> Fn(&'h str) -> bool + Send + Sync),
+    ) -> Result<LookupOutcome, SeamError> {
+        // Built here and dropped at the end of this call. A choke point cached
+        // for the daemon's life would be holding a search key resolved when it
+        // was built, which is exactly the staleness ADR-007 removed.
+        let egress = self
+            .runtime
+            .web_lookup_egress(&self.router, &self.config, &self.events, &self.session_id)
+            .map_err(|err| SeamError::Unavailable(err.to_string()))?;
+        let taint = self.runtime.web_taint_view();
+        let mut ctx = LookupContext::new(self.session_id.clone(), &*taint, hop_allowed);
+        // The endpoint, and only the endpoint. The key rides the transport,
+        // bound to this origin, and this module never sees it (BR-7).
+        if let Some(endpoint) = self.config.web.search_endpoint.as_deref() {
+            ctx = ctx.with_search_endpoint(endpoint);
+        }
+        Ok(egress.lookup(request, &ctx).await)
+    }
+
+    fn record_without_egress(&self, record: &LookupRecord) {
+        // The same recorder the choke point uses, so a cache hit and a wire
+        // lookup land in one table through one writer — "how many lookups did
+        // this session perform" has one answer (BR-7).
+        self.runtime
+            .lookup_recorder(&self.events)
+            .web_lookup(&self.session_id, record);
+    }
+}
+
 /// A [`PrivacyEventSink`] that publishes the block **and** taints the session it
 /// happened in (REQ-544 C-2, extended to the duty path by REQ-561).
 ///
@@ -945,6 +1147,40 @@ pub struct DaemonRuntime {
     /// path's own `is_privacy_blocked` arm cannot cover it (see
     /// [`TaintingPrivacySink`]).
     session_taint: Arc<SessionTaint>,
+    /// Per-session lifts of the BR-13 web restriction (REQ-563). Behind an `Arc`
+    /// because the lookup seam reads it through a [`TaintView`] on whatever task
+    /// the turn is running on, while the `web/override` RPC writes it from the
+    /// server's reader loop.
+    web_override: Arc<WebTaintOverride>,
+    /// Per-session sets of the URLs the **user** pasted (REQ-563 BR-3).
+    ///
+    /// Session-scoped and in memory only, like the permission grants and the
+    /// taint flag beside it: this is evidence about one conversation, and
+    /// persisting it would turn a per-session authorization into a standing one.
+    session_user_urls: Mutex<HashMap<SessionId, Arc<Mutex<UserUrls>>>>,
+    /// Per-session permission gates, so an "allow for this session" grant lasts
+    /// the **session** (REQ-563 verify, M-5).
+    ///
+    /// It used to be built inside [`Self::run_prompt_turn`], once per prompt
+    /// turn, which made every `*_always` grant expire at the end of the turn
+    /// that earned it. Nobody noticed because the CLI keeps its own
+    /// `SessionGrants` cache and answers the re-prompt automatically — so the
+    /// daemon was re-asking and a *different* client (or the same one after
+    /// `/verbose`, or an ACP host) would have seen the prompt again. The grant
+    /// map is the authority for "asked once per session"; holding it here is
+    /// what makes that sentence true daemon-side rather than client-side.
+    ///
+    /// Same lifecycle as [`Self::session_user_urls`] beside it: created on first
+    /// use, in memory only, never persisted, and — like the taint flag and the
+    /// URL sets — not pruned, because a `SessionId` is not reused.
+    session_gates: Mutex<HashMap<SessionId, Arc<PermissionGate>>>,
+    /// The daemon's per-user state directory — where `cost.db` lives, and where
+    /// the web document cache sits beside it (REQ-563 BR-12).
+    ///
+    /// Held rather than re-derived so the two stores cannot end up in different
+    /// places: there is exactly one resolution of the data dir and it is
+    /// [`Self::from_env`]'s caller's.
+    data_dir: PathBuf,
     /// Daemon-wide provider health, persisted across turns (REQ-544 M-5). Updated
     /// by turn outcomes and READ by [`Self::run_prompt_turn`] when it seeds the
     /// router each turn, so a provider observed `Unavailable` stays `Unavailable`
@@ -1003,6 +1239,14 @@ impl DaemonRuntime {
             probe: None,
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
+            web_override: Arc::new(WebTaintOverride::new()),
+            session_user_urls: Mutex::new(HashMap::new()),
+            session_gates: Mutex::new(HashMap::new()),
+            // A minimal runtime has no state directory. It also has an empty
+            // config, so `[web] tier` is `off` and no web tool is ever built to
+            // ask this for a cache path — the temp dir is a total answer to a
+            // question this runtime does not get asked.
+            data_dir: std::env::temp_dir(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         }
@@ -1139,6 +1383,10 @@ impl DaemonRuntime {
             probe: Some(probe),
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
+            web_override: Arc::new(WebTaintOverride::new()),
+            session_user_urls: Mutex::new(HashMap::new()),
+            session_gates: Mutex::new(HashMap::new()),
+            data_dir: base_dir.to_path_buf(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         })
@@ -1859,18 +2107,24 @@ impl DaemonRuntime {
         // snapshot itself is cheap when that decision is made.
         // TODO(REQ-544 followup): make retries cost-neutral once continue-vs-restart
         // semantics are decided.
-        let tools = self.build_tools(&router, events, &session_id).await;
+        // REQ-563 BR-3: every URL in this prompt joins the session's user-pasted
+        // set **before** the turn runs, so a message that pastes a link and asks
+        // about it in one breath classifies as `UserPasted` — the ordinary
+        // shape of the request. This is the one ingestion point, and the text it
+        // reads is the user's own (see `record_user_prompt_urls`).
+        self.record_user_prompt_urls(&session_id, &prompt);
+        // Fetched before the tools, because the web tool holds it: that tool
+        // raises its own per-tier prompt inside its run rather than being
+        // authorized by name at dispatch (REQ-563 BR-3/BR-12). Fetched rather
+        // than built, because a gate rebuilt per turn forgets every
+        // "allow for this session" answer at the end of the turn that earned it.
+        let gate = self.permission_gate_for(&session_id, events, &config);
+        let tools = self.build_tools(&router, events, &session_id, &gate).await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
         // not send one — under launchd it is `/`, which is what had every tool
         // call running against the filesystem root.
         let tool_ctx = ToolContext::new(session_cwd.as_deref().unwrap_or(&self.repo_root));
-        let gate = PermissionGate::new(
-            session_id.clone(),
-            self.permission_config.clone(),
-            events.clone(),
-            self.pending.clone(),
-        );
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
         let system = build_system_prompt(&tools, &route.harness);
@@ -2109,17 +2363,25 @@ impl DaemonRuntime {
         crate::classify::run(plan, prompt, router.judgment_default()).await
     }
 
-    /// Build the tool registry for a turn: the built-ins plus any registered MCP
-    /// server tools (ADR-003), namespaced and egress-gated.
+    /// Build the tool registry for a turn: the built-ins, any registered MCP
+    /// server tools (ADR-003, namespaced and egress-gated), and — **only** on a
+    /// machine that opted in — the web tool (REQ-563 D-1).
+    ///
+    /// The web tool goes on **last**, after the MCP tools, and that ordering is
+    /// the BR-6 charter rule expressed as insertion order rather than as a
+    /// special case: [`ToolRegistry::exposed_names`] caps from the front, so a
+    /// degraded provider's `max_tools` cuts the opt-in capability before it cuts
+    /// a server the user configured.
     async fn build_tools(
-        &self,
+        self: &Arc<Self>,
         router: &Router,
         events: &Arc<EventBus>,
         session_id: &SessionId,
+        gate: &Arc<PermissionGate>,
     ) -> ToolRegistry {
         let mut tools = ToolRegistry::with_builtins();
+        let config = self.config.lock().expect("config mutex poisoned").clone();
         if !self.mcp_servers.is_empty() {
-            let config = self.config.lock().expect("config mutex poisoned").clone();
             if let Ok(transport) = HttpTransport::new() {
                 let egress =
                     Arc::new(self.mcp_egress(transport, router, &config, events, session_id));
@@ -2136,7 +2398,110 @@ impl DaemonRuntime {
                 .await;
             }
         }
+        // REQ-563 BR-1: `register_web_tool` is the one place the "tier is above
+        // off" condition is expressed, so a machine that never opted in has no
+        // web tool rather than a web tool behind a flag.
+        let web = config.web.clone();
+        register_web_tool(
+            &mut tools,
+            &web,
+            WebCache::from_config(&self.data_dir, &web),
+            self.user_urls_for(session_id),
+            Arc::clone(gate),
+            Arc::new(RuntimeLookupSeam {
+                runtime: Arc::clone(self),
+                router: router.clone(),
+                config,
+                events: Arc::clone(events),
+                session_id: session_id.clone(),
+            }),
+            tokio::runtime::Handle::current(),
+        );
         tools
+    }
+
+    /// This session's permission gate, created on first use (REQ-563 verify,
+    /// M-5).
+    ///
+    /// One gate per **session**, not per turn. The gate is where `*_always`
+    /// answers live, and the promise attached to "Allow for this session" is
+    /// that it holds for the session — a gate rebuilt on every prompt turn kept
+    /// that promise for exactly one turn, with the CLI's own grant cache hiding
+    /// the re-prompt from the one client that happened to have it.
+    ///
+    /// ## The config read happens once, at creation
+    ///
+    /// `[web] permission_allow` is folded into the policy table here, so a
+    /// session started after `enable_permanent` listed a tier does not prompt for
+    /// *that* tier, and one started before it keeps the posture it began with. That is the same
+    /// stability every other session-scoped fact has (a grant, the taint flag),
+    /// and the alternative — re-reading config per turn — would let a config
+    /// edit silently *narrow* a session mid-conversation, which is the one
+    /// direction a user has no way to observe.
+    ///
+    /// The gate is **not** pruned, exactly like [`Self::session_user_urls`]: the
+    /// map is keyed by a monotonically-minted `SessionId`, so an entry cannot be
+    /// resurrected by a later session, and the memory is a policy table plus a
+    /// small grant map.
+    fn permission_gate_for(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        events: &Arc<EventBus>,
+        config: &Config,
+    ) -> Arc<PermissionGate> {
+        let mut gates = self
+            .session_gates
+            .lock()
+            .expect("session gate mutex poisoned");
+        Arc::clone(gates.entry(session_id.clone()).or_insert_with(|| {
+            let mut permissions = self.permission_config.clone();
+            // REQ-563 BR-4: `[web] permission_allow` is what an
+            // `enable_permanent` answer becomes on disk, and this is the one
+            // place it becomes a policy again — one listed tier, one key.
+            permissions.apply_web_permission(&config.web.permission_allow);
+            Arc::new(
+                PermissionGate::new(
+                    session_id.clone(),
+                    permissions,
+                    events.clone(),
+                    self.pending.clone(),
+                )
+                // REQ-563 BR-4: the one consent answer that outlives the session
+                // writes through the daemon, never the client. The gate holds
+                // the seam and this is the only place it is filled in.
+                .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>),
+            )
+        }))
+    }
+
+    /// This session's set of user-pasted URLs, created on first use (BR-3).
+    fn user_urls_for(&self, session_id: &SessionId) -> Arc<Mutex<UserUrls>> {
+        Arc::clone(
+            self.session_user_urls
+                .lock()
+                .expect("session user url mutex poisoned")
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(UserUrls::new()))),
+        )
+    }
+
+    /// Record every URL in one **user-authored** prompt as user-pasted (BR-3).
+    ///
+    /// Called at prompt ingestion, before the turn runs, so a message that
+    /// pastes a URL *and* asks about it in one breath classifies as
+    /// `UserPasted` — the ordinary shape of the request, and one that would
+    /// otherwise need two turns to be granted at the floor tier.
+    ///
+    /// The "user-authored" qualifier is the whole safety argument: feeding this
+    /// a model turn, a tool result or a fetched page would let the model author
+    /// its own authorization by writing a URL into content this set then
+    /// trusts. There is exactly one caller, and it holds the `session/prompt`
+    /// text.
+    fn record_user_prompt_urls(&self, session_id: &SessionId, prompt: &str) {
+        self.user_urls_for(session_id)
+            .lock()
+            .expect("user url set mutex poisoned")
+            .record_user_message(prompt);
     }
 
     /// The choke point an MCP `tools/call` crosses (ADR-003, REQ-562 ADR-1).
@@ -2599,6 +2964,413 @@ impl DaemonRuntime {
         }))
     }
 
+    /// The scanner the **search** half of the lookup seam carries, or `None`
+    /// when the configured tier does not reach search (REQ-563 BR-14, D-6).
+    ///
+    /// The same composite gate [`Self::redaction_gate`] builds — same router,
+    /// same engine slot, same `redact` category, same caps — installed from a
+    /// different switch. `[privacy] redact` is deliberately *not* read here:
+    /// BR-14 makes the scan the condition on which the search tier exists, so a
+    /// user who turned provider-payload scanning off has not thereby turned off
+    /// the thing that makes search offerable. Reading both flags would make the
+    /// coupling bypassable by the wrong one.
+    ///
+    /// The `⇔` runs both ways. Above `search` there is no tier, and below it a
+    /// lookup is a fetch, which this gate does not scan (BR-2's parity clause) —
+    /// so anything but `search` builds nothing, and the seam then refuses a
+    /// search outright rather than sending it unscanned.
+    fn search_redaction_gate(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> Option<Arc<dyn RedactionGate>> {
+        if config.web.tier != WebTier::Search {
+            return None;
+        }
+        Some(Arc::new(RedactionGateImpl {
+            router: router.clone(),
+            events: Arc::clone(events),
+            session_id: session_id.clone(),
+            engine: Arc::clone(&self.engine),
+        }))
+    }
+
+    /// The session-taint set itself, for a caller that needs to **mark**.
+    ///
+    /// Deliberately asymmetric with [`Self::web_taint_view`], which is the
+    /// read-only face the choke point gets: marking is fail-closed (it can only
+    /// ever restrict more) and [`SessionTaint`] has no un-mark, so handing it
+    /// out grants nothing a caller could relax. Lifting stays where it was —
+    /// [`WebTaintOverride::lift`] is private to this module and reachable only
+    /// through [`Self::web_override`], which is what makes "a model cannot lift
+    /// its own restriction" a fact about the type system rather than a rule.
+    #[must_use]
+    pub fn session_taint(&self) -> Arc<SessionTaint> {
+        Arc::clone(&self.session_taint)
+    }
+
+    /// The two session flags the lookup taint gate reads (REQ-563 BR-13).
+    ///
+    /// Handed to the choke point as a `&dyn TaintView` so it can decide without
+    /// depending on this runtime — and, just as importantly, so what it holds is
+    /// a *read* interface: there is no `mark` and no `lift` on the other side of
+    /// this seam.
+    #[must_use]
+    pub fn web_taint_view(&self) -> Arc<SessionTaintView> {
+        Arc::new(SessionTaintView {
+            taint: Arc::clone(&self.session_taint),
+            overridden: Arc::clone(&self.web_override),
+        })
+    }
+
+    /// The recorder that turns each lookup attempt into one ledger row and one
+    /// `web_lookup` event (REQ-563 BR-7).
+    #[must_use]
+    pub fn lookup_recorder(&self, events: &Arc<EventBus>) -> Arc<dyn LookupRecorder> {
+        Arc::new(WebLookupRecorder {
+            ledger: self.ledger.clone(),
+            events: Arc::clone(events),
+        })
+    }
+
+    /// Build the lookup-capable choke point for this session (REQ-563 D-2).
+    ///
+    /// ## Credential-free for fetch, endpoint-bound for search (BR-7)
+    ///
+    /// The transport carries **no provider credential**: a page fetch must never
+    /// have an `x-api-key` on it, and the way to guarantee that is to build the
+    /// client without one, exactly as the MCP path does. When a search endpoint
+    /// *and* a resolvable `search_key_ref` are configured, the resolved key is
+    /// attached by [`HttpTransport::with_endpoint_auth`] and **bound to that
+    /// endpoint's origin**, so it rides the search request and can travel
+    /// nowhere else — the same machinery, and the same guarantee, a provider's
+    /// key gets (REQ-544 M-3). The lookup module itself never holds the secret.
+    ///
+    /// ## Resolved here, which is why this is built per lookup
+    ///
+    /// The keychain read happens as this function runs (ADR-007: the daemon is
+    /// the resolver, at call time). A caller that cached the returned choke
+    /// point for the daemon's life would be holding a key resolved when it was
+    /// built, so callers build one per lookup — or per turn — rather than once.
+    ///
+    /// A `search_key_ref` that will not resolve is **not** fatal: an
+    /// unauthenticated endpoint is a legitimate configuration (see
+    /// [`teton_core::config::WebConfig::search_key_ref`]), so the failure is
+    /// reported by reference name — never by value — and the choke point is
+    /// built credential-free. The backend answers 401 and the lookup ends as an
+    /// HTTP-status ending, which is a truthful thing for the user to be told.
+    ///
+    /// # Errors
+    /// [`EgressError::ClientInit`] if the HTTP client cannot be constructed.
+    pub fn web_lookup_egress(
+        &self,
+        router: &Router,
+        config: &Config,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> Result<Egress<HttpTransport>, EgressError> {
+        // `for_lookup*`, never `new`/`with_endpoint_auth`: the lookup transport
+        // carries a **connect timeout**, because a lookup destination is an
+        // arbitrary host a model or a user named once and an arbitrary host is
+        // entitled to accept a connection and then say nothing. The seam's total
+        // bound (`LOOKUP_TOTAL_TIMEOUT`) still holds either way; what this adds
+        // is failing a black-holed destination fast rather than at that ceiling.
+        let transport = match self.search_auth(config) {
+            Some((endpoint, headers)) => {
+                HttpTransport::for_lookup_with_endpoint_auth(&endpoint, headers)?
+            }
+            None => HttpTransport::for_lookup()?,
+        };
+        // The privacy sink is the plain event bus, not `TaintingPrivacySink`:
+        // this choke point is used through `lookup()`, which publishes no
+        // `privacy_block` at all, and a sink that taints would be a loaded gun
+        // pointed at the rule the lookup path is built to keep.
+        let sink: Arc<dyn crate::egress::PrivacyEventSink> = events.clone();
+        let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
+            .with_lookup_recorder(self.lookup_recorder(events));
+        if let Some(gate) = self.search_redaction_gate(router, config, events, session_id) {
+            egress = egress.with_search_redaction_gate(gate);
+        }
+        // BR-2's parity clause and BR-13's "a pasted URL is still redact-scanned":
+        // the outgoing *URL string* of a fetch is scanned exactly when a provider
+        // payload would be, so the switch is `[privacy] redact` and the gate is
+        // the same composite one `redaction_gate` builds for the provider path.
+        //
+        // A **different switch** from the search gate above, deliberately: that
+        // one keys on `tier == search` because BR-14 makes the scan the condition
+        // on which the search tier exists, and reading `redact` there would let a
+        // user turn off the thing that makes search offerable by turning off
+        // provider-payload scanning. Two promises, two switches, two slots.
+        if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
+            egress = egress.with_fetch_redaction_gate(gate);
+        }
+        Ok(egress)
+    }
+
+    /// The search endpoint and its resolved credential header, or `None` when
+    /// there is no endpoint, no key reference, or the reference does not resolve.
+    ///
+    /// A bearer token, matching what `provider_auth_headers` sends to an
+    /// OpenAI-compatible or custom endpoint: there is no blessed search backend
+    /// (BR-8), and `Authorization: Bearer` is what an unblessed one is most
+    /// likely to accept. The secret exists only inside the returned header and
+    /// is dropped once the endpoint-bound transport is built — it reaches no
+    /// log, no event, and no ledger row.
+    fn search_auth(&self, config: &Config) -> Option<(String, Vec<(String, String)>)> {
+        let endpoint = config.web.search_endpoint.clone()?;
+        let key_ref = config.web.search_key_ref.as_deref()?;
+        if origin_of(&endpoint).is_none() {
+            // The same fail-closed check `build_remote_transport` makes: a
+            // credential bound to nothing is a credential silently dropped.
+            eprintln!(
+                "teton: [web] search_endpoint does not parse to a network origin, so \
+                 search_key_ref cannot be bound to it; searching without a credential."
+            );
+            return None;
+        }
+        match self.secret_resolver.resolve(key_ref) {
+            Ok(secret) => Some((
+                endpoint,
+                vec![("authorization".to_owned(), format!("Bearer {secret}"))],
+            )),
+            Err(err) => {
+                // Names the reference (config, safe) and never the value.
+                eprintln!("teton: [web] search_key_ref could not be resolved ({err})");
+                None
+            }
+        }
+    }
+
+    /// Lift this session's BR-13 web restriction (`web/override`, REQ-563 AC-12).
+    ///
+    /// The **only** caller of [`WebTaintOverride::lift`], and reachable only from
+    /// the client RPC dispatch: tool dispatch holds a `ToolContext`, never a
+    /// `DaemonRuntime`, and `lift` is private to this module besides. A
+    /// model-issued override is unrepresentable rather than rejected.
+    ///
+    /// ## What it restores, and what it does not
+    ///
+    /// It restores *model-composed lookups*; it grants no tier (BR-13). Consent
+    /// still runs per lookup, and the configured ceiling still bounds everything
+    /// — so `tiers_restored` is read from that ceiling: the tiers at or below it,
+    /// ascending, `off` excluded because "restored to nothing" is an empty list.
+    ///
+    /// `was_restricted` is the *taint* question and not the override question: a
+    /// session that was never tainted restores nothing, and the client says
+    /// "nothing was restricted" rather than confirming a lift that did not
+    /// happen.
+    ///
+    /// The event is published only on the restricted→lifted transition, so a
+    /// second override of an already-lifted session is acknowledged without
+    /// announcing a lifting twice ([`SessionTaint::mark`]'s rule).
+    ///
+    /// ## Nothing restricted means nothing happens
+    ///
+    /// The lift is **inside** the `was_restricted` branch. It used to run
+    /// unconditionally, which pre-armed the override on a clean session: the
+    /// client was truthfully told "nothing was restricted", and the flag was set
+    /// anyway, so a boundary read *later in the same session* found the
+    /// restriction already lifted and BR-13 never engaged. A user-only decision
+    /// has to be a decision about something that exists.
+    ///
+    /// ## The ledger half of BR-13
+    ///
+    /// A real lift is an accountable event — the session's restriction was
+    /// removed, on the user's say-so — so it writes one append-only
+    /// `web_overrides` row beside the `web_lookups` rows it re-enables. Written
+    /// only on the transition, for the same reason the event is: a re-override
+    /// removed nothing.
+    pub fn web_override(
+        &self,
+        params: &WebOverrideParams,
+        events: &Arc<EventBus>,
+    ) -> WebOverrideResult {
+        let was_restricted = self.session_taint.is_tainted(&params.session_id);
+        if !was_restricted {
+            return WebOverrideResult {
+                was_restricted: false,
+                tiers_restored: Vec::new(),
+            };
+        }
+        let ceiling = self.config.lock().expect("config mutex poisoned").web.tier;
+        let restored: Vec<WebTier> = WebTier::ALL
+            .into_iter()
+            .filter(|tier| ceiling.allows(*tier))
+            .collect();
+        let tiers_restored: Vec<_> = restored.iter().copied().map(to_protocol_web_tier).collect();
+        if self.web_override.lift(&params.session_id) {
+            let row = WebOverrideRow {
+                session_id: params.session_id.to_string(),
+                // The **config** spelling, so a ledger row and the `[web] tier`
+                // key a user reads afterwards name the tiers with one word.
+                tiers_restored: restored.iter().copied().map(tier_name).collect(),
+            };
+            if let Err(err) = self.ledger.record_web_override(&row) {
+                // The restriction *is* lifted; a ledger that could not be
+                // written is an accounting failure, not a reason to refuse the
+                // user's own decision (the posture `web_lookup` takes).
+                eprintln!("teton: a web override could not be recorded in the cost ledger ({err})");
+            }
+            events.publish(
+                Some(params.session_id.clone()),
+                Event::WebTaintOverridden(WebTaintOverridden {
+                    tiers_restored: tiers_restored.clone(),
+                }),
+            );
+        }
+        WebOverrideResult {
+            was_restricted,
+            tiers_restored,
+        }
+    }
+
+    /// Evict a cached document so the next lookup of that URL re-fetches
+    /// (`web/refresh`, REQ-563 BR-12's explicit-refresh clause / AC-10).
+    ///
+    /// Like [`Self::web_override`] this hangs off the **client** RPC channel and
+    /// nothing else: a model that emits a tool call named `web/refresh` reaches
+    /// the tool registry and finds no such tool. Unlike the override it needs no
+    /// user-only argument — refreshing is not a capability grant, it is a
+    /// deletion of the daemon's own copy.
+    ///
+    /// It publishes no event and writes no ledger row. A refresh is not a lookup:
+    /// nothing was requested of the network, nothing came back, and BR-7's ledger
+    /// counts lookups. The `Evicted`/`Absent` answer goes to the one client that
+    /// asked, which is the only party that asked anything.
+    ///
+    /// # Errors
+    /// [`RpcError`] (`INTERNAL_ERROR`) if a cached entry exists and cannot be
+    /// removed — the one case where the user's next lookup would silently keep
+    /// reading the copy they asked to drop.
+    pub fn web_refresh(&self, params: &WebRefreshParams) -> Result<WebRefreshResult, RpcError> {
+        // Canonicalized with the same parser the tool caches under (REQ-563
+        // verify, C-1): the tool keys its entries on the re-serialized URL, so a
+        // user typing `https://docs.rs` — which re-serializes with the empty
+        // path's `/` — has to reach the entry that URL actually wrote. A URL
+        // this cannot parse is passed through unchanged, which is exactly what
+        // the cache would key it as.
+        let url = crate::web::canonical_lookup_url(&params.url)
+            .map_or_else(|| params.url.clone(), |(url, _)| url);
+        match self.web_cache().evict(&url) {
+            Ok(true) => Ok(WebRefreshResult {
+                outcome: WebRefreshOutcome::Evicted,
+            }),
+            Ok(false) => Ok(WebRefreshResult {
+                outcome: WebRefreshOutcome::Absent,
+            }),
+            // Names the failure class and never the path: the cache path is
+            // derived from the URL's digest, and echoing it back would put a
+            // (weak) trace of the destination in an error string (BR-7).
+            Err(err) => Err(RpcError::new(
+                error_code::INTERNAL_ERROR,
+                format!("the cached document could not be removed ({err})"),
+            )),
+        }
+    }
+
+    /// The document cache the web tool reads and writes.
+    ///
+    /// Built on demand from the live config rather than held, exactly as
+    /// `build_tools` builds it per turn: [`WebCache`] is a path and a number, and
+    /// two of them addressing the same directory are the same cache. The entry
+    /// path is a function of the URL alone, so an eviction is unaffected by which
+    /// TTL the caller happened to read.
+    fn web_cache(&self) -> WebCache {
+        WebCache::from_config(
+            &self.data_dir,
+            &self.config.lock().expect("config mutex poisoned").web,
+        )
+    }
+
+    /// Write the `enable_permanent` consent answer to config — the whole effect
+    /// of that option (BR-4, AC-2's persistence half).
+    ///
+    /// BR-4 makes this the **only** consent path that writes config; allow-once
+    /// and allow-for-session are session facts and reach no file. The write goes
+    /// through the daemon's existing atomic config path (BUG-155), so a
+    /// half-written config is not a state this can produce, and the in-memory
+    /// config is replaced only after the file lands — a failed write leaves the
+    /// daemon exactly as it was rather than running above what is on disk.
+    ///
+    /// ## Two effects, and the second is the one that fires
+    ///
+    /// **`[web] permission_allow += tier`** is the durable form of the answer.
+    /// This used to write only the tier ceiling, raise-only, which meant it wrote
+    /// *nothing* in the case that actually occurs: the ceiling is checked before
+    /// any prompt exists, so every lookup that reaches a prompt is already at or
+    /// below the configured tier and the raise was always a no-op — while the
+    /// decision was still reported to the user as `Persistent` and the CLI still
+    /// said "written to your config". The consent list is what the user was
+    /// promised: next session, this tier does not ask again.
+    ///
+    /// **Exactly the one tier**, appended, never a fan-out. The answer was given
+    /// at a prompt about one capability, and BR-3 grades the three deliberately:
+    /// consenting once to fetch a URL *the user pasted* must not also stop the
+    /// prompts for URLs the **model** composes, or for searches. An idempotent
+    /// append rather than a set-and-replace, so an earlier answer about another
+    /// tier is not silently revoked by this one.
+    ///
+    /// **The tier raise** stays, unchanged and still raise-only, as the second
+    /// effect: consenting to fetch a page on a machine configured for `search`
+    /// must not quietly demote it, and a future prompt raised *above* the
+    /// ceiling (there is none today) would need exactly this. A config already
+    /// at or above `tier` is left byte-for-byte alone on that axis.
+    ///
+    /// An answer whose durable state is **already true** — the tier already
+    /// listed and the ceiling already high enough — writes nothing and reports
+    /// success,
+    /// because the user's ask is already satisfied on disk. That is the one
+    /// no-write success, and it is honest: the file says what the user asked it
+    /// to say.
+    ///
+    /// # Errors
+    /// A message naming what stopped the write, in two cases the caller must
+    /// distinguish from success because both mean "this did not become
+    /// permanent":
+    ///
+    /// - **no config file** — a defaulted config has no path to write, so
+    ///   "permanent" would outlive nothing. Reported rather than silently applied
+    ///   in memory (the shape [`Self::apply_config_update`] can afford, because
+    ///   nothing there tells the user the word "permanently").
+    /// - **the result would not load** — `[web] tier = "search"` with no
+    ///   `search_endpoint` is a config this daemon refuses to start on, so
+    ///   validating the candidate first is what keeps a consent answer from
+    ///   bricking the next start.
+    pub fn persist_web_tier(&self, tier: WebTier) -> Result<(), String> {
+        let mut config = self.config.lock().expect("config mutex poisoned");
+        let mut candidate = config.clone();
+        // Append, and only this tier — see "exactly the one tier" above. The
+        // membership test keeps a repeated answer from growing the list.
+        if !candidate.web.permission_allow.contains(&tier) {
+            candidate.web.permission_allow.push(tier);
+        }
+        // Raise-only, as documented above.
+        if candidate.web.tier < tier {
+            candidate.web.tier = tier;
+        }
+        if candidate.web == config.web {
+            // The durable state the answer asks for already holds. Nothing to
+            // write, and `Persistent` is the truthful scope.
+            return Ok(());
+        }
+        candidate
+            .validate()
+            .map_err(|e| format!("the resulting configuration would not load: {e}"))?;
+        let Some(path) = &self.config_path else {
+            return Err(
+                "this daemon has no configuration file to write, so the choice could not be \
+                 made permanent"
+                    .to_owned(),
+            );
+        };
+        write_config_atomically(path, &candidate)
+            .map_err(|err| format!("the configuration could not be saved ({err})"))?;
+        *config = candidate;
+        Ok(())
+    }
+
     /// Name this session after `prompt`, at most once for its whole life
     /// (REQ-561 BR-9a, TASK-062).
     ///
@@ -3026,6 +3798,20 @@ fn load_config(path: Option<&Path>) -> anyhow::Result<Config> {
              refusing to start rather than silently ignore it.",
             err.kind()
         )),
+    }
+}
+
+/// The daemon *is* the place a permanent consent answer is written (REQ-563
+/// BR-4, architecture D-5).
+///
+/// A one-line impl over [`DaemonRuntime::persist_web_tier`], and the indirection
+/// earns its keep: the permission gate depends on this trait rather than on the
+/// runtime, so nothing in the harness can reach config by any other route, and
+/// the "never client-side file writes" rule is a fact about which types exist
+/// rather than a review note.
+impl WebTierPersistence for DaemonRuntime {
+    fn persist_web_tier(&self, tier: WebTier) -> Result<(), String> {
+        DaemonRuntime::persist_web_tier(self, tier)
     }
 }
 
@@ -5206,6 +5992,19 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
         methodology: report.methodology.clone(),
         per_phase: report.per_phase.iter().map(group).collect(),
         per_provider: report.per_provider.iter().map(group).collect(),
+        // REQ-563 BR-7 / AC-6: lookups are recorded per session in their own
+        // ledger table, and `/cost` is where BR-7 says they become visible. The
+        // aggregation already happened (`cost::report::aggregate`); dropping it
+        // here would have left the table written and unreadable.
+        web_per_session: report
+            .web_per_session
+            .iter()
+            .map(|w| WebTotalsView {
+                key: w.key.clone(),
+                lookups: w.lookups,
+                bytes_in: w.bytes_in,
+            })
+            .collect(),
     }
 }
 
@@ -7724,6 +8523,7 @@ provider_id = "on-device"
             default_provider: None,
             local_model: teton_core::LocalModelConfig::default(),
             privacy: teton_core::PrivacyConfig::default(),
+            web: teton_core::WebConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -8036,6 +8836,7 @@ provider_id = "on-device"
             default_provider: Some("anthropic".to_owned()),
             local_model: teton_core::LocalModelConfig::default(),
             privacy: teton_core::PrivacyConfig::default(),
+            web: teton_core::WebConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),
@@ -10947,6 +11748,7 @@ provider_id = "on-device"
                     )
                     .expect("serialize");
                     Ok(teton_providers::transport::TransportResponse {
+                        location: None,
                         status: 200,
                         body: Box::pin(futures::stream::once(async move { Ok(body) })),
                     })
@@ -11660,6 +12462,1523 @@ provider_id = "on-device"
                      to the same provider"
                 );
             }
+        }
+    }
+
+    /// REQ-563 TASK-075 — the daemon half of the lookup seam: which switch
+    /// installs the search scanner, who may lift the taint restriction, and what
+    /// one lookup leaves behind.
+    mod web_lookup_seam {
+        use super::*;
+        use crate::classify::test_support::CountingEngine;
+        use crate::egress::{
+            Authorship, LookupContext, LookupDetail, LookupRecord, LookupRequest, TaintView,
+        };
+        use crate::harness::{PermissionDecision, PermissionPolicy};
+        use teton_core::config::WebTier;
+        use teton_protocol::events::{WebLookupKind, WebLookupOutcome, WebTier as WireWebTier};
+        use teton_protocol::methods::WebOverrideParams;
+
+        fn runtime_with(web_tier: WebTier, redact: bool) -> DaemonRuntime {
+            let runtime = DaemonRuntime::minimal();
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = web_tier;
+                config.web.search_endpoint = Some("https://search.example/api".to_owned());
+                config.privacy.redact = redact;
+            }
+            runtime
+        }
+
+        fn router_for(runtime: &DaemonRuntime) -> Router {
+            let config = runtime.config.lock().expect("config mutex").clone();
+            build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+        }
+
+        /// A keychain that answers exactly one `(service, account)` pair.
+        ///
+        /// The injection point `keychain.rs` documents (`SecretResolver::with_backend`
+        /// — "tests inject a fake that returns a canned secret so CI never touches
+        /// the real store"), reused here so a `search_key_ref` can be *resolvable*
+        /// in a test. Without a resolver that answers, `search_auth` returns `None`
+        /// for the ordinary reason and the wiring below could not be observed at
+        /// all.
+        struct FakeKeychain {
+            service: &'static str,
+            account: &'static str,
+            secret: &'static str,
+        }
+
+        impl crate::keychain::KeychainBackend for FakeKeychain {
+            fn get(
+                &self,
+                service: &str,
+                account: &str,
+            ) -> Result<String, crate::keychain::BackendError> {
+                if service == self.service && account == self.account {
+                    Ok(self.secret.to_owned())
+                } else {
+                    Err(crate::keychain::BackendError::NotFound)
+                }
+            }
+        }
+
+        /// A loopback HTTP server that records the head of every request it is
+        /// sent and answers each with `200 ok`.
+        ///
+        /// **Real sockets, deliberately.** The credential under test is attached
+        /// by the production [`HttpTransport`] that
+        /// [`DaemonRuntime::web_lookup_egress`] builds and does not hand back, so
+        /// a fake `Transport` cannot see it: substituting one would replace the
+        /// very object whose header behaviour is the claim. The wire is the only
+        /// place `Authorization: Bearer …` exists, so the wire is where it is
+        /// read. Nothing leaves the machine — both ends are `127.0.0.1`.
+        #[derive(Clone)]
+        struct CaptureServer {
+            port: u16,
+            heads: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl CaptureServer {
+            async fn bind() -> Self {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind a loopback port");
+                let port = listener.local_addr().expect("local addr").port();
+                let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = Arc::clone(&heads);
+                tokio::spawn(async move {
+                    while let Ok((mut socket, _)) = listener.accept().await {
+                        let mut head = Vec::new();
+                        let mut chunk = [0_u8; 512];
+                        loop {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => head.extend_from_slice(&chunk[..n]),
+                            }
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        sink.lock()
+                            .expect("capture mutex")
+                            .push(String::from_utf8_lossy(&head).into_owned());
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+                                  Connection: close\r\n\r\nok",
+                            )
+                            .await;
+                        let _ = socket.flush().await;
+                    }
+                });
+                Self { port, heads }
+            }
+
+            fn url(&self, path: &str) -> String {
+                format!("http://127.0.0.1:{}{path}", self.port)
+            }
+
+            fn requests(&self) -> Vec<String> {
+                self.heads.lock().expect("capture mutex").clone()
+            }
+
+            /// Whether request `i` carried an `Authorization` header at all.
+            /// Case-folded, because a header name is case-insensitive and the
+            /// question is about the credential, not about its spelling.
+            fn carried_auth(&self, i: usize) -> bool {
+                self.requests()[i]
+                    .to_ascii_lowercase()
+                    .contains("\r\nauthorization:")
+            }
+        }
+
+        /// A runtime configured to search `endpoint`, with `key_ref` resolvable
+        /// through a fake keychain and an engine loaded so the BR-14 search scan
+        /// can actually run.
+        fn searching_runtime(
+            endpoint: &str,
+            key_ref: Option<&str>,
+            engine: &CountingEngine,
+        ) -> DaemonRuntime {
+            let mut runtime = DaemonRuntime::minimal();
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = WebTier::Search;
+                config.web.search_endpoint = Some(endpoint.to_owned());
+                config.web.search_key_ref = key_ref.map(ToOwned::to_owned);
+            }
+            runtime
+                .engine
+                .install("counting".to_owned(), engine.handle());
+            runtime.local_available.store(true, Ordering::SeqCst);
+            runtime.secret_resolver =
+                crate::keychain::SecretResolver::with_backend(Box::new(FakeKeychain {
+                    service: "teton",
+                    account: "search",
+                    secret: SEARCH_SECRET,
+                }));
+            runtime
+        }
+
+        /// The credential the fake keychain answers with. A value no other
+        /// fixture in this file uses, so finding it on a wire is unambiguous.
+        const SEARCH_SECRET: &str = "srch-secret-4f1c9";
+
+        /// A host check that permits every redirect hop — the *permissive*
+        /// setting, so nothing below can be an accident of a restrictive one.
+        fn allow_any_host(_host: &str) -> bool {
+            true
+        }
+
+        // -- the search gate's switch (BR-14, D-6) -------------------------
+
+        /// **`⇔ tier == search`, and `[privacy] redact` is not part of it.**
+        ///
+        /// Both halves matter and the sweep asserts both at once. A gate keyed
+        /// on `redact` as well would let a user who declined provider-payload
+        /// scanning send search queries unscanned, which is the coupling BR-14
+        /// exists to prevent; a gate installed below `search` would scan a
+        /// capability that cannot search.
+        #[test]
+        fn the_search_gate_is_installed_exactly_when_the_tier_is_search() {
+            for tier in WebTier::ALL {
+                for redact in [false, true] {
+                    let runtime = runtime_with(tier, redact);
+                    let config = runtime.config.lock().expect("config mutex").clone();
+                    let router = router_for(&runtime);
+                    let events = Arc::new(EventBus::new());
+                    let gate = runtime.search_redaction_gate(
+                        &router,
+                        &config,
+                        &events,
+                        &SessionId::from("s"),
+                    );
+                    assert_eq!(
+                        gate.is_some(),
+                        tier == WebTier::Search,
+                        "tier {tier:?} with redact={redact} installed the wrong thing"
+                    );
+                }
+            }
+        }
+
+        /// **The fetch-parity gate is `⇔ [privacy] redact`, whatever the tier.**
+        ///
+        /// BR-2 promises a fetch "the same treatment a provider payload gets"
+        /// and BR-13 says a user-pasted URL is "still redact-scanned" — one
+        /// sentence, and its switch is the provider switch. A **different**
+        /// switch from the search gate above, so the sweep runs both axes: a
+        /// gate that keyed on the tier would leave a `fetch_any_url` daemon
+        /// sending URLs unscanned with `redact = true`, and one that keyed on
+        /// the tier for search would let `redact = false` turn off the scan
+        /// BR-14 makes the search tier conditional on.
+        #[test]
+        fn the_fetch_parity_gate_is_installed_exactly_when_redact_is_on() {
+            for tier in WebTier::ALL {
+                for redact in [false, true] {
+                    let runtime = runtime_with(tier, redact);
+                    let config = runtime.config.lock().expect("config mutex").clone();
+                    let router = router_for(&runtime);
+                    let events = Arc::new(EventBus::new());
+                    let egress = runtime
+                        .web_lookup_egress(&router, &config, &events, &SessionId::from("s"))
+                        .expect("the lookup choke point must build");
+                    assert_eq!(
+                        egress.fetch_redaction_installed(),
+                        redact,
+                        "tier {tier:?} with redact={redact}: the fetch gate follows \
+                         `[privacy] redact` and nothing else"
+                    );
+                    // …and the two slots really are two: the search gate on the
+                    // same choke point still follows the tier.
+                    let (_, search_gate, _) = egress.installed();
+                    assert_eq!(search_gate, tier == WebTier::Search);
+                }
+            }
+        }
+
+        /// The provider gate still answers to its own switch — otherwise the
+        /// test above would pass on an implementation that had merged the two.
+        #[test]
+        fn the_provider_gate_still_answers_to_the_privacy_switch() {
+            for redact in [false, true] {
+                let runtime = runtime_with(WebTier::Search, redact);
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router = router_for(&runtime);
+                let events = Arc::new(EventBus::new());
+                let gate = runtime.redaction_gate(&router, &config, &events, &SessionId::from("s"));
+                assert_eq!(gate.is_some(), redact);
+            }
+        }
+
+        /// **The search gate is REQ-562's composite scanner, not a new one.**
+        ///
+        /// This is what makes LESSON-491 inherited rather than re-derived: the
+        /// caps that matter — the total input cap, the chunk ceiling, and above
+        /// all the *rendered-prompt* budget — live in `harness::redact::scan`,
+        /// and the search gate is worth nothing if it does not go through it.
+        ///
+        /// The observable that pins it, on a runtime with no engine, is that a
+        /// scan comes back `Unavailable` with `scanned() == false`: that verdict
+        /// is minted by `harness::redact::scan`'s unresolved-route arm, so a
+        /// gate returning it is a gate that ran that function. A hand-rolled
+        /// scanner with its own caps would have to reproduce the failure mode to
+        /// pass, and if it did it would be the same code.
+        ///
+        /// It pins the practical half of BR-14 too: on a machine with no local
+        /// tier, every search query blocks (LESSON-492), which is why the search
+        /// tier is not offered there at all.
+        #[tokio::test]
+        async fn the_search_gate_is_the_same_scanner_the_provider_gate_uses() {
+            let runtime = runtime_with(WebTier::Search, true);
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let router = router_for(&runtime);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("s");
+
+            let search = runtime
+                .search_redaction_gate(&router, &config, &events, &session)
+                .expect("tier is search");
+            let provider = runtime
+                .redaction_gate(&router, &config, &events, &session)
+                .expect("redact is on");
+
+            let by_search = search.scan("a query").await;
+            let by_provider = provider.scan("a query").await;
+            assert_eq!(by_search.outcome(), by_provider.outcome());
+            assert_eq!(
+                by_search.outcome(),
+                crate::egress::redact::Outcome::Unavailable,
+                "no engine is loaded, so the shared scan fails closed"
+            );
+            assert!(!by_search.scanned());
+        }
+
+        // -- the override (BR-13, AC-12) ------------------------------------
+
+        #[test]
+        fn the_override_lifts_the_restriction_the_lookup_gate_reads() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(16);
+            let session = SessionId::from("sess-1");
+            runtime.session_taint.mark(&session);
+
+            // Non-vacuity: the gate really is restricted before the RPC.
+            let view = runtime.web_taint_view();
+            assert!(view.is_tainted(&session));
+            assert!(!view.is_overridden(&session));
+
+            let result = runtime.web_override(
+                &WebOverrideParams {
+                    session_id: session.clone(),
+                },
+                &events,
+            );
+
+            assert!(result.was_restricted);
+            assert_eq!(
+                result.tiers_restored,
+                vec![
+                    WireWebTier::FetchUserUrl,
+                    WireWebTier::FetchAnyUrl,
+                    WireWebTier::Search
+                ],
+                "ascending, and `off` is never a restored tier"
+            );
+            assert!(
+                runtime.web_taint_view().is_overridden(&session),
+                "the flag the choke point reads is the flag the RPC set"
+            );
+
+            let envelope = sub.try_recv().expect("one web_taint_overridden");
+            assert_eq!(envelope.session_id, Some(session));
+            match envelope.event {
+                Event::WebTaintOverridden(e) => assert_eq!(e.tiers_restored.len(), 3),
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(sub.try_recv().is_none(), "exactly one");
+        }
+
+        /// The ceiling bounds what is restored: an override never grants a tier
+        /// the machine was not configured for (BR-13's "grants no new tiers").
+        #[test]
+        fn the_override_restores_nothing_above_the_configured_ceiling() {
+            let runtime = runtime_with(WebTier::FetchUserUrl, false);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("sess-1");
+            runtime.session_taint.mark(&session);
+
+            let result = runtime.web_override(
+                &WebOverrideParams {
+                    session_id: session,
+                },
+                &events,
+            );
+            assert_eq!(result.tiers_restored, vec![WireWebTier::FetchUserUrl]);
+        }
+
+        /// A session that was never restricted gets an honest "nothing was" —
+        /// not a confirmation of a lift that did not happen.
+        #[test]
+        fn overriding_an_unrestricted_session_confirms_nothing_and_announces_nothing() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(16);
+
+            let result = runtime.web_override(
+                &WebOverrideParams {
+                    session_id: SessionId::from("clean"),
+                },
+                &events,
+            );
+            assert!(!result.was_restricted);
+            assert!(result.tiers_restored.is_empty());
+            assert!(sub.try_recv().is_none());
+        }
+
+        /// **…and it does not pre-arm the override either.**
+        ///
+        /// The lift used to run unconditionally: the client was truthfully told
+        /// "nothing was restricted", the flag was set anyway, and a boundary
+        /// read *later in the same session* then found the restriction already
+        /// lifted — so BR-13 never engaged for a session the user had only ever
+        /// asked a question about. A user-only decision has to be a decision
+        /// about something that exists.
+        #[test]
+        fn overriding_an_unrestricted_session_does_not_prearm_a_later_restriction() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("clean");
+
+            let result = runtime.web_override(
+                &WebOverrideParams {
+                    session_id: session.clone(),
+                },
+                &events,
+            );
+            assert!(!result.was_restricted);
+            assert!(
+                !runtime.web_taint_view().is_overridden(&session),
+                "an override of nothing armed the flag the choke point reads"
+            );
+
+            // The restriction that arrives afterwards must actually restrict.
+            runtime.session_taint.mark(&session);
+            let view = runtime.web_taint_view();
+            assert!(view.is_tainted(&session));
+            assert!(
+                !view.is_overridden(&session),
+                "BR-13 never engaged: the earlier no-op `/web allow` had disarmed it"
+            );
+        }
+
+        /// BR-13's ledger half: a real lift is one append-only `web_overrides`
+        /// row, naming the session and the tiers the user was told about.
+        #[test]
+        fn a_lift_writes_one_web_override_row_and_a_no_op_writes_none() {
+            let runtime = runtime_with(WebTier::FetchAnyUrl, false);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("sess-1");
+
+            // A session that was never restricted lifts nothing and records
+            // nothing — the row is evidence of a change, not of a keystroke.
+            runtime.web_override(
+                &WebOverrideParams {
+                    session_id: SessionId::from("clean"),
+                },
+                &events,
+            );
+            assert!(runtime.ledger.all_web_overrides().expect("read").is_empty());
+
+            runtime.session_taint.mark(&session);
+            runtime.web_override(
+                &WebOverrideParams {
+                    session_id: session.clone(),
+                },
+                &events,
+            );
+            let rows = runtime.ledger.all_web_overrides().expect("read");
+            assert_eq!(rows.len(), 1, "exactly one row per lift");
+            assert_eq!(rows[0].0, session.to_string());
+            assert_eq!(
+                rows[0].1,
+                vec!["fetch_user_url".to_owned(), "fetch_any_url".to_owned()],
+                "the row names the tiers the event named, in the config spelling"
+            );
+
+            // A second override removed nothing, so it records nothing — the
+            // same rule the event follows.
+            runtime.web_override(
+                &WebOverrideParams {
+                    session_id: session,
+                },
+                &events,
+            );
+            assert_eq!(
+                runtime.ledger.all_web_overrides().expect("read").len(),
+                1,
+                "a re-override is not a second lifting"
+            );
+        }
+
+        #[test]
+        fn a_second_override_is_acknowledged_without_announcing_a_second_lifting() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(16);
+            let session = SessionId::from("sess-1");
+            runtime.session_taint.mark(&session);
+            let params = WebOverrideParams {
+                session_id: session,
+            };
+
+            let first = runtime.web_override(&params, &events);
+            let second = runtime.web_override(&params, &events);
+            assert!(first.was_restricted && second.was_restricted);
+            assert!(sub.try_recv().is_some());
+            assert!(
+                sub.try_recv().is_none(),
+                "a re-override is not a second lifting"
+            );
+        }
+
+        /// **The override is unreachable from tool dispatch — by construction.**
+        ///
+        /// `WebTaintOverride::lift` carries no `pub`, so nothing outside
+        /// `runtime.rs` can call it, and this reads the daemon's own source to
+        /// pin the second half: inside `runtime.rs` there is exactly one call
+        /// site, and it is the `web/override` RPC handler. The source scan
+        /// follows [`crate::call_sites`]'s precedent — a marker nobody derives
+        /// is a marker that rots — and it fails in both directions: add a
+        /// second caller and it fires, delete the one there is and it fires
+        /// too.
+        #[test]
+        fn the_taint_override_flag_has_exactly_one_setter_call_site() {
+            // The needle is assembled at run time from fragments, so this
+            // function's own source does not contain the string it searches for
+            // — otherwise the scan finds itself and the test can only ever
+            // measure its own text.
+            let needle = format!("self.web_{}.{}(", "override", "lift");
+            let lines: Vec<&str> = include_str!("runtime.rs").lines().collect();
+            let sites: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.contains(&needle))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                sites.len(),
+                1,
+                "the taint-override setter must have exactly ONE call site. A second \
+                 one is a second channel to a user-only decision (AC-12); zero means \
+                 the RPC handler no longer sets it."
+            );
+
+            // …and that one call site is the client-RPC handler, not some other
+            // function that happens to hold a runtime.
+            let enclosing = lines[..sites[0]]
+                .iter()
+                .rev()
+                .map(|line| line.trim_start())
+                .find(|line| line.starts_with("fn ") || line.starts_with("pub fn "))
+                .expect("the call site is inside some function");
+            assert!(
+                enclosing.starts_with("pub fn web_override("),
+                "the only setter call site must be the `web/override` RPC handler, \
+                 but it is in `{enclosing}`"
+            );
+        }
+
+        // -- the recorder (BR-7, D-7/D-8) -----------------------------------
+
+        #[test]
+        fn one_lookup_writes_one_row_and_publishes_one_event_naming_only_the_host() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(16);
+            let session = SessionId::from("sess-1");
+            let recorder = runtime.lookup_recorder(&events);
+
+            recorder.web_lookup(
+                &session,
+                &LookupRecord {
+                    kind: WebLookupKind::Search,
+                    host: "search.example".to_owned(),
+                    outcome: WebLookupOutcome::Completed,
+                    bytes_in: 4_096,
+                    duration_ms: 12,
+                    cause: None,
+                },
+            );
+
+            let rows = runtime.ledger.all_web_lookups().expect("read the ledger");
+            assert_eq!(rows.len(), 1, "exactly one row");
+            assert_eq!(rows[0].host, "search.example");
+            assert_eq!(rows[0].outcome, WebLookupOutcome::Completed);
+            assert_eq!(rows[0].bytes_in, 4_096);
+            assert_eq!(
+                rows[0].usd_micros,
+                Some(0),
+                "free is a measured zero here, never an unpriced guess"
+            );
+
+            let envelope = sub.try_recv().expect("exactly one web_lookup");
+            assert_eq!(envelope.session_id, Some(session));
+            match envelope.event {
+                Event::WebLookup(lookup) => {
+                    assert_eq!(lookup.host, "search.example");
+                    assert_eq!(lookup.outcome, WebLookupOutcome::Completed);
+                    assert_eq!(lookup.bytes_in, 4_096);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(sub.try_recv().is_none(), "and exactly one event");
+        }
+
+        /// Every refusal is recorded too (BR-7: the free ones as well), and the
+        /// row count is the attempt count.
+        #[test]
+        fn every_outcome_is_recorded_including_the_ones_that_sent_nothing() {
+            let runtime = runtime_with(WebTier::Search, false);
+            let events = Arc::new(EventBus::new());
+            let recorder = runtime.lookup_recorder(&events);
+            let session = SessionId::from("sess-1");
+
+            for outcome in WebLookupOutcome::ALL {
+                recorder.web_lookup(
+                    &session,
+                    &LookupRecord {
+                        kind: WebLookupKind::Fetch,
+                        host: "docs.rs".to_owned(),
+                        outcome,
+                        bytes_in: 0,
+                        duration_ms: 1,
+                        cause: None,
+                    },
+                );
+            }
+
+            let rows = runtime.ledger.all_web_lookups().expect("read the ledger");
+            assert_eq!(rows.len(), WebLookupOutcome::ALL.len());
+            for (row, outcome) in rows.iter().zip(WebLookupOutcome::ALL) {
+                assert_eq!(row.outcome, outcome);
+            }
+        }
+
+        // -- assembly --------------------------------------------------------
+
+        /// The lookup choke point builds, carries a recorder, and carries the
+        /// search gate exactly when the tier says so.
+        #[test]
+        fn the_lookup_choke_point_carries_the_recorder_and_the_tier_s_gate() {
+            for tier in WebTier::ALL {
+                let runtime = runtime_with(tier, false);
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router = router_for(&runtime);
+                let events = Arc::new(EventBus::new());
+                let egress = runtime
+                    .web_lookup_egress(&router, &config, &events, &SessionId::from("s"))
+                    .expect("the lookup choke point must build");
+                let (provider_gate, search_gate, recorder) = egress.installed();
+                assert!(recorder, "every lookup has to be accountable (BR-7)");
+                assert_eq!(search_gate, tier == WebTier::Search);
+                assert!(
+                    !provider_gate,
+                    "the provider gate has no business on the lookup path"
+                );
+            }
+        }
+
+        // -- TASK-077: enable_permanent's write, and web/refresh -------------
+
+        /// A runtime with a real config file and state directory — what the two
+        /// durable web paths need and `minimal()` deliberately has not got.
+        fn runtime_on_disk(tag: &str) -> (DaemonRuntime, PathBuf, PathBuf) {
+            let dir = super::scratch_dir(tag);
+            let config_path = dir.join("config.toml");
+            std::fs::write(&config_path, "").expect("seed an empty config");
+            let mut runtime = DaemonRuntime::minimal();
+            runtime.config_path = Some(config_path.clone());
+            runtime.data_dir = dir.clone();
+            (runtime, config_path, dir)
+        }
+
+        /// AC-2's persistence half, asserted against the **file**: a decision
+        /// that only reached memory would not survive the restart the criterion
+        /// is about, so the check is that a fresh load of the written bytes
+        /// carries the tier.
+        #[test]
+        fn enable_permanent_writes_a_tier_a_restart_reads_back() {
+            for tier in [WebTier::FetchUserUrl, WebTier::FetchAnyUrl] {
+                let (runtime, config_path, _dir) = runtime_on_disk("persist-tier");
+                assert_eq!(
+                    runtime.config.lock().expect("config mutex").web.tier,
+                    WebTier::Off,
+                    "non-vacuity: the ceiling really was off first (BR-1)"
+                );
+
+                runtime.persist_web_tier(tier).expect("the write must land");
+
+                // The restart, simulated by the only thing a restart does with
+                // this file: load it.
+                let reloaded = load_config(Some(&config_path)).expect("the written config loads");
+                assert_eq!(
+                    reloaded.web.tier, tier,
+                    "`[web] tier` did not survive a reload"
+                );
+                // And the live config agrees, so this turn is not running under
+                // a ceiling different from the one on disk.
+                assert_eq!(runtime.config.lock().expect("config mutex").web.tier, tier);
+            }
+        }
+
+        /// A grant never lowers a ceiling. Consenting to fetch a page on a
+        /// machine configured for `search` must leave `search` alone.
+        #[test]
+        fn persisting_a_lower_tier_never_demotes_the_configured_ceiling() {
+            let (runtime, config_path, _dir) = runtime_on_disk("no-demote");
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = WebTier::Search;
+                config.web.search_endpoint = Some("https://search.example/api".to_owned());
+            }
+            runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect("already durable at a higher tier");
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web.tier,
+                WebTier::Search
+            );
+            // The *tier* axis is untouched. The write itself is not a no-op —
+            // the answer's durable form is the consent list, which is the thing
+            // the user was actually promised — but nothing here demotes.
+            let reloaded = load_config(Some(&config_path)).expect("loads");
+            assert_eq!(reloaded.web.tier, WebTier::Search);
+            assert_eq!(
+                reloaded.web.permission_allow,
+                vec![WebTier::FetchUserUrl],
+                "the answer was about `fetch_user_url` and nothing else"
+            );
+        }
+
+        /// **`enable_permanent` writes something a restart can act on.**
+        ///
+        /// The bug this pins: the ceiling is checked *before* any prompt is
+        /// raised, so every lookup that reaches one is already at or below the
+        /// configured tier — which made the raise-only tier write a guaranteed
+        /// no-op, while the decision was still reported as `Persistent` and the
+        /// CLI still said "written to your config". The durable form of the
+        /// answer is `[web] permission_allow`, and a daemon that reloads this
+        /// file must not prompt again *about that tier*.
+        #[test]
+        fn enable_permanent_writes_a_permission_a_restart_reads_back() {
+            let (runtime, config_path, _dir) = runtime_on_disk("persist-permission");
+            {
+                // The realistic shape: the ceiling is already where the lookup
+                // needs it, so the tier raise has nothing to do.
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = WebTier::FetchAnyUrl;
+            }
+            assert!(
+                runtime
+                    .config
+                    .lock()
+                    .expect("config mutex")
+                    .web
+                    .permission_allow
+                    .is_empty(),
+                "non-vacuity: the default really is ask-about-everything (BR-4)"
+            );
+
+            runtime
+                .persist_web_tier(WebTier::FetchAnyUrl)
+                .expect("the write must land");
+
+            let reloaded = load_config(Some(&config_path)).expect("the written config loads");
+            assert_eq!(
+                reloaded.web.permission_allow,
+                vec![WebTier::FetchAnyUrl],
+                "the one thing `enable_permanent` durably changes did not reach the file"
+            );
+
+            // And a gate built from the reloaded config does not ask: this is
+            // the restart, expressed as the thing a restart produces.
+            let mut permissions = PermissionConfig::with_default(PermissionPolicy::Ask);
+            permissions.apply_web_permission(&reloaded.web.permission_allow);
+            assert_eq!(
+                permissions.policy_for(crate::harness::tools::web::PERMISSION_KEY_FETCH_ANY_URL),
+                PermissionPolicy::Allow,
+                "the consented tier would still prompt after the user enabled it permanently"
+            );
+        }
+
+        /// **One answer un-asks one tier, across a restart** (REQ-563 BR-3).
+        ///
+        /// The durable half of BR-3's breadth rule, and the reason the config key
+        /// is a per-tier list rather than a two-valued switch. Answering "enable
+        /// permanently" at a prompt about a URL *the user pasted* used to write
+        /// `permission = "allow"`, which the daemon fanned onto all three consent
+        /// keys — so one answer about the narrowest capability permanently
+        /// stopped the prompts for URLs the **model** composes and for searches
+        /// too, on every future session, from a file the user never re-read.
+        ///
+        /// The restart is simulated by the only thing a restart does with this
+        /// file: load it, and build a gate from what it says.
+        #[test]
+        fn enable_permanent_at_one_tier_leaves_the_other_two_asking_after_a_restart() {
+            let (runtime, config_path, _dir) = runtime_on_disk("per-tier-consent");
+            {
+                // The ceiling is at the top, so nothing here is refused by tier —
+                // whatever is still asked is asked because consent says so.
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = WebTier::Search;
+                config.web.search_endpoint = Some("https://search.example/api".to_owned());
+            }
+
+            // The answer: given at a `fetch_user_url` prompt, about a URL the
+            // user pasted.
+            runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect("the write must land");
+
+            let reloaded = load_config(Some(&config_path)).expect("the written config loads");
+            assert_eq!(reloaded.web.permission_allow, vec![WebTier::FetchUserUrl]);
+
+            let mut permissions = PermissionConfig::with_default(PermissionPolicy::Ask);
+            permissions.apply_web_permission(&reloaded.web.permission_allow);
+            assert_eq!(
+                permissions.policy_for(crate::harness::tools::web::PERMISSION_KEY_FETCH_USER_URL),
+                PermissionPolicy::Allow,
+                "the tier the user actually answered for still prompts"
+            );
+            for unanswered in [
+                crate::harness::tools::web::PERMISSION_KEY_FETCH_ANY_URL,
+                crate::harness::tools::web::PERMISSION_KEY_SEARCH,
+            ] {
+                assert_eq!(
+                    permissions.policy_for(unanswered),
+                    PermissionPolicy::Ask,
+                    "`{unanswered}` was permanently un-asked by an answer about a different \
+                     capability"
+                );
+            }
+
+            // A second answer, at a different tier, *adds* — it does not replace
+            // the first, and it does not fan out either.
+            runtime
+                .persist_web_tier(WebTier::Search)
+                .expect("the second write must land");
+            let after = load_config(Some(&config_path)).expect("loads");
+            assert_eq!(
+                after.web.permission_allow,
+                vec![WebTier::FetchUserUrl, WebTier::Search]
+            );
+
+            // And answering the same tier twice does not grow the list.
+            runtime
+                .persist_web_tier(WebTier::Search)
+                .expect("idempotent");
+            assert_eq!(
+                load_config(Some(&config_path))
+                    .expect("loads")
+                    .web
+                    .permission_allow,
+                vec![WebTier::FetchUserUrl, WebTier::Search]
+            );
+        }
+
+        /// The gate builds from the **live** config, so the mapping above is
+        /// reached on the real path and not only in the test above.
+        #[tokio::test]
+        async fn the_session_gate_reads_the_configured_web_permission() {
+            use crate::harness::tools::web::PERMISSION_KEY_SEARCH;
+
+            // A listed tier: the gate decides with no prompt at all, which is
+            // what the user bought by answering "enable permanently" last
+            // session.
+            let runtime = Arc::new(runtime_with(WebTier::Search, false));
+            runtime
+                .config
+                .lock()
+                .expect("config mutex")
+                .web
+                .permission_allow = vec![WebTier::Search];
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let events = Arc::new(EventBus::new());
+            let gate = runtime.permission_gate_for(&SessionId::from("s"), &events, &config);
+            assert_eq!(
+                gate.authorize_web(PERMISSION_KEY_SEARCH, None, WebTier::Search)
+                    .await,
+                PermissionDecision::Allowed,
+                "`[web] permission_allow = [\"search\"]` did not reach the gate"
+            );
+
+            // Non-vacuity: the default posture prompts instead. Observed as the
+            // prompt appearing in the pending registry rather than by awaiting
+            // the decision, which would never return with nobody to answer.
+            let asking = Arc::new(runtime_with(WebTier::Search, false));
+            let ask_config = asking.config.lock().expect("config mutex").clone();
+            assert!(
+                ask_config.web.permission_allow.is_empty(),
+                "the shipped default asks about every tier (BR-4)"
+            );
+            let ask_events = Arc::new(EventBus::new());
+            let ask_gate =
+                asking.permission_gate_for(&SessionId::from("s"), &ask_events, &ask_config);
+            let mut sub = ask_events.subscribe(4);
+            let decide = ask_gate.authorize_web(PERMISSION_KEY_SEARCH, None, WebTier::Search);
+            let answer = async {
+                let request = loop {
+                    let env = sub.recv().await.expect("`ask` raised no prompt");
+                    if let Event::PermissionRequest(request) = env.event {
+                        break request;
+                    }
+                };
+                asking.pending.resolve(
+                    &request.request_id,
+                    teton_protocol::methods::PermissionOutcome::Cancelled,
+                );
+            };
+            let (denied, ()) = tokio::join!(decide, answer);
+            assert_eq!(denied, PermissionDecision::Denied);
+        }
+
+        /// **One gate per session, not per turn** (REQ-563 verify, M-5).
+        ///
+        /// "Allow for this session" is a promise about the session. A gate
+        /// rebuilt inside `run_prompt_turn` kept it for exactly one turn — and
+        /// the re-prompt was invisible because the CLI answers it from its own
+        /// grant cache, so a second client, or an ACP host, would have seen the
+        /// question again.
+        #[test]
+        fn the_permission_gate_is_the_same_object_across_turns() {
+            let runtime = Arc::new(runtime_with(WebTier::Search, false));
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("sess-1");
+
+            let first = runtime.permission_gate_for(&session, &events, &config);
+            let second = runtime.permission_gate_for(&session, &events, &config);
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "a second turn built a second gate, so every session grant expired \
+                 with the turn that earned it"
+            );
+
+            // …and it really is per session: a different session gets its own.
+            let other = runtime.permission_gate_for(&SessionId::from("sess-2"), &events, &config);
+            assert!(
+                !Arc::ptr_eq(&first, &other),
+                "two sessions shared a grant map"
+            );
+        }
+
+        /// A config the daemon would refuse to start on is refused *before* it is
+        /// written: `[web] tier = "search"` with no endpoint fails to load, so
+        /// persisting it would answer one consent prompt by bricking the next
+        /// start.
+        #[test]
+        fn a_tier_that_would_not_load_is_never_written() {
+            let (runtime, config_path, _dir) = runtime_on_disk("invalid-tier");
+            let err = runtime
+                .persist_web_tier(WebTier::Search)
+                .expect_err("search with no endpoint must be refused");
+            assert!(err.contains("would not load"), "{err}");
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web.tier,
+                WebTier::Off,
+                "a refused write must not have moved the live ceiling either"
+            );
+            assert_eq!(std::fs::read_to_string(&config_path).expect("read"), "");
+        }
+
+        /// With nowhere to write, "permanently" would outlive nothing — so it is
+        /// reported rather than silently applied in memory. The gate turns this
+        /// into a `session`-scoped consent event.
+        #[test]
+        fn a_runtime_with_no_config_file_refuses_to_claim_permanence() {
+            let runtime = DaemonRuntime::minimal();
+            assert!(runtime.config_path.is_none());
+            let err = runtime
+                .persist_web_tier(WebTier::FetchAnyUrl)
+                .expect_err("no file, no permanence");
+            assert!(err.contains("no configuration file"), "{err}");
+        }
+
+        /// The runtime really is the seam the permission gate writes through —
+        /// the trait impl and the inherent method are one behaviour, not two.
+        #[test]
+        fn the_persistence_seam_is_the_runtime_s_own_write() {
+            let (runtime, config_path, _dir) = runtime_on_disk("seam");
+            let sink: &dyn WebTierPersistence = &runtime;
+            sink.persist_web_tier(WebTier::FetchAnyUrl)
+                .expect("the seam writes");
+            assert_eq!(
+                load_config(Some(&config_path)).expect("loads").web.tier,
+                WebTier::FetchAnyUrl
+            );
+        }
+
+        /// AC-10's refresh half: after `web/refresh`, the entry the next lookup
+        /// would have hit is gone, so that lookup re-fetches.
+        #[test]
+        fn web_refresh_evicts_the_entry_the_next_lookup_would_have_hit() {
+            let (runtime, _config_path, dir) = runtime_on_disk("refresh");
+            let url = "https://docs.rs/serde";
+            let cache = WebCache::new(&dir, 900);
+            cache.put(url, "the cached reduction", false).expect("put");
+            assert!(
+                cache.get(url).is_some(),
+                "non-vacuity: there is a hit to evict"
+            );
+
+            let result = runtime
+                .web_refresh(&WebRefreshParams {
+                    url: url.to_owned(),
+                })
+                .expect("refresh");
+            assert_eq!(result.outcome, WebRefreshOutcome::Evicted);
+            assert!(
+                cache.get(url).is_none(),
+                "the next lookup must miss, which is what makes it re-fetch"
+            );
+        }
+
+        /// Nothing cached is `absent`, not `evicted` and not an error: the user
+        /// asked for the document not to be cached, and it is not.
+        #[test]
+        fn web_refresh_reports_an_uncached_url_as_absent() {
+            let (runtime, _config_path, _dir) = runtime_on_disk("refresh-absent");
+            let result = runtime
+                .web_refresh(&WebRefreshParams {
+                    url: "https://docs.rs/never-fetched".to_owned(),
+                })
+                .expect("an uncached url is not a failure");
+            assert_eq!(result.outcome, WebRefreshOutcome::Absent);
+        }
+
+        /// Refresh addresses the same entry the tool's own cache does. Keyed by
+        /// a URL normalization the daemon owns, so a URL that differs only in
+        /// the ways normalization folds still finds the stored copy.
+        #[test]
+        fn web_refresh_addresses_the_same_entry_the_tool_reads() {
+            let (runtime, _config_path, dir) = runtime_on_disk("refresh-keying");
+            let cache = WebCache::from_config(
+                &dir,
+                &runtime.config.lock().expect("config mutex").web.clone(),
+            );
+            cache
+                .put("https://docs.rs/serde", "body", false)
+                .expect("put");
+
+            let result = runtime
+                .web_refresh(&WebRefreshParams {
+                    url: "https://docs.rs/serde".to_owned(),
+                })
+                .expect("refresh");
+            assert_eq!(
+                result.outcome,
+                WebRefreshOutcome::Evicted,
+                "the refresh path and the tool's cache must agree on the key"
+            );
+
+            // …including where the two spellings differ. The tool caches under
+            // the re-serialized URL, so `https://docs.rs` (no path) has to reach
+            // the entry `https://docs.rs/` wrote — otherwise `/web refresh`
+            // silently reports `absent` for a document that is on disk.
+            cache.put("https://docs.rs/", "body", false).expect("put");
+            let bare = runtime
+                .web_refresh(&WebRefreshParams {
+                    url: "https://docs.rs".to_owned(),
+                })
+                .expect("refresh");
+            assert_eq!(
+                bare.outcome,
+                WebRefreshOutcome::Evicted,
+                "a spelling the re-serializer moves must still find its entry"
+            );
+        }
+
+        // -- the search credential's wiring (BR-7, AC-7) --------------------
+
+        /// **The search key rides the search request, to the search endpoint's
+        /// origin, and nowhere else** (REQ-563 BR-7; REQ-544 M-3's guarantee,
+        /// inherited).
+        ///
+        /// Every other test of this seam configures no `search_key_ref`, so the
+        /// whole of [`DaemonRuntime::search_auth`] — the keychain read, the
+        /// bearer header, the endpoint binding — was reachable only through code
+        /// nothing observed: replacing its body with `None` left the suite green.
+        /// This is the observation it was missing, and it is taken **off the
+        /// wire** rather than off a mock, because the object that attaches the
+        /// header is the production [`HttpTransport`] that `web_lookup_egress`
+        /// builds internally.
+        ///
+        /// Four legs, one runtime each where the configuration differs:
+        ///
+        /// 1. a search → `Authorization: Bearer …` on the request to the
+        ///    endpoint;
+        /// 2. a **user-pasted fetch to a different origin** → no credential of
+        ///    any kind, which is the cross-contamination guarantee;
+        /// 3. a user-pasted fetch **at the endpoint's own origin** → refused
+        ///    before the wire (the confused-deputy leg: verify wave 1 made the
+        ///    origin-match case unreachable, so what used to be "the key would
+        ///    ride a fetch" is now "that fetch does not happen");
+        /// 4. the same search with **no `search_key_ref`** → no credential, so
+        ///    leg 1 is reading the configuration and not a header this transport
+        ///    always adds.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_search_key_rides_only_the_search_request_and_only_to_its_endpoint() {
+            let engine = CountingEngine::answering("NONE");
+            let search = CaptureServer::bind().await;
+            let elsewhere = CaptureServer::bind().await;
+            let endpoint = search.url("/api");
+
+            let runtime = searching_runtime(&endpoint, Some("keychain://teton/search"), &engine);
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let router = router_for(&runtime);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("search-auth");
+            let egress = runtime
+                .web_lookup_egress(&router, &config, &events, &session)
+                .expect("the lookup choke point must build");
+            let taint = runtime.web_taint_view();
+            let ctx = LookupContext::new(session.clone(), taint.as_ref(), &allow_any_host)
+                .with_search_endpoint(&endpoint);
+
+            // --- leg 1: the search carries the key ------------------------
+            let searched = egress
+                .lookup(
+                    &LookupRequest::search("tokio task pinning", Authorship::ModelComposed),
+                    &ctx,
+                )
+                .await;
+            assert_eq!(
+                searched.outcome(),
+                WebLookupOutcome::Completed,
+                "the search must actually reach the endpoint, or there is no \
+                 request to read a header off: {:?}",
+                searched.detail()
+            );
+            assert_eq!(search.requests().len(), 1, "exactly one search went out");
+            let head = search.requests()[0].to_ascii_lowercase();
+            assert!(
+                head.contains(&format!("authorization: bearer {SEARCH_SECRET}")),
+                "the resolved search credential did not ride the search request; \
+                 request head:\n{}",
+                search.requests()[0]
+            );
+
+            // --- leg 2: a fetch elsewhere carries nothing -----------------
+            //
+            // User-pasted, because a model-composed loopback URL is refused by
+            // the address-class floor before any header could be attached — and
+            // the question here is about the *header*, not about that gate.
+            let fetched = egress
+                .lookup(
+                    &LookupRequest::fetch(elsewhere.url("/page"), Authorship::UserPasted),
+                    &ctx,
+                )
+                .await;
+            assert_eq!(
+                fetched.outcome(),
+                WebLookupOutcome::Completed,
+                "the fetch must reach the wire, or its missing header proves \
+                 nothing: {:?}",
+                fetched.detail()
+            );
+            assert_eq!(elsewhere.requests().len(), 1);
+            assert!(
+                !elsewhere.carried_auth(0),
+                "the search credential travelled to a host that is not the search \
+                 endpoint; request head:\n{}",
+                elsewhere.requests()[0]
+            );
+            assert_eq!(
+                search.requests().len(),
+                1,
+                "and the endpoint saw nothing new"
+            );
+
+            // --- leg 3: a fetch AT the endpoint's origin is refused --------
+            //
+            // The origin match is the one case where the transport's binding
+            // would have attached the key to a fetch. The seam closes it a layer
+            // earlier, so the guarantee is now a refusal rather than a header
+            // assertion — and the refusal is what is asserted.
+            let deputy = egress
+                .lookup(
+                    &LookupRequest::fetch(search.url("/api"), Authorship::UserPasted),
+                    &ctx,
+                )
+                .await;
+            assert_eq!(deputy.outcome(), WebLookupOutcome::RefusedDomain);
+            assert_eq!(
+                deputy.detail(),
+                &LookupDetail::SearchEndpointFetch,
+                "a fetch aimed at the search origin must be refused as one"
+            );
+            assert_eq!(
+                search.requests().len(),
+                1,
+                "a refusal that reached the endpoint is not a refusal"
+            );
+
+            // --- leg 4: no key reference, no credential -------------------
+            let unauthenticated = CaptureServer::bind().await;
+            let bare_endpoint = unauthenticated.url("/api");
+            let bare = searching_runtime(&bare_endpoint, None, &engine);
+            let bare_config = bare.config.lock().expect("config mutex").clone();
+            let bare_router = router_for(&bare);
+            let bare_egress = bare
+                .web_lookup_egress(&bare_router, &bare_config, &events, &session)
+                .expect("the lookup choke point must build");
+            let bare_taint = bare.web_taint_view();
+            let bare_ctx = LookupContext::new(session, bare_taint.as_ref(), &allow_any_host)
+                .with_search_endpoint(&bare_endpoint);
+            let unauthenticated_search = bare_egress
+                .lookup(
+                    &LookupRequest::search("tokio task pinning", Authorship::ModelComposed),
+                    &bare_ctx,
+                )
+                .await;
+            assert_eq!(
+                unauthenticated_search.outcome(),
+                WebLookupOutcome::Completed
+            );
+            assert_eq!(unauthenticated.requests().len(), 1);
+            assert!(
+                !unauthenticated.carried_auth(0),
+                "an endpoint with no `search_key_ref` must be reached without a \
+                 credential — an unauthenticated backend is a legitimate \
+                 configuration; request head:\n{}",
+                unauthenticated.requests()[0]
+            );
+        }
+    }
+
+    /// REQ-563 TASK-076 — the daemon's half of the harness web tool: whether it
+    /// is registered at all, where in the order, and what feeds its BR-3
+    /// authorship question.
+    ///
+    /// The tool's own gate order is pinned where the tool lives
+    /// (`harness::tools::web`). What can only be pinned *here* is the wiring:
+    /// deleting the `register_web_tool` call, or the URL ingestion beside
+    /// `ctx.push_user`, turns exactly these red and nothing there (LESSON-483 —
+    /// the link that calls the link needs its own mutation).
+    mod web_tool_wiring {
+        use super::*;
+        use crate::harness::tools::WEB_TOOL_NAME;
+        use teton_core::config::WebTier;
+        use teton_core::{ProviderCapabilities, ToolCallTier};
+        use teton_inference::{Completion, Engine, EngineError, GenParams};
+
+        fn runtime_at(tier: WebTier) -> Arc<DaemonRuntime> {
+            let runtime = DaemonRuntime::minimal();
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = tier;
+                config.web.search_endpoint = Some("https://search.example/api".to_owned());
+            }
+            Arc::new(runtime)
+        }
+
+        // -- the whole turn path, twice (REQ-563 verify wave 2 handoffs) ----
+
+        /// The destination the scripted model asks for.
+        ///
+        /// A loopback address, so the lookup is refused by the SSRF floor at the
+        /// seam — *after* consent, which is the gate these tests are about — and
+        /// no socket is opened. `run_prompt_turn` builds the real
+        /// `web_lookup_egress` over the real `HttpTransport`, so "nothing is
+        /// dialled" has to be a property of the destination rather than of a
+        /// substituted transport.
+        const LOOPBACK_URL: &str = "http://127.0.0.1:9/tokio";
+
+        /// An engine that calls `web` once per turn and then finishes.
+        ///
+        /// Keyed on **what is already in the rendered prompt** rather than on a
+        /// call counter: `run_prompt_turn` also spends this engine on the route
+        /// classification and the session title, so a positional script would be
+        /// consumed by duties instead of by the turn. The marker is the untrusted
+        /// envelope the loop folds every `web` result into (an error result
+        /// included), which exists only after the call has happened.
+        struct WebThenDoneEngine;
+
+        impl Engine for WebThenDoneEngine {
+            fn model_id(&self) -> &str {
+                "web-then-done"
+            }
+
+            fn complete(
+                &self,
+                prompt: &str,
+                _params: &GenParams,
+                _on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                let text = if prompt.contains("<tool-result") {
+                    "Done.".to_owned()
+                } else {
+                    format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{LOOPBACK_URL}\"}}}}")
+                };
+                Ok(Completion {
+                    text,
+                    prompt_tokens: 0,
+                    completion_tokens: 1,
+                })
+            }
+        }
+
+        /// Every tier bound to a declared local provider, so the turn is served
+        /// on this machine rather than resolving to a remote endpoint nothing is
+        /// listening on — the binding `pty_e2e.rs`'s web fixture makes, for the
+        /// same reason.
+        ///
+        /// `tool_call_tier` is the axis the capped-profile test flips: the router
+        /// derives the harness profile from it, and `Degraded` is what caps
+        /// `max_tools`.
+        fn local_only_config(tool_call_tier: ToolCallTier) -> Config {
+            Config {
+                providers: vec![ModelProvider {
+                    id: "local".to_owned(),
+                    kind: ProviderKind::Local,
+                    endpoint: None,
+                    model: None,
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities {
+                        tool_call_tier,
+                        ..ProviderCapabilities::default()
+                    },
+                }],
+                tiers: Tier::ALL
+                    .iter()
+                    .map(|tier| TierBinding {
+                        tier: *tier,
+                        provider_id: "local".to_owned(),
+                        fallback_id: None,
+                    })
+                    .collect(),
+                ..Config::default()
+            }
+        }
+
+        /// A daemon serving `config` from `engine`, with `[web] tier` set.
+        fn turn_runtime(
+            mut config: Config,
+            web_tier: WebTier,
+            engine: Arc<Mutex<dyn Engine>>,
+        ) -> Arc<DaemonRuntime> {
+            config.web.tier = web_tier;
+            let runtime = DaemonRuntime::minimal();
+            *runtime.config.lock().expect("config mutex") = config;
+            runtime.engine.install("scripted".to_owned(), engine);
+            runtime.local_available.store(true, Ordering::SeqCst);
+            Arc::new(runtime)
+        }
+
+        /// Answer every `permission_request` with `first`, then with `rest`,
+        /// counting what was asked. A prompt past the end of the script is
+        /// cancelled, which the gate reads as a denial — visible in the count
+        /// either way, which is the point.
+        fn answer_permission_prompts(
+            runtime: &Arc<DaemonRuntime>,
+            events: &Arc<EventBus>,
+            script: Vec<&'static str>,
+        ) -> (Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+            let mut sub = events.subscribe(64);
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&asked);
+            let pending = Arc::clone(&runtime.pending);
+            let handle = tokio::spawn(async move {
+                let mut script = script.into_iter();
+                while let Some(envelope) = sub.recv().await {
+                    let Event::PermissionRequest(request) = envelope.event else {
+                        continue;
+                    };
+                    seen.lock()
+                        .expect("prompt log mutex")
+                        .push(request.tool_name.clone());
+                    let outcome = match script.next() {
+                        Some(option_id) => teton_protocol::methods::PermissionOutcome::Selected {
+                            option_id: option_id.to_owned(),
+                        },
+                        None => teton_protocol::methods::PermissionOutcome::Cancelled,
+                    };
+                    pending.resolve(&request.request_id, outcome);
+                }
+            });
+            (asked, handle)
+        }
+
+        /// **"Allow for this session" is a promise about the session, observed
+        /// across two whole `run_prompt_turn` calls** (REQ-563 BR-3, verify M-5).
+        ///
+        /// The unit half of this — `permission_gate_for` returning the same
+        /// `Arc` twice — is pinned next door. What it cannot see is whether the
+        /// *turn path* uses that gate: a `run_prompt_turn` that built its own
+        /// gate, or rebuilt the tool with a fresh one, would satisfy the pointer
+        /// assertion and still re-ask. So this drives the real entry point twice,
+        /// with a scripted model that calls `web` in both turns, and counts the
+        /// questions on the bus.
+        ///
+        /// The falsification leg is the same pair of turns answered
+        /// `allow_once`, which asks twice — so "exactly one" is a reading of the
+        /// grant's scope and not of a fixture that can only ever prompt once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn one_session_grant_covers_every_later_run_prompt_turn() {
+            for (script, expected, why) in [
+                (
+                    vec!["allow_always"],
+                    1,
+                    "an allow-for-this-session grant must cover the next turn",
+                ),
+                (
+                    vec!["allow_once", "allow_once"],
+                    2,
+                    "allow-once must NOT cover the next turn — otherwise the count \
+                     above measures a fixture that cannot ask twice",
+                ),
+            ] {
+                let runtime = turn_runtime(
+                    local_only_config(ToolCallTier::Native),
+                    WebTier::FetchAnyUrl,
+                    Arc::new(Mutex::new(WebThenDoneEngine)),
+                );
+                let events = Arc::new(EventBus::new());
+                let (asked, answering) = answer_permission_prompts(&runtime, &events, script);
+                let sessions = SessionRegistry::new();
+                let session = sessions
+                    .create(SessionMode::Freeform, None, None)
+                    .expect("a freeform session needs no phase");
+
+                for turn in 0..2 {
+                    runtime
+                        .run_prompt_turn(
+                            &events,
+                            &sessions,
+                            session.session_id.clone(),
+                            session.mode,
+                            None,
+                            None,
+                            "what does the tokio page say about task pinning?".to_owned(),
+                        )
+                        .await
+                        .unwrap_or_else(|e| panic!("turn {turn} failed: {e:?}"));
+                }
+                answering.abort();
+
+                // Non-vacuity: the model really did reach the tool on both turns.
+                // One attempt, one row (BR-7) — so two turns are two rows, and a
+                // turn whose lookup never happened would show up here first.
+                let rows = runtime.ledger.all_web_lookups().expect("read the ledger");
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "the scripted model must have looked something up in BOTH \
+                     turns, or the prompt count below is about one turn: {rows:?}"
+                );
+
+                let asked = asked.lock().expect("prompt log mutex").clone();
+                assert_eq!(asked.len(), expected, "{why}; prompts: {asked:?}");
+                for key in &asked {
+                    assert_eq!(
+                        key,
+                        crate::harness::tools::web::PERMISSION_KEY_FETCH_ANY_URL,
+                        "the question was asked under the wrong grant key"
+                    );
+                }
+            }
+        }
+
+        /// **BR-1 / AC-1's structural half, through the real registry builder.**
+        ///
+        /// `off` is not a tool behind a flag: the registry does not hold one, so
+        /// there is nothing for a later change to accidentally expose.
+        #[tokio::test]
+        async fn the_web_tool_is_registered_exactly_when_the_tier_is_above_off() {
+            for tier in WebTier::ALL {
+                let runtime = runtime_at(tier);
+                let router = {
+                    let config = runtime.config.lock().expect("config mutex").clone();
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+                };
+                let events = Arc::new(EventBus::new());
+                let session = SessionId::from("s");
+                let gate = Arc::new(PermissionGate::new(
+                    session.clone(),
+                    runtime.permission_config.clone(),
+                    Arc::clone(&events),
+                    Arc::clone(&runtime.pending),
+                ));
+
+                let tools = runtime.build_tools(&router, &events, &session, &gate).await;
+
+                assert_eq!(
+                    tools.get(WEB_TOOL_NAME).is_some(),
+                    tier != WebTier::Off,
+                    "tier {tier:?} registered the wrong tool set"
+                );
+                if tier != WebTier::Off {
+                    // Added last, so it reads after the built-ins and MCP in the
+                    // exposed tool docs.
+                    assert_eq!(tools.names().last().copied(), Some(WEB_TOOL_NAME));
+                    // ...but it is cap-exempt (REQ-563 decision 2026-08-09), so
+                    // even the weak-model default cap of 5 — which equals the
+                    // built-in count — still exposes it. An explicitly opted-in
+                    // capability must reach every provider, and the built-ins are
+                    // never displaced to make room.
+                    let exposed = tools.exposed_names(Some(5));
+                    assert!(
+                        exposed.contains(&WEB_TOOL_NAME),
+                        "the opted-in web tool was cut by the degraded-profile cap: {exposed:?}"
+                    );
+                    for builtin in ["read", "edit", "grep", "glob", "shell"] {
+                        assert!(
+                            exposed.contains(&builtin),
+                            "the cap displaced a built-in to fit web: {exposed:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// **BR-3's ingestion.** A message that pastes a URL and asks about it
+        /// in one breath must classify as user-pasted on *that* turn, not the
+        /// next one — otherwise the floor tier grants nothing until the user
+        /// repeats themselves.
+        #[test]
+        fn a_prompt_that_pastes_a_url_records_it_for_the_session_before_the_turn() {
+            let runtime = DaemonRuntime::minimal();
+            let session = SessionId::from("paste");
+            runtime.record_user_prompt_urls(
+                &session,
+                "what does https://docs.rs/tokio/latest say about spawn_blocking?",
+            );
+
+            let urls = runtime.user_urls_for(&session);
+            let urls = urls.lock().expect("user url mutex");
+            assert!(
+                urls.contains("https://docs.rs/tokio/latest"),
+                "the pasted URL is not in the session's set"
+            );
+            // Scheme and host case, and a fragment, do not change the answer —
+            // and nothing the user did not type is in there.
+            assert!(urls.contains("HTTPS://Docs.RS/tokio/latest#top"));
+            assert!(!urls.contains("https://docs.rs/other"));
+        }
+
+        /// The set is per session, so one conversation's paste never authorizes
+        /// another's fetch.
+        #[test]
+        fn user_pasted_urls_do_not_leak_between_sessions() {
+            let runtime = DaemonRuntime::minimal();
+            runtime.record_user_prompt_urls(&SessionId::from("a"), "see https://docs.rs/tokio");
+            let other = runtime.user_urls_for(&SessionId::from("b"));
+            assert!(other.lock().expect("user url mutex").is_empty());
         }
     }
 }
