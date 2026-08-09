@@ -434,7 +434,10 @@ mod tests {
             let out = rendered(true, kind, "ridge");
             assert!(out.starts_with(sgr), "not opened with {sgr:?}: {out:?}");
             assert!(out.contains("ridge"), "text lost: {out:?}");
-            assert_eq!(out.trim_end_matches('\n').rfind("\x1b["), out.rfind("\x1b[0m"));
+            assert_eq!(
+                out.trim_end_matches('\n').rfind("\x1b["),
+                out.rfind("\x1b[0m")
+            );
         }
     }
 
@@ -494,8 +497,15 @@ mod tests {
     /// neutralized and rendered, never panicked on.
     #[test]
     fn an_unstyled_class_may_carry_escapes_and_is_merely_defused() {
-        let out = rendered(true, LineKind::Prompt, "fetch https://good\x1b[2K\x1b[1Aevil");
-        assert!(!out.contains('\x1b'), "escape reached the terminal: {out:?}");
+        let out = rendered(
+            true,
+            LineKind::Prompt,
+            "fetch https://good\x1b[2K\x1b[1Aevil",
+        );
+        assert!(
+            !out.contains('\x1b'),
+            "escape reached the terminal: {out:?}"
+        );
     }
 
     /// REQ-556 ADR-556-4 / AC-5. The animation must repaint its row **in
