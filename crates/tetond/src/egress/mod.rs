@@ -857,7 +857,7 @@ impl HttpTransport {
     /// Build a transport with a fresh HTTP client and no injected credential.
     /// This is the MCP egress path's transport — it never carries provider auth.
     pub fn new() -> Result<Self, EgressError> {
-        Self::build(None, None)
+        Self::build(None, None, false)
     }
 
     /// Build a transport that injects `headers` (a resolved provider credential,
@@ -868,7 +868,7 @@ impl HttpTransport {
         endpoint: &str,
         headers: Vec<(String, String)>,
     ) -> Result<Self, EgressError> {
-        Self::build(Some(EndpointAuth::new(endpoint, headers)), None)
+        Self::build(Some(EndpointAuth::new(endpoint, headers)), None, false)
     }
 
     /// Build the **web-lookup** transport: no credential, and a connect timeout
@@ -899,7 +899,7 @@ impl HttpTransport {
     /// # Errors
     /// [`EgressError::ClientInit`] if the HTTP client cannot be constructed.
     pub fn for_lookup() -> Result<Self, EgressError> {
-        Self::build(None, Some(lookup::LOOKUP_CONNECT_TIMEOUT))
+        Self::build(None, Some(lookup::LOOKUP_CONNECT_TIMEOUT), true)
     }
 
     /// The lookup transport with a search credential bound to `endpoint`'s
@@ -921,12 +921,14 @@ impl HttpTransport {
         Self::build(
             Some(EndpointAuth::new(endpoint, headers)),
             Some(lookup::LOOKUP_CONNECT_TIMEOUT),
+            true,
         )
     }
 
     fn build(
         injected: Option<EndpointAuth>,
         connect_timeout: Option<Duration>,
+        screen_dns: bool,
     ) -> Result<Self, EgressError> {
         // REQ-544 security (Low): do NOT auto-follow redirects. The daemon POSTs to
         // a single known provider/MCP endpoint and needs no redirect handling.
@@ -941,6 +943,17 @@ impl HttpTransport {
         // fetch would cut one off (REQ-563 review).
         if let Some(connect_timeout) = connect_timeout {
             builder = builder.connect_timeout(connect_timeout);
+        }
+        // REQ-563 SSRF closure: the lookup path resolves an arbitrary name a
+        // model or a user supplied once, so it screens every resolved address
+        // against the address-class policy and refuses a non-global answer at
+        // connect time ([`lookup::GlobalOnlyResolver`]) — the closure the
+        // `address_class_of_host` residual comment records as owed. The provider
+        // `send()` path keeps the default resolver: its destination is one
+        // endpoint the operator configured, and a screen there would second-guess
+        // a host they chose (and is out of this closure's scope).
+        if screen_dns {
+            builder = builder.dns_resolver(Arc::new(lookup::GlobalOnlyResolver::system()));
         }
         let client = builder.build().map_err(|_| EgressError::ClientInit)?;
         Ok(Self { client, injected })
@@ -1905,6 +1918,19 @@ mod tests {
         assert_eq!(
             out, protocol,
             "no credential-free transport may inject headers"
+        );
+    }
+
+    #[test]
+    fn the_lookup_transports_build_with_the_screening_resolver_installed() {
+        // The lookup constructors install `lookup::GlobalOnlyResolver` on the
+        // client (REQ-563 SSRF closure). This guards that wiring the resolver in
+        // does not fail `build` — the screening *behavior* is covered by the
+        // resolver's own tests in `egress::lookup`, which drive it with a fake
+        // DNS map rather than the network.
+        assert!(HttpTransport::for_lookup().is_ok());
+        assert!(
+            HttpTransport::for_lookup_with_endpoint_auth("https://search.example", vec![]).is_ok()
         );
     }
 

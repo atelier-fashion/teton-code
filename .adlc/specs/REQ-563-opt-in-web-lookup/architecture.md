@@ -184,23 +184,29 @@ cannot finish is a guard that did not run (LESSON-492), and calling a stalled
 local scanner "the destination could not be reached" is BUG-152's mislabel
 pointing the other way. Neither is ever a turn error.
 
-**Residual: name-based non-global destinations.** The floor above reads a *host
+**Closed: name-based non-global destinations.** The floor above reads a *host
 string*; the transport does the DNS, and no API on it exposes the resolved
 addresses. So `127.0.0.1.nip.io`, or any attacker-controlled name with an `A`
-record inside a refused range, passes the literal check and is dialled — as does
+record inside a refused range, passed the literal check and was dialled — as did
 the rebinding variant, where the record is global when this seam looks and
-loopback when the socket connects. `localhost` and the `.localhost` TLD are
-special-cased only because RFC 6761 makes them loopback *by definition* rather
-than by resolution; that is not a general answer. **The closure is a resolving
-transport that refuses non-global answers at connect time** — a `reqwest` custom
-resolver, or a pre-resolve-then-connect-to-IP pass — which belongs in the
-transport, not at this seam, because only the thing that opens the socket knows
-the address it opened to. Recorded here as a known gap rather than an assumed
-absence; the cross-reference lives on `address_class_of_host` in
-`egress/lookup.rs`, where anyone tightening the floor would be reading. **A
-follow-up is filed to close it with a resolving transport** (product decision
-2026-08-09, SSRF posture confirmed): the DNS-name/rebind residual is an accepted,
-tracked gap for this requirement, not a silent one.
+loopback when the socket connects. That residual is now **closed** by
+`GlobalOnlyResolver` (`egress/lookup.rs`), the lookup transport's own
+`reqwest::dns::Resolve`: installed on the `for_lookup*` clients (never the
+provider `send()` path), it resolves the name and refuses the resolution when any
+answer is non-global — **at connect time**, where the addresses it returns are
+the addresses `reqwest` dials and a rebind has no second resolution to hide
+behind. A refusal folds to a connect-class error, so the seam reports it as the
+same `offline` ending a black-holed host produces; the transport speaks
+`TransportError`, which carries no SSRF variant, so nothing finer crosses that
+boundary. Two scoping choices are deliberate, both recorded in Deviations below:
+the resolver **defers** to `address_class_of_host` for the RFC-6761 `localhost`
+family (the only non-literal the string floor classifies, and the one the seam
+lets a user paste on purpose), so `http://localhost:3000` still resolves; and the
+configured **search endpoint** rides the same client, so a search endpoint set to
+a non-`localhost` *name* that resolves into a refused range is now screened like
+any other destination (`localhost` and IP-literal endpoints are unaffected). The
+cross-reference lives on `address_class_of_host` in `egress/lookup.rs`, where
+anyone tightening the floor would be reading.
 
 ## AC → Decision Map
 
@@ -366,6 +372,33 @@ wording actually resolves to.
     re-consents. A per-session cache would defeat the point of the cache (the same
     page re-fetched every session) for a probe that reveals only local,
     already-consented history.
+12. **The name-based SSRF residual's closure is authorship-aware by deferral,
+    and narrows the search-endpoint exemption.** `GlobalOnlyResolver` (the
+    resolving transport that closes the residual recorded under egress-behaviour)
+    screens a resolved address only when `address_class_of_host` returns `None`
+    for the name — the residual case, a global-looking name. For the one
+    non-literal the string floor *does* classify (the RFC-6761 `localhost`
+    family) it **defers**, because such a name reaches the resolver only past a
+    seam that has already made the authorship call: a model-composed `localhost`
+    and a redirect to one are refused there, and a *user-pasted* one is allowed on
+    purpose (BR-11). Screening it in the transport — which cannot see authorship,
+    since `Transport` carries none — would refuse exactly the pasted
+    `http://localhost:3000` the exemption exists to allow. The deferral is how the
+    connect-time screen stays consistent with the seam's authorship-aware policy
+    without threading authorship through the transport. **Consequence, recorded:**
+    a *user-pasted* arbitrary **name** that resolves into a refused range (e.g.
+    `my-nas.local` → `192.168.x`) is now refused, where the same box reached by
+    IP **literal** is still allowed (a literal bypasses the resolver, and the seam
+    exempts a pasted literal); a name can rebind or point anywhere, a literal
+    cannot, so the two are not the same claim. **And the search endpoint:** it
+    rides the same `for_lookup*` client, so an endpoint configured as a
+    non-`localhost` name resolving into a refused range is screened like any
+    destination — the config exemption (egress-behaviour) still holds at the
+    string floor and for `localhost`/IP-literal endpoints, but no longer covers a
+    private-resolving *name*. Fully exempting the configured endpoint would mean
+    plumbing its host to the resolver through the unauthenticated-endpoint path
+    too (a `runtime.rs` change); left out because `localhost` and a literal IP
+    both work today and are the documented shapes.
 
 ## Risks / Notes for Implementation
 
