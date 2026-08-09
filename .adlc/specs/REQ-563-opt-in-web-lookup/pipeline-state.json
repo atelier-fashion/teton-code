@@ -2,8 +2,8 @@
   "req": "REQ-563",
   "branch": "feat/REQ-563-opt-in-web-lookup",
   "startedAt": "2026-08-08T22:15:00Z",
-  "completed": false,
-  "currentPhase": 7,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,9 @@
     3,
     4,
     5,
-    6
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -56,6 +58,18 @@
       "name": "Create Pull Request",
       "completedAt": "2026-08-09T07:00:00Z",
       "note": "PR #74 flipped draft->ready with full body (footprint block preserved); branch history rewritten to purge a Stripe-shaped test fixture that tripped push protection \u2014 fixture now a house-convention sentinel"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-09T12:40:00Z",
+      "note": "6/6 checks green; diff swept for debug/TODO/credential shapes (3 hits, all AWS doc-example or sentinel names); trial merge clean"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-09T13:00:00Z",
+      "note": "PR #74 squash-merged; LESSON-494..497 + ASSUME-004 captured; 3 patterns promoted to context/architecture.md; no deploy (library/daemon change, no release tag)"
     }
   ],
   "repos": {
@@ -67,7 +81,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/74",
       "prNumber": 74,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null,
       "prCreatedAt": "2026-08-08T22:20:33Z"
