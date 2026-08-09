@@ -1,7 +1,7 @@
 ---
 id: REQ-563
 title: "Opt-in web lookup through the egress choke point"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-08
 updated: 2026-08-08
