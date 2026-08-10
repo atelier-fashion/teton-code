@@ -32,7 +32,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
-use teton_inference::{ChatFormat, Engine, EngineError};
+use teton_inference::{ChatFormat, Completion, Engine, EngineError, MissReason};
+use teton_protocol::events::{PrefixCache, PrefixCacheMiss, PrefixCacheOutcome};
 use teton_protocol::{Category, Phase, ProviderId, SessionId};
 use teton_providers::{
     Message, Provider, Role, TokenUsage, ToolSpec, Transport, TurnEvent, TurnRequest,
@@ -92,6 +93,13 @@ pub struct SourceTurn {
     /// model knows the rest did not run (BUG-147 — silently dropping them is
     /// what caused the re-emit loop).
     pub dropped_calls: u32,
+    /// This turn's prefix-cache event payload (REQ-564), or `None` for a source
+    /// that has no prefix cache — every remote turn.
+    ///
+    /// Carried on the turn rather than published by the source because the
+    /// source has no event bus: the turn loop owns session-scoped emission, so
+    /// it emits this, exactly once, from the async side.
+    pub cache: Option<PrefixCache>,
 }
 
 /// A source of model turns for the turn loop: local engine or remote provider.
@@ -155,6 +163,15 @@ pub struct LocalEngineSource {
     /// property of the committed engine, resolved at load time from its GGUF
     /// template, and a committed engine is never re-templated.
     format: ChatFormat,
+    /// The session this source's turns belong to — the prefix cache's key
+    /// (REQ-564 BR-3).
+    ///
+    /// A **parameter for the same reason `format` is one**: reading it off the
+    /// engine would need the mutex, and that mutex is held for the whole of any
+    /// in-flight completion (LESSON-448). Only agent turns carry a key; duties
+    /// go through [`Engine::complete`], which has no way to name a session, so
+    /// a duty cannot evict this session's prefix (BR-5).
+    session_id: SessionId,
 }
 
 impl LocalEngineSource {
@@ -170,8 +187,38 @@ impl LocalEngineSource {
     /// cannot disagree with the engine: the slot replaces handle and format
     /// together, and a committed engine is never re-templated (ADR-2).
     #[must_use]
-    pub fn new(engine: Arc<Mutex<dyn Engine>>, format: ChatFormat) -> Self {
-        Self { engine, format }
+    pub fn new(engine: Arc<Mutex<dyn Engine>>, format: ChatFormat, session_id: SessionId) -> Self {
+        Self {
+            engine,
+            format,
+            session_id,
+        }
+    }
+
+    /// This turn's prefix-cache outcome, in wire form.
+    ///
+    /// Derived from the completion the engine returned, so the event and the
+    /// ledger row can never disagree about what happened — both read this one
+    /// projection rather than each recomputing it.
+    ///
+    /// An engine **error** never reaches here: it is an `Err` from `complete_*`
+    /// and never becomes a miss (BR-8).
+    fn cache_outcome(completion: &Completion) -> PrefixCacheOutcome {
+        match completion.cache_miss {
+            None => PrefixCacheOutcome::Hit {
+                cached_tokens: u64::from(completion.cached_tokens),
+                new_tokens: u64::from(completion.processed_tokens()),
+            },
+            Some(reason) => PrefixCacheOutcome::Miss {
+                reason: match reason {
+                    MissReason::Cold => PrefixCacheMiss::Cold,
+                    MissReason::SessionSwitch => PrefixCacheMiss::SessionSwitch,
+                    MissReason::Divergent => PrefixCacheMiss::Divergent,
+                    MissReason::Evicted => PrefixCacheMiss::Evicted,
+                },
+                processed_tokens: u64::from(completion.processed_tokens()),
+            },
+        }
     }
 }
 
@@ -207,6 +254,7 @@ impl CompletionSource for LocalEngineSource {
         let rendered = render::render_prompt(self.format, prompt);
         let format = self.format;
         let params = config.gen_params;
+        let session = self.session_id.0.clone();
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let task = tokio::task::spawn_blocking(move || {
             // BUG-147: the scanner ends the turn at the first complete tool
@@ -216,13 +264,23 @@ impl CompletionSource for LocalEngineSource {
             // rendering (BR-4): the frames the model can fabricate are the ones
             // it was just shown.
             let mut scanner = ReplyScanner::for_format(format);
-            let guard = engine.lock().expect("engine mutex poisoned");
-            guard.complete(&rendered, &params, &mut |token| {
+            let mut guard = engine.lock().expect("engine mutex poisoned");
+            // Read from the guard already held here, inside the blocking task:
+            // taking a second lock on the async path to ask the engine its model
+            // id would park a tokio worker behind whatever completion currently
+            // owns the mutex (LESSON-448) — the same reason `duty.rs` reads
+            // `chat_format` here rather than outside.
+            let model = guard.model_id().to_owned();
+            // REQ-564: the agent turn — and only the agent turn — asks for
+            // prefix reuse. `complete_cached` defaults to a cold `complete`, so
+            // an engine with no cache behaves exactly as it did before.
+            let completion = guard.complete_cached(&session, &rendered, &params, &mut |token| {
                 // A closed receiver means the caller went away; keep completing
                 // (spawn_blocking is not cancellable) and drop the token.
                 let _ = token_tx.send(token.to_owned());
                 scanner.push(token)
-            })
+            });
+            completion.map(|completion| (model, completion))
         });
         while let Some(token) = token_rx.recv().await {
             on_token(&token);
@@ -230,9 +288,15 @@ impl CompletionSource for LocalEngineSource {
         // The sender is dropped when the closure returns, ending the loop above,
         // so this join is immediate. A panicked/aborted task is a backend
         // failure, not a daemon crash.
-        let completion = task.await.map_err(|_| {
+        let (model, completion) = task.await.map_err(|_| {
             EngineError::Backend("the local inference task did not complete".to_owned())
         })??;
+        // Projected before `completion.text` is moved out, so the event
+        // describes the completion the engine actually returned.
+        let cache = PrefixCache {
+            model,
+            outcome: Self::cache_outcome(&completion),
+        };
         // Cut the reply at the turn boundary (re-scanned over the final text —
         // deterministic, and independent of how the stream was chunked), then
         // parse the *clean* reply. Everything past the first tool call — the
@@ -254,6 +318,7 @@ impl CompletionSource for LocalEngineSource {
                 output_tokens: u64::from(completion.completion_tokens),
             },
             dropped_calls: parsed.dropped_calls,
+            cache: Some(cache),
         })
     }
 }
@@ -421,6 +486,10 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             decision,
             usage,
             dropped_calls,
+            // A remote provider has no local KV to reuse; `None` says "this
+            // source has no prefix cache", which is a different fact from a
+            // miss and must not be reported as one.
+            cache: None,
         })
     }
 }
@@ -739,7 +808,8 @@ mod tests {
             "mock",
             r#"{"tool":"read","arguments":{"path":"a.rs"}}"#,
         )));
-        let mut source = LocalEngineSource::new(engine, ChatFormat::Flat);
+        let mut source =
+            LocalEngineSource::new(engine, ChatFormat::Flat, SessionId::from("test-session"));
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let mut streamed = String::new();
@@ -768,7 +838,8 @@ mod tests {
             "mock",
             "All done, nothing more to do.",
         )));
-        let mut source = LocalEngineSource::new(engine, ChatFormat::Flat);
+        let mut source =
+            LocalEngineSource::new(engine, ChatFormat::Flat, SessionId::from("test-session"));
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let prompt = flat_prompt("prompt");
@@ -800,7 +871,8 @@ mod tests {
             ChatFormat::ChatMl,
             r#"{"tool":"read","arguments":{"path":"a.rs"}}"#,
         );
-        let mut source = LocalEngineSource::new(engine, ChatFormat::ChatMl);
+        let mut source =
+            LocalEngineSource::new(engine, ChatFormat::ChatMl, SessionId::from("test-session"));
         assert_eq!(
             source.chat_format(),
             ChatFormat::ChatMl,
@@ -855,7 +927,8 @@ mod tests {
         // string `prepare()` already produced, which is what keeps every
         // scripted fixture and the flat `{{LAST_TOOL_RESULT}}` parsing valid.
         let (engine, seen) = capturing_engine(ChatFormat::Flat, "All done.");
-        let mut source = LocalEngineSource::new(engine, ChatFormat::Flat);
+        let mut source =
+            LocalEngineSource::new(engine, ChatFormat::Flat, SessionId::from("test-session"));
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let prompt = tool_using_prompt();
@@ -877,7 +950,8 @@ mod tests {
         // it takes this same path with no edit of its own.
         let mock: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::new("mock")));
         assert_eq!(
-            LocalEngineSource::new(mock, ChatFormat::Flat).chat_format(),
+            LocalEngineSource::new(mock, ChatFormat::Flat, SessionId::from("test-session"))
+                .chat_format(),
             ChatFormat::Flat
         );
     }
@@ -939,7 +1013,8 @@ mod tests {
             window_bytes,
             format: ChatFormat::ChatMl,
         }));
-        let mut source = LocalEngineSource::new(chatml, ChatFormat::ChatMl);
+        let mut source =
+            LocalEngineSource::new(chatml, ChatFormat::ChatMl, SessionId::from("test-session"));
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let err = source
@@ -964,7 +1039,8 @@ mod tests {
             window_bytes,
             format: ChatFormat::Flat,
         }));
-        let mut source = LocalEngineSource::new(flat, ChatFormat::Flat);
+        let mut source =
+            LocalEngineSource::new(flat, ChatFormat::Flat, SessionId::from("test-session"));
         source
             .produce_turn(
                 &prompt,

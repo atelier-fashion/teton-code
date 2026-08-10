@@ -2629,7 +2629,8 @@ impl DaemonRuntime {
                 // engine failure (BUG-146); the caller classifies from state.
                 return Err(HarnessError::NoTierAvailable);
             };
-            let mut source = LocalEngineSource::new(Arc::clone(engine), *format);
+            let mut source =
+                LocalEngineSource::new(Arc::clone(engine), *format, session_id.clone());
             return run_session_turn_with_source(
                 &mut source,
                 tools,
