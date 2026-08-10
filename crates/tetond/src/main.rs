@@ -16,12 +16,12 @@ use std::sync::Arc;
 
 use teton_protocol::socket_path;
 use tetond::broadcast::EventBus;
-use tetond::lifetime::{self, LifetimeSupervisor};
+use tetond::lifetime::{self, LifetimeSupervisor, LifetimeWorkClaim};
 use tetond::runtime::DaemonRuntime;
 use tetond::single_instance::{SingleInstance, DEFAULT_ACQUIRE_WINDOW};
 use tetond::{server, Daemon};
 
-use teton_core::lifetime::{BlockingActivity, ExitReason};
+use teton_core::lifetime::ExitReason;
 use teton_protocol::events::{DaemonLifetime, DaemonLifetimeStage, Event};
 
 /// Returns `true` when the process was asked to print its version.
@@ -117,6 +117,13 @@ fn main() -> anyhow::Result<ExitCode> {
         let (policy, source) =
             lifetime::resolve_policy(policy_flags, policy_env, daemon_runtime.lifetime_config());
         let supervisor = Arc::new(LifetimeSupervisor::new(policy, source, Arc::clone(&events)));
+        // REQ-565 BR-2: an install (download → verify → load) now defers the
+        // daemon's exit. Wired here rather than at construction because the
+        // policy above is read from the config the runtime loads, so the runtime
+        // — and its consent gate — necessarily exists first.
+        daemon_runtime
+            .consent()
+            .set_work_claim(Arc::new(LifetimeWorkClaim::new(Arc::clone(&supervisor))));
         eprintln!(
             "teton-code: shutdown policy {} (from {})",
             lifetime::policy_label(policy),
@@ -137,16 +144,16 @@ fn main() -> anyhow::Result<ExitCode> {
         // the daemon must keep serving sessions remote-only — so it is spawned
         // beside `serve`, never awaited before it.
         //
-        // REQ-565 BR-2: it holds a `ModelLoad` claim for its whole duration —
-        // the flow spans the deep verify, the load, and the benchmark, and
-        // ADR-006 already treats those as one in-flight claim. A client that
-        // disconnects mid-verify must not take a multi-gigabyte read down with
-        // it.
+        // REQ-565 BR-2: the flow is deliberately NOT wrapped in a lifetime claim
+        // here. That indefinite await is a wait for a *human*, not in-flight
+        // work, and a claim spanning it would mean a proposal nobody answers
+        // pins the daemon forever — the standing-resident-daemon harm this REQ
+        // removes, reintroduced by its own deferral rule. The claim lives one
+        // level down instead, on the install itself, where bytes are actually
+        // being written (`ModelConsentGate::with_work_claim`).
         if daemon_runtime.first_run_consent_applies() {
             let consent_runtime = Arc::clone(&daemon_runtime);
-            let consent_guard = supervisor.activity(BlockingActivity::ModelLoad);
             tokio::spawn(async move {
-                let _consent_guard = consent_guard;
                 consent_runtime.run_model_consent().await;
             });
         }

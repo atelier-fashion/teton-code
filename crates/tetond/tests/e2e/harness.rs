@@ -459,16 +459,53 @@ impl Drop for Workspace {
 }
 
 /// Options for spawning the daemon.
-#[derive(Default)]
 pub struct DaemonOptions {
     pub local_script: Option<PathBuf>,
     pub mcp_config: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    /// Extra command-line arguments (REQ-565: `--shutdown-policy`, which is a
+    /// flag rather than an env var precisely so it survives a release build and
+    /// is visible in a launchd plist — so the suite has to be able to pass one).
+    pub args: Vec<String>,
+    /// Whether to pin the daemon with `--shutdown-policy never`.
+    ///
+    /// Defaults to **true**, because every suite except the lifetime one uses
+    /// this daemon as a fixture whose lifetime the test owns: it is spawned
+    /// here, driven by several clients, and killed on drop. Under the shipped
+    /// default it would exit the moment the first client disconnected, and the
+    /// rest of that test would be talking to nothing.
+    ///
+    /// `daemon_lifetime.rs` sets this false — it is testing the real default.
+    pub pin_lifetime: bool,
+}
+
+impl Default for DaemonOptions {
+    fn default() -> Self {
+        Self {
+            local_script: None,
+            mcp_config: None,
+            env: Vec::new(),
+            args: Vec::new(),
+            pin_lifetime: true,
+        }
+    }
 }
 
 impl DaemonOptions {
     pub fn env(mut self, key: &str, value: impl Into<String>) -> Self {
         self.env.push((key.to_owned(), value.into()));
+        self
+    }
+
+    /// Append a command-line argument.
+    pub fn arg(mut self, value: impl Into<String>) -> Self {
+        self.args.push(value.into());
+        self
+    }
+
+    /// Let the daemon use its real shipped lifetime instead of being pinned.
+    pub fn real_lifetime(mut self) -> Self {
+        self.pin_lifetime = false;
         self
     }
 
@@ -520,6 +557,12 @@ impl Daemon {
         for (k, v) in &options.env {
             cmd.env(k, v);
         }
+        // REQ-565: pin first, so an explicit `--shutdown-policy` in `args` wins
+        // (the parser takes the last occurrence of a flag).
+        if options.pin_lifetime {
+            cmd.args(["--shutdown-policy", "never"]);
+        }
+        cmd.args(&options.args);
 
         let child = cmd.spawn().expect("spawn teton-code");
         let mut daemon = Self {

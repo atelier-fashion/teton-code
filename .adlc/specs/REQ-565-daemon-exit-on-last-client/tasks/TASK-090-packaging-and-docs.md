@@ -1,7 +1,7 @@
 ---
 id: TASK-090
 title: "Packaging: drop keep_alive, hard-wire never, caveats + docs for the migration"
-status: pending
+status: complete
 parent: REQ-565
 repo: teton-code
 created: 2026-08-10

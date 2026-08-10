@@ -318,6 +318,40 @@ async fn a_guard_dropped_by_a_panicking_task_still_releases() {
 // The accept loop stops on commit
 // ---------------------------------------------------------------------------
 
+/// Regression guard for a bug this REQ introduced and then removed.
+///
+/// The first cut wrapped the *whole* first-run consent flow in a `ModelLoad`
+/// claim. That flow parks indefinitely awaiting a client's `model/confirm`, so
+/// a proposal nobody answered pinned the daemon forever — the standing-resident
+/// daemon REQ-565 exists to abolish, reintroduced by its own deferral rule, and
+/// it would have hung the AC-5 release smoke on every fresh install.
+///
+/// The claim now lives on the install (`ModelConsentGate::set_work_claim`),
+/// where bytes are actually being written. Waiting for a human claims nothing.
+#[tokio::test]
+async fn waiting_for_a_human_does_not_pin_the_daemon() {
+    let (socket, lifetime) = spawn_daemon("consent-wait", ShutdownPolicy::OnLastDisconnect);
+
+    // Stand in for the parked consent flow: a task that awaits forever and
+    // takes no claim, exactly as `run_model_consent` is now spawned.
+    let parked = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+
+    let mut client = TestClient::connect(&socket).await;
+    client.handshake(1).await;
+    until("counted", || lifetime.client_count() == 1).await;
+    drop(client);
+
+    until("committed despite the parked flow", || {
+        lifetime.is_committed()
+    })
+    .await;
+
+    parked.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
 #[tokio::test]
 async fn a_never_policy_daemon_outlives_its_last_client() {
     let (socket, lifetime) = spawn_daemon("never", ShutdownPolicy::Never);

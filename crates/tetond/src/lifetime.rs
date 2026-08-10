@@ -476,6 +476,40 @@ impl LifetimeSupervisor {
     }
 }
 
+/// The consent gate's view of the supervisor: "an install is writing bytes".
+///
+/// Claimed as [`BlockingActivity::ModelDownload`] because that is what the
+/// claim protects — the download/verify/load span ADR-006 treats as one unit of
+/// work. It deliberately does *not* cover the consent flow's wait for a user
+/// decision: waiting for a human is not in-flight work, and a claim held across
+/// it would mean an unanswered proposal pins the daemon forever, which is the
+/// standing-resident-daemon harm REQ-565 exists to remove.
+/// Adapts the supervisor to the consent gate's [`WorkClaim`] seam (REQ-565).
+///
+/// A newtype rather than an `impl` on the supervisor itself, because an
+/// [`ActivityGuard`] must own an `Arc<LifetimeSupervisor>` for its `Drop` to
+/// reach back, and the trait method only gets `&self`. Holding the handle here
+/// makes that requirement explicit instead of hiding it behind a double `Arc`.
+pub struct LifetimeWorkClaim(Arc<LifetimeSupervisor>);
+
+impl LifetimeWorkClaim {
+    /// Wrap a supervisor so the consent gate can claim against it.
+    #[must_use]
+    pub fn new(supervisor: Arc<LifetimeSupervisor>) -> Self {
+        Self(supervisor)
+    }
+}
+
+impl crate::model_consent::WorkClaim for LifetimeWorkClaim {
+    /// Claimed as [`BlockingActivity::ModelDownload`] — the download → verify →
+    /// load span ADR-006 already treats as one unit of work. It covers the
+    /// bytes being written, never the consent flow's wait for a human: a claim
+    /// held across an unanswered proposal would pin the daemon forever.
+    fn claim(&self) -> Box<dyn Send> {
+        Box::new(self.0.activity(BlockingActivity::ModelDownload))
+    }
+}
+
 /// A client's claim on the daemon's life. Dropping it is the disconnect.
 pub struct ClientGuard {
     supervisor: Arc<LifetimeSupervisor>,
