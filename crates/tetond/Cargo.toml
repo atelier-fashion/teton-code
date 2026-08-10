@@ -47,6 +47,10 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "process",
+    # REQ-565 BR-8: SIGTERM/SIGINT run the same ordered teardown as a last-client
+    # exit, so `brew services stop` under the `never` policy unlinks the socket
+    # instead of dying where it stands and leaving a stale one behind.
+    "signal",
 ] }
 # JSON-RPC framing codec plus the cost module's own serde-derived report/price
 # types (TASK-008): `derive` covers both the shared wire types and the local

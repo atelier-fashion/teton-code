@@ -42,7 +42,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::oneshot;
 
@@ -817,6 +817,23 @@ impl ConsentOutcome {
 /// inputs, the decision store, the pending-answer registry, and the installer —
 /// so the flow is one `await` a test can drive with `tokio::join!` exactly like
 /// the permission gate.
+/// How the consent gate tells the daemon's lifetime that real work is running
+/// (REQ-565 BR-2).
+///
+/// A one-method seam rather than a direct dependency on
+/// [`crate::lifetime::LifetimeSupervisor`], for two reasons: this module's
+/// tests construct gates with no daemon at all, and the gate has no business
+/// knowing what a shutdown policy is. It knows only "I am writing bytes now"
+/// and "I have stopped".
+///
+/// The returned value is an opaque guard; dropping it releases the claim. It is
+/// `Box<dyn Send>` because the gate never inspects it — it only has to outlive
+/// the work, and pass through a `spawn_blocking` closure.
+pub trait WorkClaim: Send + Sync {
+    /// Claim that work is in flight until the returned guard drops.
+    fn claim(&self) -> Box<dyn Send>;
+}
+
 pub struct ModelConsentGate {
     profile: HardwareProfile,
     catalog: Catalog,
@@ -843,6 +860,17 @@ pub struct ModelConsentGate {
     /// the same entry can never both open the shared `.part` — the second finds
     /// the name claimed and no-ops rather than interleaving bytes into it.
     installing: Arc<Mutex<HashSet<String>>>,
+    /// How an install tells the daemon's lifetime it must not exit yet
+    /// (REQ-565 BR-2). `None` outside the daemon — the unit tests here run no
+    /// supervisor, and a gate with no claim behaves exactly as it did before.
+    ///
+    /// This is deliberately scoped to the **install**, not to the whole consent
+    /// flow. `resolve` can park indefinitely awaiting a client's
+    /// `model/confirm`, and waiting for a human is not in-flight work: a claim
+    /// held across that wait would mean a proposal nobody ever answers pins the
+    /// daemon forever — the exact standing-resident-daemon harm REQ-565 removes.
+    /// The bytes being written are what must not be interrupted.
+    work_claim: OnceLock<Arc<dyn WorkClaim>>,
 }
 
 impl ModelConsentGate {
@@ -871,7 +899,22 @@ impl ModelConsentGate {
             loader: None,
             catalog_overridden: false,
             installing: Arc::new(Mutex::new(HashSet::new())),
+            work_claim: OnceLock::new(),
         }
+    }
+
+    /// Wire the gate to the daemon's lifetime so an install defers exit
+    /// (REQ-565 BR-2).
+    ///
+    /// A `OnceLock` set after construction rather than a builder argument,
+    /// because of an ordering the daemon cannot avoid: the supervisor's policy
+    /// is read from the config that `DaemonRuntime::from_env` loads, so the
+    /// runtime — and this gate inside it — necessarily exists first. Setting it
+    /// twice is ignored; left unset the gate behaves exactly as it did before
+    /// REQ-565, which is what this module's tests rely on since they run no
+    /// supervisor.
+    pub fn set_work_claim(&self, claim: Arc<dyn WorkClaim>) {
+        let _ = self.work_claim.set(claim);
     }
 
     /// Declare that the catalog is a non-bundled override (`TETON_CATALOG`, H-2).
@@ -1395,6 +1438,12 @@ impl ModelConsentGate {
             Some(InFlightGuard {
                 installing: Arc::clone(&self.installing),
                 name: name.to_owned(),
+                // REQ-565 BR-2: taken here, released with the same guard, so the
+                // daemon's "may I exit?" answer and the installer's "is this
+                // entry busy?" answer can never disagree — they are one object's
+                // lifetime. This is the 17 GB case: a user who starts a download
+                // and closes the terminal keeps the download.
+                lifetime: self.work_claim.get().map(|claim| claim.claim()),
             })
         } else {
             None
@@ -1616,6 +1665,13 @@ impl ModelConsentGate {
 struct InFlightGuard {
     installing: Arc<Mutex<HashSet<String>>>,
     name: String,
+    /// The daemon-lifetime claim held for the same span (REQ-565). Dropped with
+    /// this guard — including on unwind, which is the point.
+    ///
+    /// Never read: like [`crate::single_instance::SingleInstance`]'s file
+    /// handle, its whole job is to exist until this struct does not.
+    #[allow(dead_code)]
+    lifetime: Option<Box<dyn Send>>,
 }
 
 impl Drop for InFlightGuard {

@@ -106,6 +106,10 @@ pub enum Event {
     PhaseTransition(PhaseTransition),
     /// A client attached to the daemon (spec: `daemon_client_attach`).
     DaemonClientAttach(DaemonClientAttach),
+    /// A moment in the daemon's own lifetime — a client counted in or out, a
+    /// shutdown armed, deferred, or taken (REQ-565). Every stage the spec names
+    /// as a separate event is a [`DaemonLifetimeStage`] on this one variant.
+    DaemonLifetime(DaemonLifetime),
     /// A web lookup reached a terminal outcome (REQ-563 BR-7). Every way a
     /// lookup can end — including the ones the spec names as separate events —
     /// is a [`WebLookupOutcome`] on this one variant.
@@ -137,6 +141,7 @@ impl Event {
             Event::PermissionRequest(_) => "permission_request",
             Event::PhaseTransition(_) => "phase_transition",
             Event::DaemonClientAttach(_) => "daemon_client_attach",
+            Event::DaemonLifetime(_) => "daemon_lifetime",
             Event::WebLookup(_) => "web_lookup",
             Event::WebConsentDecided(_) => "web_consent_decided",
             Event::WebTaintOverridden(_) => "web_taint_overridden",
@@ -971,6 +976,118 @@ pub struct DaemonClientAttach {
     pub client_kind: ClientKind,
     /// Protocol version negotiated with that client.
     pub protocol_version: ProtocolVersion,
+}
+
+// ---------------------------------------------------------------------------
+// daemon_lifetime (REQ-565)
+// ---------------------------------------------------------------------------
+//
+// REQ-565's Events table names five events — client_connected,
+// client_disconnected, daemon_shutdown_armed, daemon_shutdown_deferred,
+// daemon_shutdown. They are realized as one variant carrying a
+// [`DaemonLifetimeStage`], the same fold REQ-563's D-8 applied to the
+// web-lookup vocabulary: five near-identical top-level variants would give
+// every client five match arms for what is one story about one daemon.
+//
+// What is deliberately NOT on the wire: `conn_id`. The spec requires it to be
+// unique per live connection, and the daemon does keep one, but broadcasting it
+// would tell every attached client about the existence and identity of the
+// others for no consumer benefit. The counts are what the acceptance criteria
+// assert on, so the counts are what ships.
+
+/// Work that must finish before the daemon may exit (REQ-565 BR-2).
+///
+/// Lives here rather than in `teton-core` because it is wire vocabulary — it is
+/// the payload of `daemon_shutdown_deferred` — and one definition shared by the
+/// decision logic and the event beats two definitions plus a drift test.
+///
+/// Ordering is load-bearing: `teton_core::lifetime` reports the lowest live
+/// activity as *the* blocker, so declaration order decides which one a given
+/// set names, and an event payload that reshuffles between runs is one nobody
+/// can assert on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockingActivity {
+    /// A prompt turn is executing.
+    Turn,
+    /// Model weights are downloading or being verified.
+    ModelDownload,
+    /// Model weights are being loaded or benchmarked.
+    ModelLoad,
+    /// Cost-ledger writes are outstanding.
+    ///
+    /// Declared because the spec's vocabulary names it, but structurally empty
+    /// as things stand: the ledger is SQLite in autocommit, so a row is durable
+    /// the moment `record` returns and there is no buffer to flush. What
+    /// actually threatens ledger integrity is a turn killed before it records —
+    /// which is why [`Self::Turn`] defers.
+    LedgerFlush,
+}
+
+/// Why the daemon exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitReason {
+    /// The last client disconnected — the REQ-565 path.
+    LastClient,
+    /// No client ever arrived within the startup grace.
+    ///
+    /// Not in the spec's `reason` enum (`last_client | signal`), and
+    /// deliberately distinct from both: a daemon nobody ever talked to did not
+    /// lose a last client, and reporting it as `last_client` would make the
+    /// commonest orphan — a CLI killed during its own autostart poll — look
+    /// like a normal session end in the logs.
+    StartupUnclaimed,
+    /// A signal asked the daemon to stop.
+    Signal,
+}
+
+/// Which moment in the daemon's lifetime this event reports.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum DaemonLifetimeStage {
+    /// A client completed its handshake (spec: `client_connected`).
+    ClientConnected {
+        /// Live connections after this one was admitted.
+        live_connection_count: u32,
+    },
+    /// A client's socket closed, for any reason (spec: `client_disconnected`).
+    ClientDisconnected {
+        /// Live connections after this one left.
+        live_connection_count: u32,
+    },
+    /// The last client left and a shutdown is pending (spec:
+    /// `daemon_shutdown_armed`).
+    ShutdownArmed {
+        /// The policy that armed it, for diagnostics.
+        policy: String,
+        /// Seconds until exit under a linger policy; `0` for a strict
+        /// exit-on-last-disconnect.
+        linger_seconds: u64,
+    },
+    /// A pending shutdown is waiting on in-flight work (spec:
+    /// `daemon_shutdown_deferred`).
+    ShutdownDeferred {
+        /// What is holding the daemon open.
+        blocking_activity: BlockingActivity,
+    },
+    /// The daemon is exiting (spec: `daemon_shutdown`).
+    Shutdown {
+        /// Why.
+        reason: ExitReason,
+        /// How long the daemon ran.
+        uptime_seconds: u64,
+        /// Sessions closed during teardown.
+        sessions_closed: u32,
+    },
+}
+
+/// A moment in the daemon's lifetime (REQ-565).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonLifetime {
+    /// Which moment.
+    #[serde(flatten)]
+    pub stage: DaemonLifetimeStage,
 }
 
 // ---------------------------------------------------------------------------
@@ -2546,5 +2663,103 @@ mod tests {
             serde_json::from_str::<PrefixCacheMiss>(r#""stale""#).is_err(),
             "an unknown miss reason must not silently become a known one"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // daemon_lifetime — REQ-565
+    // -----------------------------------------------------------------------
+
+    /// All five of the spec's lifetime events ride one variant, and each stage
+    /// round-trips with the spelling the acceptance suite greps for.
+    #[test]
+    fn every_lifetime_stage_round_trips_under_one_event_name() {
+        let stages = vec![
+            (
+                DaemonLifetimeStage::ClientConnected {
+                    live_connection_count: 1,
+                },
+                "client_connected",
+            ),
+            (
+                DaemonLifetimeStage::ClientDisconnected {
+                    live_connection_count: 0,
+                },
+                "client_disconnected",
+            ),
+            (
+                DaemonLifetimeStage::ShutdownArmed {
+                    policy: "on-last-disconnect".to_owned(),
+                    linger_seconds: 0,
+                },
+                "shutdown_armed",
+            ),
+            (
+                DaemonLifetimeStage::ShutdownDeferred {
+                    blocking_activity: BlockingActivity::Turn,
+                },
+                "shutdown_deferred",
+            ),
+            (
+                DaemonLifetimeStage::Shutdown {
+                    reason: ExitReason::LastClient,
+                    uptime_seconds: 42,
+                    sessions_closed: 2,
+                },
+                "shutdown",
+            ),
+        ];
+
+        for (stage, tag) in stages {
+            let event = Event::DaemonLifetime(DaemonLifetime {
+                stage: stage.clone(),
+            });
+            assert_eq!(event.name(), "daemon_lifetime");
+
+            let json = serde_json::to_string(&event).expect("serialize");
+            assert!(
+                json.contains(&format!("\"stage\":\"{tag}\"")),
+                "stage tag `{tag}` missing from {json}"
+            );
+
+            let back: Event = serde_json::from_str(&json).expect("deserialize");
+            match back {
+                Event::DaemonLifetime(lifetime) => assert_eq!(lifetime.stage, stage),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    /// The payload spellings AC-3 asserts on. A rename here silently breaks the
+    /// acceptance suite's log grep, so they are pinned.
+    #[test]
+    fn blocking_activity_and_exit_reason_use_the_specs_spellings() {
+        let pairs = [
+            (BlockingActivity::Turn, "\"turn\""),
+            (BlockingActivity::ModelDownload, "\"model_download\""),
+            (BlockingActivity::ModelLoad, "\"model_load\""),
+            (BlockingActivity::LedgerFlush, "\"ledger_flush\""),
+        ];
+        for (activity, expected) in pairs {
+            assert_eq!(serde_json::to_string(&activity).unwrap(), expected);
+        }
+
+        let reasons = [
+            (ExitReason::LastClient, "\"last_client\""),
+            (ExitReason::StartupUnclaimed, "\"startup_unclaimed\""),
+            (ExitReason::Signal, "\"signal\""),
+        ];
+        for (reason, expected) in reasons {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), expected);
+        }
+    }
+
+    /// Declaration order decides which blocker a mixed set reports
+    /// (`teton_core::lifetime` takes the lowest), so it is a contract, not an
+    /// accident of how the variants happened to be typed.
+    #[test]
+    fn blocking_activity_ordering_is_a_contract() {
+        assert!(BlockingActivity::Turn < BlockingActivity::ModelDownload);
+        assert!(BlockingActivity::ModelDownload < BlockingActivity::ModelLoad);
+        assert!(BlockingActivity::ModelLoad < BlockingActivity::LedgerFlush);
     }
 }
