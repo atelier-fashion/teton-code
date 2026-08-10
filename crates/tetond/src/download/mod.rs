@@ -603,9 +603,17 @@ mod tests {
         }
     }
 
+    /// The counter guarantees uniqueness within the process: with pid alone,
+    /// two concurrent tests sharing a tag would receive the same path.
     fn temp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let mut path = std::env::temp_dir();
-        path.push(format!("teton-fetch-{tag}-{}.part", std::process::id()));
+        path.push(format!(
+            "teton-fetch-{tag}-{}-{}.part",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_file(&path);
         path
     }
