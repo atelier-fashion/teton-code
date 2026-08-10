@@ -31,6 +31,7 @@ use teton_core::lifetime::{
     Admission, BlockingActivity, ExitReason, LifetimeAction, LifetimePhase, LifetimeState,
     PolicySource, ShutdownPolicy,
 };
+use teton_core::{LifetimeConfig, ShutdownPolicyKind};
 use teton_protocol::events::{DaemonLifetime, DaemonLifetimeStage, Event};
 use tokio::sync::Notify;
 
@@ -45,6 +46,207 @@ use crate::broadcast::EventBus;
 /// makes that comparison valid — a slow startup happens *before* the bind, with
 /// no socket for anyone to connect to.
 pub const STARTUP_GRACE: Duration = Duration::from_secs(60);
+
+/// The daemon's `--shutdown-policy` / `--linger-seconds` flags, once parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PolicyFlags {
+    /// `--shutdown-policy <mode>`.
+    pub shutdown: Option<ShutdownPolicyKind>,
+    /// `--linger-seconds <n>`.
+    pub linger_seconds: Option<u64>,
+}
+
+/// A `--shutdown-policy` value this build does not recognize.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyArgError {
+    /// The mode is not one of the three spellings.
+    #[error(
+        "unknown {origin} value '{value}' — expected one of: {}. \
+         Refusing to start rather than silently running under a lifetime you did not ask for.",
+        ShutdownPolicyKind::SPELLINGS.join(", ")
+    )]
+    UnknownMode {
+        /// Where the bad value came from, e.g. `--shutdown-policy`.
+        origin: String,
+        /// The value, echoed so the typo is visible.
+        value: String,
+    },
+    /// A numeric option did not parse.
+    #[error("{origin} expects a whole number of seconds, got '{value}'")]
+    NotANumber {
+        /// Where the bad value came from.
+        origin: String,
+        /// The value.
+        value: String,
+    },
+    /// A flag that takes a value was given none.
+    #[error("{origin} requires a value")]
+    MissingValue {
+        /// The flag.
+        origin: String,
+    },
+}
+
+/// Parse the lifetime flags out of a command line (REQ-565 BR-7).
+///
+/// Takes the arguments rather than reading `std::env::args` so the parse is
+/// testable without a process — the same reason `seam_policy` in
+/// [`crate::runtime`] is pure.
+///
+/// # Errors
+///
+/// Returns [`PolicyArgError`] for an unknown mode, a non-numeric window, or a
+/// flag with no value. Refusing beats defaulting: a typo'd
+/// `--shutdown-policy nevr` that silently fell back to
+/// `on-last-disconnect` would give an always-on service the one lifetime it
+/// must not have (BR-5).
+pub fn parse_policy_flags<I, S>(args: I) -> Result<PolicyFlags, PolicyArgError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut flags = PolicyFlags::default();
+    let mut args = args.into_iter().map(|a| a.as_ref().to_owned());
+    while let Some(arg) = args.next() {
+        // Both `--flag value` and `--flag=value` spellings; launchd plists and
+        // hand-typed command lines differ on which they use.
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name.to_owned(), Some(value.to_owned())),
+            None => (arg, None),
+        };
+        let mut take_value = |origin: &str| -> Result<String, PolicyArgError> {
+            inline.clone().map_or_else(
+                || {
+                    args.next().ok_or_else(|| PolicyArgError::MissingValue {
+                        origin: origin.to_owned(),
+                    })
+                },
+                Ok,
+            )
+        };
+        match name.as_str() {
+            "--shutdown-policy" => {
+                let value = take_value("--shutdown-policy")?;
+                flags.shutdown = Some(ShutdownPolicyKind::parse(&value).ok_or(
+                    PolicyArgError::UnknownMode {
+                        origin: "--shutdown-policy".to_owned(),
+                        value,
+                    },
+                )?);
+            }
+            "--linger-seconds" => {
+                let value = take_value("--linger-seconds")?;
+                flags.linger_seconds =
+                    Some(value.parse().map_err(|_| PolicyArgError::NotANumber {
+                        origin: "--linger-seconds".to_owned(),
+                        value,
+                    })?);
+            }
+            _ => {}
+        }
+    }
+    Ok(flags)
+}
+
+/// The lifetime settings read from the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PolicyEnv {
+    /// `TETON_SHUTDOWN_POLICY`.
+    pub shutdown: Option<ShutdownPolicyKind>,
+    /// `TETON_LINGER_SECONDS`.
+    pub linger_seconds: Option<u64>,
+}
+
+impl PolicyEnv {
+    /// Read the two variables from the process environment.
+    ///
+    /// These are **operator** settings, not test seams: they are deliberately
+    /// not gated behind `TETON_TEST_SEAMS`, because a release build has to
+    /// honour them — the shipped Homebrew service block passes the `never`
+    /// policy, and a release daemon that ignored it would flap against
+    /// launchd's keep-alive (BR-5). Same posture as `TETON_CONFIG`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyArgError`] for an unrecognized mode or a non-numeric
+    /// window, for the same refuse-don't-default reason as the flags.
+    pub fn from_env() -> Result<Self, PolicyArgError> {
+        let shutdown = match std::env::var("TETON_SHUTDOWN_POLICY") {
+            Ok(value) if !value.trim().is_empty() => Some(
+                ShutdownPolicyKind::parse(&value).ok_or(PolicyArgError::UnknownMode {
+                    origin: "TETON_SHUTDOWN_POLICY".to_owned(),
+                    value,
+                })?,
+            ),
+            _ => None,
+        };
+        let linger_seconds = match std::env::var("TETON_LINGER_SECONDS") {
+            Ok(value) if !value.trim().is_empty() => {
+                Some(value.parse().map_err(|_| PolicyArgError::NotANumber {
+                    origin: "TETON_LINGER_SECONDS".to_owned(),
+                    value,
+                })?)
+            }
+            _ => None,
+        };
+        Ok(Self {
+            shutdown,
+            linger_seconds,
+        })
+    }
+}
+
+/// Resolve the effective policy from all three sources (REQ-565 BR-7, D-7).
+///
+/// Precedence is **flag > env > config > default**, most explicit first: a flag
+/// is written on the command line that started *this* process, an environment
+/// variable belongs to whoever launched it, and the config file is the standing
+/// preference. The winning source is returned alongside the policy because a
+/// lifetime that surprises an operator is nearly always resolved from somewhere
+/// they did not look.
+///
+/// Pure, so every precedence rule is testable without a process or a file.
+#[must_use]
+pub fn resolve_policy(
+    flags: PolicyFlags,
+    env: PolicyEnv,
+    config: LifetimeConfig,
+) -> (ShutdownPolicy, PolicySource) {
+    // The window follows the same precedence, independently of the mode: a
+    // config that sets `linger_seconds` is still describing the window when a
+    // flag only overrides the mode.
+    let window = |kind_source: PolicySource| -> u64 {
+        flags
+            .linger_seconds
+            .or(env.linger_seconds)
+            .or(config.linger_seconds)
+            .unwrap_or_else(|| {
+                let _ = kind_source;
+                0
+            })
+    };
+
+    if let Some(kind) = flags.shutdown {
+        return (build(kind, window(PolicySource::Flag)), PolicySource::Flag);
+    }
+    if let Some(kind) = env.shutdown {
+        return (build(kind, window(PolicySource::Env)), PolicySource::Env);
+    }
+    if config.is_unset() {
+        return (ShutdownPolicy::OnLastDisconnect, PolicySource::Default);
+    }
+    (config.policy(), PolicySource::Config)
+}
+
+fn build(kind: ShutdownPolicyKind, linger_seconds: u64) -> ShutdownPolicy {
+    match kind {
+        ShutdownPolicyKind::OnLastDisconnect => ShutdownPolicy::OnLastDisconnect,
+        ShutdownPolicyKind::Linger => ShutdownPolicy::Linger {
+            seconds: linger_seconds,
+        },
+        ShutdownPolicyKind::Never => ShutdownPolicy::Never,
+    }
+}
 
 /// Owns the lifetime decision and everything asynchronous about acting on it.
 pub struct LifetimeSupervisor {
@@ -347,5 +549,167 @@ fn describe(stage: &DaemonLifetimeStage) -> String {
                  sessions_closed={sessions_closed})"
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Flag parsing (BR-7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn both_flag_spellings_parse() {
+        // launchd plists and hand-typed command lines disagree about which of
+        // these they use, so the daemon has to accept both.
+        let spaced = parse_policy_flags(["--shutdown-policy", "never"]).unwrap();
+        let inline = parse_policy_flags(["--shutdown-policy=never"]).unwrap();
+        assert_eq!(spaced.shutdown, Some(ShutdownPolicyKind::Never));
+        assert_eq!(inline.shutdown, spaced.shutdown);
+    }
+
+    #[test]
+    fn the_linger_window_parses_as_a_number() {
+        let flags = parse_policy_flags(["--linger-seconds", "45"]).unwrap();
+        assert_eq!(flags.linger_seconds, Some(45));
+    }
+
+    /// The failure mode this refusal exists for: a typo that silently fell back
+    /// to the default would hand the `brew services` daemon exit-on-last-client,
+    /// and it would flap against launchd's keep-alive (BR-5).
+    #[test]
+    fn an_unknown_mode_refuses_and_names_the_valid_spellings() {
+        let err = parse_policy_flags(["--shutdown-policy", "nevr"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nevr"), "the typo must be visible: {msg}");
+        for spelling in ShutdownPolicyKind::SPELLINGS {
+            assert!(msg.contains(spelling), "`{spelling}` missing from: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_window_and_a_valueless_flag_both_refuse() {
+        assert!(matches!(
+            parse_policy_flags(["--linger-seconds", "soon"]).unwrap_err(),
+            PolicyArgError::NotANumber { .. }
+        ));
+        assert!(matches!(
+            parse_policy_flags(["--shutdown-policy"]).unwrap_err(),
+            PolicyArgError::MissingValue { .. }
+        ));
+    }
+
+    #[test]
+    fn unrelated_arguments_are_ignored() {
+        let flags = parse_policy_flags(["--version", "-V", "--not-ours=1"]).unwrap();
+        assert_eq!(flags, PolicyFlags::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Precedence (BR-7, D-7)
+    // -----------------------------------------------------------------------
+
+    fn config(kind: ShutdownPolicyKind, linger: Option<u64>) -> LifetimeConfig {
+        LifetimeConfig {
+            shutdown: kind,
+            linger_seconds: linger,
+        }
+    }
+
+    #[test]
+    fn nothing_set_anywhere_is_exit_with_the_last_client() {
+        let (policy, source) = resolve_policy(
+            PolicyFlags::default(),
+            PolicyEnv::default(),
+            LifetimeConfig::default(),
+        );
+        assert_eq!(policy, ShutdownPolicy::OnLastDisconnect);
+        assert_eq!(source, PolicySource::Default);
+    }
+
+    #[test]
+    fn the_flag_outranks_the_environment_and_the_config() {
+        let (policy, source) = resolve_policy(
+            PolicyFlags {
+                shutdown: Some(ShutdownPolicyKind::Never),
+                linger_seconds: None,
+            },
+            PolicyEnv {
+                shutdown: Some(ShutdownPolicyKind::Linger),
+                linger_seconds: Some(10),
+            },
+            config(ShutdownPolicyKind::OnLastDisconnect, None),
+        );
+        assert_eq!(policy, ShutdownPolicy::Never);
+        assert_eq!(source, PolicySource::Flag);
+    }
+
+    #[test]
+    fn the_environment_outranks_the_config() {
+        let (policy, source) = resolve_policy(
+            PolicyFlags::default(),
+            PolicyEnv {
+                shutdown: Some(ShutdownPolicyKind::Never),
+                linger_seconds: None,
+            },
+            config(ShutdownPolicyKind::OnLastDisconnect, None),
+        );
+        assert_eq!(policy, ShutdownPolicy::Never);
+        assert_eq!(source, PolicySource::Env);
+    }
+
+    #[test]
+    fn a_config_that_sets_a_policy_is_reported_as_the_source() {
+        let (policy, source) = resolve_policy(
+            PolicyFlags::default(),
+            PolicyEnv::default(),
+            config(ShutdownPolicyKind::Linger, Some(30)),
+        );
+        assert_eq!(policy, ShutdownPolicy::Linger { seconds: 30 });
+        assert_eq!(source, PolicySource::Config);
+    }
+
+    /// The window follows the same precedence as the mode but independently, so
+    /// a flag that only names `linger` still honours a window the config set.
+    #[test]
+    fn the_window_resolves_independently_of_the_mode() {
+        let (policy, source) = resolve_policy(
+            PolicyFlags {
+                shutdown: Some(ShutdownPolicyKind::Linger),
+                linger_seconds: None,
+            },
+            PolicyEnv::default(),
+            config(ShutdownPolicyKind::Linger, Some(90)),
+        );
+        assert_eq!(policy, ShutdownPolicy::Linger { seconds: 90 });
+        assert_eq!(source, PolicySource::Flag);
+    }
+
+    /// The Homebrew service block's exact invocation. If this ever stops
+    /// yielding `Never`, the shipped always-on daemon exits under launchd's
+    /// keep-alive and flaps — reloading the model every cycle (BR-5).
+    #[test]
+    fn the_shipped_service_invocation_resolves_to_never() {
+        let flags = parse_policy_flags(["--shutdown-policy", "never"]).unwrap();
+        let (policy, source) =
+            resolve_policy(flags, PolicyEnv::default(), LifetimeConfig::default());
+        assert_eq!(policy, ShutdownPolicy::Never);
+        assert_eq!(source, PolicySource::Flag);
+        assert!(!policy.self_terminates());
+    }
+
+    #[test]
+    fn policy_labels_name_the_mode_and_its_window() {
+        assert_eq!(
+            policy_label(ShutdownPolicy::OnLastDisconnect),
+            "on-last-disconnect"
+        );
+        assert_eq!(policy_label(ShutdownPolicy::Never), "never");
+        assert_eq!(
+            policy_label(ShutdownPolicy::Linger { seconds: 30 }),
+            "linger(30s)"
+        );
     }
 }

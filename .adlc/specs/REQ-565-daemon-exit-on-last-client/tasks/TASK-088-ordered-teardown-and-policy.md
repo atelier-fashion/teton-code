@@ -1,7 +1,7 @@
 ---
 id: TASK-088
 title: "Ordered shutdown, flock hand-off, and policy resolution in the daemon binary"
-status: pending
+status: complete
 parent: REQ-565
 repo: teton-code
 created: 2026-08-10
