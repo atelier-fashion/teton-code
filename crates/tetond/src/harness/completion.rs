@@ -39,7 +39,7 @@ use teton_providers::{
     Message, Provider, Role, TokenUsage, ToolSpec, Transport, TurnEvent, TurnRequest,
 };
 
-use crate::cost::CostAttribution;
+use crate::cost::{CostAttribution, LocalUsageMeter};
 use crate::egress::{Egress, EgressContext, Provenance};
 
 use super::context::{ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance};
@@ -163,6 +163,14 @@ pub struct LocalEngineSource {
     /// property of the committed engine, resolved at load time from its GGUF
     /// template, and a committed engine is never re-templated.
     format: ChatFormat,
+    /// Where completed local turns are recorded (REQ-564 BR-9), or `None` for
+    /// a source with no ledger — the test entry points, and any caller that
+    /// only wants the turn.
+    ///
+    /// The remote tier meters itself at the egress choke point every remote
+    /// call flows through. The local tier is transport-free, so it has no such
+    /// seam and carries its own sink instead.
+    meter: Option<Arc<dyn LocalUsageMeter>>,
     /// The session this source's turns belong to — the prefix cache's key
     /// (REQ-564 BR-3).
     ///
@@ -191,8 +199,19 @@ impl LocalEngineSource {
         Self {
             engine,
             format,
+            meter: None,
             session_id,
         }
+    }
+
+    /// Record this source's completed turns into `meter` (REQ-564 BR-9).
+    ///
+    /// Opt-in rather than required so the harness-only entry points, which have
+    /// no ledger, stay constructible with no change.
+    #[must_use]
+    pub fn metered(mut self, meter: Arc<dyn LocalUsageMeter>) -> Self {
+        self.meter = Some(meter);
+        self
     }
 
     /// This turn's prefix-cache outcome, in wire form.
@@ -297,6 +316,17 @@ impl CompletionSource for LocalEngineSource {
             model,
             outcome: Self::cache_outcome(&completion),
         };
+        // One usage row per completed local turn (BR-9). `input_tokens` stays
+        // the full prompt; `cached_tokens` says how much of it came for free.
+        if let Some(meter) = self.meter.as_ref() {
+            meter.local_call(
+                &self.session_id,
+                &CostAttribution::new(cache.model.clone()),
+                u64::from(completion.prompt_tokens),
+                u64::from(completion.completion_tokens),
+                u64::from(completion.cached_tokens),
+            );
+        }
         // Cut the reply at the turn boundary (re-scanned over the final text —
         // deterministic, and independent of how the stream was chunked), then
         // parse the *clean* reply. Everything past the first tool call — the

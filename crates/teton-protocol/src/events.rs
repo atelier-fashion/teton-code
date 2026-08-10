@@ -480,6 +480,14 @@ pub struct CostRecord {
     /// Cost in integer micro-dollars (1e-6 USD). Spec entity field `usd`, sent
     /// as an integer so money never rounds on the wire.
     pub usd_micros: i64,
+    /// Prompt tokens whose KV was reused from a resident local prefix (REQ-564
+    /// BR-9), or `None` for a call with no prefix cache — every remote call,
+    /// and every row a pre-REQ build wrote.
+    ///
+    /// Omitted from the wire when absent, so a client built against the older
+    /// shape reads the same bytes it always did.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cached_tokens: Option<u64>,
 }
 
 /// Event payload wrapping a [`CostRecord`] (spec Events: `cost_recorded`).
@@ -1434,6 +1442,7 @@ mod tests {
                         input_tokens: 1,
                         output_tokens: 2,
                         usd_micros: 1234,
+                        cached_tokens: None,
                     },
                 }),
                 "cost_recorded",
@@ -1845,6 +1854,7 @@ mod tests {
                 input_tokens: 1000,
                 output_tokens: 500,
                 usd_micros: 45_000,
+                cached_tokens: None,
             },
         });
     }

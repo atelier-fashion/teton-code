@@ -2630,7 +2630,8 @@ impl DaemonRuntime {
                 return Err(HarnessError::NoTierAvailable);
             };
             let mut source =
-                LocalEngineSource::new(Arc::clone(engine), *format, session_id.clone());
+                LocalEngineSource::new(Arc::clone(engine), *format, session_id.clone())
+                    .metered(Arc::new(self.ledger.clone()));
             return run_session_turn_with_source(
                 &mut source,
                 tools,
