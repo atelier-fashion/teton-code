@@ -15,16 +15,30 @@ teton
 
 That is the whole install: two binaries — `teton` (CLI) and `teton-code` (the
 daemon) — with no Rust toolchain, no cmake, and no feature flags to get right.
-On its first run `teton` notices there is no daemon and offers to register
-`teton-code` with launchd (`brew services start teton`, run for you) so it
-starts now and survives reboots; press return to accept, or decline and it
-starts an unmanaged daemon for the session and never asks again. The manual
-`brew services start teton` keeps working, before or instead of the offer.
 
-If the service registration refuses with a tap-trust error, run
+**The daemon runs on demand.** `teton` starts `teton-code` when it needs one and
+the daemon exits when your last session ends, so nothing holds the local model
+in memory while you are not using it. The tradeoff is deliberate: the next
+session pays the model load again.
+
+If you would rather keep one running permanently — worth it if you start
+sessions constantly, and it costs the model's memory continuously — that is one
+command:
+
+```sh
+brew services start teton
+```
+
+That registers `teton-code` with launchd, starts it now, and keeps it across
+reboots. If the registration refuses with a tap-trust error, run
 `brew trust atelier-fashion/tap` once — Homebrew 6 treats the fully-qualified
 name in the install command as self-authorizing, but not the short name that
 `brew services` resolves.
+
+> **Upgrading from v0.1.13 or earlier?** Those versions ran the daemon under
+> `brew services` with keep-alive, so it started at login and could not be
+> stopped short of `brew services stop teton`. Run that once after upgrading to
+> pick up the on-demand lifetime. Nothing else changes.
 
 **The model arrives on first run, with your consent.** The install ships no
 weights. The first `teton` run proposes a local model matched to your hardware
@@ -57,18 +71,29 @@ double it: `//usr/local/bin/x — why?` asks the model about `/usr/local/bin/x`.
 
 ```sh
 brew upgrade teton
+```
+
+On the default on-demand lifetime that is the whole thing: an upgrade replaces
+the binaries on disk, and the next session starts a daemon from the new ones.
+Exit any session you already have open — that daemon is still the old build
+until it does.
+
+If you opted into the always-on daemon, restart it too, because nothing else
+will:
+
+```sh
 brew services restart teton
 ```
 
-The restart is the load-bearing half. An upgrade replaces the binaries on disk;
-the `teton-code` already running is still the old one until something restarts it,
-and `teton doctor` names the running daemon's version so you can tell which one
-answered.
+You will be told either way. When the CLI attaches to a daemon built from a
+different version, it prints one line naming both versions and what to do about
+it. That check is separate from — and stricter than — the protocol negotiation:
+two adjacent releases usually speak the *same* protocol version, so a stale
+daemon handshakes perfectly happily and would otherwise serve every command
+silently. When the protocol versions genuinely disagree, the handshake is
+refused outright and the error says which half is behind.
 
-Forget it and nothing is silently wrong: the two halves negotiate a protocol
-version when the CLI attaches, so a daemon left behind by an upgrade is turned
-away at that point — every command answers with which half is stale and the
-restart command, rather than failing partway through with an internal error.
+`teton doctor` names the running daemon's version at any time.
 
 [`CHANGELOG.md`](CHANGELOG.md) records what an upgrade changes on a machine that
 was already running — in particular any release that changes where your data

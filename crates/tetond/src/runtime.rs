@@ -499,11 +499,7 @@ impl Engine for ScriptedFileEngine {
             }
         }
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
-        Ok(Completion {
-            text,
-            prompt_tokens,
-            completion_tokens,
-        })
+        Ok(Completion::cold(text, prompt_tokens, completion_tokens))
     }
 }
 
@@ -1871,6 +1867,18 @@ impl DaemonRuntime {
     /// answers is told the daemon is awaiting a decision; one attaching after an
     /// install is told what is actually on disk. Both are true when they are
     /// said, which a snapshot taken at startup could not be.
+    /// The daemon-lifetime settings the loaded config declares (REQ-565 BR-7).
+    ///
+    /// Read once at startup to seed the [`crate::lifetime::LifetimeSupervisor`].
+    /// The policy is deliberately *not* re-read on `config/set`: a daemon that
+    /// changed its own exit rules mid-flight would make the lifetime depend on
+    /// when a client happened to write the file, and the effective policy is
+    /// already reported once, at startup, for exactly that reason.
+    #[must_use]
+    pub fn lifetime_config(&self) -> teton_core::LifetimeConfig {
+        self.config.lock().expect("config mutex poisoned").lifetime
+    }
+
     #[must_use]
     pub fn lifecycle_events(&self) -> Vec<ModelLifecycle> {
         match &self.probe {
@@ -2633,7 +2641,9 @@ impl DaemonRuntime {
                 // engine failure (BUG-146); the caller classifies from state.
                 return Err(HarnessError::NoTierAvailable);
             };
-            let mut source = LocalEngineSource::new(Arc::clone(engine), *format);
+            let mut source =
+                LocalEngineSource::new(Arc::clone(engine), *format, session_id.clone())
+                    .metered(Arc::new(self.ledger.clone()));
             return run_session_turn_with_source(
                 &mut source,
                 tools,
@@ -8524,6 +8534,7 @@ provider_id = "on-device"
             local_model: teton_core::LocalModelConfig::default(),
             privacy: teton_core::PrivacyConfig::default(),
             web: teton_core::WebConfig::default(),
+            lifetime: teton_core::LifetimeConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -8837,6 +8848,7 @@ provider_id = "on-device"
             local_model: teton_core::LocalModelConfig::default(),
             privacy: teton_core::PrivacyConfig::default(),
             web: teton_core::WebConfig::default(),
+            lifetime: teton_core::LifetimeConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),
@@ -10989,11 +11001,7 @@ provider_id = "on-device"
                     _on_token: &mut dyn FnMut(&str) -> bool,
                 ) -> Result<Completion, EngineError> {
                     let _ = self.release.lock().expect("gate poisoned").recv();
-                    Ok(Completion {
-                        text: self.reply.clone(),
-                        prompt_tokens: 0,
-                        completion_tokens: 1,
-                    })
+                    Ok(Completion::cold(self.reply.clone(), 0, 1))
                 }
             }
 
@@ -13725,11 +13733,7 @@ provider_id = "on-device"
                 } else {
                     format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{LOOPBACK_URL}\"}}}}")
                 };
-                Ok(Completion {
-                    text,
-                    prompt_tokens: 0,
-                    completion_tokens: 1,
-                })
+                Ok(Completion::cold(text, 0, 1))
             }
         }
 

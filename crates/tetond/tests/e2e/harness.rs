@@ -236,6 +236,22 @@ impl MockProvider {
     /// Start a mock provider that serves `scripted` responses in order, then the
     /// `default` for any further request.
     pub fn start(scripted: Vec<MockResponse>, default: MockResponse) -> Self {
+        Self::start_delayed(scripted, default, Duration::ZERO)
+    }
+
+    /// [`Self::start`], but each response is held back by `delay` (REQ-565).
+    ///
+    /// A test that needs a turn to be *genuinely* still executing when its
+    /// client disconnects cannot get there by racing an instant response. The
+    /// AC-3 deferral test learned that the expensive way: it passed locally and
+    /// on Linux CI, then failed on a loaded macOS runner where the turn finished
+    /// before the daemon had read the disconnect. A held-open response makes the
+    /// window a duration the test chooses rather than a scheduling accident.
+    pub fn start_delayed(
+        scripted: Vec<MockResponse>,
+        default: MockResponse,
+        delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -258,6 +274,9 @@ impl MockProvider {
                                 .unwrap()
                                 .pop_front()
                                 .unwrap_or_else(|| default.clone());
+                            if !delay.is_zero() {
+                                thread::sleep(delay);
+                            }
                             handle_http(accepted(stream), &requests, &response);
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -459,16 +478,53 @@ impl Drop for Workspace {
 }
 
 /// Options for spawning the daemon.
-#[derive(Default)]
 pub struct DaemonOptions {
     pub local_script: Option<PathBuf>,
     pub mcp_config: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    /// Extra command-line arguments (REQ-565: `--shutdown-policy`, which is a
+    /// flag rather than an env var precisely so it survives a release build and
+    /// is visible in a launchd plist — so the suite has to be able to pass one).
+    pub args: Vec<String>,
+    /// Whether to pin the daemon with `--shutdown-policy never`.
+    ///
+    /// Defaults to **true**, because every suite except the lifetime one uses
+    /// this daemon as a fixture whose lifetime the test owns: it is spawned
+    /// here, driven by several clients, and killed on drop. Under the shipped
+    /// default it would exit the moment the first client disconnected, and the
+    /// rest of that test would be talking to nothing.
+    ///
+    /// `daemon_lifetime.rs` sets this false — it is testing the real default.
+    pub pin_lifetime: bool,
+}
+
+impl Default for DaemonOptions {
+    fn default() -> Self {
+        Self {
+            local_script: None,
+            mcp_config: None,
+            env: Vec::new(),
+            args: Vec::new(),
+            pin_lifetime: true,
+        }
+    }
 }
 
 impl DaemonOptions {
     pub fn env(mut self, key: &str, value: impl Into<String>) -> Self {
         self.env.push((key.to_owned(), value.into()));
+        self
+    }
+
+    /// Append a command-line argument.
+    pub fn arg(mut self, value: impl Into<String>) -> Self {
+        self.args.push(value.into());
+        self
+    }
+
+    /// Let the daemon use its real shipped lifetime instead of being pinned.
+    pub fn real_lifetime(mut self) -> Self {
+        self.pin_lifetime = false;
         self
     }
 
@@ -520,6 +576,12 @@ impl Daemon {
         for (k, v) in &options.env {
             cmd.env(k, v);
         }
+        // REQ-565: pin first, so an explicit `--shutdown-policy` in `args` wins
+        // (the parser takes the last occurrence of a flag).
+        if options.pin_lifetime {
+            cmd.args(["--shutdown-policy", "never"]);
+        }
+        cmd.args(&options.args);
 
         let child = cmd.spawn().expect("spawn teton-code");
         let mut daemon = Self {
@@ -564,10 +626,41 @@ impl Daemon {
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log_path).unwrap_or_default()
     }
+
+    /// The socket this daemon binds. REQ-565 asserts on its *absence* after a
+    /// clean exit, so the suite needs the path, not just a connection.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Wait for the daemon to exit **on its own**, up to `window`.
+    ///
+    /// `None` means it was still running when the window ran out. Deliberately
+    /// never kills: the whole claim under test (REQ-565 AC-1) is that the
+    /// process leaves by itself, and a helper that tidied up on the way out
+    /// would make the failing case indistinguishable from the passing one.
+    pub fn wait_for_exit(&mut self, window: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + window;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                Ok(None) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Whether the daemon process is still alive right now.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        // Tolerates an already-exited child: under REQ-565 a daemon that ended
+        // itself is the expected state, not an error.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -676,6 +769,34 @@ impl Client {
     pub fn call(&mut self, method: &str, params: Value) -> Value {
         let id = self.send(method, params);
         self.await_response(id)
+    }
+
+    /// Send a prompt turn and return **without** waiting for it (REQ-565 AC-3).
+    ///
+    /// The suite needs a turn that is genuinely still executing when its client
+    /// disconnects, which `prompt` cannot produce — it waits for the response,
+    /// by which time the turn is over and there is nothing left to defer.
+    pub fn prompt_no_wait(&mut self, session_id: &str, text: &str) {
+        self.send(
+            "session/prompt",
+            json!({
+                "session_id": session_id,
+                "prompt": [{ "type": "text", "text": text }],
+            }),
+        );
+    }
+
+    /// Close this connection the way a departing client does.
+    ///
+    /// Explicit because dropping the struct is not enough on its own: the reader
+    /// thread holds a `try_clone` of the socket, so the last descriptor — and
+    /// therefore the peer's EOF — would wait on that thread noticing something,
+    /// which it only does when the daemon happens to send. `shutdown` acts on
+    /// the connection rather than on one descriptor, so the daemon sees the
+    /// disconnect immediately. Called from `Drop`, so ordinary `drop(client)`
+    /// means what every test here assumes it means.
+    pub fn disconnect(&mut self) {
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
     }
 
     fn await_response(&mut self, id: i64) -> Value {
@@ -948,6 +1069,20 @@ impl Client {
             }
             thread::sleep(Duration::from_millis(25));
         }
+    }
+}
+
+impl Drop for Client {
+    /// A dropped client is a departed client (REQ-565).
+    ///
+    /// Without this, `drop(client)` closed only the writer descriptor while the
+    /// reader thread kept its `try_clone` alive, so the daemon saw no EOF until
+    /// that thread happened to wake — which it only does when the daemon sends
+    /// something. Tests that dropped a client and expected the daemon to notice
+    /// were passing on the timing of unrelated broadcasts. See
+    /// [`Client::disconnect`].
+    fn drop(&mut self) {
+        self.disconnect();
     }
 }
 

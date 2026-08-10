@@ -46,13 +46,24 @@ use teton_protocol::methods::{
     SessionListParams, SessionListResult, WebOverrideParams, WebRefreshParams,
 };
 
+use teton_core::lifetime::{BlockingActivity, PolicySource, ShutdownPolicy};
+
 use crate::auth;
 use crate::broadcast::{EventBus, Subscription, DEFAULT_CAPACITY};
+use crate::lifetime::LifetimeSupervisor;
 use crate::runtime::DaemonRuntime;
 use crate::sessions::SessionRegistry;
 
 /// Depth of a client's outbound message queue (responses + events).
 const OUTBOUND_CAPACITY: usize = 1024;
+
+/// How long a disconnecting client's in-flight prompt turns are given to finish
+/// before they are abandoned (REQ-565 BR-2).
+///
+/// Generous, because the thing being protected is the turn's cost row and the
+/// work already paid for; a local turn on a large model can legitimately run for
+/// minutes. It is an upper bound on pathology, not a normal-path timeout.
+const TURN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Shared daemon state: the session registry and the event bus.
 ///
@@ -65,6 +76,10 @@ pub struct Daemon {
     pub events: Arc<EventBus>,
     /// The assembled engine/router/egress/cost/MCP state prompt turns drive.
     pub runtime: Arc<DaemonRuntime>,
+    /// The exit-with-the-last-client decision (REQ-565). Every handshake asks it
+    /// for admission and every prompt turn holds one of its activity guards, so
+    /// it is shared state like the registry and the bus.
+    pub lifetime: Arc<LifetimeSupervisor>,
 }
 
 impl Daemon {
@@ -73,10 +88,20 @@ impl Daemon {
     /// prompt turns run.
     #[must_use]
     pub fn new() -> Self {
+        let events = Arc::new(EventBus::new());
+        // `Never`: a bare `Daemon::new()` is a fixture, and a fixture that could
+        // decide to exit would make unrelated tests race a shutdown they never
+        // asked for. The production path states its policy explicitly.
+        let lifetime = Arc::new(LifetimeSupervisor::new(
+            ShutdownPolicy::Never,
+            PolicySource::Default,
+            Arc::clone(&events),
+        ));
         Self {
             sessions: SessionRegistry::new(),
-            events: Arc::new(EventBus::new()),
+            events,
             runtime: Arc::new(DaemonRuntime::minimal()),
+            lifetime,
         }
     }
 
@@ -87,10 +112,28 @@ impl Daemon {
     /// onto, so those events reach attached clients.
     #[must_use]
     pub fn with_runtime(events: Arc<EventBus>, runtime: Arc<DaemonRuntime>) -> Self {
+        let lifetime = Arc::new(LifetimeSupervisor::new(
+            ShutdownPolicy::Never,
+            PolicySource::Default,
+            Arc::clone(&events),
+        ));
+        Self::with_lifetime(events, runtime, lifetime)
+    }
+
+    /// A daemon over an explicit lifetime supervisor — the production path
+    /// (`crate::main`), which resolves the policy from flags, environment, and
+    /// config before the daemon exists (REQ-565 BR-7).
+    #[must_use]
+    pub fn with_lifetime(
+        events: Arc<EventBus>,
+        runtime: Arc<DaemonRuntime>,
+        lifetime: Arc<LifetimeSupervisor>,
+    ) -> Self {
         Self {
             sessions: SessionRegistry::new(),
             events,
             runtime,
+            lifetime,
         }
     }
 }
@@ -133,7 +176,19 @@ pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
 /// stop the server.
 pub async fn serve(listener: UnixListener, daemon: Arc<Daemon>) -> std::io::Result<()> {
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        // REQ-565: the accept loop is no longer infinite. It races `accept`
+        // against the lifetime supervisor's shutdown signal, so a daemon whose
+        // last client left stops listening and returns to `main` for the ordered
+        // teardown (BR-8) instead of blocking here forever.
+        let accepted = tokio::select! {
+            // Biased so a pending shutdown wins a tie: once committed, the
+            // daemon must not pick up one more connection it would immediately
+            // refuse.
+            biased;
+            () = daemon.lifetime.wait_for_shutdown() => return Ok(()),
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, _addr) = accepted?;
         match auth::check_peer(&stream) {
             Ok(_uid) => {
                 let daemon = Arc::clone(&daemon);
@@ -189,6 +244,12 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
 
     let mut reader = BufReader::new(read_half);
     let mut handshaked = false;
+    // REQ-565 BR-1: the client's claim on the daemon's life, taken when the
+    // handshake completes — never at `accept`. A bare `UnixStream::connect` that
+    // never handshakes (the CLI's own autostart poll, the e2e harness's
+    // readiness probe) must not pin the daemon, and must not arm a shutdown when
+    // it drops.
+    let mut client_guard: Option<crate::lifetime::ClientGuard> = None;
     let mut forwarder: Option<JoinHandle<()>> = None;
     let mut fence: Option<EventFence> = None;
     // In-flight `session/prompt` executions. A prompt turn is run on its own task
@@ -248,8 +309,9 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
 
             // On success, subscribe and start forwarding events. On failure the
             // error response is already queued and the client stays unauthenticated.
-            if let Some(sub) = do_handshake(&daemon, id, params, &out_tx) {
+            if let Some((sub, guard)) = do_handshake(&daemon, id, params, &out_tx) {
                 handshaked = true;
+                client_guard = Some(guard);
                 let (forwarded_tx, forwarded_rx) = watch::channel(0u64);
                 fence = Some(EventFence {
                     delivered: sub.delivered_counter(),
@@ -289,13 +351,52 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
         }
     }
 
-    // Teardown: stop forwarding events and abandon any in-flight prompt turns,
-    // then let the writer drain and exit once every outbound sender is gone.
+    // Teardown. Stop forwarding events — nobody is listening — but do NOT
+    // abandon in-flight prompt turns.
     if let Some(forwarder) = forwarder {
         forwarder.abort();
     }
+
+    // REQ-565 BR-2/AC-3, and the order here is the whole mechanism:
+    //
+    //   1. drop the client guard   → the count falls to zero and a shutdown arms
+    //   2. await the prompt tasks  → each holds an ActivityGuard(Turn), so the
+    //                                armed shutdown *defers* rather than commits
+    //   3. the last turn finishes  → its guard drops → the shutdown commits
+    //
+    // Awaiting before dropping the guard would never arm, and the deferral the
+    // event vocabulary must show would never happen.
+    //
+    // Until this REQ these turns were `abort()`ed, which killed the turn at
+    // whatever await point it had reached — so it never reached its
+    // `record_call` and its cost row was simply lost. A client closing its
+    // terminal mid-turn is exactly AC-3's scenario, and "the ledger row for that
+    // turn is intact" was false. The turn's *output* still goes nowhere (the
+    // writer half is gone by now); the durable row is the point.
+    drop(client_guard);
     for task in prompt_tasks {
-        task.abort();
+        if task.is_finished() {
+            continue;
+        }
+        // Bounded: a wedged turn must not hold the daemon open forever, which
+        // would reinstate the standing-resident-model harm by another route.
+        //
+        // The abort on timeout is load-bearing, not tidiness. Dropping a
+        // `JoinHandle` *detaches* the task rather than cancelling it, so a bare
+        // `timeout` would leave the turn running, its `ActivityGuard` held, and
+        // the daemon deferring forever — a bound that bounds nothing.
+        let abort = task.abort_handle();
+        if tokio::time::timeout(TURN_DRAIN_TIMEOUT, task)
+            .await
+            .is_err()
+        {
+            abort.abort();
+            eprintln!(
+                "tetond: a prompt turn did not finish within {}s of its client \
+                 disconnecting; abandoning it (its cost row may be missing)",
+                TURN_DRAIN_TIMEOUT.as_secs()
+            );
+        }
     }
     drop(out_tx);
     let _ = writer.await;
@@ -346,7 +447,19 @@ fn spawn_prompt_turn(
     let daemon = Arc::clone(daemon);
     let out = out_tx.clone();
 
+    // REQ-565 BR-2: the turn pins the daemon for its whole execution. Taken here
+    // rather than inside the task so the claim exists before `spawn` returns —
+    // a client that disconnects in the gap between the two would otherwise see
+    // an idle daemon and commit to exiting while this turn was still starting.
+    //
+    // Moved into the task, so it is released by `Drop` on every exit path the
+    // turn can take: normal completion, an error, a panic, or the teardown
+    // abort. A claim released only on the happy path would wedge the daemon
+    // alive on the unhappy ones.
+    let turn_guard = daemon.lifetime.activity(BlockingActivity::Turn);
+
     Some(tokio::spawn(async move {
+        let _turn_guard = turn_guard;
         let result = runtime
             .run_prompt_turn(
                 &events,
@@ -388,16 +501,19 @@ fn flatten_prompt(blocks: &[PromptBlock]) -> String {
     parts.join("\n")
 }
 
-/// Performs the handshake, and on success subscribes this client to the bus.
+/// Performs the handshake, and on success subscribes this client to the bus and
+/// counts it against the daemon's lifetime.
 ///
-/// Returns the new [`Subscription`] on success (so the caller can start the
-/// event forwarder), or `None` on failure (an error response has been queued).
+/// Returns the new [`Subscription`] and the client's lifetime claim on success
+/// (so the caller can start the event forwarder and hold the claim for the
+/// connection's life), or `None` on failure — an error response has been queued,
+/// and no claim was taken.
 fn do_handshake(
     daemon: &Daemon,
     id: Id,
     params: Value,
     out_tx: &mpsc::Sender<String>,
-) -> Option<Subscription> {
+) -> Option<(Subscription, crate::lifetime::ClientGuard)> {
     let params: HandshakeParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => {
@@ -416,6 +532,24 @@ fn do_handshake(
             let _ = out_tx.try_send(error_from(id, err.to_rpc_error()));
             return None;
         }
+    };
+
+    // REQ-565 BR-3, second arm. Admission is the last gate and it is atomic with
+    // the daemon's decision to exit: either this client is counted in (which
+    // *cancels* a pending shutdown — the first arm) or the daemon has already
+    // committed and refuses. There is deliberately no third outcome, and no
+    // window in which a committed daemon accepts a session it will not serve.
+    //
+    // Placed after negotiation so a version-incompatible client still gets its
+    // version diagnosis rather than a shutdown notice that would send it off to
+    // restart a daemon whose version was never the problem.
+    let Some(client_guard) = daemon.lifetime.admit() else {
+        let _ = out_tx.try_send(error_string(
+            id,
+            error_code::DAEMON_SHUTTING_DOWN,
+            "the daemon is shutting down; start a new one and retry",
+        ));
+        return None;
     };
 
     // Announce the attach to clients already subscribed, *before* subscribing
@@ -454,7 +588,7 @@ fn do_handshake(
             .publish(None, Event::ModelLifecycle(lifecycle));
     }
 
-    Some(subscription)
+    Some((subscription, client_guard))
 }
 
 /// Dispatches a post-handshake request to its typed handler, returning the
@@ -595,7 +729,14 @@ fn handle_model_set(daemon: &Daemon, id: Id, params: Value) -> String {
                 && !daemon.runtime.consent().install_in_flight(&params.name)
             {
                 let runtime = Arc::clone(&daemon.runtime);
+                // REQ-565 BR-2: the install pins the daemon for its whole
+                // duration — download, verify, load, benchmark (ADR-006 holds
+                // one claim across all four). This is the 17 GB case the rule
+                // names explicitly: a user who kicks off an install and then
+                // closes the terminal must not have it killed mid-flight.
+                let install_guard = daemon.lifetime.activity(BlockingActivity::ModelDownload);
                 tokio::spawn(async move {
+                    let _install_guard = install_guard;
                     runtime.install_selected_model().await;
                 });
             }

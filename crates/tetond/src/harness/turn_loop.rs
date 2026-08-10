@@ -35,7 +35,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
-use teton_protocol::events::{Event, SessionUpdate, SessionUpdatePayload, ToolCallStatus};
+use teton_protocol::events::{
+    Event, PrefixCache, SessionUpdate, SessionUpdatePayload, ToolCallStatus,
+};
 use teton_protocol::methods::StopReason;
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::{BlockDetail, HarnessProfile, ProviderError, ToolCall};
@@ -293,11 +295,31 @@ impl SessionEvents {
         Self { bus, session_id }
     }
 
+    /// The session these events are scoped to.
+    ///
+    /// Exposed so the local completion source can key the prefix cache by the
+    /// same session the events are attributed to (REQ-564) — one identity, not
+    /// two that could drift.
+    #[must_use]
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     fn emit(&self, update: SessionUpdatePayload) {
         self.bus.publish(
             Some(self.session_id.clone()),
             Event::SessionUpdate(SessionUpdate { update }),
         );
+    }
+
+    /// Publish this turn's prefix-cache outcome (REQ-564).
+    ///
+    /// A narrow typed emitter rather than a public accessor on the bus: the
+    /// session attribution stays owned by this type, so a caller cannot publish
+    /// a cache event against the wrong session.
+    pub fn prefix_cache(&self, cache: PrefixCache) {
+        self.bus
+            .publish(Some(self.session_id.clone()), Event::PrefixCache(cache));
     }
 
     fn agent_message(&self, text: &str) {
@@ -371,7 +393,11 @@ pub async fn run_session_turn(
     // another session's inference (LESSON-448). The daemon's engine slot
     // stores the format beside the handle; tests pass the format their test
     // engine reports.
-    let mut source = LocalEngineSource::new(Arc::clone(engine), format);
+    // The cache key is the session these events are already scoped to, read
+    // off `events` rather than passed separately so the prefix cache and the
+    // event attribution cannot name two different sessions (REQ-564).
+    let mut source =
+        LocalEngineSource::new(Arc::clone(engine), format, events.session_id().clone());
     // The local tier names itself here, as it does everywhere the tier comes from
     // the engine rather than from a `[[providers]]` entry (REQ-557 ADR-D).
     let digest = DutyRoute::local(DIGEST_DUTY, "local", Arc::clone(engine));
@@ -509,8 +535,16 @@ pub async fn run_session_turn_with_source(
             text,
             decision,
             dropped_calls,
+            cache,
             ..
         } = produced;
+        // Exactly one prefix-cache event per local turn, emitted here on the
+        // async side from what the completion reported (REQ-564). A remote turn
+        // carries `None` — no local KV exists to hit or miss, which is not the
+        // same claim as a miss.
+        if let Some(cache) = cache {
+            events.prefix_cache(cache);
+        }
         // A held tail is the final answer only on an end-of-turn; on a tool
         // call (or malformed call) it is the JSON itself and stays hidden.
         if let Some(tail) = stream_gate.finish(matches!(decision, TurnDecision::EndTurn { .. })) {
@@ -1031,6 +1065,7 @@ mod tests {
                 },
                 usage: TokenUsage::default(),
                 dropped_calls: 0,
+                cache: None,
             })
         }
     }
@@ -1098,6 +1133,7 @@ mod tests {
                 decision,
                 usage: TokenUsage::default(),
                 dropped_calls: 0,
+                cache: None,
             })
         }
     }
@@ -1651,6 +1687,7 @@ mod tests {
                 decision,
                 usage: TokenUsage::default(),
                 dropped_calls: 0,
+                cache: None,
             })
         }
     }

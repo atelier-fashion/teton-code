@@ -315,11 +315,11 @@ impl Engine for LoggingEngine {
                 break;
             }
         }
-        Ok(Completion {
+        Ok(Completion::cold(
             text,
-            prompt_tokens: u32::try_from(prompt.len() / 4).unwrap_or(u32::MAX),
+            u32::try_from(prompt.len() / 4).unwrap_or(u32::MAX),
             completion_tokens,
-        })
+        ))
     }
 }
 

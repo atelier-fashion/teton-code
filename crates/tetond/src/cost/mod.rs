@@ -130,6 +130,29 @@ pub trait CostMeter: Send + Sync {
     ) -> TransportResponse;
 }
 
+/// A sink for **local-tier** usage rows (REQ-564 BR-9).
+///
+/// The remote tier records itself at the egress choke point, which every remote
+/// call already flows through. The local tier flows through no such seam — it is
+/// transport-free by construction — so it needs its own narrow sink, abstracted
+/// for the same reasons [`CostEventSink`] is: the harness must not depend on the
+/// concrete ledger, and tests need to capture what was recorded.
+pub trait LocalUsageMeter: Send + Sync {
+    /// Record one completed local call.
+    ///
+    /// `cached_tokens` is a component of `input_tokens`, not a substitute for
+    /// part of it. Best-effort by contract: a ledger failure must never fail a
+    /// turn, so this returns nothing.
+    fn local_call(
+        &self,
+        session_id: &SessionId,
+        attribution: &CostAttribution,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    );
+}
+
 /// A sink for the `cost_recorded` event emitted as each row is written.
 ///
 /// Abstracted so the ledger does not depend on the concrete daemon event bus

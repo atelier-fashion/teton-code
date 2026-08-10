@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS cost_records (
     model          TEXT    NOT NULL,
     input_tokens   INTEGER NOT NULL,
     output_tokens  INTEGER NOT NULL,
-    usd_micros     INTEGER
+    usd_micros     INTEGER,
+    cached_tokens  INTEGER
 );
 CREATE TRIGGER IF NOT EXISTS cost_records_no_update
     BEFORE UPDATE ON cost_records
@@ -127,16 +128,54 @@ CREATE TRIGGER IF NOT EXISTS web_overrides_no_delete
 /// does reach an existing file, which is how REQ-563's `web_lookups` arrives on
 /// a `cost.db` written before it existed. Only a new column on a table that is
 /// already there is invisible to the schema batch.
-const ADDITIVE_COLUMNS: [(&str, &str); 1] = [(
-    // REQ-558: the routing category the call was made for.
-    "category",
-    "ALTER TABLE cost_records ADD COLUMN category TEXT",
-)];
+const ADDITIVE_COLUMNS: [(&str, &str); 2] = [
+    (
+        // REQ-558: the routing category the call was made for.
+        "category",
+        "ALTER TABLE cost_records ADD COLUMN category TEXT",
+    ),
+    (
+        // REQ-564: prompt tokens whose KV was reused from the resident prefix.
+        // Nullable and never backfilled: a remote row has no prefix cache, and a
+        // row written before this column existed predates the concept — which is
+        // the truth about it, not a zero.
+        "cached_tokens",
+        "ALTER TABLE cost_records ADD COLUMN cached_tokens INTEGER",
+    ),
+];
 
 /// How many trailing bytes of one chunk the usage scanner carries into the next,
 /// so a usage key or its number split across a chunk boundary is still matched.
 /// Comfortably larger than the longest key plus a token count.
 const CARRY_BYTES: usize = 64;
+
+impl super::LocalUsageMeter for CostLedger {
+    fn local_call(
+        &self,
+        session_id: &teton_protocol::SessionId,
+        attribution: &CostAttribution,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    ) {
+        // Best-effort by contract: a ledger hiccup must never fail a turn the
+        // user already received an answer for. The failure is logged, not
+        // swallowed silently (LESSON-456).
+        if let Err(err) = self.record_local_call(
+            session_id.0.clone(),
+            attribution,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        ) {
+            // The turn already happened; a ledger that could not be written is
+            // an accounting failure, not a reason to fail it. The line names the
+            // failure class and no part of the prompt (LedgerError is
+            // content-free by construction).
+            eprintln!("teton: a local turn could not be recorded in the cost ledger ({err})");
+        }
+    }
+}
 
 /// A failure interacting with the ledger store.
 ///
@@ -177,6 +216,16 @@ pub struct LedgerRow {
     /// **unpriced** (BR-2: never guessed). The report's source of truth for the
     /// priced/unpriced split.
     pub usd_micros: Option<i64>,
+    /// Prompt tokens whose KV was reused from the resident prefix (REQ-564
+    /// BR-9), or `None` for a call with no prefix cache.
+    ///
+    /// `None` on every remote row — a remote provider has no local KV, so
+    /// "no cache" is the fact, not "nothing was reused". A *local* row records
+    /// `Some(0)` on a miss, which is the different claim that a cache existed
+    /// and did not serve. `cached_tokens` is a **component of**
+    /// `input_tokens`, never a substitute: the prompt is still that many tokens
+    /// whether or not their KV had to be recomputed.
+    pub cached_tokens: Option<u64>,
 }
 
 impl LedgerRow {
@@ -197,6 +246,7 @@ impl LedgerRow {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             usd_micros: self.usd_micros.unwrap_or(0),
+            cached_tokens: self.cached_tokens,
         }
     }
 }
@@ -364,6 +414,50 @@ impl CostLedger {
             input_tokens,
             output_tokens,
             usd_micros,
+            // A remote provider has no local KV: "no cache" rather than
+            // "nothing reused".
+            cached_tokens: None,
+        })
+    }
+
+    /// Append a **local-tier** usage row (REQ-564 BR-9).
+    ///
+    /// Local inference is a usage record, not a spend record. The model is
+    /// absent from the price table, so [`Prices::price`] returns `None` and the
+    /// row is recorded **unpriced** — deliberately not `Some(0)`, which would
+    /// tell the meter that a call was priced and cost nothing. Unpriced is the
+    /// truth and keeps the report's priced/unpriced split honest.
+    ///
+    /// A sibling of [`CostLedger::record_call`] rather than a widened signature:
+    /// every remote caller would otherwise have to pass a `None` that can only
+    /// ever be `None`.
+    ///
+    /// # Errors
+    /// [`LedgerError`] if the insert fails or the mutex is poisoned.
+    pub fn record_local_call(
+        &self,
+        session_id: impl Into<String>,
+        attribution: &CostAttribution,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    ) -> Result<(), LedgerError> {
+        let usd_micros = self
+            .prices
+            .price(&attribution.model, input_tokens, output_tokens);
+        self.record(LedgerRow {
+            session_id: session_id.into(),
+            phase: attribution.phase,
+            category: attribution.category,
+            // The local tier names itself here, as it does everywhere the tier
+            // comes from the engine rather than a `[[providers]]` entry
+            // (REQ-557 ADR-D).
+            provider_id: "local".to_owned(),
+            model: attribution.model.clone(),
+            input_tokens,
+            output_tokens,
+            usd_micros,
+            cached_tokens: Some(cached_tokens),
         })
     }
 
@@ -375,7 +469,7 @@ impl CostLedger {
         let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
         let mut stmt = guard.prepare(
             "SELECT session_id, phase, category, provider_id, model,
-                    input_tokens, output_tokens, usd_micros
+                    input_tokens, output_tokens, usd_micros, cached_tokens
              FROM cost_records ORDER BY id",
         )?;
         let rows = stmt
@@ -391,6 +485,7 @@ impl CostLedger {
                     input_tokens: to_u64(r.get::<_, i64>(5)?),
                     output_tokens: to_u64(r.get::<_, i64>(6)?),
                     usd_micros: r.get(7)?,
+                    cached_tokens: r.get::<_, Option<i64>>(8)?.map(to_u64),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -656,6 +751,8 @@ impl MeteredBody {
             input_tokens: usage.input,
             output_tokens: usage.output,
             usd_micros,
+            // The metered stream is the remote choke point; no local KV here.
+            cached_tokens: None,
         };
         // Best-effort: never let a ledger hiccup break the response stream.
         let _ = insert_and_emit(&self.conn, self.sink.as_ref(), &row);
@@ -818,8 +915,8 @@ fn insert_and_emit(
         guard.execute(
             "INSERT INTO cost_records
                (recorded_at_ms, session_id, phase, category, provider_id, model,
-                input_tokens, output_tokens, usd_micros)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                input_tokens, output_tokens, usd_micros, cached_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 now_ms(),
                 row.session_id,
@@ -830,6 +927,7 @@ fn insert_and_emit(
                 to_i64(row.input_tokens),
                 to_i64(row.output_tokens),
                 row.usd_micros,
+                row.cached_tokens.map(to_i64),
             ],
         )?;
     }
@@ -1203,6 +1301,10 @@ CREATE TRIGGER cost_records_no_delete
         assert_eq!(rows[0].session_id, "old-session");
         assert_eq!(rows[0].phase, Some(Phase::Review));
         assert_eq!(rows[0].category, None, "a pre-REQ row has no category");
+        assert_eq!(
+            rows[0].cached_tokens, None,
+            "a pre-REQ row predates the prefix cache — None is the truth about              it, not zero"
+        );
         assert_eq!(rows[0].input_tokens, 900);
         assert_eq!(rows[0].usd_micros, Some(42));
 
@@ -1580,6 +1682,60 @@ CREATE TRIGGER cost_records_no_delete
             .expect("append after the table arrives");
         assert_eq!(ledger.all_web_overrides().expect("read").len(), 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// BR-9: a local turn is a **usage** record, not a spend record.
+    ///
+    /// `usd_micros` must be `None` (unpriced), never `Some(0)`. The difference
+    /// is not cosmetic: `Some(0)` tells the meter a call was priced and cost
+    /// nothing, which would quietly report every local turn as free spend
+    /// rather than as spend that was never priced at all.
+    #[test]
+    fn a_local_turn_is_recorded_unpriced_with_its_cached_token_count() {
+        let (ledger, _sink) = ledger();
+        ledger
+            .record_local_call(
+                "s1",
+                &CostAttribution::new("qwen2.5-coder-3b"),
+                16_000,
+                120,
+                15_872,
+            )
+            .expect("record a local turn");
+
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_id, "local");
+        assert_eq!(rows[0].model, "qwen2.5-coder-3b");
+        assert_eq!(
+            rows[0].usd_micros, None,
+            "a local model is absent from the price table, so the row is \
+             unpriced — not priced at zero"
+        );
+        assert_eq!(rows[0].cached_tokens, Some(15_872));
+        assert_eq!(
+            rows[0].input_tokens, 16_000,
+            "cached tokens are a COMPONENT of the prompt, never a deduction \
+             from it"
+        );
+    }
+
+    /// A remote row carries `None`, not `Some(0)`: a remote provider has no
+    /// local KV, so "no cache exists" is the fact — reporting zero reused
+    /// tokens would imply one existed and served nothing.
+    #[test]
+    fn a_remote_row_has_no_cached_token_count_at_all() {
+        let (ledger, _sink) = ledger();
+        ledger
+            .record_call(
+                "s1",
+                "anthropic",
+                &CostAttribution::new("claude-opus-4"),
+                10,
+                20,
+            )
+            .expect("record a remote call");
+        assert_eq!(ledger.all_records().expect("read")[0].cached_tokens, None);
     }
 
     #[test]

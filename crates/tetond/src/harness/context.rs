@@ -1512,11 +1512,11 @@ mod tests {
             _on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<teton_inference::Completion, teton_inference::EngineError> {
             self.seen.lock().expect("seen poisoned").push(prompt.len());
-            Ok(teton_inference::Completion {
-                text: "SUMMARY".to_owned(),
-                prompt_tokens: 1,
-                completion_tokens: 1,
-            })
+            Ok(teton_inference::Completion::cold(
+                "SUMMARY".to_owned(),
+                1,
+                1,
+            ))
         }
     }
 
@@ -1588,11 +1588,11 @@ mod tests {
                 .lock()
                 .expect("seen poisoned")
                 .push(prompt.to_owned());
-            Ok(teton_inference::Completion {
-                text: self.response.clone(),
-                prompt_tokens: 1,
-                completion_tokens: 1,
-            })
+            Ok(teton_inference::Completion::cold(
+                self.response.clone(),
+                1,
+                1,
+            ))
         }
         fn chat_format(&self) -> teton_inference::ChatFormat {
             self.format

@@ -203,6 +203,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             usd_micros,
+            cached_tokens: None,
         }
     }
 

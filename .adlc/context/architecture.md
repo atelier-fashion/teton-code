@@ -87,6 +87,19 @@
   accounting are properties of the seam rather than of each caller. A tool that
   reaches the network is handed transport; it never constructs one, and the
   tree-wide `deny_http_client` check keeps that mechanical.
+- **Policy is pure, mechanism is gated** — when a subsystem's interesting logic
+  sits behind a non-default cargo feature CI never compiles, the *decision* is
+  extracted into a feature-free module over plain data and the gated module is
+  left holding only FFI. Otherwise the subtlest code in the tree ships with the
+  least coverage. The test double must consume that same extracted policy, not
+  a reimplementation — a double with its own copy of the rule tests only that
+  two implementations share each other's bugs (REQ-564, LESSON-499).
+- **A foreign handle that is both borrowed and `!Send` wants a thread** — those
+  two constraints together are the callee describing its ownership model, not
+  two obstacles to route around with `unsafe impl Send` and a lifetime erasure.
+  Give the parent and child one owned thread and a channel; the borrow becomes
+  an ordinary stack borrow, `Send` stops being a question, and drop order is
+  compiler-checked rather than commented (REQ-564, LESSON-498).
 - **Adapter degradation** — providers with weak tool-calling get a reduced
   harness profile (smaller tool set, shorter loops, mandatory verification)
   rather than the full loop (BR-6).

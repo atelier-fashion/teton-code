@@ -1,7 +1,7 @@
 ---
 id: REQ-564
 title: "Persistent llama context: prefix-cached KV across agent turns"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-09
 updated: 2026-08-10
@@ -28,9 +28,10 @@ create/destroy cycles in the daemon log; a single user question drove an
 redundant prefill. This is the single largest local-tier latency lever
 (charter BR-8 latency duty).
 
-Goal: within a session, a turn whose rendered prompt extends the previous
-turn's prompt prefills **only the new suffix**, reusing the resident KV for the
-shared prefix. Reuse is a pure optimization: any divergence falls back to a
+Goal: within a session, a turn whose rendered prompt shares a token prefix
+with the previous turn's prompt prefills **only what changed**, reusing the
+resident KV for the common prefix. Reuse is a pure optimization: it never
+crosses a divergence point, and a turn with no reusable prefix falls back to a
 full cold prefill.
 
 ## System Model
@@ -48,80 +49,91 @@ full cold prefill.
 
 | Event | Trigger | Payload |
 |-------|---------|---------|
-| prefix_cache_hit | new turn's token stream extends the cached prefix | session_id, cached_tokens (count reused), new_tokens (count prefilled) |
-| prefix_cache_miss | no cache, divergent prompt, different session, or evicted | session_id, reason (cold \| divergent \| session_switch \| evicted), processed_tokens |
+| prefix_cache_hit | new turn's token stream shares a non-empty prefix with the cached prefix | session_id, cached_tokens (count reused), new_tokens (count prefilled), divergent (true iff reuse was capped by a token disagreement, not by prompt length) |
+| prefix_cache_miss | no cache, divergence at token zero, different session, or evicted | session_id, reason (cold \| divergent \| session_switch \| evicted), processed_tokens |
 | prefix_cache_evicted | memory pressure, engine unload/swap, or session end | session_id, reason |
 
 ## Business Rules
 
-- [ ] BR-1: **Correctness is observable-identical.** With identical prompt,
+- [x] BR-1: **Correctness is observable-identical.** With identical prompt,
   params, and sampling seed, generation output with the cache enabled is
   byte-identical to a cold fresh-context generation. Prefix reuse must never be
   observable in output, only in latency.
-- [ ] BR-2: **Reuse only on exact token-prefix extension.** A turn reuses
-  cached KV only when its tokenized prompt starts with the cached
-  `token_prefix` exactly (token-level comparison, not string-level). Any
-  divergence — context compaction/truncation rewrote history, template change,
-  session switch — falls back to a full cold prefill from position zero; never
-  partial reuse past a divergence point. (informed by LESSON-447)
-- [ ] BR-3: **Bounded memory: one cache slot.** At most one persistent context
+- [x] BR-2: **Reuse the longest common token prefix; never reuse past it.**
+  A turn reuses cached KV for exactly the longest common prefix of its
+  tokenized prompt and the cached `token_prefix` (token-level comparison, not
+  string-level), and prefills everything from the first disagreeing position
+  onward. KV at or past a divergence point is never reused — the comparison is
+  over a contiguous head, so it can never skip a disagreement. A turn whose
+  common prefix is empty (divergence at token zero, session switch, nothing
+  resident) falls back to a full cold prefill from position zero. A hit whose
+  reuse was capped by a token disagreement — rather than by prompt length —
+  carries a `divergent` marker so history rewrites (compaction, BUG-147
+  fabrication cuts) stay measurable. (informed by LESSON-447; **amended
+  2026-08-10** — originally all-or-nothing exact-extension reuse, revised per
+  verify finding L-1: fabrication-cut turns, the motivating workload, diverge
+  mid-stream every time and were paying full cold prefills)
+- [x] BR-3: **Bounded memory: one cache slot.** At most one persistent context
   exists per loaded engine (the most recently used session). A session switch
   rebuilds the cache; KV memory never exceeds the single already-reserved
   context envelope. No per-session KV accumulation.
-- [ ] BR-4: **Eviction is safe and silent-degrading, loud-reporting.** Under
+- [x] BR-4: **Eviction is safe and silent-degrading, loud-reporting.** Under
   the existing runtime memory-pressure adaptation, the cached context is
   dropped before the engine is; a dropped cache must never fail a turn — the
   next turn cold-prefills — and the eviction is reported via the
   `prefix_cache_evicted` event, never silently. (informed by LESSON-447)
-- [ ] BR-5: **Duty calls do not evict the agent cache.** Non-agent-turn
+- [x] BR-5: **Duty calls do not evict the agent cache.** Non-agent-turn
   purposes (summarize, classify, redaction duties) must not destroy the active
   session's cached agent context. How they are served (own small context,
   cold path, or other) is an architecture decision; the constraint is that a
   duty call between two agent turns leaves the second turn's cache hit intact.
-- [ ] BR-6: **Blocking-pool discipline is preserved.** All cache probing,
+- [x] BR-6: **Blocking-pool discipline is preserved.** All cache probing,
   prefill, and decode still run inside `spawn_blocking` on the owned engine
   handle; no tokio worker is ever parked on inference. The invariant pinned by
   `tests/nonblocking_inference.rs` continues to hold. (informed by LESSON-448)
-- [ ] BR-7: **The over-window guard survives the fast path.** The typed
+- [x] BR-7: **The over-window guard survives the fast path.** The typed
   refusal of over-budget prompts (which prevents llama.cpp's `GGML_ASSERT`
   abort) runs on the rendered, tokenized prompt on **both** the hit and miss
   paths — enforcement stays at the last transform before the FFI call.
   (informed by LESSON-444, LESSON-491)
-- [ ] BR-8: **Misses tell the truth.** Every miss carries its actual reason
+- [x] BR-8: **Misses tell the truth.** Every miss carries its actual reason
   (cold / divergent / session_switch / evicted); a divergence must never be
   reported as an error, and an error must never be masked as a miss.
   (informed by BUG-146, BUG-152)
-- [ ] BR-9: **Cost attribution distinguishes reused from processed tokens.**
+- [x] BR-9: **Cost attribution distinguishes reused from processed tokens.**
   The cost ledger's local-call records gain a cached-tokens count alongside
   processed tokens, so the cost meter and future perf work can compute hit
   rates from recorded data.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: In a scripted 5-turn agent session (e2e harness, scripted engine or
+- [x] AC-1 (scripted; real-model leg is the dogfood run in
+  `docs/manual-verification.md`, NOT RUN): In a scripted 5-turn agent session (e2e harness, scripted engine or
   real small model), turns 2–5 each emit `prefix_cache_hit` and prefill only
   the suffix: instrumented processed-token counts equal the per-turn delta,
   not the full prompt length.
-- [ ] AC-2: A/B correctness test: a scripted multi-turn session with fixed
+- [x] AC-2: A/B correctness test: a scripted multi-turn session with fixed
   seed produces byte-identical outputs with the cache enabled vs disabled
   (BR-1).
-- [ ] AC-3: Divergence test: a turn following a context compaction/truncation
-  emits `prefix_cache_miss` with reason `divergent` and produces correct
-  output via full re-prefill (BR-2).
-- [ ] AC-4: Interleaved-session test: two sessions alternating turns produce
+- [x] AC-3: Divergence test: a turn following a context compaction/truncation
+  reuses the common head — it emits `prefix_cache_hit` with `divergent: true`
+  and `cached_tokens` equal to the agreement length — and produces correct
+  output; a turn diverging at the first token emits `prefix_cache_miss` with
+  reason `divergent` and re-prefills from zero (BR-2, as amended).
+- [x] AC-4: Interleaved-session test: two sessions alternating turns produce
   correct outputs for both; cache thrash is permitted, wrong output is not
   (BR-3).
-- [ ] AC-5: Eviction test: with the cache populated, a simulated memory
+- [x] AC-5: Eviction test: with the cache populated, a simulated memory
   pressure signal drops it (`prefix_cache_evicted` emitted); the next turn
   succeeds cold (BR-4).
-- [ ] AC-6: Duty-interleave test: an agent turn, then a summarize duty call,
+- [x] AC-6: Duty-interleave test: an agent turn, then a summarize duty call,
   then a second agent turn — the second agent turn is a cache hit (BR-5).
-- [ ] AC-7: `tests/nonblocking_inference.rs` passes unchanged: unrelated RPCs
+- [x] AC-7: `tests/nonblocking_inference.rs` passes unchanged: unrelated RPCs
   complete while a gated cached-path generation is in flight (BR-6).
-- [ ] AC-8: Over-window test: a prompt exceeding the window is refused with
+- [x] AC-8: Over-window test: a prompt exceeding the window is refused with
   the typed error on the hit path as well as the miss path, with no process
   abort (BR-7).
-- [ ] AC-9: Ledger rows for local calls carry cached vs processed token
+- [x] AC-9: Ledger rows for local calls carry cached vs processed token
   counts, and the summed counts across AC-1's session match the
   instrumentation (BR-9).
 
@@ -133,11 +145,14 @@ full cold prefill.
 
 ## Assumptions
 
-- `llama-cpp-2` 0.1.151 exposes the KV-cache sequence operations needed to
-  retain a context and clear/rewind past a token offset. If it does not, a
-  binding upgrade becomes an external dependency — verify at architecture
-  time before task breakdown. (informed by LESSON-453 — verify the callee's
-  contract, don't assume it)
+- ~~`llama-cpp-2` 0.1.151 exposes the KV-cache sequence operations needed to
+  retain a context and clear/rewind past a token offset.~~ **VALIDATED at
+  architecture time (2026-08-10)**: `clear_kv_cache_seq(seq, p0, p1)`,
+  `clear_kv_cache()` and `kv_cache_seq_pos_max()` are all present on
+  `LlamaContext`. No binding upgrade needed; "no new external dependencies"
+  holds. What the check *did* surface is that `LlamaContext` is `!Send` and
+  lifetime-bound to the model — see architecture D-1. (informed by LESSON-453 —
+  verify the callee's contract, don't assume it)
 - Prompt rendering is deterministic turn-over-turn absent new content (same
   template arm, same neutralization), so real sessions produce genuine prefix
   extensions. The REQ-554 render pipeline gives no reason to doubt this, but

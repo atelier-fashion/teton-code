@@ -416,11 +416,7 @@ pub(crate) mod test_support {
             _on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<Completion, EngineError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Completion {
-                text: self.reply.clone(),
-                prompt_tokens: 0,
-                completion_tokens: 1,
-            })
+            Ok(Completion::cold(self.reply.clone(), 0, 1))
         }
     }
 }

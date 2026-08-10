@@ -11,6 +11,15 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// How long [`SingleInstance::acquire_within`] waits for a predecessor to
+/// finish releasing the lock before concluding another daemon is genuinely
+/// live (REQ-565 D-6).
+pub const DEFAULT_ACQUIRE_WINDOW: Duration = Duration::from_secs(5);
+
+/// How often the wait re-attempts inside that window.
+const RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 /// RAII guard proving this process holds the single-instance lock.
 ///
@@ -57,6 +66,42 @@ impl SingleInstance {
             _ => Err(err),
         }
     }
+
+    /// [`Self::acquire`], retried until `window` elapses (REQ-565 D-6).
+    ///
+    /// # Why a successor has to wait
+    ///
+    /// Exit-on-last-client puts a *departing* daemon and an *arriving* one in
+    /// the same instant. The departing one holds this lock until after it has
+    /// unlinked the socket — that ordering is what stops a racing autostart
+    /// from finding a stale socket (BR-3) — but it also means a successor
+    /// spawned during that teardown sees `EWOULDBLOCK`.
+    ///
+    /// Without a wait, that successor prints "already running" and exits 0,
+    /// after which the CLI polls a socket path that nobody will ever bind and
+    /// reports "could not reach the daemon after autostart". The user sees a
+    /// failure caused entirely by good timing.
+    ///
+    /// A predecessor mid-teardown is transient by construction, so waiting for
+    /// it costs milliseconds. A daemon that is genuinely alive still yields
+    /// "already running", just `window` later — and in that case the CLI's
+    /// *first* connect would have succeeded, so this slow path is unreachable
+    /// on the common route.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error if the lock file cannot be created or `flock` fails
+    /// for a reason other than the lock being held.
+    pub fn acquire_within(lock_path: &Path, window: Duration) -> io::Result<Option<Self>> {
+        let deadline = Instant::now() + window;
+        loop {
+            match Self::acquire(lock_path)? {
+                Some(instance) => return Ok(Some(instance)),
+                None if Instant::now() < deadline => std::thread::sleep(RETRY_INTERVAL),
+                None => return Ok(None),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -69,14 +114,27 @@ mod tests {
     /// description get out of the way. See [`acquire_within`].
     const RELEASE_WINDOW: Duration = Duration::from_secs(2);
 
+    /// A lock path no other test in this binary can be handed.
+    ///
+    /// The counter is not belt-and-braces. `SystemTime::now()` is not
+    /// guaranteed to advance between two calls — its granularity is coarser
+    /// than a nanosecond on macOS — so two tests calling this from different
+    /// threads inside one tick used to receive the *same* path, and then
+    /// genuinely contended for one lock. That reads as a flaky
+    /// "acquire returned None" in whichever test lost, which is a bug in the
+    /// fixture masquerading as a bug in the code under test. A monotonic
+    /// counter makes the path unique by construction rather than by timing.
     fn temp_lock() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "teton-lock-{}-{}.lock",
+            "teton-lock-{}-{}-{}.lock",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
         ))
     }
 
@@ -140,6 +198,80 @@ mod tests {
         );
 
         drop(third);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // acquire_within — REQ-565 D-6
+    // -----------------------------------------------------------------------
+
+    /// The successor case. A predecessor still finishing its teardown holds the
+    /// lock for a moment; without the wait, the successor would report "already
+    /// running" and exit, leaving the CLI polling a socket nobody will bind.
+    #[test]
+    fn a_successor_wins_the_lock_once_a_departing_predecessor_releases_it() {
+        let path = temp_lock();
+        let predecessor = SingleInstance::acquire(&path).unwrap();
+        assert!(predecessor.is_some());
+
+        // Release it shortly, as a teardown would.
+        let releaser = {
+            let predecessor = predecessor;
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                drop(predecessor);
+            })
+        };
+
+        let started = Instant::now();
+        let successor = SingleInstance::acquire_within(&path, Duration::from_secs(5))
+            .expect("acquiring must not error");
+        assert!(
+            successor.is_some(),
+            "the successor must get the lock once the predecessor releases it"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the successor should have waited rather than succeeding instantly"
+        );
+
+        releaser.join().unwrap();
+        drop(successor);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The wait must not turn a genuinely live daemon into a second one. A
+    /// holder that never lets go still yields "already running" — just later.
+    #[test]
+    fn a_lock_that_is_never_released_still_reports_already_running() {
+        let path = temp_lock();
+        let held = SingleInstance::acquire(&path).unwrap();
+        assert!(held.is_some());
+
+        let second = SingleInstance::acquire_within(&path, Duration::from_millis(150))
+            .expect("acquiring must not error");
+        assert!(
+            second.is_none(),
+            "a live holder must still be reported as already running"
+        );
+
+        drop(held);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A free lock costs nothing — the wait is a fallback, not a delay on the
+    /// common path (every ordinary autostart takes this branch).
+    #[test]
+    fn an_uncontended_lock_is_acquired_without_waiting() {
+        let path = temp_lock();
+        let started = Instant::now();
+        let instance = SingleInstance::acquire_within(&path, Duration::from_secs(5)).unwrap();
+        assert!(instance.is_some());
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "an uncontended acquire must not pay the retry window"
+        );
+        drop(instance);
         let _ = std::fs::remove_file(&path);
     }
 }

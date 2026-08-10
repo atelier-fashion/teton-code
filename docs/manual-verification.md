@@ -780,3 +780,79 @@ count either way; a number here is the only evidence the model call earns its
 latency.
 
 **Status: NOT RUN.** No sign-off block below, because nobody has executed it.
+
+---
+
+## REQ-564 — persistent llama context (prefix-cached KV)
+
+REQ-564's policy, plumbing, window guard and accounting are all covered by
+`crates/tetond/tests/prefix_cache_session.rs`, which runs the **same**
+`PrefixCacheState` and the **same** `over_window` guard the real engine runs.
+One claim is left over, and it is the claim the whole REQ exists for.
+
+### Not automated: that llama.cpp actually reuses the KV
+
+**What is uncovered.** Everything below the trait. The `llama` cargo feature is
+non-default and CI never compiles it, so no automated run in this repository
+links llama.cpp at all. The acceptance suite proves that *when an engine reports
+a hit, the harness prefills only the suffix, reports the split honestly, and
+records it* — it cannot prove that truncating the KV at `clear_kv_cache_seq` and
+decoding from position `reuse` produces the same logits as a full prefill,
+because nothing in a default build ever calls those functions.
+
+Reading a green suite as "prefix reuse works" is exactly the overclaim
+LESSON-448 names: a fast test double proving a latency property it could not
+observe.
+
+**The baseline.** The requirement's own measurement, 2026-08-09 dogfooding on an
+M5 Max with the 17 GB model: **211 context create/destroy cycles** in the daemon
+log, and a single user question driving an 11-generation agent loop that took
+over five minutes of wall time, most of it redundant prefill.
+
+**Procedure.**
+
+1. Build the workspace first — *not* a targeted test target. A
+   `-p teton --test …` run does not rebuild `tetond`, so the CLI would drive a
+   stale daemon and the measurement would describe the old binary:
+   ```
+   cargo build --workspace --features tetond/llama
+   ```
+2. Start a daemon with a real model on the large band and note its log path.
+3. Run one multi-turn agent session — at least five turns that build on each
+   other, so each turn's prompt genuinely extends the previous one. A session of
+   unrelated one-shot questions is not a test of this feature.
+4. Record, from the daemon log and the `prefix_cache` events:
+   - context create/destroy cycles for the session (the 211-cycle number's
+     successor);
+   - per-turn `cached_tokens`, `new_tokens` and `divergent` on each
+     `prefix_cache_hit`. A `divergent: true` hit is a turn whose history was
+     rewritten mid-stream — on a weak model that is usually a BUG-147
+     fabrication cut — reusing the kept head and re-prefilling the tail (BR-2
+     as amended 2026-08-10). A fabricating session should show divergent
+     *hits* with non-zero `cached_tokens`, not `divergent` *misses*; a run
+     full of `divergent` misses means the pre-amendment all-or-nothing rule is
+     somehow back;
+   - wall time for the whole session, against the >5 minute baseline.
+5. Confirm correctness alongside the latency: the answers must be coherent
+   across turns. A cache bug that reuses a wrong offset shows up as an
+   answer that drifts or repeats, not as an error.
+6. Note the **duty interleave** in the same run: a `summarize` or `triage` duty
+   between two agent turns must not turn the following agent turn into a miss
+   (BR-5). Grep the events for a `miss` whose reason is `evicted` or
+   `session_switch` immediately after a duty — that is the failure this looks
+   for.
+
+**What a failure looks like.** Cycles roughly unchanged from 211 means the
+policy is deciding "hit" and the mechanism is not delivering — check that the
+recorded prefix includes the generated tokens, not just the prompt. Coherent
+counts with incoherent answers means the reuse offset and the KV disagree, which
+is the correctness bug the offset arithmetic exists to avoid.
+
+**Also worth measuring while you are there.** Peak RSS during a duty call. With
+the cache resident, a duty's own throwaway context coexists with the agent's, so
+peak KV is two contexts rather than one (~1.5 GiB each at `n_ctx` 16384). The
+architecture accepts this as bounded and transient with eviction as the
+compensating control; a number here would tell us whether sizing duty contexts
+to their own budgets should be promoted from follow-up to urgent.
+
+**Status: NOT RUN.** No sign-off block below, because nobody has executed it.
