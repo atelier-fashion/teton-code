@@ -244,6 +244,20 @@ implementation task. Recommend revisiting BR-2 before measuring the dogfood
 result, since the measurement will otherwise look disappointing for a reason
 that has nothing to do with the mechanism.
 
+**RESOLVED (product decision, 2026-08-10): BR-2 amended to
+longest-common-prefix reuse.** `PrefixCacheState::probe` walks the common
+prefix instead of demanding total agreement over the compared head; the engine
+side needed no change (it already rewinds to whatever offset `probe` returns
+via `clear_kv_cache_seq`). The `-1` rule and its invariants are preserved:
+a hit's `reuse` is always `>= 1` and `< tokens.len()`, so the final batch is
+never empty. Correctness argument is unchanged from the rewind case already in
+probe's contract: KV at positions `[0, reuse)` depends only on the agreeing
+tokens, and the comparison is contiguous, so no disagreement can be skipped.
+To keep the fabrication-cut rate measurable (BR-8's spirit), a hit whose reuse
+was capped by a token disagreement rather than by prompt length carries
+`divergent: true` on the `prefix_cache` hit event; `divergent` as a **miss**
+reason now means divergence at token zero (or an unusably short prompt).
+
 ### L-2: session end does not evict
 
 The spec's Events table lists "session end" as a `prefix_cache_evicted`

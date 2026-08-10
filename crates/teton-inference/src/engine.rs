@@ -53,6 +53,10 @@ pub struct Completion {
     /// "unknown". An engine *error* is never expressed here — it is an `Err`
     /// (BR-8).
     pub cache_miss: Option<MissReason>,
+    /// On a hit, whether reuse was capped by a token disagreement rather than
+    /// by prompt length (BR-2 as amended) — a history rewrite this turn
+    /// re-prefilled past. Always `false` on a miss and on every cold path.
+    pub cache_divergent: bool,
 }
 
 impl Completion {
@@ -68,6 +72,7 @@ impl Completion {
             completion_tokens,
             cached_tokens: 0,
             cache_miss: Some(MissReason::Cold),
+            cache_divergent: false,
         }
     }
 
@@ -896,7 +901,7 @@ mod llama {
         let Some(session) = cache_key else {
             let mut ctx = new_context(model, backend, n_ctx)?;
             let generated = run_generation(&mut ctx, model, &tokens, 0, params, out_tx, ctrl_rx)?;
-            return Ok(generated.into_completion(prompt_tokens, 0, Some(MissReason::Cold)));
+            return Ok(generated.into_completion(prompt_tokens, 0, Some(MissReason::Cold), false));
         };
 
         // The context must exist before the probe can mean anything: a slot
@@ -915,7 +920,7 @@ mod llama {
             .expect("the resident context was just installed");
 
         let start = match decision {
-            CacheDecision::Hit { reuse } => {
+            CacheDecision::Hit { reuse, .. } => {
                 // Rewind the KV to the agreement point. Everything past it is
                 // another turn's history and must not survive into this one.
                 ctx.clear_kv_cache_seq(Some(0), u32::try_from(reuse).ok(), None)
@@ -953,7 +958,12 @@ mod llama {
         resident_ids.extend(generated.tokens.iter().map(|t| t.0));
         cache.record(session, resident_ids);
 
-        Ok(generated.into_completion(prompt_tokens, cached_tokens, decision.miss_reason()))
+        Ok(generated.into_completion(
+            prompt_tokens,
+            cached_tokens,
+            decision.miss_reason(),
+            decision.divergent(),
+        ))
     }
 
     /// A fresh context sized to this engine's window.
@@ -985,6 +995,7 @@ mod llama {
             prompt_tokens: u32,
             cached_tokens: u32,
             cache_miss: Option<MissReason>,
+            cache_divergent: bool,
         ) -> Completion {
             Completion {
                 text: self.text,
@@ -992,6 +1003,7 @@ mod llama {
                 completion_tokens: self.completion_tokens,
                 cached_tokens,
                 cache_miss,
+                cache_divergent,
             }
         }
     }

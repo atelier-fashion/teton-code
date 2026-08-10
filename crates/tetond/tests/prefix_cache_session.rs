@@ -90,6 +90,7 @@ struct CallRecord {
     cached_tokens: u32,
     processed_tokens: u32,
     miss: Option<MissReason>,
+    divergent: bool,
 }
 
 impl CachingScriptedEngine {
@@ -148,6 +149,7 @@ impl CachingScriptedEngine {
             cached_tokens: completion.cached_tokens,
             processed_tokens: completion.processed_tokens(),
             miss: completion.cache_miss,
+            divergent: completion.cache_divergent,
         });
     }
 }
@@ -232,6 +234,7 @@ impl Engine for CachingScriptedEngine {
             completion_tokens,
             cached_tokens,
             cache_miss: decision.miss_reason(),
+            cache_divergent: decision.divergent(),
         };
         self.record(&completion);
         Ok(completion)
@@ -276,7 +279,8 @@ fn turns_two_through_five_prefill_only_the_new_suffix() {
     // the user's new message, then the assistant's ACTUAL reply. The reply text
     // matters — the engine's resident prefix is prompt + generated tokens,
     // because that is what the KV holds, so a transcript that appended some
-    // other text would diverge and every turn would miss.
+    // other text would diverge and every turn would re-prefill the rewritten
+    // tail.
     let mut transcript = String::from("system prompt here");
     for n in 0..5 {
         transcript.push_str(&format!(" user turn {n}"));
@@ -295,6 +299,12 @@ fn turns_two_through_five_prefill_only_the_new_suffix() {
 
     for (i, call) in calls.iter().enumerate().skip(1) {
         assert_eq!(call.miss, None, "turn {} must be a hit", i + 1);
+        assert!(
+            !call.divergent,
+            "turn {} is a pure extension — nothing compared disagreed, so it \
+             must not be marked divergent",
+            i + 1
+        );
         assert!(
             call.processed_tokens < call.prompt_tokens,
             "turn {} processed the whole prompt ({} of {}) — no reuse happened",
@@ -349,22 +359,87 @@ fn output_is_byte_identical_with_the_cache_enabled_and_disabled() {
 // AC-3 — divergence
 // ---------------------------------------------------------------------------
 
-/// AC-3 / BR-2: a turn whose history was rewritten (compaction/truncation)
-/// misses with `divergent` and re-prefills from zero, producing correct output.
+/// AC-3 / BR-2 (as amended): a turn whose history was rewritten
+/// (compaction/truncation) reuses the common head — a hit carrying
+/// `divergent: true` — and re-prefills only the rewritten tail, producing
+/// correct output. Nothing at or past the first disagreement is reused.
 #[test]
-fn a_compacted_transcript_misses_as_divergent_and_re_prefills() {
+fn a_compacted_transcript_reuses_the_common_head_and_marks_divergence() {
     let (mut engine, log) = CachingScriptedEngine::new(&["first.", "second."], true);
 
     turn(&mut engine, "s1", "sys u1 a1 u2 a2 u3");
-    // Compaction rewrites history: the prompt no longer extends the resident
-    // prefix, it replaces its middle.
+    // Compaction rewrites history: the prompt still opens with the system
+    // prompt but replaces the middle with a summary.
     let text = turn(&mut engine, "s1", "sys SUMMARY-OF-EARLIER u4");
 
     let calls = log.lock().expect("log").clone();
+    assert_eq!(calls[1].miss, None, "the common head makes this a hit");
+    assert!(calls[1].divergent, "a rewritten tail must be marked");
+    assert_eq!(
+        calls[1].cached_tokens, 1,
+        "exactly the agreeing head (`sys`) is reused — nothing past the \
+         divergence point"
+    );
+    assert_eq!(
+        calls[1].processed_tokens,
+        calls[1].prompt_tokens - 1,
+        "the rewritten tail is re-prefilled in full"
+    );
+    assert_eq!(text, "second.", "the turn still produces its answer");
+}
+
+/// AC-3's miss half: a transcript rewritten from the very first token shares
+/// nothing, so it misses with `divergent` and re-prefills from zero.
+#[test]
+fn a_transcript_rewritten_from_the_first_token_misses_as_divergent() {
+    let (mut engine, log) = CachingScriptedEngine::new(&["first.", "second."], true);
+
+    turn(&mut engine, "s1", "sys u1 a1 u2");
+    let text = turn(&mut engine, "s1", "SUMMARY-OF-EVERYTHING u3");
+
+    let calls = log.lock().expect("log").clone();
     assert_eq!(calls[1].miss, Some(MissReason::Divergent));
-    assert_eq!(calls[1].cached_tokens, 0, "a divergent turn reuses nothing");
+    assert!(!calls[1].divergent, "a miss is not a divergent hit");
+    assert_eq!(calls[1].cached_tokens, 0, "nothing agreed, nothing reused");
     assert_eq!(calls[1].processed_tokens, calls[1].prompt_tokens);
     assert_eq!(text, "second.", "the turn still produces its answer");
+}
+
+/// The workload that motivated the BR-2 amendment (architecture L-1): a weak
+/// model fabricates a continuation, BUG-147's scanner cuts it from context,
+/// but the fabricated tokens were decoded and live in the KV. The next turn's
+/// prompt continues from the *kept* text, so it diverges from the resident
+/// prefix where the cut happened — and must still reuse everything before it.
+#[test]
+fn a_fabrication_cut_reply_still_reuses_the_kept_head() {
+    let (mut engine, log) = CachingScriptedEngine::new(
+        &[
+            // The engine serves (and its KV holds) the fabricated continuation…
+            "answer one. FABRICATED tool output and an invented user turn",
+            "answer two.",
+        ],
+        true,
+    );
+
+    turn(&mut engine, "s1", "sys u1");
+    // …but the harness kept only the text before the cut, so the next prompt
+    // extends the kept head, not the resident prefix.
+    turn(&mut engine, "s1", "sys u1 answer one. u2 with more words");
+
+    let calls = log.lock().expect("log").clone();
+    assert_eq!(calls[1].miss, None, "the kept head must be reused");
+    assert!(
+        calls[1].divergent,
+        "the fabricated tail was rewritten — the hit must say so"
+    );
+    // The agreement is `sys u1 answer one.` — the prompt plus the kept part of
+    // the reply — and not one token of the fabricated tail.
+    assert_eq!(calls[1].cached_tokens, 4);
+    assert_eq!(
+        calls[1].cached_tokens + calls[1].processed_tokens,
+        calls[1].prompt_tokens,
+        "cached and processed must partition the prompt exactly"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -652,11 +727,14 @@ fn the_reuse_rule_always_leaves_a_token_to_prefill() {
     let mut state = PrefixCacheState::new();
     state.record("s1", vec![1, 2, 3, 4]);
     match state.probe("s1", &[1, 2, 3, 4]) {
-        CacheDecision::Hit { reuse } => assert_eq!(
-            reuse, 3,
-            "an identical prompt must still leave one token to decode, or \
-             sampling reads stale logits"
-        ),
+        CacheDecision::Hit { reuse, divergent } => {
+            assert_eq!(
+                reuse, 3,
+                "an identical prompt must still leave one token to decode, or \
+                 sampling reads stale logits"
+            );
+            assert!(!divergent, "a retry is not a history rewrite");
+        }
         other => panic!("an identical prompt is a hit, got {other:?}"),
     }
 }

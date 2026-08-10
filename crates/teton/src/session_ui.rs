@@ -353,10 +353,21 @@ fn format_prefix_cache(cache: &PrefixCache) -> String {
         PrefixCacheOutcome::Hit {
             cached_tokens,
             new_tokens,
-        } => format!(
-            "context: reused {cached_tokens} tokens, prefilled {new_tokens} ({})",
-            cache.model
-        ),
+            divergent,
+        } => {
+            // A divergent hit says why the prefill was bigger than the turn's
+            // delta: history was rewritten past the reuse point, and the
+            // rewritten tail was re-prefilled (BR-2 as amended).
+            let note = if *divergent {
+                " after a history change"
+            } else {
+                ""
+            };
+            format!(
+                "context: reused {cached_tokens} tokens{note}, prefilled {new_tokens} ({})",
+                cache.model
+            )
+        }
         PrefixCacheOutcome::Miss {
             reason,
             processed_tokens,
@@ -1345,6 +1356,7 @@ mod tests {
                 outcome: PrefixCacheOutcome::Hit {
                     cached_tokens: 15_000,
                     new_tokens: 84,
+                    divergent: false,
                 },
             }))
         };
@@ -1360,6 +1372,31 @@ mod tests {
         render_event(&event(), &mut surface, &mut state);
         assert!(surface.any_line_contains(LineKind::Notice, "15000"));
         assert!(surface.any_line_contains(LineKind::Notice, "84"));
+    }
+
+    /// A divergent hit says so: the prefill was bigger than the turn's delta
+    /// because history was rewritten, and a user chasing latency needs that
+    /// distinction just as BR-8 demands it for misses.
+    #[test]
+    fn a_divergent_hit_names_the_history_change() {
+        let plain = format_prefix_cache(&PrefixCache {
+            model: "m".to_owned(),
+            outcome: PrefixCacheOutcome::Hit {
+                cached_tokens: 100,
+                new_tokens: 8,
+                divergent: false,
+            },
+        });
+        let divergent = format_prefix_cache(&PrefixCache {
+            model: "m".to_owned(),
+            outcome: PrefixCacheOutcome::Hit {
+                cached_tokens: 100,
+                new_tokens: 8,
+                divergent: true,
+            },
+        });
+        assert!(!plain.contains("history change"));
+        assert!(divergent.contains("history change"));
     }
 
     /// Every miss reason renders its own sentence. Folding them into one
