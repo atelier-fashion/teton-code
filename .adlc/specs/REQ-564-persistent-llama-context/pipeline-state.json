@@ -56,6 +56,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-10T14:00:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-08-10T14:20:00Z"
     }
   ],
   "repos": {
