@@ -394,10 +394,14 @@ impl Engine for MockEngine {
 #[cfg(feature = "llama")]
 mod llama {
     use super::{detect_chat_format, ChatFormat, Completion, Engine, EngineError, GenParams};
+    use crate::prefix_cache::{CacheDecision, EvictionReason, MissReason, PrefixCacheState};
     use std::path::Path;
+    use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::OnceLock;
+    use std::thread::JoinHandle;
 
     use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::context::LlamaContext;
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
@@ -509,20 +513,74 @@ mod llama {
         }
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
+    /// One message from the worker thread to the caller of a completion.
+    enum Emission {
+        /// A decoded piece of text. The worker blocks until the caller answers
+        /// on the control channel with whether to keep going.
+        Token(String),
+        /// The completion finished (or failed). Always the last message.
+        Done(Box<Result<Completion, EngineError>>),
+    }
+
+    /// A unit of work for the model-owning thread.
+    enum Request {
+        Complete {
+            rendered: String,
+            params: GenParams,
+            /// `Some(session)` may reuse the resident prefix; `None` is a cold
+            /// call on its own throwaway context (every duty — BR-5).
+            cache_key: Option<String>,
+            out_tx: Sender<Emission>,
+            ctrl_rx: Receiver<bool>,
+        },
+        Evict,
+    }
+
+    /// What the worker learned about the model at load time.
+    struct LoadedMeta {
+        chat_format: ChatFormat,
+        template_fallback_reason: Option<&'static str>,
+    }
 
     /// A llama.cpp-backed [`Engine`]. Metal is used automatically on Apple
     /// Silicon by offloading all layers to the GPU.
+    ///
+    /// # Why this is a thread handle and not a struct holding the model
+    ///
+    /// REQ-564 keeps one `LlamaContext` alive across turns so a turn that
+    /// extends the previous prompt prefills only the new suffix. Two properties
+    /// of the binding make the obvious "add a `cache: Option<LlamaContext>`
+    /// field" unsound:
+    ///
+    /// 1. **Self-reference.** `LlamaModel::new_context<'a>(&'a self, …) ->
+    ///    LlamaContext<'a>` ties the context to a borrow of the model, so a
+    ///    struct holding both is self-referential — it needs `unsafe` lifetime
+    ///    erasure or a crate like `ouroboros`.
+    /// 2. **`LlamaContext` is `!Send`.** It holds a raw `NonNull<llama_context>`
+    ///    and the binding declares no `unsafe impl Send` (contrast `LlamaModel`,
+    ///    which has both). But [`Engine`] is `Send`, the daemon shares the engine
+    ///    as `Arc<Mutex<dyn Engine>>`, and successive turns run on *different*
+    ///    `spawn_blocking` threads. Holding the context here would force an
+    ///    `unsafe impl Send` asserting that llama.cpp contexts — including their
+    ///    Metal command queues — have no thread affinity, a claim about a callee
+    ///    we cannot discharge from its source (LESSON-453).
+    ///
+    /// So the model and its context live together on one owned thread, where the
+    /// borrow is an ordinary stack borrow and the context never crosses a thread
+    /// boundary. Both problems disappear and this module contains no `unsafe`.
     pub struct LlamaEngine {
         model_id: String,
-        backend: &'static LlamaBackend,
-        model: LlamaModel,
-        n_ctx: u32,
         chat_format: ChatFormat,
         /// Why this engine fell back to [`ChatFormat::Flat`], when it did —
         /// carried for the loader's user-visible downgrade report (REQ-554
         /// BR-2, LESSON-456: never discard the reason a degradation happened).
         /// `None` when a template was recognized.
         template_fallback_reason: Option<&'static str>,
+        /// To the model-owning thread. Dropping it ends that thread's loop,
+        /// which is how [`Drop`] shuts the worker down without a sentinel
+        /// message that could be missed.
+        tx: Option<Sender<Request>>,
+        worker: Option<JoinHandle<()>>,
     }
 
     impl LlamaEngine {
@@ -530,7 +588,11 @@ mod llama {
         /// offload to the GPU (`u32::MAX` offloads all — the Metal fast path on
         /// Apple Silicon; `0` runs CPU-only).
         ///
-        /// The GGUF's `tokenizer.chat_template` metadata is read here, once, and
+        /// The model is loaded **on** the worker thread, and this call blocks
+        /// until that load reports back — externally identical to the previous
+        /// synchronous load, which also blocked its caller for minutes.
+        ///
+        /// The GGUF's `tokenizer.chat_template` metadata is read there, once, and
         /// reduced to a [`ChatFormat`] by the pure matcher (REQ-554 ADR-1/ADR-2).
         /// Every way that read can fail — no template metadata
         /// (`ChatTemplateError::MissingTemplate`), an interior NUL, non-UTF-8
@@ -546,39 +608,38 @@ mod llama {
             gpu_layers: u32,
             n_ctx: u32,
         ) -> Result<Self, EngineError> {
-            let backend = shared_backend()?;
-            let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
-            let model = LlamaModel::load_from_file(backend, path, &model_params)
-                .map_err(|e| EngineError::Backend(e.to_string()))?;
-            // Every failure mode resolves to Flat, but the CAUSE is kept, not
-            // discarded (LESSON-456): the loader interpolates it into the
-            // user-visible fallback report, so "no template at all" and "a
-            // template we can't reproduce" read differently.
-            let (chat_format, template_fallback_reason) = match model.chat_template(None) {
-                Err(_) => (
-                    ChatFormat::Flat,
-                    Some("no chat template in the GGUF metadata"),
-                ),
-                Ok(template) => match template.to_str() {
-                    Err(_) => (
-                        ChatFormat::Flat,
-                        Some("the GGUF chat template is not valid UTF-8"),
-                    ),
-                    Ok(text) => match detect_chat_format(text) {
-                        ChatFormat::ChatMl => (ChatFormat::ChatMl, None),
-                        ChatFormat::Flat => {
-                            (ChatFormat::Flat, Some("unrecognized chat template family"))
-                        }
-                    },
-                },
+            let model_id = model_id.into();
+            let owned_path = path.to_path_buf();
+            let (tx, rx) = mpsc::channel::<Request>();
+            let (load_tx, load_rx) = mpsc::channel::<Result<LoadedMeta, EngineError>>();
+
+            let worker = std::thread::Builder::new()
+                // Named so a stuck inference is identifiable in a sample/backtrace
+                // rather than being one anonymous thread among the pool's.
+                .name(format!("teton-llama-{model_id}"))
+                .spawn(move || worker_main(&owned_path, gpu_layers, n_ctx, &load_tx, &rx))
+                .map_err(|e| {
+                    EngineError::Backend(format!("could not start the inference thread: {e}"))
+                })?;
+
+            // A worker that died before replying drops `load_tx`, so this recv
+            // fails rather than hanging — the error is never silent.
+            let meta = match load_rx.recv() {
+                Ok(result) => result?,
+                Err(_) => {
+                    let _ = worker.join();
+                    return Err(EngineError::Backend(
+                        "the inference thread stopped before the model finished loading".to_owned(),
+                    ));
+                }
             };
+
             Ok(Self {
-                model_id: model_id.into(),
-                backend,
-                model,
-                n_ctx,
-                chat_format,
-                template_fallback_reason,
+                model_id,
+                chat_format: meta.chat_format,
+                template_fallback_reason: meta.template_fallback_reason,
+                tx: Some(tx),
+                worker: Some(worker),
             })
         }
 
@@ -588,6 +649,65 @@ mod llama {
         #[must_use]
         pub fn template_fallback_reason(&self) -> Option<&'static str> {
             self.template_fallback_reason
+        }
+
+        /// Drive one completion on the worker thread, bridging its token stream
+        /// back through `on_token`.
+        ///
+        /// The control channel is created here and dropped when this returns, so
+        /// it is exactly as long-lived as the call: the worker can never block on
+        /// an answer from a caller that has gone away.
+        fn run(
+            &self,
+            cache_key: Option<String>,
+            prompt: &str,
+            params: &GenParams,
+            on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<Completion, EngineError> {
+            let stopped = || {
+                EngineError::Backend("the local inference thread is no longer running".to_owned())
+            };
+            let tx = self.tx.as_ref().ok_or_else(stopped)?;
+
+            let (out_tx, out_rx) = mpsc::channel::<Emission>();
+            let (ctrl_tx, ctrl_rx) = mpsc::channel::<bool>();
+            tx.send(Request::Complete {
+                rendered: prompt.to_owned(),
+                params: *params,
+                cache_key,
+                out_tx,
+                ctrl_rx,
+            })
+            .map_err(|_| stopped())?;
+
+            loop {
+                match out_rx.recv() {
+                    Ok(Emission::Token(piece)) => {
+                        let keep_going = on_token(&piece);
+                        // A send failure means the worker already finished (it
+                        // stops reading control after the final piece); the
+                        // `Done` message is still queued, so keep draining.
+                        let _ = ctrl_tx.send(keep_going);
+                    }
+                    Ok(Emission::Done(result)) => return *result,
+                    // The worker panicked or vanished without a `Done`. A
+                    // panicked worker is a backend failure, never a daemon crash.
+                    Err(_) => return Err(stopped()),
+                }
+            }
+        }
+    }
+
+    impl Drop for LlamaEngine {
+        fn drop(&mut self) {
+            // Dropping the sender ends the worker's `recv` loop; the join then
+            // waits for the model (and any resident context) to be freed before
+            // this engine is considered gone. Without the join, an engine swap
+            // could hold two models' weights resident at once.
+            self.tx = None;
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
         }
     }
 
@@ -606,118 +726,380 @@ mod llama {
             params: &GenParams,
             on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<Completion, EngineError> {
-            let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(std::num::NonZeroU32::new(self.n_ctx))
-                .with_n_batch(N_BATCH);
-            let mut ctx = self
-                .model
-                .new_context(self.backend, ctx_params)
-                .map_err(|e| EngineError::Backend(e.to_string()))?;
-
-            // BEHAVIORAL DEPENDENCY (REQ-554 security): llama-cpp-2 0.1.151's
-            // `str_to_token` hardcodes `parse_special = true`, so control-token
-            // spellings ANYWHERE in this string tokenize as real ChatML control
-            // tokens, not text. The harness renderer is the compensating
-            // control — it defuses those spellings in untrusted content before
-            // they reach this call (`tetond`'s `neutralize_control_tokens`).
-            // Re-audit that pairing if this binding is ever bumped: an upstream
-            // flip of that flag silently changes the injection posture in
-            // either direction.
-            let tokens = self
-                .model
-                .str_to_token(prompt, AddBos::Always)
-                .map_err(|e| EngineError::Backend(e.to_string()))?;
-            let prompt_tokens = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-
-            // Refuse an over-window prompt with a typed error BEFORE any llama.cpp
-            // call sees it. llama.cpp enforces its limits with GGML_ASSERT — an
-            // `abort()`, not a catchable error — so feeding it an input that
-            // cannot fit would take down the whole daemon process, as the first
-            // dogfooded over-window turn did.
-            let budget = self.n_ctx.saturating_sub(params.max_tokens);
-            if prompt_tokens > budget {
-                return Err(EngineError::Backend(format!(
-                    "prompt of {prompt_tokens} tokens exceeds this engine's window \
-                     ({budget} = {} context minus {} generation)",
-                    self.n_ctx, params.max_tokens
-                )));
-            }
-
-            // Decode the prompt in `n_batch`-sized chunks: one `decode` may not
-            // exceed the context's logical batch size (GGML_ASSERT, as above).
-            // Only the final token of the final chunk requests logits — that is
-            // where generation starts.
-            let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
-            let last = tokens.len().saturating_sub(1);
-            let mut pos = 0usize;
-            for chunk in tokens.chunks(N_BATCH as usize) {
-                batch.clear();
-                for (i, token) in chunk.iter().enumerate() {
-                    let index = pos + i;
-                    batch
-                        .add(*token, index as i32, &[0], index == last)
-                        .map_err(|e| EngineError::Backend(e.to_string()))?;
-                }
-                ctx.decode(&mut batch)
-                    .map_err(|e| EngineError::Backend(e.to_string()))?;
-                pos += chunk.len();
-            }
-
-            let mut sampler = LlamaSampler::greedy();
-            let mut text = String::new();
-            let mut completion_tokens = 0u32;
-            let mut n_cur = i32::try_from(tokens.len()).unwrap_or(i32::MAX);
-            // One [`PieceDecoder`] for the whole stream — see its docs for why
-            // the decoder must outlive every token.
-            let mut decoder = PieceDecoder::new();
-
-            while completion_tokens < params.max_tokens {
-                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-                sampler.accept(token);
-                if self.model.is_eog_token(token) {
-                    break;
-                }
-                let piece = decoder.push(&piece_bytes(&self.model, token)?);
-                // A token that only *starts* a multi-byte character yields an
-                // empty piece (its bytes are held in the decoder) — nothing to
-                // stream yet, but it still counts as a generated token.
-                let mut keep_going = true;
-                if !piece.is_empty() {
-                    keep_going = on_token(&piece);
-                    text.push_str(&piece);
-                }
-                completion_tokens += 1;
-                if !keep_going {
-                    // The caller ended the turn (e.g. the first tool call
-                    // completed); stop decoding — the tail flush below still
-                    // accounts for any held partial character.
-                    break;
-                }
-
-                batch.clear();
-                batch
-                    .add(token, n_cur, &[0], true)
-                    .map_err(|e| EngineError::Backend(e.to_string()))?;
-                n_cur += 1;
-                ctx.decode(&mut batch)
-                    .map_err(|e| EngineError::Backend(e.to_string()))?;
-            }
-
-            // The stream can end (EOG or max_tokens) while the decoder holds an
-            // incomplete sequence; the flush turns it into U+FFFD rather than
-            // dropping the bytes silently.
-            let tail = decoder.finish();
-            if !tail.is_empty() {
-                on_token(&tail);
-                text.push_str(&tail);
-            }
-
-            Ok(Completion {
-                text,
-                prompt_tokens,
-                completion_tokens,
-            })
+            // No cache key: a throwaway context, prefilled from zero, dropped at
+            // the end. This is every duty call (OQ-1's cold-per-duty), and it
+            // leaves the agent session's resident prefix untouched (BR-5).
+            self.run(None, prompt, params, on_token)
         }
+
+        fn complete_cached(
+            &mut self,
+            session: &str,
+            prompt: &str,
+            params: &GenParams,
+            on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<Completion, EngineError> {
+            self.run(Some(session.to_owned()), prompt, params, on_token)
+        }
+
+        fn evict_prefix_cache(&mut self, _reason: EvictionReason) {
+            // Best-effort by contract: a dropped cache must never fail a turn
+            // (BR-4), so a worker that has already gone away is not an error
+            // here — the next turn cold-prefills, which is exactly the intended
+            // post-eviction behavior.
+            if let Some(tx) = self.tx.as_ref() {
+                let _ = tx.send(Request::Evict);
+            }
+        }
+    }
+
+    /// The model-owning thread.
+    ///
+    /// `model` and `resident` are both locals here, and `resident` is declared
+    /// after `model`, so Rust's reverse-declaration drop order frees the context
+    /// before the model it borrows. That ordering is the whole safety argument
+    /// for keeping them together, and it is enforced by the compiler rather than
+    /// by a comment.
+    fn worker_main(
+        path: &Path,
+        gpu_layers: u32,
+        n_ctx: u32,
+        load_tx: &Sender<Result<LoadedMeta, EngineError>>,
+        rx: &Receiver<Request>,
+    ) {
+        let backend = match shared_backend() {
+            Ok(backend) => backend,
+            Err(e) => {
+                let _ = load_tx.send(Err(e));
+                return;
+            }
+        };
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+        let model = match LlamaModel::load_from_file(backend, path, &model_params) {
+            Ok(model) => model,
+            Err(e) => {
+                let _ = load_tx.send(Err(EngineError::Backend(e.to_string())));
+                return;
+            }
+        };
+
+        // Every failure mode resolves to Flat, but the CAUSE is kept, not
+        // discarded (LESSON-456): the loader interpolates it into the
+        // user-visible fallback report, so "no template at all" and "a
+        // template we can't reproduce" read differently.
+        let (chat_format, template_fallback_reason) = match model.chat_template(None) {
+            Err(_) => (
+                ChatFormat::Flat,
+                Some("no chat template in the GGUF metadata"),
+            ),
+            Ok(template) => match template.to_str() {
+                Err(_) => (
+                    ChatFormat::Flat,
+                    Some("the GGUF chat template is not valid UTF-8"),
+                ),
+                Ok(text) => match detect_chat_format(text) {
+                    ChatFormat::ChatMl => (ChatFormat::ChatMl, None),
+                    ChatFormat::Flat => {
+                        (ChatFormat::Flat, Some("unrecognized chat template family"))
+                    }
+                },
+            },
+        };
+        if load_tx
+            .send(Ok(LoadedMeta {
+                chat_format,
+                template_fallback_reason,
+            }))
+            .is_err()
+        {
+            // The loader gave up while we were loading; nothing to serve.
+            return;
+        }
+
+        // The single cache slot (BR-3) and the context whose KV it describes.
+        // Declared after `model` so they drop before it.
+        let mut resident: Option<LlamaContext<'_>> = None;
+        let mut cache = PrefixCacheState::new();
+
+        while let Ok(request) = rx.recv() {
+            match request {
+                Request::Evict => {
+                    resident = None;
+                    cache.evict();
+                }
+                Request::Complete {
+                    rendered,
+                    params,
+                    cache_key,
+                    out_tx,
+                    ctrl_rx,
+                } => {
+                    let result = serve(
+                        backend,
+                        &model,
+                        n_ctx,
+                        &mut resident,
+                        &mut cache,
+                        cache_key.as_deref(),
+                        &rendered,
+                        &params,
+                        &out_tx,
+                        &ctrl_rx,
+                    );
+                    let _ = out_tx.send(Emission::Done(Box::new(result)));
+                }
+            }
+        }
+    }
+
+    /// Serve one completion, reusing the resident prefix when the policy allows.
+    #[allow(clippy::too_many_arguments)]
+    fn serve<'m>(
+        backend: &'static LlamaBackend,
+        model: &'m LlamaModel,
+        n_ctx: u32,
+        resident: &mut Option<LlamaContext<'m>>,
+        cache: &mut PrefixCacheState,
+        cache_key: Option<&str>,
+        prompt: &str,
+        params: &GenParams,
+        out_tx: &Sender<Emission>,
+        ctrl_rx: &Receiver<bool>,
+    ) -> Result<Completion, EngineError> {
+        // BEHAVIORAL DEPENDENCY (REQ-554 security): llama-cpp-2 0.1.151's
+        // `str_to_token` hardcodes `parse_special = true`, so control-token
+        // spellings ANYWHERE in this string tokenize as real ChatML control
+        // tokens, not text. The harness renderer is the compensating
+        // control — it defuses those spellings in untrusted content before
+        // they reach this call (`tetond`'s `neutralize_control_tokens`).
+        // Re-audit that pairing if this binding is ever bumped: an upstream
+        // flip of that flag silently changes the injection posture in
+        // either direction.
+        let tokens = model
+            .str_to_token(prompt, AddBos::Always)
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let prompt_tokens = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+
+        // The over-window guard runs HERE — after tokenization, before any
+        // llama.cpp call, and before the cache probe — so it covers the reuse
+        // path and the cold path with one expression (BR-7, LESSON-491).
+        // Reuse changes how many tokens are decoded, never how many must fit:
+        // the KV still has to hold the whole prompt.
+        if let Some(refusal) = super::over_window(prompt_tokens, n_ctx, params.max_tokens) {
+            return Err(refusal);
+        }
+
+        let ids: Vec<i32> = tokens.iter().map(|t| t.0).collect();
+
+        // A duty call (no cache key) gets its own throwaway context and never
+        // touches the resident one (BR-5).
+        let Some(session) = cache_key else {
+            let mut ctx = new_context(model, backend, n_ctx)?;
+            let generated = run_generation(&mut ctx, model, &tokens, 0, params, out_tx, ctrl_rx)?;
+            return Ok(generated.into_completion(prompt_tokens, 0, Some(MissReason::Cold)));
+        };
+
+        // The context must exist before the probe can mean anything: a slot
+        // whose context was dropped describes nothing.
+        if resident.is_none() {
+            *resident = Some(new_context(model, backend, n_ctx)?);
+            // Losing the context loses the KV it held, so the description must
+            // go with it or the next probe compares against a phantom.
+            if !cache.is_empty() {
+                cache.evict();
+            }
+        }
+        let decision = cache.probe(session, &ids);
+        let ctx = resident
+            .as_mut()
+            .expect("the resident context was just installed");
+
+        let start = match decision {
+            CacheDecision::Hit { reuse } => {
+                // Rewind the KV to the agreement point. Everything past it is
+                // another turn's history and must not survive into this one.
+                ctx.clear_kv_cache_seq(Some(0), u32::try_from(reuse).ok(), None)
+                    .map_err(|e| EngineError::Backend(e.to_string()))?;
+                reuse
+            }
+            CacheDecision::Miss(_) => {
+                ctx.clear_kv_cache();
+                0
+            }
+        };
+
+        let cached_tokens = u32::try_from(start).unwrap_or(u32::MAX);
+        let generated = match run_generation(ctx, model, &tokens, start, params, out_tx, ctrl_rx) {
+            Ok(generated) => generated,
+            Err(e) => {
+                // The KV is now in an unknown state — some of the prompt may be
+                // decoded, some not. The recorded prefix would no longer describe
+                // it, so drop both rather than let the next turn reuse a
+                // description we cannot vouch for. A fallback must preserve the
+                // invariant it guards (LESSON-447); here that invariant is "the
+                // recorded prefix describes the resident KV exactly".
+                *resident = None;
+                cache.evict();
+                return Err(e);
+            }
+        };
+
+        // Record what the KV actually holds: the prompt PLUS every token decoded
+        // during generation. Recording only the prompt would leave the
+        // description shorter than the real KV and the next turn's reuse offset
+        // would be computed against the wrong baseline — a correctness bug, not
+        // a performance one.
+        let mut resident_ids = ids;
+        resident_ids.extend(generated.tokens.iter().map(|t| t.0));
+        cache.record(session, resident_ids);
+
+        Ok(generated.into_completion(prompt_tokens, cached_tokens, decision.miss_reason()))
+    }
+
+    /// A fresh context sized to this engine's window.
+    fn new_context<'m>(
+        model: &'m LlamaModel,
+        backend: &'static LlamaBackend,
+        n_ctx: u32,
+    ) -> Result<LlamaContext<'m>, EngineError> {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
+            .with_n_batch(N_BATCH);
+        model
+            .new_context(backend, ctx_params)
+            .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+
+    /// What one generation produced.
+    struct Generated {
+        text: String,
+        completion_tokens: u32,
+        /// The tokens decoded into the context during generation — needed to
+        /// describe the resident KV afterwards.
+        tokens: Vec<LlamaToken>,
+    }
+
+    impl Generated {
+        fn into_completion(
+            self,
+            prompt_tokens: u32,
+            cached_tokens: u32,
+            cache_miss: Option<MissReason>,
+        ) -> Completion {
+            Completion {
+                text: self.text,
+                prompt_tokens,
+                completion_tokens: self.completion_tokens,
+                cached_tokens,
+                cache_miss,
+            }
+        }
+    }
+
+    /// Prefill `tokens[start..]` and then decode until EOG, the cap, or an early
+    /// stop from the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn run_generation(
+        ctx: &mut LlamaContext<'_>,
+        model: &LlamaModel,
+        tokens: &[LlamaToken],
+        start: usize,
+        params: &GenParams,
+        out_tx: &Sender<Emission>,
+        ctrl_rx: &Receiver<bool>,
+    ) -> Result<Generated, EngineError> {
+        // Decode the prompt suffix in `n_batch`-sized chunks: one `decode` may
+        // not exceed the context's logical batch size (GGML_ASSERT, which aborts
+        // the process rather than returning — LESSON-444). Only the final token
+        // of the final chunk requests logits — that is where generation starts.
+        //
+        // Positions are absolute, so a reused prefix of `start` tokens means the
+        // suffix occupies positions `start..tokens.len()` and lines up with the
+        // KV cells that survived the truncation.
+        let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
+        let last = tokens.len().saturating_sub(1);
+        let mut pos = start;
+        for chunk in tokens[start..].chunks(N_BATCH as usize) {
+            batch.clear();
+            for (i, token) in chunk.iter().enumerate() {
+                let index = pos + i;
+                batch
+                    .add(*token, index as i32, &[0], index == last)
+                    .map_err(|e| EngineError::Backend(e.to_string()))?;
+            }
+            ctx.decode(&mut batch)
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            pos += chunk.len();
+        }
+
+        let mut sampler = LlamaSampler::greedy();
+        let mut text = String::new();
+        let mut completion_tokens = 0u32;
+        let mut generated = Vec::new();
+        let mut n_cur = i32::try_from(tokens.len()).unwrap_or(i32::MAX);
+        // One [`PieceDecoder`] for the whole stream — see its docs for why
+        // the decoder must outlive every token (LESSON-452).
+        let mut decoder = PieceDecoder::new();
+
+        while completion_tokens < params.max_tokens {
+            let token = sampler.sample(ctx, batch.n_tokens() - 1);
+            sampler.accept(token);
+            if model.is_eog_token(token) {
+                break;
+            }
+            let piece = decoder.push(&piece_bytes(model, token)?);
+            // A token that only *starts* a multi-byte character yields an
+            // empty piece (its bytes are held in the decoder) — nothing to
+            // stream yet, but it still counts as a generated token.
+            let mut keep_going = true;
+            if !piece.is_empty() {
+                keep_going = emit(out_tx, ctrl_rx, piece.clone());
+                text.push_str(&piece);
+            }
+            completion_tokens += 1;
+            if !keep_going {
+                // The caller ended the turn (e.g. the first tool call
+                // completed); stop decoding — the tail flush below still
+                // accounts for any held partial character.
+                break;
+            }
+
+            batch.clear();
+            batch
+                .add(token, n_cur, &[0], true)
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            n_cur += 1;
+            generated.push(token);
+            ctx.decode(&mut batch)
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+
+        // The stream can end (EOG or max_tokens) while the decoder holds an
+        // incomplete sequence; the flush turns it into U+FFFD rather than
+        // dropping the bytes silently.
+        let tail = decoder.finish();
+        if !tail.is_empty() {
+            emit(out_tx, ctrl_rx, tail.clone());
+            text.push_str(&tail);
+        }
+
+        Ok(Generated {
+            text,
+            completion_tokens,
+            tokens: generated,
+        })
+    }
+
+    /// Hand one piece to the caller and wait for its continue/stop answer.
+    ///
+    /// A caller that has gone away (either channel closed) reads as "stop":
+    /// there is nobody left to stream to, and unlike the old inline path there
+    /// is no reason to keep burning inference for a result no one will receive.
+    fn emit(out_tx: &Sender<Emission>, ctrl_rx: &Receiver<bool>, piece: String) -> bool {
+        if out_tx.send(Emission::Token(piece)).is_err() {
+            return false;
+        }
+        ctrl_rx.recv().unwrap_or(false)
     }
 
     /// [`PieceDecoder`] needs no model, so its contract — the one the old
