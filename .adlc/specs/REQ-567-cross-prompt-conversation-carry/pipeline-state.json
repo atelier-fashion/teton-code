@@ -1,0 +1,82 @@
+{
+  "req": "REQ-567",
+  "branch": "feat/REQ-567-cross-prompt-conversation-carry",
+  "startedAt": "2026-08-10T19:05:00Z",
+  "completed": false,
+  "currentPhase": 6,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Create Worktrees + Preflight",
+      "completedAt": "2026-08-10T19:05:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-10T19:08:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-10T19:16:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-10T19:18:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-10T21:05:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (Reflect + Review)",
+      "completedAt": "2026-08-10T22:55:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-567",
+      "branch": "feat/REQ-567-cross-prompt-conversation-carry",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/87",
+      "prNumber": 87,
+      "prCreatedAt": "2026-08-10T19:12:23Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-092",
+      "TASK-093",
+      "TASK-094",
+      "TASK-095",
+      "TASK-096"
+    ],
+    "failedTasks": []
+  },
+  "notes": {
+    "specMergedToMainVia": "PR #86 (c6c669a) before pipeline start, per normal flow",
+    "draftPrDeferred": "branch had no commits beyond origin/main at Step 0; PR creation deferred to Phase 6 fallback per LESSON-004",
+    "phase5PreFinding": "OQ-1 refinement: cancelled-turn guard retains a trailing assistant block containing an unanswered tool call; product decision 'drop incomplete tool work' should trim it. Fix in Phase 5 Step C (guard in runtime.rs TurnConversation) + test."
+  }
+}

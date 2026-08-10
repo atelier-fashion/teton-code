@@ -42,8 +42,8 @@ use teton_protocol::methods::{
     ConfigGetParams, ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams,
     ModelConfirmParams, ModelListParams, ModelSetParams, ModelStatusParams,
     PermissionRespondParams, PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod,
-    SessionAttachParams, SessionAttachResult, SessionCreateParams, SessionCreateResult,
-    SessionListParams, SessionListResult, WebOverrideParams, WebRefreshParams,
+    SessionAttachParams, SessionAttachResult, SessionClearParams, SessionCreateParams,
+    SessionCreateResult, SessionListParams, SessionListResult, WebOverrideParams, WebRefreshParams,
 };
 
 use teton_core::lifetime::{BlockingActivity, PolicySource, ShutdownPolicy};
@@ -603,6 +603,7 @@ fn dispatch(daemon: &Daemon, id: Id, method: &str, params: Value) -> Option<Stri
             Some(ok_string(id, &result))
         }
         SessionAttachParams::METHOD => Some(handle_session_attach(daemon, id, params)),
+        SessionClearParams::METHOD => Some(handle_session_clear(daemon, id, params)),
         PermissionRespondParams::METHOD => Some(handle_permission_respond(daemon, id, params)),
         ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, id, params)),
         ModelListParams::METHOD => Some(ok_string(id, &daemon.runtime.model_list())),
@@ -844,6 +845,31 @@ fn handle_session_attach(daemon: &Daemon, id: Id, params: Value) -> String {
     }
 }
 
+/// Empty a session's retained conversation (`session/clear`, REQ-567 BR-8).
+///
+/// Dispatched from the synchronous path, so the reader loop's fence puts the
+/// `context_cleared` event on the wire ahead of this response (see the module
+/// docs on ordering) — a client therefore learns *that* the conversation was
+/// cleared before it is told how much went, never the reverse.
+///
+/// The unknown-session and busy-session answers both come from the runtime's
+/// single claim, so this handler decides nothing: [`handle_session_attach`]'s
+/// `UNKNOWN_SESSION` and a concurrent prompt's `SESSION_BUSY` reach a client
+/// through one classifier rather than two agreeing ones.
+fn handle_session_clear(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: SessionClearParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    match daemon
+        .runtime
+        .clear_session(&params, &daemon.sessions, &daemon.events)
+    {
+        Ok(result) => ok_string(id, &result),
+        Err(err) => error_from(id, err),
+    }
+}
+
 /// Forwards broadcast events from `sub` to the client's outbound channel until
 /// the subscription ends, reporting its progress on `forwarded` (the
 /// [`EventFence`] watermark: how many delivered events have reached the
@@ -1019,6 +1045,50 @@ mod tests {
         )
         .unwrap();
         assert!(listed.contains("sess-0"));
+    }
+
+    /// REQ-567 BR-8 / D-2: `session/clear` is a dispatchable method, and its
+    /// two answers come off the runtime's claim rather than off a check here —
+    /// a live session clears (idempotently, so an untouched one reports `0`),
+    /// and a session the registry never had is `UNKNOWN_SESSION`, the same code
+    /// `session/attach` answers that fact with.
+    #[test]
+    fn dispatch_routes_session_clear_and_tells_empty_from_unknown() {
+        let daemon = Daemon::new();
+        let created = handle_session_create(
+            &daemon,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        assert!(created.contains("sess-0"), "{created}");
+
+        let cleared = dispatch(
+            &daemon,
+            Id::Number(2),
+            SessionClearParams::METHOD,
+            serde_json::json!({"session_id": "sess-0"}),
+        )
+        .unwrap();
+        assert!(
+            !cleared.contains("-32601"),
+            "the method must be routed, not rejected as unknown: {cleared}"
+        );
+        assert!(
+            cleared.contains("\"blocks_dropped\":0"),
+            "a session that has said nothing clears to zero, and says so: {cleared}"
+        );
+
+        let ghost = dispatch(
+            &daemon,
+            Id::Number(3),
+            SessionClearParams::METHOD,
+            serde_json::json!({"session_id": "sess-ghost"}),
+        )
+        .unwrap();
+        assert!(
+            ghost.contains(&error_code::UNKNOWN_SESSION.to_string()),
+            "an unknown session must not clear cheerfully: {ghost}"
+        );
     }
 
     /// REQ-563 AC-10: `web/refresh` is a dispatchable method, and it answers

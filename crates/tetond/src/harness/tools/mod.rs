@@ -750,4 +750,91 @@ mod tests {
         assert!(docs.contains("web"), "{docs}");
         assert!(!docs.contains("mcp"), "{docs}");
     }
+
+    /// **REQ-567 AC-6, the structural half: the model cannot clear a session.**
+    ///
+    /// BR-8 says a clear is user-only, and AC-6 says that must hold *by
+    /// construction* rather than by a check someone has to remember. The
+    /// registry is the whole surface a model's tool call can reach, so the claim
+    /// has two parts and both are here.
+    ///
+    /// **No tool is named for it.** A tool called `clear` — or any spelling of
+    /// it — would make "the model may not clear the conversation" a runtime
+    /// branch; its absence is what makes the rule structural. Asserted with the
+    /// full built-in set present, so the claim is about the registry a real
+    /// session runs with and not about an empty one. (`web` is opt-in and absent
+    /// here by construction; REQ-563's own AC-12 test asserts its namespace with
+    /// the tool registered.)
+    ///
+    /// **And no MCP tool can reach it either.** MCP is the one path that adds
+    /// tools this crate did not write, so "no built-in is named clear" would be
+    /// a partial answer: a server is free to publish a tool called `clear`.
+    /// What that tool would do is call *its own server* —
+    /// [`mcp::McpToolHandle::run`] forwards to `McpRegistry::call_tool` and has
+    /// no other effect on this process — and `session/clear` is a method on
+    /// `DaemonRuntime`, which no [`Tool`] is ever handed. The scan below is the
+    /// mechanical form of that argument: no production source under `harness/`
+    /// — where every `impl Tool` lives — so much as names the runtime's clear or
+    /// its params type. Wire one in and this fails, which is the point: the next
+    /// person to try it has to answer for it here rather than ship a tool that
+    /// quietly drops a user's conversation on the model's say-so (LESSON-495).
+    #[test]
+    fn no_tool_can_clear_a_session_and_no_mcp_wiring_path_could() {
+        let reg = ToolRegistry::with_builtins();
+        // Non-vacuity: the registry under test is the populated one.
+        assert!(
+            reg.get("read").is_some() && reg.names().len() == 5,
+            "the built-in set is missing, so the sweep below proves nothing: {:?}",
+            reg.names()
+        );
+
+        for forbidden in [
+            "clear",
+            "session/clear",
+            "session_clear",
+            "clear_session",
+            "clear_context",
+            "context_clear",
+            "reset",
+        ] {
+            assert!(
+                reg.get(forbidden).is_none(),
+                "`{forbidden}` is reachable from tool dispatch, so a model could issue it"
+            );
+        }
+        // Belt and braces over the whole namespace: no registered tool mentions
+        // the verb, whatever it is spelled.
+        for name in reg.names() {
+            assert!(
+                !name.contains("clear"),
+                "`{name}` is a tool the model can call, and it names a user-only action"
+            );
+        }
+
+        // The MCP half, and every other tool this crate might grow: nothing a
+        // tool call reaches names the runtime's clear. Whole-line comments are
+        // stripped, because this REQ documented in prose is not a second
+        // implementation of it; test modules are already stripped by the scan.
+        let harness: Vec<_> = crate::call_sites::scan::production_sources()
+            .into_iter()
+            .filter(|(path, _)| path.starts_with("harness/"))
+            .collect();
+        assert!(
+            harness
+                .iter()
+                .any(|(path, _)| path.contains("tools/mcp.rs")),
+            "the scan missed the MCP wiring it is about: {:?}",
+            harness.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        for (path, source) in &harness {
+            let code = crate::call_sites::scan::code_only(source);
+            for named in ["clear_session", "SessionClearParams"] {
+                assert!(
+                    !code.contains(named),
+                    "{path} names `{named}`, so tool dispatch has a path to clearing a \
+                     session's conversation — AC-6's by-construction claim is false"
+                );
+            }
+        }
+    }
 }

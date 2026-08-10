@@ -5,13 +5,34 @@
 //! client can disconnect and reconnect, or a second client can attach, and the
 //! session list stays identical for everyone. This module is the skeleton's
 //! session store; prompt-turn and phase-gate machinery land in later tasks.
+//!
+//! # The conversation lives here too (REQ-567)
+//!
+//! A session's [`Conversation`] — the ordered blocks the harness retained
+//! across every completed turn — is canonical session state, the thing ACP says
+//! a session *is*, so it belongs in the session store rather than in a sixth
+//! per-session side-map beside the runtime's cross-cutting ones (`session_taint`,
+//! `session_gates`, `session_user_urls`). Three properties make it safe to keep
+//! it behind the same `std::sync::Mutex` as the summaries:
+//!
+//! - Every critical section is a vector move or a clone; **the lock is never
+//!   held across a turn or an `.await`** (LESSON-448). A turn's exclusivity is
+//!   carried by a [`TurnClaim`] — a flag on the record, released on drop — not
+//!   by a held lock.
+//! - A commit is a **whole-vector replacement** (BR-6): there is no partial
+//!   write for a failed turn to leave behind.
+//! - The store is keyed by session and read only by that session's dispatch, so
+//!   BR-2's isolation is structural rather than checked.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use teton_protocol::methods::SessionSummary;
-use teton_protocol::{Phase, SessionId, SessionMode};
+use teton_protocol::{Phase, SessionId, SessionMode, TurnId};
+
+use crate::harness::context::{ContextBlock, RetainedContext};
 
 /// One session as the registry holds it: what clients see, plus what only the
 /// registry needs to know.
@@ -34,6 +55,209 @@ struct SessionRecord {
     /// not working. So the attempt is spent when it is made, not when it
     /// succeeds.
     title_attempted: bool,
+    /// What this session has said so far (REQ-567 BR-1) — replayed into the next
+    /// turn's [`ContextManager`](crate::harness::context::ContextManager) and
+    /// replaced wholesale when that turn completes.
+    conversation: Conversation,
+    /// The turn currently holding this session, if any (REQ-567 BR-5).
+    ///
+    /// Named rather than a bare `bool` because the refusal has to say *which*
+    /// turn is in flight: a busy error that cannot name its cause is the generic
+    /// turn failure LESSON-456 is about.
+    in_flight_turn: Option<TurnId>,
+}
+
+/// One session's conversation: the ordered blocks the harness retained, turn
+/// after turn (REQ-567 BR-1).
+///
+/// The blocks are stored **exactly as the harness kept them** — post containment
+/// cut (BUG-147), post compaction — with the per-block role and egress
+/// provenance the [`ContextBlock`] already carries. There is no parallel
+/// conversation type: a second spelling of "who said this and where did it come
+/// from" is how one of them ends up laxer than the other at the egress choke
+/// point (BR-3).
+///
+/// **The system head is never in here.** Heads are rebuilt per prompt from the
+/// current tools and route, and a fossilized head replayed under a fresh one
+/// would put two system prompts in the context and make a mid-session head
+/// change unrepresentable — which is exactly what BR-7's cache-independence
+/// asks for. [`ContextManager::into_retained`](crate::harness::context::ContextManager::into_retained)
+/// excludes it by construction: the head was never a block.
+///
+/// It wraps a [`RetainedContext`] rather than a bare block vector because two
+/// facts about a conversation are not inside its blocks and must cross the
+/// boundary with them: whether history has been dropped (so the truncation note
+/// survives the turn that cut) and the egress provenance of what was dropped (so
+/// a truncated-away `local-only` read still pins the session — BR-3).
+///
+/// ## Invariant: a stored conversation fits the budget (BR-4)
+///
+/// Every turn that writes here does so through
+/// [`CarriedTurn`](crate::carry::CarriedTurn) — the sole production caller of
+/// [`Self::from_retained`]'s two commit paths — and it truncates to the turn's
+/// byte/token budget immediately before handing the vector over. No path can
+/// leave an oversized vector here to be replayed into the next prompt. That
+/// matters because a conversation is *replayed*, not
+/// re-derived: an over-budget vector stored once would be replayed into a prompt
+/// the engine refuses, and a refused turn never commits (BR-6) — the session
+/// would wedge on its own history rather than degrade to compaction.
+///
+/// It is an invariant of the store rather than of the turn loop because the
+/// loop's own gate runs at the top of each iteration and a cancelled turn can be
+/// dropped between two of them. The budget itself is per-route, so this says
+/// "fit the budget of the turn that wrote it", not "fit some global constant".
+#[derive(Debug, Clone, Default)]
+pub struct Conversation {
+    retained: RetainedContext,
+}
+
+impl Conversation {
+    /// The conversation a completed turn's context is (REQ-567 D-1).
+    #[must_use]
+    pub fn from_retained(retained: RetainedContext) -> Self {
+        Self { retained }
+    }
+
+    /// The blocks, in the order they happened.
+    #[must_use]
+    pub fn blocks(&self) -> &[ContextBlock] {
+        self.retained.blocks()
+    }
+
+    /// What the next turn replays into its manager: blocks, truncation flag, and
+    /// dropped provenance together.
+    #[must_use]
+    pub fn into_retained(self) -> RetainedContext {
+        self.retained
+    }
+
+    /// The same, borrowed — for a caller that only needs to look.
+    #[must_use]
+    pub fn retained(&self) -> &RetainedContext {
+        &self.retained
+    }
+
+    /// How many blocks the conversation holds — the count `context_cleared`
+    /// reports (BR-8).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.retained.blocks().len()
+    }
+
+    /// Whether this session has retained anything yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.retained.blocks().is_empty()
+    }
+}
+
+/// The refusal a second concurrent turn on one session gets (REQ-567 BR-5, D-3).
+///
+/// Typed, and it names the turn already running: BR-5 requires that a refusal
+/// "names its cause truthfully rather than surfacing as a generic turn error",
+/// which is LESSON-456's rule applied to a state a client can legitimately hit
+/// and legitimately retry.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TurnClaimError {
+    /// Another turn holds this session. The conversation is linear by refusing,
+    /// not by interleaving (D-3).
+    #[error(
+        "session {session_id} is already running turn {turn_id}; \
+         one session runs one turn at a time — retry when it finishes"
+    )]
+    InFlight {
+        /// The session that is busy.
+        session_id: SessionId,
+        /// The turn holding it.
+        turn_id: TurnId,
+    },
+    /// There is no such session to claim.
+    ///
+    /// A second variant rather than a granted claim over nothing: a claim that
+    /// guards no record would let a turn run — and later commit — against a
+    /// session the registry does not have, which is a silent no-op dressed as a
+    /// turn. Callers reach this only if a session vanishes between lookup and
+    /// claim, which nothing does today.
+    #[error("no such session {session_id}")]
+    NoSuchSession {
+        /// The id that matched no record.
+        session_id: SessionId,
+    },
+}
+
+/// Exclusive hold on one session's conversation for the length of one turn
+/// (REQ-567 BR-5, D-3).
+///
+/// **Released by `Drop`, never by an explicit call** — the discipline
+/// [`crate::lifetime`] and [`crate::model_consent`]'s `InFlightGuard` already
+/// keep, because there are three ways a turn's future can stop existing and only
+/// one of them runs code the turn wrote. A turn can panic and unwind; a turn can
+/// return; and a turn whose client disconnects is **drained** for
+/// `TURN_DRAIN_TIMEOUT` and aborted only if it outlasts that (`server.rs`,
+/// REQ-565) — the abort drops the future where it stands. Any of the three
+/// leaking a claim would wedge the session so that every later prompt on it is
+/// refused for a turn that no longer exists.
+///
+/// It holds a registry *handle*, not a lock guard: the mutex is taken for the
+/// two vector writes and released immediately, so nothing here blocks the async
+/// path for the length of a turn (LESSON-448).
+pub struct TurnClaim {
+    sessions: Arc<Mutex<Vec<SessionRecord>>>,
+    session_id: SessionId,
+    turn_id: TurnId,
+}
+
+impl TurnClaim {
+    /// The turn this claim was taken for.
+    #[must_use]
+    pub fn turn_id(&self) -> &TurnId {
+        &self.turn_id
+    }
+
+    /// The session it holds.
+    #[must_use]
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+/// Prints what the claim *is* — which session, which turn — and not the
+/// registry handle it releases into.
+///
+/// Deriving would print every session's conversation through the handle, which
+/// is prompt text and tool output in whatever log the claim was formatted into
+/// (conventions: no file content or prompt text in logs).
+impl fmt::Debug for TurnClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurnClaim")
+            .field("session_id", &self.session_id)
+            .field("turn_id", &self.turn_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TurnClaim {
+    fn drop(&mut self) {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            // A poisoned registry means some other critical section panicked;
+            // there is nothing useful to release into and unwinding here would
+            // replace that panic with this one.
+            return;
+        };
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| record.summary.session_id == self.session_id)
+        else {
+            return;
+        };
+        // Only ever release *this* claim. Two claims cannot coexist today, so
+        // the comparison is a guard against a future that changes that rather
+        // than a live case — but "the guard released whatever it found" is the
+        // shape that turns such a change into a silent double-admission.
+        if record.in_flight_turn.as_ref() == Some(&self.turn_id) {
+            record.in_flight_turn = None;
+        }
+    }
 }
 
 /// A thread-safe registry of live sessions, newest tracked last.
@@ -100,6 +324,8 @@ impl SessionRegistry {
             .push(SessionRecord {
                 summary: summary.clone(),
                 title_attempted: false,
+                conversation: Conversation::default(),
+                in_flight_turn: None,
             });
         Ok(summary)
     }
@@ -197,6 +423,189 @@ impl SessionRegistry {
         }
         record.summary.title = Some(title.to_owned());
         true
+    }
+
+    /// This session's retained conversation, as the next turn replays it
+    /// (REQ-567 BR-1).
+    ///
+    /// A clone rather than a borrow, deliberately: the caller replays these
+    /// blocks into a `ContextManager` and then runs a whole turn against it, and
+    /// handing out a borrow would mean handing out the lock for that long
+    /// (LESSON-448). The copy costs one pass over the retained blocks per prompt,
+    /// against a turn that is about to spend seconds in a model.
+    ///
+    /// A session the registry does not have snapshots as **empty**, which is the
+    /// honest answer — a conversation that does not exist has said nothing — and
+    /// keeps the caller's seeding path free of a "session vanished" branch it
+    /// cannot act on anyway.
+    #[must_use]
+    pub fn conversation_snapshot(&self, id: &SessionId) -> Conversation {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .iter()
+            .find(|record| &record.summary.session_id == id)
+            .map(|record| record.conversation.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replace this session's conversation with `blocks` — **the whole vector**,
+    /// which is the atomic unit of REQ-567 BR-6.
+    ///
+    /// ## Why replacement and never an append
+    ///
+    /// What the turn's manager holds when the turn ends *is* the retained view:
+    /// the model text as the containment cut kept it (BUG-147), the blocks a
+    /// mid-turn compaction rewrote (BR-4), the tool results as they folded in.
+    /// Committing that vector is a move, not a re-derivation — so the store can
+    /// never disagree with the harness about what the conversation is. An append
+    /// API would have to be told which blocks are new, and a compaction that
+    /// rewrote the history it is appending to has no such answer.
+    ///
+    /// ## Rollback is by omission, not by undo
+    ///
+    /// This is the **only** writer, so a turn that fails simply never calls it
+    /// and the pre-turn vector stands untouched (BR-6/AC-5). There is no partial
+    /// state to roll back because there was never a partial write; the atomicity
+    /// is a property of the API's shape rather than of a call site remembering to
+    /// restore something.
+    ///
+    /// A commit for a session the registry does not have stores nothing — there
+    /// is no record to hold it, and inventing one would resurrect a session
+    /// whose id nothing will ever look up again.
+    ///
+    /// # Panics
+    ///
+    /// If the registry mutex is poisoned. [`Self::try_commit_conversation`] is
+    /// the non-panicking twin the drop path uses.
+    pub fn commit_conversation(&self, id: &SessionId, retained: RetainedContext) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        Self::write_conversation(&mut sessions, id, retained);
+    }
+
+    /// The same commit, on a path that must not panic (REQ-567 verify).
+    ///
+    /// `Drop` runs during unwinding, and a panic raised inside a drop that is
+    /// itself running because of a panic aborts the process — the whole daemon,
+    /// every other session with it. So the drop-path commit takes the lock with
+    /// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner) rather
+    /// than `expect`. That is sound for *this* write specifically: it is a
+    /// whole-vector replacement of one field, so there is no half-updated
+    /// invariant a poisoned lock could be protecting — the very property BR-6
+    /// already rests on.
+    ///
+    /// The explicit path keeps `expect`: a poisoned registry there is a bug to
+    /// surface loudly, on a stack where surfacing it is safe.
+    pub fn try_commit_conversation(&self, id: &SessionId, retained: RetainedContext) {
+        let mut sessions = match self.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::write_conversation(&mut sessions, id, retained);
+    }
+
+    /// The one write both commit paths perform.
+    fn write_conversation(
+        sessions: &mut [SessionRecord],
+        id: &SessionId,
+        retained: RetainedContext,
+    ) {
+        if let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        {
+            record.conversation = Conversation::from_retained(retained);
+        }
+    }
+
+    /// Empty this session's conversation and report how many blocks went
+    /// (REQ-567 BR-8).
+    ///
+    /// The count is the `context_cleared` payload — a clear that reported
+    /// nothing would leave the user unable to tell "cleared a long session" from
+    /// "cleared a session that was already empty", and those are the two things
+    /// they are most likely to want to know.
+    ///
+    /// **Only the conversation** (OQ-4): session taint, the user-pasted-URL set,
+    /// and remembered permission grants all survive, because a routinely-typed
+    /// clear must never silently widen egress or consent (LESSON-495).
+    pub fn clear_conversation(&self, id: &SessionId) -> usize {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return 0;
+        };
+        let dropped = record.conversation.len();
+        record.conversation = Conversation::default();
+        dropped
+    }
+
+    /// Claim this session for `turn_id`, or refuse and name the turn already
+    /// running (REQ-567 BR-5, D-3).
+    ///
+    /// Two `session/prompt` calls on one session can be in flight at once — each
+    /// runs on its own task — and both replaying the same snapshot and then both
+    /// committing would fork the conversation: the second commit would erase the
+    /// first turn's blocks wholesale. This is the gate that makes the transcript
+    /// linear, and it refuses rather than queues (D-3): a refusal is immediate
+    /// and retryable where a queue is silent and unbounded, and the CLI prompter
+    /// is sequential, so a single well-behaved client never sees it.
+    ///
+    /// ## The check and the mark are one lock, for `claim_title`'s reason
+    ///
+    /// A `is_busy()` followed by a `mark_busy()` would let both turns read
+    /// "free" and both proceed — the exact race this exists to close. So the
+    /// read and the write happen under one lock and the claim is genuinely
+    /// exclusive.
+    ///
+    /// ## The lock is not what is held for the turn
+    ///
+    /// The returned [`TurnClaim`] holds a flag on the record, released on drop,
+    /// while the mutex is released before this function returns. Holding the
+    /// registry lock across a turn would block every other session's `list`,
+    /// `get`, and title claim on one model call (LESSON-448).
+    ///
+    /// # Errors
+    ///
+    /// [`TurnClaimError::InFlight`] when another turn holds the session, and
+    /// [`TurnClaimError::NoSuchSession`] when there is no record to claim.
+    pub fn try_begin_turn(
+        &self,
+        id: &SessionId,
+        turn_id: &TurnId,
+    ) -> Result<TurnClaim, TurnClaimError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return Err(TurnClaimError::NoSuchSession {
+                session_id: id.clone(),
+            });
+        };
+        if let Some(in_flight) = &record.in_flight_turn {
+            return Err(TurnClaimError::InFlight {
+                session_id: id.clone(),
+                turn_id: in_flight.clone(),
+            });
+        }
+        record.in_flight_turn = Some(turn_id.clone());
+        Ok(TurnClaim {
+            sessions: Arc::clone(&self.sessions),
+            session_id: id.clone(),
+            turn_id: turn_id.clone(),
+        })
     }
 
     /// Number of live sessions.
@@ -391,5 +800,313 @@ mod tests {
         assert!(reg.claim_title(&a.session_id));
         assert!(reg.claim_title(&b.session_id));
         assert!(!reg.claim_title(&a.session_id));
+    }
+
+    // -- the session's conversation (REQ-567 TASK-092) ------------------------
+
+    use crate::harness::context::{BlockRole, ContextManager, Provenance, ToolProvenance};
+
+    fn user_block(text: &str) -> ContextBlock {
+        ContextBlock {
+            role: BlockRole::User,
+            text: text.to_owned(),
+            provenance: Provenance::User,
+        }
+    }
+
+    fn model_block(text: &str) -> ContextBlock {
+        ContextBlock {
+            role: BlockRole::Assistant,
+            text: text.to_owned(),
+            provenance: Provenance::Model,
+        }
+    }
+
+    fn tool_block(tool: &str, path: &str, text: &str) -> ContextBlock {
+        ContextBlock {
+            role: BlockRole::Tool,
+            text: text.to_owned(),
+            provenance: Provenance::Tool {
+                tool: tool.to_owned(),
+                provenance: ToolProvenance::path(path),
+            },
+        }
+    }
+
+    fn texts(blocks: &[ContextBlock]) -> Vec<&str> {
+        blocks.iter().map(|b| b.text.as_str()).collect()
+    }
+
+    /// What a turn hands the store: blocks with nothing yet truncated and
+    /// nothing yet forgotten. The two extra facts a real commit carries have
+    /// their own tests below.
+    fn retained(blocks: Vec<ContextBlock>) -> RetainedContext {
+        RetainedContext::from_blocks(blocks)
+    }
+
+    /// **BR-1 at its source.** A session starts with nothing to say, and what a
+    /// turn commits is exactly what the next turn snapshots — same blocks, same
+    /// order, same roles and provenance.
+    #[test]
+    fn what_a_turn_commits_is_what_the_next_turn_snapshots() {
+        let reg = SessionRegistry::new();
+        let s = reg.create(SessionMode::Freeform, None, None).unwrap();
+        assert!(
+            reg.conversation_snapshot(&s.session_id).is_empty(),
+            "a new session has said nothing"
+        );
+
+        let committed = vec![
+            user_block("what does sessions.rs do?"),
+            model_block("it is the daemon's session store"),
+            tool_block("read", "crates/tetond/src/sessions.rs", "//! The session…"),
+        ];
+        reg.commit_conversation(&s.session_id, retained(committed.clone()));
+
+        assert_eq!(reg.conversation_snapshot(&s.session_id).blocks(), committed);
+    }
+
+    /// **BR-6, both halves, in the one place that can hold them.** A turn mutates
+    /// a snapshot it took — that is what a turn *is* — and none of it reaches the
+    /// registry until the turn commits. A turn that fails never commits, so the
+    /// next prompt sees the pre-turn conversation byte for byte (AC-5).
+    ///
+    /// And the commit that does land is a **whole-vector replacement**, not an
+    /// append: it is the manager's post-turn view, which a mid-turn compaction is
+    /// free to have rewritten.
+    #[test]
+    fn only_a_commit_changes_the_conversation_and_it_replaces_the_whole_vector() {
+        let reg = SessionRegistry::new();
+        let s = reg.create(SessionMode::Freeform, None, None).unwrap();
+        let before = vec![user_block("prompt one"), model_block("answer one")];
+        reg.commit_conversation(&s.session_id, retained(before.clone()));
+
+        // A turn that errors: it read the conversation, grew it, and died.
+        let mut failed_turn = reg.conversation_snapshot(&s.session_id).blocks().to_vec();
+        failed_turn.push(user_block("prompt two"));
+        failed_turn.push(tool_block("read", "a.rs", "half a file"));
+        drop(failed_turn);
+
+        assert_eq!(
+            reg.conversation_snapshot(&s.session_id).blocks(),
+            before,
+            "a turn that never committed left blocks behind"
+        );
+
+        // A turn that completes, having compacted its history mid-turn: the
+        // vector it commits does not contain the blocks it replaced.
+        let compacted = vec![
+            tool_block("compact", "a.rs", "[earlier conversation compacted]"),
+            user_block("prompt two"),
+            model_block("answer two"),
+        ];
+        reg.commit_conversation(&s.session_id, retained(compacted.clone()));
+
+        assert_eq!(
+            reg.conversation_snapshot(&s.session_id).blocks(),
+            compacted,
+            "a commit must replace the conversation, never extend it"
+        );
+    }
+
+    /// **BR-3 / the truncation note, at the store.** A conversation is three
+    /// facts, not one: the blocks, whether history was dropped, and the egress
+    /// provenance of what was dropped. All three cross the registry, because a
+    /// commit that carried only the vector would retract the honesty note on the
+    /// next prompt and launder a truncated-away boundary read.
+    #[test]
+    fn a_commit_carries_the_two_facts_that_are_not_in_the_blocks() {
+        let reg = SessionRegistry::new();
+        let s = reg.create(SessionMode::Freeform, None, None).unwrap();
+
+        // A turn that truncated a `local-only` read away, as its manager would
+        // hand it over.
+        let mut ctx = ContextManager::new("head", 1_000_000).with_budget_bytes(2_000);
+        ctx.push_tool_result(
+            "read",
+            Some("secrets/prod.env".to_owned()),
+            "x".repeat(1_500),
+        );
+        ctx.push_user("x".repeat(1_500));
+        ctx.push_user("and now this");
+        ctx.truncate_to_budget();
+        assert!(ctx.was_truncated(), "fixture: the turn must have truncated");
+
+        reg.commit_conversation(&s.session_id, ctx.into_retained());
+
+        let carried = reg.conversation_snapshot(&s.session_id);
+        assert!(
+            carried.retained().was_truncated(),
+            "the next prompt would stop saying that history is missing"
+        );
+        assert!(
+            carried
+                .retained()
+                .dropped_provenance()
+                .sources()
+                .contains("secrets/prod.env"),
+            "the next prompt would carry boundary-derived content with nothing \
+             to scope it"
+        );
+        assert!(
+            !carried.blocks().iter().any(|b| matches!(
+                &b.provenance,
+                Provenance::Tool {
+                    provenance: ToolProvenance::Sources(paths),
+                    ..
+                } if paths.contains("secrets/prod.env")
+            )),
+            "fixture: the boundary block really was dropped, so the provenance \
+             above can only have come from the accumulator"
+        );
+
+        // And a clear takes all three, not just the blocks: a cleared session
+        // that still reported truncated history would print the note over an
+        // empty conversation.
+        assert!(reg.clear_conversation(&s.session_id) > 0);
+        let cleared = reg.conversation_snapshot(&s.session_id);
+        assert!(cleared.is_empty());
+        assert!(!cleared.retained().was_truncated());
+        assert!(cleared.retained().dropped_provenance().is_empty());
+    }
+
+    /// **BR-8.** Clearing empties the conversation and reports what went — the
+    /// number `context_cleared` carries — and clearing again reports nothing,
+    /// because nothing was there.
+    #[test]
+    fn clearing_empties_the_conversation_and_reports_what_went() {
+        let reg = SessionRegistry::new();
+        let s = reg.create(SessionMode::Freeform, None, None).unwrap();
+        reg.commit_conversation(
+            &s.session_id,
+            retained(vec![
+                user_block("one"),
+                model_block("two"),
+                tool_block("read", "a.rs", "three"),
+            ]),
+        );
+
+        assert_eq!(reg.clear_conversation(&s.session_id), 3);
+        assert!(reg.conversation_snapshot(&s.session_id).is_empty());
+        assert_eq!(
+            reg.clear_conversation(&s.session_id),
+            0,
+            "clearing an empty conversation drops nothing"
+        );
+    }
+
+    /// **BR-2 / AC-12.** Two sessions interleaving their turns each carry only
+    /// their own blocks. The isolation is the key, not a filter someone applies:
+    /// a snapshot reads one record.
+    #[test]
+    fn interleaved_sessions_never_see_each_others_blocks() {
+        let reg = SessionRegistry::new();
+        let a = reg.create(SessionMode::Freeform, None, None).unwrap();
+        let b = reg.create(SessionMode::Freeform, None, None).unwrap();
+
+        reg.commit_conversation(&a.session_id, retained(vec![user_block("A's secret plan")]));
+        reg.commit_conversation(
+            &b.session_id,
+            retained(vec![user_block("B's unrelated bug")]),
+        );
+        reg.commit_conversation(
+            &a.session_id,
+            retained(vec![
+                user_block("A's secret plan"),
+                model_block("A's answer"),
+            ]),
+        );
+
+        assert_eq!(
+            texts(reg.conversation_snapshot(&a.session_id).blocks()),
+            ["A's secret plan", "A's answer"]
+        );
+        assert_eq!(
+            texts(reg.conversation_snapshot(&b.session_id).blocks()),
+            ["B's unrelated bug"]
+        );
+        // And clearing one session leaves the other's conversation alone.
+        assert_eq!(reg.clear_conversation(&a.session_id), 2);
+        assert_eq!(
+            texts(reg.conversation_snapshot(&b.session_id).blocks()),
+            ["B's unrelated bug"]
+        );
+    }
+
+    /// **BR-5 / D-3.** One session runs one turn: the second claim is refused
+    /// while the first is live, and the refusal names the turn holding it rather
+    /// than surfacing as a generic failure (LESSON-456). When the claim drops —
+    /// including on an aborted or panicking turn, which is the whole reason it is
+    /// a guard — the session is admitted again.
+    #[test]
+    fn a_second_turn_is_refused_while_one_is_in_flight_and_admitted_after_it_drops() {
+        let reg = SessionRegistry::new();
+        let s = reg.create(SessionMode::Freeform, None, None).unwrap();
+        let first = TurnId::from("turn-1");
+        let second = TurnId::from("turn-2");
+
+        let claim = reg.try_begin_turn(&s.session_id, &first).unwrap();
+        assert_eq!(claim.turn_id(), &first);
+        assert_eq!(claim.session_id(), &s.session_id);
+
+        let refused = reg.try_begin_turn(&s.session_id, &second).unwrap_err();
+        assert_eq!(
+            refused,
+            TurnClaimError::InFlight {
+                session_id: s.session_id.clone(),
+                turn_id: first.clone(),
+            }
+        );
+        assert!(
+            refused.to_string().contains("turn-1"),
+            "the refusal must name the in-flight turn, not just report busy: {refused}"
+        );
+
+        drop(claim);
+        let readmitted = reg
+            .try_begin_turn(&s.session_id, &second)
+            .expect("a released session must admit the next turn");
+        assert_eq!(readmitted.turn_id(), &second);
+    }
+
+    /// The claim is per session, like the title claim: one busy session does not
+    /// stop the daemon's other sessions from running turns (BR-2).
+    #[test]
+    fn each_session_is_claimed_independently() {
+        let reg = SessionRegistry::new();
+        let a = reg.create(SessionMode::Freeform, None, None).unwrap();
+        let b = reg.create(SessionMode::Freeform, None, None).unwrap();
+
+        let _a_turn = reg.try_begin_turn(&a.session_id, &TurnId::from("turn-1"));
+        assert!(reg
+            .try_begin_turn(&b.session_id, &TurnId::from("turn-2"))
+            .is_ok());
+        assert!(reg
+            .try_begin_turn(&a.session_id, &TurnId::from("turn-3"))
+            .is_err());
+    }
+
+    /// A session the registry never had carries no conversation and grants no
+    /// claim — and says which of the two failures it is, rather than handing back
+    /// a claim over nothing.
+    #[test]
+    fn an_unknown_session_carries_no_conversation_and_claims_no_turn() {
+        let reg = SessionRegistry::new();
+        let ghost = SessionId::from("never-created");
+
+        assert!(reg.conversation_snapshot(&ghost).is_empty());
+        reg.commit_conversation(&ghost, retained(vec![user_block("into the void")]));
+        assert!(
+            reg.conversation_snapshot(&ghost).is_empty(),
+            "a commit must not resurrect a session that does not exist"
+        );
+        assert_eq!(reg.clear_conversation(&ghost), 0);
+        assert_eq!(
+            reg.try_begin_turn(&ghost, &TurnId::from("turn-1"))
+                .unwrap_err(),
+            TurnClaimError::NoSuchSession {
+                session_id: ghost.clone(),
+            }
+        );
     }
 }

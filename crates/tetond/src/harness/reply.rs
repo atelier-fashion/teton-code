@@ -135,9 +135,40 @@ pub(crate) struct ParsedReply {
     /// for a tool call, through the end of the dispatched object; everything
     /// after it (further calls, trailing chatter) is noise.
     pub clean_len: usize,
+    /// Byte offset where the dispatched call's JSON object *begins*, for a
+    /// tool-call-shaped reply — so `text[..call_start]` is the prose the model
+    /// wrote ahead of the call, and `text[call_start..clean_len]` is the call.
+    ///
+    /// `None` for an end-of-turn reply, which has no call to separate from.
+    /// Recorded here rather than re-found by a second scan because a caller
+    /// that located the call its own way would be a second parser, free to
+    /// disagree with this one about where a call starts (LESSON-494).
+    pub call_start: Option<usize>,
     /// Tool-call-shaped objects after the first — present in the reply but
     /// not executed by the one-tool-per-turn harness.
     pub dropped_calls: u32,
+}
+
+/// The prose a tool-call-shaped reply carries **ahead** of its call, or `None`
+/// when the reply is not tool-call-shaped at all (REQ-567 OQ-1).
+///
+/// Used to trim a *dangling* call — an assistant block whose call was never
+/// answered because the turn was cancelled at the permission gate. What the
+/// model said before the call is completed prose the user saw and OQ-1 retains;
+/// the call itself is incomplete tool work OQ-1 drops.
+///
+/// The tool list is deliberately empty: this asks only "is this text tool-call
+/// shaped", which [`parse_reply`] answers identically for a known and an
+/// unknown tool ([`ParsedTurn::ToolCall`] versus [`ParsedTurn::Malformed`] —
+/// both are a call, neither is an end of turn). Threading a registry in would
+/// make the answer depend on which tools happened to be exposed to the turn
+/// that produced the text, which is not a property of the text.
+pub(crate) fn prose_before_tool_call(text: &str) -> Option<&str> {
+    let parsed = parse_reply(text, &[]);
+    if matches!(parsed.turn, ParsedTurn::EndTurn(_)) {
+        return None;
+    }
+    Some(&text[..parsed.call_start.unwrap_or(0)])
 }
 
 /// Parse a model reply into a tool call, an end-of-turn answer, or a malformed
@@ -145,7 +176,7 @@ pub(crate) struct ParsedReply {
 /// (or `name`) key; anything else is treated as the final answer.
 pub(crate) fn parse_reply(text: &str, known_tools: &[&str]) -> ParsedReply {
     let spans = json_object_spans(text);
-    let mut first_call: Option<(usize, ParsedTurn)> = None;
+    let mut first_call: Option<(usize, usize, ParsedTurn)> = None;
     let mut dropped_calls = 0u32;
 
     for (start, end) in spans {
@@ -185,18 +216,20 @@ pub(crate) fn parse_reply(text: &str, known_tools: &[&str]) -> ParsedReply {
                 arguments,
             }
         };
-        first_call = Some((end, turn));
+        first_call = Some((start, end, turn));
     }
 
     match first_call {
-        Some((end, turn)) => ParsedReply {
+        Some((start, end, turn)) => ParsedReply {
             turn,
             clean_len: end,
+            call_start: Some(start),
             dropped_calls,
         },
         None => ParsedReply {
             turn: ParsedTurn::EndTurn(text.trim().to_owned()),
             clean_len: text.len(),
+            call_start: None,
             dropped_calls: 0,
         },
     }
@@ -962,5 +995,60 @@ mod tests {
             r#"I'll read it. {"tool":"read","arguments":{"path":"a.rs"}}"#
         );
         assert_eq!(scanner.flushable_len(), "I'll read it. ".len());
+    }
+
+    // -- REQ-567 OQ-1: separating completed prose from an unanswered call ----
+
+    /// The prose half of a tool-calling reply is what the user watched stream,
+    /// and OQ-1 retains it when the turn is cancelled at the permission gate.
+    #[test]
+    fn prose_before_a_tool_call_is_the_text_ahead_of_the_object() {
+        assert_eq!(
+            prose_before_tool_call(
+                r#"I will run the tests. {"tool":"shell","arguments":{"command":"cargo test"}}"#
+            ),
+            Some("I will run the tests. ")
+        );
+    }
+
+    /// A reply that is nothing but a call has no completed prose in it, and the
+    /// empty string is how the caller learns to drop the block whole rather than
+    /// commit a blank assistant turn.
+    #[test]
+    fn a_bare_tool_call_has_no_prose_before_it() {
+        assert_eq!(
+            prose_before_tool_call(r#"{"tool":"read","arguments":{"path":"a.rs"}}"#),
+            Some("")
+        );
+    }
+
+    /// An end-of-turn answer is not tool-call-shaped, so there is nothing to
+    /// trim — including one that merely *mentions* JSON, which is the false
+    /// positive that would silently eat a completed answer.
+    #[test]
+    fn an_end_of_turn_answer_is_not_trimmed() {
+        assert_eq!(prose_before_tool_call("The retry budget is three."), None);
+        assert_eq!(
+            prose_before_tool_call(r#"The config looks like {"retries": 3}."#),
+            None
+        );
+    }
+
+    /// The answer does not depend on which tools happened to be exposed: a call
+    /// to an unknown tool is still a call. It is a property of the text, and
+    /// `parse_reply` classifies it the same way with or without a registry —
+    /// which is what lets the trim run where no registry is in hand.
+    #[test]
+    fn an_unknown_tool_is_still_a_call_to_trim() {
+        let text = r#"Trying something. {"tool":"teleport","arguments":{}}"#;
+        assert_eq!(prose_before_tool_call(text), Some("Trying something. "));
+        assert!(matches!(
+            parse_reply(text, &["read"]).turn,
+            ParsedTurn::Malformed(_)
+        ));
+        assert!(matches!(
+            parse_reply(text, &["teleport"]).turn,
+            ParsedTurn::ToolCall { .. }
+        ));
     }
 }

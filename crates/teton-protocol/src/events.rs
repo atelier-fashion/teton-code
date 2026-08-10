@@ -18,6 +18,8 @@
 //! `web_lookup`, `web_consent_decided`, `web_taint_overridden` — where its
 //! spec's ten-row Events table is deliberately folded onto three variants
 //! (architecture D-8; the fold is spelled out above [`WebLookupOutcome`]).
+//! REQ-567 adds `context_cleared` (BR-8), which announces that a session's
+//! retained conversation was dropped on the user's say-so.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -122,6 +124,8 @@ pub enum Event {
     /// A local agent turn hit, missed, or evicted the KV prefix cache
     /// (REQ-564). Every ending is a [`PrefixCacheOutcome`] on this one variant.
     PrefixCache(PrefixCache),
+    /// The user cleared a session's retained conversation (REQ-567 BR-8).
+    ContextCleared(ContextCleared),
 }
 
 impl Event {
@@ -146,6 +150,7 @@ impl Event {
             Event::WebConsentDecided(_) => "web_consent_decided",
             Event::WebTaintOverridden(_) => "web_taint_overridden",
             Event::PrefixCache(_) => "prefix_cache",
+            Event::ContextCleared(_) => "context_cleared",
         }
     }
 }
@@ -1444,6 +1449,41 @@ pub enum EvictionReason {
     GenerationFailed,
 }
 
+// ---------------------------------------------------------------------------
+// context_cleared
+// ---------------------------------------------------------------------------
+
+/// A session's retained conversation was cleared (REQ-567 BR-8).
+///
+/// Published on every accepted `session/clear`, including one that dropped
+/// nothing — deliberately *not* [`WebTaintOverridden`]'s transition-only rule.
+/// That event announces a state change with consequences, so a re-lift
+/// announces nothing; this one announces the **user's action**, and every
+/// attached client has to stop describing a conversation the next prompt will
+/// not carry. A clear of an already-empty session ends in exactly that state,
+/// and `blocks_dropped` is what tells the two apart.
+///
+/// ## What it does not mean
+///
+/// **The conversation only** (REQ-567 OQ-4, resolved). The session's privacy
+/// taint, its user-pasted-URL set, and its remembered permission grants all
+/// survive a clear, so a client must never render this as a consent or egress
+/// reset: a routinely-typed clear that silently widened either would be
+/// LESSON-495's harm, and a grant is only as narrow as its key.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the same shape
+/// [`SessionTitled`], [`WebTaintOverridden`] and [`PrefixCache`] document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCleared {
+    /// How many retained blocks went, `0` when there was nothing to drop.
+    ///
+    /// Blocks rather than tokens: the conversation is stored as blocks, so this
+    /// is the one count the daemon can state exactly rather than estimate.
+    pub blocks_dropped: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1659,6 +1699,10 @@ mod tests {
                 }),
                 "web_taint_overridden",
             ),
+            (
+                Event::ContextCleared(ContextCleared { blocks_dropped: 6 }),
+                "context_cleared",
+            ),
         ];
 
         for (event, expected) in cases {
@@ -1694,6 +1738,41 @@ mod tests {
         assert_eq!(wire["title"], "wire the unreached categories");
 
         assert_eq!(Event::SessionTitled(titled).name(), "session_titled");
+    }
+
+    /// **REQ-567 BR-8's wire half.** A clear reaches a client as a flat
+    /// `context_cleared` object naming its session and how much went, and
+    /// survives the round trip unchanged.
+    ///
+    /// `session_id` is asserted on the wire object rather than on the payload
+    /// for [`SessionTitled`]'s reason: the envelope is what carries it, and
+    /// `envelope_wire` round-trips before returning, so re-adding `session_id`
+    /// to [`ContextCleared`] fails here on the duplicate key rather than
+    /// reaching a client.
+    ///
+    /// The zero case is asserted beside the populated one because it is a real
+    /// event and not a degenerate one — clearing an already-empty session is
+    /// idempotent and still announced, so `0` has to survive the wire as a
+    /// number rather than be skipped as a default.
+    #[test]
+    fn context_cleared_round_trips_under_its_wire_name() {
+        let cleared = ContextCleared { blocks_dropped: 6 };
+        round_trip(&cleared);
+
+        let wire = envelope_wire(Event::ContextCleared(cleared));
+        assert_eq!(wire["event"], "context_cleared");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["blocks_dropped"], 6);
+
+        assert_eq!(Event::ContextCleared(cleared).name(), "context_cleared");
+
+        let empty = ContextCleared { blocks_dropped: 0 };
+        round_trip(&empty);
+        let wire = envelope_wire(Event::ContextCleared(empty));
+        assert_eq!(
+            wire["blocks_dropped"], 0,
+            "a clear that dropped nothing must still say so on the wire"
+        );
     }
 
     #[test]

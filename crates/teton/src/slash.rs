@@ -52,8 +52,8 @@
 
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    ModelStatusParams, PromptBlock, PromptTurnParams, WebOverrideParams, WebOverrideResult,
-    WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
+    ModelStatusParams, PromptBlock, PromptTurnParams, SessionClearParams, WebOverrideParams,
+    WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
 };
 use teton_protocol::SessionId;
 
@@ -204,6 +204,18 @@ const COMMANDS: &[CommandSpec] = &[
             "a catalog name — `/model set <name>`, and `teton model list` names them",
         ),
         handler: handle_model_set,
+    },
+    // REQ-567's user-only clear. Placed beside `/verbose` because both are
+    // commands about *this session* rather than about the machine's
+    // configuration, and listed here — and therefore in `/help` — because a
+    // conversation the user cannot drop is a conversation they cannot get out
+    // of (BUG-153).
+    CommandSpec {
+        name: "clear",
+        aliases: &[],
+        summary: "Drop this session's retained conversation; the next prompt starts fresh.",
+        args: Args::None,
+        handler: handle_clear,
     },
     CommandSpec {
         name: "verbose",
@@ -815,6 +827,133 @@ fn web_refresh_or_report(
 const WEB_METHODS_UNAVAILABLE: &str =
     "this daemon build does not expose the web lookup controls yet.";
 
+/// The `/clear` handler: drop this session's retained conversation (REQ-567
+/// BR-8 / AC-6).
+///
+/// ## It renders nothing when it succeeds, and that is the point
+///
+/// A clear produces two things a client could draw: this RPC's answer, carrying
+/// `blocks_dropped`, and the broadcast `context_cleared` event, carrying the
+/// same number. Rendering both would print the same fact twice to the one client
+/// that typed the command, which is the drift `/web allow` avoids from the other
+/// direction — there the *answer* is authoritative (`was_restricted` is a fact
+/// only the daemon's reply carries) and the event is verbose-gated for the
+/// bystanders.
+///
+/// Here the event is the authoritative line, because it says everything there is
+/// to say: the count is on the event too, and every attached client has to stop
+/// describing a conversation the next prompt will not carry (`session_ui`'s
+/// `context_cleared` arm). So the issuing client and a second attached client
+/// see *the same one line*, drawn by the same code, and this handler is silent
+/// on success. The daemon's reader loop fences a request's events ahead of its
+/// response, so that line has already been drawn by [`Connection::call`]'s own
+/// event pump by the time this returns — the ordering is the server's, not a
+/// hopeful assumption here.
+///
+/// Only failures are rendered, and the busy one is a **notice** rather than an
+/// error (BUG-152): a session already running a turn is not something the user
+/// broke or has to fix, it resolves by itself, and the daemon's own sentence
+/// names the turn holding it and says to retry. The class is matched on the
+/// daemon's code, never on its wording, for [`crate::render_turn_failure`]'s
+/// reason (LESSON-456).
+///
+/// ## Why there is no typed-input gate
+///
+/// `/model set` is refused on piped stdin because it changes **daemon** state
+/// that outlives the session — the selection every later session and every other
+/// client inherits, on a machine whose RAM floor the user was asked about. A
+/// clear is none of that. It is session-scoped, it takes no consent, it spends
+/// no money, and what it destroys is conversational convenience: the retained
+/// blocks, and nothing else.
+///
+/// ## What the summary line promises, and what it does not
+///
+/// "Drop this session's retained conversation; the next prompt starts fresh" is
+/// the whole claim, and it is exact: the conversation is what every later prompt
+/// is assembled from, and after this there is none. It deliberately does **not**
+/// promise that the cleared bytes have left the machine's memory. The local
+/// engine's prefix cache still holds the cleared conversation's tokens until the
+/// next prompt's prefill overwrites them (architecture D-5): process memory
+/// only, never disk, and unreachable through any prompt, because the cache is
+/// keyed by comparing token ids against the *new* prompt and nothing past the
+/// common prefix can be decoded from. Nobody is told otherwise, and the one-line
+/// summary is left as-is rather than qualified — a help row that hedged about
+/// KV residency would trade a promise nobody made for a sentence nobody can
+/// act on. A user who needs the bytes gone ends the session (BR-9).
+///
+/// OQ-4 is resolved to exactly that — the session's
+/// privacy taint, its pasted-URL set, and its remembered permission grants all
+/// survive a clear, so a `/clear` a script could type can widen no boundary and
+/// grant no permission. It is therefore pipe-friendly like every other command
+/// (BR-9), and gating it would buy nothing while making the one documented
+/// exception to BR-9 into a pattern.
+fn handle_clear(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    _args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let Some(params) = session_clear_params(ctx.session_id.clone()) else {
+        ctx.surface.line(LineKind::Error, CLEAR_NEEDS_A_SESSION);
+        return Ok(CommandOutcome::Continue);
+    };
+    // The session's own connection and context (D-4). The `context_cleared`
+    // event lands on this pump, so the notice is drawn before the answer arrives
+    // — and the answer, on success, is deliberately dropped.
+    if let Err(err) = conn.call(params, ctx)? {
+        report_clear_refusal(&err, ctx.surface);
+    }
+    Ok(CommandOutcome::Continue)
+}
+
+/// The `session/clear` request for a session, or `None` when there is no session
+/// to name.
+///
+/// Split out for [`web_override_params`]'s reason: the `None` arm is the one a
+/// test process cannot otherwise reach, and it is the arm that guarantees no
+/// session id is ever fabricated.
+fn session_clear_params(session_id: Option<SessionId>) -> Option<SessionClearParams> {
+    session_id.map(|session_id| SessionClearParams { session_id })
+}
+
+/// What `/clear` says when there is no session whose conversation to drop.
+const CLEAR_NEEDS_A_SESSION: &str =
+    "`/clear` needs a session to act on, and this command owns none.";
+
+/// What `/clear` says to a daemon built before REQ-567.
+///
+/// A version fact, not a failure, so it wears no `error:` prefix (BUG-152) — and
+/// it says what is true of such a daemon rather than only that the call failed:
+/// a build with no `session/clear` retains nothing across prompts either, so
+/// there is nothing there to clear.
+const CLEAR_UNAVAILABLE: &str = "this daemon build does not retain a conversation across prompts, \
+                                 so there is nothing to clear.";
+
+/// Render the reason a `/clear` did not happen — and nothing at all when it did.
+///
+/// Split out of the handler so all three arms are asserted without a socket, for
+/// the reason [`crate::cost_report_or_report`] is: the wording and the line class
+/// *are* the behaviour here, and the busy arm is the one an e2e can only reach by
+/// racing a turn.
+fn report_clear_refusal(err: &RpcError, surface: &mut dyn Surface) {
+    match err.code {
+        // A build without the method (BUG-152's class), and a session that is
+        // simply busy right now — both transient or informational, neither a
+        // failure the user caused or can fix.
+        error_code::METHOD_NOT_FOUND => surface.line(LineKind::Notice, CLEAR_UNAVAILABLE),
+        // The daemon's sentence names the turn holding the session and says to
+        // retry when it finishes, so this adds only the fact the daemon cannot
+        // know the user is waiting on: that nothing was dropped.
+        error_code::SESSION_BUSY => surface.line(
+            LineKind::Notice,
+            &format!("nothing was cleared: {}", err.message),
+        ),
+        _ => surface.line(
+            LineKind::Error,
+            &format!("the conversation could not be cleared: {}", err.message),
+        ),
+    }
+}
+
 /// What [`model_set_gate`] decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelSetGate {
@@ -1035,6 +1174,9 @@ mod tests {
             // be a spec decision rather than a drive-by.
             "web allow",
             "web refresh",
+            // REQ-567 BR-8: the user-only clear, declared here for the same
+            // reason the web rows were — a new command is a spec decision.
+            "clear",
         ];
         for expected in promised {
             assert!(
@@ -1636,5 +1778,91 @@ mod tests {
         assert_ne!(WEB_REFRESH_EVICTED, WEB_REFRESH_ABSENT);
         assert!(WEB_REFRESH_EVICTED.contains("re-fetches"));
         assert!(WEB_REFRESH_ABSENT.contains("nothing was stored"));
+    }
+
+    /// `/clear` never fabricates a session id either: with no session there is
+    /// nothing to clear, so nothing is sent.
+    #[test]
+    fn clear_without_a_session_builds_no_request() {
+        assert!(
+            session_clear_params(None).is_none(),
+            "a command with no session must not invent one to clear"
+        );
+        assert!(CLEAR_NEEDS_A_SESSION.contains("needs a session"));
+
+        let named = session_clear_params(Some(SessionId::from("sess-9")))
+            .expect("a session is all this request needs");
+        assert_eq!(named.session_id, SessionId::from("sess-9"));
+    }
+
+    /// **REQ-567 BR-8, the render decision.** A `/clear` that worked prints
+    /// nothing here — the `context_cleared` event is the one line every attached
+    /// client draws, the issuer included — so this pins the arms that *do*
+    /// render, and their line classes.
+    ///
+    /// The busy arm is the one that matters: a session already running a turn is
+    /// transient, resolves by itself, and needs no fixing, so it is a **notice**
+    /// (BUG-152). Shipping it as an `error:` line would tell a user who typed
+    /// `/clear` a second too early that something had gone wrong.
+    ///
+    /// Matched on the daemon's code rather than on its sentence, so the daemon's
+    /// wording can change without silently reclassifying the line (LESSON-456);
+    /// the sentence is passed through because it names the turn holding the
+    /// session and says to retry, which no string written here could.
+    #[test]
+    fn a_busy_clear_is_a_notice_and_a_real_failure_is_an_error() {
+        let mut surface = RecordingSurface::new();
+        report_clear_refusal(
+            &RpcError::new(
+                error_code::SESSION_BUSY,
+                "session sess-1 is already running turn turn-2; one session runs one turn at a \
+                 time — retry when it finishes",
+            ),
+            &mut surface,
+        );
+        let busy = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(
+            busy.contains("nothing was cleared"),
+            "a refused clear must say the conversation is still there: {busy}"
+        );
+        assert!(
+            busy.contains("turn-2"),
+            "the daemon's sentence names the turn holding the session: {busy}"
+        );
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "a busy session is not a failure (BUG-152): {:?}",
+            surface.calls
+        );
+
+        // A daemon built before REQ-567 retains nothing across prompts, so
+        // "there is nothing to clear" is the true thing to say — and it is a
+        // version fact, not a failure.
+        let mut surface = RecordingSurface::new();
+        report_clear_refusal(
+            &RpcError::new(error_code::METHOD_NOT_FOUND, "no such method"),
+            &mut surface,
+        );
+        assert_eq!(surface.lines_of(LineKind::Notice).len(), 1);
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "a build without the method is not a failure: {:?}",
+            surface.calls
+        );
+
+        // Everything else keeps the error line, carrying the daemon's reason.
+        let mut surface = RecordingSurface::new();
+        report_clear_refusal(
+            &RpcError::new(error_code::INTERNAL_ERROR, "boom"),
+            &mut surface,
+        );
+        let failed = surface.lines_of(LineKind::Error).join("\n");
+        assert!(failed.contains("could not be cleared"), "{failed}");
+        assert!(failed.contains("boom"), "{failed}");
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "a real failure must not be softened into a notice: {:?}",
+            surface.calls
+        );
     }
 }

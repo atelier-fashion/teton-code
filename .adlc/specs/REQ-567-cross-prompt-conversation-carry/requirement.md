@@ -1,7 +1,7 @@
 ---
 id: REQ-567
 title: "Cross-prompt conversation carry in interactive sessions"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-10
 updated: 2026-08-10
@@ -78,9 +78,10 @@ tokens.
 |-------|---------|---------|
 | context_cleared | user clears the session's conversation | session_id, blocks_dropped (count) |
 
-No new RPCs and no change to `session/prompt`'s wire shape. Carry is visible
-through existing surfaces: REQ-564's `prefix_cache_*` events and BR-9 ledger
-counts at prompt boundaries, and the assembled-context behavior itself.
+One new RPC, `session/clear` (architecture D-2); `session/prompt`'s wire shape
+is unchanged. Carry is visible through existing surfaces: REQ-564's
+`prefix_cache_*` events and BR-9 ledger counts at prompt boundaries, and the
+assembled-context behavior itself.
 
 ### Permissions
 
@@ -90,7 +91,7 @@ counts at prompt boundaries, and the assembled-context behavior itself.
 
 ## Business Rules
 
-- [ ] BR-1: **A prompt turn begins from the retained conversation.** The
+- [x] BR-1: **A prompt turn begins from the retained conversation.** The
       context for prompt N+1 consists of the current system head, every block
       the harness retained from prompts 1..N — as it kept them: post
       containment cut, post compaction — and the new user message, in order.
@@ -98,14 +99,14 @@ counts at prompt boundaries, and the assembled-context behavior itself.
       view (the two diverge wherever the harness edits output — see
       LESSON-500). A follow-up that refers to earlier prompts is answerable
       without re-supplying files or restating the conversation.
-- [ ] BR-2: **The conversation lives in the daemon; the wire shape is
+- [x] BR-2: **The conversation lives in the daemon; the wire shape is
       unchanged.** Clients continue to send only the new prompt in
       `session/prompt`. Every client attached to a session extends one shared
       conversation — a second client's prompt sees the first client's turns.
       Conversations are keyed by session: no block from one session's
       conversation ever appears in another session's context.
       (informed by REQ-544 BR-4/AC-6)
-- [ ] BR-3: **Provenance survives carry.** Every carried block keeps its
+- [x] BR-3: **Provenance survives carry.** Every carried block keeps its
       egress provenance, and the BR-1 choke-point inspection treats carried
       content identically to same-turn content: boundary content read in an
       early prompt produces the same `privacy_block`/reroute when a later
@@ -113,7 +114,7 @@ counts at prompt boundaries, and the assembled-context behavior itself.
       unchanged — taint is already session-scoped and now guards a
       conversation that actually spans the session. Egress-capture verified,
       not code-inspected. (informed by REQ-544 BR-1/AC-5, REQ-563 BR-13)
-- [ ] BR-4: **The context budget spans the session.** The token/byte budget
+- [x] BR-4: **The context budget spans the session.** The token/byte budget
       applies to the carried conversation; under pressure the existing
       compaction machinery runs and the compacted history is what carries
       forward. An over-window rendered prompt is still refused with the typed
@@ -121,9 +122,16 @@ counts at prompt boundaries, and the assembled-context behavior itself.
       BR-7 unchanged). A long-lived session degrades to compaction, never to
       a failed turn. A compacted boundary may legitimately reuse less KV than
       the prior turn's prefix; it shows as a `divergent` hit or a miss
-      alongside the compaction — never silently. (informed by LESSON-491,
-      REQ-564 BR-7)
-- [ ] BR-5: **One conversation never interleaves.** Two in-flight
+      alongside the compaction — never silently. **Scope note (verify,
+      2026-08-10):** moving the budget gate to the top of the loop (D-6) makes
+      the `compact` duty reachable on the first iteration, so a *tool-free*
+      pressured conversation can now egress to a remote `compact` binding —
+      previously impossible by construction, since the gate's only call site was
+      the tool-result fold. Intended, and named here rather than left implicit:
+      the duty egress scoping of REQ-561 BR-7 and the session taint still govern
+      what may be sent, so what changed is which turns can reach the duty, not
+      what the duty may send. (informed by LESSON-491, REQ-564 BR-7)
+- [x] BR-5: **One conversation never interleaves.** Two in-flight
       `session/prompt` calls on one session (possible today — each runs on its
       own task) must not interleave or fork the conversation. Whether the
       second turn queues in arrival order or is refused with a typed
@@ -131,30 +139,36 @@ counts at prompt boundaries, and the assembled-context behavior itself.
       the transcript stays linear, the outcome is deterministic, and a refusal
       names its cause truthfully rather than surfacing as a generic turn
       error. (informed by LESSON-456, BUG-152)
-- [ ] BR-6: **A turn's blocks join the conversation atomically, on
+- [x] BR-6: **A turn's blocks join the conversation atomically, on
       completion.** A turn that fails leaves the conversation exactly as it
       was when the turn started — the next prompt's context contains no
-      partial blocks from the failed turn. Duty calls (title naming,
-      summarize/classify) never contribute blocks to the conversation; they
-      are not turns. (Cancelled-turn retention is OQ-1.)
-- [ ] BR-7: **Carry is correct independent of the KV cache.** The assembled
+      partial blocks from the failed turn; a turn that panics is a failed turn
+      for this purpose. **Out-of-band duty output never joins the
+      conversation**: a duty that answers a question *about* a turn — naming
+      the session, classifying the route, judging an outbound payload — writes
+      nothing into it, because its answer is not something the session said.
+      Duties that *rewrite the conversation in place* are a different thing and
+      are not excluded: `compact`'s summary and `digest`'s condensed tool result
+      **are** the retained view of conversation content (OQ-3). (Cancelled-turn
+      retention is OQ-1.)
+- [x] BR-7: **Carry is correct independent of the KV cache.** The assembled
       context for any turn is identical with the prefix cache enabled,
       disabled, evicted, or divergent, and identical across a mid-session
       system-head change (tools or route changing between prompts). Cache
       state may only ever change latency — REQ-564 BR-1's posture, extended
       across prompt boundaries. (informed by REQ-564 BR-1)
-- [ ] BR-8: **Clearing is explicit, user-only, and visible.** A clear command
+- [x] BR-8: **Clearing is explicit, user-only, and visible.** A clear command
       empties the session's conversation, emits `context_cleared`, and the
       next prompt starts from the system head alone. The model cannot invoke
       it, and observed content cannot trigger it. What else clearing resets —
       if anything — is OQ-4; by default it resets the conversation only.
       (informed by REQ-563 BR-13, LESSON-495)
-- [ ] BR-9: **The conversation is daemon-lifetime state, honestly.** It dies
+- [x] BR-9: **The conversation is daemon-lifetime state, honestly.** It dies
       with the daemon — under REQ-565's default policy, when the last client
       disconnects. No persistence, no replay-on-attach in this REQ; a client
       attaching to a live session joins its conversation from now on, and
       nothing claims otherwise. (informed by REQ-565)
-- [ ] BR-10: **Duty inputs do not scale with the conversation.** The route
+- [x] BR-10: **Duty inputs do not scale with the conversation.** The route
       classifier — and any other fixed-frame duty that reads "this turn's
       prompt" — consumes the new user message inside a fixed frame; its input
       size must not grow with conversation length. Carry changes what the
@@ -163,39 +177,39 @@ counts at prompt boundaries, and the assembled-context behavior itself.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: **The recap test.** Scripted e2e session of ≥3 prompts: the
+- [x] AC-1: **The recap test.** Scripted e2e session of ≥3 prompts: the
       rendered prompt the engine receives for turn N contains turn N-1's user
       message and retained assistant reply, and a final recap-shaped prompt's
       rendered context contains the content it asks about. The received
       context is the scripted leg's evidence; tool-free recap answering is
       only meaningful on AC-8's real-model leg. This test fails against
       today's binary.
-- [ ] AC-2: Privacy: egress-capture — prompt 1 reads `local-only` boundary
+- [x] AC-2: Privacy: egress-capture — prompt 1 reads `local-only` boundary
       content (served locally); prompt 2 routes remote; the boundary content
       triggers the same `privacy_block`/reroute as a same-turn inclusion, and
       no boundary bytes appear in any remote payload for the session.
       (informed by REQ-544 AC-5)
-- [ ] AC-3: Budget: a session driven past the context budget across several
+- [x] AC-3: Budget: a session driven past the context budget across several
       prompts compacts rather than fails; later prompts succeed; no process
       abort and no over-window error escape; the post-compaction boundary
       emits a `divergent: true` prefix-cache hit reusing the common head
       (REQ-564 AC-3's shape, now across prompts).
-- [ ] AC-4: Serialization: two concurrent prompts on one session resolve per
+- [x] AC-4: Serialization: two concurrent prompts on one session resolve per
       the BR-5 decision — both transcripts linear and deterministic, or the
       second refused with the typed busy error naming the in-flight turn —
       and the conversation afterward contains no interleaved blocks.
-- [ ] AC-5: Atomicity: a scripted turn that errors after a completed tool
+- [x] AC-5: Atomicity: a scripted turn that errors after a completed tool
       call leaves the next prompt's context byte-identical to what it would
       have been had the failed turn never run.
-- [ ] AC-6: Clear: the clear command emits `context_cleared`; the next
+- [x] AC-6: Clear: the clear command emits `context_cleared`; the next
       prompt's assembled context contains no prior conversation; and clear is
       unreachable by the model **by construction** — no tool in the registry
       exposes it, asserted by a tool-surface test, so the user-only rule
       (BR-8) is structural rather than checked at call time.
-- [ ] AC-7: A/B correctness: a fixed-seed multi-prompt scripted session
+- [x] AC-7: A/B correctness: a fixed-seed multi-prompt scripted session
       produces byte-identical assembled contexts and outputs with the KV
       cache enabled vs disabled (REQ-564 AC-2 extended across boundaries).
-- [ ] AC-8: Boundary warmth: in a scripted multi-prompt session with caching
+- [x] AC-8: Boundary warmth: in a scripted multi-prompt session with caching
       on, each well-behaved prompt boundary emits `prefix_cache_hit` with
       `divergent: false` and `cached_tokens` equal to the full retained prior
       context — not the system head. Ledger rows carry the matching
@@ -203,19 +217,43 @@ counts at prompt boundaries, and the assembled-context behavior itself.
       dogfood follow-up in `docs/manual-verification.md`, superseding the
       2026-08-10 measurement in which every boundary reused only the
       ~814-token head.
-- [ ] AC-9: Multi-client continuity: client A prompts and disconnects while
+- [x] AC-9: Multi-client continuity: client A prompts and disconnects while
       client B stays attached (holding the daemon alive); client B prompts
       the same session and its turn context contains A's conversation.
       (informed by REQ-544 AC-6)
-- [ ] AC-10: Mutation check: reverting to a per-prompt fresh context (the
+- [x] AC-10: Mutation check: reverting to a per-prompt fresh context (the
       current `ContextManager::new` per dispatch) turns AC-1 and AC-8 red.
-- [ ] AC-11: Duty-input bound: across a ≥5-prompt session, the route
+      **Executed 2026-08-10** (TASK-096), by two routes to the same end state
+      and a third for provenance, each reverted immediately; the observed
+      failures are recorded in `crates/tetond/tests/conversation_carry.rs`'s
+      module doc. Dropping the dispatch seeding reddened AC-1, AC-11, AC-12,
+      BR-1's kept-view test, OQ-1's cancellation test and both e2e legs;
+      emptying `commit_conversation` reddened those plus AC-8 and AC-3;
+      replaying tool blocks without their provenance reddened AC-2 and put the
+      fixture repo's secret on the wire (`BR-1 VIOLATION` from the suite-wide
+      egress capture).
+- [x] AC-11: Duty-input bound: across a ≥5-prompt session, the route
       classifier's input length stays fixed while the agent context grows
       (BR-10).
-- [ ] AC-12: Cross-session isolation: two interleaved sessions each carry
+- [x] AC-12: Cross-session isolation: two interleaved sessions each carry
       only their own conversation; a prompt in one session that references
       the other session's content gets a rendered context containing none of
       it (BR-2).
+
+**Where each AC is verified** (TASK-096): the mapping from AC to the test that
+holds it is the module doc of `crates/tetond/tests/conversation_carry.rs` — the
+three homes are that file (AC-3, AC-7, AC-8), the in-crate
+`runtime::tests::conversation_carry` module (AC-1, AC-4, AC-5, AC-6, AC-11,
+AC-12, whose claims are about the dispatch and need the crate-private engine
+slot), and `crates/tetond/tests/e2e/conversation_carry.rs` over the real socket
+(AC-2, AC-9).
+
+**Open for manual verification** (`docs/manual-verification.md`, REQ-567): the
+two legs no default build can run, because no model is linked into one — AC-1's
+tool-free recap *answering* (the scripted leg proves the recap's material
+reached the context, not that a model used it) and AC-8's real-model boundary
+measurement (the scripted leg proves the reuse policy, not that llama.cpp
+reuses the KV). Both are the same dogfood session; status NOT RUN.
 
 ## External Dependencies
 
@@ -265,12 +303,53 @@ counts at prompt boundaries, and the assembled-context behavior itself.
       conversation (the user saw it; ACP replays it) and drops incomplete
       tool calls/results. BR-6's clean-rollback rule applies to *failed*
       turns only; cancellation is its own case.
-- [ ] OQ-2: BR-5 queue-vs-refuse for concurrent turns on one session —
-      architect's latitude with a UX voice; queuing matches user expectation,
-      refusal is simpler and honest if the error is typed.
-- [ ] OQ-3: Confirm at architecture time that no duty output (titles,
-      summaries, redaction verdicts) should ever join the conversation —
-      BR-6 assumes never; is there a future duty that legitimately should?
+      **Scope of "retain prose" (verify, 2026-08-10):** it covers *completed*
+      generations — text the harness had already folded into the context when
+      the turn was cancelled. Prose lost mid-generation, where the abort lands
+      between tokens and nothing has been pushed, is **not** retained: the
+      harness pushes a model turn when the generation ends, so a partial
+      generation is not a block for the commit to keep. The narrower promise is
+      the honest one; retaining a half-decoded generation would also mean
+      carrying text the containment scanner never got to cut (LESSON-500).
+      The dangling call the cancellation *does* have to handle is the one that
+      was fully generated and then parked at the permission gate: its assistant
+      block is committed with the call trimmed off and the prose ahead of it
+      kept. **That, and only that** (verify, second pass): a *remote* turn's
+      call is a structured event and is not in the text, so its prose is
+      committed verbatim however tool-call-shaped the JSON it quotes; and a call
+      whose tool already ran is not incomplete work, so a cancellation after
+      dispatch commits the call block as it stands. A committed conversation may
+      therefore hold a dispatched-but-unfolded call — the honest record, and
+      better than erasing a request whose edit is on the disk. "Incomplete tool
+      work" means work that never ran.
+- [x] OQ-2 — RESOLVED (architecture D-3, 2026-08-10): **refused, not queued.**
+      A second `session/prompt` while a turn is in flight gets a typed
+      session-busy error naming the turn that holds the session; the claim
+      releases on drop, so an aborted turn cannot wedge it. A queue can be
+      layered on later without a wire change (a busy error is retryable).
+      Verified by AC-4's test.
+- [x] OQ-3 — RESOLVED (2026-08-10): **it depends on what the duty is for, and
+      the line is already load-bearing.** Two kinds of duty exist and BR-6's
+      original sentence collapsed them.
+      *Out-of-band duties* answer a question **about** a turn and produce
+      nothing the session said: `title` names the session, `classify` picks a
+      route, `redact` judges an outbound payload. None of their output joins
+      the conversation, now or in a future duty of the same shape — an answer
+      about the conversation is not part of it, and letting one in would put
+      harness-authored narration in the model's transcript with nobody having
+      said it.
+      *In-band duties* rewrite conversation content **in place**, and their
+      output is already in the conversation by design: `compact`'s replacement
+      summary is what stands in for the blocks it elides, and `digest`'s
+      condensed tool result is the form in which an oversized result enters
+      context at all. Both are the retained view (BR-1: "as the harness kept
+      them"), both inherit the provenance of what they replace, and both are
+      framed as untrusted data on the way in. Excluding them would mean either
+      carrying the pre-compaction history the budget just dropped or carrying
+      nothing where a tool result was.
+      So the rule is not "duty output never joins" but "**output that is about
+      the conversation never joins; output that is a rewrite of the
+      conversation is the conversation**". BR-6 is reworded to say that.
 - [x] OQ-4 — RESOLVED (product decision, 2026-08-10): **conversation only.**
       Clear empties the conversation and nothing else — REQ-563 session
       taint, the user-pasted-URL set, and session permission grants all

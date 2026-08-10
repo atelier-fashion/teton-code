@@ -289,6 +289,23 @@ pub mod error_code {
         /// a new daemon cannot fix a stale binary on disk, so a client that
         /// folded the two together would spin.
         DAEMON_SHUTTING_DOWN = -32007;
+        /// Another turn is already running on this session, so this prompt was
+        /// refused rather than interleaved into the same conversation
+        /// (REQ-567 BR-5, architecture D-3).
+        ///
+        /// The **second** transient code, numbered for [`TIER_WARMING`]'s
+        /// reason: it resolves without the user doing anything — the turn
+        /// holding the session finishes — so the remedy is to retry, not to fix
+        /// something. A concurrent prompt is a state a client can legitimately
+        /// reach and legitimately retry from, and reporting it as an
+        /// [`INTERNAL_ERROR`] would tell the user their turn broke when the
+        /// daemon knew exactly why it refused (LESSON-456).
+        ///
+        /// The accompanying message names the in-flight turn, because BR-5
+        /// requires a refusal to name its cause rather than surface as a
+        /// generic turn failure. The daemon classifies here; the client renders
+        /// it as a waiting notice, exactly as it does `TIER_WARMING` (BUG-152).
+        SESSION_BUSY = -32008;
     }
 }
 

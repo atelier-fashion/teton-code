@@ -42,7 +42,9 @@ use teton_providers::{
 use crate::cost::{CostAttribution, LocalUsageMeter};
 use crate::egress::{Egress, EgressContext, Provenance};
 
-use super::context::{ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance};
+use super::context::{
+    ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance, ToolProvenance,
+};
 use super::digest::tool_result_provenance;
 use super::render;
 use super::reply::{parse_reply, ParsedTurn, ReplyScanner};
@@ -100,6 +102,27 @@ pub struct SourceTurn {
     /// source has no event bus: the turn loop owns session-scoped emission, so
     /// it emits this, exactly once, from the async side.
     pub cache: Option<PrefixCache>,
+    /// Whether a [`TurnDecision::ToolCall`] on this turn is **embedded in
+    /// [`text`](Self::text)** rather than arriving beside it (REQ-567 OQ-1).
+    ///
+    /// The two sources answer differently and the difference is structural, not
+    /// stylistic:
+    ///
+    /// - [`LocalEngineSource`] parses the call **out of the reply text**, so the
+    ///   assistant block the loop pushes literally contains the call's JSON.
+    /// - [`RemoteProviderSource`] receives the call as a structured
+    ///   [`TurnEvent::ToolCall`]; the text is prose only, and any JSON in it is
+    ///   something the model was *talking about*.
+    ///
+    /// The loop needs the answer because OQ-1's cancellation trim edits that
+    /// block's text. Re-deriving it later by re-parsing the text is what this
+    /// field exists to prevent: a cancelled remote turn whose prose mentions
+    /// `{"name": "serde", "version": "1"}` is tool-call-*shaped* and would be
+    /// truncated at that JSON, discarding content the user watched stream.
+    ///
+    /// Always `false` when the decision is not a tool call — there is no call to
+    /// be embedded.
+    pub call_in_text: bool,
 }
 
 /// A source of model turns for the turn loop: local engine or remote provider.
@@ -341,6 +364,10 @@ impl CompletionSource for LocalEngineSource {
             ParsedTurn::Malformed(reason) => TurnDecision::Malformed { reason },
         };
         text.truncate(parsed.clean_len);
+        // REQ-567 OQ-1: this tier's call *is* the text — `parse_reply` found it
+        // there and `clean_len` keeps it — so the block the loop pushes carries
+        // it and the cancellation trim has something to cut.
+        let call_in_text = matches!(decision, TurnDecision::ToolCall { .. });
         Ok(SourceTurn {
             text,
             decision,
@@ -350,6 +377,7 @@ impl CompletionSource for LocalEngineSource {
             },
             dropped_calls: parsed.dropped_calls,
             cache: Some(cache),
+            call_in_text,
         })
     }
 }
@@ -521,6 +549,12 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             // source has no prefix cache", which is a different fact from a
             // miss and must not be reported as one.
             cache: None,
+            // REQ-567 OQ-1: never. A remote call arrives as a structured
+            // `TurnEvent::ToolCall` and is assembled above from *that*, not from
+            // the stream's `TextDelta`s — so `text` is prose the user watched
+            // stream and holds no call for a cancellation to trim, however
+            // tool-call-shaped some JSON in it may look.
+            call_in_text: false,
         })
     }
 }
@@ -535,6 +569,17 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
 /// The remote source hands the result to [`Egress::scoped`], so a turn whose
 /// context touched a `local-only` file — or ran an unparseable shell command — is
 /// blocked before a byte leaves.
+///
+/// ## Forgotten blocks are counted too (REQ-567 BR-3)
+///
+/// The union is over the blocks the context *holds* **plus** the
+/// [`DroppedProvenance`](super::context::DroppedProvenance) of the ones
+/// `truncate_to_budget` took away. A dropped block's content routinely outlives
+/// it — in the model text right after it, in a compaction summary, in the next
+/// prompt's carried conversation — and a scope computed from surviving blocks
+/// alone would call that content ordinary conversation and let it egress. So a
+/// `local-only` read that has since been truncated away still scopes this
+/// context, and an unknown-provenance `shell` result still fail-closes it.
 #[must_use]
 pub fn context_provenance(ctx: &ContextManager) -> Provenance {
     let mut prov = Provenance::empty();
@@ -546,6 +591,17 @@ pub fn context_provenance(ctx: &ContextManager) -> Provenance {
             // up laxer than the other.
             prov.merge(&tool_result_provenance(provenance));
         }
+    }
+    // Through the same mapping, for the same reason: the forgotten blocks are
+    // scoped by exactly the rule the surviving ones are.
+    let dropped = ctx.dropped_provenance();
+    if !dropped.sources().is_empty() {
+        prov.merge(&tool_result_provenance(&ToolProvenance::Sources(
+            dropped.sources().clone(),
+        )));
+    }
+    if dropped.is_unknown() {
+        prov.merge(&tool_result_provenance(&ToolProvenance::Unknown));
     }
     prov
 }

@@ -34,7 +34,7 @@ use teton_protocol::events::{
     WebTier, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
-use teton_protocol::{Phase, RequestId};
+use teton_protocol::{Phase, RequestId, SessionId};
 
 use crate::cost_ui::CostMeter;
 use crate::firstrun;
@@ -106,6 +106,19 @@ pub struct SessionState {
     /// are two readings of one fold and cannot disagree about whether the session
     /// is restricted.
     pub web: WebState,
+    /// The session this client is *in*, once `session/create` (or
+    /// `session/attach`) has answered — `None` before that.
+    ///
+    /// The event bus is daemon-wide: every attached client receives every
+    /// session's events, and the envelope's `session_id` is the only thing that
+    /// says whose. Most arms need not care, because the events they render are
+    /// already scoped by which client owns the prompt. `context_cleared` is not:
+    /// it is a fact about one session's conversation that every client would
+    /// otherwise draw as though it were its own ("context cleared; 12 retained
+    /// blocks dropped" in a session where nothing was cleared). So the arm names
+    /// the other session, following `client.rs`'s "in another session" precedent
+    /// for a permission request that is not ours to answer.
+    pub session_id: Option<SessionId>,
 }
 
 /// What the session's web capability currently is, for the status row.
@@ -366,6 +379,40 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+        Event::ContextCleared(cleared) => {
+            // REQ-567 BR-8. Never verbose-gated: a clear changes what every
+            // later prompt starts from, and a second attached client that did
+            // not type the command would otherwise watch the conversation reset
+            // in silence — the case `web_taint_overridden`'s notice exists for,
+            // without its gate, because there the issuing client's own RPC
+            // answer is the authoritative line and here the reset is the news.
+            //
+            // This is also the **only** line the client that typed `/clear`
+            // draws: `slash::handle_clear` renders nothing on success precisely
+            // so that one clear is one line, drawn by this code, on every
+            // attached client including the issuer. The count it needs is here,
+            // so a second rendering from the RPC's answer would say the same
+            // thing twice to the one person who already knew.
+            //
+            // It says the conversation and nothing else, because that is all a
+            // clear drops (OQ-4): the session's taint pin, pasted URLs and
+            // permission grants survive, and a line that read "session reset"
+            // would be telling the user their consent had been re-asked for.
+            //
+            // And it says *whose* conversation when it was not this client's.
+            // The bus is daemon-wide, so an unqualified line would tell every
+            // attached client that its own context had just been dropped — the
+            // one thing this notice must never get wrong, since the user's next
+            // move depends on what their next prompt starts from.
+            surface.line(
+                LineKind::Notice,
+                &format_context_cleared(
+                    cleared.blocks_dropped,
+                    other_session(state.session_id.as_ref(), env.session_id.as_ref()),
+                ),
+            );
+            EventOutcome::Rendered
+        }
         Event::PrefixCache(cache) => {
             // Diagnostic chrome, not news: prefix reuse is a pure latency
             // optimization and BR-1 makes it unobservable in output, so a user
@@ -378,6 +425,47 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+    }
+}
+
+/// The session an event belongs to when it is **not** the one this client is in
+/// — `None` when it is ours, or when either side is unknown.
+///
+/// Unknown counts as ours on purpose. A client that has not yet learned its own
+/// session id, or an event that names none, gives no evidence that the event
+/// came from elsewhere, and a notice that guessed "in another session" would be
+/// wrong in precisely the common case (a single-session client, before
+/// `session/create` answers).
+fn other_session<'a>(
+    ours: Option<&SessionId>,
+    theirs: Option<&'a SessionId>,
+) -> Option<&'a SessionId> {
+    match (ours, theirs) {
+        (Some(ours), Some(theirs)) if ours != theirs => Some(theirs),
+        _ => None,
+    }
+}
+
+/// The one-line notice a `context_cleared` event draws (REQ-567 BR-8).
+///
+/// The count is stated even when it is zero, and singular/plural is worth the
+/// branch: "cleared 0 blocks" and "there was nothing to clear" are the same
+/// fact, and only the second reads as an answer to a command the user just
+/// typed.
+///
+/// `elsewhere` names the session when the clear was not this client's — the
+/// difference between "your next prompt starts from nothing" and "some other
+/// session's does", which is not a nuance the reader can recover from a line
+/// that omits it.
+fn format_context_cleared(blocks_dropped: u64, elsewhere: Option<&SessionId>) -> String {
+    let what = match blocks_dropped {
+        0 => "there was nothing retained to drop".to_owned(),
+        1 => "1 retained block dropped".to_owned(),
+        n => format!("{n} retained blocks dropped"),
+    };
+    match elsewhere {
+        Some(session) => format!("context cleared in another session ({session}); {what}."),
+        None => format!("context cleared; {what}."),
     }
 }
 
@@ -963,8 +1051,8 @@ mod tests {
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
     use teton_protocol::events::{
-        ByteSpan, CostRecord, CostRecorded, FindingKind, ModelSelectionDecided, PlanEntry,
-        PlanEntryStatus, SelectionSource, SessionUpdate, WebTaintOverridden,
+        ByteSpan, ContextCleared, CostRecord, CostRecorded, FindingKind, ModelSelectionDecided,
+        PlanEntry, PlanEntryStatus, SelectionSource, SessionUpdate, WebTaintOverridden,
     };
     use teton_protocol::{ProviderId, RequestId, SessionId};
 
@@ -2103,6 +2191,94 @@ mod tests {
             !prompter.any_question_contains("[p]ermanently"),
             "a prompt must not advertise a key that answers nothing: {:?}",
             prompter.questions
+        );
+    }
+
+    // -- REQ-567 BR-8: the clear notice ------------------------------------
+
+    /// A `context_cleared` envelope for `session`, carrying `dropped` blocks.
+    fn cleared(session: &str, dropped: u64) -> EventEnvelope {
+        EventEnvelope::new(
+            1,
+            Some(SessionId::from(session)),
+            Event::ContextCleared(ContextCleared {
+                blocks_dropped: dropped,
+            }),
+        )
+    }
+
+    /// The client that is *in* the cleared session gets the plain notice, and
+    /// the count reads as an answer to the command the user just typed —
+    /// including the singular and the nothing-to-drop branches, which exist
+    /// because "cleared 0 blocks" and "there was nothing to clear" are the same
+    /// fact stated one usefully and one uselessly.
+    #[test]
+    fn a_clear_in_this_session_reports_what_it_dropped() {
+        for (dropped, expected) in [
+            (0u64, "context cleared; there was nothing retained to drop."),
+            (1, "context cleared; 1 retained block dropped."),
+            (12, "context cleared; 12 retained blocks dropped."),
+        ] {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.session_id = Some(SessionId::from("s1"));
+
+            render_event(&cleared("s1", dropped), &mut surface, &mut state);
+
+            assert!(
+                surface.any_line_contains(LineKind::Notice, expected),
+                "{dropped} dropped blocks rendered as {:?}",
+                surface.lines_of(LineKind::Notice)
+            );
+            assert!(
+                !surface.any_line_contains(LineKind::Notice, "another session"),
+                "this client's own clear must not be attributed elsewhere"
+            );
+        }
+    }
+
+    /// **The bus is daemon-wide.** A clear in a *different* session must not read
+    /// as this session's: the user's next prompt starts from an untouched
+    /// conversation, and a bare "context cleared; 12 retained blocks dropped"
+    /// tells them the opposite. It names the other session, the way `client.rs`
+    /// names one for a permission request that is not ours to answer.
+    #[test]
+    fn a_clear_in_another_session_says_so_and_names_it() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+
+        render_event(&cleared("s2", 12), &mut surface, &mut state);
+
+        assert!(
+            surface.any_line_contains(
+                LineKind::Notice,
+                "context cleared in another session (s2); 12 retained blocks dropped."
+            ),
+            "a clear elsewhere rendered as {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+    }
+
+    /// A client that does not yet know its own session id — a passive
+    /// subcommand context, or the window before `session/create` answers —
+    /// renders the plain line. Unknown is not evidence of elsewhere, and
+    /// guessing "another session" would be wrong in the single-session case
+    /// that is almost every case.
+    #[test]
+    fn a_clear_is_not_attributed_elsewhere_when_this_client_has_no_session() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        render_event(&cleared("s2", 3), &mut surface, &mut state);
+
+        assert!(
+            surface.any_line_contains(
+                LineKind::Notice,
+                "context cleared; 3 retained blocks dropped."
+            ),
+            "rendered as {:?}",
+            surface.lines_of(LineKind::Notice)
         );
     }
 }
