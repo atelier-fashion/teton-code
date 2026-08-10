@@ -911,3 +911,110 @@ eviction was emitted — the interleave never cost the agent its cache (BR-5).
 **Failure-shape watch items from the procedure:** cycles are 2, not ~211, so
 the mechanism delivers; counts were coherent with correct answers, so the
 reuse offset and the KV agree.
+
+## REQ-567 — cross-prompt conversation carry
+
+REQ-567's mechanics are covered end to end without a model: what carries
+(`runtime::tests::conversation_carry`), what it costs at the cache and the
+ledger (`crates/tetond/tests/conversation_carry.rs`, running the real
+`PrefixCacheState`), and what it must never leak
+(`crates/tetond/tests/e2e/conversation_carry.rs`, over the real socket with
+egress capture). Two claims are left over, and they are the two the REQ was
+written from — both need a real model, and both are answered by one session.
+
+### Not automated: that a carried conversation is a conversation the model uses
+
+**What is uncovered.** AC-1's tool-free recap *answering*, and AC-8's real-model
+boundary measurement.
+
+The scripted legs prove that the recap prompt's material is in the context the
+engine was handed, and that the reuse policy reports the whole retained
+conversation as cached. Neither can prove that a real model, shown that
+context, answers from it rather than asking for the files again — a scripted
+engine answers from a script — nor that llama.cpp truly reuses that many KV
+tokens, since no default build links llama.cpp at all (the REQ-564 section above
+says the same at greater length, and it is the same limitation).
+
+**The baseline this supersedes.** The 2026-08-10 REQ-564 sign-off, above. Two of
+its observations are the ones to replace, and they were the same defect seen
+from two directions:
+
+- *the product symptom*: its final "recap the conversation" prompt was answered
+  with a request to re-share the files (logged there as a session-layer
+  follow-up — this REQ is that follow-up);
+- *the measurement*: **all 5 of 5 prompt boundaries** were `divergent: true`
+  hits reusing exactly the ~814-token system head with ~20–34 new tokens,
+  because a fresh `ContextManager` per prompt left consecutive prompts sharing
+  only the system prompt. Session totals were 14 generations, 14,799 prompt
+  tokens, 12,413 reused (83.9%).
+
+A REQ-567 run should move both. Note that the *within-prompt* generations were
+already pure-extension hits before this REQ; the number that must change is the
+boundary one.
+
+**Procedure.**
+
+1. Build the workspace first — *not* a targeted test target. A `-p teton --test
+   …` run does not rebuild `tetond`, so the CLI would drive a stale daemon and
+   the measurement would describe the old binary:
+   ```
+   cargo build --workspace --features tetond/llama
+   ```
+2. Start an isolated daemon with a real model (short `XDG_RUNTIME_DIR`,
+   symlinked weights) and note its log path — the REQ-564 run's setup.
+3. Drive **one six-prompt session** whose prompts build on each other and whose
+   **last prompt is the recap**, e.g.: read a file; ask a follow-up about what
+   was read; read a second file; ask something that needs both; ask a question
+   answerable from the conversation alone; then finally *"recap what we
+   established"*. The recap must name nothing — no paths, no restatement — or
+   it is not testing the conversation.
+4. Read the recap answer. It passes when it answers **from the conversation**:
+   it re-reads no file (no `read`/`grep`/`glob` tool call in that turn) and it
+   names facts established in prompts 1–5. It fails in the shape the REQ exists
+   for if it asks for the files again.
+5. Record, from the `prefix_cache` events, the **boundary** rows specifically —
+   the first generation of each prompt after the first:
+   - `cached_tokens` must be far above the ~814-token system head, and should be
+     close to the previous generation's prompt + generated total (that is AC-8's
+     scripted assertion, and the real-model number is what this leg adds);
+   - `divergent` should be `false` at a well-behaved boundary. A `divergent:
+     true` boundary is not automatically a failure: a compaction, a truncation,
+     or a BUG-147 fabrication cut in the previous turn each legitimately produce
+     one (spec BR-4, LESSON-500). What it must never be is *silent* — pair every
+     divergent boundary with the compaction/cut that explains it, and if none
+     exists, that is the finding.
+6. Record the session totals against the baseline: generations, prompt tokens,
+   reused tokens and percentage, context create/destroy cycles, wall time.
+7. Note the context budget: a six-prompt session carrying two files may reach
+   compaction, which is the interesting case (AC-3's real-model counterpart).
+   If compaction fires, the turn must still complete and the answer must stay
+   coherent.
+8. Then type `/clear` and prompt once more. The next turn's context must start
+   from the system head alone: the prefix-cache boundary drops back to ~head
+   reuse (a `divergent` hit, per architecture D-5 — no eviction is expected),
+   and the model no longer knows what was established.
+
+**Driving it with a piped stdin.** The REQ-564 sign-off used a scripted driver;
+its pitfalls are the same here and each one silently corrupts a run rather than
+failing it:
+
+- the CLI buffers piped stdout mid-turn, so a driver must pace on the `› `
+  ready marker, never on output growth — otherwise prompts arrive while a turn
+  is still running and are answered out of order, or refused as
+  `SESSION_BUSY` (which, since REQ-567, is what a second concurrent prompt now
+  gets);
+- permission prompts are effectively invisible to a piped driver: a turn parked
+  on one looks exactly like a slow turn. Pre-grant what the session will need,
+  or drive it by hand;
+- name the files explicitly in prompts 1–4. A prompt that says "the file we
+  looked at" is testing the recap in the middle of the session rather than at
+  the end of it.
+
+**What a failure looks like.** A recap answered with "please share the files"
+means the conversation is not reaching the model — the same symptom this REQ was
+opened for. Boundary `cached_tokens` still pinned near ~814 means the
+conversation reaches the model but not the KV: check that what was committed is
+byte-identical to what was rendered (REQ-554 determinism), because a boundary
+that re-renders differently diverges at the first changed token.
+
+**Status: NOT RUN.**

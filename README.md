@@ -61,7 +61,10 @@ prompts:
 | `/cost` | The live cost meter — same report as `teton cost` |
 | `/model` | One line naming the model the local tier is on |
 | `/model set <name>` | Change the local model (typed input only; asks before an above-RAM-floor pick) |
+| `/clear` | Drop this session's retained conversation; the next prompt starts fresh |
 | `/verbose` | Toggle routing and turn-end notices for this session |
+| `/web allow` | Lift this session's web taint restriction (grants no new tier) |
+| `/web refresh <url>` | Drop a URL's cached copy so the next lookup re-fetches |
 | `/quit` (or `/exit`) | End the session (same as Ctrl-D) |
 
 To send a prompt that genuinely starts with a slash — a pasted path, say —

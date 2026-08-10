@@ -14292,19 +14292,33 @@ provider_id = "on-device"
         struct RecordingEngine {
             script: Vec<Scripted>,
             seen: Arc<Mutex<Vec<String>>>,
+            /// The **duty** prompts, kept separately from the turns.
+            ///
+            /// One log per kind rather than one log with a discriminator,
+            /// because the two are read for opposite reasons: a turn's context
+            /// is asserted to *grow* with the conversation, and a duty's frame
+            /// is asserted not to (BR-10/AC-11). Mixing them would leave every
+            /// assertion re-deriving the split the recorder already knows.
+            duties: Arc<Mutex<Vec<String>>>,
             calls: AtomicUsize,
         }
 
+        /// What a fixture keeps of one recording engine: the turn contexts it
+        /// was handed, and the duty prompts it answered.
+        type RecordedPrompts = (Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>);
+
         impl RecordingEngine {
-            fn new(script: &[Scripted]) -> (Self, Arc<Mutex<Vec<String>>>) {
+            fn new(script: &[Scripted]) -> (Self, RecordedPrompts) {
                 let seen = Arc::new(Mutex::new(Vec::new()));
+                let duties = Arc::new(Mutex::new(Vec::new()));
                 (
                     Self {
                         script: script.to_vec(),
                         seen: Arc::clone(&seen),
+                        duties: Arc::clone(&duties),
                         calls: AtomicUsize::new(0),
                     },
-                    seen,
+                    (seen, duties),
                 )
             }
         }
@@ -14321,9 +14335,14 @@ provider_id = "on-device"
                 on_token: &mut dyn FnMut(&str) -> bool,
             ) -> Result<Completion, EngineError> {
                 if !prompt.contains(SYSTEM_HEAD_OPENING) {
-                    // A duty. Answered off-script and unrecorded; an unparseable
-                    // answer degrades to the duty's own default, which is all
-                    // any of these fixtures needs from a title or a category.
+                    // A duty. Answered off-script and logged apart from the
+                    // turns; an unparseable answer degrades to the duty's own
+                    // default, which is all any of these fixtures needs from a
+                    // title or a category.
+                    self.duties
+                        .lock()
+                        .expect("recorded-duty mutex")
+                        .push(prompt.to_owned());
                     return Ok(Completion::cold("none".to_owned(), 0, 1));
                 }
                 self.seen
@@ -14390,14 +14409,24 @@ provider_id = "on-device"
         /// A daemon serving `script` from a recording engine, and the log of the
         /// contexts that engine is handed.
         fn carry_runtime(script: &[Scripted]) -> (Arc<DaemonRuntime>, Arc<Mutex<Vec<String>>>) {
-            let (engine, seen) = RecordingEngine::new(script);
+            let (runtime, (seen, _duties)) = carry_runtime_recording_duties(script);
+            (runtime, seen)
+        }
+
+        /// A daemon and both of its recorders.
+        type CarryFixture = (Arc<DaemonRuntime>, RecordedPrompts);
+
+        /// The same daemon, also handing back the duty prompts — what AC-11
+        /// measures the classifier's frame against.
+        fn carry_runtime_recording_duties(script: &[Scripted]) -> CarryFixture {
+            let (engine, (seen, duties)) = RecordingEngine::new(script);
             let runtime = DaemonRuntime::minimal();
             *runtime.config.lock().expect("config mutex") = local_config();
             runtime
                 .engine
                 .install("recording".to_owned(), Arc::new(Mutex::new(engine)));
             runtime.local_available.store(true, Ordering::SeqCst);
-            (Arc::new(runtime), seen)
+            (Arc::new(runtime), (seen, duties))
         }
 
         /// A registry holding one freeform session.
@@ -14559,6 +14588,218 @@ provider_id = "on-device"
                 third.matches(SYSTEM_HEAD_OPENING).count(),
                 1,
                 "the head is rebuilt per prompt and never carried (BR-7)"
+            );
+        }
+
+        // -- AC-12: one conversation per session -----------------------------
+
+        /// **AC-12 / BR-2.** Two sessions alive on one daemon, prompted
+        /// alternately: each turn's context contains its own session's
+        /// conversation and not one line of the other's.
+        ///
+        /// Asserted on the **contexts the engine was handed**, not on the
+        /// registry's keying (`sessions.rs` pins that at its own seam). The
+        /// interesting failure is not a store that mixes two vectors — it is a
+        /// dispatch that seeds from the wrong one, and only the prompt the model
+        /// received can tell those apart.
+        ///
+        /// The last prompt asks, in session A, about a phrase only session B
+        /// ever said: the answer has to come from a context that does not
+        /// contain it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn two_interleaved_sessions_never_see_each_others_conversations() {
+            let (runtime, seen) = carry_runtime(&[
+                Scripted::Say("The retry budget is three attempts."),
+                Scripted::Say("The parser handles nested objects."),
+                Scripted::Say("Yes, three, and the fallback shares it."),
+                Scripted::Say("Yes, and arrays of them."),
+                Scripted::Say("Nothing here mentions a parser."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let alpha = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase")
+                .session_id;
+            let beta = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase")
+                .session_id;
+
+            // Alternating, and awaited in turn, so the recorded contexts are in
+            // this order — a session's own text is the only thing that
+            // identifies its turns, which is precisely the property under test.
+            for (session, text) in [
+                (&alpha, "how many retry attempts are there?"),
+                (&beta, "what does the parser handle?"),
+                (&alpha, "does the fallback share the budget?"),
+                (&beta, "does it handle arrays?"),
+                (&alpha, "did we say anything about a parser?"),
+            ] {
+                prompt(&runtime, &events, &sessions, session, None, text)
+                    .await
+                    .expect("the scripted turn completes");
+            }
+
+            let seen = seen.lock().expect("recorded-context mutex").clone();
+            assert_eq!(seen.len(), 5, "one recorded context per turn");
+
+            // What each session said, and what it must never be shown.
+            let alpha_only = [
+                "how many retry attempts are there?",
+                "The retry budget is three attempts.",
+                "does the fallback share the budget?",
+            ];
+            let beta_only = [
+                "what does the parser handle?",
+                "The parser handles nested objects.",
+                "does it handle arrays?",
+            ];
+            for (n, context) in seen.iter().enumerate() {
+                let (mine, theirs) = if n % 2 == 0 {
+                    (alpha_only, beta_only)
+                } else {
+                    (beta_only, alpha_only)
+                };
+                for line in theirs {
+                    assert!(
+                        !context.contains(line),
+                        "turn {} was shown {line:?} — content from the other \
+                         session on this daemon",
+                        n + 1
+                    );
+                }
+                // Non-vacuity: this turn really is carrying *something*, so the
+                // absence above is isolation rather than an empty context. The
+                // first two turns have nothing before them to carry.
+                if n >= 2 {
+                    assert!(
+                        mine.iter().any(|line| context.contains(line)),
+                        "turn {} carried nothing at all, so it proves nothing \
+                         about whose conversation it carried",
+                        n + 1
+                    );
+                }
+            }
+        }
+
+        // -- AC-11: what a duty pays as the conversation grows ----------------
+
+        /// **AC-11 / BR-10.** Across a five-prompt session the route
+        /// classifier's input is the new user message inside its fixed frame —
+        /// byte-for-byte the same length every turn — while the agent context
+        /// the same engine is handed grows with the conversation.
+        ///
+        /// The five prompts are deliberately the same length as each other, so
+        /// "the classifier's input did not grow" is an equality rather than a
+        /// trend: any leak of the conversation into the classifier's frame moves
+        /// that number, and only a leak can.
+        ///
+        /// This is the duty half of carry's cost story. Carry changes what the
+        /// *agent* turn reads; a reflex-tier duty that started reading the
+        /// conversation instead of the prompt would turn a cheap call into one
+        /// that scales with session length, on the latency path REQ-558 BR-5
+        /// exists to keep short.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_classifiers_input_stays_fixed_while_the_conversation_grows() {
+            let (runtime, (seen, duties)) = carry_runtime_recording_duties(&[
+                Scripted::Say("Answer one."),
+                Scripted::Say("Answer two."),
+                Scripted::Say("Answer three."),
+                Scripted::Say("Answer four."),
+                Scripted::Say("Answer five."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session();
+
+            // Same length, different content: `where does the router decide aaa`
+            // and its four siblings.
+            let prompts: Vec<String> = ["aaa", "bbb", "ccc", "ddd", "eee"]
+                .iter()
+                .map(|tag| format!("where does the router decide {tag}"))
+                .collect();
+            for text in &prompts {
+                prompt(&runtime, &events, &sessions, &session_id, None, text)
+                    .await
+                    .expect("the scripted turn completes");
+            }
+
+            let classifier_prompts: Vec<String> = duties
+                .lock()
+                .expect("recorded-duty mutex")
+                .iter()
+                .filter(|duty| duty.contains(crate::classify::CLASSIFIER_OUTPUT_CONTRACT))
+                .cloned()
+                .collect();
+            assert_eq!(
+                classifier_prompts.len(),
+                prompts.len(),
+                "one classification per freeform turn: {}",
+                classifier_prompts.len()
+            );
+
+            // The agent context grew, turn on turn — without this the fixed
+            // number below is fixed against nothing.
+            let contexts = seen.lock().expect("recorded-context mutex").clone();
+            assert_eq!(contexts.len(), prompts.len());
+            for n in 1..contexts.len() {
+                assert!(
+                    contexts[n].len() > contexts[n - 1].len(),
+                    "the agent context must grow across the session, or the \
+                     fixed classifier input is fixed against nothing: turn {} \
+                     was {} bytes against turn {}'s {}",
+                    n + 1,
+                    contexts[n].len(),
+                    n,
+                    contexts[n - 1].len()
+                );
+            }
+
+            let first = classifier_prompts[0].len();
+            for (n, classifier) in classifier_prompts.iter().enumerate() {
+                assert_eq!(
+                    classifier.len(),
+                    first,
+                    "the classifier's input grew by turn {}: {} bytes against \
+                     the first turn's {first}. Its material is this turn's \
+                     prompt inside a fixed frame — a number that moves with the \
+                     conversation means the assembled context reached the \
+                     cap site (BR-10)",
+                    n + 1,
+                    classifier.len()
+                );
+                assert!(
+                    classifier.contains(prompts[n].as_str()),
+                    "the classifier for turn {} did not carry turn {}'s own \
+                     message",
+                    n + 1,
+                    n + 1
+                );
+                // And it carries no other turn's, which is the same claim from
+                // the other side: a frame holding the conversation would hold
+                // the earlier prompts too.
+                for (other, earlier) in prompts.iter().enumerate() {
+                    assert!(
+                        other == n || !classifier.contains(earlier.as_str()),
+                        "the classifier for turn {} carried turn {}'s message",
+                        n + 1,
+                        other + 1
+                    );
+                }
+                assert!(
+                    classifier.len()
+                        <= crate::classify::CLASSIFIER_INPUT_MAX_BYTES + DUTY_CONTRACT_PREFIX_BYTES,
+                    "the classifier's whole prompt outgrew its own input cap \
+                     plus its frame"
+                );
+            }
+
+            // The last turn's agent context is the comparison that makes the
+            // point: same daemon, same engine, same five prompts.
+            assert!(
+                contexts[contexts.len() - 1].len() > classifier_prompts[0].len(),
+                "the agent context never outgrew the classifier's frame, so \
+                 this session is too short to say anything about scaling"
             );
         }
 

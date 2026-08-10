@@ -1,7 +1,7 @@
 ---
 id: TASK-096
 title: "Acceptance matrix: privacy, cache warmth, A/B, classifier pin, multi-client; spec flips"
-status: draft
+status: complete
 parent: REQ-567
 created: 2026-08-10
 updated: 2026-08-10
@@ -43,19 +43,19 @@ prompts, and the requirement checkbox flips + dogfood follow-up note.
 
 ## Acceptance Criteria
 
-- [ ] Every REQ-567 AC (1-12) is covered by a named test or an explicit
+- [x] Every REQ-567 AC (1-12) is covered by a named test or an explicit
   manual-verification entry; the mapping is listed in the test file's
   module doc.
-- [ ] AC-8's boundary-warmth assertion uses the real `PrefixCacheState`
+- [x] AC-8's boundary-warmth assertion uses the real `PrefixCacheState`
   via `CachingScriptedEngine` (policy-pure seam, LESSON-499) — no
   reimplemented reuse rule.
-- [ ] AC-10: reverting the dispatch seeding (temporary local patch or
+- [x] AC-10: reverting the dispatch seeding (temporary local patch or
   `#[cfg]`-free assertion against the old construction) turns AC-1 and
   AC-8 tests red — documented in the test module doc as executed, with
   the observed failures.
-- [ ] `cargo test --workspace --no-fail-fast` green; workspace built
+- [x] `cargo test --workspace --no-fail-fast` green; workspace built
   before any targeted e2e run (stale-daemon pitfall).
-- [ ] Requirement checkboxes flipped; `updated` date bumped.
+- [x] Requirement checkboxes flipped; `updated` date bumped.
 
 ## Technical Notes
 

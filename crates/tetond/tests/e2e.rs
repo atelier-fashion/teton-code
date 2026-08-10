@@ -21,6 +21,11 @@
 //!   category binding (AC-6, egress capture), what every `route_decided`
 //!   carries (AC-8), and the one-resolver rule across the surfaces that
 //!   describe a routing state (AC-11).
+//! - [`conversation_carry`] — REQ-567: a `local-only` read in an early prompt
+//!   blocks a later prompt's remote route exactly as a same-turn read does
+//!   (AC-2, egress capture), and a second client's prompt carries the
+//!   conversation the departed client left behind (AC-9, two connections under
+//!   the real daemon lifetime).
 //! - [`daemon_lifetime`] — REQ-565: the daemon exits with its last client.
 //!   The only suite here that runs its daemon under the real shipped lifetime
 //!   rather than pinning it, and the only one that asserts on the process.
@@ -35,6 +40,8 @@
 mod ac_matrix;
 #[path = "e2e/consent_matrix.rs"]
 mod consent_matrix;
+#[path = "e2e/conversation_carry.rs"]
+mod conversation_carry;
 #[path = "e2e/daemon_lifetime.rs"]
 mod daemon_lifetime;
 #[path = "e2e/duty_taint.rs"]
