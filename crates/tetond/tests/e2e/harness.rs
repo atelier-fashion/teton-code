@@ -607,10 +607,41 @@ impl Daemon {
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log_path).unwrap_or_default()
     }
+
+    /// The socket this daemon binds. REQ-565 asserts on its *absence* after a
+    /// clean exit, so the suite needs the path, not just a connection.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Wait for the daemon to exit **on its own**, up to `window`.
+    ///
+    /// `None` means it was still running when the window ran out. Deliberately
+    /// never kills: the whole claim under test (REQ-565 AC-1) is that the
+    /// process leaves by itself, and a helper that tidied up on the way out
+    /// would make the failing case indistinguishable from the passing one.
+    pub fn wait_for_exit(&mut self, window: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + window;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                Ok(None) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Whether the daemon process is still alive right now.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        // Tolerates an already-exited child: under REQ-565 a daemon that ended
+        // itself is the expected state, not an error.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -719,6 +750,34 @@ impl Client {
     pub fn call(&mut self, method: &str, params: Value) -> Value {
         let id = self.send(method, params);
         self.await_response(id)
+    }
+
+    /// Send a prompt turn and return **without** waiting for it (REQ-565 AC-3).
+    ///
+    /// The suite needs a turn that is genuinely still executing when its client
+    /// disconnects, which `prompt` cannot produce — it waits for the response,
+    /// by which time the turn is over and there is nothing left to defer.
+    pub fn prompt_no_wait(&mut self, session_id: &str, text: &str) {
+        self.send(
+            "session/prompt",
+            json!({
+                "session_id": session_id,
+                "prompt": [{ "type": "text", "text": text }],
+            }),
+        );
+    }
+
+    /// Close this connection the way a departing client does.
+    ///
+    /// Explicit because dropping the struct is not enough on its own: the reader
+    /// thread holds a `try_clone` of the socket, so the last descriptor — and
+    /// therefore the peer's EOF — would wait on that thread noticing something,
+    /// which it only does when the daemon happens to send. `shutdown` acts on
+    /// the connection rather than on one descriptor, so the daemon sees the
+    /// disconnect immediately. Called from `Drop`, so ordinary `drop(client)`
+    /// means what every test here assumes it means.
+    pub fn disconnect(&mut self) {
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
     }
 
     fn await_response(&mut self, id: i64) -> Value {
@@ -991,6 +1050,20 @@ impl Client {
             }
             thread::sleep(Duration::from_millis(25));
         }
+    }
+}
+
+impl Drop for Client {
+    /// A dropped client is a departed client (REQ-565).
+    ///
+    /// Without this, `drop(client)` closed only the writer descriptor while the
+    /// reader thread kept its `try_clone` alive, so the daemon saw no EOF until
+    /// that thread happened to wake — which it only does when the daemon sends
+    /// something. Tests that dropped a client and expected the daemon to notice
+    /// were passing on the timing of unrelated broadcasts. See
+    /// [`Client::disconnect`].
+    fn drop(&mut self) {
+        self.disconnect();
     }
 }
 

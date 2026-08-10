@@ -1,7 +1,7 @@
 ---
 id: TASK-091
 title: "Acceptance suite: lifetime e2e over the real socket"
-status: pending
+status: complete
 parent: REQ-565
 repo: teton-code
 created: 2026-08-10
