@@ -1,7 +1,7 @@
 ---
 id: REQ-564
 title: "Persistent llama context: prefix-cached KV across agent turns"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-09
 updated: 2026-08-10
