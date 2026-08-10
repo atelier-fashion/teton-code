@@ -236,6 +236,22 @@ impl MockProvider {
     /// Start a mock provider that serves `scripted` responses in order, then the
     /// `default` for any further request.
     pub fn start(scripted: Vec<MockResponse>, default: MockResponse) -> Self {
+        Self::start_delayed(scripted, default, Duration::ZERO)
+    }
+
+    /// [`Self::start`], but each response is held back by `delay` (REQ-565).
+    ///
+    /// A test that needs a turn to be *genuinely* still executing when its
+    /// client disconnects cannot get there by racing an instant response. The
+    /// AC-3 deferral test learned that the expensive way: it passed locally and
+    /// on Linux CI, then failed on a loaded macOS runner where the turn finished
+    /// before the daemon had read the disconnect. A held-open response makes the
+    /// window a duration the test chooses rather than a scheduling accident.
+    pub fn start_delayed(
+        scripted: Vec<MockResponse>,
+        default: MockResponse,
+        delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -258,6 +274,9 @@ impl MockProvider {
                                 .unwrap()
                                 .pop_front()
                                 .unwrap_or_else(|| default.clone());
+                            if !delay.is_zero() {
+                                thread::sleep(delay);
+                            }
                             handle_http(accepted(stream), &requests, &response);
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

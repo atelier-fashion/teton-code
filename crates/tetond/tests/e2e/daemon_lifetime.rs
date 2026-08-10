@@ -7,12 +7,17 @@
 //! its daemon with `--shutdown-policy never`, because it uses the daemon as a
 //! fixture rather than as the thing under test.
 //!
-//! A scripted local engine (`TETON_LOCAL_SCRIPT`) is used throughout so no real
-//! model is downloaded, verified, or loaded. That is not just speed:
-//! `first_run_consent_applies()` is false for a scripted engine, so the consent
-//! flow never runs, and BR-2's model deferral cannot make exit timing depend on
-//! multi-gigabyte I/O. The deferral itself is asserted with a prompt turn, which
-//! this suite can control exactly.
+//! A scripted local engine (`TETON_LOCAL_SCRIPT`) is used for the tests that do
+//! not need a turn, so no real model is downloaded, verified, or loaded. That is
+//! not just speed: `first_run_consent_applies()` is false for a scripted engine,
+//! so the consent flow never runs and BR-2's model deferral cannot make exit
+//! timing depend on multi-gigabyte I/O.
+//!
+//! The two AC-3 tests need a turn that is genuinely still running when its
+//! client leaves, so they use a **delayed mock provider** instead. An instant
+//! engine cannot give that window reliably — the first version of this suite
+//! tried, and the race it left failed on a loaded macOS runner after passing
+//! locally and on Linux.
 
 use std::time::Duration;
 
@@ -132,7 +137,30 @@ fn ac2_only_the_second_disconnect_stops_a_two_client_daemon() {
 /// durable row is the claim.
 #[test]
 fn ac3_a_turn_in_flight_defers_the_exit_until_it_completes() {
-    let (workspace, script) = workspace("ac3");
+    // A provider that holds its response open for two seconds, so the turn is
+    // unambiguously still executing when the client disconnects.
+    //
+    // The first version of this test used the instant scripted engine and argued
+    // the ordering was structural — EOF is already buffered, while the turn must
+    // make a `spawn_blocking` round trip. That reasoning was wrong: it held
+    // locally over six runs and on Linux CI, then failed on a loaded macOS
+    // runner where the turn finished first and no deferral was ever recorded.
+    // The window is now a duration this test owns, not a scheduling accident
+    // (LESSON-433: verification on one machine is not verification).
+    let provider = MockProvider::start_delayed(
+        vec![MockResponse::ok(openai_turn("done", None, 100, 20))],
+        MockResponse::ok(openai_turn("done", None, 100, 20)),
+        Duration::from_secs(2),
+    );
+
+    let workspace = Workspace::new("ac3");
+    workspace.write_config(&format!(
+        "default_provider = \"mock\"\n\n\
+         [[providers]]\nid = \"mock\"\nkind = \"openai-compatible\"\n\
+         endpoint = \"{}\"\nmodel = \"deepseek-chat\"\n\n",
+        provider.openai_endpoint()
+    ));
+    let script = workspace.write_script("ok\n");
     let mut daemon = spawn(&workspace, &script);
 
     let mut client = daemon.connect();
@@ -141,14 +169,6 @@ fn ac3_a_turn_in_flight_defers_the_exit_until_it_completes() {
     // Fire and forget, then leave immediately: the turn is still executing when
     // its client's socket closes, which is precisely AC-3's scenario and the one
     // `prompt` (which waits for the response) cannot produce.
-    //
-    // The ordering is structural, not lucky. By the time the reader loop polls
-    // again, the EOF is already buffered — the client shut the socket down
-    // before this line returned — so teardown begins within one loop iteration.
-    // The turn, meanwhile, cannot finish faster than a `spawn_blocking` thread
-    // round trip (ADR-006 E-3 puts every engine call there). So the turn is
-    // still in flight when the disconnect lands, even with a scripted engine
-    // whose completion is microseconds.
     client.prompt_no_wait(&session, "hello");
     drop(client);
 
@@ -333,15 +353,19 @@ fn ac8_linger_waits_out_its_window_then_exits() {
             .script(script.clone())
             .arg("--shutdown-policy")
             .arg("linger")
+            // Six seconds, checked at one: the margin is deliberate. A loaded CI
+            // runner has already caught this suite out once by finishing work
+            // sooner than the test assumed, and a linger test that trips on
+            // scheduling noise would be read as a lifetime bug.
             .arg("--linger-seconds")
-            .arg("3"),
+            .arg("6"),
     );
 
     let client = daemon.connect();
     drop(client);
 
     // Still there partway through the window.
-    std::thread::sleep(Duration::from_millis(750));
+    std::thread::sleep(Duration::from_secs(1));
     assert!(
         daemon.is_running(),
         "a linger daemon must not exit before its window elapses; log:\n{}",
@@ -371,16 +395,17 @@ fn ac8_a_client_returning_inside_the_linger_window_keeps_the_daemon() {
             .arg("--shutdown-policy")
             .arg("linger")
             .arg("--linger-seconds")
-            .arg("5"),
+            .arg("8"),
     );
 
     let first = daemon.connect();
     drop(first);
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_secs(1));
 
     let second = daemon.connect();
-    // Past the original window: the returning client must have cancelled it.
-    std::thread::sleep(Duration::from_secs(6));
+    // Well past the original window: the returning client must have cancelled
+    // it, so the daemon is alive for a reason and not merely slow.
+    std::thread::sleep(Duration::from_secs(10));
     assert!(
         daemon.is_running(),
         "a client that returned inside the window must cancel the exit; log:\n{}",
