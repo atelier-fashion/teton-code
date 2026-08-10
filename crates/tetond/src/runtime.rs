@@ -499,11 +499,7 @@ impl Engine for ScriptedFileEngine {
             }
         }
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
-        Ok(Completion {
-            text,
-            prompt_tokens,
-            completion_tokens,
-        })
+        Ok(Completion::cold(text, prompt_tokens, completion_tokens))
     }
 }
 
@@ -2633,7 +2629,9 @@ impl DaemonRuntime {
                 // engine failure (BUG-146); the caller classifies from state.
                 return Err(HarnessError::NoTierAvailable);
             };
-            let mut source = LocalEngineSource::new(Arc::clone(engine), *format);
+            let mut source =
+                LocalEngineSource::new(Arc::clone(engine), *format, session_id.clone())
+                    .metered(Arc::new(self.ledger.clone()));
             return run_session_turn_with_source(
                 &mut source,
                 tools,
@@ -10989,11 +10987,7 @@ provider_id = "on-device"
                     _on_token: &mut dyn FnMut(&str) -> bool,
                 ) -> Result<Completion, EngineError> {
                     let _ = self.release.lock().expect("gate poisoned").recv();
-                    Ok(Completion {
-                        text: self.reply.clone(),
-                        prompt_tokens: 0,
-                        completion_tokens: 1,
-                    })
+                    Ok(Completion::cold(self.reply.clone(), 0, 1))
                 }
             }
 
@@ -13725,11 +13719,7 @@ provider_id = "on-device"
                 } else {
                     format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{LOOPBACK_URL}\"}}}}")
                 };
-                Ok(Completion {
-                    text,
-                    prompt_tokens: 0,
-                    completion_tokens: 1,
-                })
+                Ok(Completion::cold(text, 0, 1))
             }
         }
 

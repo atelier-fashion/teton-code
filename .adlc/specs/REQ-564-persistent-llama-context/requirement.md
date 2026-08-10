@@ -1,7 +1,7 @@
 ---
 id: REQ-564
 title: "Persistent llama context: prefix-cached KV across agent turns"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-09
 updated: 2026-08-10
@@ -54,74 +54,75 @@ full cold prefill.
 
 ## Business Rules
 
-- [ ] BR-1: **Correctness is observable-identical.** With identical prompt,
+- [x] BR-1: **Correctness is observable-identical.** With identical prompt,
   params, and sampling seed, generation output with the cache enabled is
   byte-identical to a cold fresh-context generation. Prefix reuse must never be
   observable in output, only in latency.
-- [ ] BR-2: **Reuse only on exact token-prefix extension.** A turn reuses
+- [x] BR-2: **Reuse only on exact token-prefix extension.** A turn reuses
   cached KV only when its tokenized prompt starts with the cached
   `token_prefix` exactly (token-level comparison, not string-level). Any
   divergence — context compaction/truncation rewrote history, template change,
   session switch — falls back to a full cold prefill from position zero; never
   partial reuse past a divergence point. (informed by LESSON-447)
-- [ ] BR-3: **Bounded memory: one cache slot.** At most one persistent context
+- [x] BR-3: **Bounded memory: one cache slot.** At most one persistent context
   exists per loaded engine (the most recently used session). A session switch
   rebuilds the cache; KV memory never exceeds the single already-reserved
   context envelope. No per-session KV accumulation.
-- [ ] BR-4: **Eviction is safe and silent-degrading, loud-reporting.** Under
+- [x] BR-4: **Eviction is safe and silent-degrading, loud-reporting.** Under
   the existing runtime memory-pressure adaptation, the cached context is
   dropped before the engine is; a dropped cache must never fail a turn — the
   next turn cold-prefills — and the eviction is reported via the
   `prefix_cache_evicted` event, never silently. (informed by LESSON-447)
-- [ ] BR-5: **Duty calls do not evict the agent cache.** Non-agent-turn
+- [x] BR-5: **Duty calls do not evict the agent cache.** Non-agent-turn
   purposes (summarize, classify, redaction duties) must not destroy the active
   session's cached agent context. How they are served (own small context,
   cold path, or other) is an architecture decision; the constraint is that a
   duty call between two agent turns leaves the second turn's cache hit intact.
-- [ ] BR-6: **Blocking-pool discipline is preserved.** All cache probing,
+- [x] BR-6: **Blocking-pool discipline is preserved.** All cache probing,
   prefill, and decode still run inside `spawn_blocking` on the owned engine
   handle; no tokio worker is ever parked on inference. The invariant pinned by
   `tests/nonblocking_inference.rs` continues to hold. (informed by LESSON-448)
-- [ ] BR-7: **The over-window guard survives the fast path.** The typed
+- [x] BR-7: **The over-window guard survives the fast path.** The typed
   refusal of over-budget prompts (which prevents llama.cpp's `GGML_ASSERT`
   abort) runs on the rendered, tokenized prompt on **both** the hit and miss
   paths — enforcement stays at the last transform before the FFI call.
   (informed by LESSON-444, LESSON-491)
-- [ ] BR-8: **Misses tell the truth.** Every miss carries its actual reason
+- [x] BR-8: **Misses tell the truth.** Every miss carries its actual reason
   (cold / divergent / session_switch / evicted); a divergence must never be
   reported as an error, and an error must never be masked as a miss.
   (informed by BUG-146, BUG-152)
-- [ ] BR-9: **Cost attribution distinguishes reused from processed tokens.**
+- [x] BR-9: **Cost attribution distinguishes reused from processed tokens.**
   The cost ledger's local-call records gain a cached-tokens count alongside
   processed tokens, so the cost meter and future perf work can compute hit
   rates from recorded data.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: In a scripted 5-turn agent session (e2e harness, scripted engine or
+- [x] AC-1 (scripted; real-model leg is the dogfood run in
+  `docs/manual-verification.md`, NOT RUN): In a scripted 5-turn agent session (e2e harness, scripted engine or
   real small model), turns 2–5 each emit `prefix_cache_hit` and prefill only
   the suffix: instrumented processed-token counts equal the per-turn delta,
   not the full prompt length.
-- [ ] AC-2: A/B correctness test: a scripted multi-turn session with fixed
+- [x] AC-2: A/B correctness test: a scripted multi-turn session with fixed
   seed produces byte-identical outputs with the cache enabled vs disabled
   (BR-1).
-- [ ] AC-3: Divergence test: a turn following a context compaction/truncation
+- [x] AC-3: Divergence test: a turn following a context compaction/truncation
   emits `prefix_cache_miss` with reason `divergent` and produces correct
   output via full re-prefill (BR-2).
-- [ ] AC-4: Interleaved-session test: two sessions alternating turns produce
+- [x] AC-4: Interleaved-session test: two sessions alternating turns produce
   correct outputs for both; cache thrash is permitted, wrong output is not
   (BR-3).
-- [ ] AC-5: Eviction test: with the cache populated, a simulated memory
+- [x] AC-5: Eviction test: with the cache populated, a simulated memory
   pressure signal drops it (`prefix_cache_evicted` emitted); the next turn
   succeeds cold (BR-4).
-- [ ] AC-6: Duty-interleave test: an agent turn, then a summarize duty call,
+- [x] AC-6: Duty-interleave test: an agent turn, then a summarize duty call,
   then a second agent turn — the second agent turn is a cache hit (BR-5).
-- [ ] AC-7: `tests/nonblocking_inference.rs` passes unchanged: unrelated RPCs
+- [x] AC-7: `tests/nonblocking_inference.rs` passes unchanged: unrelated RPCs
   complete while a gated cached-path generation is in flight (BR-6).
-- [ ] AC-8: Over-window test: a prompt exceeding the window is refused with
+- [x] AC-8: Over-window test: a prompt exceeding the window is refused with
   the typed error on the hit path as well as the miss path, with no process
   abort (BR-7).
-- [ ] AC-9: Ledger rows for local calls carry cached vs processed token
+- [x] AC-9: Ledger rows for local calls carry cached vs processed token
   counts, and the summed counts across AC-1's session match the
   instrumentation (BR-9).
 
@@ -133,11 +134,14 @@ full cold prefill.
 
 ## Assumptions
 
-- `llama-cpp-2` 0.1.151 exposes the KV-cache sequence operations needed to
-  retain a context and clear/rewind past a token offset. If it does not, a
-  binding upgrade becomes an external dependency — verify at architecture
-  time before task breakdown. (informed by LESSON-453 — verify the callee's
-  contract, don't assume it)
+- ~~`llama-cpp-2` 0.1.151 exposes the KV-cache sequence operations needed to
+  retain a context and clear/rewind past a token offset.~~ **VALIDATED at
+  architecture time (2026-08-10)**: `clear_kv_cache_seq(seq, p0, p1)`,
+  `clear_kv_cache()` and `kv_cache_seq_pos_max()` are all present on
+  `LlamaContext`. No binding upgrade needed; "no new external dependencies"
+  holds. What the check *did* surface is that `LlamaContext` is `!Send` and
+  lifetime-bound to the model — see architecture D-1. (informed by LESSON-453 —
+  verify the callee's contract, don't assume it)
 - Prompt rendering is deterministic turn-over-turn absent new content (same
   template arm, same neutralization), so real sessions produce genuine prefix
   extensions. The REQ-554 render pipeline gives no reason to doubt this, but

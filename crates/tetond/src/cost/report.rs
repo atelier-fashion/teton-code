@@ -363,6 +363,7 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             usd_micros,
+            cached_tokens: None,
         }
     }
 

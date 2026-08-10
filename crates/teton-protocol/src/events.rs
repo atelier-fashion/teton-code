@@ -115,6 +115,9 @@ pub enum Event {
     WebConsentDecided(WebConsentDecided),
     /// The user lifted this session's web taint restriction (REQ-563 BR-13).
     WebTaintOverridden(WebTaintOverridden),
+    /// A local agent turn hit, missed, or evicted the KV prefix cache
+    /// (REQ-564). Every ending is a [`PrefixCacheOutcome`] on this one variant.
+    PrefixCache(PrefixCache),
 }
 
 impl Event {
@@ -137,6 +140,7 @@ impl Event {
             Event::WebLookup(_) => "web_lookup",
             Event::WebConsentDecided(_) => "web_consent_decided",
             Event::WebTaintOverridden(_) => "web_taint_overridden",
+            Event::PrefixCache(_) => "prefix_cache",
         }
     }
 }
@@ -476,6 +480,14 @@ pub struct CostRecord {
     /// Cost in integer micro-dollars (1e-6 USD). Spec entity field `usd`, sent
     /// as an integer so money never rounds on the wire.
     pub usd_micros: i64,
+    /// Prompt tokens whose KV was reused from a resident local prefix (REQ-564
+    /// BR-9), or `None` for a call with no prefix cache — every remote call,
+    /// and every row a pre-REQ build wrote.
+    ///
+    /// Omitted from the wire when absent, so a client built against the older
+    /// shape reads the same bytes it always did.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cached_tokens: Option<u64>,
 }
 
 /// Event payload wrapping a [`CostRecord`] (spec Events: `cost_recorded`).
@@ -1215,6 +1227,93 @@ pub struct WebTaintOverridden {
     pub tiers_restored: Vec<WebTier>,
 }
 
+// ---------------------------------------------------------------------------
+// prefix_cache
+// ---------------------------------------------------------------------------
+
+/// A local agent turn's prefix-cache outcome (REQ-564).
+///
+/// One variant with an outcome enum, following [`WebLookup`]'s precedent rather
+/// than minting three near-identical events: hit, miss and eviction are three
+/// ways one thing ends, and a client that renders the event renders all three
+/// or none.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the same shape
+/// [`SessionTitled`] and [`WebTaintOverridden`] document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixCache {
+    /// The local model whose context holds (or held) the prefix.
+    pub model: String,
+    /// How this turn's interaction with the cache ended.
+    ///
+    /// Flattened, so the outcome tag and its fields sit beside `model` on the
+    /// wire rather than nesting under an `outcome` object — the same flat shape
+    /// [`EventEnvelope`] gives every other event, and what a client reading
+    /// `wire["outcome"]` expects.
+    #[serde(flatten)]
+    pub outcome: PrefixCacheOutcome,
+}
+
+/// How a turn's prefix-cache interaction ended (REQ-564 Events).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PrefixCacheOutcome {
+    /// The turn extended the resident prefix and prefilled only the suffix.
+    Hit {
+        /// Prompt tokens whose KV was reused.
+        cached_tokens: u64,
+        /// Prompt tokens actually prefilled this turn.
+        new_tokens: u64,
+    },
+    /// The turn prefilled from position zero.
+    Miss {
+        /// Why the cache did not serve — never an error, and never a guess
+        /// (BR-8).
+        reason: PrefixCacheMiss,
+        /// Prompt tokens prefilled, i.e. the whole prompt.
+        processed_tokens: u64,
+    },
+    /// The resident prefix was dropped.
+    ///
+    /// Reported rather than silent: a cache that vanishes without a word is
+    /// indistinguishable from one that was never warm, and BR-4 asks for
+    /// silent *degradation*, not silent *eviction*.
+    Evicted {
+        /// What took the memory back.
+        reason: EvictionReason,
+    },
+}
+
+/// Why a turn could not reuse the resident prefix (REQ-564 BR-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixCacheMiss {
+    /// Nothing was resident.
+    Cold,
+    /// The resident prefix belonged to another session (BR-3's single slot).
+    SessionSwitch,
+    /// Same session, but the token streams disagreed — compaction, truncation,
+    /// or a template change rewrote history (BR-2).
+    Divergent,
+    /// The prefix had been dropped before this turn.
+    Evicted,
+}
+
+/// Why a resident prefix was dropped (REQ-564 BR-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionReason {
+    /// The runtime asked for the memory back.
+    MemoryPressure,
+    /// The engine is being unloaded or swapped for another model.
+    EngineUnload,
+    /// A generation failed partway, so the resident KV no longer provably
+    /// matches the recorded prefix.
+    GenerationFailed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1343,6 +1442,7 @@ mod tests {
                         input_tokens: 1,
                         output_tokens: 2,
                         usd_micros: 1234,
+                        cached_tokens: None,
                     },
                 }),
                 "cost_recorded",
@@ -1754,6 +1854,7 @@ mod tests {
                 input_tokens: 1000,
                 output_tokens: 500,
                 usd_micros: 45_000,
+                cached_tokens: None,
             },
         });
     }
@@ -2360,5 +2461,90 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    /// A hit reports both halves of the split — what was reused and what still
+    /// had to be prefilled. One number alone cannot answer "was this turn
+    /// fast", which is the entire question the event exists for.
+    #[test]
+    fn a_prefix_cache_hit_reports_reused_and_prefilled_counts() {
+        let hit = PrefixCache {
+            model: "qwen2.5-coder-3b".to_owned(),
+            outcome: PrefixCacheOutcome::Hit {
+                cached_tokens: 15_000,
+                new_tokens: 84,
+            },
+        };
+        round_trip(&hit);
+
+        let wire = envelope_wire(Event::PrefixCache(hit));
+        assert_eq!(wire["event"], "prefix_cache");
+        // The session rides the envelope, never the payload — a `session_id`
+        // field on the struct would emit the key twice and fail to parse.
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["outcome"], "hit");
+        assert_eq!(wire["cached_tokens"], 15_000);
+        assert_eq!(wire["new_tokens"], 84);
+    }
+
+    /// BR-8: every miss carries its actual reason. A reader must be able to
+    /// tell "history was rewritten" from "another session took the slot" —
+    /// folding them into one `miss` is the failure this asserts against.
+    #[test]
+    fn every_miss_reason_has_its_own_wire_spelling() {
+        for (reason, spelling) in [
+            (PrefixCacheMiss::Cold, "cold"),
+            (PrefixCacheMiss::SessionSwitch, "session_switch"),
+            (PrefixCacheMiss::Divergent, "divergent"),
+            (PrefixCacheMiss::Evicted, "evicted"),
+        ] {
+            let miss = PrefixCache {
+                model: "qwen2.5-coder-3b".to_owned(),
+                outcome: PrefixCacheOutcome::Miss {
+                    reason,
+                    processed_tokens: 2_048,
+                },
+            };
+            round_trip(&miss);
+
+            let wire = envelope_wire(Event::PrefixCache(miss));
+            assert_eq!(wire["outcome"], "miss");
+            assert_eq!(wire["reason"], spelling);
+            assert_eq!(wire["processed_tokens"], 2_048);
+        }
+    }
+
+    #[test]
+    fn every_eviction_reason_has_its_own_wire_spelling() {
+        for (reason, spelling) in [
+            (EvictionReason::MemoryPressure, "memory_pressure"),
+            (EvictionReason::EngineUnload, "engine_unload"),
+            (EvictionReason::GenerationFailed, "generation_failed"),
+        ] {
+            let evicted = PrefixCache {
+                model: "qwen2.5-coder-3b".to_owned(),
+                outcome: PrefixCacheOutcome::Evicted { reason },
+            };
+            round_trip(&evicted);
+
+            let wire = envelope_wire(Event::PrefixCache(evicted));
+            assert_eq!(wire["outcome"], "evicted");
+            assert_eq!(wire["reason"], spelling);
+        }
+    }
+
+    /// An outcome this build cannot read must fail loudly rather than default
+    /// to one — the same posture `web_consent_decided` holds. Silently reading
+    /// an unknown outcome as `hit` would report reuse that never happened.
+    #[test]
+    fn an_unknown_prefix_cache_outcome_is_rejected() {
+        assert!(
+            serde_json::from_str::<PrefixCacheOutcome>(r#"{"outcome":"partial"}"#).is_err(),
+            "an unknown outcome must not silently become a known one"
+        );
+        assert!(
+            serde_json::from_str::<PrefixCacheMiss>(r#""stale""#).is_err(),
+            "an unknown miss reason must not silently become a known one"
+        );
     }
 }
