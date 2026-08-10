@@ -2,15 +2,18 @@
   "req": "REQ-567",
   "branch": "feat/REQ-567-cross-prompt-conversation-carry",
   "startedAt": "2026-08-10T19:05:00Z",
-  "completed": false,
-  "currentPhase": 6,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -42,6 +45,21 @@
       "phase": 5,
       "name": "Verify (Reflect + Review)",
       "completedAt": "2026-08-10T22:55:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-08-10T23:00:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-10T23:06:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-10T23:30:00Z"
     }
   ],
   "integrationBranch": "main",
@@ -55,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/87",
       "prNumber": 87,
       "prCreatedAt": "2026-08-10T19:12:23Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }

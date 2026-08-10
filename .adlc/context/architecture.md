@@ -94,6 +94,12 @@
   least coverage. The test double must consume that same extracted policy, not
   a reimplementation — a double with its own copy of the rule tests only that
   two implementations share each other's bugs (REQ-564, LESSON-499).
+- **A lifetime extension re-asserts its invariants at the seam** — when a
+  value outlives the scope that enforced its invariants (a per-turn context
+  becoming a per-session conversation), every invariant either travels with
+  the value or is re-evaluated at one commit seam every writing path shares —
+  success, error, and abort alike — and facts are recorded where they were
+  known, never re-derived downstream of the knowledge (REQ-567, LESSON-501).
 - **A foreign handle that is both borrowed and `!Send` wants a thread** — those
   two constraints together are the callee describing its ownership model, not
   two obstacles to route around with `unsafe impl Send` and a lifetime erasure.
