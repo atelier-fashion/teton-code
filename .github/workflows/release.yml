@@ -2116,7 +2116,13 @@ jobs:
             echo "--- teton doctor ---"
             teton doctor </dev/null 2>&1 || true
             echo "--- teton-code processes ---"
-            ps -Ao pid,etime,command | grep -E "[t]eton-code" || echo "(none)"
+            # `pgrep -l`, not `ps | grep`: the pipeline form needs a
+            # `[t]eton-code` trick to avoid matching itself, which shellcheck
+            # rightly flags (SC2009). `pgrep` matches the process name directly,
+            # so there is nothing to exclude. `-l` (pid + name) rather than `-a`
+            # because BSD reads `-a` as "include ancestors", not as Linux's
+            # "full command line" — and this job runs on macOS.
+            pgrep -l teton-code || echo "(none)"
             echo "--- brew services list ---"
             brew services list || true
             echo "--- daemon logs ---"
