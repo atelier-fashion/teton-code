@@ -161,7 +161,7 @@ use crate::router::{
     to_protocol_category, to_protocol_phase, to_protocol_tier, Router, TierOrigin, TierReport,
 };
 use crate::selection_store::SelectionStore;
-use crate::sessions::SessionRegistry;
+use crate::sessions::{SessionRegistry, TurnClaimError};
 use crate::web::{UserUrls, WebCache};
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
@@ -1060,6 +1060,115 @@ impl HealthRecord {
             other => other,
         }
     }
+}
+
+/// One turn's [`ContextManager`], plus the promise to write what it holds back
+/// to the session's conversation (REQ-567 D-1).
+///
+/// The manager is owned here rather than beside the guard because the third
+/// outcome — cancellation — has no code of its own to run. The server aborts a
+/// prompt's task when its client disconnects (`server.rs`), and an aborted
+/// future reaches neither the success nor the failure branch: `Drop` is the only
+/// thing that executes. A guard that merely *watched* a manager it did not own
+/// would be dropped alongside blocks it could no longer read.
+///
+/// So the three outcomes are:
+///
+/// - **completed** ([`Self::commit`]): disarm, then replace the session's
+///   conversation with what the manager holds. That vector *is* the retained
+///   view — post containment cut (BUG-147), post compaction (BR-4) — so the
+///   commit is a move rather than a re-derivation.
+/// - **failed** ([`Self::abandon`]): disarm and write nothing. Commit is the
+///   only writer, so a failed turn rolls back by never having written (BR-6).
+/// - **cancelled** (armed [`Drop`]): commit whatever the manager holds at that
+///   instant. Every block in it is complete by construction — the loop pushes
+///   model text when a generation ends and a tool result when the tool
+///   returns — so OQ-1's "retain prose, drop incomplete tool work" falls out of
+///   the shape rather than out of a filter: the tool result that never arrived
+///   was never pushed.
+///
+/// It holds a registry *handle*, never a lock: the mutex is taken for the one
+/// vector write and released, so nothing here blocks the async path for the
+/// length of a turn (LESSON-448).
+struct TurnConversation {
+    /// The turn's context. `Some` for the guard's whole life; taken only by the
+    /// method (or the `Drop`) that consumes it, so the two can never both write.
+    ctx: Option<ContextManager>,
+    sessions: SessionRegistry,
+    session_id: SessionId,
+    /// Whether a drop from here would be a cancellation. Set once the new user
+    /// message is in the manager and cleared by whichever outcome arrives first.
+    armed: bool,
+}
+
+impl TurnConversation {
+    /// Take ownership of `ctx` for `session_id` and arm the cancellation commit.
+    fn armed(ctx: ContextManager, sessions: SessionRegistry, session_id: SessionId) -> Self {
+        Self {
+            ctx: Some(ctx),
+            sessions,
+            session_id,
+            armed: true,
+        }
+    }
+
+    /// The turn's context.
+    fn ctx(&self) -> &ContextManager {
+        self.ctx.as_ref().expect("the turn context was taken")
+    }
+
+    /// The turn's context, mutably — what the turn loop appends to.
+    fn ctx_mut(&mut self) -> &mut ContextManager {
+        self.ctx.as_mut().expect("the turn context was taken")
+    }
+
+    /// The turn completed: the conversation becomes what the manager holds.
+    fn commit(mut self) {
+        self.armed = false;
+        if let Some(ctx) = self.ctx.take() {
+            self.sessions
+                .commit_conversation(&self.session_id, ctx.into_blocks());
+        }
+    }
+
+    /// The turn failed: the conversation stays exactly as the turn found it.
+    fn abandon(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TurnConversation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(ctx) = self.ctx.take() {
+            self.sessions
+                .commit_conversation(&self.session_id, ctx.into_blocks());
+        }
+    }
+}
+
+/// Turn a refused session claim into the error a client sees (REQ-567 BR-5, D-3).
+///
+/// Both arms are typed and both name their cause, which is the whole point: BR-5
+/// asks that a refusal "names its cause truthfully rather than surfacing as a
+/// generic turn error", and the sentence each variant already carries is that
+/// name — for a busy session, the turn holding it.
+///
+/// The codes differ because the *facts* differ, and collapsing them would be the
+/// LESSON-456 downgrade in the other direction. A busy session is transient and
+/// retryable, so it carries the transient code and a client renders it as a
+/// waiting notice (BUG-152's `TIER_WARMING` precedent). A session that does not
+/// exist is settled — retrying meets the same absence — and it takes the code
+/// the server already answers an unknown session with, so one fact has one
+/// number wherever it is discovered.
+fn refused_claim_error(err: &TurnClaimError) -> RpcError {
+    let code = match err {
+        TurnClaimError::InFlight { .. } => error_code::SESSION_BUSY,
+        TurnClaimError::NoSuchSession { .. } => error_code::UNKNOWN_SESSION,
+    };
+    RpcError::new(code, err.to_string())
 }
 
 /// The assembled daemon runtime shared by every client task.
@@ -2063,6 +2172,26 @@ impl DaemonRuntime {
             self.turn_counter.fetch_add(1, Ordering::SeqCst)
         ));
 
+        // REQ-567 BR-5 / D-3: claim the session before ANY of this turn's work.
+        // Two `session/prompt` calls on one session can be in flight at once —
+        // each runs on its own task — and both would replay the same snapshot
+        // and both commit, so the second commit would erase the first turn's
+        // blocks wholesale. Refused rather than queued, with the turn already
+        // running named in the sentence.
+        //
+        // Placed first so a refused prompt spends nothing: no classifier call,
+        // no title duty, no tool registry. The claim releases on drop, so every
+        // exit below — including the task abort that has no code to run — frees
+        // the session.
+        //
+        // Bound for the whole function on purpose, and declared BEFORE the
+        // conversation guard below so it outlives it: locals drop in reverse,
+        // which means the commit happens while this session is still claimed and
+        // a waiting client cannot slip a turn between the write and the release.
+        let _claim = sessions
+            .try_begin_turn(&session_id, &turn_id)
+            .map_err(|err| refused_claim_error(&err))?;
+
         let config = self.config.lock().expect("config mutex poisoned").clone();
         // REQ-544 M-5: seed the router from the daemon-wide health map so a
         // provider marked Unavailable on an earlier turn stays Unavailable here —
@@ -2138,11 +2267,30 @@ impl DaemonRuntime {
         let system = build_system_prompt(&tools, &route.harness);
         let mut ctx = ContextManager::new(system, route.harness.context_budget_tokens)
             .with_budget_bytes(route.harness.context_budget_bytes);
+        // REQ-567 BR-1: this turn begins from what the session has already said.
+        // The head above was rebuilt from *this* turn's tools and route, and the
+        // carried blocks are replayed under it — so a mid-session head change
+        // re-renders the same conversation rather than fossilizing an old head
+        // (BR-7). Before `push_user`, because the transcript is in turn order and
+        // this prompt is the newest thing in it.
+        ctx.replay_blocks(sessions.conversation_snapshot(&session_id));
         ctx.push_user(prompt);
+        // From here the manager is the conversation-in-progress: whichever of the
+        // three outcomes arrives — completed, failed, or the task simply being
+        // dropped — decides what the session keeps (see `TurnConversation`).
+        // Armed after `push_user` so a cancelled turn retains the message the
+        // user sent (OQ-1), and there is exactly ONE place below where a turn's
+        // outcome becomes that decision.
+        let mut conversation = TurnConversation::armed(ctx, sessions.clone(), session_id.clone());
 
         let mut attempts = 0u32;
         let mut rerouted_local = false;
-        loop {
+        // The loop is labelled and its endings `break` a value rather than
+        // returning one, so every one of them funnels through the single
+        // commit/abandon below instead of each exit remembering to disarm —
+        // BR-6's atomicity is a property of the shape, not of ten call sites
+        // agreeing.
+        let outcome: Result<PromptTurnResult, RpcError> = 'turn: loop {
             router.emit_route_decided(events, Some(session_id.clone()), &route);
             let provider_id = route.provider_id.clone();
 
@@ -2158,7 +2306,7 @@ impl DaemonRuntime {
                     &tool_ctx,
                     &gate,
                     &stream_events,
-                    &mut ctx,
+                    conversation.ctx_mut(),
                 )
                 .await;
 
@@ -2179,7 +2327,7 @@ impl DaemonRuntime {
                         eprintln!("{}", taint_pin_line(taint_detail_word(detail)));
                     }
                     if !self.engine.present() {
-                        return Err(RpcError::new(
+                        break 'turn Err(RpcError::new(
                             error_code::PRIVACY_BLOCKED,
                             unrerouteable_block_sentence(detail),
                         ));
@@ -2187,7 +2335,7 @@ impl DaemonRuntime {
                     if rerouted_local {
                         // Already rerouted to local (which has no egress and so
                         // cannot privacy-block) — never loop.
-                        return Err(RpcError::new(
+                        break 'turn Err(RpcError::new(
                             error_code::PRIVACY_BLOCKED,
                             failed_reroute_block_sentence(detail),
                         ));
@@ -2211,12 +2359,12 @@ impl DaemonRuntime {
                     // boundary or carries unknown provenance, pin the session to
                     // the local tier for every subsequent turn (the backstop for
                     // a later model paraphrase of what it read here).
-                    if context_is_sensitive(&ctx, &config.boundaries)
+                    if context_is_sensitive(conversation.ctx(), &config.boundaries)
                         && self.session_taint.mark(&session_id)
                     {
                         eprintln!("{}", taint_pin_line(TAINT_BY_CONTEXT));
                     }
-                    return Ok(PromptTurnResult {
+                    break 'turn Ok(PromptTurnResult {
                         turn_id,
                         stop_reason: outcome.stop_reason,
                     });
@@ -2224,13 +2372,13 @@ impl DaemonRuntime {
                 Err(HarnessError::Remote(perr)) if attempts < 2 => {
                     attempts += 1;
                     let Some(pid) = provider_id.as_ref() else {
-                        return Err(RpcError::new(
+                        break 'turn Err(RpcError::new(
                             error_code::INTERNAL_ERROR,
                             "remote turn failed with no provider to fall back from",
                         ));
                     };
                     let Some(class) = perr.failure_class() else {
-                        return Err(RpcError::new(
+                        break 'turn Err(RpcError::new(
                             error_code::INTERNAL_ERROR,
                             "provider failed unrecoverably",
                         ));
@@ -2252,7 +2400,7 @@ impl DaemonRuntime {
                             continue;
                         }
                         None => {
-                            return Err(RpcError::new(
+                            break 'turn Err(RpcError::new(
                                 error_code::UNKNOWN_PROVIDER,
                                 "provider failed and no fallback is configured",
                             ));
@@ -2260,7 +2408,7 @@ impl DaemonRuntime {
                     }
                 }
                 Err(HarnessError::Remote(_)) => {
-                    return Err(RpcError::new(
+                    break 'turn Err(RpcError::new(
                         error_code::INTERNAL_ERROR,
                         "remote turn failed after exhausting fallbacks",
                     ));
@@ -2270,7 +2418,7 @@ impl DaemonRuntime {
                 // literal or an already-scrubbed backend message — never a
                 // path or prompt text (BR-11).
                 Err(HarnessError::Engine(e)) => {
-                    return Err(RpcError::new(
+                    break 'turn Err(RpcError::new(
                         error_code::INTERNAL_ERROR,
                         format!("the local engine could not serve the turn: {e}"),
                     ));
@@ -2285,7 +2433,7 @@ impl DaemonRuntime {
                     // resolution rather than recomputed, and `None` for the taint
                     // pin, which resolved no category at all (BR-7).
                     let category = route.resolution.as_ref().map(|r| r.category);
-                    return Err(unserved_turn_sentence(
+                    break 'turn Err(unserved_turn_sentence(
                         &route,
                         self.unserved_turn_error(&config, category),
                     ));
@@ -2295,8 +2443,25 @@ impl DaemonRuntime {
                 // message names the reference and reason, never the secret) and
                 // do not retry the same broken credential.
                 Err(HarnessError::Credential(msg)) => {
-                    return Err(RpcError::new(error_code::CONFIG_REJECTED, msg));
+                    break 'turn Err(RpcError::new(error_code::CONFIG_REJECTED, msg));
                 }
+            }
+        };
+
+        // REQ-567 D-1, the whole commit protocol in one place. A turn that
+        // completed hands the session what its manager holds — the retained
+        // view, post cut and post compaction, moved rather than re-derived. A
+        // turn that failed writes nothing at all, which is what makes BR-6's
+        // "byte-identical to the failed turn never having run" true by
+        // construction: the pre-turn vector was never touched.
+        match outcome {
+            Ok(result) => {
+                conversation.commit();
+                Ok(result)
+            }
+            Err(err) => {
+                conversation.abandon();
+                Err(err)
             }
         }
     }
@@ -13715,6 +13880,13 @@ provider_id = "on-device"
         /// consumed by duties instead of by the turn. The marker is the untrusted
         /// envelope the loop folds every `web` result into (an error result
         /// included), which exists only after the call has happened.
+        ///
+        /// **Asked of this turn only** (REQ-567): the prompt now opens with the
+        /// whole carried conversation, so the previous turn's `web` result is in
+        /// every later context. Reading the marker across the whole prompt made
+        /// turn 2 answer "Done." without ever reaching the tool — a fixture that
+        /// looked like a grant covering the second turn and was really a model
+        /// that never asked again.
         struct WebThenDoneEngine;
 
         impl Engine for WebThenDoneEngine {
@@ -13728,7 +13900,12 @@ provider_id = "on-device"
                 _params: &GenParams,
                 _on_token: &mut dyn FnMut(&str) -> bool,
             ) -> Result<Completion, EngineError> {
-                let text = if prompt.contains("<tool-result") {
+                // This turn is everything after the newest user block — the one
+                // `run_prompt_turn` pushed for the prompt being served.
+                let this_turn = prompt
+                    .rsplit_once("\nUser:")
+                    .map_or(prompt, |(_, turn)| turn);
+                let text = if this_turn.contains("<tool-result") {
                     "Done.".to_owned()
                 } else {
                     format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{LOOPBACK_URL}\"}}}}")
@@ -13983,6 +14160,709 @@ provider_id = "on-device"
             runtime.record_user_prompt_urls(&SessionId::from("a"), "see https://docs.rs/tokio");
             let other = runtime.user_urls_for(&SessionId::from("b"));
             assert!(other.lock().expect("user url mutex").is_empty());
+        }
+    }
+
+    /// REQ-567 TASK-093 — the dispatch wiring: seed from the conversation,
+    /// commit on completion, commit on cancellation, refuse a concurrent turn.
+    ///
+    /// # What these drive, and why here
+    ///
+    /// Every test in this module calls [`DaemonRuntime::run_prompt_turn`] — the
+    /// real entry point `session/prompt` reaches — against a scripted local
+    /// engine, and asserts on **the context that engine was handed**. That is
+    /// the evidence AC-1 asks for: not "the store holds blocks" (TASK-092 pins
+    /// that at the registry seam) but "the model saw the earlier turns", which
+    /// is the only reading that fails against the pre-change dispatch.
+    ///
+    /// They live in-crate rather than beside `tests/prefix_cache_session.rs`
+    /// because the runtime's engine slot and config are private: an integration
+    /// test cannot install a recording engine, and a `TETON_LOCAL_SCRIPT`
+    /// daemon answers from a file without reporting what it read. The
+    /// protocol-level leg of the acceptance matrix is TASK-096's.
+    mod conversation_carry {
+        use super::*;
+        use crate::harness::context::BlockRole;
+
+        /// The opening of the system head, and the discriminator that tells a
+        /// **turn** prompt from a duty prompt.
+        ///
+        /// `run_prompt_turn` spends the same engine on the route classifier and
+        /// the session title before the turn ever runs, so a recorder that
+        /// logged every completion would be asserting against whichever prompt
+        /// happened to arrive first. Only a turn carries the system head — the
+        /// duties build their own fixed frames — and none of these fixtures
+        /// routes remotely, so the one duty whose *material* is another prompt
+        /// (`redact`, which scans an outbound body) never fires here.
+        const SYSTEM_HEAD_OPENING: &str = "You are Teton Code";
+
+        /// What the engine does when it is next asked to serve a turn.
+        #[derive(Clone, Copy)]
+        enum Scripted {
+            /// Reply with this text: a tool-call JSON, or a final answer.
+            Say(&'static str),
+            /// Fail from inside the engine — the local tier's turn error.
+            Fail(&'static str),
+        }
+
+        /// A local engine that answers turns from a script and keeps the
+        /// assembled context it was handed for each one.
+        ///
+        /// The script advances on **turn** calls only (see
+        /// [`SYSTEM_HEAD_OPENING`]); a duty gets a canned answer and consumes
+        /// nothing, which is the failure mode `ScriptedFileEngine`'s own docs
+        /// record having shipped twice.
+        struct RecordingEngine {
+            script: Vec<Scripted>,
+            seen: Arc<Mutex<Vec<String>>>,
+            calls: AtomicUsize,
+        }
+
+        impl RecordingEngine {
+            fn new(script: &[Scripted]) -> (Self, Arc<Mutex<Vec<String>>>) {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                (
+                    Self {
+                        script: script.to_vec(),
+                        seen: Arc::clone(&seen),
+                        calls: AtomicUsize::new(0),
+                    },
+                    seen,
+                )
+            }
+        }
+
+        impl Engine for RecordingEngine {
+            fn model_id(&self) -> &str {
+                "recording-local"
+            }
+
+            fn complete(
+                &self,
+                prompt: &str,
+                params: &GenParams,
+                on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                if !prompt.contains(SYSTEM_HEAD_OPENING) {
+                    // A duty. Answered off-script and unrecorded; an unparseable
+                    // answer degrades to the duty's own default, which is all
+                    // any of these fixtures needs from a title or a category.
+                    return Ok(Completion::cold("none".to_owned(), 0, 1));
+                }
+                self.seen
+                    .lock()
+                    .expect("recorded-context mutex")
+                    .push(prompt.to_owned());
+
+                let step = self.calls.fetch_add(1, Ordering::SeqCst);
+                let full = match self.script.get(step).copied() {
+                    Some(Scripted::Say(text)) => text,
+                    Some(Scripted::Fail(reason)) => {
+                        return Err(EngineError::Backend(reason.to_owned()))
+                    }
+                    None => "Done.",
+                };
+
+                // Streamed word by word, honouring an early stop, exactly as
+                // `ScriptedFileEngine` does — the containment scanner has to see
+                // a token stream or it cannot cut a fabricated tail.
+                let mut text = String::new();
+                let mut completion_tokens = 0u32;
+                for token in full.split_inclusive(' ') {
+                    if completion_tokens >= params.max_tokens {
+                        break;
+                    }
+                    let keep_going = on_token(token);
+                    text.push_str(token);
+                    completion_tokens += 1;
+                    if !keep_going {
+                        break;
+                    }
+                }
+                let prompt_tokens =
+                    u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
+                Ok(Completion::cold(text, prompt_tokens, completion_tokens))
+            }
+        }
+
+        /// Every tier bound to a declared local provider, so these turns are
+        /// served on this machine rather than resolving to an endpoint nothing
+        /// is listening on.
+        fn local_config() -> Config {
+            Config {
+                providers: vec![ModelProvider {
+                    id: "local".to_owned(),
+                    kind: ProviderKind::Local,
+                    endpoint: None,
+                    model: None,
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                }],
+                tiers: Tier::ALL
+                    .iter()
+                    .map(|tier| TierBinding {
+                        tier: *tier,
+                        provider_id: "local".to_owned(),
+                        fallback_id: None,
+                    })
+                    .collect(),
+                ..Config::default()
+            }
+        }
+
+        /// A daemon serving `script` from a recording engine, and the log of the
+        /// contexts that engine is handed.
+        fn carry_runtime(script: &[Scripted]) -> (Arc<DaemonRuntime>, Arc<Mutex<Vec<String>>>) {
+            let (engine, seen) = RecordingEngine::new(script);
+            let runtime = DaemonRuntime::minimal();
+            *runtime.config.lock().expect("config mutex") = local_config();
+            runtime
+                .engine
+                .install("recording".to_owned(), Arc::new(Mutex::new(engine)));
+            runtime.local_available.store(true, Ordering::SeqCst);
+            (Arc::new(runtime), seen)
+        }
+
+        /// A registry holding one freeform session.
+        fn one_session() -> (SessionRegistry, SessionId) {
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase");
+            let id = session.session_id.clone();
+            (sessions, id)
+        }
+
+        /// Drive one prompt to completion.
+        async fn prompt(
+            runtime: &Arc<DaemonRuntime>,
+            events: &Arc<EventBus>,
+            sessions: &SessionRegistry,
+            session_id: &SessionId,
+            cwd: Option<PathBuf>,
+            text: &str,
+        ) -> Result<PromptTurnResult, RpcError> {
+            runtime
+                .run_prompt_turn(
+                    events,
+                    sessions,
+                    session_id.clone(),
+                    SessionMode::Freeform,
+                    None,
+                    cwd,
+                    text.to_owned(),
+                )
+                .await
+        }
+
+        /// A scratch working directory holding one readable file, so a scripted
+        /// `read` call is real tool work rather than an error result.
+        fn repo_with_notes(tag: &str) -> PathBuf {
+            let dir = scratch_dir(tag);
+            std::fs::write(
+                dir.join("notes.txt"),
+                "the retry budget is three attempts\n",
+            )
+            .expect("write the fixture file");
+            dir
+        }
+
+        /// Wait for the permission prompt `tool` raises, so a test knows the
+        /// turn is genuinely parked at the gate rather than racing a timer.
+        async fn await_permission_prompt(sub: &mut crate::broadcast::Subscription, tool: &str) {
+            let waited = tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(envelope) = sub.recv().await {
+                    if let Event::PermissionRequest(request) = envelope.event {
+                        if request.tool_name == tool {
+                            return;
+                        }
+                    }
+                }
+            })
+            .await;
+            waited.unwrap_or_else(|_| panic!("no `{tool}` permission prompt arrived"));
+        }
+
+        // -- AC-1: the conversation reaches the model ------------------------
+
+        /// **AC-1, the recap test.** Three prompts on one session: the context
+        /// the engine is handed for prompt 3 contains prompt 1's message *and*
+        /// the reply prompt 1 got.
+        ///
+        /// This is the assertion that fails against the pre-change dispatch
+        /// (AC-10's red half). Before this task every `session/prompt` built a
+        /// fresh `ContextManager`, so prompt 3's context was the system head and
+        /// prompt 3 — the dogfood session in which "recap what we learned" was
+        /// answered with "could you share the relevant files?".
+        ///
+        /// The non-vacuity leg is prompt 1's own context: it must contain
+        /// *nothing* from the later turns, or the log being read is not
+        /// per-turn.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_third_prompt_carries_the_first_prompts_message_and_reply() {
+            let (runtime, seen) = carry_runtime(&[
+                Scripted::Say("The router allows three attempts."),
+                Scripted::Say("Yes, the fallback shares that budget."),
+                Scripted::Say("We established the retry budget and the fallback."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session();
+
+            for text in [
+                "how many attempts does the router allow?",
+                "does the fallback share it?",
+                "recap what we established",
+            ] {
+                prompt(&runtime, &events, &sessions, &session_id, None, text)
+                    .await
+                    .expect("the scripted turn completes");
+            }
+
+            let seen = seen.lock().expect("recorded-context mutex").clone();
+            assert_eq!(
+                seen.len(),
+                3,
+                "one recorded context per turn: {}",
+                seen.len()
+            );
+
+            // Prompt 1 saw only itself — the log is per-turn, and the head is
+            // genuinely all a first prompt starts from.
+            assert!(
+                !seen[0].contains("does the fallback share it?")
+                    && !seen[0].contains("recap what we established"),
+                "the first turn cannot have seen the later ones"
+            );
+
+            // Prompt 2 already carries turn 1, and prompt 3 carries both.
+            assert!(
+                seen[1].contains("how many attempts does the router allow?"),
+                "prompt 2 lost prompt 1's message"
+            );
+            let third = &seen[2];
+            assert!(
+                third.contains("how many attempts does the router allow?"),
+                "prompt 3's context does not contain prompt 1's user message — \
+                 this is the dispatch building a fresh context per prompt"
+            );
+            assert!(
+                third.contains("The router allows three attempts."),
+                "prompt 3's context does not contain the reply prompt 1 got — \
+                 the retained assistant text is half of what BR-1 carries"
+            );
+            assert!(
+                third.contains("Yes, the fallback shares that budget."),
+                "prompt 3's context is missing turn 2 as well"
+            );
+            // In turn order, under one head: the recap has to read as a
+            // transcript rather than as a bag of blocks.
+            let first_at = third
+                .find("how many attempts does the router allow?")
+                .expect("turn 1");
+            let second_at = third.find("does the fallback share it?").expect("turn 2");
+            let third_at = third.find("recap what we established").expect("turn 3");
+            assert!(
+                first_at < second_at && second_at < third_at,
+                "the carried conversation is out of turn order"
+            );
+            assert_eq!(
+                third.matches(SYSTEM_HEAD_OPENING).count(),
+                1,
+                "the head is rebuilt per prompt and never carried (BR-7)"
+            );
+        }
+
+        // -- AC-5: a failed turn leaves nothing behind -----------------------
+
+        /// **AC-5 / BR-6.** A turn that errors *after* a completed tool call
+        /// leaves the next prompt's context byte-identical to what it would
+        /// have been had the failed turn never run.
+        ///
+        /// Byte-identical is checked against an actual control run rather than
+        /// against a hand-written expectation: the same two surviving prompts on
+        /// a session that never saw the failing turn. A commit that leaked even
+        /// the failed turn's user message — let alone the tool result it did
+        /// produce — separates the two strings.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_turn_that_fails_after_a_tool_call_leaves_no_trace_in_the_next_context() {
+            let repo = repo_with_notes("carry-atomicity");
+
+            // The failing run: prompt 1 answers, prompt 2 reads a file and then
+            // the engine dies, prompt 3 answers.
+            let (runtime, seen) = carry_runtime(&[
+                Scripted::Say("Noted."),
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "notes.txt"}}"#),
+                Scripted::Fail("the backend went away mid-turn"),
+                Scripted::Say("Fine."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session();
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Some(repo.clone()),
+                "remember the retry budget",
+            )
+            .await
+            .expect("the first turn completes");
+            let failed = prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Some(repo.clone()),
+                "check notes.txt for me",
+            )
+            .await
+            .expect_err("the scripted engine fails this turn");
+            assert!(
+                failed
+                    .message
+                    .contains("the local engine could not serve the turn"),
+                "the fixture must fail as a turn error, not some other way: {}",
+                failed.message
+            );
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Some(repo.clone()),
+                "and what did we say?",
+            )
+            .await
+            .expect("the session still serves turns after a failed one");
+
+            // Non-vacuity: the failed turn really did complete a tool call, so
+            // there really was work that a partial commit could have kept.
+            let after_failure = seen.lock().expect("recorded-context mutex").clone();
+            assert_eq!(after_failure.len(), 4, "one context per model call");
+            assert!(
+                after_failure[2].contains("the retry budget is three attempts"),
+                "the `read` never folded its result into the failed turn, so \
+                 this test is not measuring what it claims"
+            );
+
+            // The control run: the same session without the failing prompt.
+            let (control_runtime, control_seen) =
+                carry_runtime(&[Scripted::Say("Noted."), Scripted::Say("Fine.")]);
+            let control_events = Arc::new(EventBus::new());
+            let (control_sessions, control_id) = one_session();
+            for text in ["remember the retry budget", "and what did we say?"] {
+                prompt(
+                    &control_runtime,
+                    &control_events,
+                    &control_sessions,
+                    &control_id,
+                    Some(repo.clone()),
+                    text,
+                )
+                .await
+                .expect("the control turn completes");
+            }
+            let control = control_seen.lock().expect("recorded-context mutex").clone();
+
+            assert_eq!(
+                after_failure[3], control[1],
+                "the failed turn left something in the next prompt's context"
+            );
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+
+        // -- OQ-1: a cancelled turn keeps what completed ---------------------
+
+        /// **OQ-1 / D-1's third outcome.** The server aborts a prompt's task
+        /// when its client disconnects, and an aborted future runs neither the
+        /// success nor the failure branch — only `Drop`. So a cancelled turn
+        /// commits what its manager holds at that instant: the prose from the
+        /// turn before it, this turn's message, and the tool work that
+        /// *finished*. The call still waiting on a permission answer contributed
+        /// nothing, because a result is pushed when the tool returns.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancelled_turn_commits_its_completed_work_and_not_the_pending_call() {
+            let repo = repo_with_notes("carry-cancel");
+            let (runtime, _seen) = carry_runtime(&[
+                Scripted::Say("The build passes."),
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "notes.txt"}}"#),
+                Scripted::Say(r#"{"tool": "shell", "arguments": {"command": "echo hi"}}"#),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(64);
+            let (sessions, session_id) = one_session();
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Some(repo.clone()),
+                "did the build pass?",
+            )
+            .await
+            .expect("the first turn completes");
+
+            // The second turn reads a file, then asks to run a command — and
+            // nobody ever answers that prompt.
+            let turn = {
+                let runtime = Arc::clone(&runtime);
+                let events = Arc::clone(&events);
+                let sessions = sessions.clone();
+                let session_id = session_id.clone();
+                let repo = repo.clone();
+                tokio::spawn(async move {
+                    prompt(
+                        &runtime,
+                        &events,
+                        &sessions,
+                        &session_id,
+                        Some(repo),
+                        "now check the notes and run the tests",
+                    )
+                    .await
+                })
+            };
+            await_permission_prompt(&mut sub, "shell").await;
+
+            // The client disconnected: the task is aborted and the future is
+            // dropped where it stood.
+            turn.abort();
+            assert!(
+                turn.await.is_err(),
+                "the turn must have been cancelled, not completed"
+            );
+
+            let blocks = sessions.conversation_snapshot(&session_id);
+            let texts: Vec<&str> = blocks.iter().map(|b| b.text.as_str()).collect();
+            assert!(
+                texts.iter().any(|t| t.contains("The build passes.")),
+                "the completed turn's prose was lost by the cancelled one: {texts:?}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|t| t.contains("now check the notes and run the tests")),
+                "the user's own message must survive cancellation (OQ-1): {texts:?}"
+            );
+            let tool_blocks: Vec<&str> = blocks
+                .iter()
+                .filter(|b| b.role == BlockRole::Tool)
+                .map(|b| b.text.as_str())
+                .collect();
+            assert_eq!(
+                tool_blocks.len(),
+                1,
+                "exactly the tool work that finished: {tool_blocks:?}"
+            );
+            assert!(
+                tool_blocks[0].contains("the retry budget is three attempts"),
+                "the surviving tool block is not the completed `read`: {tool_blocks:?}"
+            );
+            assert!(
+                !texts
+                    .iter()
+                    .any(|t| t.contains("echo hi") && !t.contains("tool")),
+                "no result for the command that never ran: {texts:?}"
+            );
+
+            // And the session is not wedged: the claim the aborted task held was
+            // released by the same drop that committed.
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Some(repo.clone()),
+                "never mind",
+            )
+            .await
+            .expect("an aborted turn must not wedge its session");
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+
+        // -- AC-4: two prompts, one session ----------------------------------
+
+        /// **AC-4 / BR-5 / D-3.** A second prompt arriving while a turn is in
+        /// flight is refused with the typed busy error naming the turn that
+        /// holds the session — never queued, never interleaved, and never a
+        /// generic turn failure (LESSON-456).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_concurrent_prompt_is_refused_by_name_and_leaves_the_conversation_linear() {
+            let (runtime, _seen) = carry_runtime(&[
+                Scripted::Say(r#"{"tool": "shell", "arguments": {"command": "echo hi"}}"#),
+                Scripted::Say("All done."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(64);
+            let (sessions, session_id) = one_session();
+
+            let first = {
+                let runtime = Arc::clone(&runtime);
+                let events = Arc::clone(&events);
+                let sessions = sessions.clone();
+                let session_id = session_id.clone();
+                tokio::spawn(async move {
+                    prompt(
+                        &runtime,
+                        &events,
+                        &sessions,
+                        &session_id,
+                        None,
+                        "run the tests please",
+                    )
+                    .await
+                })
+            };
+            await_permission_prompt(&mut sub, "shell").await;
+
+            let refused = prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                None,
+                "actually, tell me about the parser instead",
+            )
+            .await
+            .expect_err("a second turn on one session must be refused");
+
+            assert_eq!(
+                refused.code,
+                error_code::SESSION_BUSY,
+                "a busy session is its own state, not an internal error: {}",
+                refused.message
+            );
+            assert!(
+                refused.message.contains("turn-0"),
+                "the refusal must name the turn holding the session: {}",
+                refused.message
+            );
+            assert!(
+                refused.message.contains(session_id.0.as_str()),
+                "and the session it is about: {}",
+                refused.message
+            );
+
+            first.abort();
+            let _ = first.await;
+
+            // Nothing of the refused prompt is in the conversation: a refusal
+            // that had run far enough to push a block would have forked it.
+            let texts: Vec<String> = sessions
+                .conversation_snapshot(&session_id)
+                .into_iter()
+                .map(|b| b.text)
+                .collect();
+            assert!(
+                texts.iter().any(|t| t.contains("run the tests please")),
+                "the turn that held the claim kept its own message: {texts:?}"
+            );
+            assert!(
+                !texts.iter().any(|t| t.contains("tell me about the parser")),
+                "the refused prompt interleaved a block into the conversation: {texts:?}"
+            );
+
+            // AC-4's tail: the session a refusal was issued for is usable again
+            // the moment the turn that held it lets go.
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                None,
+                "actually, tell me about the parser instead",
+            )
+            .await
+            .expect("a session whose turn was refused must serve the retry");
+        }
+
+        // -- BR-1's kept-view rule -------------------------------------------
+
+        /// **BR-1 / LESSON-500.** What carries is the harness's *retained* view,
+        /// never the model's decoded one. A reply that runs on past its answer
+        /// into a fabricated transcript is cut by the containment scanner
+        /// (BUG-147), and it is the cut text — not the decoded text — that the
+        /// next prompt's context is built from.
+        ///
+        /// This is the property that makes a carried boundary a `divergent` hit
+        /// rather than a wrong one: the resident KV holds the fabrication, the
+        /// conversation does not.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_fabricated_continuation_never_enters_the_carried_conversation() {
+            let (runtime, seen) = carry_runtime(&[
+                Scripted::Say(
+                    "The parser handles nested objects.\n\
+                     User: and does it handle FABRICATEDTAIL too?\n\
+                     Assistant: yes, invented entirely.",
+                ),
+                Scripted::Say("Still nested objects."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session();
+
+            for text in ["what does the parser handle?", "say that again"] {
+                prompt(&runtime, &events, &sessions, &session_id, None, text)
+                    .await
+                    .expect("the scripted turn completes");
+            }
+
+            let seen = seen.lock().expect("recorded-context mutex").clone();
+            let second = &seen[1];
+            assert!(
+                second.contains("The parser handles nested objects."),
+                "the KEPT text is what carries: {second}"
+            );
+            assert!(
+                !second.contains("FABRICATEDTAIL"),
+                "the fabricated continuation reached the next turn's context"
+            );
+            // And the store agrees with the context — one retained view, not two.
+            let texts: Vec<String> = sessions
+                .conversation_snapshot(&session_id)
+                .into_iter()
+                .map(|b| b.text)
+                .collect();
+            assert!(
+                !texts.iter().any(|t| t.contains("FABRICATEDTAIL")),
+                "the conversation kept a fabrication the context did not: {texts:?}"
+            );
+        }
+
+        // -- the claim's own arms --------------------------------------------
+
+        /// A prompt for a session the registry does not have is refused before
+        /// any work, and refused as *that* fact rather than as a busy session —
+        /// the two are told apart by code, so a client can tell "retry in a
+        /// moment" from "this session is gone".
+        #[tokio::test]
+        async fn a_prompt_for_an_unknown_session_is_refused_as_unknown_not_busy() {
+            let (runtime, seen) = carry_runtime(&[Scripted::Say("unreachable")]);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+
+            let err = prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &SessionId::from("sess-ghost"),
+                None,
+                "anyone home?",
+            )
+            .await
+            .expect_err("there is no such session to run a turn on");
+
+            assert_eq!(err.code, error_code::UNKNOWN_SESSION);
+            assert_ne!(
+                err.code,
+                error_code::SESSION_BUSY,
+                "a session that does not exist is not a session that is busy"
+            );
+            assert!(
+                seen.lock().expect("recorded-context mutex").is_empty(),
+                "a refused prompt must spend no inference at all"
+            );
         }
     }
 }

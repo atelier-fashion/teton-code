@@ -1,7 +1,7 @@
 ---
 id: TASK-093
 title: "Dispatch wiring: seed from conversation, commit on completion, cancel guard, busy refusal"
-status: draft
+status: complete
 parent: REQ-567
 created: 2026-08-10
 updated: 2026-08-10

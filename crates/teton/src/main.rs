@@ -493,27 +493,41 @@ fn paint_indicator(ctx: &mut UiContext<'_>, tick: u64) -> usize {
 /// action is required, and the tier is on its way.
 const TIER_WARMING_HEADLINE: &str = "model still loading —";
 
+/// The headline a prompt refused because its session is already running a turn
+/// renders under (REQ-567 BR-5).
+///
+/// The daemon's sentence follows and names the turn that holds the session. Like
+/// the warming headline above it, this says only the part that decides whether
+/// to read the rest: nothing broke and nothing needs fixing, the session is
+/// simply busy and the prompt can be sent again.
+const SESSION_BUSY_HEADLINE: &str = "session busy —";
+
 /// Render a `prompt/turn` the daemon answered with an error.
 ///
 /// Two classes, told apart by the daemon's own code rather than by re-reading
-/// its sentence here (BUG-152). A tier that is still coming up — weights
-/// downloading, or loaded and being benchmarked — is not a failure: nothing
-/// broke, the user has nothing to fix, and the state ends by itself. It renders
-/// as a [`LineKind::Notice`], the same class as the startup lifecycle lines it
-/// is a continuation of. Everything else is a real failure and keeps the error
-/// line and its `prompt failed:` prefix.
+/// its sentence here (BUG-152). A refusal that **resolves on its own** — a tier
+/// still coming up (weights downloading, or loaded and being benchmarked), or a
+/// session already running another turn (REQ-567 BR-5) — is not a failure:
+/// nothing broke, the user has nothing to fix, and the state ends by itself. It
+/// renders as a [`LineKind::Notice`], the same class as the startup lifecycle
+/// lines it is a continuation of. Everything else is a real failure and keeps
+/// the error line and its `prompt failed:` prefix.
 ///
 /// Split out of the entry loop so both arms are testable without a socket, for
 /// the reason [`cost_report_or_report`] is: the arms *are* the behaviour, and a
 /// branch only an e2e can reach is a branch that gets asserted on by accident.
 fn render_turn_failure(err: &RpcError, surface: &mut dyn Surface) {
-    if err.code == error_code::TIER_WARMING {
-        surface.line(
-            LineKind::Notice,
-            &format!("{TIER_WARMING_HEADLINE} {}", err.message),
-        );
-    } else {
-        surface.line(LineKind::Error, &format!("prompt failed: {}", err.message));
+    // Matched on the code, never on the sentence: the daemon classified this
+    // state once and a client re-deriving it from keywords would be a second
+    // classifier for one fact (LESSON-456).
+    let headline = match err.code {
+        error_code::TIER_WARMING => Some(TIER_WARMING_HEADLINE),
+        error_code::SESSION_BUSY => Some(SESSION_BUSY_HEADLINE),
+        _ => None,
+    };
+    match headline {
+        Some(headline) => surface.line(LineKind::Notice, &format!("{headline} {}", err.message)),
+        None => surface.line(LineKind::Error, &format!("prompt failed: {}", err.message)),
     }
 }
 
@@ -2892,6 +2906,45 @@ mod tests {
                 surface.calls
             );
         }
+    }
+
+    /// REQ-567 BR-5: a prompt refused because the session is already running a
+    /// turn is the second self-resolving state, and it renders like the first.
+    ///
+    /// The assertion that matters is the *turn id surviving*: BR-5 requires a
+    /// refusal to name its cause, and a client that dropped the daemon's
+    /// sentence in favour of its own headline would leave the user with a
+    /// generic "busy" and no way to tell which turn they are waiting on.
+    #[test]
+    fn a_busy_session_is_a_notice_that_still_names_the_turn_holding_it() {
+        let mut surface = RecordingSurface::new();
+        render_turn_failure(
+            &RpcError::new(
+                error_code::SESSION_BUSY,
+                "session sess-0 is already running turn turn-3; one session runs one \
+                 turn at a time — retry when it finishes",
+            ),
+            &mut surface,
+        );
+
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "a busy session is not a broken one: {:?}",
+            surface.calls
+        );
+        let notices = surface.lines_of(LineKind::Notice);
+        assert_eq!(notices.len(), 1, "exactly one line: {notices:?}");
+        assert!(
+            notices[0].starts_with(SESSION_BUSY_HEADLINE),
+            "the waiting headline leads, so it is what scans: {}",
+            notices[0]
+        );
+        assert!(
+            notices[0].contains("turn-3") && notices[0].contains("retry when it finishes"),
+            "the daemon's reason — the turn it names included — must reach the \
+             user intact: {}",
+            notices[0]
+        );
     }
 
     // The same shape for the cost surfaces (REQ-555 BR-4): `teton cost`, the
