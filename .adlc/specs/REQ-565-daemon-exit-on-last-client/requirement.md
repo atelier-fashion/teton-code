@@ -1,7 +1,7 @@
 ---
 id: REQ-565
 title: "On-demand daemon lifetime: exit with the last client"
-status: draft
+status: in-progress
 deployable: true
 created: 2026-08-09
 updated: 2026-08-10
