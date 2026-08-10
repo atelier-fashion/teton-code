@@ -227,6 +227,7 @@ impl LocalEngineSource {
             None => PrefixCacheOutcome::Hit {
                 cached_tokens: u64::from(completion.cached_tokens),
                 new_tokens: u64::from(completion.processed_tokens()),
+                divergent: completion.cache_divergent,
             },
             Some(reason) => PrefixCacheOutcome::Miss {
                 reason: match reason {

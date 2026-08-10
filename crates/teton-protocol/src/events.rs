@@ -1377,12 +1377,23 @@ pub struct PrefixCache {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum PrefixCacheOutcome {
-    /// The turn extended the resident prefix and prefilled only the suffix.
+    /// The turn shared a non-empty prefix with the resident KV and prefilled
+    /// only what changed.
     Hit {
         /// Prompt tokens whose KV was reused.
         cached_tokens: u64,
         /// Prompt tokens actually prefilled this turn.
         new_tokens: u64,
+        /// Whether reuse was capped by a token disagreement rather than by
+        /// prompt length (BR-2 as amended 2026-08-10) — history was rewritten
+        /// past the reuse point (compaction, a BUG-147 fabrication cut) and
+        /// this turn re-prefilled the rewritten tail.
+        ///
+        /// `default` so events recorded before the amendment still
+        /// deserialize; absent means `false`, which is what those events
+        /// meant — the old rule never produced a divergent hit.
+        #[serde(default)]
+        divergent: bool,
     },
     /// The turn prefilled from position zero.
     Miss {
@@ -1411,8 +1422,10 @@ pub enum PrefixCacheMiss {
     Cold,
     /// The resident prefix belonged to another session (BR-3's single slot).
     SessionSwitch,
-    /// Same session, but the token streams disagreed — compaction, truncation,
-    /// or a template change rewrote history (BR-2).
+    /// Same session, but nothing was reusable — the streams disagreed at the
+    /// very first token, or the prompt was too short to reuse anything (BR-2,
+    /// as amended: a *mid-stream* disagreement is a hit carrying
+    /// `divergent: true`, not a miss).
     Divergent,
     /// The prefix had been dropped before this turn.
     Evicted,
@@ -2590,6 +2603,7 @@ mod tests {
             outcome: PrefixCacheOutcome::Hit {
                 cached_tokens: 15_000,
                 new_tokens: 84,
+                divergent: true,
             },
         };
         round_trip(&hit);
@@ -2602,6 +2616,36 @@ mod tests {
         assert_eq!(wire["outcome"], "hit");
         assert_eq!(wire["cached_tokens"], 15_000);
         assert_eq!(wire["new_tokens"], 84);
+        assert_eq!(wire["divergent"], true);
+    }
+
+    /// A hit recorded before the BR-2 amendment carries no `divergent` key;
+    /// it must still deserialize, and to `false` — which is what it meant, as
+    /// the old rule never produced a divergent hit.
+    #[test]
+    fn a_pre_amendment_hit_without_divergent_deserializes_to_false() {
+        let json = r#"{
+            "seq": 7,
+            "ts_ms": 1,
+            "session_id": "s1",
+            "event": "prefix_cache",
+            "model": "qwen2.5-coder-3b",
+            "outcome": "hit",
+            "cached_tokens": 15000,
+            "new_tokens": 84
+        }"#;
+        let env: EventEnvelope = serde_json::from_str(json).unwrap();
+        match env.event {
+            Event::PrefixCache(cache) => assert_eq!(
+                cache.outcome,
+                PrefixCacheOutcome::Hit {
+                    cached_tokens: 15_000,
+                    new_tokens: 84,
+                    divergent: false,
+                }
+            ),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     /// BR-8: every miss carries its actual reason. A reader must be able to

@@ -28,9 +28,10 @@ create/destroy cycles in the daemon log; a single user question drove an
 redundant prefill. This is the single largest local-tier latency lever
 (charter BR-8 latency duty).
 
-Goal: within a session, a turn whose rendered prompt extends the previous
-turn's prompt prefills **only the new suffix**, reusing the resident KV for the
-shared prefix. Reuse is a pure optimization: any divergence falls back to a
+Goal: within a session, a turn whose rendered prompt shares a token prefix
+with the previous turn's prompt prefills **only what changed**, reusing the
+resident KV for the common prefix. Reuse is a pure optimization: it never
+crosses a divergence point, and a turn with no reusable prefix falls back to a
 full cold prefill.
 
 ## System Model
@@ -48,8 +49,8 @@ full cold prefill.
 
 | Event | Trigger | Payload |
 |-------|---------|---------|
-| prefix_cache_hit | new turn's token stream extends the cached prefix | session_id, cached_tokens (count reused), new_tokens (count prefilled) |
-| prefix_cache_miss | no cache, divergent prompt, different session, or evicted | session_id, reason (cold \| divergent \| session_switch \| evicted), processed_tokens |
+| prefix_cache_hit | new turn's token stream shares a non-empty prefix with the cached prefix | session_id, cached_tokens (count reused), new_tokens (count prefilled), divergent (true iff reuse was capped by a token disagreement, not by prompt length) |
+| prefix_cache_miss | no cache, divergence at token zero, different session, or evicted | session_id, reason (cold \| divergent \| session_switch \| evicted), processed_tokens |
 | prefix_cache_evicted | memory pressure, engine unload/swap, or session end | session_id, reason |
 
 ## Business Rules
@@ -58,12 +59,20 @@ full cold prefill.
   params, and sampling seed, generation output with the cache enabled is
   byte-identical to a cold fresh-context generation. Prefix reuse must never be
   observable in output, only in latency.
-- [x] BR-2: **Reuse only on exact token-prefix extension.** A turn reuses
-  cached KV only when its tokenized prompt starts with the cached
-  `token_prefix` exactly (token-level comparison, not string-level). Any
-  divergence — context compaction/truncation rewrote history, template change,
-  session switch — falls back to a full cold prefill from position zero; never
-  partial reuse past a divergence point. (informed by LESSON-447)
+- [x] BR-2: **Reuse the longest common token prefix; never reuse past it.**
+  A turn reuses cached KV for exactly the longest common prefix of its
+  tokenized prompt and the cached `token_prefix` (token-level comparison, not
+  string-level), and prefills everything from the first disagreeing position
+  onward. KV at or past a divergence point is never reused — the comparison is
+  over a contiguous head, so it can never skip a disagreement. A turn whose
+  common prefix is empty (divergence at token zero, session switch, nothing
+  resident) falls back to a full cold prefill from position zero. A hit whose
+  reuse was capped by a token disagreement — rather than by prompt length —
+  carries a `divergent` marker so history rewrites (compaction, BUG-147
+  fabrication cuts) stay measurable. (informed by LESSON-447; **amended
+  2026-08-10** — originally all-or-nothing exact-extension reuse, revised per
+  verify finding L-1: fabrication-cut turns, the motivating workload, diverge
+  mid-stream every time and were paying full cold prefills)
 - [x] BR-3: **Bounded memory: one cache slot.** At most one persistent context
   exists per loaded engine (the most recently used session). A session switch
   rebuilds the cache; KV memory never exceeds the single already-reserved
@@ -107,8 +116,10 @@ full cold prefill.
   seed produces byte-identical outputs with the cache enabled vs disabled
   (BR-1).
 - [x] AC-3: Divergence test: a turn following a context compaction/truncation
-  emits `prefix_cache_miss` with reason `divergent` and produces correct
-  output via full re-prefill (BR-2).
+  reuses the common head — it emits `prefix_cache_hit` with `divergent: true`
+  and `cached_tokens` equal to the agreement length — and produces correct
+  output; a turn diverging at the first token emits `prefix_cache_miss` with
+  reason `divergent` and re-prefills from zero (BR-2, as amended).
 - [x] AC-4: Interleaved-session test: two sessions alternating turns produce
   correct outputs for both; cache thrash is permitted, wrong output is not
   (BR-3).

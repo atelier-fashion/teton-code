@@ -23,8 +23,10 @@ pub enum MissReason {
     Cold,
     /// A prefix was resident, but for a different session (BR-3's single slot).
     SessionSwitch,
-    /// Same session, but the token streams disagree — context compaction,
-    /// truncation, or a template change rewrote history (BR-2).
+    /// Same session, but nothing was reusable: the streams disagree at token
+    /// zero, or the prompt is too short to leave a token to prefill (BR-2, as
+    /// amended — a *mid-stream* disagreement is now a partial
+    /// [`CacheDecision::Hit`] carrying `divergent: true`, not a miss).
     Divergent,
     /// The prefix was dropped by [`PrefixCacheState::evict`] before this turn.
     ///
@@ -81,6 +83,16 @@ pub enum CacheDecision {
     Hit {
         /// Tokens whose KV is reused (the truncation point).
         reuse: usize,
+        /// Whether `reuse` was capped by a token disagreement rather than by
+        /// prompt length (BR-2 as amended 2026-08-10).
+        ///
+        /// `true` means history was rewritten past the reuse point —
+        /// compaction, or a BUG-147 fabrication cut — and this turn re-prefills
+        /// the rewritten tail. `false` covers a pure extension, a retry, and a
+        /// rewind: everything compared agreed. The flag keeps the
+        /// history-rewrite rate measurable now that a mid-stream divergence is
+        /// a partial hit instead of a miss (BR-8's spirit).
+        divergent: bool,
     },
     /// Prefill everything from position zero.
     Miss(MissReason),
@@ -91,9 +103,21 @@ impl CacheDecision {
     #[must_use]
     pub fn reused(self) -> usize {
         match self {
-            Self::Hit { reuse } => reuse,
+            Self::Hit { reuse, .. } => reuse,
             Self::Miss(_) => 0,
         }
+    }
+
+    /// Whether reuse was capped by a token disagreement — `false` on a miss.
+    #[must_use]
+    pub fn divergent(self) -> bool {
+        matches!(
+            self,
+            Self::Hit {
+                divergent: true,
+                ..
+            }
+        )
     }
 
     /// The miss reason, or `None` on a hit.
@@ -149,21 +173,25 @@ impl PrefixCacheState {
 
     /// Decide what `tokens` may reuse. Pure, total, and infallible.
     ///
-    /// The rule is **not** a naive `tokens.starts_with(resident)`. Let
-    /// `reuse = min(resident.len(), tokens.len() - 1)`; it is a hit iff
-    /// `reuse > 0`, the session matches, and the two agree on `tokens[..reuse]`.
+    /// The rule (BR-2, amended 2026-08-10) is longest-common-prefix reuse. Let
+    /// `cap = min(resident.len(), tokens.len() - 1)` and `reuse` be the length
+    /// of the longest common prefix of `resident[..cap]` and `tokens[..cap]`;
+    /// it is a hit iff `reuse > 0` and the session matches, and the hit is
+    /// `divergent` iff `reuse < cap` — reuse stopped at a token disagreement,
+    /// not at the end of what there was to compare. KV at or past the first
+    /// disagreement is never reused: the comparison is over a contiguous head,
+    /// so it can never skip a disagreement.
     ///
-    /// The `- 1` is load-bearing. Sampling reads logits, and logits exist only
-    /// for a token actually decoded in the final batch. A prompt that exactly
-    /// equals the resident prefix (a retry, or a turn whose whole delta was
-    /// dropped) would otherwise reuse everything, decode an empty batch, and
-    /// sample from stale logits. Leaving one token to prefill keeps the batch
-    /// non-empty on every path.
+    /// The `- 1` in `cap` is load-bearing. Sampling reads logits, and logits
+    /// exist only for a token actually decoded in the final batch. A prompt
+    /// that exactly equals the resident prefix (a retry, or a turn whose whole
+    /// delta was dropped) would otherwise reuse everything, decode an empty
+    /// batch, and sample from stale logits. Leaving one token to prefill keeps
+    /// the batch non-empty on every path.
     ///
     /// It also makes a *shorter* agreeing prompt safe: the KV is truncated to
-    /// `reuse` and the surplus discarded. That is a rewind, not the "partial
-    /// reuse past a divergence point" BR-2 forbids — the comparison is over a
-    /// contiguous head, so it can never skip over a disagreement.
+    /// `reuse` and the surplus discarded. That is a rewind, not divergence —
+    /// nothing compared disagreed — so it is not marked `divergent`.
     #[must_use]
     pub fn probe(&mut self, session: &str, tokens: &[i32]) -> CacheDecision {
         let was_evicted = std::mem::take(&mut self.evicted);
@@ -180,14 +208,18 @@ impl PrefixCacheState {
         }
         // `tokens.len() - 1` without underflow: an empty prompt has nothing to
         // reuse and nothing to prefill, so it is a miss like any other.
-        let reuse = self.tokens.len().min(tokens.len().saturating_sub(1));
+        let cap = self.tokens.len().min(tokens.len().saturating_sub(1));
+        let reuse = self.tokens[..cap]
+            .iter()
+            .zip(&tokens[..cap])
+            .take_while(|(resident, incoming)| resident == incoming)
+            .count();
         if reuse == 0 {
             return CacheDecision::Miss(MissReason::Divergent);
         }
-        if self.tokens[..reuse] == tokens[..reuse] {
-            CacheDecision::Hit { reuse }
-        } else {
-            CacheDecision::Miss(MissReason::Divergent)
+        CacheDecision::Hit {
+            reuse,
+            divergent: reuse < cap,
         }
     }
 
@@ -241,7 +273,10 @@ mod tests {
         let mut state = populated("s1", &[1, 2, 3]);
         assert_eq!(
             state.probe("s1", &[1, 2, 3, 4, 5]),
-            CacheDecision::Hit { reuse: 3 }
+            CacheDecision::Hit {
+                reuse: 3,
+                divergent: false
+            }
         );
     }
 
@@ -251,27 +286,72 @@ mod tests {
     fn an_identical_prompt_still_leaves_one_token_to_prefill() {
         let mut state = populated("s1", &[1, 2, 3]);
         let decision = state.probe("s1", &[1, 2, 3]);
-        assert_eq!(decision, CacheDecision::Hit { reuse: 2 });
+        assert_eq!(
+            decision,
+            CacheDecision::Hit {
+                reuse: 2,
+                divergent: false
+            }
+        );
         assert!(decision.reused() < 3, "the suffix must never be empty");
     }
 
     /// A prompt shorter than the resident prefix is a rewind, not a divergence:
-    /// the surplus KV is truncated away.
+    /// the surplus KV is truncated away and nothing compared disagreed.
     #[test]
     fn a_shorter_agreeing_prompt_rewinds_rather_than_diverging() {
         let mut state = populated("s1", &[1, 2, 3, 4, 5]);
         assert_eq!(
             state.probe("s1", &[1, 2, 3]),
-            CacheDecision::Hit { reuse: 2 }
+            CacheDecision::Hit {
+                reuse: 2,
+                divergent: false
+            }
         );
     }
 
+    /// BR-2 as amended: a mid-stream disagreement reuses the common head —
+    /// never anything at or past the first disagreeing position — and is
+    /// marked `divergent` so history rewrites stay measurable.
     #[test]
-    fn a_divergent_prompt_misses_with_the_divergent_reason() {
+    fn a_mid_stream_divergence_reuses_the_common_prefix_and_is_marked() {
         let mut state = populated("s1", &[1, 2, 3]);
         assert_eq!(
             state.probe("s1", &[1, 2, 9, 4]),
-            CacheDecision::Miss(MissReason::Divergent)
+            CacheDecision::Hit {
+                reuse: 2,
+                divergent: true
+            }
+        );
+    }
+
+    /// The motivating case (architecture L-1): the resident prefix carries a
+    /// fabricated tail the harness cut, and the next prompt continues from the
+    /// kept portion. The kept head is reused; the fabricated tail is not.
+    #[test]
+    fn a_fabrication_cut_turn_reuses_the_kept_head() {
+        let mut state = populated("s1", &[1, 2, 3, 7, 8, 9]);
+        assert_eq!(
+            state.probe("s1", &[1, 2, 3, 4, 5]),
+            CacheDecision::Hit {
+                reuse: 3,
+                divergent: true
+            }
+        );
+    }
+
+    /// A disagreement at or past the `-1` cap is not divergence: those
+    /// positions are prefilled regardless, so reuse was capped by prompt
+    /// length, not by the disagreement.
+    #[test]
+    fn a_disagreement_beyond_the_cap_is_not_divergence() {
+        let mut state = populated("s1", &[1, 2, 3]);
+        assert_eq!(
+            state.probe("s1", &[1, 9]),
+            CacheDecision::Hit {
+                reuse: 1,
+                divergent: false
+            }
         );
     }
 
@@ -335,15 +415,29 @@ mod tests {
         state.record("s1", vec![1, 2, 3, 4]);
         assert_eq!(
             state.probe("s1", &[1, 2, 3, 4, 5]),
-            CacheDecision::Hit { reuse: 4 }
+            CacheDecision::Hit {
+                reuse: 4,
+                divergent: false
+            }
         );
     }
 
     #[test]
     fn decision_accessors_agree_with_the_variant() {
-        assert_eq!(CacheDecision::Hit { reuse: 7 }.reused(), 7);
-        assert_eq!(CacheDecision::Hit { reuse: 7 }.miss_reason(), None);
+        let hit = CacheDecision::Hit {
+            reuse: 7,
+            divergent: false,
+        };
+        assert_eq!(hit.reused(), 7);
+        assert_eq!(hit.miss_reason(), None);
+        assert!(!hit.divergent());
+        assert!(CacheDecision::Hit {
+            reuse: 7,
+            divergent: true
+        }
+        .divergent());
         assert_eq!(CacheDecision::Miss(MissReason::Cold).reused(), 0);
+        assert!(!CacheDecision::Miss(MissReason::Cold).divergent());
         assert_eq!(
             CacheDecision::Miss(MissReason::Cold).miss_reason(),
             Some(MissReason::Cold)

@@ -824,7 +824,14 @@ over five minutes of wall time, most of it redundant prefill.
 4. Record, from the daemon log and the `prefix_cache` events:
    - context create/destroy cycles for the session (the 211-cycle number's
      successor);
-   - per-turn `cached_tokens` and `new_tokens` on each `prefix_cache_hit`;
+   - per-turn `cached_tokens`, `new_tokens` and `divergent` on each
+     `prefix_cache_hit`. A `divergent: true` hit is a turn whose history was
+     rewritten mid-stream — on a weak model that is usually a BUG-147
+     fabrication cut — reusing the kept head and re-prefilling the tail (BR-2
+     as amended 2026-08-10). A fabricating session should show divergent
+     *hits* with non-zero `cached_tokens`, not `divergent` *misses*; a run
+     full of `divergent` misses means the pre-amendment all-or-nothing rule is
+     somehow back;
    - wall time for the whole session, against the >5 minute baseline.
 5. Confirm correctness alongside the latency: the answers must be coherent
    across turns. A cache bug that reuses a wrong offset shows up as an
