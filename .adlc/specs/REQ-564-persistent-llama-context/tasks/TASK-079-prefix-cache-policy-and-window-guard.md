@@ -1,7 +1,7 @@
 ---
 id: TASK-079
 title: "Pure prefix-cache policy module and the shared over-window guard"
-status: draft
+status: complete
 parent: REQ-564
 created: 2026-08-10
 updated: 2026-08-10

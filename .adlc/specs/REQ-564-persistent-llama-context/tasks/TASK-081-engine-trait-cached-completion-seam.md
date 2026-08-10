@@ -1,7 +1,7 @@
 ---
 id: TASK-081
 title: "Engine trait: complete_cached + evict_prefix_cache seam"
-status: draft
+status: complete
 parent: REQ-564
 created: 2026-08-10
 updated: 2026-08-10

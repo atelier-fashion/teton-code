@@ -1,7 +1,7 @@
 ---
 id: TASK-085
 title: "Acceptance suite across the nine ACs, plus the dogfood measurement"
-status: draft
+status: complete
 parent: REQ-564
 created: 2026-08-10
 updated: 2026-08-10

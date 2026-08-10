@@ -214,6 +214,61 @@ KV, because CI never builds the FFI. The task list requires a dogfood
 measurement (context create/destroy count over a multi-turn session) as the
 evidence for that claim, not a green pipeline.
 
+## Known limitations, found at verify
+
+Recorded rather than quietly shipped. None is a correctness defect; each is a
+place where the shipped behavior is narrower than a reader of the spec would
+assume.
+
+### L-1: a turn whose fabricated tail was cut will miss — and that is the common case
+
+The KV holds every token the model **decoded**. The context holds what the
+harness **kept**. Those differ exactly when BUG-147's `ReplyScanner` cuts a
+fabricated continuation: the model ran on inventing tool results and future
+turns, all of it decoded into the KV, and `context_cut` dropped it before it
+reached context. The next turn's prompt therefore diverges from the resident
+prefix at that point, and BR-2 mandates a full cold prefill.
+
+So the cache serves well-behaved turns and misses fabricating ones — and
+fabricating turns are precisely what the REQ's motivating measurement was full
+of (an 11-generation loop on a weak local model). **The optimization is likely
+to help least on the workload that motivated it.**
+
+This is not a bug: it is BR-2 implemented as written ("Any divergence … falls
+back to a full cold prefill from position zero; never partial reuse past a
+divergence point"). The fix is a **spec** decision, not a code one. Reusing the
+longest common prefix — reuse *up to* the divergence, never past it — would
+recover this case and is arguably what "prefix cache" ought to mean, but it
+contradicts the sentence above, so it is not something to slip in under an
+implementation task. Recommend revisiting BR-2 before measuring the dogfood
+result, since the measurement will otherwise look disappointing for a reason
+that has nothing to do with the mechanism.
+
+### L-2: session end does not evict
+
+The spec's Events table lists "session end" as a `prefix_cache_evicted`
+trigger. No business rule requires it and none of the ACs test it, and there is
+no session-lifecycle hook to hang it off — REQ-565 is actively reworking daemon
+and session lifetime, so adding one here would collide. The resident prefix
+therefore outlives its session until another session takes the slot or the
+engine unloads. No cross-session read is possible (the probe keys on session id
+and reports `session_switch`), so this is a residency question, not a leak.
+
+### L-3: a duty transiently doubles resident KV
+
+Stated in D-4 and repeated here so it is not lost: with the agent's context
+resident, a duty allocates its own, so peak KV during a duty is two contexts
+(~1.5 GiB each at `n_ctx` 16384) rather than one. Bounded and transient, with
+eviction as the compensating control. Sizing duty contexts to their own much
+smaller budgets is the follow-up; it is deferred because a second `n_ctx`
+currency is the two-numbers trap LESSON-446 names.
+
+### L-4: eviction has no automatic trigger
+
+D-7 already records this: `PressureController` is exported but unconsumed, so
+`evict_prefix_cache` today has no production caller. The seam is built and
+tested; wiring it is the separate REQ it already was.
+
 ## Proposed addition to `.adlc/context/architecture.md`
 
 > **Policy is pure, mechanism is gated** — when a subsystem's interesting logic

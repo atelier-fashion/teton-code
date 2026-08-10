@@ -1,7 +1,7 @@
 ---
 id: TASK-082
 title: "LlamaEngine: model-owning thread, resident context, suffix-only prefill"
-status: draft
+status: complete
 parent: REQ-564
 created: 2026-08-10
 updated: 2026-08-10

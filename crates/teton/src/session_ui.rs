@@ -1332,6 +1332,80 @@ mod tests {
         assert!(surface.any_line_contains(LineKind::Notice, "user override"));
     }
 
+    /// REQ-564: prefix-cache outcomes are verbose-only diagnostic chrome. A
+    /// user who did not ask has nothing to act on — BR-1 makes reuse
+    /// unobservable in output — so a quiet session must stay quiet.
+    #[test]
+    fn a_prefix_cache_event_is_silent_unless_verbose() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let event = || {
+            envelope(Event::PrefixCache(PrefixCache {
+                model: "qwen2.5-coder-3b".to_owned(),
+                outcome: PrefixCacheOutcome::Hit {
+                    cached_tokens: 15_000,
+                    new_tokens: 84,
+                },
+            }))
+        };
+
+        let outcome = render_event(&event(), &mut surface, &mut state);
+        assert!(matches!(outcome, EventOutcome::Rendered));
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "a non-verbose session must not narrate cache hits"
+        );
+
+        state.verbose = true;
+        render_event(&event(), &mut surface, &mut state);
+        assert!(surface.any_line_contains(LineKind::Notice, "15000"));
+        assert!(surface.any_line_contains(LineKind::Notice, "84"));
+    }
+
+    /// Every miss reason renders its own sentence. Folding them into one
+    /// "cache miss" line would hide the difference between "history was
+    /// rewritten" and "another session took the slot" — the two a user chasing
+    /// a slow turn most needs to tell apart (BR-8).
+    #[test]
+    fn each_miss_reason_renders_a_distinguishable_sentence() {
+        let mut rendered = Vec::new();
+        for reason in [
+            PrefixCacheMiss::Cold,
+            PrefixCacheMiss::SessionSwitch,
+            PrefixCacheMiss::Divergent,
+            PrefixCacheMiss::Evicted,
+        ] {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.verbose = true;
+            render_event(
+                &envelope(Event::PrefixCache(PrefixCache {
+                    model: "qwen2.5-coder-3b".to_owned(),
+                    outcome: PrefixCacheOutcome::Miss {
+                        reason,
+                        processed_tokens: 2_048,
+                    },
+                })),
+                &mut surface,
+                &mut state,
+            );
+            let line = surface
+                .lines_of(LineKind::Notice)
+                .first()
+                .map(|text| (*text).to_owned())
+                .expect("a verbose miss renders a line");
+            assert!(line.contains("2048"), "the line names the prefilled count");
+            rendered.push(line);
+        }
+        rendered.sort();
+        rendered.dedup();
+        assert_eq!(
+            rendered.len(),
+            4,
+            "two miss reasons rendered the same sentence: {rendered:?}"
+        );
+    }
+
     #[test]
     fn a_proposal_is_claimed_once_so_the_late_attach_path_cannot_double_prompt() {
         let mut state = SessionState::new();
