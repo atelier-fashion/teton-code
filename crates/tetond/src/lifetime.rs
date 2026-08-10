@@ -361,8 +361,23 @@ impl LifetimeSupervisor {
 
     /// Resolves once the daemon has committed to exiting.
     ///
-    /// Checks the flag before and after registering interest so a commit that
-    /// lands between the two cannot be missed.
+    /// The flag is checked *around* the creation of the `Notified` future, and
+    /// the ordering is load-bearing: a commit landing between the two checks is
+    /// still delivered, because tokio guarantees a `Notified` receives wakeups
+    /// from **`notify_waiters()` as soon as it is created**, even before it is
+    /// first polled.
+    ///
+    /// That guarantee is specific to `notify_waiters()`. `notify_one()` makes
+    /// the weaker promise — an unpolled future may miss it — so switching
+    /// [`Self::commit`] to `notify_one()` would silently turn this into a
+    /// daemon that never learns it is supposed to exit. If that ever becomes
+    /// necessary, this needs `tokio::pin!` + `Notified::enable()` before the
+    /// second check.
+    ///
+    /// The `committed` flag is what makes a *late* waiter work at all:
+    /// `notify_waiters()` wakes only those already waiting and keeps no permit,
+    /// so a caller arriving after the commit is served by the flag, never by
+    /// the notification.
     pub async fn wait_for_shutdown(&self) {
         loop {
             if self.is_committed() {

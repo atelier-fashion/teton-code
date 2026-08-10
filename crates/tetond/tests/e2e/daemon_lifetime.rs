@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use super::harness::{Daemon, DaemonOptions, Workspace};
+use super::harness::{openai_turn, Daemon, DaemonOptions, MockProvider, MockResponse, Workspace};
 
 /// How long a daemon is given to notice it is idle and go. Generous for CI, but
 /// finite: a test that passed by waiting forever would assert nothing.
@@ -69,9 +69,12 @@ fn ac1_the_daemon_exits_cleanly_when_its_only_client_leaves() {
     );
 
     let log = daemon.log();
+    // `daemon_shutdown (` with the paren, not a bare prefix: `daemon_shutdown`
+    // is also the start of `daemon_shutdown_armed` and `_deferred`, so the
+    // loose form would pass against a daemon that armed and never left.
     assert!(
-        log.contains("daemon_shutdown"),
-        "the shutdown must be reported; log:\n{log}"
+        log.contains("daemon_shutdown ("),
+        "the exit itself must be reported, not just the arming; log:\n{log}"
     );
     assert!(
         log.contains("last_client"),
@@ -178,36 +181,74 @@ fn ac3_a_turn_in_flight_defers_the_exit_until_it_completes() {
     );
 }
 
-/// The ledger half of AC-3, at the layer that can actually show it.
+/// The ledger half of AC-3, asserted on an actual row.
 ///
-/// A turn's cost row is written by `record_call` inside the turn. Before this
-/// REQ, client teardown called `task.abort()` on in-flight turns, so a turn
-/// killed mid-flight never reached that call and its row was lost. The fix is
-/// that teardown now *awaits* the turn instead — asserted here by the turn
-/// reaching its natural end after its client is gone, which is the only way the
-/// row can exist at all.
+/// This is the claim the REQ turns on: *"the ledger row for that turn is
+/// intact"*. Before this change, client teardown called `task.abort()` on
+/// in-flight prompt turns, killing the turn at whatever await point it had
+/// reached — so it never reached its `record_call` and the row was simply lost.
+/// The statement was false.
+///
+/// A real (mock) remote provider is used rather than the scripted local engine
+/// because only a priced remote call produces a cost row at all; a scripted
+/// turn records nothing, so it could never distinguish the fix from the bug.
+///
+/// A second client stays attached throughout. That is what makes the assertion
+/// possible — someone has to be able to *ask* — and it isolates the property
+/// under test: this is about the first client's teardown not killing its turn,
+/// not about the daemon's exit, which the test above covers.
 #[test]
-fn ac3_a_disconnect_no_longer_kills_the_turn_that_writes_the_row() {
-    let (workspace, script) = workspace("ac3b");
-    let mut daemon = spawn(&workspace, &script);
+fn ac3_a_disconnect_no_longer_kills_the_turn_that_writes_its_ledger_row() {
+    let provider = MockProvider::start(
+        vec![MockResponse::ok(openai_turn("done", None, 100, 20))],
+        MockResponse::ok(openai_turn("done", None, 100, 20)),
+    );
 
-    let mut client = daemon.connect();
-    let session = client.create_session("freeform", None);
-    client.prompt_no_wait(&session, "hello");
-    drop(client);
+    let workspace = Workspace::new("ac3b");
+    workspace.write_config(&format!(
+        "default_provider = \"mock\"\n\n\
+         [[providers]]\nid = \"mock\"\nkind = \"openai-compatible\"\n\
+         endpoint = \"{}\"\nmodel = \"deepseek-chat\"\n\n",
+        provider.openai_endpoint()
+    ));
+    let script = workspace.write_script("ok\n");
+    let daemon = spawn(&workspace, &script);
+
+    // The observer, attached first so the daemon cannot exit when the worker
+    // leaves — the exit path is a different test's concern.
+    let mut observer = daemon.connect();
+
+    let mut worker = daemon.connect();
+    let session = worker.create_session("freeform", None);
+    worker.prompt_no_wait(&session, "hello");
+    // Leave while the turn is still executing. Under the old `abort()` teardown
+    // this is precisely where the turn died and its row was lost.
+    drop(worker);
+
+    // Poll: the turn finishes after its client is gone, so there is no response
+    // to wait on — the row appearing is the only signal.
+    let deadline = std::time::Instant::now() + EXIT_WINDOW;
+    let mut calls = 0;
+    while std::time::Instant::now() < deadline {
+        calls = observer.cost_query()["total_calls"].as_u64().unwrap_or(0);
+        if calls > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     assert!(
-        daemon.wait_for_exit(EXIT_WINDOW).is_some(),
-        "the daemon must exit; log:\n{}",
+        calls > 0,
+        "the turn's cost row must survive its client disconnecting mid-turn — \
+         this is AC-3's ledger claim, and it was false before the teardown \
+         stopped aborting in-flight turns; log:\n{}",
         daemon.log()
     );
 
-    let log = daemon.log();
-    // The abandonment path logs loudly when it fires. Its absence is the claim:
-    // the turn was waited for, not abandoned.
     assert!(
-        !log.contains("did not finish within"),
-        "the turn must have been awaited to completion, not abandoned; log:\n{log}"
+        !daemon.log().contains("did not finish within"),
+        "the turn must have been awaited to completion, not abandoned; log:\n{}",
+        daemon.log()
     );
 }
 
