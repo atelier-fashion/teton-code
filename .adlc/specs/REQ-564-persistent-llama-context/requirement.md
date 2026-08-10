@@ -108,7 +108,8 @@ full cold prefill.
 ## Acceptance Criteria
 
 - [x] AC-1 (scripted; real-model leg is the dogfood run in
-  `docs/manual-verification.md`, NOT RUN): In a scripted 5-turn agent session (e2e harness, scripted engine or
+  `docs/manual-verification.md`, RUN 2026-08-10 — 83.9% of prompt tokens
+  served from KV, 2 context creations vs the 211-cycle baseline): In a scripted 5-turn agent session (e2e harness, scripted engine or
   real small model), turns 2–5 each emit `prefix_cache_hit` and prefill only
   the suffix: instrumented processed-token counts equal the per-turn delta,
   not the full prompt length.
