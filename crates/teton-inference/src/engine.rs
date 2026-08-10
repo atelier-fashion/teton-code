@@ -6,6 +6,8 @@
 //! so that default builds and CI never pull in llama.cpp or cmake (see the crate
 //! docs). The daemon selects the backend at runtime.
 
+use crate::prefix_cache::MissReason;
+
 /// Parameters for a single completion request.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GenParams {
@@ -36,6 +38,72 @@ pub struct Completion {
     pub prompt_tokens: u32,
     /// Tokens generated.
     pub completion_tokens: u32,
+    /// Prompt tokens whose KV was reused from the resident prefix (REQ-564
+    /// BR-9). Always `0` on the cold path, which is every path except
+    /// [`Engine::complete_cached`] against a cache-bearing engine.
+    ///
+    /// The *processed* count is deliberately not stored: it is
+    /// `prompt_tokens - cached_tokens` and nothing else. Two stored counts that
+    /// must sum to a third is a drift surface (LESSON-446) — derive it with
+    /// [`Completion::processed_tokens`].
+    pub cached_tokens: u32,
+    /// Why the prefix cache did not serve this completion, or `None` on a hit.
+    ///
+    /// A cold path reports [`MissReason::Cold`]; `None` means "reused", never
+    /// "unknown". An engine *error* is never expressed here — it is an `Err`
+    /// (BR-8).
+    pub cache_miss: Option<MissReason>,
+}
+
+impl Completion {
+    /// A cold completion of `text`: nothing reused, miss reason `Cold`.
+    ///
+    /// The single constructor every non-caching engine uses, so the two new
+    /// REQ-564 fields cannot drift apart across implementors.
+    #[must_use]
+    pub fn cold(text: String, prompt_tokens: u32, completion_tokens: u32) -> Self {
+        Self {
+            text,
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens: 0,
+            cache_miss: Some(MissReason::Cold),
+        }
+    }
+
+    /// Prompt tokens this completion actually had to prefill.
+    #[must_use]
+    pub fn processed_tokens(&self) -> u32 {
+        self.prompt_tokens.saturating_sub(self.cached_tokens)
+    }
+}
+
+/// The typed refusal for a prompt that cannot fit the engine's window, or
+/// `None` when it fits.
+///
+/// **One expression, every path** (BR-7, LESSON-491). llama.cpp enforces its
+/// limits with `GGML_ASSERT` — an `abort()`, not a catchable error — so an
+/// over-window prompt would take down the whole daemon process, as the first
+/// dogfooded over-window turn did (LESSON-444). Prefix reuse changes how many
+/// tokens must be *decoded*; it does not change how many must *fit*, because
+/// the KV still has to hold the entire prompt. So the guard measures the full
+/// tokenized prompt and runs ahead of the cache probe, and the cached and cold
+/// paths are guarded by this one function rather than by two copies that can
+/// drift.
+///
+/// Free-standing and feature-free on purpose: the scripted test engines call
+/// the same function the real engine does, so the acceptance suite cannot pass
+/// against a laxer guard than production runs (AC-8).
+#[must_use]
+pub fn over_window(prompt_tokens: u32, n_ctx: u32, max_tokens: u32) -> Option<EngineError> {
+    let budget = n_ctx.saturating_sub(max_tokens);
+    if prompt_tokens > budget {
+        return Some(EngineError::Backend(format!(
+            "prompt of {prompt_tokens} tokens exceeds this engine's window \
+             ({budget} = {n_ctx} context minus {max_tokens} generation)"
+        )));
+    }
+    None
 }
 
 /// A failure from the local inference tier.
@@ -142,6 +210,40 @@ pub trait Engine: Send {
         params: &GenParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion, EngineError>;
+
+    /// Generate a completion that may reuse `session`'s resident KV prefix
+    /// (REQ-564).
+    ///
+    /// This is the **agent-turn** entry point, and the only one that carries a
+    /// cache key. Duty calls (`summarize`, `classify`, `triage`, `shell`,
+    /// `compact`, redaction) keep calling [`Engine::complete`], which is why
+    /// BR-5 holds structurally rather than by discipline: a duty has no way to
+    /// name a session, so it cannot evict the agent's prefix even by mistake.
+    /// OQ-1 resolved this as cold-per-duty.
+    ///
+    /// Defaulted to a cold delegation, so every engine that does not cache —
+    /// [`MockEngine`], the scripted and gated test doubles — keeps working
+    /// unchanged and honestly reports [`MissReason::Cold`].
+    ///
+    /// # Errors
+    /// As [`Engine::complete`]. A cache miss is **not** an error: it is a
+    /// successful completion whose `cache_miss` field names the reason (BR-8).
+    fn complete_cached(
+        &mut self,
+        _session: &str,
+        prompt: &str,
+        params: &GenParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Completion, EngineError> {
+        self.complete(prompt, params, on_token)
+    }
+
+    /// Drop any resident KV prefix (REQ-564 BR-4).
+    ///
+    /// Must never fail a subsequent turn — the next completion cold-prefills
+    /// and reports [`MissReason::Evicted`] so the drop is visible rather than
+    /// silent. Defaulted to a no-op for engines that hold no cache.
+    fn evict_prefix_cache(&mut self, _reason: crate::prefix_cache::EvictionReason) {}
 
     /// The prompt-rendering family this engine expects.
     ///
@@ -272,11 +374,7 @@ impl Engine for MockEngine {
             }
         }
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
-        Ok(Completion {
-            text,
-            prompt_tokens,
-            completion_tokens,
-        })
+        Ok(Completion::cold(text, prompt_tokens, completion_tokens))
     }
 
     fn chat_format(&self) -> ChatFormat {
@@ -683,6 +781,68 @@ pub use llama::LlamaEngine;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guard's boundary, pinned exactly: a prompt *at* the budget is
+    /// allowed and one token past it is refused. An off-by-one in the
+    /// permissive direction here is a `GGML_ASSERT` process abort, not a bad
+    /// answer (LESSON-444).
+    #[test]
+    fn the_window_guard_admits_the_budget_and_refuses_one_past_it() {
+        // 16384 context minus 512 generation leaves a 15872-token budget.
+        assert!(over_window(15872, 16384, 512).is_none());
+        let refusal = over_window(15873, 16384, 512).expect("one past the budget is refused");
+        let message = refusal.to_string();
+        assert!(message.contains("15873"), "names the offending size");
+        assert!(message.contains("15872"), "names the budget");
+        assert!(message.contains("16384"), "names the context");
+        assert!(message.contains("512"), "names the generation reserve");
+    }
+
+    /// A `max_tokens` larger than the whole window saturates to a zero budget
+    /// rather than wrapping to a huge one — the wrap would admit every prompt.
+    #[test]
+    fn the_window_guard_saturates_when_generation_exceeds_the_context() {
+        assert!(over_window(0, 512, 4096).is_none());
+        assert!(over_window(1, 512, 4096).is_some());
+    }
+
+    /// `processed_tokens` is derived, never stored, so it cannot disagree with
+    /// the two counts it is computed from (LESSON-446).
+    #[test]
+    fn processed_tokens_is_the_uncached_remainder() {
+        let mut completion = Completion::cold("hi".to_owned(), 100, 5);
+        assert_eq!(completion.processed_tokens(), 100);
+        assert_eq!(completion.cached_tokens, 0);
+        assert_eq!(completion.cache_miss, Some(MissReason::Cold));
+
+        completion.cached_tokens = 80;
+        assert_eq!(completion.processed_tokens(), 20);
+    }
+
+    /// The trait default is a *cold* completion, not a silent pretend-hit: an
+    /// engine with no cache must say so rather than report `None` (BR-8).
+    #[test]
+    fn the_default_cached_completion_reports_a_cold_miss() {
+        let mut engine = MockEngine::new("mock-3b");
+        let completion = engine
+            .complete_cached("session-1", "hello there", &GenParams::default(), &mut |_| {
+                true
+            })
+            .expect("the default delegates to complete");
+        assert_eq!(completion.cached_tokens, 0);
+        assert_eq!(completion.cache_miss, Some(MissReason::Cold));
+    }
+
+    /// Evicting an engine that holds no cache is a no-op, not a panic — BR-4's
+    /// "a dropped cache must never fail a turn" starts here.
+    #[test]
+    fn evicting_a_cacheless_engine_is_harmless() {
+        let mut engine = MockEngine::new("mock-3b");
+        engine.evict_prefix_cache(crate::prefix_cache::EvictionReason::MemoryPressure);
+        assert!(engine
+            .complete("still works", &GenParams::default(), &mut |_| true)
+            .is_ok());
+    }
 
     #[test]
     fn mock_streams_tokens_and_counts_them() {

@@ -17,6 +17,9 @@
 //!   ([`Downloader`]) with progress events.
 //! - [`benchmark`] — the post-download micro-benchmark and auto-step-down
 //!   ([`benchmark_with_step_down`]) that enforces the BR-8 latency duty.
+//! - [`prefix_cache`] — the REQ-564 prefix-reuse *decision* ([`PrefixCacheState`]):
+//!   a pure, feature-free policy over token ids, kept apart from the gated
+//!   llama.cpp mechanism so CI can prove the rule it enforces.
 //! - [`pressure`] — the runtime memory-pressure watcher
 //!   ([`PressureController`]) that downgrades or unloads under load and reloads
 //!   on recovery.
@@ -38,6 +41,7 @@ pub mod download;
 pub mod engine;
 mod hash;
 pub mod lifecycle;
+pub mod prefix_cache;
 pub mod pressure;
 pub mod probe;
 
@@ -48,8 +52,10 @@ pub use benchmark::{
 pub use catalog::{Catalog, ModelEntry, TierBand};
 pub use download::{DownloadConfig, DownloadError, Downloader, RangeFetcher};
 pub use engine::{
-    detect_chat_format, ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine,
+    detect_chat_format, over_window, ChatFormat, Completion, Engine, EngineError, GenParams,
+    MockEngine,
 };
+pub use prefix_cache::{CacheDecision, EvictionReason, MissReason, PrefixCacheState};
 /// SHA-256 over files and byte slices — the integrity primitive behind BR-6.
 ///
 /// Re-exported (rather than the whole `hash` module made public) so the daemon's

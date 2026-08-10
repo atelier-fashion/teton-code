@@ -499,11 +499,7 @@ impl Engine for ScriptedFileEngine {
             }
         }
         let prompt_tokens = u32::try_from(prompt.split_whitespace().count()).unwrap_or(u32::MAX);
-        Ok(Completion {
-            text,
-            prompt_tokens,
-            completion_tokens,
-        })
+        Ok(Completion::cold(text, prompt_tokens, completion_tokens))
     }
 }
 
