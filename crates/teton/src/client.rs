@@ -122,6 +122,12 @@ pub struct Connection {
     writer: UnixStream,
     incoming: Receiver<Incoming>,
     next_id: i64,
+    /// The daemon build version this connection handshook with (REQ-565 BR-6).
+    ///
+    /// Kept on the connection rather than returned to each caller because the
+    /// skew warning belongs to *attaching*, and every command attaches through
+    /// `ensure_connected`. `None` until the handshake completes.
+    daemon_version: Option<String>,
 }
 
 impl Connection {
@@ -138,10 +144,18 @@ impl Connection {
             .name("teton-reader".to_owned())
             .spawn(move || reader_loop(reader_stream, &tx))?;
         Ok(Self {
+            daemon_version: None,
             writer: stream,
             incoming: rx,
             next_id: 1,
         })
+    }
+
+    /// The daemon build version this connection handshook with, once it has
+    /// (REQ-565 BR-6).
+    #[must_use]
+    pub fn daemon_version(&self) -> Option<&str> {
+        self.daemon_version.as_deref()
     }
 
     /// Perform the protocol-version handshake. No events precede it (the daemon
@@ -167,8 +181,17 @@ impl Connection {
                 if resp.id == id {
                     return match resp.error {
                         Some(err) => Err(explain_handshake_failure(err)),
-                        None => Ok(serde_json::from_value(resp.result.unwrap_or(Value::Null))
-                            .map_err(|e| stale_daemon_hint(HandshakeParams::METHOD, &e))?),
+                        None => {
+                            let result: HandshakeResult =
+                                serde_json::from_value(resp.result.unwrap_or(Value::Null))
+                                    .map_err(|e| stale_daemon_hint(HandshakeParams::METHOD, &e))?;
+                            // REQ-565 BR-6: remembered here so the build-skew
+                            // notice is derived from the handshake that actually
+                            // happened, rather than from a second query that
+                            // could reach a different daemon.
+                            self.daemon_version = Some(result.daemon_version.clone());
+                            Ok(result)
+                        }
                     };
                 }
             }
@@ -607,9 +630,21 @@ pub fn ensure_connected(
     paths: &DaemonPaths,
     surface: &mut dyn Surface,
 ) -> anyhow::Result<Connection> {
-    if let Ok(mut conn) = Connection::connect(&paths.socket) {
-        conn.handshake()?;
-        return Ok(conn);
+    // REQ-565 BR-3, client side. A daemon that has committed to exiting refuses
+    // the handshake rather than accepting a session it will not serve, and that
+    // refusal is **retryable** — the remedy is a successor, not an error. Every
+    // other handshake failure still propagates: a protocol mismatch cannot be
+    // fixed by starting another daemon from the same binary, and swallowing it
+    // into a spawn-retry would spin while hiding the one diagnosis that matters.
+    match connect_and_handshake(&paths.socket) {
+        Ok(Some(conn)) => {
+            report_build_skew(&conn, surface);
+            return Ok(conn);
+        }
+        // Unreachable, or reached-but-shutting-down: both mean "autostart a
+        // fresh one", which is what the rest of this function does.
+        Ok(None) => {}
+        Err(err) => return Err(err),
     }
 
     surface.line(LineKind::Info, "no daemon reachable — starting teton-code…");
@@ -617,6 +652,7 @@ pub fn ensure_connected(
 
     if let Some(conn) = poll_for_daemon(paths)? {
         surface.line(LineKind::Info, "daemon started.");
+        report_build_skew(&conn, surface);
         return Ok(conn);
     }
     // H-1 (E-4): the daemon we just spawned had no terminal, so whatever it said
@@ -648,16 +684,22 @@ pub fn ensure_connected_session(
     surface: &mut dyn Surface,
     prompter: &mut dyn Prompter,
 ) -> anyhow::Result<Connection> {
-    if let Ok(mut conn) = Connection::connect(&paths.socket) {
-        conn.handshake()?;
-        return Ok(conn);
+    match connect_and_handshake(&paths.socket) {
+        Ok(Some(conn)) => {
+            report_build_skew(&conn, surface);
+            return Ok(conn);
+        }
+        Ok(None) => {}
+        Err(err) => return Err(err),
     }
     if crate::service::offer_registration(paths, surface, prompter) {
         if let Some(conn) = poll_for_daemon(paths)? {
             surface.line(
                 LineKind::Info,
-                "daemon registered with launchd and started — it will survive reboots.",
+                "daemon registered with launchd and started — it will keep running when you \
+                 exit, and survive reboots.",
             );
+            report_build_skew(&conn, surface);
             return Ok(conn);
         }
         // launchd accepted the service but no socket appeared in time. The
@@ -673,18 +715,78 @@ pub fn ensure_connected_session(
     ensure_connected(paths, surface)
 }
 
+/// Connect and handshake, distinguishing "no usable daemon here" from a real
+/// failure (REQ-565).
+///
+/// - `Ok(Some(conn))` — attached.
+/// - `Ok(None)` — nothing to attach to *yet*: either the socket is absent, or a
+///   daemon answered but is shutting down. Both are resolved by a successor, so
+///   the caller autostarts or keeps polling.
+/// - `Err(_)` — a real failure the user must see, protocol mismatch above all.
+fn connect_and_handshake(socket: &Path) -> anyhow::Result<Option<Connection>> {
+    let Ok(mut conn) = Connection::connect(socket) else {
+        return Ok(None);
+    };
+    match conn.handshake() {
+        Ok(_) => Ok(Some(conn)),
+        Err(err) if is_shutting_down(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether a handshake failure is the daemon saying "I am on my way out".
+fn is_shutting_down(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RpcError>()
+        .is_some_and(|rpc| rpc.code == error_code::DAEMON_SHUTTING_DOWN)
+}
+
 /// Poll the socket until a daemon answers the handshake, or give up after
 /// [`POLL_ATTEMPTS`]. `Ok(None)` is "nobody came up", not an error — the
 /// caller owns the diagnostics for its own start path.
 fn poll_for_daemon(paths: &DaemonPaths) -> anyhow::Result<Option<Connection>> {
     for _ in 0..POLL_ATTEMPTS {
         thread::sleep(POLL_INTERVAL);
-        if let Ok(mut conn) = Connection::connect(&paths.socket) {
-            conn.handshake()?;
+        // A predecessor mid-teardown can still have the socket bound for a
+        // moment and will refuse the handshake. That is "keep polling", not
+        // "give up" — the successor we spawned is waiting on the same flock
+        // (see `tetond::single_instance::acquire_within`), so the next attempt
+        // reaches it.
+        if let Some(conn) = connect_and_handshake(&paths.socket)? {
             return Ok(Some(conn));
         }
     }
     Ok(None)
+}
+
+/// The build-skew sentence, or `None` when the two halves agree (BR-6/AC-7).
+///
+/// The check the *protocol* negotiation cannot make: two adjacent releases
+/// almost always speak the same protocol version, so a v0.1.12 daemon still
+/// serving after v0.1.13 was installed handshakes cleanly and says nothing —
+/// the exact harm REQ-565 was written for. The handshake has already succeeded
+/// by the time this runs, so it is a notice, never an error.
+///
+/// Pure and version-injected, so AC-7 is provable without a daemon, a socket, or
+/// a second build on disk. The *classification* lives in `teton-protocol`, which
+/// is transport-free and knows nothing about how a client is installed; the
+/// remedy sentence lives here, where that is known.
+fn build_skew_line(client_version: &str, daemon_version: &str) -> Option<String> {
+    let skew = handshake::build_skew(client_version, daemon_version)?;
+    Some(format!(
+        "this CLI is {} but the running daemon is {} — commands are being served by the older \
+         binary. Exit every teton session to stop it; the next one starts the new daemon.",
+        skew.client_version, skew.daemon_version
+    ))
+}
+
+/// Render [`build_skew_line`] for a freshly attached connection.
+fn report_build_skew(conn: &Connection, surface: &mut dyn Surface) {
+    let Some(daemon_version) = conn.daemon_version() else {
+        return;
+    };
+    if let Some(line) = build_skew_line(CLIENT_VERSION, daemon_version) {
+        surface.line(LineKind::Notice, &line);
+    }
 }
 
 /// How many bytes of the daemon log to quote back on an autostart failure.
@@ -938,6 +1040,9 @@ mod tests {
                 writer,
                 incoming: rx,
                 next_id: 1,
+                // No handshake happened on this fixture, so there is genuinely
+                // no daemon version to report (REQ-565).
+                daemon_version: None,
             },
             tx,
             peer,
@@ -1407,5 +1512,87 @@ mod tests {
         assert_eq!(resolve_daemon_binary(Some(&dir)), sibling);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Build-version skew — REQ-565 BR-6 / AC-7
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn matching_builds_say_nothing() {
+        assert_eq!(build_skew_line("0.1.13", "0.1.13"), None);
+    }
+
+    #[test]
+    fn a_stale_daemon_produces_one_line_naming_both_versions_and_the_remedy() {
+        let line = build_skew_line("0.1.13", "0.1.12").expect("a skew must be reported");
+        assert!(line.contains("0.1.13"), "{line}");
+        assert!(line.contains("0.1.12"), "{line}");
+        // The remedy has to be actionable: under exit-on-last-client, ending
+        // every session *is* how the old daemon stops.
+        assert!(line.contains("Exit every teton session"), "{line}");
+        assert_eq!(line.lines().count(), 1, "exactly one line: {line}");
+    }
+
+    /// The v0.1.12/v0.1.13 pairing REQ-565 cites: same protocol, so the
+    /// handshake succeeds and the existing protocol-skew check stays silent.
+    /// This notice is the only thing that speaks.
+    #[test]
+    fn the_notice_covers_the_case_the_protocol_check_cannot_see() {
+        assert!(
+            handshake::negotiate(
+                PROTOCOL_VERSION_MIN,
+                PROTOCOL_VERSION_MAX,
+                PROTOCOL_VERSION_MIN,
+                PROTOCOL_VERSION_MAX,
+            )
+            .is_ok(),
+            "the pairing under test must be one that negotiates cleanly"
+        );
+        assert!(build_skew_line("0.1.13", "0.1.12").is_some());
+    }
+
+    /// A daemon whose version we never learned (no completed handshake) must not
+    /// invent one — silence beats a fabricated comparison.
+    #[test]
+    fn a_connection_without_a_handshake_reports_no_version() {
+        assert_eq!(build_skew_line("0.1.13", "0.1.13"), None);
+        // And the accessor's default is genuinely absent, not an empty string
+        // that would compare unequal to every real version.
+        assert!(build_skew_line("", "0.1.13").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // The shutting-down refusal is retryable; nothing else is — REQ-565 BR-3
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn only_the_shutting_down_code_is_treated_as_retryable() {
+        let shutting_down = anyhow::Error::new(RpcError::new(
+            error_code::DAEMON_SHUTTING_DOWN,
+            "the daemon is shutting down",
+        ));
+        assert!(is_shutting_down(&shutting_down));
+
+        // A protocol mismatch must NOT be swallowed into a spawn-retry: another
+        // daemon from the same binary on disk cannot fix it, so retrying would
+        // spin while hiding the one diagnosis that matters.
+        let version = anyhow::Error::new(RpcError::new(
+            error_code::UNSUPPORTED_PROTOCOL_VERSION,
+            "no mutually supported protocol version",
+        ));
+        assert!(!is_shutting_down(&version));
+
+        for code in [
+            error_code::INVALID_PARAMS,
+            error_code::INTERNAL_ERROR,
+            error_code::UNKNOWN_SESSION,
+        ] {
+            let err = anyhow::Error::new(RpcError::new(code, "something else"));
+            assert!(!is_shutting_down(&err), "code {code} must not be retryable");
+        }
+
+        // A transport error carries no RpcError at all.
+        assert!(!is_shutting_down(&anyhow!("connection reset")));
     }
 }

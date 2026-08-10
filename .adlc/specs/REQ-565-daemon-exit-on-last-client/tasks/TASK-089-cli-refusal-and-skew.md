@@ -1,7 +1,7 @@
 ---
 id: TASK-089
 title: "CLI: retry a shutting-down daemon, warn on build skew, keep warm-up a notice"
-status: pending
+status: complete
 parent: REQ-565
 repo: teton-code
 created: 2026-08-10
