@@ -178,6 +178,148 @@ pub struct PreparedPrompt {
     pub messages: Vec<StructuredMessage>,
 }
 
+/// The egress provenance of blocks a context has **forgotten** — what the
+/// oldest-first drop took away (REQ-567 BR-3).
+///
+/// ## Why a forgotten block still has a say at the choke point
+///
+/// Compaction never loses provenance: the summary that stands in for the blocks
+/// it elides inherits their merged [`ToolProvenance`], so a paragraph describing
+/// a `local-only` file is still boundary-protected
+/// ([`ContextManager::compaction_summary`]). Truncation had no such inheritance
+/// — it removed the block outright — and that asymmetry is a hole rather than a
+/// simplification: a model paraphrase of a `local-only` read (or of an
+/// unknown-provenance `shell` result) can easily outlive the block that
+/// sourced it, in the assistant text right after it, in a summary, in the next
+/// prompt's carried conversation. With the block gone and nothing left to say
+/// where its content came from, `context_provenance` sees ordinary
+/// conversation and the choke point ships a boundary-derived paraphrase
+/// remote.
+///
+/// So the provenance of a dropped block **outlives the block**. It is sticky:
+/// nothing removes a path from here, because nothing can prove the content it
+/// justified is gone too. That is deliberately conservative — the cost of a
+/// stale entry is a session pinned local for longer than strictly necessary
+/// (REQ-544 C-2's own posture), and the cost of dropping one is a boundary
+/// crossed silently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DroppedProvenance {
+    /// Repo-relative paths the forgotten blocks' tools touched.
+    sources: BTreeSet<String>,
+    /// Whether any forgotten block carried [`ToolProvenance::Unknown`].
+    ///
+    /// Beside the set rather than replacing it, because "unknown" and "these
+    /// files" are both true at once: the egress [`Provenance`](crate::egress::Provenance)
+    /// carries the same pair, and collapsing them here would drop the named
+    /// files from a context that also holds a `shell` result.
+    unknown: bool,
+}
+
+impl DroppedProvenance {
+    /// Absorb one forgotten block's provenance. A non-tool block contributes
+    /// nothing — user and model text carries no file provenance of its own.
+    pub fn absorb(&mut self, provenance: &Provenance) {
+        let Provenance::Tool { provenance, .. } = provenance else {
+            return;
+        };
+        match provenance {
+            ToolProvenance::Sources(paths) => self.sources.extend(paths.iter().cloned()),
+            ToolProvenance::Unknown => self.unknown = true,
+        }
+    }
+
+    /// Absorb everything another accumulator holds — how a carried
+    /// conversation's forgotten provenance re-enters the next turn's manager.
+    pub fn merge(&mut self, other: &Self) {
+        self.sources.extend(other.sources.iter().cloned());
+        self.unknown |= other.unknown;
+    }
+
+    /// The paths forgotten blocks touched.
+    #[must_use]
+    pub fn sources(&self) -> &BTreeSet<String> {
+        &self.sources
+    }
+
+    /// Whether a forgotten block's touched files could not be determined.
+    #[must_use]
+    pub fn is_unknown(&self) -> bool {
+        self.unknown
+    }
+
+    /// Whether anything with egress provenance has been forgotten at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty() && !self.unknown
+    }
+}
+
+/// Everything one turn hands the next across a prompt boundary (REQ-567 BR-1).
+///
+/// Three facts travel together because all three are properties of the retained
+/// conversation that are **not inside its blocks**:
+///
+/// - the blocks themselves, as the harness kept them;
+/// - whether history has been dropped, so the honesty note
+///   (`[earlier conversation truncated …]`) survives past the turn that cut —
+///   a note that appeared for one turn and then vanished would tell the model
+///   the gap had been filled;
+/// - the [`DroppedProvenance`] of what was cut, so a boundary read that has
+///   since been truncated away still pins the session (BR-3).
+///
+/// One value rather than three arguments: a commit that carried the blocks and
+/// forgot either of the other two would be a silent downgrade at exactly the
+/// seam that is hardest to notice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedContext {
+    blocks: Vec<ContextBlock>,
+    truncated: bool,
+    dropped: DroppedProvenance,
+}
+
+impl RetainedContext {
+    /// A retained context that is nothing but blocks — the shape a test or a
+    /// hand-built fixture makes.
+    #[must_use]
+    pub fn from_blocks(blocks: Vec<ContextBlock>) -> Self {
+        Self {
+            blocks,
+            truncated: false,
+            dropped: DroppedProvenance::default(),
+        }
+    }
+
+    /// The retained blocks, in the order they happened.
+    #[must_use]
+    pub fn blocks(&self) -> &[ContextBlock] {
+        &self.blocks
+    }
+
+    /// The retained blocks, moved out.
+    #[must_use]
+    pub fn into_blocks(self) -> Vec<ContextBlock> {
+        self.blocks
+    }
+
+    /// Whether history has been dropped from this conversation.
+    #[must_use]
+    pub fn was_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The egress provenance of the blocks that were dropped.
+    #[must_use]
+    pub fn dropped_provenance(&self) -> &DroppedProvenance {
+        &self.dropped
+    }
+
+    /// Replace the blocks, keeping the truncation and provenance facts — what a
+    /// trim of incomplete work does (REQ-567 OQ-1).
+    pub fn set_blocks(&mut self, blocks: Vec<ContextBlock>) {
+        self.blocks = blocks;
+    }
+}
+
 /// One block of conversation context with its provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBlock {
@@ -234,6 +376,9 @@ pub struct ContextManager {
     budget_tokens: usize,
     budget_bytes: usize,
     truncated: bool,
+    /// The egress provenance of blocks this context has dropped — sticky, and
+    /// carried across prompt boundaries (REQ-567 BR-3, [`DroppedProvenance`]).
+    dropped: DroppedProvenance,
     compaction: CompactionGate,
     /// The request this manager's turn is serving — see
     /// [`ContextManager::request`].
@@ -375,6 +520,7 @@ impl ContextManager {
             budget_tokens,
             budget_bytes: budget_tokens.saturating_mul(APPROX_BYTES_PER_TOKEN),
             truncated: false,
+            dropped: DroppedProvenance::default(),
             compaction: CompactionGate::default(),
             request: String::new(),
         }
@@ -471,24 +617,70 @@ impl ContextManager {
         &self.blocks
     }
 
-    /// Move this manager's conversation blocks out — what the session registry
-    /// commits when the turn completes (REQ-567 D-1).
+    /// Move everything this turn hands the next one out (REQ-567 D-1): the
+    /// blocks, the truncation flag, and the provenance of what was dropped.
     ///
-    /// A move rather than a re-derivation, and that is the whole point: what this
-    /// manager holds at turn end **is** the retained view — model text as the
-    /// containment cut kept it (BUG-147), history as a mid-turn compaction
-    /// rewrote it (BR-4), tool results as they folded in. Anything that rebuilt
-    /// the conversation from the turn's events instead would be a second opinion
-    /// about what the harness kept, free to disagree with it.
+    /// ## A move, not a re-derivation
+    ///
+    /// What this manager holds at turn end **is** the retained view — model text
+    /// as the containment cut kept it (BUG-147), history as a mid-turn
+    /// compaction rewrote it (BR-4), tool results as they folded in. Anything
+    /// that rebuilt the conversation from the turn's events instead would be a
+    /// second opinion about what the harness kept, free to disagree with it.
     ///
     /// **The system head is excluded by construction**, which is what BR-7's
     /// cache-independence needs: the head was never a block. It is rebuilt per
     /// prompt from the current tools and route ([`ContextManager::new`]), so a
     /// mid-session head change re-renders the same conversation under the new
     /// head rather than carrying a fossil of the old one.
+    ///
+    /// ## Why it is not just the blocks
+    ///
+    /// A bare `Vec<ContextBlock>` was the commit for exactly as long as blocks
+    /// were the whole of the retained state, and they are not: the truncation
+    /// note and the [`DroppedProvenance`] are facts *about* the conversation
+    /// that no block carries, and a commit that shipped only the vector dropped
+    /// both at every prompt boundary — the note reappearing and vanishing turn
+    /// by turn, and a truncated-away `local-only` read losing the tag that pins
+    /// the session. There is deliberately no blocks-only exit beside this one:
+    /// two ways out is how one of them ends up carrying less than the other.
     #[must_use]
-    pub fn into_blocks(self) -> Vec<ContextBlock> {
-        self.blocks
+    pub fn into_retained(self) -> RetainedContext {
+        RetainedContext {
+            truncated: self.truncated,
+            dropped: self.dropped,
+            blocks: self.blocks,
+        }
+    }
+
+    /// Seed this manager from a committed conversation — the composite counterpart
+    /// of [`into_retained`](Self::into_retained), and what dispatch calls.
+    ///
+    /// It is [`replay_blocks`](Self::replay_blocks) plus the two facts that live
+    /// beside the blocks, restored together so that neither can be forgotten at
+    /// a call site:
+    ///
+    /// - **the truncation flag**, so the `[earlier conversation truncated]` note
+    ///   keeps appearing for the rest of the session. The note is an honesty
+    ///   statement about a gap that is still there; a note that showed up only
+    ///   on the turn where the cut happened would silently retract it on the
+    ///   next prompt.
+    /// - **the dropped provenance**, so a boundary read that was truncated away
+    ///   two prompts ago still reaches [`context_provenance`] and still pins the
+    ///   session (BR-3).
+    ///
+    /// Both are merged rather than assigned: a manager that has already
+    /// truncated this turn stays truncated, and the accumulator only ever grows.
+    pub fn replay(&mut self, retained: RetainedContext) {
+        self.truncated |= retained.truncated;
+        self.dropped.merge(&retained.dropped);
+        self.replay_blocks(retained.blocks);
+    }
+
+    /// The egress provenance of everything this context has forgotten (BR-3).
+    #[must_use]
+    pub fn dropped_provenance(&self) -> &DroppedProvenance {
+        &self.dropped
     }
 
     /// Append a committed conversation to this manager, before the new user
@@ -530,7 +722,7 @@ impl ContextManager {
     /// `System`-provenance block can only arrive from a hand-built vector, and
     /// replaying it would put a second, stale system prompt inside the
     /// conversation under the freshly built head. It is dropped.
-    pub fn replay_blocks(&mut self, blocks: Vec<ContextBlock>) {
+    fn replay_blocks(&mut self, blocks: Vec<ContextBlock>) {
         let request = std::mem::take(&mut self.request);
         for block in blocks {
             match block.provenance {
@@ -917,12 +1109,23 @@ impl ContextManager {
     /// context actually reached. Untouched when nothing has been compacted this
     /// turn — a `None` mark means the first compaction has yet to be bought, and
     /// nothing here should buy it.
+    ///
+    /// ## The block goes; its provenance does not (BR-3)
+    ///
+    /// Compaction folds every elided block's [`ToolProvenance`] into the summary
+    /// that replaces it, so a compacted `local-only` read is still boundary
+    /// protected. This method has no replacement block to inherit into, so it
+    /// absorbs the dropped provenance into the manager's sticky
+    /// [`DroppedProvenance`] instead — which [`context_provenance`] unions in.
+    /// Without it, dropping the block would launder every paraphrase of its
+    /// content that outlives it (see [`DroppedProvenance`]'s own doc).
     pub fn truncate_to_budget(&mut self) {
         while (self.estimated_tokens() > self.budget_tokens
             || self.estimated_bytes() > self.budget_bytes)
             && self.blocks.len() > 1
         {
-            self.blocks.remove(0);
+            let dropped = self.blocks.remove(0);
+            self.dropped.absorb(&dropped.provenance);
             self.truncated = true;
         }
         if self.estimated_bytes() > self.budget_bytes {
@@ -2765,7 +2968,7 @@ mod tests {
         ctx.push_user("what is in a.rs?");
         ctx.push_model("let me read it");
         ctx.push_tool_result("read", Some("a.rs".to_owned()), "fn main() {}");
-        ctx.into_blocks()
+        ctx.into_retained().into_blocks()
     }
 
     fn roles(ctx: &ContextManager) -> Vec<BlockRole> {
@@ -2838,7 +3041,7 @@ mod tests {
         let egress_before = context_provenance(&first);
 
         let mut second = ContextManager::new("A DIFFERENT HEAD", 10_000);
-        second.replay_blocks(first.into_blocks());
+        second.replay_blocks(first.into_retained().into_blocks());
 
         let after: Vec<Provenance> = second
             .blocks()
@@ -2895,7 +3098,7 @@ mod tests {
     fn a_system_head_is_neither_carried_nor_replayed() {
         let mut first = ContextManager::new("SYSTEM HEAD ONE", 10_000);
         first.push_user("hello");
-        let committed = first.into_blocks();
+        let committed = first.into_retained().into_blocks();
         assert!(committed
             .iter()
             .all(|b| b.provenance != Provenance::System && !b.text.contains("SYSTEM HEAD ONE")));
@@ -2935,7 +3138,7 @@ mod tests {
     /// truncation rather than to a panic or an over-window prompt.
     #[test]
     fn an_over_budget_replay_is_cut_by_the_hard_gate() {
-        let committed = conversation(5, 1_000).into_blocks();
+        let committed = conversation(5, 1_000).into_retained().into_blocks();
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
         ctx.replay_blocks(committed);
         ctx.push_user("and now the next prompt");
@@ -2959,12 +3162,140 @@ mod tests {
         assert!(ctx.assemble(&mut hook).contains("truncated"));
     }
 
+    /// **BR-3, the truncation hole.** The oldest-first drop takes the block; it
+    /// does not take the block's egress provenance with it.
+    ///
+    /// Compaction has always inherited provenance into the summary it leaves
+    /// behind. Truncation had nothing to inherit into, so a `local-only` read
+    /// dropped for budget stopped scoping the context — while everything derived
+    /// from it (the model's answer about it, a later summary, the next prompt's
+    /// carried conversation) stayed. The accumulator closes that: the block is
+    /// gone from `blocks()`, and `context_provenance` still names the file.
+    #[test]
+    fn truncation_keeps_the_provenance_of_the_blocks_it_drops() {
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
+        ctx.push_user("what is in the production config?");
+        ctx.push_tool_result(
+            "read",
+            Some("secrets/prod.env".to_owned()),
+            format!("API_KEY=1 {}", "x".repeat(1_000)),
+        );
+        ctx.push_model("It holds the production API key.");
+        for i in 0..4 {
+            ctx.push_tool_result("read", Some(format!("src/{i}.rs")), "x".repeat(1_000));
+        }
+        assert!(context_provenance(&ctx).contains("secrets/prod.env"));
+
+        ctx.truncate_to_budget();
+
+        assert!(
+            !ctx.blocks().iter().any(|b| b.text.contains("API_KEY=1")),
+            "fixture: the boundary block must actually have been dropped"
+        );
+        assert!(
+            ctx.dropped_provenance()
+                .sources()
+                .contains("secrets/prod.env"),
+            "the dropped block's provenance died with it"
+        );
+        assert!(
+            context_provenance(&ctx).contains("secrets/prod.env"),
+            "the choke point can no longer tell that this context is derived \
+             from a boundary file, so the paraphrase of it that survived the \
+             drop would egress"
+        );
+    }
+
+    /// An unknown-provenance result — a `shell` command — stays unknown after it
+    /// is dropped, and the known paths dropped alongside it are still named. The
+    /// two facts ride together because the egress scope carries both.
+    #[test]
+    fn a_dropped_unknown_result_still_fails_the_context_closed() {
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
+        ctx.push_tool_result("read", Some("src/lib.rs".to_owned()), "x".repeat(1_000));
+        ctx.push_tool_result_prov("shell", ToolProvenance::Unknown, "x".repeat(1_000));
+        for _ in 0..4 {
+            ctx.push_user("x".repeat(1_000));
+        }
+        ctx.truncate_to_budget();
+
+        assert!(ctx.dropped_provenance().is_unknown());
+        assert!(ctx.dropped_provenance().sources().contains("src/lib.rs"));
+        let prov = context_provenance(&ctx);
+        assert!(
+            prov.is_unknown(),
+            "a forgotten `shell` result still fails closed"
+        );
+        assert!(prov.contains("src/lib.rs"));
+    }
+
+    /// **BR-3 and the honesty note, across a prompt boundary.** Both facts a
+    /// conversation carries beside its blocks survive the commit/replay round
+    /// trip: the next turn still says history is missing, and still knows the
+    /// missing history came from a boundary file.
+    ///
+    /// A commit that shipped only the vector would retract the note on the next
+    /// prompt (telling the model the gap had been filled) and launder the
+    /// provenance (letting the paraphrase egress).
+    #[test]
+    fn a_commit_carries_the_truncation_note_and_the_dropped_provenance() {
+        let mut first =
+            ContextManager::new("HEAD ONE", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
+        first.push_tool_result(
+            "read",
+            Some("secrets/prod.env".to_owned()),
+            "x".repeat(1_000),
+        );
+        for _ in 0..5 {
+            first.push_user("x".repeat(1_000));
+        }
+        first.truncate_to_budget();
+        assert!(first.was_truncated());
+
+        let mut second =
+            ContextManager::new("HEAD TWO", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
+        second.replay(first.into_retained());
+        second.push_user("and now the next prompt");
+
+        assert!(
+            second.was_truncated(),
+            "the next turn stopped saying that history is missing"
+        );
+        let mut hook = NoopProvenanceHook;
+        assert!(second.assemble(&mut hook).contains("truncated"));
+        assert!(
+            context_provenance(&second).contains("secrets/prod.env"),
+            "the carried conversation lost the scope of what it had forgotten"
+        );
+    }
+
+    /// A conversation that never dropped anything carries neither fact — the
+    /// note is not printed and nothing is scoped by a forgotten block. Without
+    /// this the two assertions above would pass against an accumulator that
+    /// simply always said yes.
+    #[test]
+    fn an_untruncated_commit_carries_neither_fact() {
+        let mut first = ContextManager::new("HEAD", 10_000);
+        first.push_user("hello");
+        first.push_model("hi");
+        let retained = first.into_retained();
+        assert!(!retained.was_truncated());
+        assert!(retained.dropped_provenance().is_empty());
+
+        let mut second = ContextManager::new("HEAD", 10_000);
+        second.replay(retained);
+        assert!(!second.was_truncated());
+        let mut hook = NoopProvenanceHook;
+        assert!(!second.assemble(&mut hook).contains("truncated"));
+        assert!(context_provenance(&second).is_empty());
+    }
+
     /// And the soft gate ahead of it sees the carried conversation too: pressure
     /// built up across prompts buys a `compact` call exactly as pressure built up
     /// within one does, and the pair still lands under budget (ADR-4).
     #[tokio::test]
     async fn a_replayed_conversation_goes_through_the_compaction_gate() {
-        let committed = conversation(5, 1_000).into_blocks();
+        let committed = conversation(5, 1_000).into_retained().into_blocks();
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
         ctx.replay_blocks(committed);
         ctx.push_user("and now the next prompt");

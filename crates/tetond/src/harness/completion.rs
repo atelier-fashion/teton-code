@@ -42,7 +42,9 @@ use teton_providers::{
 use crate::cost::{CostAttribution, LocalUsageMeter};
 use crate::egress::{Egress, EgressContext, Provenance};
 
-use super::context::{ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance};
+use super::context::{
+    ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance, ToolProvenance,
+};
 use super::digest::tool_result_provenance;
 use super::render;
 use super::reply::{parse_reply, ParsedTurn, ReplyScanner};
@@ -535,6 +537,17 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
 /// The remote source hands the result to [`Egress::scoped`], so a turn whose
 /// context touched a `local-only` file — or ran an unparseable shell command — is
 /// blocked before a byte leaves.
+///
+/// ## Forgotten blocks are counted too (REQ-567 BR-3)
+///
+/// The union is over the blocks the context *holds* **plus** the
+/// [`DroppedProvenance`](super::context::DroppedProvenance) of the ones
+/// `truncate_to_budget` took away. A dropped block's content routinely outlives
+/// it — in the model text right after it, in a compaction summary, in the next
+/// prompt's carried conversation — and a scope computed from surviving blocks
+/// alone would call that content ordinary conversation and let it egress. So a
+/// `local-only` read that has since been truncated away still scopes this
+/// context, and an unknown-provenance `shell` result still fail-closes it.
 #[must_use]
 pub fn context_provenance(ctx: &ContextManager) -> Provenance {
     let mut prov = Provenance::empty();
@@ -546,6 +559,17 @@ pub fn context_provenance(ctx: &ContextManager) -> Provenance {
             // up laxer than the other.
             prov.merge(&tool_result_provenance(provenance));
         }
+    }
+    // Through the same mapping, for the same reason: the forgotten blocks are
+    // scoped by exactly the rule the surviving ones are.
+    let dropped = ctx.dropped_provenance();
+    if !dropped.sources().is_empty() {
+        prov.merge(&tool_result_provenance(&ToolProvenance::Sources(
+            dropped.sources().clone(),
+        )));
+    }
+    if dropped.is_unknown() {
+        prov.merge(&tool_result_provenance(&ToolProvenance::Unknown));
     }
     prov
 }

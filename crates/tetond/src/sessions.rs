@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use teton_protocol::methods::SessionSummary;
 use teton_protocol::{Phase, SessionId, SessionMode, TurnId};
 
-use crate::harness::context::ContextBlock;
+use crate::harness::context::{ContextBlock, RetainedContext};
 
 /// One session as the registry holds it: what clients see, plus what only the
 /// registry needs to know.
@@ -81,31 +81,56 @@ struct SessionRecord {
 /// current tools and route, and a fossilized head replayed under a fresh one
 /// would put two system prompts in the context and make a mid-session head
 /// change unrepresentable — which is exactly what BR-7's cache-independence
-/// asks for. [`ContextManager::into_blocks`](crate::harness::context::ContextManager::into_blocks)
+/// asks for. [`ContextManager::into_retained`](crate::harness::context::ContextManager::into_retained)
 /// excludes it by construction: the head was never a block.
+///
+/// It wraps a [`RetainedContext`] rather than a bare block vector because two
+/// facts about a conversation are not inside its blocks and must cross the
+/// boundary with them: whether history has been dropped (so the truncation note
+/// survives the turn that cut) and the egress provenance of what was dropped (so
+/// a truncated-away `local-only` read still pins the session — BR-3).
 #[derive(Debug, Clone, Default)]
 pub struct Conversation {
-    blocks: Vec<ContextBlock>,
+    retained: RetainedContext,
 }
 
 impl Conversation {
+    /// The conversation a completed turn's context is (REQ-567 D-1).
+    #[must_use]
+    pub fn from_retained(retained: RetainedContext) -> Self {
+        Self { retained }
+    }
+
     /// The blocks, in the order they happened.
     #[must_use]
     pub fn blocks(&self) -> &[ContextBlock] {
-        &self.blocks
+        self.retained.blocks()
+    }
+
+    /// What the next turn replays into its manager: blocks, truncation flag, and
+    /// dropped provenance together.
+    #[must_use]
+    pub fn into_retained(self) -> RetainedContext {
+        self.retained
+    }
+
+    /// The same, borrowed — for a caller that only needs to look.
+    #[must_use]
+    pub fn retained(&self) -> &RetainedContext {
+        &self.retained
     }
 
     /// How many blocks the conversation holds — the count `context_cleared`
     /// reports (BR-8).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.blocks.len()
+        self.retained.blocks().len()
     }
 
     /// Whether this session has retained anything yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.retained.blocks().is_empty()
     }
 }
 
@@ -148,8 +173,11 @@ pub enum TurnClaimError {
 ///
 /// **Released by `Drop`, never by an explicit call** — the discipline
 /// [`crate::lifetime`] and [`crate::model_consent`]'s `InFlightGuard` already
-/// keep, for the same reason: a turn can panic, and the server aborts a turn's
-/// task outright when its client disconnects (`server.rs`). Either of those
+/// keep, because there are three ways a turn's future can stop existing and only
+/// one of them runs code the turn wrote. A turn can panic and unwind; a turn can
+/// return; and a turn whose client disconnects is **drained** for
+/// `TURN_DRAIN_TIMEOUT` and aborted only if it outlasts that (`server.rs`,
+/// REQ-565) — the abort drops the future where it stands. Any of the three
 /// leaking a claim would wedge the session so that every later prompt on it is
 /// refused for a turn that no longer exists.
 ///
@@ -394,13 +422,13 @@ impl SessionRegistry {
     /// keeps the caller's seeding path free of a "session vanished" branch it
     /// cannot act on anyway.
     #[must_use]
-    pub fn conversation_snapshot(&self, id: &SessionId) -> Vec<ContextBlock> {
+    pub fn conversation_snapshot(&self, id: &SessionId) -> Conversation {
         self.sessions
             .lock()
             .expect("session registry mutex poisoned")
             .iter()
             .find(|record| &record.summary.session_id == id)
-            .map(|record| record.conversation.blocks.clone())
+            .map(|record| record.conversation.clone())
             .unwrap_or_default()
     }
 
@@ -428,16 +456,51 @@ impl SessionRegistry {
     /// A commit for a session the registry does not have stores nothing — there
     /// is no record to hold it, and inventing one would resurrect a session
     /// whose id nothing will ever look up again.
-    pub fn commit_conversation(&self, id: &SessionId, blocks: Vec<ContextBlock>) {
+    ///
+    /// # Panics
+    ///
+    /// If the registry mutex is poisoned. [`Self::try_commit_conversation`] is
+    /// the non-panicking twin the drop path uses.
+    pub fn commit_conversation(&self, id: &SessionId, retained: RetainedContext) {
         let mut sessions = self
             .sessions
             .lock()
             .expect("session registry mutex poisoned");
+        Self::write_conversation(&mut sessions, id, retained);
+    }
+
+    /// The same commit, on a path that must not panic (REQ-567 verify).
+    ///
+    /// `Drop` runs during unwinding, and a panic raised inside a drop that is
+    /// itself running because of a panic aborts the process — the whole daemon,
+    /// every other session with it. So the drop-path commit takes the lock with
+    /// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner) rather
+    /// than `expect`. That is sound for *this* write specifically: it is a
+    /// whole-vector replacement of one field, so there is no half-updated
+    /// invariant a poisoned lock could be protecting — the very property BR-6
+    /// already rests on.
+    ///
+    /// The explicit path keeps `expect`: a poisoned registry there is a bug to
+    /// surface loudly, on a stack where surfacing it is safe.
+    pub fn try_commit_conversation(&self, id: &SessionId, retained: RetainedContext) {
+        let mut sessions = match self.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::write_conversation(&mut sessions, id, retained);
+    }
+
+    /// The one write both commit paths perform.
+    fn write_conversation(
+        sessions: &mut [SessionRecord],
+        id: &SessionId,
+        retained: RetainedContext,
+    ) {
         if let Some(record) = sessions
             .iter_mut()
             .find(|record| &record.summary.session_id == id)
         {
-            record.conversation.blocks = blocks;
+            record.conversation = Conversation::from_retained(retained);
         }
     }
 
@@ -463,8 +526,8 @@ impl SessionRegistry {
         else {
             return 0;
         };
-        let dropped = record.conversation.blocks.len();
-        record.conversation.blocks.clear();
+        let dropped = record.conversation.len();
+        record.conversation = Conversation::default();
         dropped
     }
 
@@ -724,7 +787,7 @@ mod tests {
 
     // -- the session's conversation (REQ-567 TASK-092) ------------------------
 
-    use crate::harness::context::{BlockRole, Provenance, ToolProvenance};
+    use crate::harness::context::{BlockRole, ContextManager, Provenance, ToolProvenance};
 
     fn user_block(text: &str) -> ContextBlock {
         ContextBlock {
@@ -757,6 +820,13 @@ mod tests {
         blocks.iter().map(|b| b.text.as_str()).collect()
     }
 
+    /// What a turn hands the store: blocks with nothing yet truncated and
+    /// nothing yet forgotten. The two extra facts a real commit carries have
+    /// their own tests below.
+    fn retained(blocks: Vec<ContextBlock>) -> RetainedContext {
+        RetainedContext::from_blocks(blocks)
+    }
+
     /// **BR-1 at its source.** A session starts with nothing to say, and what a
     /// turn commits is exactly what the next turn snapshots — same blocks, same
     /// order, same roles and provenance.
@@ -774,9 +844,9 @@ mod tests {
             model_block("it is the daemon's session store"),
             tool_block("read", "crates/tetond/src/sessions.rs", "//! The session…"),
         ];
-        reg.commit_conversation(&s.session_id, committed.clone());
+        reg.commit_conversation(&s.session_id, retained(committed.clone()));
 
-        assert_eq!(reg.conversation_snapshot(&s.session_id), committed);
+        assert_eq!(reg.conversation_snapshot(&s.session_id).blocks(), committed);
     }
 
     /// **BR-6, both halves, in the one place that can hold them.** A turn mutates
@@ -792,16 +862,16 @@ mod tests {
         let reg = SessionRegistry::new();
         let s = reg.create(SessionMode::Freeform, None, None).unwrap();
         let before = vec![user_block("prompt one"), model_block("answer one")];
-        reg.commit_conversation(&s.session_id, before.clone());
+        reg.commit_conversation(&s.session_id, retained(before.clone()));
 
         // A turn that errors: it read the conversation, grew it, and died.
-        let mut failed_turn = reg.conversation_snapshot(&s.session_id);
+        let mut failed_turn = reg.conversation_snapshot(&s.session_id).blocks().to_vec();
         failed_turn.push(user_block("prompt two"));
         failed_turn.push(tool_block("read", "a.rs", "half a file"));
         drop(failed_turn);
 
         assert_eq!(
-            reg.conversation_snapshot(&s.session_id),
+            reg.conversation_snapshot(&s.session_id).blocks(),
             before,
             "a turn that never committed left blocks behind"
         );
@@ -813,13 +883,74 @@ mod tests {
             user_block("prompt two"),
             model_block("answer two"),
         ];
-        reg.commit_conversation(&s.session_id, compacted.clone());
+        reg.commit_conversation(&s.session_id, retained(compacted.clone()));
 
         assert_eq!(
-            reg.conversation_snapshot(&s.session_id),
+            reg.conversation_snapshot(&s.session_id).blocks(),
             compacted,
             "a commit must replace the conversation, never extend it"
         );
+    }
+
+    /// **BR-3 / the truncation note, at the store.** A conversation is three
+    /// facts, not one: the blocks, whether history was dropped, and the egress
+    /// provenance of what was dropped. All three cross the registry, because a
+    /// commit that carried only the vector would retract the honesty note on the
+    /// next prompt and launder a truncated-away boundary read.
+    #[test]
+    fn a_commit_carries_the_two_facts_that_are_not_in_the_blocks() {
+        let reg = SessionRegistry::new();
+        let s = reg.create(SessionMode::Freeform, None, None).unwrap();
+
+        // A turn that truncated a `local-only` read away, as its manager would
+        // hand it over.
+        let mut ctx = ContextManager::new("head", 1_000_000).with_budget_bytes(2_000);
+        ctx.push_tool_result(
+            "read",
+            Some("secrets/prod.env".to_owned()),
+            "x".repeat(1_500),
+        );
+        ctx.push_user("x".repeat(1_500));
+        ctx.push_user("and now this");
+        ctx.truncate_to_budget();
+        assert!(ctx.was_truncated(), "fixture: the turn must have truncated");
+
+        reg.commit_conversation(&s.session_id, ctx.into_retained());
+
+        let carried = reg.conversation_snapshot(&s.session_id);
+        assert!(
+            carried.retained().was_truncated(),
+            "the next prompt would stop saying that history is missing"
+        );
+        assert!(
+            carried
+                .retained()
+                .dropped_provenance()
+                .sources()
+                .contains("secrets/prod.env"),
+            "the next prompt would carry boundary-derived content with nothing \
+             to scope it"
+        );
+        assert!(
+            !carried.blocks().iter().any(|b| matches!(
+                &b.provenance,
+                Provenance::Tool {
+                    provenance: ToolProvenance::Sources(paths),
+                    ..
+                } if paths.contains("secrets/prod.env")
+            )),
+            "fixture: the boundary block really was dropped, so the provenance \
+             above can only have come from the accumulator"
+        );
+
+        // And a clear takes all three, not just the blocks: a cleared session
+        // that still reported truncated history would print the note over an
+        // empty conversation.
+        assert!(reg.clear_conversation(&s.session_id) > 0);
+        let cleared = reg.conversation_snapshot(&s.session_id);
+        assert!(cleared.is_empty());
+        assert!(!cleared.retained().was_truncated());
+        assert!(cleared.retained().dropped_provenance().is_empty());
     }
 
     /// **BR-8.** Clearing empties the conversation and reports what went — the
@@ -831,11 +962,11 @@ mod tests {
         let s = reg.create(SessionMode::Freeform, None, None).unwrap();
         reg.commit_conversation(
             &s.session_id,
-            vec![
+            retained(vec![
                 user_block("one"),
                 model_block("two"),
                 tool_block("read", "a.rs", "three"),
-            ],
+            ]),
         );
 
         assert_eq!(reg.clear_conversation(&s.session_id), 3);
@@ -856,25 +987,31 @@ mod tests {
         let a = reg.create(SessionMode::Freeform, None, None).unwrap();
         let b = reg.create(SessionMode::Freeform, None, None).unwrap();
 
-        reg.commit_conversation(&a.session_id, vec![user_block("A's secret plan")]);
-        reg.commit_conversation(&b.session_id, vec![user_block("B's unrelated bug")]);
+        reg.commit_conversation(&a.session_id, retained(vec![user_block("A's secret plan")]));
+        reg.commit_conversation(
+            &b.session_id,
+            retained(vec![user_block("B's unrelated bug")]),
+        );
         reg.commit_conversation(
             &a.session_id,
-            vec![user_block("A's secret plan"), model_block("A's answer")],
+            retained(vec![
+                user_block("A's secret plan"),
+                model_block("A's answer"),
+            ]),
         );
 
         assert_eq!(
-            texts(&reg.conversation_snapshot(&a.session_id)),
+            texts(reg.conversation_snapshot(&a.session_id).blocks()),
             ["A's secret plan", "A's answer"]
         );
         assert_eq!(
-            texts(&reg.conversation_snapshot(&b.session_id)),
+            texts(reg.conversation_snapshot(&b.session_id).blocks()),
             ["B's unrelated bug"]
         );
         // And clearing one session leaves the other's conversation alone.
         assert_eq!(reg.clear_conversation(&a.session_id), 2);
         assert_eq!(
-            texts(&reg.conversation_snapshot(&b.session_id)),
+            texts(reg.conversation_snapshot(&b.session_id).blocks()),
             ["B's unrelated bug"]
         );
     }
@@ -941,7 +1078,7 @@ mod tests {
         let ghost = SessionId::from("never-created");
 
         assert!(reg.conversation_snapshot(&ghost).is_empty());
-        reg.commit_conversation(&ghost, vec![user_block("into the void")]);
+        reg.commit_conversation(&ghost, retained(vec![user_block("into the void")]));
         assert!(
             reg.conversation_snapshot(&ghost).is_empty(),
             "a commit must not resurrect a session that does not exist"

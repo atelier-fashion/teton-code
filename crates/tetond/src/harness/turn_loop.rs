@@ -502,6 +502,39 @@ pub async fn run_session_turn_with_source(
             });
         }
 
+        // ---- the budget gate (REQ-561 ADR-4, REQ-567 BR-4) ----
+        //
+        // Here, at the top of the iteration, because this is the **one** point
+        // every path that is about to build a prompt passes through: the first
+        // iteration (whose context is a whole carried conversation plus the new
+        // message, REQ-567 BR-1), a tool-result fold, a denied tool, a malformed
+        // call, and the verification nudge. Sitting at the fold instead left
+        // every other path ungated — and a tool-free session, which is most of
+        // them, was never measured at all: it grew by two blocks per prompt
+        // until the rendered prompt busted the engine window, and because a
+        // failed turn never commits (BR-6), the oversized conversation was
+        // replayed into every subsequent prompt. The session wedged permanently,
+        // which is precisely the "degrades to compaction, never to a failed
+        // turn" that BR-4 forbids.
+        //
+        // The order is the ADR-4 order and the second line is unconditional: the
+        // `compact` duty gets a say in *which* blocks go, at a soft fraction of
+        // the budget, and `truncate_to_budget` is what actually enforces the
+        // budget — unwrapped, conditional on nothing, so a duty that hangs,
+        // returns garbage, returns an over-budget answer or was never routed
+        // still cannot produce an over-budget prompt.
+        //
+        // A failure is never silent: this duty guards the context window, so the
+        // deterministic drop standing in for it is logged with the reason.
+        let compaction = ctx.compact_if_pressured(compact).await;
+        if let Some(error) = &compaction.reason {
+            eprintln!(
+                "tetond: the `compact` duty could not be served ({error}); the \
+                 context was truncated deterministically instead"
+            );
+        }
+        ctx.truncate_to_budget();
+
         // ---- model call ----
         // The egress provenance of the assembled context travels with the turn so
         // a remote source's send is blocked before a byte crosses a `local-only`
@@ -758,29 +791,12 @@ pub async fn run_session_turn_with_source(
                             folded
                         };
                         ctx.push_tool_result_prov(name, provenance, folded);
-                        // REQ-561 ADR-4: the `compact` duty gets a say in WHICH
-                        // blocks go, at a soft fraction of the budget — and it
-                        // gets it *here*, ahead of the gate below, never instead
-                        // of it. The line after this one is unchanged,
-                        // unwrapped, and conditional on nothing: that is what
-                        // makes BR-4 structural rather than a code path someone
-                        // has to remember. A duty that hangs, returns garbage,
-                        // returns an over-budget answer or was never routed
-                        // still ends with a context under budget, because the
-                        // thing enforcing the budget was never the duty.
-                        //
-                        // A failure is never silent, for the reason the `digest`
-                        // failure above is not: this duty guards the context
-                        // window, so the deterministic drop standing in for it is
-                        // logged with the reason it had to.
-                        let compaction = ctx.compact_if_pressured(compact).await;
-                        if let Some(error) = &compaction.reason {
-                            eprintln!(
-                                "tetond: the `compact` duty could not be served ({error}); the \
-                                 context was truncated deterministically instead"
-                            );
-                        }
-                        ctx.truncate_to_budget();
+                        // The budget gate used to live here, right after the
+                        // fold. It is now at the top of the loop, which this
+                        // `continue` reaches before any prompt is built — same
+                        // measurement, one iteration later, and every *other*
+                        // path gated too (REQ-567 BR-4). Nothing between here
+                        // and there assembles a prompt.
                         continue;
                     }
                 }

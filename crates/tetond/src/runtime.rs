@@ -132,6 +132,7 @@ use teton_providers::{
 
 use crate::broadcast::EventBus;
 use crate::call_sites::has_call_site;
+use crate::carry::CarriedTurn;
 use crate::classify::Classification;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable, WebLookupRow, WebOverrideRow};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
@@ -938,7 +939,7 @@ const TAINT_BY_BOUNDARY: &str = "a `local-only` privacy boundary was crossed";
 const TAINT_BY_REDACTION: &str =
     "the redaction scan found sensitive content in an outbound payload";
 /// This turn's assembled context carried boundary or unknown-provenance content.
-const TAINT_BY_CONTEXT: &str = "this turn read boundary or unknown-provenance content";
+pub(crate) const TAINT_BY_CONTEXT: &str = "this turn read boundary or unknown-provenance content";
 /// Unreachable: [`cause_taints_the_session`] and [`mcp_cause_taints_the_session`]
 /// both answer `false` for `ScanUnavailable`, so no announcement is ever minted
 /// for it. Present so the maps below are total, and worded so that a future
@@ -962,7 +963,7 @@ const TAINT_BY_UNSTATED_CAUSE: &str = "a blocked outbound payload";
 /// reason `read_findings`' error type does: a compile-time literal cannot carry
 /// a runtime value, so no path, session id, or payload byte can reach this line
 /// even by accident. The cause is a *class*, never an instance.
-fn taint_pin_line(cause: &'static str) -> String {
+pub(crate) fn taint_pin_line(cause: &'static str) -> String {
     format!(
         "tetond: privacy — this session is pinned to the local tier for the rest of its life \
          ({cause}); remote providers will not be used in it again."
@@ -1058,93 +1059,6 @@ impl HealthRecord {
                 _ => ProviderHealth::Unavailable,
             },
             other => other,
-        }
-    }
-}
-
-/// One turn's [`ContextManager`], plus the promise to write what it holds back
-/// to the session's conversation (REQ-567 D-1).
-///
-/// The manager is owned here rather than beside the guard because the third
-/// outcome — cancellation — has no code of its own to run. The server aborts a
-/// prompt's task when its client disconnects (`server.rs`), and an aborted
-/// future reaches neither the success nor the failure branch: `Drop` is the only
-/// thing that executes. A guard that merely *watched* a manager it did not own
-/// would be dropped alongside blocks it could no longer read.
-///
-/// So the three outcomes are:
-///
-/// - **completed** ([`Self::commit`]): disarm, then replace the session's
-///   conversation with what the manager holds. That vector *is* the retained
-///   view — post containment cut (BUG-147), post compaction (BR-4) — so the
-///   commit is a move rather than a re-derivation.
-/// - **failed** ([`Self::abandon`]): disarm and write nothing. Commit is the
-///   only writer, so a failed turn rolls back by never having written (BR-6).
-/// - **cancelled** (armed [`Drop`]): commit whatever the manager holds at that
-///   instant. Every block in it is complete by construction — the loop pushes
-///   model text when a generation ends and a tool result when the tool
-///   returns — so OQ-1's "retain prose, drop incomplete tool work" falls out of
-///   the shape rather than out of a filter: the tool result that never arrived
-///   was never pushed.
-///
-/// It holds a registry *handle*, never a lock: the mutex is taken for the one
-/// vector write and released, so nothing here blocks the async path for the
-/// length of a turn (LESSON-448).
-struct TurnConversation {
-    /// The turn's context. `Some` for the guard's whole life; taken only by the
-    /// method (or the `Drop`) that consumes it, so the two can never both write.
-    ctx: Option<ContextManager>,
-    sessions: SessionRegistry,
-    session_id: SessionId,
-    /// Whether a drop from here would be a cancellation. Set once the new user
-    /// message is in the manager and cleared by whichever outcome arrives first.
-    armed: bool,
-}
-
-impl TurnConversation {
-    /// Take ownership of `ctx` for `session_id` and arm the cancellation commit.
-    fn armed(ctx: ContextManager, sessions: SessionRegistry, session_id: SessionId) -> Self {
-        Self {
-            ctx: Some(ctx),
-            sessions,
-            session_id,
-            armed: true,
-        }
-    }
-
-    /// The turn's context.
-    fn ctx(&self) -> &ContextManager {
-        self.ctx.as_ref().expect("the turn context was taken")
-    }
-
-    /// The turn's context, mutably — what the turn loop appends to.
-    fn ctx_mut(&mut self) -> &mut ContextManager {
-        self.ctx.as_mut().expect("the turn context was taken")
-    }
-
-    /// The turn completed: the conversation becomes what the manager holds.
-    fn commit(mut self) {
-        self.armed = false;
-        if let Some(ctx) = self.ctx.take() {
-            self.sessions
-                .commit_conversation(&self.session_id, ctx.into_blocks());
-        }
-    }
-
-    /// The turn failed: the conversation stays exactly as the turn found it.
-    fn abandon(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TurnConversation {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Some(ctx) = self.ctx.take() {
-            self.sessions
-                .commit_conversation(&self.session_id, ctx.into_blocks());
         }
     }
 }
@@ -2265,23 +2179,24 @@ impl DaemonRuntime {
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
         let system = build_system_prompt(&tools, &route.harness);
-        let mut ctx = ContextManager::new(system, route.harness.context_budget_tokens)
-            .with_budget_bytes(route.harness.context_budget_bytes);
         // REQ-567 BR-1: this turn begins from what the session has already said.
-        // The head above was rebuilt from *this* turn's tools and route, and the
+        // The head was rebuilt from *this* turn's tools and route, and the
         // carried blocks are replayed under it — so a mid-session head change
         // re-renders the same conversation rather than fossilizing an old head
-        // (BR-7). Before `push_user`, because the transcript is in turn order and
-        // this prompt is the newest thing in it.
-        ctx.replay_blocks(sessions.conversation_snapshot(&session_id));
-        ctx.push_user(prompt);
-        // From here the manager is the conversation-in-progress: whichever of the
-        // three outcomes arrives — completed, failed, or the task simply being
-        // dropped — decides what the session keeps (see `TurnConversation`).
-        // Armed after `push_user` so a cancelled turn retains the message the
-        // user sent (OQ-1), and there is exactly ONE place below where a turn's
-        // outcome becomes that decision.
-        let mut conversation = TurnConversation::armed(ctx, sessions.clone(), session_id.clone());
+        // (BR-7). From here the manager is the conversation-in-progress:
+        // whichever outcome arrives — completed, failed, the task being dropped,
+        // or a panic — decides what the session keeps (see [`CarriedTurn`]),
+        // and there is exactly ONE place below where a turn's outcome becomes
+        // that decision.
+        let mut conversation = CarriedTurn::begin(
+            sessions,
+            &session_id,
+            system,
+            &route.harness,
+            Arc::clone(&self.session_taint),
+            config.boundaries.clone(),
+            prompt,
+        );
 
         let mut attempts = 0u32;
         let mut rerouted_local = false;
@@ -2355,15 +2270,13 @@ impl DaemonRuntime {
                     if let Some(pid) = route.provider_id.as_ref() {
                         self.record_health(&pid.0, HealthRecord::healthy());
                     }
-                    // REQ-544 C-2: if this turn's context intersects a local-only
-                    // boundary or carries unknown provenance, pin the session to
-                    // the local tier for every subsequent turn (the backstop for
-                    // a later model paraphrase of what it read here).
-                    if context_is_sensitive(conversation.ctx(), &config.boundaries)
-                        && self.session_taint.mark(&session_id)
-                    {
-                        eprintln!("{}", taint_pin_line(TAINT_BY_CONTEXT));
-                    }
+                    // REQ-544 C-2's pin — "this turn's context intersects a
+                    // local-only boundary, so every later turn stays local" —
+                    // is evaluated at the commit seam rather than here. It has
+                    // to be: the cancellation path commits too, and a pin
+                    // written only in this arm left an aborted turn's boundary
+                    // content carried into the next prompt with nothing pinning
+                    // the session (see [`CarriedTurn::commit_now`]).
                     break 'turn Ok(PromptTurnResult {
                         turn_id,
                         stop_reason: outcome.stop_reason,
@@ -5979,7 +5892,7 @@ fn health_record_after_failure(class: FailureClass, now: Instant) -> Option<Heal
 /// With no boundaries configured, nothing is sensitive — there is nothing to
 /// protect. Boundaries that fail to compile fail-closed (treated as sensitive),
 /// the same posture the egress choke point takes.
-fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBoundary]) -> bool {
+pub(crate) fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBoundary]) -> bool {
     if boundaries.is_empty() {
         return false;
     }
@@ -14259,7 +14172,8 @@ provider_id = "on-device"
     /// protocol-level leg of the acceptance matrix is TASK-096's.
     mod conversation_carry {
         use super::*;
-        use crate::harness::context::BlockRole;
+        use crate::carry::CarriedTurn;
+        use crate::harness::context::{BlockRole, Provenance as CtxProvenance, ToolProvenance};
 
         /// The opening of the system head, and the discriminator that tells a
         /// **turn** prompt from a duty prompt.
@@ -14905,20 +14819,40 @@ provider_id = "on-device"
 
         // -- OQ-1: a cancelled turn keeps what completed ---------------------
 
-        /// **OQ-1 / D-1's third outcome.** The server aborts a prompt's task
-        /// when its client disconnects, and an aborted future runs neither the
-        /// success nor the failure branch — only `Drop`. So a cancelled turn
-        /// commits what its manager holds at that instant: the prose from the
-        /// turn before it, this turn's message, and the tool work that
-        /// *finished*. The call still waiting on a permission answer contributed
-        /// nothing, because a result is pushed when the tool returns.
+        /// **OQ-1 / D-1's third outcome.** A prompt's task is drained when its
+        /// client disconnects and aborted if it outlasts the drain, and an
+        /// aborted future runs neither the success nor the failure branch — only
+        /// `Drop`. So a cancelled turn commits what its manager holds at that
+        /// instant, minus the tool work that never finished: the prose from the
+        /// turn before it, this turn's message, the tool work that *did*
+        /// finish, and the prose the model wrote before the call it was parked
+        /// on — with the call itself cut off (OQ-1: retain prose, drop
+        /// incomplete tool work).
+        ///
+        /// ## The dangling call is the point
+        ///
+        /// The loop pushes the model's text — which on a tool-calling reply
+        /// *contains* the call — **before** it awaits the permission gate, so a
+        /// turn cancelled at the gate holds an assistant block whose call the
+        /// transcript never answers. The assertions below therefore look at the
+        /// conversation's shape directly: what the last block is, and that no
+        /// assistant block carrying a call is left without the tool block that
+        /// answers it. An earlier version of this test asserted only that no
+        /// text mentioned `echo hi` "unless it mentioned `tool`" — which exempted
+        /// exactly the dangling call it was supposed to catch, and passed while
+        /// the call was being committed.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_cancelled_turn_commits_its_completed_work_and_not_the_pending_call() {
             let repo = repo_with_notes("carry-cancel");
             let (runtime, _seen) = carry_runtime(&[
                 Scripted::Say("The build passes."),
                 Scripted::Say(r#"{"tool": "read", "arguments": {"path": "notes.txt"}}"#),
-                Scripted::Say(r#"{"tool": "shell", "arguments": {"command": "echo hi"}}"#),
+                // Prose *and* a call, so the trim has both halves to tell apart:
+                // the sentence is completed work the user watched stream, the
+                // call is work that never happened.
+                Scripted::Say(
+                    "Now I will run the tests.\n                     {\"tool\": \"shell\", \"arguments\": {\"command\": \"echo hi\"}}",
+                ),
             ]);
             let events = Arc::new(EventBus::new());
             let mut sub = events.subscribe(64);
@@ -14965,7 +14899,8 @@ provider_id = "on-device"
                 "the turn must have been cancelled, not completed"
             );
 
-            let blocks = sessions.conversation_snapshot(&session_id);
+            let conversation = sessions.conversation_snapshot(&session_id);
+            let blocks = conversation.blocks();
             let texts: Vec<&str> = blocks.iter().map(|b| b.text.as_str()).collect();
             assert!(
                 texts.iter().any(|t| t.contains("The build passes.")),
@@ -14991,12 +14926,49 @@ provider_id = "on-device"
                 tool_blocks[0].contains("the retry budget is three attempts"),
                 "the surviving tool block is not the completed `read`: {tool_blocks:?}"
             );
-            assert!(
-                !texts
-                    .iter()
-                    .any(|t| t.contains("echo hi") && !t.contains("tool")),
-                "no result for the command that never ran: {texts:?}"
+
+            // OQ-1's two halves, asserted on the committed conversation itself.
+            //
+            // The prose the model streamed before the call it was parked on is
+            // completed work and stays; the call is not and goes. So the
+            // conversation ends on an assistant block that is exactly that
+            // sentence.
+            let last = blocks.last().expect("a cancelled turn commits something");
+            assert_eq!(
+                last.role,
+                BlockRole::Assistant,
+                "the conversation must end on the prose the cancelled turn \
+                 completed, not on the call it never got an answer to: \
+                 {texts:?}"
             );
+            assert_eq!(
+                last.text.trim(),
+                "Now I will run the tests.",
+                "the trailing assistant block must be the completed prose with \
+                 the dangling call cut off it: {:?}",
+                last.text
+            );
+            assert!(
+                !texts.iter().any(|t| t.contains("echo hi")),
+                "the call that was never answered is still in the conversation: \
+                 {texts:?}"
+            );
+
+            // And the structural rule the trim exists to keep: every assistant
+            // block that carries a call is followed by the tool block answering
+            // it. A committed conversation that breaks this opens the next
+            // prompt on a question its own transcript never resolves.
+            for (i, block) in blocks.iter().enumerate() {
+                if block.role != BlockRole::Assistant || !block.text.contains("\"tool\":") {
+                    continue;
+                }
+                assert_eq!(
+                    blocks.get(i + 1).map(|next| next.role),
+                    Some(BlockRole::Tool),
+                    "assistant block {i} carries a tool call with no result \
+                     after it: {texts:?}"
+                );
+            }
 
             // And the session is not wedged: the claim the aborted task held was
             // released by the same drop that committed.
@@ -15011,6 +14983,309 @@ provider_id = "on-device"
             .await
             .expect("an aborted turn must not wedge its session");
             let _ = std::fs::remove_dir_all(&repo);
+        }
+
+        // -- B1/B2: what a shrinking or cancelled turn owes the boundary ------
+
+        /// A daemon whose config declares `secrets/**` local-only — what the
+        /// REQ-544 C-2 pin is measured against.
+        fn boundary_config() -> Config {
+            Config {
+                boundaries: vec![PrivacyBoundary {
+                    path_glob: "secrets/**".to_owned(),
+                    mode: BoundaryMode::LocalOnly,
+                }],
+                ..local_config()
+            }
+        }
+
+        /// The same recording daemon, with a boundary declared.
+        fn boundary_runtime(script: &[Scripted]) -> (Arc<DaemonRuntime>, Arc<Mutex<Vec<String>>>) {
+            let (engine, (seen, _duties)) = RecordingEngine::new(script);
+            let runtime = DaemonRuntime::minimal();
+            *runtime.config.lock().expect("config mutex") = boundary_config();
+            runtime
+                .engine
+                .install("recording".to_owned(), Arc::new(Mutex::new(engine)));
+            runtime.local_available.store(true, Ordering::SeqCst);
+            (Arc::new(runtime), seen)
+        }
+
+        /// A scratch repo with one boundary file and three bulky ordinary ones.
+        ///
+        /// Each file is ~1260 words: **under** the 1500-token `digest`
+        /// threshold, so it folds into context whole rather than arriving as a
+        /// duty's condensed answer (which would carry the provenance but none of
+        /// the bytes, and leave nothing big enough to press on the budget), and
+        /// big enough that two of them bust the default budget and force the
+        /// oldest — the boundary read — out.
+        fn repo_with_a_secret(tag: &str) -> PathBuf {
+            let dir = scratch_dir(tag);
+            std::fs::create_dir_all(dir.join("secrets")).expect("secrets dir");
+            let bulk = |seed: &str| {
+                (0..180)
+                    .map(|n| format!("{seed} line {n} of otherwise unremarkable text\n"))
+                    .collect::<String>()
+            };
+            std::fs::write(
+                dir.join("secrets/prod.env"),
+                format!("PROD_API_KEY=hunter2\n{}", bulk("secret")),
+            )
+            .expect("write the boundary file");
+            for name in ["a.rs", "b.rs", "c.rs"] {
+                std::fs::write(dir.join(name), bulk(name)).expect("write a bulk file");
+            }
+            dir
+        }
+
+        /// **BR-3, the truncation hole.** A `local-only` read that the budget
+        /// gate drops *before the turn ends* still pins the session, and the
+        /// provenance that pins it is carried into the next prompt.
+        ///
+        /// Compaction never had this hole — its summary inherits the merged
+        /// provenance of everything it was shown — but `truncate_to_budget`
+        /// removed the block outright, and with it the only record of where its
+        /// content came from. What survives such a drop is routinely a
+        /// *paraphrase*: the assistant text right after the read, a later
+        /// summary, the carried conversation. So the pin has to be computed
+        /// from what the context has forgotten as well as from what it holds,
+        /// or a session can read a secret, forget the block, and route the
+        /// paraphrase remote on the next prompt.
+        ///
+        /// The evidence is the taint pin and the committed conversation, not a
+        /// reading of the code: the boundary block is asserted **gone**, its
+        /// bytes asserted absent from every retained block, and the session
+        /// asserted pinned anyway — with a control session in the same daemon,
+        /// reading the same bulk files and no secret, left unpinned.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_truncated_away_boundary_read_still_pins_the_session_and_the_next_prompt() {
+            let repo = repo_with_a_secret("carry-truncated-boundary");
+            let (runtime, _seen) = boundary_runtime(&[
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "secrets/prod.env"}}"#),
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "a.rs"}}"#),
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "b.rs"}}"#),
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "c.rs"}}"#),
+                Scripted::Say("Read them all."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session();
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Some(repo.clone()),
+                "read everything in here",
+            )
+            .await
+            .expect("the scripted turn completes");
+
+            let conversation = sessions.conversation_snapshot(&session_id);
+            // Non-vacuity, both halves: the boundary read really happened, and
+            // the budget gate really took it away again.
+            assert!(
+                !conversation.blocks().iter().any(|block| matches!(
+                    &block.provenance,
+                    CtxProvenance::Tool {
+                        provenance: ToolProvenance::Sources(paths),
+                        ..
+                    } if paths.contains("secrets/prod.env")
+                )),
+                "the boundary block survived the turn, so this test is not about \
+                 a truncated-away read at all"
+            );
+            assert!(
+                !conversation
+                    .blocks()
+                    .iter()
+                    .any(|block| block.text.contains("PROD_API_KEY")),
+                "the boundary file's bytes are still in the retained conversation"
+            );
+            assert!(
+                conversation
+                    .retained()
+                    .dropped_provenance()
+                    .sources()
+                    .contains("secrets/prod.env"),
+                "the dropped block's provenance died with it, so the next prompt \
+                 carries boundary-derived content with nothing to scope it"
+            );
+
+            // The security claim: the session is pinned to the local tier for
+            // the rest of its life, exactly as it would have been had the block
+            // survived.
+            assert!(
+                runtime.session_taint.is_tainted(&session_id),
+                "a session that read a `local-only` file and then forgot the \
+                 block is still a session that read it"
+            );
+
+            // The control, in the same daemon, on the same config: bulk reads
+            // and no secret leave the session free to route remote.
+            let (control_runtime, _control_seen) = boundary_runtime(&[
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "a.rs"}}"#),
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "b.rs"}}"#),
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "c.rs"}}"#),
+                Scripted::Say("Read them."),
+            ]);
+            let (control_sessions, control_id) = one_session();
+            prompt(
+                &control_runtime,
+                &events,
+                &control_sessions,
+                &control_id,
+                Some(repo.clone()),
+                "read the source files",
+            )
+            .await
+            .expect("the control turn completes");
+            assert!(
+                !control_runtime.session_taint.is_tainted(&control_id),
+                "a session that read no boundary file must not be pinned — the \
+                 pin above would then be about the budget, not the boundary"
+            );
+
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+
+        /// **REQ-544 C-2 on the abort path.** A turn cancelled after reading
+        /// `local-only` content commits that content — and must pin the session
+        /// on the way, or the next prompt carries a boundary read with nothing
+        /// stopping it going remote.
+        ///
+        /// The pin used to be evaluated in `run_prompt_turn`'s `Ok` arm, which
+        /// an aborted future never reaches; the commit, meanwhile, happens in
+        /// `Drop`, which it always reaches. Binding the evaluation to the commit
+        /// is what makes "if the content carries, the pin carries" true of every
+        /// path rather than of the happy one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancelled_turn_that_read_boundary_content_leaves_the_session_pinned() {
+            let repo = repo_with_a_secret("carry-cancel-boundary");
+            let (runtime, _seen) = boundary_runtime(&[
+                Scripted::Say(r#"{"tool": "read", "arguments": {"path": "secrets/prod.env"}}"#),
+                Scripted::Say(r#"{"tool": "shell", "arguments": {"command": "echo hi"}}"#),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(64);
+            let (sessions, session_id) = one_session();
+
+            let turn = {
+                let runtime = Arc::clone(&runtime);
+                let events = Arc::clone(&events);
+                let sessions = sessions.clone();
+                let session_id = session_id.clone();
+                let repo = repo.clone();
+                tokio::spawn(async move {
+                    prompt(
+                        &runtime,
+                        &events,
+                        &sessions,
+                        &session_id,
+                        Some(repo),
+                        "read the production config and then run the tests",
+                    )
+                    .await
+                })
+            };
+            // Parked at the permission gate, with the boundary read already
+            // folded into the manager and nothing about to answer the prompt.
+            await_permission_prompt(&mut sub, "shell").await;
+            assert!(
+                !runtime.session_taint.is_tainted(&session_id),
+                "nothing has committed yet, so nothing has pinned yet — without \
+                 this the assertion below could be about a pin from elsewhere"
+            );
+
+            turn.abort();
+            assert!(
+                turn.await.is_err(),
+                "the turn must have been cancelled, not completed"
+            );
+
+            // The content carried…
+            let conversation = sessions.conversation_snapshot(&session_id);
+            assert!(
+                conversation
+                    .blocks()
+                    .iter()
+                    .any(|block| block.text.contains("PROD_API_KEY")),
+                "the cancelled turn kept its completed tool work (OQ-1), which \
+                 is the premise of the pin below"
+            );
+            // …so the pin carried with it.
+            assert!(
+                runtime.session_taint.is_tainted(&session_id),
+                "a cancelled turn committed boundary content without pinning the \
+                 session: the next prompt would carry it straight to a remote \
+                 provider"
+            );
+
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+
+        /// **BR-6 on the panic path.** A turn that panics is a *failed* turn, so
+        /// it leaves the conversation exactly as it found it — the same rule the
+        /// error arm follows, applied to the one failure that has no error arm
+        /// to run.
+        ///
+        /// `Drop` cannot otherwise tell a panic from a task abort: both arrive as
+        /// a drop with the guard still armed. Committing a panicking turn's
+        /// half-assembled context would treat a bug as a user walking away, and
+        /// carry whatever state the panic interrupted into every later prompt.
+        ///
+        /// Driven at the guard rather than through a whole turn, because a
+        /// panic inside the daemon's turn loop is not something a test can stage
+        /// without a fixture whose only purpose is to crash: what is under test
+        /// is the guard's decision, and this drives it exactly as an unwinding
+        /// turn does.
+        #[test]
+        fn a_panicking_turn_commits_nothing_while_an_aborted_one_commits() {
+            let (sessions, session_id) = one_session();
+            let taint = Arc::new(SessionTaint::new());
+            let begin = |prompt: &str| {
+                CarriedTurn::begin(
+                    &sessions,
+                    &session_id,
+                    "SYSTEM HEAD",
+                    &crate::harness::turn_loop::HarnessConfig::default(),
+                    Arc::clone(&taint),
+                    Vec::new(),
+                    prompt.to_owned(),
+                )
+            };
+
+            // A plain drop — the task abort — commits what the turn held.
+            drop(begin("the client went away"));
+            assert_eq!(
+                sessions
+                    .conversation_snapshot(&session_id)
+                    .blocks()
+                    .iter()
+                    .map(|block| block.text.clone())
+                    .collect::<Vec<_>>(),
+                ["the client went away"],
+                "an aborted turn retains what it completed (OQ-1)"
+            );
+
+            // A drop while unwinding — the panic — writes nothing at all, and
+            // leaves the conversation the earlier turn committed untouched.
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _turn = begin("this turn is about to fall over");
+                panic!("something in the turn loop went wrong");
+            }));
+            assert!(panicked.is_err(), "the fixture must actually panic");
+            assert_eq!(
+                sessions
+                    .conversation_snapshot(&session_id)
+                    .blocks()
+                    .iter()
+                    .map(|block| block.text.clone())
+                    .collect::<Vec<_>>(),
+                ["the client went away"],
+                "a panicking turn left a trace in the conversation — BR-6 says a \
+                 failed turn leaves it exactly as it found it"
+            );
         }
 
         // -- AC-4: two prompts, one session ----------------------------------
@@ -15083,8 +15358,9 @@ provider_id = "on-device"
             // that had run far enough to push a block would have forked it.
             let texts: Vec<String> = sessions
                 .conversation_snapshot(&session_id)
-                .into_iter()
-                .map(|b| b.text)
+                .blocks()
+                .iter()
+                .map(|b| b.text.clone())
                 .collect();
             assert!(
                 texts.iter().any(|t| t.contains("run the tests please")),
@@ -15152,8 +15428,9 @@ provider_id = "on-device"
             // And the store agrees with the context — one retained view, not two.
             let texts: Vec<String> = sessions
                 .conversation_snapshot(&session_id)
-                .into_iter()
-                .map(|b| b.text)
+                .blocks()
+                .iter()
+                .map(|b| b.text.clone())
                 .collect();
             assert!(
                 !texts.iter().any(|t| t.contains("FABRICATEDTAIL")),

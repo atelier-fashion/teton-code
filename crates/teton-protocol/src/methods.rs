@@ -1291,6 +1291,20 @@ mod tests {
         });
     }
 
+    /// REQ-567 D-2's one new method, pinned beside its siblings: a params/result
+    /// pair whose shape nothing else in this file constrains, on a verb clients
+    /// call by hand.
+    #[test]
+    fn session_clear_round_trips() {
+        round_trip(&SessionClearParams {
+            session_id: SessionId::from("s1"),
+        });
+        // Both ends of the count, because they are the two the CLI words
+        // differently: "there was nothing retained to drop" and a real number.
+        round_trip(&SessionClearResult { blocks_dropped: 0 });
+        round_trip(&SessionClearResult { blocks_dropped: 12 });
+    }
+
     #[test]
     fn prompt_turn_round_trips() {
         round_trip(&PromptTurnParams {

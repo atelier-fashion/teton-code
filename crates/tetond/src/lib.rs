@@ -58,6 +58,7 @@
 pub mod auth;
 pub mod broadcast;
 pub mod call_sites;
+pub mod carry;
 pub mod classify;
 pub mod cost;
 pub mod download;

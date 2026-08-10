@@ -864,7 +864,24 @@ const WEB_METHODS_UNAVAILABLE: &str =
 /// client inherits, on a machine whose RAM floor the user was asked about. A
 /// clear is none of that. It is session-scoped, it takes no consent, it spends
 /// no money, and what it destroys is conversational convenience: the retained
-/// blocks, and nothing else. OQ-4 is resolved to exactly that — the session's
+/// blocks, and nothing else.
+///
+/// ## What the summary line promises, and what it does not
+///
+/// "Drop this session's retained conversation; the next prompt starts fresh" is
+/// the whole claim, and it is exact: the conversation is what every later prompt
+/// is assembled from, and after this there is none. It deliberately does **not**
+/// promise that the cleared bytes have left the machine's memory. The local
+/// engine's prefix cache still holds the cleared conversation's tokens until the
+/// next prompt's prefill overwrites them (architecture D-5): process memory
+/// only, never disk, and unreachable through any prompt, because the cache is
+/// keyed by comparing token ids against the *new* prompt and nothing past the
+/// common prefix can be decoded from. Nobody is told otherwise, and the one-line
+/// summary is left as-is rather than qualified — a help row that hedged about
+/// KV residency would trade a promise nobody made for a sentence nobody can
+/// act on. A user who needs the bytes gone ends the session (BR-9).
+///
+/// OQ-4 is resolved to exactly that — the session's
 /// privacy taint, its pasted-URL set, and its remembered permission grants all
 /// survive a clear, so a `/clear` a script could type can widen no boundary and
 /// grant no permission. It is therefore pipe-friendly like every other command

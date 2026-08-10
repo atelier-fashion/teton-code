@@ -610,8 +610,10 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
         };
         // The slash handlers act on this session and reach it only through the
         // context (REQ-563: `/web allow` names the session whose restriction it
-        // lifts).
+        // lifts), and the renderer needs it to tell this session's events from
+        // another session's on the daemon-wide bus (REQ-567 BR-8).
         ctx.session_id = Some(session_id.clone());
+        ctx.state.session_id = Some(session_id.clone());
         ctx.surface.line(
             LineKind::Info,
             &format!(

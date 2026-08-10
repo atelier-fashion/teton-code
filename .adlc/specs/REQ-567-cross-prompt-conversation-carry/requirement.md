@@ -135,9 +135,15 @@ assembled-context behavior itself.
 - [x] BR-6: **A turn's blocks join the conversation atomically, on
       completion.** A turn that fails leaves the conversation exactly as it
       was when the turn started — the next prompt's context contains no
-      partial blocks from the failed turn. Duty calls (title naming,
-      summarize/classify) never contribute blocks to the conversation; they
-      are not turns. (Cancelled-turn retention is OQ-1.)
+      partial blocks from the failed turn; a turn that panics is a failed turn
+      for this purpose. **Out-of-band duty output never joins the
+      conversation**: a duty that answers a question *about* a turn — naming
+      the session, classifying the route, judging an outbound payload — writes
+      nothing into it, because its answer is not something the session said.
+      Duties that *rewrite the conversation in place* are a different thing and
+      are not excluded: `compact`'s summary and `digest`'s condensed tool result
+      **are** the retained view of conversation content (OQ-3). (Cancelled-turn
+      retention is OQ-1.)
 - [x] BR-7: **Carry is correct independent of the KV cache.** The assembled
       context for any turn is identical with the prefix cache enabled,
       disabled, evicted, or divergent, and identical across a mid-session
@@ -290,15 +296,46 @@ reuses the KV). Both are the same dogfood session; status NOT RUN.
       conversation (the user saw it; ACP replays it) and drops incomplete
       tool calls/results. BR-6's clean-rollback rule applies to *failed*
       turns only; cancellation is its own case.
+      **Scope of "retain prose" (verify, 2026-08-10):** it covers *completed*
+      generations — text the harness had already folded into the context when
+      the turn was cancelled. Prose lost mid-generation, where the abort lands
+      between tokens and nothing has been pushed, is **not** retained: the
+      harness pushes a model turn when the generation ends, so a partial
+      generation is not a block for the commit to keep. The narrower promise is
+      the honest one; retaining a half-decoded generation would also mean
+      carrying text the containment scanner never got to cut (LESSON-500).
+      The dangling call the cancellation *does* have to handle is the one that
+      was fully generated and then parked at the permission gate: its assistant
+      block is committed with the call trimmed off and the prose ahead of it
+      kept.
 - [x] OQ-2 — RESOLVED (architecture D-3, 2026-08-10): **refused, not queued.**
       A second `session/prompt` while a turn is in flight gets a typed
       session-busy error naming the turn that holds the session; the claim
       releases on drop, so an aborted turn cannot wedge it. A queue can be
       layered on later without a wire change (a busy error is retryable).
       Verified by AC-4's test.
-- [ ] OQ-3: Confirm at architecture time that no duty output (titles,
-      summaries, redaction verdicts) should ever join the conversation —
-      BR-6 assumes never; is there a future duty that legitimately should?
+- [x] OQ-3 — RESOLVED (2026-08-10): **it depends on what the duty is for, and
+      the line is already load-bearing.** Two kinds of duty exist and BR-6's
+      original sentence collapsed them.
+      *Out-of-band duties* answer a question **about** a turn and produce
+      nothing the session said: `title` names the session, `classify` picks a
+      route, `redact` judges an outbound payload. None of their output joins
+      the conversation, now or in a future duty of the same shape — an answer
+      about the conversation is not part of it, and letting one in would put
+      harness-authored narration in the model's transcript with nobody having
+      said it.
+      *In-band duties* rewrite conversation content **in place**, and their
+      output is already in the conversation by design: `compact`'s replacement
+      summary is what stands in for the blocks it elides, and `digest`'s
+      condensed tool result is the form in which an oversized result enters
+      context at all. Both are the retained view (BR-1: "as the harness kept
+      them"), both inherit the provenance of what they replace, and both are
+      framed as untrusted data on the way in. Excluding them would mean either
+      carrying the pre-compaction history the budget just dropped or carrying
+      nothing where a tool result was.
+      So the rule is not "duty output never joins" but "**output that is about
+      the conversation never joins; output that is a rewrite of the
+      conversation is the conversation**". BR-6 is reworded to say that.
 - [x] OQ-4 — RESOLVED (product decision, 2026-08-10): **conversation only.**
       Clear empties the conversation and nothing else — REQ-563 session
       taint, the user-pasted-URL set, and session permission grants all
