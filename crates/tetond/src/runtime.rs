@@ -107,16 +107,16 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction, SessionTitled,
-    WebLookup, WebTaintOverridden,
+    BlockCause, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction,
+    SessionTitled, WebLookup, WebTaintOverridden,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
-    TierRouteView, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
-    WebRefreshResult, WebTotalsView,
+    SessionClearParams, SessionClearResult, TierRouteView, WebOverrideParams, WebOverrideResult,
+    WebRefreshOutcome, WebRefreshParams, WebRefreshResult, WebTotalsView,
 };
 use teton_protocol::{
     BindingSource, ConfigurableCategory as ProtoConfigurableCategory, Phase as ProtoPhase,
@@ -2464,6 +2464,83 @@ impl DaemonRuntime {
                 Err(err)
             }
         }
+    }
+
+    /// Empty a session's retained conversation and announce it (`session/clear`,
+    /// REQ-567 BR-8 / architecture D-2).
+    ///
+    /// ## Why a clear takes the turn claim
+    ///
+    /// A turn owns the conversation from [`SessionRegistry::try_begin_turn`]
+    /// until it commits, and [`SessionRegistry::commit_conversation`] replaces
+    /// the **whole** vector (BR-6's atomic unit). So a clear that landed under an
+    /// in-flight turn would be undone moments later by that turn's commit:
+    /// history the user asked to drop would come back, and BR-8's "the next
+    /// prompt starts from the system head alone" would be false with nothing on
+    /// the wire to say so — the worst shape available, since the user was already
+    /// told the clear succeeded.
+    ///
+    /// It is refused rather than queued or best-effort, through the **same**
+    /// claim and the same [`refused_claim_error`] a concurrent `session/prompt`
+    /// takes (D-3): one gate, one classifier, one sentence (LESSON-456). That is
+    /// also where the unknown-session arm comes from — a clear for a session the
+    /// registry does not have is `UNKNOWN_SESSION`, the code the server already
+    /// answers that fact with, not a cheerful `blocks_dropped: 0`.
+    ///
+    /// The claim is held until this returns, so the announcement lands while the
+    /// session is still claimed and a waiting client cannot slip a turn between
+    /// the clear and the event that describes it. Nothing here awaits, so the
+    /// registry lock is taken twice for two vector operations and released
+    /// (LESSON-448).
+    ///
+    /// ## Idempotent, and announced anyway
+    ///
+    /// Clearing an empty session succeeds with `blocks_dropped: 0` and still
+    /// publishes: the event is the user's *action*, not a state transition (the
+    /// one place this departs from [`Self::web_override`]'s announce-on-the-edge
+    /// rule), and every attached client has to stop describing a conversation the
+    /// next prompt will not carry.
+    ///
+    /// ## Conversation only
+    ///
+    /// OQ-4, resolved: session taint, the user-pasted-URL set, and this session's
+    /// remembered permission grants are all untouched — none of them is reachable
+    /// from here, which is why the property is structural rather than checked. A
+    /// routinely-typed clear must never silently widen egress or consent
+    /// (LESSON-495).
+    ///
+    /// # Errors
+    ///
+    /// [`error_code::SESSION_BUSY`] while a turn holds the session, and
+    /// [`error_code::UNKNOWN_SESSION`] for a session the registry does not have.
+    pub fn clear_session(
+        &self,
+        params: &SessionClearParams,
+        sessions: &SessionRegistry,
+        events: &Arc<EventBus>,
+    ) -> Result<SessionClearResult, RpcError> {
+        // The claim id comes off the turn counter, so a clear and a prompt can
+        // never mint the same one, and reads as what holds the session: a client
+        // refused during a clear is told "already running turn clear-4", which is
+        // true and actionable, where a shared `turn-` prefix would name a turn
+        // the user never asked for.
+        let _claim = sessions
+            .try_begin_turn(
+                &params.session_id,
+                &teton_protocol::TurnId::from(format!(
+                    "clear-{}",
+                    self.turn_counter.fetch_add(1, Ordering::SeqCst)
+                )),
+            )
+            .map_err(|err| refused_claim_error(&err))?;
+
+        let blocks_dropped =
+            u64::try_from(sessions.clear_conversation(&params.session_id)).unwrap_or(u64::MAX);
+        events.publish(
+            Some(params.session_id.clone()),
+            Event::ContextCleared(ContextCleared { blocks_dropped }),
+        );
+        Ok(SessionClearResult { blocks_dropped })
     }
 
     /// The route this turn takes, chosen before the harness runs (REQ-558 BR-1).
@@ -14370,17 +14447,30 @@ provider_id = "on-device"
         /// Wait for the permission prompt `tool` raises, so a test knows the
         /// turn is genuinely parked at the gate rather than racing a timer.
         async fn await_permission_prompt(sub: &mut crate::broadcast::Subscription, tool: &str) {
+            let _ = await_permission_request(sub, tool).await;
+        }
+
+        /// The same wait, keeping the request — for a test that has to *answer*
+        /// it and let the parked turn run on to completion.
+        async fn await_permission_request(
+            sub: &mut crate::broadcast::Subscription,
+            tool: &str,
+        ) -> teton_protocol::events::PermissionRequest {
             let waited = tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(envelope) = sub.recv().await {
                     if let Event::PermissionRequest(request) = envelope.event {
                         if request.tool_name == tool {
-                            return;
+                            return Some(request);
                         }
                     }
                 }
+                None
             })
             .await;
-            waited.unwrap_or_else(|_| panic!("no `{tool}` permission prompt arrived"));
+            match waited {
+                Ok(Some(request)) => request,
+                _ => panic!("no `{tool}` permission prompt arrived"),
+            }
         }
 
         // -- AC-1: the conversation reaches the model ------------------------
@@ -14862,6 +14952,403 @@ provider_id = "on-device"
             assert!(
                 seen.lock().expect("recorded-context mutex").is_empty(),
                 "a refused prompt must spend no inference at all"
+            );
+        }
+
+        // -- BR-8: the clear surface ------------------------------------------
+
+        /// Shorthand for the RPC under test (TASK-094).
+        fn clear(
+            runtime: &Arc<DaemonRuntime>,
+            events: &Arc<EventBus>,
+            sessions: &SessionRegistry,
+            session_id: &SessionId,
+        ) -> Result<SessionClearResult, RpcError> {
+            runtime.clear_session(
+                &SessionClearParams {
+                    session_id: session_id.clone(),
+                },
+                sessions,
+                events,
+            )
+        }
+
+        /// Every `context_cleared` currently queued on `sub`, as
+        /// `(envelope session, blocks_dropped)`.
+        ///
+        /// The session comes off the **envelope**, which is where the wire
+        /// carries it — reading it from a payload field would be asserting
+        /// against a shape `events.rs` makes unrepresentable.
+        fn drained_clears(
+            sub: &mut crate::broadcast::Subscription,
+        ) -> Vec<(Option<SessionId>, u64)> {
+            let mut found = Vec::new();
+            while let Some(envelope) = sub.try_recv() {
+                if let Event::ContextCleared(cleared) = envelope.event {
+                    found.push((envelope.session_id, cleared.blocks_dropped));
+                }
+            }
+            found
+        }
+
+        /// A block count as the wire states it.
+        fn as_wire_count(blocks: usize) -> u64 {
+            u64::try_from(blocks).expect("a fixture's block count fits a u64")
+        }
+
+        /// **BR-8, and AC-6's wire half.** A clear on a populated session
+        /// empties it, reports what went, announces it exactly once — and the
+        /// next prompt's context is the system head and that prompt alone.
+        ///
+        /// The count is read off the session's own snapshot rather than
+        /// hard-coded, so the assertion stays about "everything retained" as the
+        /// harness's retention rules move.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_clear_empties_the_conversation_and_announces_what_it_dropped() {
+            let (runtime, seen) = carry_runtime(&[
+                Scripted::Say("The router allows three attempts."),
+                Scripted::Say("I have nothing earlier to go on."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session();
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                None,
+                "how many attempts does the router allow?",
+            )
+            .await
+            .expect("the scripted turn completes");
+            let retained = sessions.conversation_snapshot(&session_id).len();
+            assert!(
+                retained >= 2,
+                "the turn must have retained the exchange this clear is about to \
+                 drop, or the count below is about nothing: {retained}"
+            );
+
+            // Subscribed *after* the turn, so the only events in the channel are
+            // the clear's own — "exactly one" is then a count, not a filter.
+            let mut sub = events.subscribe(64);
+            let result =
+                clear(&runtime, &events, &sessions, &session_id).expect("an idle session clears");
+
+            assert_eq!(
+                result.blocks_dropped,
+                as_wire_count(retained),
+                "the answer must count the blocks that actually went"
+            );
+            assert!(
+                sessions.conversation_snapshot(&session_id).is_empty(),
+                "the clear left blocks behind"
+            );
+
+            let announced = drained_clears(&mut sub);
+            assert_eq!(
+                announced.len(),
+                1,
+                "exactly one context_cleared per clear: {announced:?}"
+            );
+            assert_eq!(
+                announced[0].0.as_ref(),
+                Some(&session_id),
+                "the event must name its session on the envelope"
+            );
+            assert_eq!(
+                announced[0].1, result.blocks_dropped,
+                "the event and the RPC answer disagree about how much went"
+            );
+
+            // AC-6's wire half: the next turn starts from the head alone.
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                None,
+                "what did we establish?",
+            )
+            .await
+            .expect("a cleared session still serves turns");
+
+            let seen = seen.lock().expect("recorded-context mutex").clone();
+            assert_eq!(seen.len(), 2, "one recorded context per turn");
+            let after = &seen[1];
+            assert!(
+                !after.contains("how many attempts does the router allow?"),
+                "the cleared user message came back in the next context: {after}"
+            );
+            assert!(
+                !after.contains("The router allows three attempts."),
+                "the cleared reply came back in the next context: {after}"
+            );
+            assert!(
+                after.contains("what did we establish?"),
+                "the new prompt is missing from its own context"
+            );
+            assert_eq!(
+                after.matches(SYSTEM_HEAD_OPENING).count(),
+                1,
+                "the head is still rebuilt exactly once (BR-7)"
+            );
+        }
+
+        /// **BR-8's idempotence.** A second clear drops nothing, says so, and
+        /// still succeeds — while a clear for a session the registry never had
+        /// is refused as *unknown* rather than answered with a cheerful zero.
+        ///
+        /// The two live together because they are the same question asked twice:
+        /// "nothing to drop" is a fact about a session that exists, and "no such
+        /// session" is not, so they must not answer alike.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_second_clear_drops_nothing_and_an_unknown_session_is_refused() {
+            let (runtime, _seen) = carry_runtime(&[Scripted::Say("Noted.")]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session();
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                None,
+                "remember the retry budget",
+            )
+            .await
+            .expect("the scripted turn completes");
+
+            let first =
+                clear(&runtime, &events, &sessions, &session_id).expect("the first clear succeeds");
+            assert!(
+                first.blocks_dropped > 0,
+                "the first clear had nothing to drop, so the second proves nothing"
+            );
+
+            let mut sub = events.subscribe(64);
+            let second = clear(&runtime, &events, &sessions, &session_id)
+                .expect("clearing an already-empty session still succeeds");
+            assert_eq!(second.blocks_dropped, 0);
+            assert_eq!(
+                drained_clears(&mut sub),
+                vec![(Some(session_id.clone()), 0)],
+                "an empty clear is still the user's action, and still announced"
+            );
+
+            let ghost = runtime
+                .clear_session(
+                    &SessionClearParams {
+                        session_id: SessionId::from("sess-ghost"),
+                    },
+                    &sessions,
+                    &events,
+                )
+                .expect_err("there is no such session to clear");
+            assert_eq!(ghost.code, error_code::UNKNOWN_SESSION);
+            assert_ne!(
+                ghost.code,
+                error_code::SESSION_BUSY,
+                "a session that does not exist is not a session that is busy"
+            );
+        }
+
+        /// **BR-8 under D-3.** A clear issued while a turn is in flight is
+        /// refused with the *same* typed busy error a concurrent prompt gets:
+        /// the turn owns the conversation until it commits, and
+        /// `commit_conversation` replaces the whole vector — so a clear that
+        /// landed underneath would be undone moments later, resurrecting the
+        /// history the user was told had gone.
+        ///
+        /// The turn is then answered rather than aborted, so the tail is about a
+        /// turn that genuinely *completed* and committed: the clear that follows
+        /// has real blocks to drop, and the prompt after it carries none of them.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_clear_during_an_in_flight_turn_is_refused_and_succeeds_after_it() {
+            let (runtime, seen) = carry_runtime(&[
+                Scripted::Say(r#"{"tool": "shell", "arguments": {"command": "echo hi"}}"#),
+                Scripted::Say("The tests pass."),
+                Scripted::Say("I have nothing earlier to go on."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(256);
+            let (sessions, session_id) = one_session();
+
+            let turn = {
+                let runtime = Arc::clone(&runtime);
+                let events = Arc::clone(&events);
+                let sessions = sessions.clone();
+                let session_id = session_id.clone();
+                tokio::spawn(async move {
+                    prompt(
+                        &runtime,
+                        &events,
+                        &sessions,
+                        &session_id,
+                        None,
+                        "run the tests please",
+                    )
+                    .await
+                })
+            };
+            let request = await_permission_request(&mut sub, "shell").await;
+
+            let refused = clear(&runtime, &events, &sessions, &session_id)
+                .expect_err("a clear cannot land under a running turn");
+            assert_eq!(
+                refused.code,
+                error_code::SESSION_BUSY,
+                "a busy session is its own state, not an internal error: {}",
+                refused.message
+            );
+            assert!(
+                refused.message.contains("turn-0"),
+                "the refusal must name the turn holding the session: {}",
+                refused.message
+            );
+            assert!(
+                refused.message.contains(session_id.0.as_str()),
+                "and the session it is about: {}",
+                refused.message
+            );
+            assert!(
+                drained_clears(&mut sub).is_empty(),
+                "a refused clear must announce nothing — a client that rendered \
+                 the notice would show a clear that did not happen"
+            );
+
+            // Let the turn finish: the tool runs, the model answers, the
+            // conversation commits.
+            runtime.pending.resolve(
+                &request.request_id,
+                teton_protocol::methods::PermissionOutcome::Selected {
+                    option_id: "allow_once".to_owned(),
+                },
+            );
+            turn.await
+                .expect("the turn task joins")
+                .expect("the answered turn completes");
+            assert!(
+                !sessions.conversation_snapshot(&session_id).is_empty(),
+                "the refused clear (or the turn) left nothing to clear afterwards"
+            );
+
+            let cleared = clear(&runtime, &events, &sessions, &session_id)
+                .expect("the session is free the moment its turn commits");
+            assert!(
+                cleared.blocks_dropped > 0,
+                "the refusal was honoured, so this clear had the turn's blocks \
+                 to drop"
+            );
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                None,
+                "what did we just run?",
+            )
+            .await
+            .expect("a cleared session still serves turns");
+
+            let seen = seen.lock().expect("recorded-context mutex").clone();
+            let after = seen.last().expect("the last turn recorded its context");
+            assert!(
+                !after.contains("run the tests please"),
+                "the cleared conversation came back in the next context: {after}"
+            );
+            assert!(
+                !after.contains("The tests pass."),
+                "the cleared reply came back in the next context: {after}"
+            );
+        }
+
+        /// **OQ-4, resolved: the conversation and nothing else.**
+        ///
+        /// After a clear the session's privacy taint still pins it to the local
+        /// tier, and a permission grant the user gave still answers without
+        /// re-asking. Both are guard assertions rather than descriptions of
+        /// today's code — nothing in `clear_session` can reach either — and that
+        /// is exactly what they are for: a later "clear resets the session"
+        /// change would be typed routinely, would widen egress and consent
+        /// silently, and would look like tidying up (LESSON-495).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_clear_leaves_the_session_taint_and_its_permission_grants_alone() {
+            use crate::harness::PermissionDecision;
+
+            let (runtime, _seen) = carry_runtime(&[Scripted::Say("Noted.")]);
+            let events = Arc::new(EventBus::new());
+            let (sessions, session_id) = one_session();
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                None,
+                "remember the retry budget",
+            )
+            .await
+            .expect("the scripted turn completes");
+
+            // A tainted session: pinned to the local tier for every later turn
+            // (`is_tainted` is the one read every route consult makes).
+            assert!(
+                !runtime.session_taint.is_tainted(&session_id),
+                "the fixture must start clean, or the assertion after the clear \
+                 is about a pin that was always there"
+            );
+            runtime.session_taint.mark(&session_id);
+
+            // …and a grant the user gave once, for the session. Earned through a
+            // real prompt, which is the non-vacuity leg: the gate demonstrably
+            // asks when it has no grant to answer from.
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let gate = runtime.permission_gate_for(&session_id, &events, &config);
+            let mut asking = events.subscribe(64);
+            let decide = gate.authorize("shell", None);
+            let answer = async {
+                let request = loop {
+                    let envelope = asking.recv().await.expect("the gate raised no prompt");
+                    if let Event::PermissionRequest(request) = envelope.event {
+                        break request;
+                    }
+                };
+                runtime.pending.resolve(
+                    &request.request_id,
+                    teton_protocol::methods::PermissionOutcome::Selected {
+                        option_id: "allow_always".to_owned(),
+                    },
+                );
+            };
+            let (granted, ()) = tokio::join!(decide, answer);
+            assert_eq!(granted, PermissionDecision::Allowed);
+
+            clear(&runtime, &events, &sessions, &session_id).expect("the clear succeeds");
+
+            assert!(
+                runtime.session_taint.is_tainted(&session_id),
+                "the clear un-pinned a tainted session — every later turn on it \
+                 could route remote with boundary content still in the user's head"
+            );
+
+            // The same gate, still holding the grant: asked again it answers
+            // from memory and publishes no second prompt.
+            let mut after = events.subscribe(64);
+            let gate_after = runtime.permission_gate_for(&session_id, &events, &config);
+            assert!(
+                Arc::ptr_eq(&gate, &gate_after),
+                "the clear dropped the session's permission gate"
+            );
+            assert_eq!(
+                gate_after.authorize("shell", None).await,
+                PermissionDecision::Allowed
+            );
+            let asked_again = std::iter::from_fn(|| after.try_recv())
+                .any(|envelope| matches!(envelope.event, Event::PermissionRequest(_)));
+            assert!(
+                !asked_again,
+                "the clear dropped the session grant and the user was asked again"
             );
         }
     }

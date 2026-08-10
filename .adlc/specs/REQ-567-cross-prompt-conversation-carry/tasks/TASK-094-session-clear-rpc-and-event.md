@@ -1,7 +1,7 @@
 ---
 id: TASK-094
 title: "session/clear RPC + context_cleared event + spec erratum"
-status: draft
+status: complete
 parent: REQ-567
 created: 2026-08-10
 updated: 2026-08-10

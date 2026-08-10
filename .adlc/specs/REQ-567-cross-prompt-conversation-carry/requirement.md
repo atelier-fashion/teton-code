@@ -78,9 +78,10 @@ tokens.
 |-------|---------|---------|
 | context_cleared | user clears the session's conversation | session_id, blocks_dropped (count) |
 
-No new RPCs and no change to `session/prompt`'s wire shape. Carry is visible
-through existing surfaces: REQ-564's `prefix_cache_*` events and BR-9 ledger
-counts at prompt boundaries, and the assembled-context behavior itself.
+One new RPC, `session/clear` (architecture D-2); `session/prompt`'s wire shape
+is unchanged. Carry is visible through existing surfaces: REQ-564's
+`prefix_cache_*` events and BR-9 ledger counts at prompt boundaries, and the
+assembled-context behavior itself.
 
 ### Permissions
 

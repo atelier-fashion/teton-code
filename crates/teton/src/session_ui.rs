@@ -366,6 +366,24 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+        Event::ContextCleared(cleared) => {
+            // REQ-567 BR-8. Never verbose-gated: a clear changes what every
+            // later prompt starts from, and a second attached client that did
+            // not type the command would otherwise watch the conversation reset
+            // in silence — the case `web_taint_overridden`'s notice exists for,
+            // without its gate, because there the issuing client's own RPC
+            // answer is the authoritative line and here the reset is the news.
+            //
+            // It says the conversation and nothing else, because that is all a
+            // clear drops (OQ-4): the session's taint pin, pasted URLs and
+            // permission grants survive, and a line that read "session reset"
+            // would be telling the user their consent had been re-asked for.
+            surface.line(
+                LineKind::Notice,
+                &format_context_cleared(cleared.blocks_dropped),
+            );
+            EventOutcome::Rendered
+        }
         Event::PrefixCache(cache) => {
             // Diagnostic chrome, not news: prefix reuse is a pure latency
             // optimization and BR-1 makes it unobservable in output, so a user
@@ -378,6 +396,20 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+    }
+}
+
+/// The one-line notice a `context_cleared` event draws (REQ-567 BR-8).
+///
+/// The count is stated even when it is zero, and singular/plural is worth the
+/// branch: "cleared 0 blocks" and "there was nothing to clear" are the same
+/// fact, and only the second reads as an answer to a command the user just
+/// typed.
+fn format_context_cleared(blocks_dropped: u64) -> String {
+    match blocks_dropped {
+        0 => "context cleared; there was nothing retained to drop.".to_owned(),
+        1 => "context cleared; 1 retained block dropped.".to_owned(),
+        n => format!("context cleared; {n} retained blocks dropped."),
     }
 }
 

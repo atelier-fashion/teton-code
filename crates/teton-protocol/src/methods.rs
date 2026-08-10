@@ -118,6 +118,42 @@ impl RpcMethod for SessionAttachParams {
     type Result = SessionAttachResult;
 }
 
+/// Empty a session's retained conversation (REQ-567 BR-8, architecture D-2).
+///
+/// No ACP equivalent — ACP has no clear, and a bespoke addition is ADR-002's
+/// expected shape. It exists because carry makes the conversation *daemon*
+/// state: a client-local `/clear` would be a lie, since the next
+/// `session/prompt` would still be seeded from the daemon's copy.
+///
+/// **User-only, by construction** (BR-8). The method is reachable from client
+/// RPC dispatch and from nowhere else: no tool in the registry wraps it, so a
+/// model that emits a tool call named `session/clear` finds no such tool — the
+/// same channel argument [`WebOverrideParams`] rests on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionClearParams {
+    /// The session whose conversation is dropped.
+    pub session_id: SessionId,
+}
+
+/// Result of [`SessionClearParams`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionClearResult {
+    /// How many retained blocks the clear dropped; `0` when the session had
+    /// nothing to say yet.
+    ///
+    /// Reported rather than acknowledged silently: without it a user cannot
+    /// tell "cleared a long conversation" from "cleared one that was already
+    /// empty", and those are the two things they are most likely to want to
+    /// know. It counts *retained blocks*, never tokens — the conversation's
+    /// unit of storage, and the only one the daemon can state exactly.
+    pub blocks_dropped: u64,
+}
+
+impl RpcMethod for SessionClearParams {
+    const METHOD: &'static str = "session/clear";
+    type Result = SessionClearResult;
+}
+
 // ---------------------------------------------------------------------------
 // prompt turn
 // ---------------------------------------------------------------------------
