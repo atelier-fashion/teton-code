@@ -569,6 +569,7 @@ pub async fn run_session_turn_with_source(
             decision,
             dropped_calls,
             cache,
+            call_in_text,
             ..
         } = produced;
         // Exactly one prefix-cache event per local turn, emitted here on the
@@ -629,7 +630,19 @@ pub async fn run_session_turn_with_source(
             }
 
             TurnDecision::ToolCall { name, arguments } => {
-                ctx.push_model(text.clone());
+                // REQ-567 OQ-1: the block is pushed here and the permission gate
+                // is awaited below, so this is where a cancellation finds it.
+                // Whether the harness may later cut a call out of this text is
+                // decided by the source that produced it — the local tier parsed
+                // the call *from* the text, a remote provider delivered it
+                // beside the text — and is recorded now, while the answer is
+                // known. Re-deriving it at commit time would read a remote
+                // turn's ordinary JSON-quoting prose as a call and truncate it.
+                if call_in_text {
+                    ctx.push_model_call(text.clone());
+                } else {
+                    ctx.push_model(text.clone());
+                }
                 let call = ToolCall {
                     id: format!("call-{turns}"),
                     name: name.clone(),
@@ -668,6 +681,17 @@ pub async fn run_session_turn_with_source(
                     }
                     PermissionDecision::Allowed => {
                         let outcome = tools.dispatch(&name, tool_ctx, &arguments);
+                        // REQ-567 OQ-1: the tool has RUN. Everything from here
+                        // to the fold below awaits — the tool's own duty, then
+                        // `digest` — and a cancellation landing in one of those
+                        // awaits must commit the call block as the honest trace
+                        // of what happened. An `edit` that reached the disk
+                        // reached it; trimming the call that made it would leave
+                        // a conversation denying an edit the repo is holding,
+                        // which is a worse trace than a call whose result never
+                        // arrived. OQ-1 drops tool work that never ran, not tool
+                        // work whose result was lost.
+                        ctx.resolve_pending_call();
                         events.tool_finished(&call.id, !outcome.is_error);
 
                         if name == "edit" && !outcome.is_error {
@@ -1025,7 +1049,7 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use teton_inference::ChatFormat;
+    use teton_inference::{ChatFormat, MockEngine};
     use teton_providers::TokenUsage;
 
     use crate::egress::Provenance as EgressProvenance;
@@ -1082,6 +1106,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 dropped_calls: 0,
                 cache: None,
+                call_in_text: false,
             })
         }
     }
@@ -1144,12 +1169,15 @@ mod tests {
                     },
                 )
             };
+            // The local tier's shape: the call is in the reply text.
+            let call_in_text = matches!(decision, TurnDecision::ToolCall { .. });
             Ok(SourceTurn {
                 text,
                 decision,
                 usage: TokenUsage::default(),
                 dropped_calls: 0,
                 cache: None,
+                call_in_text,
             })
         }
     }
@@ -1233,6 +1261,215 @@ mod tests {
             ctx.estimated_bytes() <= BUDGET_BYTES,
             "the turn ended {} bytes over its budget with a `compact` duty that never served",
             ctx.estimated_bytes() - BUDGET_BYTES
+        );
+    }
+
+    /// A source that calls a tool once, whose reply text is the same prose
+    /// either way and whose `call_in_text` says where the call came from.
+    ///
+    /// The text quotes tool-call-*shaped* JSON on purpose: it is what a model
+    /// naming a crate writes, and it is what a trim that re-derived "is there a
+    /// call here" from the text would cut the block at.
+    struct ParkingSource {
+        call_in_text: bool,
+    }
+
+    const PARKED_PROSE: &str = r#"The manifest pins {"name": "serde", "version": "1"}."#;
+
+    #[async_trait]
+    impl CompletionSource for ParkingSource {
+        fn chat_format(&self) -> ChatFormat {
+            ChatFormat::Flat
+        }
+
+        async fn produce_turn(
+            &mut self,
+            _prompt: &PreparedPrompt,
+            _provenance: &EgressProvenance,
+            _config: &HarnessConfig,
+            _tools: &ToolRegistry,
+            _exposed: &[&str],
+            _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            Ok(SourceTurn {
+                text: PARKED_PROSE.to_owned(),
+                decision: TurnDecision::ToolCall {
+                    name: "read".to_owned(),
+                    arguments: serde_json::json!({ "path": "Cargo.toml" }),
+                },
+                usage: TokenUsage::default(),
+                dropped_calls: 0,
+                cache: None,
+                call_in_text: self.call_in_text,
+            })
+        }
+    }
+
+    /// Drive the loop until it parks at an unanswered permission prompt, drop it
+    /// there, and report whether the context is left holding an undispatched
+    /// call.
+    ///
+    /// Polled by hand rather than raced against a timer: everything before the
+    /// gate is ready on the first poll, so one poll returning `Pending` *is* the
+    /// state "parked at the gate" — no wall-clock window to go flaky under CI
+    /// scheduler pressure (LESSON-450).
+    fn pending_call_when_dropped_at_the_gate(call_in_text: bool) -> bool {
+        let session_id = SessionId::from("oq1-park");
+        let bus = Arc::new(EventBus::new());
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            // `ask`, with nobody to answer: `read` is auto-allowed by the
+            // permissive config, so this is what makes the loop park.
+            PermissionConfig::with_default(super::super::permissions::PermissionPolicy::Ask),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig::default();
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
+        ctx.push_user("what does the manifest pin");
+
+        let digest = DutyRoute::unresolved("no digest route in this test");
+        let compact = DutyRoute::unresolved("no compact route in this test");
+        let triage = DutyRoute::unresolved("no triage route in this test");
+        let shell = DutyRoute::unresolved("no shell route in this test");
+        let duties = ToolDuties {
+            triage: &triage,
+            shell: &shell,
+        };
+        let mut source = ParkingSource { call_in_text };
+        {
+            let mut turn = Box::pin(run_session_turn_with_source(
+                &mut source,
+                &tools,
+                &tool_ctx,
+                &gate,
+                &events,
+                &mut ctx,
+                &config,
+                &mut hook,
+                &digest,
+                &compact,
+                &duties,
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(turn.as_mut(), &mut cx).is_pending(),
+                "the fixture must park at the permission gate, not finish"
+            );
+            // The client disconnected: the turn is dropped where it stands.
+        }
+
+        assert_eq!(
+            ctx.blocks().last().map(|b| b.text.as_str()),
+            Some(PARKED_PROSE),
+            "non-vacuity: the parked turn must have pushed its reply"
+        );
+        ctx.pending_tool_call()
+    }
+
+    /// **REQ-567 OQ-1's scope, at the wiring.** Whether a cancellation may cut a
+    /// call out of the trailing block is decided by the *source*, not by
+    /// re-reading the text — and the loop is what carries that answer across.
+    ///
+    /// Two turns that are byte-identical in context differ only in where their
+    /// call came from: the local tier parsed it out of the text (so the text
+    /// holds it, and OQ-1 trims it), a remote provider delivered it as a
+    /// structured event (so the text is prose, and there is nothing to trim).
+    /// Hard-wiring either answer turns exactly one of these red.
+    #[tokio::test]
+    async fn only_a_call_the_source_found_in_the_text_is_left_pending_at_the_gate() {
+        assert!(
+            pending_call_when_dropped_at_the_gate(true),
+            "a local turn parked at the gate must leave its call pending, or the \
+             cancellation commits a call the transcript never answers"
+        );
+        assert!(
+            !pending_call_when_dropped_at_the_gate(false),
+            "a remote turn's prose was marked as holding a call: the cancellation \
+             trim would truncate it at the JSON it merely quotes"
+        );
+    }
+
+    /// **REQ-567 OQ-1's other edge, at the wiring.** Dispatch is not the end of
+    /// the iteration — the tool's own duty and then `digest` both await before
+    /// the result is folded — so a cancellation can land in that window with the
+    /// call block still on the end. By then the tool has *run*: an `edit` is on
+    /// the disk. The loop must have already said so, or the commit trims a call
+    /// whose effects the repository is holding.
+    ///
+    /// The park point is the `digest` await, reached by pinning the threshold to
+    /// one token and giving the duty a local route — `spawn_blocking` is pending
+    /// on its first poll whatever the engine does, so this needs no timing.
+    #[tokio::test]
+    async fn a_dispatched_call_stops_being_pending_before_the_loop_awaits_again() {
+        let session_id = SessionId::from("oq1-dispatched");
+        let bus = Arc::new(EventBus::new());
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig {
+            // Everything is oversized, so the fold always goes through `digest`.
+            summarize_threshold_tokens: 1,
+            ..HarnessConfig::default()
+        };
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
+        ctx.push_user("read nope.txt");
+
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(MockEngine::with_response(
+            "mock-3b",
+            "CONDENSED",
+        )));
+        let digest = DutyRoute::local(DIGEST_DUTY, "local", engine);
+        let compact = DutyRoute::unresolved("no compact route in this test");
+        let triage = DutyRoute::unresolved("no triage route in this test");
+        let shell = DutyRoute::unresolved("no shell route in this test");
+        let duties = ToolDuties {
+            triage: &triage,
+            shell: &shell,
+        };
+        let mut source = ToolThenEndSource { calls: 0 };
+        {
+            let mut turn = Box::pin(run_session_turn_with_source(
+                &mut source,
+                &tools,
+                &tool_ctx,
+                &gate,
+                &events,
+                &mut ctx,
+                &config,
+                &mut hook,
+                &digest,
+                &compact,
+                &duties,
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(turn.as_mut(), &mut cx).is_pending(),
+                "the fixture must park in the duty await, not finish"
+            );
+        }
+
+        assert_eq!(
+            ctx.blocks().last().map(|b| b.role),
+            Some(crate::harness::context::BlockRole::Assistant),
+            "non-vacuity: the turn must be parked between dispatch and the fold, \
+             with the call block still on the end"
+        );
+        assert!(
+            !ctx.pending_tool_call(),
+            "the loop still calls this call pending after dispatching it: a \
+             cancellation here would trim the call of a tool that already ran"
         );
     }
 
@@ -1698,12 +1935,15 @@ mod tests {
                     },
                 )
             };
+            // The local tier's shape: the call is in the reply text.
+            let call_in_text = matches!(decision, TurnDecision::ToolCall { .. });
             Ok(SourceTurn {
                 text,
                 decision,
                 usage: TokenUsage::default(),
                 dropped_calls: 0,
                 cache: None,
+                call_in_text,
             })
         }
     }

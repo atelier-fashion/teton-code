@@ -280,6 +280,14 @@ pub struct RetainedContext {
 impl RetainedContext {
     /// A retained context that is nothing but blocks — the shape a test or a
     /// hand-built fixture makes.
+    ///
+    /// **Test-only, deliberately.** [`ContextManager::into_retained`] promises
+    /// there is no blocks-only exit beside it, because two ways out is how one
+    /// of them ends up carrying less than the other — and this constructor is
+    /// exactly that second way, defaulting away both facts that live beside the
+    /// blocks. `#[cfg(test)]` is what makes the promise checkable rather than
+    /// merely stated: production code that reached for it does not compile.
+    #[cfg(test)]
     #[must_use]
     pub fn from_blocks(blocks: Vec<ContextBlock>) -> Self {
         Self {
@@ -317,6 +325,20 @@ impl RetainedContext {
     /// trim of incomplete work does (REQ-567 OQ-1).
     pub fn set_blocks(&mut self, blocks: Vec<ContextBlock>) {
         self.blocks = blocks;
+    }
+
+    /// Absorb the egress provenance of a block this context is about to lose,
+    /// the same way [`ContextManager::truncate_to_budget`] does for a block it
+    /// drops (BR-3).
+    ///
+    /// The counterpart of [`Self::set_blocks`]: anything that removes a block
+    /// after the manager is gone owes the [`DroppedProvenance`] accumulator the
+    /// same thing the manager would have owed it. Non-tool blocks contribute
+    /// nothing ([`DroppedProvenance::absorb`]), so calling this unconditionally
+    /// is correct and is what keeps a caller from having to reason about which
+    /// roles carry provenance.
+    pub fn absorb_dropped(&mut self, provenance: &Provenance) {
+        self.dropped.absorb(provenance);
     }
 }
 
@@ -383,6 +405,18 @@ pub struct ContextManager {
     /// The request this manager's turn is serving — see
     /// [`ContextManager::request`].
     request: String,
+    /// Whether the **last** block is a model turn whose text embeds a tool call
+    /// that has not been dispatched (REQ-567 OQ-1).
+    ///
+    /// Explicit state, maintained by the one loop that can know it, rather than
+    /// a fact re-derived from the text at commit time: "is this block a call"
+    /// has no answer that reading the text can give, because a *remote* turn's
+    /// call never appears in its text and its prose may still be tool-call
+    /// shaped. See [`Self::push_model_call`].
+    ///
+    /// Every push resets it and only `push_model_call` sets it, so it describes
+    /// the block on the end and nothing else.
+    pending_tool_call: bool,
 }
 
 /// What this manager has already spent on `compact`, and what that buys the rest
@@ -523,6 +557,7 @@ impl ContextManager {
             dropped: DroppedProvenance::default(),
             compaction: CompactionGate::default(),
             request: String::new(),
+            pending_tool_call: false,
         }
     }
 
@@ -561,6 +596,7 @@ impl ContextManager {
     pub fn push_user(&mut self, text: impl Into<String>) {
         let text = text.into();
         self.request.clone_from(&text);
+        self.pending_tool_call = false;
         self.blocks.push(ContextBlock {
             role: BlockRole::User,
             text,
@@ -570,11 +606,61 @@ impl ContextManager {
 
     /// Append an assistant turn.
     pub fn push_model(&mut self, text: impl Into<String>) {
+        self.pending_tool_call = false;
         self.blocks.push(ContextBlock {
             role: BlockRole::Assistant,
             text: text.into(),
             provenance: Provenance::Model,
         });
+    }
+
+    /// Append an assistant turn whose text **embeds a tool call that has not
+    /// run yet** (REQ-567 OQ-1).
+    ///
+    /// The block itself is an ordinary model turn — same role, same provenance,
+    /// same rendering. What is different is what the harness knows about it, and
+    /// this is the only way to record that: the turn loop pushes the reply
+    /// *before* it awaits the permission gate, so a turn cancelled at the gate
+    /// leaves this block on the end with its call unanswered, and the commit
+    /// trims it ([`crate::carry`]).
+    ///
+    /// One call rather than a push followed by a flag, because the two facts
+    /// arrive together and a caller that performed the first and forgot the
+    /// second would commit a dangling call. Its counterpart is
+    /// [`Self::resolve_pending_call`], and pushing anything else clears the flag
+    /// too — a block with a result after it is answered work.
+    ///
+    /// **Only a call the loop found in the text.** A remote provider's call
+    /// arrives as a structured event and is not in this text
+    /// ([`SourceTurn::call_in_text`](super::completion::SourceTurn::call_in_text)),
+    /// so such a turn is pushed through [`Self::push_model`]: nothing in it is
+    /// the harness's to cut.
+    pub fn push_model_call(&mut self, text: impl Into<String>) {
+        self.push_model(text);
+        self.pending_tool_call = true;
+    }
+
+    /// The call in the trailing model block was dispatched: it is no longer
+    /// pending (REQ-567 OQ-1).
+    ///
+    /// Called the instant the tool returns, which is **before** the result is
+    /// folded — the refine and digest duties both await in between, and a
+    /// cancellation landing in one of those awaits must not trim a call whose
+    /// tool has already run. An `edit` that reached the disk is on the disk; a
+    /// conversation that denies having asked for it is a worse trace than one
+    /// holding a call whose result never arrived.
+    ///
+    /// Idempotent, and implied by every later push — this exists for the window
+    /// where the tool has run and nothing has been pushed yet.
+    pub fn resolve_pending_call(&mut self) {
+        self.pending_tool_call = false;
+    }
+
+    /// Whether the trailing model block embeds a call that never ran
+    /// (REQ-567 OQ-1) — what the cancellation commit gates its trim on.
+    #[must_use]
+    pub fn pending_tool_call(&self) -> bool {
+        self.pending_tool_call
     }
 
     /// Append a tool result, tagged with the tool and (optionally) the single
@@ -604,6 +690,10 @@ impl ContextManager {
         text: impl Into<String>,
     ) {
         let tool = tool.into();
+        // A result is an answer: whatever call preceded it is no longer pending
+        // (REQ-567 OQ-1). This covers the denied-tool and malformed-call folds,
+        // which push a result without ever dispatching anything.
+        self.pending_tool_call = false;
         self.blocks.push(ContextBlock {
             role: BlockRole::Tool,
             text: text.into(),
@@ -1022,6 +1112,22 @@ impl ContextManager {
     /// it would be laundered. So a summary of a `local-only` file is still
     /// boundary-protected and a summary of an unknown-provenance `shell` result
     /// is still unknown — a summary of a secret is a secret.
+    ///
+    /// ## Why `Unknown` may swallow the named sources here
+    ///
+    /// [`ToolProvenance`] is one-or-the-other, so a summary of a conversation
+    /// holding both a `shell` result and a `read` of `a.rs` collapses to
+    /// `Unknown` and stops naming `a.rs`. [`DroppedProvenance`] deliberately
+    /// refuses that collapse — it keeps the pair, because it is *accumulating*
+    /// across a whole session and a set that lost its members could never get
+    /// them back. This is the opposite situation and the collapse is sound in
+    /// it: the two values meet again at one choke point
+    /// ([`context_provenance`](super::completion::context_provenance) →
+    /// `Egress`), where `Unknown` fails closed at least as hard as any path set
+    /// would — every send this block could have permitted under
+    /// `Sources({a.rs})` is refused under `Unknown`. The collapse can only ever
+    /// make this block *more* restrictive, never less, which is the only
+    /// direction a provenance may be rounded.
     fn compaction_summary(&self, compaction: &Compaction) -> Option<ContextBlock> {
         let mut summary = compaction.summary().to_owned();
         summary.truncate(super::reply::ReplyScanner::scan_control_tokens(&summary).context_cut());

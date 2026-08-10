@@ -550,6 +550,33 @@ impl SessionTaint {
             .insert(session.clone())
     }
 
+    /// The same mark, on a path that must not panic (REQ-567 verify).
+    ///
+    /// The twin of
+    /// [`SessionRegistry::try_commit_conversation`](crate::sessions::SessionRegistry::try_commit_conversation)
+    /// and it exists for the same reason: the cancellation commit runs from
+    /// `Drop`, a panic raised inside a drop that is itself running because of a
+    /// panic aborts the whole daemon, and this pin is evaluated on that path
+    /// ([`CarriedTurn::commit_now`](crate::carry::CarriedTurn)). A poisoned
+    /// taint mutex must therefore not be an `expect`.
+    ///
+    /// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner) is sound
+    /// for *this* mutation specifically: the set is a plain `HashSet` of ids
+    /// with no invariant spanning two operations, so a writer that panicked
+    /// mid-insert left it consistent — and the fail-closed direction is to
+    /// insert anyway. Refusing to pin because a lock was poisoned is precisely
+    /// the failure this must not have.
+    ///
+    /// The explicit path keeps [`Self::mark`]'s `expect`: a poisoned set there
+    /// is a bug to surface loudly, on a stack where surfacing it is safe.
+    pub fn try_mark(&self, session: &SessionId) -> bool {
+        let mut tainted = match self.tainted.lock() {
+            Ok(tainted) => tainted,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tainted.insert(session.clone())
+    }
+
     /// Whether `session` is pinned to the local tier by a prior boundary/unknown
     /// exposure.
     #[must_use]

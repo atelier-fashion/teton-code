@@ -12,12 +12,13 @@
 //! implementation and both callers consume it, which makes that mutation
 //! impossible to hide.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use teton_core::entities::PrivacyBoundary;
 use teton_protocol::SessionId;
 
-use crate::harness::context::{BlockRole, ContextBlock, ContextManager, Provenance};
+use crate::harness::context::{BlockRole, ContextManager, Provenance, RetainedContext};
 use crate::harness::reply::prose_before_tool_call;
 use crate::harness::turn_loop::HarnessConfig;
 use crate::runtime::{context_is_sensitive, taint_pin_line, SessionTaint, TAINT_BY_CONTEXT};
@@ -44,7 +45,8 @@ use crate::sessions::SessionRegistry;
 /// - **failed** ([`Self::abandon`]): disarm and write nothing. Commit is the
 ///   only writer, so a failed turn rolls back by never having written (BR-6).
 /// - **cancelled** (armed [`Drop`], not panicking): commit what the manager
-///   holds, minus any dangling tool call (OQ-1 — see [`Self::commit_now`]).
+///   holds, minus a tool call that was parked and never dispatched (OQ-1 — see
+///   [`Self::commit_now`]).
 /// - **panicked** (armed [`Drop`] while unwinding): write nothing. A panicking
 ///   turn is a *failed* turn, and BR-6 says a failed turn leaves no trace.
 ///
@@ -164,18 +166,51 @@ impl CarriedTurn {
     /// read: the next prompt would carry the content and route remote. So the
     /// evaluation is bound to the commit, fail-closed, and a `Drop` gets it too.
     ///
-    /// ## The dangling-call trim (OQ-1)
+    /// ## The budget (BR-4)
     ///
-    /// The loop pushes the model's text — which, on a tool-calling reply, *is*
-    /// the call — before it awaits the permission gate. A turn cancelled while
-    /// parked at that gate therefore holds a trailing assistant block containing
-    /// a call that was never answered, and committing it would leave the next
-    /// prompt opening on a question the transcript never resolves. OQ-1's
+    /// The context is measured one last time before it is handed over, so that
+    /// **a stored `Conversation` fits the budget** is an invariant of the store
+    /// rather than a property the last turn happened to leave behind. The loop's
+    /// own gate runs at the top of each iteration, which covers every
+    /// conversation a *completed* turn commits; a cancelled one can be dropped
+    /// after a fold and before the next iteration measures it, and the block it
+    /// grew by would otherwise be replayed into the next prompt unmeasured.
+    ///
+    /// ## The undispatched-call trim (OQ-1)
+    ///
+    /// The loop pushes the model's text — which, on a *local* tool-calling
+    /// reply, contains the call — before it awaits the permission gate. A turn
+    /// cancelled while parked at that gate therefore holds a trailing assistant
+    /// block whose call was never answered, and committing it would leave the
+    /// next prompt opening on a question the transcript never resolves. OQ-1's
     /// product decision is "retain prose, drop incomplete tool work", so on the
-    /// cancellation path the call is cut off the end of that block through the
-    /// same parser the loop dispatches with ([`prose_before_tool_call`]); what
-    /// the model wrote *before* the call is completed prose and stays, and a
-    /// block left with nothing but the call is dropped whole.
+    /// cancellation path the call is cut off the end of that block
+    /// ([`prose_before_tool_call`]); what the model wrote *before* the call is
+    /// completed prose and stays, and a block left with nothing but the call is
+    /// dropped whole.
+    ///
+    /// ### It fires only where the loop says there is a call to cut
+    ///
+    /// The trim is gated on
+    /// [`ContextManager::pending_tool_call`](crate::harness::context::ContextManager::pending_tool_call),
+    /// which the turn loop sets when it pushes a block whose text embeds an
+    /// undispatched call and clears the moment the tool returns. It is
+    /// deliberately **not** re-derived here by asking whether the trailing text
+    /// parses as a call, because that question has two wrong answers:
+    ///
+    /// - A *remote* turn's call arrives as a structured `TurnEvent::ToolCall`
+    ///   and is never in the text, so a cancelled remote turn whose prose
+    ///   happens to quote `{"name": "serde", "version": "1"}` would be truncated
+    ///   at that JSON — discarding it and everything after, content the user
+    ///   watched stream.
+    /// - A call whose tool **already ran** is not incomplete work. A
+    ///   cancellation landing in the refine or digest awaits that follow
+    ///   dispatch commits the call block as it stands: an `edit` that reached
+    ///   the disk reached it, and a conversation that denies having asked for it
+    ///   is a worse trace than one holding a call whose result never arrived.
+    ///   Such a conversation can therefore carry a dispatched-but-unfolded call
+    ///   — the honest record of exactly what happened. OQ-1's "incomplete tool
+    ///   work" means work that never ran.
     ///
     /// The committed conversation therefore ends at the last complete exchange —
     /// possibly on the user's own message, which is correct and stays: the user
@@ -185,25 +220,33 @@ impl CarriedTurn {
     /// `panicking` is the one state that writes nothing: a panicking turn is a
     /// failed turn (BR-6), not a cancelled one.
     fn commit_now(&mut self, cancelled: bool, panicking: bool) {
-        let Some(ctx) = self.ctx.take() else {
+        let Some(mut ctx) = self.ctx.take() else {
             return;
         };
         if panicking {
             return;
         }
-        // Read before the manager is consumed, and before any trim: the pin is
-        // about what this turn's context *was*, not about what survives OQ-1's
-        // edit — a call the user never answered was still assembled from, and
-        // shown, whatever the conversation had read.
-        if context_is_sensitive(&ctx, &self.boundaries) && self.taint.mark(&self.session_id) {
-            eprintln!("{}", taint_pin_line(TAINT_BY_CONTEXT));
+        // Read before the manager is shrunk or consumed, and before any trim:
+        // the pin is about what this turn's context *was*, not about what
+        // survives OQ-1's edit — a call the user never answered was still
+        // assembled from, and shown, whatever the conversation had read.
+        //
+        // `try_mark` and a swallowed write, not `mark` and `eprintln!`: this
+        // runs from `Drop`, and a panic raised inside a drop that is itself
+        // unwinding aborts the daemon. A poisoned taint mutex and a closed
+        // stderr are both survivable; neither is worth the whole process.
+        if context_is_sensitive(&ctx, &self.boundaries) && self.taint.try_mark(&self.session_id) {
+            let _ = writeln!(std::io::stderr(), "{}", taint_pin_line(TAINT_BY_CONTEXT));
         }
+        // BR-4, at the seam that makes it an invariant of the store rather than
+        // of the last writer. Unconditional and ahead of the trim, for the same
+        // reason the loop's own gate is unconditional: what enforces a budget is
+        // never allowed to be skipped by a path.
+        ctx.truncate_to_budget();
+        let pending_call = ctx.pending_tool_call();
         let mut retained = ctx.into_retained();
-        if cancelled {
-            let mut blocks = retained.blocks().to_vec();
-            if trim_dangling_tool_call(&mut blocks) {
-                retained.set_blocks(blocks);
-            }
+        if cancelled && pending_call {
+            trim_dangling_tool_call(&mut retained);
         }
         // The non-panicking twin, because this is also the drop path: a panic
         // raised inside a drop that is running because of a panic aborts the
@@ -213,29 +256,44 @@ impl CarriedTurn {
     }
 }
 
-/// Cut a trailing, unanswered tool call off the end of `blocks`, reporting
-/// whether anything changed (REQ-567 OQ-1).
+/// Cut an undispatched tool call off the end of `retained` (REQ-567 OQ-1).
 ///
-/// Only the **last** block is considered, and only when it is the assistant's:
-/// a call anywhere earlier was answered by the tool block after it, and a
-/// trailing user or tool block is complete work by construction.
-fn trim_dangling_tool_call(blocks: &mut Vec<ContextBlock>) -> bool {
+/// The caller has already established that there *is* one — the turn loop said
+/// so when it pushed the block — so this only has to find where the call starts
+/// and edit around it. Only the **last** block is touched: a call anywhere
+/// earlier was answered by the tool block after it.
+///
+/// The role/provenance guard is a consistency check on that claim rather than
+/// the decision itself, and the block's provenance is absorbed into the retained
+/// [`DroppedProvenance`](crate::harness::context::DroppedProvenance) either way.
+/// That absorb is a no-op for the `Model` block this always finds today, which
+/// is the point: it means nothing here depends on the guard being right, so a
+/// future call shape that *does* carry provenance cannot be laundered out of the
+/// conversation by this edit (BR-3).
+fn trim_dangling_tool_call(retained: &mut RetainedContext) {
+    let mut blocks = retained.blocks().to_vec();
     let Some(last) = blocks.last_mut() else {
-        return false;
+        return;
     };
     if last.role != BlockRole::Assistant || last.provenance != Provenance::Model {
-        return false;
+        return;
     }
+    // A trailing block whose text no longer parses as a call — a budget clamp
+    // that landed in the middle of the JSON is the way this happens — is left
+    // exactly as it is. There is nothing to cut around, and guessing would edit
+    // prose.
     let Some(prose) = prose_before_tool_call(&last.text) else {
-        return false;
+        return;
     };
     let prose = prose.trim_end().to_owned();
+    let provenance = last.provenance.clone();
     if prose.is_empty() {
         blocks.pop();
     } else {
         last.text = prose;
     }
-    true
+    retained.absorb_dropped(&provenance);
+    retained.set_blocks(blocks);
 }
 
 impl Drop for CarriedTurn {
@@ -257,6 +315,8 @@ impl Drop for CarriedTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use teton_protocol::SessionMode;
 
     use crate::harness::context::ContextBlock;
 
@@ -291,15 +351,21 @@ mod tests {
         blocks.iter().map(|b| b.text.as_str()).collect()
     }
 
+    /// Run the trim over `blocks` and hand back what it left.
+    fn trimmed(blocks: Vec<ContextBlock>) -> Vec<ContextBlock> {
+        let mut retained = RetainedContext::from_blocks(blocks);
+        trim_dangling_tool_call(&mut retained);
+        retained.into_blocks()
+    }
+
     /// OQ-1's two halves in one edit: the prose the model completed before the
     /// call stays, the call goes.
     #[test]
     fn a_trailing_call_is_cut_off_the_prose_that_preceded_it() {
-        let mut blocks = vec![
+        let blocks = trimmed(vec![
             user("run the tests"),
             model(r#"I will run them. {"tool":"shell","arguments":{"command":"cargo test"}}"#),
-        ];
-        assert!(trim_dangling_tool_call(&mut blocks));
+        ]);
         assert_eq!(texts(&blocks), ["run the tests", "I will run them."]);
     }
 
@@ -309,41 +375,194 @@ mod tests {
     /// user really did send it, and the client has already rendered it.
     #[test]
     fn a_bare_trailing_call_takes_its_block_with_it() {
-        let mut blocks = vec![
+        let blocks = trimmed(vec![
             user("run the tests"),
             model(r#"{"tool":"shell","arguments":{"command":"cargo test"}}"#),
-        ];
-        assert!(trim_dangling_tool_call(&mut blocks));
+        ]);
         assert_eq!(texts(&blocks), ["run the tests"]);
     }
 
-    /// A call that was *answered* is complete work and is left alone: the tool
-    /// block after it is the answer, so the assistant block is no longer last.
-    #[test]
-    fn an_answered_call_is_not_a_dangling_one() {
-        let mut blocks = vec![
-            user("read a.rs"),
-            model(r#"{"tool":"read","arguments":{"path":"a.rs"}}"#),
-            tool("fn main() {}"),
-        ];
-        assert!(!trim_dangling_tool_call(&mut blocks));
-        assert_eq!(blocks.len(), 3);
-    }
-
-    /// A completed answer is not trimmed, and neither is a trailing user or
-    /// tool block. Without these the trim would quietly eat the last thing a
-    /// cancelled turn actually finished.
+    /// The structural guard, independent of the caller's flag: a trailing user
+    /// or tool block, and an assistant block that is no longer last, are all
+    /// complete work by construction and are left alone even if the trim is
+    /// reached with them on the end.
     #[test]
     fn completed_work_survives_the_trim() {
-        for mut blocks in [
+        for blocks in [
             vec![user("hi"), model("The retry budget is three.")],
             vec![model("Done."), user("thanks")],
             vec![model(r#"{"tool":"read","arguments":{}}"#), tool("ok")],
+            vec![
+                user("read a.rs"),
+                model(r#"{"tool":"read","arguments":{"path":"a.rs"}}"#),
+                tool("fn main() {}"),
+            ],
             Vec::new(),
         ] {
-            let before = blocks.clone();
-            assert!(!trim_dangling_tool_call(&mut blocks));
-            assert_eq!(blocks, before);
+            assert_eq!(trimmed(blocks.clone()), blocks);
         }
+    }
+
+    // -- the gate: what a cancelled turn actually commits ---------------------
+
+    /// A turn on a fresh session, armed exactly as dispatch arms it.
+    fn begin_turn(sessions: &SessionRegistry, session_id: &SessionId) -> CarriedTurn {
+        CarriedTurn::begin(
+            sessions,
+            session_id,
+            "sys",
+            &HarnessConfig::default(),
+            Arc::new(SessionTaint::new()),
+            Vec::new(),
+            "do the thing",
+        )
+    }
+
+    /// A registry holding one freeform session.
+    fn one_session() -> (SessionRegistry, SessionId) {
+        let sessions = SessionRegistry::new();
+        let summary = sessions
+            .create(SessionMode::Freeform, None, None)
+            .expect("a freeform session needs no phase");
+        let id = summary.session_id.clone();
+        (sessions, id)
+    }
+
+    /// **The local path, at the gate.** The loop pushed the reply through
+    /// `push_model_call` because the call was parsed out of that very text, and
+    /// then parked. The cancellation keeps the prose and cuts the call.
+    #[test]
+    fn a_turn_cancelled_at_the_gate_commits_its_prose_without_the_call() {
+        let (sessions, session_id) = one_session();
+        {
+            let mut turn = begin_turn(&sessions, &session_id);
+            turn.ctx_mut().push_model_call(
+                r#"Now I will run the tests. {"tool":"shell","arguments":{"command":"echo hi"}}"#,
+            );
+            // Dropped armed and not panicking: a cancelled turn.
+        }
+        let conversation = sessions.conversation_snapshot(&session_id);
+        assert_eq!(
+            texts(conversation.blocks()),
+            ["do the thing", "Now I will run the tests."],
+            "the cancelled turn did not commit prose-minus-call"
+        );
+    }
+
+    /// **The remote path, at the same gate — the regression this gate exists
+    /// for.** A remote provider delivers its call as a structured event, so the
+    /// loop pushes the prose through `push_model` and nothing is pending. That
+    /// prose may itself quote tool-call-*shaped* JSON, and it is ordinary
+    /// content the user watched stream: a trim that re-derived "is this a call"
+    /// from the text would truncate the block there and discard the rest.
+    #[test]
+    fn a_cancelled_remote_turn_keeps_prose_that_merely_looks_like_a_call() {
+        let (sessions, session_id) = one_session();
+        const PROSE: &str =
+            r#"The manifest pins {"name": "serde", "version": "1"}, which the lockfile agrees on."#;
+        {
+            let mut turn = begin_turn(&sessions, &session_id);
+            // Exactly what the loop does for `call_in_text == false`.
+            turn.ctx_mut().push_model(PROSE);
+        }
+        let conversation = sessions.conversation_snapshot(&session_id);
+        assert_eq!(
+            texts(conversation.blocks()),
+            ["do the thing", PROSE],
+            "a cancelled remote turn's prose was mutilated at the JSON it quoted"
+        );
+    }
+
+    /// **After dispatch.** The tool ran; the cancellation landed in the refine
+    /// or digest await that follows. The call block stays as the honest trace of
+    /// what happened — an edit that reached the disk is on the disk, and a
+    /// conversation denying it is worse than one holding a call whose result
+    /// never arrived.
+    #[test]
+    fn a_turn_cancelled_after_dispatch_keeps_the_call_it_actually_ran() {
+        let (sessions, session_id) = one_session();
+        const CALL: &str = r#"{"tool":"edit","arguments":{"path":"a.rs","new":"fn main() {}"}}"#;
+        {
+            let mut turn = begin_turn(&sessions, &session_id);
+            turn.ctx_mut().push_model_call(CALL);
+            // `tools.dispatch` returned — the tool ran.
+            turn.ctx_mut().resolve_pending_call();
+        }
+        let conversation = sessions.conversation_snapshot(&session_id);
+        assert_eq!(
+            texts(conversation.blocks()),
+            ["do the thing", CALL],
+            "the call of a tool that actually ran was erased from the conversation"
+        );
+    }
+
+    /// The three outcomes that are not a cancellation still behave: a completed
+    /// turn commits the call block untouched (it is not cancelled, whatever the
+    /// flag says), and a failed one commits nothing at all.
+    #[test]
+    fn only_a_cancellation_trims_and_only_a_commit_writes() {
+        const CALL: &str = r#"Checking. {"tool":"read","arguments":{"path":"a.rs"}}"#;
+
+        let (sessions, session_id) = one_session();
+        let mut turn = begin_turn(&sessions, &session_id);
+        turn.ctx_mut().push_model_call(CALL);
+        turn.commit();
+        assert_eq!(
+            texts(sessions.conversation_snapshot(&session_id).blocks()),
+            ["do the thing", CALL],
+            "a completed turn's blocks must reach the store verbatim"
+        );
+
+        let (sessions, session_id) = one_session();
+        let mut turn = begin_turn(&sessions, &session_id);
+        turn.ctx_mut().push_model_call(CALL);
+        turn.abandon();
+        assert!(
+            sessions.conversation_snapshot(&session_id).is_empty(),
+            "a failed turn wrote to the conversation (BR-6)"
+        );
+    }
+
+    /// **BR-4 as a store invariant.** A cancellation can land after a fold and
+    /// before the loop's next iteration measures anything, so the commit
+    /// measures. Without it the over-budget vector is replayed into the next
+    /// prompt, which is the wedge BR-4 forbids.
+    #[test]
+    fn a_cancelled_turn_commits_a_conversation_that_fits_the_budget() {
+        const BUDGET_BYTES: usize = 4_000;
+        let harness = HarnessConfig {
+            context_budget_bytes: BUDGET_BYTES,
+            ..HarnessConfig::default()
+        };
+        let (sessions, session_id) = one_session();
+        {
+            let mut turn = CarriedTurn::begin(
+                &sessions,
+                &session_id,
+                "sys",
+                &harness,
+                Arc::new(SessionTaint::new()),
+                Vec::new(),
+                "do the thing",
+            );
+            for i in 0..6 {
+                turn.ctx_mut()
+                    .push_model(format!("block {i} {}", "x".repeat(1_000)));
+            }
+            assert!(
+                turn.ctx().estimated_bytes() > BUDGET_BYTES,
+                "non-vacuity: the turn must be over budget, or the gate has nothing to do"
+            );
+        }
+        let conversation = sessions.conversation_snapshot(&session_id);
+        let bytes: usize = conversation.blocks().iter().map(|b| b.text.len()).sum();
+        assert!(
+            bytes <= BUDGET_BYTES,
+            "a cancelled turn stored {bytes} bytes of blocks against a {BUDGET_BYTES}-byte budget"
+        );
+        assert!(
+            conversation.retained().was_truncated(),
+            "the conversation was cut without the honesty note that says so"
+        );
     }
 }

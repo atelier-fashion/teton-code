@@ -111,15 +111,31 @@ which is BR-7's cache-independence requirement met by construction.
 - **The dangling call** (verify correction): "every block in the manager is
   complete by construction" was *almost* true and the exception is the one
   cancellation actually hits. The loop pushes the model's text — which on a
-  tool-calling reply **is** the call — *before* it awaits the permission gate,
-  so a turn cancelled while parked at that gate holds a trailing assistant
-  block whose call the transcript never answers. The cancellation commit
-  therefore trims it: the prose the model wrote ahead of the call is completed
-  work and stays; the call is cut off through the same parser the loop
-  dispatches with (`parse_reply`), and a block left with nothing but the call
-  is dropped whole. The committed conversation ends at the last complete
-  exchange — possibly on the user's own message, which is correct and stays:
-  the user really did send it, and the client has already rendered it.
+  *local* tool-calling reply contains the call — *before* it awaits the
+  permission gate, so a turn cancelled while parked at that gate holds a
+  trailing assistant block whose call the transcript never answers. The
+  cancellation commit therefore trims it: the prose the model wrote ahead of the
+  call is completed work and stays; the call is cut off (`parse_reply`), and a
+  block left with nothing but the call is dropped whole. The committed
+  conversation ends at the last complete exchange — possibly on the user's own
+  message, which is correct and stays: the user really did send it, and the
+  client has already rendered it.
+- **The trim's scope** (verify correction, second pass): the trim fires only
+  where the loop says there is an undispatched call, never on a re-parse of the
+  trailing text. `SourceTurn.call_in_text` records where the call came from —
+  the local tier parsed it *out of* the text, a remote provider delivered it
+  beside the text as a structured `TurnEvent::ToolCall` — and the loop marks the
+  block it pushes accordingly (`ContextManager::push_model_call`), clearing the
+  mark the instant `tools.dispatch` returns. Two failures are closed by this.
+  A cancelled **remote** turn whose prose quotes tool-call-shaped JSON
+  (`{"name": "serde", "version": "1"}` — `parse_reply` reads `name` as a tool
+  key) would otherwise be truncated at that JSON, discarding content the user
+  watched stream. And a cancellation landing in the refine/digest awaits that
+  follow dispatch would trim a call whose tool has already run; the call block
+  stays instead, so a committed conversation may hold a dispatched-but-unfolded
+  call. That is the honest trace: an `edit` that reached the disk reached it,
+  and a conversation denying it is worse than one holding a call whose result
+  never arrived. OQ-1's "incomplete tool work" means work that never ran.
 
 All of this lives in one place, `carry.rs`'s `CarriedTurn`, which both
 `run_prompt_turn` and the acceptance fixture consume. That is a verify-time
@@ -231,6 +247,28 @@ the new user message under its existing `CLASSIFIER_INPUT_MAX_BYTES = 2048`
 head/tail cap (`classify.rs:71-81`); BR-10/AC-11 pin that the cap-site
 input is the prompt text, not the assembled context, so duty cost cannot
 scale with conversation length.
+
+**A consequence worth naming (verify, second pass):** the `compact` duty is now
+reachable on iteration 0, so a **tool-free** pressured conversation can egress
+to a remote `compact` binding — previously impossible by construction, because
+the only call site was the tool-result fold and a session with no tool call
+never reached it. This is intended: it is the same duty, at the same soft
+threshold, on the conversation it was always meant to compact, and a long
+tool-free session is exactly the shape D-6 exists to keep from wedging. What
+governs the egress is unchanged and still sufficient: the duty's own scoping
+(REQ-561 BR-7 — a duty's route is resolved and its payload inspected at the one
+choke point, with the conversation's `context_provenance` attached) and the
+session taint (REQ-544 C-2 / REQ-563 BR-13 — a session that has read boundary or
+unknown-provenance content is pinned local and cannot reach a remote binding at
+all). The new fact is only *which turns* can reach the duty, not what it is
+allowed to send.
+
+Also at the commit seam: `CarriedTurn::commit_now` truncates to budget before it
+hands the vector over, so "a stored `Conversation` fits the budget" is an
+invariant of the store rather than a property the last turn happened to leave
+behind. The loop's gate covers every conversation a completed turn commits; a
+cancelled one can be dropped after a fold and before the next iteration measures
+it.
 
 ## Blast radius
 

@@ -89,6 +89,23 @@ struct SessionRecord {
 /// boundary with them: whether history has been dropped (so the truncation note
 /// survives the turn that cut) and the egress provenance of what was dropped (so
 /// a truncated-away `local-only` read still pins the session — BR-3).
+///
+/// ## Invariant: a stored conversation fits the budget (BR-4)
+///
+/// Every turn that writes here does so through
+/// [`CarriedTurn`](crate::carry::CarriedTurn) — the sole production caller of
+/// [`Self::from_retained`]'s two commit paths — and it truncates to the turn's
+/// byte/token budget immediately before handing the vector over. No path can
+/// leave an oversized vector here to be replayed into the next prompt. That
+/// matters because a conversation is *replayed*, not
+/// re-derived: an over-budget vector stored once would be replayed into a prompt
+/// the engine refuses, and a refused turn never commits (BR-6) — the session
+/// would wedge on its own history rather than degrade to compaction.
+///
+/// It is an invariant of the store rather than of the turn loop because the
+/// loop's own gate runs at the top of each iteration and a cancelled turn can be
+/// dropped between two of them. The budget itself is per-route, so this says
+/// "fit the budget of the turn that wrote it", not "fit some global constant".
 #[derive(Debug, Clone, Default)]
 pub struct Conversation {
     retained: RetainedContext,

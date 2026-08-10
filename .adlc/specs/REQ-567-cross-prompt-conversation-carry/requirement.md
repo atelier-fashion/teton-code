@@ -122,8 +122,15 @@ assembled-context behavior itself.
       BR-7 unchanged). A long-lived session degrades to compaction, never to
       a failed turn. A compacted boundary may legitimately reuse less KV than
       the prior turn's prefix; it shows as a `divergent` hit or a miss
-      alongside the compaction — never silently. (informed by LESSON-491,
-      REQ-564 BR-7)
+      alongside the compaction — never silently. **Scope note (verify,
+      2026-08-10):** moving the budget gate to the top of the loop (D-6) makes
+      the `compact` duty reachable on the first iteration, so a *tool-free*
+      pressured conversation can now egress to a remote `compact` binding —
+      previously impossible by construction, since the gate's only call site was
+      the tool-result fold. Intended, and named here rather than left implicit:
+      the duty egress scoping of REQ-561 BR-7 and the session taint still govern
+      what may be sent, so what changed is which turns can reach the duty, not
+      what the duty may send. (informed by LESSON-491, REQ-564 BR-7)
 - [x] BR-5: **One conversation never interleaves.** Two in-flight
       `session/prompt` calls on one session (possible today — each runs on its
       own task) must not interleave or fork the conversation. Whether the
@@ -307,7 +314,14 @@ reuses the KV). Both are the same dogfood session; status NOT RUN.
       The dangling call the cancellation *does* have to handle is the one that
       was fully generated and then parked at the permission gate: its assistant
       block is committed with the call trimmed off and the prose ahead of it
-      kept.
+      kept. **That, and only that** (verify, second pass): a *remote* turn's
+      call is a structured event and is not in the text, so its prose is
+      committed verbatim however tool-call-shaped the JSON it quotes; and a call
+      whose tool already ran is not incomplete work, so a cancellation after
+      dispatch commits the call block as it stands. A committed conversation may
+      therefore hold a dispatched-but-unfolded call — the honest record, and
+      better than erasing a request whose edit is on the disk. "Incomplete tool
+      work" means work that never ran.
 - [x] OQ-2 — RESOLVED (architecture D-3, 2026-08-10): **refused, not queued.**
       A second `session/prompt` while a turn is in flight gets a typed
       session-busy error naming the turn that holds the session; the claim
