@@ -855,4 +855,59 @@ architecture accepts this as bounded and transient with eviction as the
 compensating control; a number here would tell us whether sizing duty contexts
 to their own budgets should be promoted from follow-up to urgent.
 
-**Status: NOT RUN.** No sign-off block below, because nobody has executed it.
+**Status: RUN — sign-off below (2026-08-10).**
+
+### Sign-off: 2026-08-10, M5 Max 48 GB, qwen3-coder-30b-a3b (17 GB), main @ d6df9b7
+
+Run after the BR-2 amendment (PR #82) landed, as the amendment's own note
+required. Isolated daemon (`XDG_RUNTIME_DIR=/tmp/…`, weights symlinked), the
+workspace built `--release --features tetond/llama` first. The session was a
+scripted 6-prompt run driven over the CLI's stdin by a pacing harness (the CLI
+buffers piped stdout mid-turn, so a driver must pace on the `› ` ready marker,
+not on output growth). Model benchmark at load: first token 151 ms, 97.2 tok/s.
+
+**Numbers** (from the per-generation `prefix_cache` events):
+
+- 14 generations across 6 prompts; **1 cold miss** (the first generation),
+  **13 hits**, of which **5 divergent**. No `session_switch`, no `evicted`,
+  no divergent *misses*.
+- 14,799 prompt tokens total; **12,413 reused from KV (83.9%)**, 2,386
+  prefilled.
+- Context creations for the whole run: **2** (the load-time benchmark's, and
+  the session's one persistent context created at the cold miss) against the
+  211-cycle baseline. Nothing was destroyed mid-session.
+- Wall time: 61.1 s for the whole session including model load; per-prompt
+  turn latency 1–3 s against the >5-minute baseline session.
+- Peak daemon RSS 20.4 GiB; no second-context spike was observed (no separate
+  duty context was allocated in this run — see the interleave note).
+
+**Where the divergent hits came from.** Every prompt boundary (5 of 5)
+produced a hit with `divergent: true` reusing exactly the ~814-token system
+prompt head with ~20–34 new tokens — not a BUG-147 fabrication cut. The cause
+is structural: the runtime builds a **fresh `ContextManager` per prompt**
+(`runtime.rs` — `ContextManager::new` + `push_user` per dispatch), so an
+interactive session's consecutive prompts share only the system prompt, and
+the boundary is a mid-stream divergence every time. Under pre-amendment BR-2
+all five boundaries would have been divergent cold misses (~4,100 tokens
+re-prefilled); measured reuse would have dropped from 83.9% to ~56%. The
+amendment is what keeps prompt boundaries warm in the session shape that
+actually ships. Within a prompt's agent loop, every generation was a pure
+extension hit (reuse growing 850 → 1,531), as designed.
+
+**Correctness.** Answers were checked against the fixture files: the summary,
+the 5-entry checklist listing, the exact "Aug 4" quote, the 4-row/3-column CSV
+description, and the cross-file reconciliation (invoice 102, $8,400) were all
+correct and coherent; no drift, repetition-past-the-answer, or garbling that a
+wrong reuse offset would produce. (The final "recap the conversation" prompt
+was answered with a request to re-share the files — that is the per-prompt
+context reset above, a session-layer property reproduced identically with the
+cache untouched, not a KV-coherence failure. Logged for follow-up.)
+
+**Duty interleave.** The route classifier ran between agent generations
+throughout (5 classifier calls interleaved with agent turns on the cached
+path); the agent generation following each still hit with reuse ≥ 882 and no
+eviction was emitted — the interleave never cost the agent its cache (BR-5).
+
+**Failure-shape watch items from the procedure:** cycles are 2, not ~211, so
+the mechanism delivers; counts were coherent with correct answers, so the
+reuse offset and the KV agree.
