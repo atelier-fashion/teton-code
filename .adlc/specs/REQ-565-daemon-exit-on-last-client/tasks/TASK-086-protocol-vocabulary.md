@@ -1,7 +1,7 @@
 ---
 id: TASK-086
 title: "Protocol: lifetime events, shutting-down error code, build-version skew"
-status: pending
+status: complete
 parent: REQ-565
 repo: teton-code
 created: 2026-08-10

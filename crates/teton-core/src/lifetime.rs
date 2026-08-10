@@ -36,7 +36,13 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+// The blocker and exit-reason vocabularies are wire types: they are the payload
+// of `daemon_shutdown_deferred` and `daemon_shutdown`. They live in
+// `teton-protocol` and are re-exported here so this module reads as one
+// vocabulary rather than a translation layer — one definition shared by the
+// decision and the event, instead of two definitions and a test asserting they
+// still agree.
+pub use teton_protocol::events::{BlockingActivity, ExitReason};
 
 /// What the daemon does when its last client disconnects (BR-7).
 ///
@@ -103,73 +109,6 @@ impl PolicySource {
             Self::Config => "config",
             Self::Env => "env",
             Self::Flag => "flag",
-        }
-    }
-}
-
-/// Work that must finish before the daemon may exit (BR-2).
-///
-/// Ordered so that [`LifetimeState::blocking_activity`] reports the same
-/// blocker for the same set every time — an event payload that reshuffles
-/// between runs is a payload nobody can assert on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BlockingActivity {
-    /// A prompt turn is executing.
-    Turn,
-    /// Model weights are downloading or being verified.
-    ModelDownload,
-    /// Model weights are being loaded or benchmarked.
-    ModelLoad,
-    /// Cost-ledger writes are outstanding.
-    ///
-    /// Declared for vocabulary completeness (REQ-565's Events table names it),
-    /// but structurally empty as things stand: the ledger is SQLite in
-    /// autocommit, so a row is durable the moment `record` returns and there is
-    /// no buffer to flush. What actually threatens ledger integrity is a turn
-    /// killed before it records — which is why [`Self::Turn`] defers.
-    LedgerFlush,
-}
-
-impl BlockingActivity {
-    /// The wire spelling used in `daemon_shutdown_deferred`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Turn => "turn",
-            Self::ModelDownload => "model_download",
-            Self::ModelLoad => "model_load",
-            Self::LedgerFlush => "ledger_flush",
-        }
-    }
-}
-
-/// Why the daemon exited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExitReason {
-    /// The last client disconnected (the REQ-565 path).
-    LastClient,
-    /// No client ever arrived within the startup grace.
-    ///
-    /// Not in the spec's `reason` enum (`last_client | signal`), and
-    /// deliberately distinct from both: a daemon nobody ever talked to did not
-    /// lose a last client, and reporting it as `last_client` would make the
-    /// commonest orphan — a CLI killed during its autostart poll — look like a
-    /// normal session end in the logs.
-    StartupUnclaimed,
-    /// A signal asked the daemon to stop.
-    Signal,
-}
-
-impl ExitReason {
-    /// The wire spelling used in `daemon_shutdown`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::LastClient => "last_client",
-            Self::StartupUnclaimed => "startup_unclaimed",
-            Self::Signal => "signal",
         }
     }
 }
@@ -741,17 +680,18 @@ mod tests {
     // -- vocabulary -----------------------------------------------------------
 
     #[test]
-    fn wire_spellings_match_the_specs_event_vocabulary() {
-        assert_eq!(BlockingActivity::Turn.as_str(), "turn");
-        assert_eq!(BlockingActivity::ModelDownload.as_str(), "model_download");
-        assert_eq!(BlockingActivity::ModelLoad.as_str(), "model_load");
-        assert_eq!(BlockingActivity::LedgerFlush.as_str(), "ledger_flush");
-        assert_eq!(ExitReason::LastClient.as_str(), "last_client");
-        assert_eq!(ExitReason::Signal.as_str(), "signal");
-        assert_eq!(ExitReason::StartupUnclaimed.as_str(), "startup_unclaimed");
+    fn only_never_declines_to_self_terminate() {
         assert!(ShutdownPolicy::OnLastDisconnect.self_terminates());
         assert!(ShutdownPolicy::Linger { seconds: 1 }.self_terminates());
         assert!(!ShutdownPolicy::Never.self_terminates());
+    }
+
+    #[test]
+    fn the_policy_source_is_reported_for_diagnostics() {
+        assert_eq!(PolicySource::Default.as_str(), "default");
+        assert_eq!(PolicySource::Config.as_str(), "config");
+        assert_eq!(PolicySource::Env.as_str(), "env");
+        assert_eq!(PolicySource::Flag.as_str(), "flag");
     }
 
     /// A disconnect that underflows the count must saturate rather than wrap —

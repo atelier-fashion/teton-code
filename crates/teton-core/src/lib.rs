@@ -47,8 +47,9 @@ pub use category::{
     ParseCategoryError, ParseJudgmentCategoryError, ParseTierError, Tier, TierBinding,
 };
 pub use config::{
-    Config, ConfigError, LegacyRoutingRule, LoadError, LocalModelConfig, MigratedPhase,
-    PrivacyConfig, RoutingMigration, SkippedRule, WebConfig, WebTier,
+    Config, ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig,
+    MigratedPhase, PrivacyConfig, RoutingMigration, ShutdownPolicyKind, SkippedRule, WebConfig,
+    WebTier,
 };
 pub use entities::{
     BoundaryMode, ModelProvider, ModelSelection, PrivacyBoundary, ProviderCapabilities,

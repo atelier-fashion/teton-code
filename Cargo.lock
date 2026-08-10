@@ -1543,6 +1543,7 @@ version = "0.1.13"
 dependencies = [
  "globset",
  "serde",
+ "teton-protocol",
  "thiserror 2.0.18",
  "toml",
 ]

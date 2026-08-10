@@ -8522,6 +8522,7 @@ provider_id = "on-device"
             local_model: teton_core::LocalModelConfig::default(),
             privacy: teton_core::PrivacyConfig::default(),
             web: teton_core::WebConfig::default(),
+            lifetime: teton_core::LifetimeConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -8835,6 +8836,7 @@ provider_id = "on-device"
             local_model: teton_core::LocalModelConfig::default(),
             privacy: teton_core::PrivacyConfig::default(),
             web: teton_core::WebConfig::default(),
+            lifetime: teton_core::LifetimeConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),

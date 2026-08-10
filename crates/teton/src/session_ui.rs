@@ -26,8 +26,8 @@
 use std::collections::{HashMap, HashSet};
 
 use teton_protocol::events::{
-    BlockCause, DaemonClientAttach, Event, EventEnvelope, EvictionReason, FailureClass,
-    ModelLifecycle, ModelSelectionProposed, PermissionOption, PermissionOptionKind,
+    BlockCause, DaemonClientAttach, DaemonLifetimeStage, Event, EventEnvelope, EvictionReason,
+    FailureClass, ModelLifecycle, ModelSelectionProposed, PermissionOption, PermissionOptionKind,
     PermissionRequest, PhaseTransition, PrefixCache, PrefixCacheMiss, PrefixCacheOutcome,
     PrivacyAction, PrivacyBlock, ProviderDegraded, RouteDecided, SessionUpdatePayload,
     ToolCallStatus, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome,
@@ -256,6 +256,40 @@ pub fn render_event(
         }
         Event::DaemonClientAttach(a) => {
             surface.line(LineKind::Info, &format_attach(a));
+            EventOutcome::Rendered
+        }
+        // REQ-565's lifetime stages. Only the two connection-count stages can
+        // ever reach a *live* client, and then only when a second client comes
+        // or goes — the three shutdown stages fire when the count is already
+        // zero, so nobody is attached to receive them and their audience is the
+        // daemon log (which is where the acceptance suite reads them).
+        //
+        // Verbose-gated, like `route_decided`: another session opening or
+        // closing is diagnostic detail, not something a default session should
+        // interrupt itself to report.
+        Event::DaemonLifetime(lifetime) => {
+            if state.verbose {
+                match &lifetime.stage {
+                    DaemonLifetimeStage::ClientConnected {
+                        live_connection_count,
+                    } => surface.line(
+                        LineKind::Notice,
+                        &format!("a client attached ({live_connection_count} connected)"),
+                    ),
+                    DaemonLifetimeStage::ClientDisconnected {
+                        live_connection_count,
+                    } => surface.line(
+                        LineKind::Notice,
+                        &format!("a client detached ({live_connection_count} connected)"),
+                    ),
+                    // Unreachable while this client is attached; consumed rather
+                    // than rendered so a future change that does deliver one
+                    // cannot print a shutdown notice into a working session.
+                    DaemonLifetimeStage::ShutdownArmed { .. }
+                    | DaemonLifetimeStage::ShutdownDeferred { .. }
+                    | DaemonLifetimeStage::Shutdown { .. } => {}
+                }
+            }
             EventOutcome::Rendered
         }
         // REQ-561 BR-9a ships the title as data and stops there: the event is
