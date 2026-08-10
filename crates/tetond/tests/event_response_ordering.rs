@@ -125,14 +125,19 @@ impl TestClient {
     }
 }
 
+/// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
+/// can return the same value for two calls within one clock tick.
 fn temp_socket(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "teton-{tag}-{}-{}.sock",
+        "teton-{tag}-{}-{}-{}.sock",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
     ))
 }
 

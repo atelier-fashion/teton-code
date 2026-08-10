@@ -70,14 +70,19 @@ fn entry(body: &[u8]) -> ModelEntry {
     }
 }
 
+/// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
+/// can return the same value for two calls within one clock tick.
 fn temp_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "teton-install-pipeline-{tag}-{}-{}",
+        "teton-install-pipeline-{tag}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
