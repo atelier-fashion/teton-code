@@ -1,7 +1,7 @@
 ---
 id: TASK-087
 title: "LifetimeSupervisor + server integration (admit, guards, no-abort teardown)"
-status: pending
+status: complete
 parent: REQ-565
 repo: teton-code
 created: 2026-08-10
