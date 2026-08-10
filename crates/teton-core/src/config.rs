@@ -129,6 +129,98 @@ impl PrivacyConfig {
     }
 }
 
+/// How the daemon's shutdown policy is spelled in TOML (`[lifetime] shutdown`).
+///
+/// The wire spelling is separate from [`crate::lifetime::ShutdownPolicy`]
+/// because the runtime type carries the linger window *inside* the `Linger`
+/// variant, which is the right shape for the state machine (a `Linger` with no
+/// window is unrepresentable) and the wrong shape for TOML, where the mode and
+/// the window are two keys. [`LifetimeConfig::policy`] is the one place they
+/// are joined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShutdownPolicyKind {
+    /// Exit as soon as the last client disconnects (the shipped default).
+    #[default]
+    OnLastDisconnect,
+    /// Exit `linger_seconds` after the last client disconnects.
+    Linger,
+    /// Never self-terminate — the `brew services` always-on opt-in (BR-5).
+    Never,
+}
+
+impl ShutdownPolicyKind {
+    /// The three accepted spellings, for error messages that have to name them.
+    pub const SPELLINGS: [&'static str; 3] = ["on-last-disconnect", "linger", "never"];
+
+    /// Parse a flag or environment value.
+    ///
+    /// Shared by the `--shutdown-policy` flag and `TETON_SHUTDOWN_POLICY` so the
+    /// two cannot drift into accepting different spellings of the same mode.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "on-last-disconnect" => Some(Self::OnLastDisconnect),
+            "linger" => Some(Self::Linger),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+/// Daemon lifetime behaviour (the `[lifetime]` table, REQ-565 BR-7).
+///
+/// One knob. BR-7 requires that adding or changing a linger default later cost
+/// neither a protocol change nor a packaging change, which is why the mode is a
+/// value here rather than, say, an inference from whether launchd started the
+/// process — a guard condition derived from incidental facts is exactly the
+/// shape LESSON-443 warns about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LifetimeConfig {
+    /// What to do when the last client disconnects. Defaults to
+    /// `on-last-disconnect`.
+    ///
+    /// Serialized unconditionally within the table (like
+    /// [`PrivacyConfig::redact`]): a config that names `[lifetime]` at all
+    /// states its posture rather than leaving it to be inferred.
+    #[serde(default)]
+    pub shutdown: ShutdownPolicyKind,
+    /// The idle window for `shutdown = "linger"`, in seconds.
+    ///
+    /// Meaningful only in `linger` mode; setting it in any other mode is a
+    /// validity error rather than a silently ignored key, because a config that
+    /// says `linger_seconds = 300` under `on-last-disconnect` is describing a
+    /// belief about the daemon that is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linger_seconds: Option<u64>,
+}
+
+impl LifetimeConfig {
+    /// Whether every field still holds its default, used to keep the
+    /// `[lifetime]` table out of a config that never set one.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The runtime policy this table describes.
+    #[must_use]
+    pub fn policy(&self) -> crate::lifetime::ShutdownPolicy {
+        match self.shutdown {
+            ShutdownPolicyKind::OnLastDisconnect => {
+                crate::lifetime::ShutdownPolicy::OnLastDisconnect
+            }
+            // A `linger` mode with no window is a 0 s window, which is
+            // `on-last-disconnect` by another name — harmless, and validated
+            // against separately so the user is told rather than surprised.
+            ShutdownPolicyKind::Linger => crate::lifetime::ShutdownPolicy::Linger {
+                seconds: self.linger_seconds.unwrap_or(0),
+            },
+            ShutdownPolicyKind::Never => crate::lifetime::ShutdownPolicy::Never,
+        }
+    }
+}
+
 /// The web-lookup capability ceiling, ordered so that each tier includes the
 /// ones below it (REQ-563 BR-3).
 ///
@@ -384,6 +476,12 @@ pub struct Config {
     /// array-of-table fields, for the TOML-ordering reason above.
     #[serde(default, skip_serializing_if = "WebConfig::is_unset")]
     pub web: WebConfig,
+    /// Daemon lifetime (`[lifetime]`): what happens when the last client
+    /// disconnects (REQ-565). Absent means `on-last-disconnect` — the daemon
+    /// exits with its last client. Declared here among the tables, before the
+    /// array-of-table fields, for the TOML-ordering reason above.
+    #[serde(default, skip_serializing_if = "LifetimeConfig::is_unset")]
+    pub lifetime: LifetimeConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -607,6 +705,24 @@ pub enum ConfigError {
     /// Two providers share an id.
     #[error("provider '{0}' is defined more than once; provider ids must be unique")]
     DuplicateProvider(String),
+
+    /// `[lifetime] shutdown = "linger"` with no `linger_seconds`.
+    #[error(
+        "[lifetime] shutdown = \"linger\" needs a linger_seconds window. Without one the daemon \
+         exits the instant the last client leaves, which is what shutdown = \"on-last-disconnect\" \
+         already means — say which you want."
+    )]
+    LingerWithoutWindow,
+
+    /// `linger_seconds` set under a mode that never lingers.
+    #[error(
+        "[lifetime] linger_seconds is set, but shutdown = \"{shutdown:?}\" never lingers, so the \
+         window would be ignored. Set shutdown = \"linger\" to use it, or remove linger_seconds."
+    )]
+    LingerWindowWithoutLingerMode {
+        /// The mode that makes the window meaningless.
+        shutdown: ShutdownPolicyKind,
+    },
 
     /// An `auth_ref` is not a recognized credential *reference*. The message
     /// names only the provider and the accepted forms, never the value.
@@ -971,6 +1087,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_local_model()?;
         self.validate_web()?;
+        self.validate_lifetime()?;
 
         let mut ids: HashSet<&str> = HashSet::with_capacity(self.providers.len());
         for p in &self.providers {
@@ -1474,6 +1591,32 @@ impl Config {
     /// are runtime conditions, answered where the lookup happens — a tier that
     /// cannot be served today is a stated absence, not a config that fails to
     /// load (BR-8, BR-14).
+    /// `[lifetime]` coherence (REQ-565 BR-7).
+    ///
+    /// Both checks exist to stop a config from *describing* a lifetime it will
+    /// not get. A `linger_seconds` under a non-linger mode, and a `linger` mode
+    /// with no window, are each a statement the daemon would silently ignore —
+    /// and a silently ignored lifetime setting is how an operator ends up
+    /// believing a daemon lingers when it exits instantly.
+    fn validate_lifetime(&self) -> Result<(), ConfigError> {
+        let lifetime = &self.lifetime;
+        match lifetime.shutdown {
+            ShutdownPolicyKind::Linger => {
+                if lifetime.linger_seconds.is_none() {
+                    return Err(ConfigError::LingerWithoutWindow);
+                }
+            }
+            _ => {
+                if lifetime.linger_seconds.is_some() {
+                    return Err(ConfigError::LingerWindowWithoutLingerMode {
+                        shutdown: lifetime.shutdown,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_web(&self) -> Result<(), ConfigError> {
         let web = &self.web;
 
@@ -2050,6 +2193,9 @@ auth_ref = "keychain:anthropic"
             privacy: PrivacyConfig::default(),
             // REQ-563: likewise off, for the same reason.
             web: WebConfig::default(),
+            // REQ-565: the shipped default (exit with the last client); the
+            // policy modes have their own tests.
+            lifetime: LifetimeConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),
@@ -4505,5 +4651,109 @@ cache_ttl_secs = 60
             0,
             "an explicit zero came back as the default: {written}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // [lifetime] — REQ-565
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_absent_lifetime_table_means_exit_with_the_last_client() {
+        let cfg = Config::load("").expect("an empty config must load");
+        assert_eq!(cfg.lifetime.shutdown, ShutdownPolicyKind::OnLastDisconnect);
+        assert_eq!(cfg.lifetime.linger_seconds, None);
+        assert_eq!(
+            cfg.lifetime.policy(),
+            crate::lifetime::ShutdownPolicy::OnLastDisconnect
+        );
+        assert!(cfg.lifetime.is_unset());
+    }
+
+    #[test]
+    fn a_config_that_never_set_a_lifetime_does_not_grow_the_table() {
+        let cfg = Config::load("").expect("an empty config must load");
+        let written = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            !written.contains("[lifetime]"),
+            "an unset lifetime must not be written out: {written}"
+        );
+    }
+
+    #[test]
+    fn the_three_modes_round_trip_through_toml() {
+        let never = Config::load("[lifetime]\nshutdown = \"never\"\n").expect("never must load");
+        assert_eq!(
+            never.lifetime.policy(),
+            crate::lifetime::ShutdownPolicy::Never
+        );
+
+        let linger = Config::load("[lifetime]\nshutdown = \"linger\"\nlinger_seconds = 45\n")
+            .expect("linger must load");
+        assert_eq!(
+            linger.lifetime.policy(),
+            crate::lifetime::ShutdownPolicy::Linger { seconds: 45 }
+        );
+
+        let default = Config::load("[lifetime]\nshutdown = \"on-last-disconnect\"\n")
+            .expect("the default must load");
+        assert_eq!(
+            default.lifetime.policy(),
+            crate::lifetime::ShutdownPolicy::OnLastDisconnect
+        );
+    }
+
+    /// A window nobody will honour is a belief about the daemon that is false;
+    /// say so at load rather than ignoring the key.
+    #[test]
+    fn a_linger_window_under_a_non_linger_mode_is_rejected() {
+        let err = Config::load("[lifetime]\nshutdown = \"never\"\nlinger_seconds = 30\n")
+            .expect_err("a window under `never` must not validate");
+        assert!(
+            matches!(
+                err,
+                LoadError::Validate(ConfigError::LingerWindowWithoutLingerMode { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("linger_seconds"), "{err}");
+    }
+
+    #[test]
+    fn linger_without_a_window_is_rejected_and_names_the_alternative() {
+        let err = Config::load("[lifetime]\nshutdown = \"linger\"\n")
+            .expect_err("linger with no window must not validate");
+        assert!(
+            matches!(err, LoadError::Validate(ConfigError::LingerWithoutWindow)),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("linger_seconds"), "{msg}");
+        assert!(msg.contains("on-last-disconnect"), "{msg}");
+    }
+
+    #[test]
+    fn an_unknown_shutdown_spelling_is_a_parse_error() {
+        let err = Config::load("[lifetime]\nshutdown = \"forever\"\n")
+            .expect_err("an unknown mode must not load");
+        assert!(matches!(err, LoadError::Parse(_)), "{err:?}");
+    }
+
+    /// The flag/env parser and the TOML spellings must not drift apart — one
+    /// accepting a mode the other rejects is how `--shutdown-policy never`
+    /// silently becomes the default.
+    #[test]
+    fn the_flag_parser_accepts_exactly_the_toml_spellings() {
+        for spelling in ShutdownPolicyKind::SPELLINGS {
+            let kind = ShutdownPolicyKind::parse(spelling)
+                .unwrap_or_else(|| panic!("`{spelling}` must parse as a mode"));
+            let toml = format!("[lifetime]\nshutdown = \"{spelling}\"\n");
+            let from_toml = Config::from_toml(&toml)
+                .unwrap_or_else(|e| panic!("`{spelling}` must deserialize: {e}"))
+                .lifetime
+                .shutdown;
+            assert_eq!(kind, from_toml, "`{spelling}` disagreed");
+        }
+        assert_eq!(ShutdownPolicyKind::parse("keep-alive"), None);
+        assert_eq!(ShutdownPolicyKind::parse(""), None);
     }
 }

@@ -23,11 +23,15 @@
 //!   [`RouteOutcome`] out. Its phase-policy evaluator was deleted with its last
 //!   caller when [`category::resolve`] became the one resolver (REQ-558 ADR-J).
 //! - [`boundary`] — pure privacy-boundary glob matching.
+//! - [`lifetime`] — the daemon's arm/disarm/defer/commit decision as a pure
+//!   state machine, so the exit-on-last-client behaviour is testable without a
+//!   socket, launchd, or a TTY (REQ-565 BR-9).
 
 pub mod boundary;
 pub mod category;
 pub mod config;
 pub mod entities;
+pub mod lifetime;
 pub mod mcp;
 pub mod phase;
 pub mod policy;

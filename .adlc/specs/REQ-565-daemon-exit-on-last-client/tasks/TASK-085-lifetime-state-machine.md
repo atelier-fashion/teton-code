@@ -1,7 +1,7 @@
 ---
 id: TASK-085
 title: "Pure lifetime state machine + [lifetime] config"
-status: pending
+status: complete
 parent: REQ-565
 repo: teton-code
 created: 2026-08-10
