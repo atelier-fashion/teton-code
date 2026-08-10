@@ -5,7 +5,7 @@ status: draft
 parent: REQ-567
 created: 2026-08-10
 updated: 2026-08-10
-dependencies: [TASK-092]
+dependencies: [TASK-092, TASK-093]
 repo: teton-code
 ---
 

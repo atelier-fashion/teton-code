@@ -51,8 +51,9 @@ drop guard for task abort (OQ-1: retain prose, drop incomplete tool work).
   afterward has no interleaved blocks; a session whose turn was refused can
   prompt again after the first completes (AC-4).
 - [ ] Cut-tail test: a scripted reply with a fabricated continuation
-  carries only the kept text into the next prompt's context (AC-2 of BR-2's
-  kept-view rule — the fabricated tail never enters the conversation).
+  carries only the kept text into the next prompt's context (BR-1's
+  kept-view rule / LESSON-500 — the fabricated tail never enters the
+  conversation; spec AC-2, the privacy test, lives in TASK-096).
 - [ ] `cargo test --workspace` green.
 
 ## Technical Notes
