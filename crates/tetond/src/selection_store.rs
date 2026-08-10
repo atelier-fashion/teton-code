@@ -162,11 +162,16 @@ mod tests {
     use super::*;
     use teton_core::entities::SelectionSource;
 
+    /// The counter, not the timestamp, guarantees uniqueness: `now_ms()` is
+    /// millisecond-coarse, so two calls within one tick see the same value.
     fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "teton-selection-{tag}-{}-{}",
+            "teton-selection-{tag}-{}-{}-{}",
             std::process::id(),
-            now_ms()
+            now_ms(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
