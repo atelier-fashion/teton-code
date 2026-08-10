@@ -19,7 +19,8 @@ prove and which needs a real model (architecture "Test strategy").
   divergence, interleaved-session, duty-interleave, eviction and ledger cases
 - `crates/teton-inference/src/prefix_cache.rs` — extend unit tests if the
   suite finds uncovered policy edges
-- `docs/` — record the dogfood measurement procedure and its result
+- `docs/manual-verification.md` — record the dogfood measurement procedure and
+  its result (this is where the repo already keeps CI-unprovable claims)
 
 ## Acceptance Criteria
 
