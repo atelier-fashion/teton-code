@@ -1,7 +1,7 @@
 ---
 id: REQ-567
 title: "Cross-prompt conversation carry in interactive sessions"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-10
 updated: 2026-08-10
