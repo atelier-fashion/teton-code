@@ -260,23 +260,22 @@ counts at prompt boundaries, and the assembled-context behavior itself.
 
 ## Open Questions
 
-- [ ] OQ-1: **Cancelled turns.** ACP replays what was streamed; a user who
-      cancels has *seen* the streamed prose. Does a cancelled turn retain its
-      streamed text in the conversation (matching what the user saw) or roll
-      back like a failure (BR-6's clean rule)? Leaning retain-prose /
-      drop-incomplete-tool-work; product call.
+- [x] OQ-1 — RESOLVED (product decision, 2026-08-10): **retain prose, drop
+      tool work.** A cancelled turn keeps its streamed text in the
+      conversation (the user saw it; ACP replays it) and drops incomplete
+      tool calls/results. BR-6's clean-rollback rule applies to *failed*
+      turns only; cancellation is its own case.
 - [ ] OQ-2: BR-5 queue-vs-refuse for concurrent turns on one session —
       architect's latitude with a UX voice; queuing matches user expectation,
       refusal is simpler and honest if the error is typed.
 - [ ] OQ-3: Confirm at architecture time that no duty output (titles,
       summaries, redaction verdicts) should ever join the conversation —
       BR-6 assumes never; is there a future duty that legitimately should?
-- [ ] OQ-4: Does clear (BR-8) reset anything beyond the conversation —
-      REQ-563 session taint, the user-pasted-URL set, session permission
-      grants? Leaning conversation-only: taint and grants guard egress and
-      consent, and a routinely-typed clear must not silently widen either
-      (a grant is only as narrow as its key — LESSON-495). Needs a product
-      answer before the command ships.
+- [x] OQ-4 — RESOLVED (product decision, 2026-08-10): **conversation only.**
+      Clear empties the conversation and nothing else — REQ-563 session
+      taint, the user-pasted-URL set, and session permission grants all
+      survive. A routinely-typed clear must never silently widen egress or
+      consent (a grant is only as narrow as its key — LESSON-495).
 
 ## Out of Scope
 
