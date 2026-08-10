@@ -15,6 +15,7 @@ Values are project-local — extend this list as new components emerge.
 Values for this project:
 - `daemon/router`
 - `daemon/session`
+- `daemon/lifecycle`
 - `daemon/egress`
 - `daemon/cost-ledger`
 - `inference/local`
