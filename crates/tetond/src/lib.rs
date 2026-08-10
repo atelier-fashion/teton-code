@@ -65,6 +65,7 @@ pub mod egress;
 pub mod harness;
 pub mod install;
 pub mod keychain;
+pub mod lifetime;
 pub mod mcp;
 pub mod model_consent;
 pub mod router;

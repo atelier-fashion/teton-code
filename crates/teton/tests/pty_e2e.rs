@@ -170,6 +170,12 @@ impl TestDaemon {
 
         let log = std::fs::File::create(root.join("tetond.log")).unwrap();
         let child = std::process::Command::new(daemon)
+            // REQ-565: a fixture daemon whose lifetime this test owns (killed in
+            // `Drop`). Without `never` it would exit when the PTY session
+            // disconnects, and a later command in the same test would autostart
+            // a replacement that never saw `TETON_CONFIG`. The lifetime itself
+            // is covered by `tetond/tests/daemon_lifetime.rs`.
+            .args(["--shutdown-policy", "never"])
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("TETON_CONFIG", &config_path)
             .env("TETON_REPO_ROOT", &root)

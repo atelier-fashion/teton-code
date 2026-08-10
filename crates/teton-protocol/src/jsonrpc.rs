@@ -274,6 +274,21 @@ pub mod error_code {
         /// the numeric code alone must never confuse an evicted subscription
         /// with a turn blocked by a privacy boundary.
         SUBSCRIPTION_LAGGED = -32006;
+        /// The daemon has committed to exiting and will not serve a new session
+        /// (REQ-565 BR-3).
+        ///
+        /// The *second* arm of the connect-vs-shutdown race. A daemon whose last
+        /// client left decides to exit under the same lock that admits clients,
+        /// so a handshake arriving after that decision is refused here rather
+        /// than accepted into a session the daemon will not serve.
+        ///
+        /// This is a **retryable** condition and the only handshake error that
+        /// is: the client's remedy is to autostart a successor and connect to
+        /// it, not to report a failure. It is deliberately distinct from
+        /// [`UNSUPPORTED_PROTOCOL_VERSION`], which is *not* retryable — spawning
+        /// a new daemon cannot fix a stale binary on disk, so a client that
+        /// folded the two together would spin.
+        DAEMON_SHUTTING_DOWN = -32007;
     }
 }
 

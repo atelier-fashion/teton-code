@@ -75,19 +75,25 @@ pub fn offer_registration(
         return false;
     }
 
+    // REQ-565 BR-5: the default lifetime is on demand, so this offer is the
+    // ALWAYS-ON opt-in and reads like one. It used to default to yes and lead
+    // with "survives reboots", which made the always-on daemon the path of
+    // least resistance — the standing-memory arrangement this REQ exists to
+    // stop shipping. The cost is now stated, and pressing return declines.
     surface.line(
         LineKind::Notice,
-        "no daemon is running. Teton can register teton-code with launchd (brew services start \
-         teton) so it starts now and survives reboots — or just start one for this session.",
+        "no daemon is running — starting one for this session. Teton can instead keep a daemon \
+         running permanently (brew services), which is faster to start but holds the local \
+         model in memory continuously.",
     );
-    match answer_from(prompter.ask("register the service? [Y/n] ")) {
+    match answer_from(prompter.ask("keep a daemon running permanently? [y/N] ")) {
         Answer::Yes => {}
         Answer::No => {
             record_decline(&state_dir, surface);
             surface.line(
                 LineKind::Notice,
-                "okay — Teton will not ask again. Register any time with `brew services start \
-                 teton`.",
+                "okay — Teton will not ask again, and will start a daemon whenever you need one. \
+                 Change your mind any time with `brew services start teton`.",
             );
             return false;
         }
@@ -123,14 +129,19 @@ pub fn offer_registration(
     }
 }
 
-/// Maps the raw prompt answer onto the offer's semantics: return accepts,
-/// only an explicit no declines, EOF cancels.
+/// Maps the raw prompt answer onto the offer's semantics: only an explicit yes
+/// accepts, return or an explicit no declines, EOF cancels.
+///
+/// The empty answer moved from `Yes` to `No` in REQ-565. Registering the
+/// service is now the always-on opt-in rather than the recommended path, and an
+/// opt-in that happens when you press return is not one — it would make the
+/// standing-resident daemon the default again by way of the prompt.
 fn answer_from(raw: Option<String>) -> Answer {
     match raw {
         None => Answer::Cancel,
         Some(text) => match text.trim().to_lowercase().as_str() {
-            "" | "y" | "yes" => Answer::Yes,
-            "n" | "no" => Answer::No,
+            "y" | "yes" => Answer::Yes,
+            "" | "n" | "no" => Answer::No,
             // Anything else is not consent to change service state; treat it
             // as a decline for this run but do not record it as permanent.
             _ => Answer::Cancel,
@@ -236,9 +247,19 @@ mod tests {
         }
     }
 
+    /// REQ-565 BR-5: only an explicit yes registers the always-on service.
+    ///
+    /// The empty answer moved from `Yes` to `No` with the on-demand default.
+    /// An always-on daemon that you get by pressing return is not an opt-in —
+    /// it would restore the standing-resident arrangement through the prompt,
+    /// while the formula was busy removing it.
     #[test]
-    fn return_accepts_only_explicit_no_declines_eof_cancels() {
-        assert_eq!(answer_from(Some(String::new())), Answer::Yes);
+    fn only_an_explicit_yes_opts_into_the_always_on_daemon() {
+        assert_eq!(
+            answer_from(Some(String::new())),
+            Answer::No,
+            "pressing return must decline the opt-in, not accept it"
+        );
         assert_eq!(answer_from(Some("y".into())), Answer::Yes);
         assert_eq!(answer_from(Some("YES".into())), Answer::Yes);
         assert_eq!(answer_from(Some("n".into())), Answer::No);

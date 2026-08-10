@@ -21,6 +21,9 @@
 //!   category binding (AC-6, egress capture), what every `route_decided`
 //!   carries (AC-8), and the one-resolver rule across the surfaces that
 //!   describe a routing state (AC-11).
+//! - [`daemon_lifetime`] — REQ-565: the daemon exits with its last client.
+//!   The only suite here that runs its daemon under the real shipped lifetime
+//!   rather than pinning it, and the only one that asserts on the process.
 //! - [`duty_taint`] — REQ-561 AC-5: a tainted session runs its harness duties on
 //!   the local tier however they are bound, asserted by the bytes a mock
 //!   provider received rather than by reading the resolved route, and paired
@@ -32,6 +35,8 @@
 mod ac_matrix;
 #[path = "e2e/consent_matrix.rs"]
 mod consent_matrix;
+#[path = "e2e/daemon_lifetime.rs"]
+mod daemon_lifetime;
 #[path = "e2e/duty_taint.rs"]
 mod duty_taint;
 #[path = "e2e/harness.rs"]

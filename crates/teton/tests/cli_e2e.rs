@@ -168,6 +168,20 @@ impl TestDaemon {
         let log = std::fs::File::create(root.join("tetond.log")).unwrap();
         let mut command = Command::new(daemon);
         command
+            // REQ-565: this daemon is a *fixture* whose lifetime the test owns —
+            // it is spawned here and killed in `Drop`. Without the `never`
+            // policy it would exit as soon as the first CLI command
+            // disconnected, and every subsequent command in the same test would
+            // autostart a replacement that never saw `TETON_CONFIG` (the CLI
+            // does not forward it), so the config this fixture was built around
+            // would silently vanish mid-test.
+            //
+            // Pinning the fixture is not hiding the new behaviour: these tests
+            // are about providers, models and rendering across commands, and
+            // the lifetime itself has its own suite
+            // (`tetond/tests/daemon_lifetime.rs`) that spawns real daemons under
+            // the real default.
+            .args(["--shutdown-policy", "never"])
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("TETON_CONFIG", &config_path)
             .env("TETON_REPO_ROOT", &root)

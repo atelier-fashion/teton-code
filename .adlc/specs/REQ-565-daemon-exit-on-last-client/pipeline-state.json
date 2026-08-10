@@ -1,0 +1,92 @@
+{
+  "req": "REQ-565",
+  "branch": "feat/REQ-565-daemon-exit-on-last-client",
+  "startedAt": "2026-08-10T00:00:00Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-08-10T11:25:54.088303Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-10T11:27:13.083781Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-10T11:36:59.698190Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-10T11:37:47.504941Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-10T12:21:09.104482Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-08-10T12:33:28.547032Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-10T12:34:46.967037Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-10T12:49:25.495782Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-565",
+      "branch": "feat/REQ-565-daemon-exit-on-last-client",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/80",
+      "prNumber": 80,
+      "prCreatedAt": "2026-08-10T11:25:54.088176Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-085",
+      "TASK-086",
+      "TASK-087",
+      "TASK-088",
+      "TASK-089",
+      "TASK-090",
+      "TASK-091"
+    ],
+    "failedTasks": []
+  },
+  "blockers": []
+}

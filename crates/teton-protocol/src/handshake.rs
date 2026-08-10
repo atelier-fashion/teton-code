@@ -171,6 +171,57 @@ pub fn format_range(min: ProtocolVersion, max: ProtocolVersion) -> String {
     }
 }
 
+/// A *build*-version difference between a client and the daemon it just
+/// successfully attached to (REQ-565 BR-6).
+///
+/// # Why this is not [`VersionSkew`]
+///
+/// [`VersionSkew`] classifies **protocol** ranges, and it only exists on a path
+/// that has already *failed*: the ranges are disjoint, the handshake is
+/// refused, and the client is told to restart something. That check is silent
+/// precisely when the harm REQ-565 cites occurs — a v0.1.12 daemon still
+/// serving four hours after v0.1.13 was installed. Two adjacent releases almost
+/// always speak the same protocol version, so negotiation succeeds and nothing
+/// is said, while every command is answered by the old binary.
+///
+/// So this is a different question with a different answer shape: the handshake
+/// **succeeded**, both halves work, and the user is being told a true thing
+/// about which build answered — a notice, never an error (BR-6).
+///
+/// Carries both versions because a warning that names only one of them cannot
+/// be acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildSkew {
+    /// The version the client is built at.
+    pub client_version: String,
+    /// The version the answering daemon reports.
+    pub daemon_version: String,
+}
+
+/// Classifies a build-version difference, or `None` when the two agree.
+///
+/// Deliberately a plain string inequality rather than a semver comparison. The
+/// remedy is the same in both directions — end every session so the next start
+/// runs whatever is on disk now — so ordering the two versions would add a
+/// parse that can fail (on a `-dev` suffix, a git describe, a locally built
+/// binary) in exchange for a distinction nothing consumes. Any difference is
+/// worth one line; no difference is worth none.
+///
+/// Whitespace is trimmed so a trailing newline picked up from a version file
+/// cannot masquerade as a skew.
+#[must_use]
+pub fn build_skew(client_version: &str, daemon_version: &str) -> Option<BuildSkew> {
+    let client = client_version.trim();
+    let daemon = daemon_version.trim();
+    if client == daemon {
+        return None;
+    }
+    Some(BuildSkew {
+        client_version: client.to_owned(),
+        daemon_version: daemon.to_owned(),
+    })
+}
+
 /// A handshake could not be completed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HandshakeError {
@@ -501,5 +552,85 @@ mod tests {
     fn a_single_version_range_reads_as_one_number() {
         assert_eq!(format_range(ProtocolVersion(2), ProtocolVersion(2)), "2");
         assert_eq!(format_range(ProtocolVersion(1), ProtocolVersion(3)), "1–3");
+    }
+
+    // -----------------------------------------------------------------------
+    // Build skew — REQ-565 BR-6 / AC-7
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn matching_builds_produce_no_skew() {
+        assert_eq!(build_skew("0.1.13", "0.1.13"), None);
+    }
+
+    #[test]
+    fn differing_builds_carry_both_versions() {
+        let skew = build_skew("0.1.13", "0.1.12").expect("a differing build must be reported");
+        assert_eq!(skew.client_version, "0.1.13");
+        assert_eq!(skew.daemon_version, "0.1.12");
+    }
+
+    /// Direction does not change the verdict: an older *client* against a newer
+    /// daemon is still worth a line, and the remedy is the same either way.
+    #[test]
+    fn skew_is_reported_in_both_directions() {
+        assert!(build_skew("0.1.12", "0.1.13").is_some());
+        assert!(build_skew("0.1.13", "0.1.12").is_some());
+    }
+
+    /// The whole reason this exists. The exact pairing REQ-565's Description
+    /// cites — v0.1.12 daemon, v0.1.13 CLI — speaks one protocol version, so
+    /// `negotiate` **succeeds** and `VersionSkew` says nothing. If the build
+    /// check ever gets folded into the protocol check, this fails.
+    #[test]
+    fn a_same_protocol_build_difference_is_invisible_to_the_protocol_check() {
+        // Both halves speak the same protocol range: negotiation succeeds…
+        let negotiated = negotiate(
+            PROTOCOL_VERSION_MIN,
+            PROTOCOL_VERSION_MAX,
+            PROTOCOL_VERSION_MIN,
+            PROTOCOL_VERSION_MAX,
+        )
+        .expect("identical ranges must negotiate");
+        assert_eq!(negotiated, PROTOCOL_VERSION_MAX);
+
+        // …and the protocol-skew classifier is silent…
+        assert_eq!(
+            VersionSkew::classify(
+                PROTOCOL_VERSION_MIN,
+                PROTOCOL_VERSION_MAX,
+                PROTOCOL_VERSION_MIN,
+                PROTOCOL_VERSION_MAX
+            ),
+            None,
+            "overlapping ranges must not be a protocol skew"
+        );
+
+        // …but the stale daemon is still stale, and this is what says so.
+        assert!(
+            build_skew("0.1.13", "0.1.12").is_some(),
+            "the build check must catch what the protocol check cannot"
+        );
+    }
+
+    /// A version string carrying stray whitespace is the same version.
+    #[test]
+    fn whitespace_is_not_a_skew() {
+        assert_eq!(build_skew("0.1.13", "0.1.13\n"), None);
+        assert_eq!(build_skew(" 0.1.13 ", "0.1.13"), None);
+    }
+
+    /// `HandshakeResult` already carries what the check needs, so BR-6 costs no
+    /// protocol change — if this stops compiling, the wire type moved and the
+    /// CLI's skew check lost its input.
+    #[test]
+    fn the_handshake_result_carries_the_daemon_version_the_check_needs() {
+        let result = HandshakeResult {
+            protocol_version: PROTOCOL_VERSION_MAX,
+            daemon_name: "teton-code".to_owned(),
+            daemon_version: "0.1.12".to_owned(),
+            capabilities: vec![],
+        };
+        assert!(build_skew("0.1.13", &result.daemon_version).is_some());
     }
 }

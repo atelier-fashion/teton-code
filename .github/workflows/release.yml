@@ -2087,9 +2087,92 @@ jobs:
               ;;
           esac
 
+      # REQ-565 AC-5: the DEFAULT lifecycle, proved before the opt-in one below.
+      #
+      # This is the claim the formula now makes to every user who runs plain
+      # `brew install`: no service is registered, the CLI starts a daemon when
+      # it needs one, and that daemon is GONE when the CLI exits. The old
+      # `brew services` assertion (next step) proves the always-on opt-in and is
+      # kept — but it proves the opposite lifetime, so it cannot stand in for
+      # this one. A gate proves only what it exercises (LESSON-459).
+      #
+      # `teton doctor` is the round trip: it autostarts a daemon, handshakes it,
+      # and exits. Under the shipped default that whole daemon should then be
+      # gone. Asserting on the PROCESS, not on doctor's text, is deliberate —
+      # the claim is "no teton-code process remains", and only pgrep can say so.
+      - name: install → CLI round-trip → daemon is gone (REQ-565 AC-5)
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          set -uo pipefail
+
+          DEADLINE_SECS=60
+
+          daemon_pids() {
+            pgrep -x teton-code || true
+          }
+
+          report_and_fail_565() {
+            echo "::error title=$1"
+            echo "--- teton doctor ---"
+            teton doctor </dev/null 2>&1 || true
+            echo "--- teton-code processes ---"
+            # `pgrep -l`, not `ps | grep`: the pipeline form needs a
+            # `[t]eton-code` trick to avoid matching itself, which shellcheck
+            # rightly flags (SC2009). `pgrep` matches the process name directly,
+            # so there is nothing to exclude. `-l` (pid + name) rather than `-a`
+            # because BSD reads `-a` as "include ancestors", not as Linux's
+            # "full command line" — and this job runs on macOS.
+            pgrep -l teton-code || echo "(none)"
+            echo "--- brew services list ---"
+            brew services list || true
+            echo "--- daemon logs ---"
+            tail -n 50 "$(brew --prefix)/var/log/teton/"*.log 2>/dev/null || echo "(no logs)"
+            exit 65
+          }
+
+          # Precondition: a plain `brew install` must not have registered or
+          # started anything. If a daemon is already up here, the "no boot-time
+          # start" half of AC-5 is false and the rest of this step would be
+          # measuring the wrong process.
+          if [ -n "$(daemon_pids)" ]; then
+            report_and_fail_565 "A daemon was already running before any CLI ran (AC-5)::Plain 'brew install' must not start or register a service. The tap was NOT updated."
+          fi
+
+          # The round trip. It autostarts a daemon by design.
+          teton doctor </dev/null >/dev/null 2>&1 || true
+
+          # Wait for the daemon to go away on its own.
+          #
+          # A daemon legitimately outlives the CLI while it is downloading,
+          # verifying, or loading model weights — BR-2 defers exit for exactly
+          # that, and killing a 17 GB download because a terminal closed is the
+          # behaviour the rule forbids. On this runner no model has been
+          # consented to, so no install is in flight and the daemon has nothing
+          # to defer for; the wait exists for CI slowness, not for that case.
+          # If this ever starts timing out because a model IS being fetched, the
+          # fix is to assert against a daemon with no install in flight — never
+          # to widen the window until the assertion stops meaning anything.
+          deadline=$(($(date +%s) + DEADLINE_SECS))
+          while [ -n "$(daemon_pids)" ]; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              report_and_fail_565 "Daemon still running after the CLI exited (AC-5)::'teton doctor' completed but a teton-code process was still alive ${DEADLINE_SECS}s later. The shipped default is exit-on-last-client; a daemon that outlives every client is the standing-memory harm REQ-565 removes. The tap was NOT updated."
+            fi
+            sleep 1
+          done
+
+          echo "::notice title=On-demand lifecycle OK (REQ-565 AC-5)::Plain install started nothing; 'teton doctor' autostarted a daemon, handshook it, and the daemon exited with the CLI."
+
       # AC-6 and REQ-548 BR-6, end to end: launchd runs the daemon, the CLI handshakes
       # it without anyone invoking teton-code by hand, restart survives, stop
       # actually stops, and the logs are where brew says logs are.
+      #
+      # REQ-565 re-scopes what this proves. `brew services` is now the explicit
+      # ALWAYS-ON opt-in, and the formula's service block passes
+      # `--shutdown-policy never` so launchd's supervision and the daemon's
+      # self-exit cannot fight. So this step now also stands as AC-8's evidence
+      # that `never` + `brew services` keeps the pre-REQ-565 behaviour: the
+      # daemon here must survive the CLI exits that the step above requires it
+      # to NOT survive under the default.
       #
       # Every assertion is on doctor's TEXT, never its exit code. `teton doctor`
       # exits 0 whether or not it reaches a daemon — it is a diagnostic, not a
@@ -2161,6 +2244,26 @@ jobs:
               report_and_fail "Daemon is running the wrong version (AC-6 / BR-3)::doctor reported '$line', which does not name $VERSION. The tap was NOT updated."
               ;;
           esac
+
+          # REQ-565 AC-8 / BR-5: the always-on opt-in must actually stay on.
+          # The service block passes `--shutdown-policy never`, so this daemon
+          # must survive the very CLI exit that ends a default-lifetime daemon.
+          # If `never` were ever dropped or misspelled, the daemon would exit
+          # here, launchd would restart it, and the pair would flap — reloading
+          # the model every cycle. That failure is silent without this check:
+          # `doctor` a moment later would find a *replacement* daemon and look
+          # healthy.
+          before_pid="$(pgrep -x teton-code | head -1)"
+          teton doctor </dev/null >/dev/null 2>&1 || true
+          sleep 5
+          after_pid="$(pgrep -x teton-code | head -1)"
+          if [ -z "$after_pid" ]; then
+            report_and_fail "Service daemon exited with the CLI (REQ-565 AC-8/BR-5)::The brew-services daemon must run under --shutdown-policy never and survive a CLI exit, but no teton-code process remains. The tap was NOT updated."
+          fi
+          if [ "$before_pid" != "$after_pid" ]; then
+            report_and_fail "Service daemon was replaced, not preserved (REQ-565 AC-8/BR-5)::teton-code was pid $before_pid before the CLI round trip and $after_pid after, so it exited and launchd restarted it — the keep-alive/self-exit flap the 'never' policy exists to prevent. The tap was NOT updated."
+          fi
+          echo "::notice title=Always-on opt-in OK (REQ-565 AC-8)::The brew-services daemon (pid $after_pid) survived a CLI round trip, as --shutdown-policy never requires."
 
           # REQ-548 BR-6: "where are the logs" must have a brew answer. launchd creates
           # both redirect targets when it spawns the service, so if the daemon
