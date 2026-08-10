@@ -1,0 +1,51 @@
+{
+  "req": "REQ-567",
+  "branch": "feat/REQ-567-cross-prompt-conversation-carry",
+  "startedAt": "2026-08-10T19:05:00Z",
+  "completed": false,
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Create Worktrees + Preflight",
+      "completedAt": "2026-08-10T19:05:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-10T19:08:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-567",
+      "branch": "feat/REQ-567-cross-prompt-conversation-carry",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "notes": {
+    "specMergedToMainVia": "PR #86 (c6c669a) before pipeline start, per normal flow",
+    "draftPrDeferred": "branch had no commits beyond origin/main at Step 0; PR creation deferred to Phase 6 fallback per LESSON-004"
+  }
+}
