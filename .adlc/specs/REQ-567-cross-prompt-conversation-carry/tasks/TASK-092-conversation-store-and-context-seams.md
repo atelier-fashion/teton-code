@@ -1,7 +1,7 @@
 ---
 id: TASK-092
 title: "Conversation store in the session registry + ContextManager replay/commit seams"
-status: draft
+status: complete
 parent: REQ-567
 created: 2026-08-10
 updated: 2026-08-10

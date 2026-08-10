@@ -471,6 +471,81 @@ impl ContextManager {
         &self.blocks
     }
 
+    /// Move this manager's conversation blocks out — what the session registry
+    /// commits when the turn completes (REQ-567 D-1).
+    ///
+    /// A move rather than a re-derivation, and that is the whole point: what this
+    /// manager holds at turn end **is** the retained view — model text as the
+    /// containment cut kept it (BUG-147), history as a mid-turn compaction
+    /// rewrote it (BR-4), tool results as they folded in. Anything that rebuilt
+    /// the conversation from the turn's events instead would be a second opinion
+    /// about what the harness kept, free to disagree with it.
+    ///
+    /// **The system head is excluded by construction**, which is what BR-7's
+    /// cache-independence needs: the head was never a block. It is rebuilt per
+    /// prompt from the current tools and route ([`ContextManager::new`]), so a
+    /// mid-session head change re-renders the same conversation under the new
+    /// head rather than carrying a fossil of the old one.
+    #[must_use]
+    pub fn into_blocks(self) -> Vec<ContextBlock> {
+        self.blocks
+    }
+
+    /// Append a committed conversation to this manager, before the new user
+    /// message (REQ-567 BR-1, D-4).
+    ///
+    /// ## The same push paths the live turn used
+    ///
+    /// Every block goes back in through [`push_user`](Self::push_user),
+    /// [`push_model`](Self::push_model), or
+    /// [`push_tool_result_prov`](Self::push_tool_result_prov) — not by splicing
+    /// the vector — so role and egress provenance survive the round trip
+    /// verbatim and [`context_provenance`] sees a carried `local-only` read
+    /// exactly as it saw it on the turn that read it (BR-3). Sanitization is not
+    /// re-applied here and must not be: it lives at the render layer (ADR-009,
+    /// LESSON-474), so carried blocks re-render through `assemble`/`prepare`
+    /// neutralization every turn and carry adds no new injection surface.
+    ///
+    /// The push path is chosen by [`Provenance`] rather than by
+    /// [`BlockRole`] because provenance is the field that carries data the role
+    /// cannot reconstruct (the tool's name and its touched-file set). The role
+    /// rides along unchanged: each push path writes the one role its provenance
+    /// implies, and the two are set together at every site that makes a block.
+    ///
+    /// ## A carried user block is not *this* turn's request
+    ///
+    /// [`push_user`](Self::push_user) records what it appends as
+    /// [`request`](Self::request) — the
+    /// string the `triage`/`verify` duties measure relevance against — and every
+    /// carried user block would overwrite it in turn, leaving the duty measuring
+    /// against prompt N−1. So the field is saved across the replay and restored:
+    /// dispatch calls this **before** `push_user` of the new message, and it is
+    /// that message which must end up as the request. Restoring rather than
+    /// merely skipping the assignment also makes the ordering non-load-bearing —
+    /// a replay after `push_user` still leaves the real request in place.
+    ///
+    /// ## A stored system head is refused, not replayed
+    ///
+    /// `into_blocks` cannot produce one — the head is not a block — so a
+    /// `System`-provenance block can only arrive from a hand-built vector, and
+    /// replaying it would put a second, stale system prompt inside the
+    /// conversation under the freshly built head. It is dropped.
+    pub fn replay_blocks(&mut self, blocks: Vec<ContextBlock>) {
+        let request = std::mem::take(&mut self.request);
+        for block in blocks {
+            match block.provenance {
+                Provenance::User => self.push_user(block.text),
+                Provenance::Model => self.push_model(block.text),
+                Provenance::Tool { tool, provenance } => {
+                    self.push_tool_result_prov(tool, provenance, block.text);
+                }
+                // A head, replayed under a head. Dropped, not pushed — see above.
+                Provenance::System => {}
+            }
+        }
+        self.request = request;
+    }
+
     /// Estimated total tokens (system + all blocks), by a whitespace heuristic
     /// consistent with the mock engine's counting.
     #[must_use]
@@ -2672,5 +2747,239 @@ mod tests {
         assert!(out.degraded, "{:?}", out.reason);
         assert_eq!(out.dropped_blocks, 0);
         assert_eq!(ctx.blocks().len(), 5, "nothing was forgotten for nothing");
+    }
+
+    // ------------------------------------------------------------------
+    // Cross-prompt carry: the commit and replay seams (REQ-567 TASK-092).
+    //
+    // The manager stays per-turn — the daemon still builds one per prompt —
+    // and these two methods are the only way state crosses a prompt boundary:
+    // the blocks move out at the end of one turn and back in at the start of
+    // the next, under a freshly built system head.
+    // ------------------------------------------------------------------
+
+    /// The conversation one completed turn leaves behind, as the registry would
+    /// hold it: a user message, the model's retained reply, and a tool result.
+    fn committed_turn() -> Vec<ContextBlock> {
+        let mut ctx = ContextManager::new("SYSTEM HEAD ONE", 10_000);
+        ctx.push_user("what is in a.rs?");
+        ctx.push_model("let me read it");
+        ctx.push_tool_result("read", Some("a.rs".to_owned()), "fn main() {}");
+        ctx.into_blocks()
+    }
+
+    fn roles(ctx: &ContextManager) -> Vec<BlockRole> {
+        ctx.blocks().iter().map(|b| b.role).collect()
+    }
+
+    /// **BR-1's ordering.** The carried conversation comes first, in the order it
+    /// happened, and the new user message last — under the head *this* prompt
+    /// built, with no trace of the one the earlier turn ran under (BR-7).
+    #[test]
+    fn a_replayed_conversation_comes_before_the_new_user_message() {
+        let committed = committed_turn();
+        let mut ctx = ContextManager::new("SYSTEM HEAD TWO", 10_000);
+        ctx.replay_blocks(committed.clone());
+        ctx.push_user("recap what we learned");
+
+        assert_eq!(ctx.blocks().len(), committed.len() + 1);
+        assert_eq!(
+            ctx.blocks()
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "what is in a.rs?",
+                "let me read it",
+                "fn main() {}",
+                "recap what we learned",
+            ]
+        );
+        assert_eq!(
+            roles(&ctx),
+            [
+                BlockRole::User,
+                BlockRole::Assistant,
+                BlockRole::Tool,
+                BlockRole::User,
+            ]
+        );
+
+        let mut hook = NoopProvenanceHook;
+        let flat = ctx.assemble(&mut hook);
+        assert!(flat.starts_with("SYSTEM HEAD TWO"));
+        assert!(
+            !flat.contains("SYSTEM HEAD ONE"),
+            "the earlier turn's head must be rebuilt, never carried"
+        );
+        let earlier = flat.find("what is in a.rs?").expect("carried user message");
+        let newest = flat
+            .find("recap what we learned")
+            .expect("new user message");
+        assert!(earlier < newest, "the transcript must stay in turn order");
+    }
+
+    /// **BR-3.** Every carried block keeps the role and provenance it was pushed
+    /// with, so the egress choke point reads a conversation carried across a
+    /// prompt boundary exactly as it read the live one: an unknown-provenance
+    /// `shell` result still taints, a `local-only` read is still attributable.
+    #[test]
+    fn per_block_provenance_survives_the_commit_and_replay_round_trip() {
+        let mut first = ContextManager::new("HEAD", 10_000);
+        first.push_user("read the config");
+        first.push_model("reading");
+        first.push_tool_result("read", Some("src/lib.rs".to_owned()), "code");
+        first.push_tool_result_prov("shell", ToolProvenance::Unknown, "ran a command");
+        let before: Vec<Provenance> = first
+            .blocks()
+            .iter()
+            .map(|b| b.provenance.clone())
+            .collect();
+        let egress_before = context_provenance(&first);
+
+        let mut second = ContextManager::new("A DIFFERENT HEAD", 10_000);
+        second.replay_blocks(first.into_blocks());
+
+        let after: Vec<Provenance> = second
+            .blocks()
+            .iter()
+            .map(|b| b.provenance.clone())
+            .collect();
+        assert_eq!(after, before, "provenance must ride through the round trip");
+        assert_eq!(
+            context_provenance(&second),
+            egress_before,
+            "the choke point must see a carried conversation as it saw the live one"
+        );
+
+        // And the hook — the seam egress actually plugs into — sees them too, in
+        // order, behind the freshly built system block.
+        let mut hook = RecordingProvenanceHook::default();
+        let _ = second.assemble(&mut hook);
+        assert_eq!(hook.seen.first(), Some(&Provenance::System));
+        assert_eq!(&hook.seen[1..], before.as_slice());
+    }
+
+    /// A carried user block is an *earlier* turn's request, and the duties that
+    /// measure relevance against [`ContextManager::request`] must not be handed
+    /// it. Restoring the field rather than skipping the assignment also keeps the
+    /// call order from being load-bearing.
+    #[test]
+    fn a_carried_user_block_is_not_this_turns_request() {
+        let committed = committed_turn();
+
+        let mut ctx = ContextManager::new("HEAD", 10_000);
+        ctx.replay_blocks(committed.clone());
+        assert_eq!(
+            ctx.request(),
+            "",
+            "a replay alone is serving no request yet"
+        );
+        ctx.push_user("recap what we learned");
+        assert_eq!(ctx.request(), "recap what we learned");
+
+        let mut reversed = ContextManager::new("HEAD", 10_000);
+        reversed.push_user("recap what we learned");
+        reversed.replay_blocks(committed);
+        assert_eq!(
+            reversed.request(),
+            "recap what we learned",
+            "a replay must never overwrite the request with an older prompt"
+        );
+    }
+
+    /// **The system head is never carried** (architecture D-1): `into_blocks`
+    /// cannot produce one, and a hand-built `System` block is refused rather than
+    /// planted inside the conversation under the fresh head.
+    #[test]
+    fn a_system_head_is_neither_carried_nor_replayed() {
+        let mut first = ContextManager::new("SYSTEM HEAD ONE", 10_000);
+        first.push_user("hello");
+        let committed = first.into_blocks();
+        assert!(committed
+            .iter()
+            .all(|b| b.provenance != Provenance::System && !b.text.contains("SYSTEM HEAD ONE")));
+
+        let mut second = ContextManager::new("SYSTEM HEAD TWO", 10_000);
+        second.replay_blocks(vec![
+            ContextBlock {
+                role: BlockRole::User,
+                text: "SYSTEM HEAD ONE".to_owned(),
+                provenance: Provenance::System,
+            },
+            committed[0].clone(),
+        ]);
+
+        assert_eq!(
+            second
+                .blocks()
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>(),
+            ["hello"],
+            "a stored head must not re-enter the conversation"
+        );
+        let mut hook = NoopProvenanceHook;
+        assert_eq!(
+            second
+                .assemble(&mut hook)
+                .matches("SYSTEM HEAD ONE")
+                .count(),
+            0
+        );
+    }
+
+    /// **BR-4.** A replayed conversation is measured and cut by exactly the gates
+    /// a same-turn one is: nothing about a block having crossed a prompt boundary
+    /// exempts it from the budget, and an over-budget carry degrades to
+    /// truncation rather than to a panic or an over-window prompt.
+    #[test]
+    fn an_over_budget_replay_is_cut_by_the_hard_gate() {
+        let committed = conversation(5, 1_000).into_blocks();
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
+        ctx.replay_blocks(committed);
+        ctx.push_user("and now the next prompt");
+        assert!(
+            ctx.estimated_bytes() > TEST_BUDGET_BYTES,
+            "fixture is over budget"
+        );
+
+        ctx.truncate_to_budget();
+
+        assert!(
+            ctx.estimated_bytes() <= TEST_BUDGET_BYTES,
+            "a carried conversation is {} bytes after the gate",
+            ctx.estimated_bytes()
+        );
+        assert!(ctx.was_truncated());
+        // The turn survives: the newest block — this prompt's message — is what
+        // the oldest-first drop preserves.
+        assert_eq!(ctx.blocks().last().unwrap().text, "and now the next prompt");
+        let mut hook = NoopProvenanceHook;
+        assert!(ctx.assemble(&mut hook).contains("truncated"));
+    }
+
+    /// And the soft gate ahead of it sees the carried conversation too: pressure
+    /// built up across prompts buys a `compact` call exactly as pressure built up
+    /// within one does, and the pair still lands under budget (ADR-4).
+    #[tokio::test]
+    async fn a_replayed_conversation_goes_through_the_compaction_gate() {
+        let committed = conversation(5, 1_000).into_blocks();
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
+        ctx.replay_blocks(committed);
+        ctx.push_user("and now the next prompt");
+        assert!(ctx.under_compaction_pressure());
+
+        let (route, calls) = stub(StubAnswer::Says(forget_first(3)));
+        let out = ctx.compact_if_pressured(&route).await;
+        ctx.truncate_to_budget();
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(!out.degraded, "{:?}", out.reason);
+        assert_eq!(out.dropped_blocks, 3);
+        assert!(ctx.estimated_bytes() <= TEST_BUDGET_BYTES);
+        assert!(ctx.estimated_tokens() <= 1_000_000);
+        // The compacted history is what this turn will commit forward (BR-4).
+        assert_eq!(ctx.blocks().last().unwrap().text, "and now the next prompt");
     }
 }
