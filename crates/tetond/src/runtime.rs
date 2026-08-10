@@ -10985,11 +10985,7 @@ provider_id = "on-device"
                     _on_token: &mut dyn FnMut(&str) -> bool,
                 ) -> Result<Completion, EngineError> {
                     let _ = self.release.lock().expect("gate poisoned").recv();
-                    Ok(Completion {
-                        text: self.reply.clone(),
-                        prompt_tokens: 0,
-                        completion_tokens: 1,
-                    })
+                    Ok(Completion::cold(self.reply.clone(), 0, 1))
                 }
             }
 
@@ -13721,11 +13717,7 @@ provider_id = "on-device"
                 } else {
                     format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{LOOPBACK_URL}\"}}}}")
                 };
-                Ok(Completion {
-                    text,
-                    prompt_tokens: 0,
-                    completion_tokens: 1,
-                })
+                Ok(Completion::cold(text, 0, 1))
             }
         }
 

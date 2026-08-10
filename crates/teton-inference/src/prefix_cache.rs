@@ -260,7 +260,10 @@ mod tests {
     #[test]
     fn a_shorter_agreeing_prompt_rewinds_rather_than_diverging() {
         let mut state = populated("s1", &[1, 2, 3, 4, 5]);
-        assert_eq!(state.probe("s1", &[1, 2, 3]), CacheDecision::Hit { reuse: 2 });
+        assert_eq!(
+            state.probe("s1", &[1, 2, 3]),
+            CacheDecision::Hit { reuse: 2 }
+        );
     }
 
     #[test]

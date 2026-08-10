@@ -1763,11 +1763,7 @@ mod tests {
             _on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<Completion, EngineError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Completion {
-                text: self.reply.clone(),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-            })
+            Ok(Completion::cold(self.reply.clone(), 0, 0))
         }
     }
 
@@ -2225,11 +2221,7 @@ mod tests {
         ) -> Result<Completion, EngineError> {
             let nth = self.calls.fetch_add(1, Ordering::SeqCst);
             match self.replies.get(nth) {
-                Some(Ok(text)) => Ok(Completion {
-                    text: text.clone(),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                }),
+                Some(Ok(text)) => Ok(Completion::cold(text.clone(), 0, 0)),
                 Some(Err(reason)) => Err(EngineError::unavailable(reason.clone())),
                 None => Err(EngineError::Backend(format!(
                     "the fixture scripted {} calls and this is call {}",

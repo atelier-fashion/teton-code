@@ -536,11 +536,7 @@ mod tests {
                 .expect("capture mutex poisoned")
                 .push(prompt.to_owned());
             on_token(&self.response);
-            Ok(Completion {
-                text: self.response.clone(),
-                prompt_tokens: 1,
-                completion_tokens: 1,
-            })
+            Ok(Completion::cold(self.response.clone(), 1, 1))
         }
         fn chat_format(&self) -> ChatFormat {
             self.format
@@ -915,11 +911,7 @@ mod tests {
                 )));
             }
             on_token("ok");
-            Ok(teton_inference::Completion {
-                text: "ok".to_owned(),
-                prompt_tokens: 1,
-                completion_tokens: 1,
-            })
+            Ok(teton_inference::Completion::cold("ok".to_owned(), 1, 1))
         }
     }
 

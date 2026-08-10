@@ -62,11 +62,7 @@ impl Engine for GatedEngine {
     ) -> Result<Completion, EngineError> {
         self.started.send(()).ok();
         let _ = self.release.recv_timeout(GATE_FALLBACK);
-        Ok(Completion {
-            text: self.reply.clone(),
-            prompt_tokens: 1,
-            completion_tokens: 1,
-        })
+        Ok(Completion::cold(self.reply.clone(), 1, 1))
     }
 }
 

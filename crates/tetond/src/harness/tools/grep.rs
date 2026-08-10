@@ -487,11 +487,7 @@ mod tests {
             _on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<Completion, EngineError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Completion {
-                text: self.reply.clone(),
-                prompt_tokens: 1,
-                completion_tokens: 1,
-            })
+            Ok(Completion::cold(self.reply.clone(), 1, 1))
         }
     }
 

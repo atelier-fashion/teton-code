@@ -26,11 +26,12 @@
 use std::collections::{HashMap, HashSet};
 
 use teton_protocol::events::{
-    BlockCause, DaemonClientAttach, Event, EventEnvelope, FailureClass, ModelLifecycle,
-    ModelSelectionProposed, PermissionOption, PermissionOptionKind, PermissionRequest,
-    PhaseTransition, PrivacyAction, PrivacyBlock, ProviderDegraded, RouteDecided,
-    SessionUpdatePayload, ToolCallStatus, WebConsentDecided, WebConsentScope, WebLookup,
-    WebLookupKind, WebLookupOutcome, WebTier, OPTION_ID_ENABLE_PERMANENT,
+    BlockCause, DaemonClientAttach, Event, EventEnvelope, EvictionReason, FailureClass,
+    ModelLifecycle, ModelSelectionProposed, PermissionOption, PermissionOptionKind,
+    PermissionRequest, PhaseTransition, PrefixCache, PrefixCacheMiss, PrefixCacheOutcome,
+    PrivacyAction, PrivacyBlock, ProviderDegraded, RouteDecided, SessionUpdatePayload,
+    ToolCallStatus, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome,
+    WebTier, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
 use teton_protocol::{Phase, RequestId};
@@ -330,6 +331,55 @@ pub fn render_event(
                 );
             }
             EventOutcome::Rendered
+        }
+        Event::PrefixCache(cache) => {
+            // Diagnostic chrome, not news: prefix reuse is a pure latency
+            // optimization and BR-1 makes it unobservable in output, so a user
+            // who did not ask has nothing to act on. It renders under the same
+            // `verbose` flag the routing notices use — an *eviction* included,
+            // because "your cache went away" only matters to someone already
+            // watching why a turn was slow.
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_prefix_cache(cache));
+            }
+            EventOutcome::Rendered
+        }
+    }
+}
+
+/// The one-line verbose notice a `prefix_cache` event draws.
+fn format_prefix_cache(cache: &PrefixCache) -> String {
+    match &cache.outcome {
+        PrefixCacheOutcome::Hit {
+            cached_tokens,
+            new_tokens,
+        } => format!(
+            "context: reused {cached_tokens} tokens, prefilled {new_tokens} ({})",
+            cache.model
+        ),
+        PrefixCacheOutcome::Miss {
+            reason,
+            processed_tokens,
+        } => {
+            // The reason is spelled out rather than folded into "cache miss":
+            // `divergent` means history was rewritten, `session_switch` means
+            // another session took the slot, and a user chasing latency needs
+            // to tell those apart (BR-8).
+            let reason = match reason {
+                PrefixCacheMiss::Cold => "no resident context",
+                PrefixCacheMiss::SessionSwitch => "another session held the context",
+                PrefixCacheMiss::Divergent => "conversation history changed",
+                PrefixCacheMiss::Evicted => "context was released",
+            };
+            format!("context: prefilled {processed_tokens} tokens — {reason}")
+        }
+        PrefixCacheOutcome::Evicted { reason } => {
+            let reason = match reason {
+                EvictionReason::MemoryPressure => "memory pressure",
+                EvictionReason::EngineUnload => "model unloaded",
+                EvictionReason::GenerationFailed => "a generation failed",
+            };
+            format!("context: released — {reason}")
         }
     }
 }

@@ -55,7 +55,6 @@ pub use engine::{
     detect_chat_format, over_window, ChatFormat, Completion, Engine, EngineError, GenParams,
     MockEngine,
 };
-pub use prefix_cache::{CacheDecision, EvictionReason, MissReason, PrefixCacheState};
 /// SHA-256 over files and byte slices — the integrity primitive behind BR-6.
 ///
 /// Re-exported (rather than the whole `hash` module made public) so the daemon's
@@ -64,6 +63,7 @@ pub use prefix_cache::{CacheDecision, EvictionReason, MissReason, PrefixCacheSta
 /// exposing the hand-rolled streaming `Sha256` internals as public crate API.
 pub use hash::{sha256_file, sha256_hex};
 pub use lifecycle::LifecycleEvent;
+pub use prefix_cache::{CacheDecision, EvictionReason, MissReason, PrefixCacheState};
 pub use pressure::{MemoryPressure, PressureController};
 pub use probe::{band_for_ram, decide, probe, GpuClass, HardwareProfile, TierDecision};
 

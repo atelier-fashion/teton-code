@@ -825,9 +825,12 @@ mod tests {
     fn the_default_cached_completion_reports_a_cold_miss() {
         let mut engine = MockEngine::new("mock-3b");
         let completion = engine
-            .complete_cached("session-1", "hello there", &GenParams::default(), &mut |_| {
-                true
-            })
+            .complete_cached(
+                "session-1",
+                "hello there",
+                &GenParams::default(),
+                &mut |_| true,
+            )
             .expect("the default delegates to complete");
         assert_eq!(completion.cached_tokens, 0);
         assert_eq!(completion.cache_miss, Some(MissReason::Cold));
