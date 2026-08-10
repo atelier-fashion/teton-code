@@ -374,6 +374,13 @@ pub fn render_event(
             // without its gate, because there the issuing client's own RPC
             // answer is the authoritative line and here the reset is the news.
             //
+            // This is also the **only** line the client that typed `/clear`
+            // draws: `slash::handle_clear` renders nothing on success precisely
+            // so that one clear is one line, drawn by this code, on every
+            // attached client including the issuer. The count it needs is here,
+            // so a second rendering from the RPC's answer would say the same
+            // thing twice to the one person who already knew.
+            //
             // It says the conversation and nothing else, because that is all a
             // clear drops (OQ-4): the session's taint pin, pasted URLs and
             // permission grants survive, and a line that read "session reset"

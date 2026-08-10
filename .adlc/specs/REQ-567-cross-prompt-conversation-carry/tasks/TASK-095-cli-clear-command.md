@@ -1,7 +1,7 @@
 ---
 id: TASK-095
 title: "CLI /clear slash command + context_cleared rendering"
-status: draft
+status: complete
 parent: REQ-567
 created: 2026-08-10
 updated: 2026-08-10

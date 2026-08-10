@@ -843,6 +843,12 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
             "/model set",
             "Switch the local tier to a catalog model: /model set <name>.",
         ),
+        // REQ-567 BR-8: the only way a user drops a conversation the daemon now
+        // carries across prompts, so it has to be findable (BUG-153).
+        (
+            "/clear",
+            "Drop this session's retained conversation; the next prompt starts fresh.",
+        ),
         (
             "/verbose",
             "Toggle the routing and turn-end notices for this session.",
@@ -1087,6 +1093,176 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
         session.matches("turn ended").count(),
         1,
         "exactly the verbose turn should have printed a turn-end line; output:\n{session}"
+    );
+}
+
+/// The opening of the one line a clear draws (`session_ui::format_context_cleared`).
+const CLEAR_MARKER: &str = "context cleared;";
+
+/// How many blocks each `context_cleared` notice in `output` reported, in order.
+///
+/// Parsed from the rendered line rather than from a debug hook, because the
+/// rendered line is what this suite is about: a clear the user cannot read the
+/// result of is a clear they have to take on faith. The zero case has its own
+/// sentence ("there was nothing retained to drop"), which is why it is matched
+/// as a word and not as a number.
+fn clear_counts(output: &str) -> Vec<u64> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once(CLEAR_MARKER))
+        .map(|(_, tail)| {
+            let tail = tail.trim();
+            if tail.starts_with("there was nothing") {
+                return 0;
+            }
+            tail.split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("a clear notice named no count: `{tail}`"))
+        })
+        .collect()
+}
+
+/// **REQ-567 AC-6, the UX half: `/clear` spends no model call, and says so once.**
+///
+/// The command is dispatched before a prompt is ever built (BR-1), so the
+/// session-wide evidence that no turn ran is the same absence
+/// [`assert_no_turn_ran`] checks for every other command — and it is checked on
+/// a session whose *only* input is `/clear`, so nothing else could have produced
+/// a reply to hide behind.
+///
+/// The count is asserted as **exactly one line**, which is the whole render
+/// decision (TASK-095): a clear publishes `context_cleared` to every attached
+/// client *and* answers the issuing client's RPC with the same number, and only
+/// the event is rendered. A handler that also printed its answer would leave two
+/// lines here saying one thing, and the person who typed the command would be the
+/// only one who saw the duplicate.
+///
+/// A fresh session has nothing to drop, and that is deliberately the case under
+/// test here: `0` is a real answer, not a degenerate one, and the sentence it
+/// gets is the one that reads as an answer to a command rather than as an
+/// arithmetic result.
+#[test]
+fn slash_clear_runs_no_turn_and_says_when_there_was_nothing_to_drop() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/clear\n");
+
+    assert_eq!(
+        clear_counts(&session),
+        vec![0],
+        "one clear must draw exactly one notice, naming what it dropped; output:\n{session}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        session.contains("context cleared; there was nothing retained to drop."),
+        "a clear with nothing to drop must read as an answer, not as `0 blocks`; \
+         output:\n{session}"
+    );
+    // Wider than the count above, and deliberately so: a second rendering that
+    // did not reuse the event's wording would slip past a marker-shaped count.
+    // One clear, one line that talks about clearing or dropping at all — a
+    // second line saying the same thing in its own words fails here even though
+    // it carries no marker. (Checked by mutation, 2026-08-10: a handler that
+    // also rendered its RPC answer as "dropped N blocks." passes the marker
+    // count and dies on this.)
+    //
+    // Scanned from the session-ready line onward, which is where the entry loop
+    // starts and therefore the only region a command can render into: the
+    // startup chatter above it legitimately says "clears" about this machine's
+    // RAM floor, and a guard that counted that would be about the banner.
+    let entry_loop = session
+        .split_once("ready (freeform)")
+        .map(|(_, tail)| tail)
+        .unwrap_or_else(|| panic!("the session never became ready; output:\n{session}"));
+    let about_the_clear: Vec<&str> = entry_loop
+        .lines()
+        .filter(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("clear") || line.contains("drop")
+        })
+        .collect();
+    assert_eq!(
+        about_the_clear.len(),
+        1,
+        "the issuing client drew a second line about the clear — the RPC answer and the \
+         broadcast event both reached it and both rendered: {about_the_clear:?}\noutput:\n{session}"
+    );
+    assert_no_turn_ran(&session, "`/clear`");
+}
+
+/// **REQ-567 AC-6's flow, through the user's own surface.**
+///
+/// Prompt, `/clear`, prompt about the first exchange, `/clear` again. The second
+/// clear's count is the assertion: it can only cover the second exchange if the
+/// first clear really emptied the conversation, and it would be roughly double
+/// if the daemon had gone on carrying the first exchange past a clear that told
+/// the user it was gone. That is the worst available failure — the user was
+/// already told it had worked — so it is worth pinning from outside the daemon.
+///
+/// **Why the count and not the context.** The claim AC-6 states about the
+/// *assembled context* ("the next prompt's assembled context contains no prior
+/// conversation") cannot be made from here: the scripted daemon answers from a
+/// file and never reports what prompt it was handed, so a second prompt's reply
+/// is the same marker whether or not the first exchange came with it. That leg
+/// lives where the evidence is — `runtime.rs`'s `conversation_carry` module
+/// drives `run_prompt_turn` against a recording engine and asserts on the
+/// context that engine received, including the prompt-clear-prompt flow this
+/// test drives (TASK-094's
+/// `a_clear_empties_the_conversation_and_announces_what_it_dropped`). What is
+/// only assertable *here* is that the real `/clear` command, typed into a real
+/// session, reaches that path at all — and the second count is the externally
+/// visible consequence of it having done so.
+#[test]
+fn slash_clear_drops_the_conversation_the_next_prompt_would_have_carried() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "how many attempts does the router allow?\n\
+         /clear\n\
+         what did we just establish?\n\
+         /clear\n",
+    );
+
+    // Non-vacuity: both turns really ran, so both clears had an exchange to
+    // drop. Without this the counts below could both be zero and agree.
+    for (nth, reply) in TURN_REPLIES.iter().take(2).enumerate() {
+        assert!(
+            session.contains(reply),
+            "turn {} never ran, so the clear counts below are about nothing; output:\n{session}",
+            nth + 1
+        );
+    }
+
+    let counts = clear_counts(&session);
+    assert_eq!(
+        counts.len(),
+        2,
+        "two clears, two notices — no more and no fewer; output:\n{session}"
+    );
+    assert!(
+        counts[0] > 0,
+        "the first clear dropped nothing, so the turn before it retained nothing \
+         and this test is about neither; output:\n{session}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert_eq!(
+        counts[1], counts[0],
+        "the second clear dropped {} blocks where the first dropped {} — the first clear \
+         reported success and left the conversation behind, so the prompt after it carried \
+         history the user was told had gone; output:\n{session}",
+        counts[1], counts[0]
     );
 }
 
