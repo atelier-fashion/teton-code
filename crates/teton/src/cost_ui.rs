@@ -344,12 +344,12 @@ mod tests {
         let report = CostReportView {
             web_per_session: vec![
                 WebTotalsView {
-                    key: "sess-1".to_owned(),
+                    key: "sess-alpha".to_owned(),
                     lookups: 3,
                     bytes_in: 12_345,
                 },
                 WebTotalsView {
-                    key: "sess-2".to_owned(),
+                    key: "sess-beta".to_owned(),
                     lookups: 1,
                     bytes_in: 0,
                 },
@@ -361,11 +361,11 @@ mod tests {
         render_report_view(&report, &mut surface);
 
         assert!(surface.any_line_contains(LineKind::Cost, "web lookups:"));
-        assert!(surface.any_line_contains(LineKind::Cost, "sess-1"));
+        assert!(surface.any_line_contains(LineKind::Cost, "sess-alpha"));
         assert!(surface.any_line_contains(LineKind::Cost, "3 lookup(s)"));
         assert!(surface.any_line_contains(LineKind::Cost, "12345 bytes in"));
         // Every session with a row appears, not just the first.
-        assert!(surface.any_line_contains(LineKind::Cost, "sess-2"));
+        assert!(surface.any_line_contains(LineKind::Cost, "sess-beta"));
         // A lookup that brought nothing back is still a lookup (BR-7).
         assert!(surface.any_line_contains(LineKind::Cost, "1 lookup(s)"));
         // Lookups are never folded into the call counts: they are different

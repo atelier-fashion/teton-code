@@ -1266,7 +1266,7 @@ mod tests {
     // can see the bytes.
     #[test]
     fn a_prompt_line_becomes_a_turn_carrying_exactly_its_own_bytes() {
-        let session = SessionId::from("sess-7");
+        let session = SessionId::from("sess-under-test");
         let text_of = |params: &PromptTurnParams| match params.prompt.as_slice() {
             [PromptBlock::Text { text }] => text.clone(),
             other => panic!("a prompt turn carries exactly one text block: {other:?}"),
@@ -1729,9 +1729,9 @@ mod tests {
         );
         assert!(WEB_NEEDS_A_SESSION.contains("needs a session"));
 
-        let named = web_override_params(Some(SessionId::from("sess-7")))
+        let named = web_override_params(Some(SessionId::from("sess-under-test")))
             .expect("a session is all this request needs");
-        assert_eq!(named.session_id, SessionId::from("sess-7"));
+        assert_eq!(named.session_id, SessionId::from("sess-under-test"));
     }
 
     /// Both web commands report a daemon too old to know them as a **notice**,
@@ -1790,9 +1790,9 @@ mod tests {
         );
         assert!(CLEAR_NEEDS_A_SESSION.contains("needs a session"));
 
-        let named = session_clear_params(Some(SessionId::from("sess-9")))
+        let named = session_clear_params(Some(SessionId::from("sess-under-test")))
             .expect("a session is all this request needs");
-        assert_eq!(named.session_id, SessionId::from("sess-9"));
+        assert_eq!(named.session_id, SessionId::from("sess-under-test"));
     }
 
     /// **REQ-567 BR-8, the render decision.** A `/clear` that worked prints
@@ -1815,7 +1815,7 @@ mod tests {
         report_clear_refusal(
             &RpcError::new(
                 error_code::SESSION_BUSY,
-                "session sess-1 is already running turn turn-2; one session runs one turn at a \
+                "session sess-under-test is already running turn turn-2; one session runs one turn at a \
                  time — retry when it finishes",
             ),
             &mut surface,

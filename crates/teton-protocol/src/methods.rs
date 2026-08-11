@@ -1998,7 +1998,7 @@ mod tests {
                     usd_micros: 3_000,
                 }],
                 web_per_session: vec![WebTotalsView {
-                    key: "sess-1".to_owned(),
+                    key: "sess-under-test".to_owned(),
                     lookups: 2,
                     bytes_in: 8_192,
                 }],

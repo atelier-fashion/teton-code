@@ -1163,7 +1163,7 @@ mod tests {
         let sink = Arc::new(CapturingSink::default());
         let egress = Egress::new(CaptureTransport::default(), boundaries(), sink.clone());
         let prov = Provenance::tainted_by("secrets/prod.env");
-        let ctx = EgressContext::new("deepseek").with_session("sess-1");
+        let ctx = EgressContext::new("deepseek").with_session("sess-under-test");
         let _ = egress.send(a_request("secret"), &prov, &ctx).await;
         let events = sink.events.lock().unwrap();
         assert_eq!(events.len(), 1);
@@ -1363,7 +1363,7 @@ mod tests {
             .send(
                 a_request("ordinary prompt"),
                 &Provenance::empty(),
-                &EgressContext::new("anthropic").with_session("sess-1"),
+                &EgressContext::new("anthropic").with_session("sess-under-test"),
             )
             .await
             .expect_err("an unscannable payload must not be sent");
@@ -1550,7 +1550,7 @@ mod tests {
         // boundary blocks — and an allowed forward bills exactly as before.
         let meter = Arc::new(CountingMeter::default());
         let ctx = EgressContext::new("anthropic")
-            .with_session("sess-1")
+            .with_session("sess-under-test")
             .with_cost(CostAttribution::new("claude-opus-4"));
 
         let blocked = Egress::new(
@@ -1697,7 +1697,7 @@ mod tests {
             .send(
                 a_request("a prompt with a credential in it"),
                 &Provenance::empty(),
-                &EgressContext::new("anthropic").with_session("sess-1"),
+                &EgressContext::new("anthropic").with_session("sess-under-test"),
             )
             .await
             .expect_err("an unavailable verdict still blocks");

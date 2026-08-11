@@ -626,10 +626,10 @@ mod tests {
 
     #[test]
     fn id_newtype_is_transparent_string() {
-        let id = SessionId::from("sess-1");
-        assert_eq!(serde_json::to_string(&id).unwrap(), "\"sess-1\"");
-        assert_eq!(id.to_string(), "sess-1");
-        let back: SessionId = serde_json::from_str("\"sess-1\"").unwrap();
+        let id = SessionId::from("sess-wire");
+        assert_eq!(serde_json::to_string(&id).unwrap(), "\"sess-wire\"");
+        assert_eq!(id.to_string(), "sess-wire");
+        let back: SessionId = serde_json::from_str("\"sess-wire\"").unwrap();
         assert_eq!(back, id);
     }
 

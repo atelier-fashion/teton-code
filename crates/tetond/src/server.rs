@@ -1419,6 +1419,23 @@ mod tests {
         ConnState::new(false)
     }
 
+    /// The id `session/create` just minted, read back off its response
+    /// (REQ-569 BR-8).
+    ///
+    /// A session id is 128 random bits, so a test can no longer *name* the
+    /// session it created — it has to capture it. The parsing lives in one
+    /// place so a fixture reads `let session = created_session_id(&created);`
+    /// instead of repeating a literal that was only ever true while ids were a
+    /// counter.
+    fn created_session_id(response: &str) -> SessionId {
+        let parsed: Value = serde_json::from_str(response)
+            .unwrap_or_else(|e| panic!("session/create answered with non-JSON ({e}): {response}"));
+        let id = parsed["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session/create carried no session_id: {response}"));
+        SessionId::from(id)
+    }
+
     #[test]
     fn dispatch_rejects_unknown_methods() {
         let daemon = Daemon::new();
@@ -1443,6 +1460,7 @@ mod tests {
             serde_json::json!({"mode": "freeform"}),
         );
         assert!(created.contains("session_id"));
+        let session = created_session_id(&created);
 
         let listed = dispatch(
             &daemon,
@@ -1452,7 +1470,7 @@ mod tests {
             Value::Null,
         )
         .unwrap();
-        assert!(listed.contains("sess-0"));
+        assert!(listed.contains(&session.to_string()), "{listed}");
     }
 
     /// REQ-568 BR-1: the two ways a connection comes to see a session, and the
@@ -1474,9 +1492,7 @@ mod tests {
             Id::Number(1),
             serde_json::json!({"mode": "freeform"}),
         );
-        assert!(created.contains("sess-0"), "{created}");
-
-        let session = SessionId::from("sess-0");
+        let session = created_session_id(&created);
         assert!(
             creator.may_receive(Some(&session)),
             "the creator must see the session it just made"
@@ -1492,14 +1508,14 @@ mod tests {
             &daemon,
             &onlooker,
             Id::Number(2),
-            serde_json::json!({"session_id": "sess-ghost"}),
+            serde_json::json!({"session_id": "sess-nonexistent"}),
         );
         assert!(
             ghost.contains(&error_code::UNKNOWN_SESSION.to_string()),
             "{ghost}"
         );
         assert!(
-            !onlooker.may_receive(Some(&SessionId::from("sess-ghost"))),
+            !onlooker.may_receive(Some(&SessionId::from("sess-nonexistent"))),
             "a refused attach must not leave the name in the set"
         );
 
@@ -1507,9 +1523,9 @@ mod tests {
             &daemon,
             &onlooker,
             Id::Number(3),
-            serde_json::json!({"session_id": "sess-0"}),
+            serde_json::json!({"session_id": session.to_string()}),
         );
-        assert!(attached.contains("sess-0"), "{attached}");
+        assert!(attached.contains(&session.to_string()), "{attached}");
         assert!(
             onlooker.may_receive(Some(&session)),
             "attaching is the grant — after it the session's events are visible"
@@ -1770,7 +1786,7 @@ mod tests {
             Id::Number(1),
             serde_json::json!({"mode": "freeform"}),
         );
-        assert!(created.contains("sess-0"), "{created}");
+        let session = created_session_id(&created);
 
         // Attached and live: clears, idempotently, and says how much went.
         let cleared = dispatch(
@@ -1778,7 +1794,7 @@ mod tests {
             &conn,
             Id::Number(2),
             SessionClearParams::METHOD,
-            serde_json::json!({"session_id": "sess-0"}),
+            serde_json::json!({"session_id": session.to_string()}),
         )
         .unwrap();
         assert!(
@@ -1795,7 +1811,7 @@ mod tests {
         // assertion, since two different codes here would be the existence
         // oracle ADR-B refuses to build.
         let stranger = unattached();
-        for target in ["sess-0", "sess-ghost"] {
+        for target in [session.to_string(), "sess-nonexistent".to_owned()] {
             let refused = dispatch(
                 &daemon,
                 &stranger,
@@ -1816,13 +1832,13 @@ mod tests {
 
         // Attached to a name the registry never had: the runtime still
         // classifies it, and the gate did not take that answer away.
-        conn.attach(SessionId::from("sess-ghost"));
+        conn.attach(SessionId::from("sess-nonexistent"));
         let ghost = dispatch(
             &daemon,
             &conn,
             Id::Number(4),
             SessionClearParams::METHOD,
-            serde_json::json!({"session_id": "sess-ghost"}),
+            serde_json::json!({"session_id": "sess-nonexistent"}),
         )
         .unwrap();
         assert!(
@@ -1851,10 +1867,10 @@ mod tests {
             Id::Number(1),
             serde_json::json!({"mode": "freeform"}),
         );
-        assert!(created.contains("sess-0"), "{created}");
+        let session = created_session_id(&created);
 
         let prompt = serde_json::json!({
-            "session_id": "sess-0",
+            "session_id": session.to_string(),
             "prompt": [{"type": "text", "text": "what is in this session?"}],
         });
         let (tx, mut rx) = mpsc::channel::<String>(4);
@@ -1905,11 +1921,11 @@ mod tests {
             Id::Number(1),
             serde_json::json!({"mode": "freeform"}),
         );
-        assert!(created.contains("sess-0"), "{created}");
+        let session = created_session_id(&created);
 
         let monitor = ConnState::new(true);
         assert!(
-            monitor.may_receive(Some(&SessionId::from("sess-0"))),
+            monitor.may_receive(Some(&session)),
             "a monitor sees every session's events"
         );
 
@@ -1918,7 +1934,7 @@ mod tests {
             &monitor,
             Id::Number(2),
             SessionClearParams::METHOD,
-            serde_json::json!({"session_id": "sess-0"}),
+            serde_json::json!({"session_id": session.to_string()}),
         )
         .unwrap();
         assert!(
@@ -1933,9 +1949,9 @@ mod tests {
     /// `session/prompt` bypasses `dispatch`, so its gate is in `spawn_prompt_turn`
     /// and not covered by the `session/clear` monitor test above. The mutation
     /// this pins is reading that gate off `may_receive` instead of `may_drive`:
-    /// a monitor's `may_receive(sess-0)` is `true`, so the swap would spawn a
-    /// turn here — the handle would be `Some` and no refusal queued — handing a
-    /// passive observer a prompt against every session it can see.
+    /// a monitor's `may_receive` of this session is `true`, so the swap would
+    /// spawn a turn here — the handle would be `Some` and no refusal queued —
+    /// handing a passive observer a prompt against every session it can see.
     #[tokio::test]
     async fn a_monitor_cannot_prompt_a_session_it_only_watches() {
         let daemon = Arc::new(Daemon::new());
@@ -1946,16 +1962,16 @@ mod tests {
             Id::Number(1),
             serde_json::json!({"mode": "freeform"}),
         );
-        assert!(created.contains("sess-0"), "{created}");
+        let session = created_session_id(&created);
 
         let monitor = ConnState::new(true);
         assert!(
-            monitor.may_receive(Some(&SessionId::from("sess-0"))),
+            monitor.may_receive(Some(&session)),
             "a monitor sees the session's events — the receive side is not the gate"
         );
 
         let prompt = serde_json::json!({
-            "session_id": "sess-0",
+            "session_id": session.to_string(),
             "prompt": [{"type": "text", "text": "drive this session"}],
         });
         let (tx, mut rx) = mpsc::channel::<String>(4);

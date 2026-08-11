@@ -1123,6 +1123,45 @@ fn clear_counts(output: &str) -> Vec<u64> {
         .collect()
 }
 
+/// The session-ready banner with its minted id replaced by a fixed sentinel, so
+/// two runs' transcripts can be compared byte for byte (REQ-569 BR-8).
+///
+/// Session ids stopped being `sess-0` — every daemon mints 128 random bits — so
+/// two runs against two freshly spawned daemons *always* differ in the banner
+/// line. That is the only difference by design, and normalizing it is what lets
+/// the caller keep asserting whole-output equality rather than retreating to a
+/// comparison that would stop noticing an extra line.
+///
+/// It panics when the banner is absent instead of returning the transcript
+/// unchanged. A mask that quietly did nothing would make two runs that *both*
+/// stopped printing the session line compare equal — the vacuous pass is the
+/// failure mode a normalizing helper invites, so the non-vacuity is checked here
+/// rather than left to each caller to remember.
+fn mask_session_id(transcript: &str, what: &str) -> String {
+    const BANNER: &str = "session sess-";
+    const SENTINEL: &str = "sess-<minted>";
+
+    let mut masked = String::with_capacity(transcript.len());
+    let mut rest = transcript;
+    let mut hits = 0;
+    while let Some(at) = rest.find(BANNER) {
+        let (head, tail) = rest.split_at(at + "session ".len());
+        masked.push_str(head);
+        masked.push_str(SENTINEL);
+        // The id runs to the next space — `session <id> ready (freeform).`
+        rest = &tail[tail.find(' ').unwrap_or(tail.len())..];
+        hits += 1;
+    }
+    masked.push_str(rest);
+
+    assert!(
+        hits > 0,
+        "{what}: no session-ready banner to mask — the transcript is not the \
+         session output this compares:\n{transcript}"
+    );
+    masked
+}
+
 /// **REQ-567 AC-6, the UX half: `/clear` spends no model call, and says so once.**
 ///
 /// The command is dispatched before a prompt is ever built (BR-1), so the
@@ -1304,6 +1343,14 @@ fn slash_clear_drops_the_conversation_the_next_prompt_would_have_carried() {
 /// (`split_once("ready (freeform)")`) — that is the session-end output AC-5
 /// actually asks about. Weakening it further (comparing only the cost block)
 /// would stop testing that `/quit` and Ctrl-D leave through the same path.
+///
+/// One difference between two runs is intended and permanent: session ids are
+/// 128 random bits (REQ-569 BR-8), so three freshly spawned daemons name three
+/// different sessions in their ready banners. [`mask_session_id`] normalizes
+/// exactly that, which keeps the assertion a **whole-output** equality — the
+/// thing that would catch `/quit` printing an extra line or skipping the
+/// summary — instead of demoting it to the weaker suffix comparison the
+/// paragraph above holds in reserve.
 #[test]
 fn slash_quit_ends_the_session_exactly_as_ctrl_d_does() {
     let Some(daemon_bin) = daemon_or_skip() else {
@@ -1325,6 +1372,15 @@ fn slash_quit_ends_the_session_exactly_as_ctrl_d_does() {
     let eof_daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
     let (eof, eof_status) = eof_daemon.run_cli_capture(&teton, &[], history);
     drop(eof_daemon);
+
+    // The three runs' session ids are three independent 128-bit values, and
+    // that is the one difference between the transcripts that is not evidence
+    // of anything. Masked here, once, before any comparison below.
+    let (quit, exit, eof) = (
+        mask_session_id(&quit, "/quit"),
+        mask_session_id(&exit, "/exit"),
+        mask_session_id(&eof, "ctrl-d"),
+    );
 
     // The reported failure was `/exit` reaching the model, which replied
     // conversationally instead of leaving. Both halves are asserted: nothing

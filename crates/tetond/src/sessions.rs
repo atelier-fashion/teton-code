@@ -26,7 +26,6 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use teton_protocol::methods::SessionSummary;
@@ -260,6 +259,85 @@ impl Drop for TurnClaim {
     }
 }
 
+/// How much entropy backs one session id (REQ-569 ADR-H): 128 bits, the same
+/// width the rest of the industry gives an opaque resource name.
+const SESSION_ID_ENTROPY_BYTES: usize = 16;
+
+/// Crockford's base32 alphabet, lowercased.
+///
+/// Base32 rather than hex because 128 bits is 26 characters here against hex's
+/// 32, and these ids are read by humans in daemon logs and typed back on a CLI.
+/// Crockford's variant specifically: it drops `i`, `l`, `o`, and `u`, so an id
+/// read off a log line cannot be transcribed into a *different valid-looking*
+/// id by the usual one/ell and zero/oh confusions.
+const SESSION_ID_ALPHABET: [u8; 32] = *b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// The number of base32 characters 128 bits encodes to: 25 full 5-bit groups
+/// plus 3 leftover bits, which take a 26th.
+const SESSION_ID_BODY_LEN: usize = 26;
+
+/// The prefix every session id carries.
+///
+/// Kept from the old `sess-{n}` scheme deliberately: logs, error strings, and
+/// the CLI's session handling all read better when an id is self-describing,
+/// and the prefix costs nothing — the entropy is entirely in what follows it.
+const SESSION_ID_PREFIX: &str = "sess-";
+
+/// Mint one session id: `sess-` plus 128 bits of OS entropy in base32
+/// (REQ-569 BR-8, ADR-H).
+///
+/// ## This is defense in depth, and nothing may treat it as more
+///
+/// BR-8 is explicit that **ids are names and grants are credentials**. Nothing
+/// in the daemon may key an authorization decision on an id being hard to
+/// guess: an attacker who learns an id — from a log, a screen, a shell history —
+/// must still be refused by the grant checks, exactly as they were when ids were
+/// `sess-0`. What this buys is narrower: a blind guesser no longer enumerates
+/// the session namespace by counting, so the guessing surface stops being a
+/// dozen names and starts being 2^128.
+///
+/// ## Why a failure to mint is an error and not a fallback
+///
+/// The one thing this must never do is quietly degrade to a predictable id when
+/// the entropy source is unavailable. A fallback counter would reintroduce the
+/// enumerable namespace precisely on the machines where nobody is watching, and
+/// it would do so silently. So an entropy failure refuses the `session/create`
+/// through the `Result` the caller already handles. On every platform the daemon
+/// supports this is a `getentropy(2)`/`getrandom(2)` call that does not fail.
+///
+/// # Errors
+///
+/// Returns an error message when the OS entropy source is unavailable.
+fn mint_session_id() -> Result<SessionId, &'static str> {
+    let mut entropy = [0u8; SESSION_ID_ENTROPY_BYTES];
+    getrandom::getrandom(&mut entropy)
+        .map_err(|_| "cannot mint a session id: the OS entropy source is unavailable")?;
+
+    let mut id = String::with_capacity(SESSION_ID_PREFIX.len() + SESSION_ID_BODY_LEN);
+    id.push_str(SESSION_ID_PREFIX);
+
+    // A plain 8-bits-in, 5-bits-out accumulator. The final group is left-padded
+    // with zero bits, so the last character carries 3 bits of entropy rather
+    // than 5 — 128 bits total, as counted above.
+    let mut accumulator: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in entropy {
+        accumulator = (accumulator << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            let index = usize::try_from((accumulator >> bits) & 0b1_1111).expect("5 bits fit");
+            id.push(char::from(SESSION_ID_ALPHABET[index]));
+        }
+    }
+    if bits > 0 {
+        let index = usize::try_from((accumulator << (5 - bits)) & 0b1_1111).expect("5 bits fit");
+        id.push(char::from(SESSION_ID_ALPHABET[index]));
+    }
+
+    Ok(SessionId::from(id))
+}
+
 /// A thread-safe registry of live sessions, newest tracked last.
 ///
 /// **`Clone` yields another handle to the *same* registry**, not a copy of it —
@@ -272,7 +350,6 @@ impl Drop for TurnClaim {
 #[derive(Clone)]
 pub struct SessionRegistry {
     sessions: Arc<Mutex<Vec<SessionRecord>>>,
-    counter: Arc<AtomicU64>,
 }
 
 impl SessionRegistry {
@@ -281,7 +358,6 @@ impl SessionRegistry {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(Vec::new())),
-            counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -295,7 +371,8 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// Returns an error message when a structured session is requested without
-    /// a starting phase (the protocol requires one).
+    /// a starting phase (the protocol requires one), or when the OS entropy
+    /// source cannot mint an id (see [`mint_session_id`]).
     pub fn create(
         &self,
         mode: SessionMode,
@@ -310,9 +387,8 @@ impl SessionRegistry {
             SessionMode::Freeform => None,
         };
 
-        let n = self.counter.fetch_add(1, Ordering::SeqCst);
         let summary = SessionSummary {
-            session_id: SessionId::from(format!("sess-{n}")),
+            session_id: mint_session_id()?,
             mode,
             phase,
             title: None,
@@ -704,6 +780,94 @@ mod tests {
         let a = reg.create(SessionMode::Freeform, None, None).unwrap();
         let b = reg.create(SessionMode::Freeform, None, None).unwrap();
         assert_ne!(a.session_id, b.session_id);
+    }
+
+    /// **REQ-569 BR-8 / ADR-H.** Every id is `sess-` plus 26 base32 characters
+    /// drawn from Crockford's alphabet — so an id is well-formed by shape, and
+    /// the shape itself excludes the `i`/`l`/`o`/`u` a transcription slip would
+    /// produce.
+    ///
+    /// Asserted on the *format*, never on exact values: an id is 128 random
+    /// bits, so a test that named one would be a test of the RNG.
+    #[test]
+    fn a_session_id_is_the_prefix_plus_26_base32_characters() {
+        let reg = SessionRegistry::new();
+        let s = reg.create(SessionMode::Freeform, None, None).unwrap();
+        let id = s.session_id.to_string();
+
+        let body = id
+            .strip_prefix(SESSION_ID_PREFIX)
+            .unwrap_or_else(|| panic!("an id must keep the `sess-` prefix logs read: {id}"));
+        assert_eq!(
+            body.len(),
+            SESSION_ID_BODY_LEN,
+            "128 bits is 26 base32 characters: {id}"
+        );
+        assert!(
+            body.bytes().all(|c| SESSION_ID_ALPHABET.contains(&c)),
+            "an id must be Crockford base32 — no i/l/o/u to mistype: {id}"
+        );
+    }
+
+    /// **REQ-569 BR-8 / ADR-H, the property the change exists for.** Two
+    /// sessions from one daemon are not sequentially related: knowing one tells
+    /// you nothing about the next.
+    ///
+    /// The old scheme failed all three of these at once — `sess-0` and `sess-1`
+    /// are all-digit, differ in a single position, and are the literal integers
+    /// `0` and `1` — so each assertion below is a distinct way the counter could
+    /// come back. The "differ in more than one position" check is probabilistic
+    /// in principle and decided in practice: two independent 26-character base32
+    /// strings agree in 25 of 26 positions with probability below 2^-120, which
+    /// is far under this suite's real flake floor.
+    ///
+    /// It deliberately asserts nothing about *authorization*. Unguessability is
+    /// defense in depth (ADR-H); the grants are the access control, and no test
+    /// here should imply otherwise.
+    #[test]
+    fn session_ids_are_not_sequentially_related() {
+        let reg = SessionRegistry::new();
+        let ids: Vec<String> = (0..64)
+            .map(|_| {
+                reg.create(SessionMode::Freeform, None, None)
+                    .unwrap()
+                    .session_id
+                    .to_string()
+            })
+            .collect();
+
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "64 sessions minted a repeated id");
+
+        for (n, id) in ids.iter().enumerate() {
+            let body = id.strip_prefix(SESSION_ID_PREFIX).unwrap();
+            assert!(
+                body.parse::<u128>().is_err(),
+                "an all-digit body is a counter wearing a new name: {id}"
+            );
+            assert_ne!(
+                id,
+                &format!("{SESSION_ID_PREFIX}{n}"),
+                "the sequential scheme is back"
+            );
+        }
+
+        // Adjacency, at the character level: a counter's consecutive ids differ
+        // in one place. Random ones differ nearly everywhere.
+        for pair in ids.windows(2) {
+            let differing = pair[0]
+                .bytes()
+                .zip(pair[1].bytes())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert!(
+                differing > 1,
+                "consecutive ids differ in {differing} position(s) — that is a \
+                 counter, not entropy: {} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     // -- the `title` duty's once-only guard (REQ-561 TASK-062) ---------------

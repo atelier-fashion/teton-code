@@ -12954,7 +12954,7 @@ provider_id = "on-device"
             let runtime = runtime_with(WebTier::Search, false);
             let events = Arc::new(EventBus::new());
             let mut sub = events.subscribe(16);
-            let session = SessionId::from("sess-1");
+            let session = SessionId::from("sess-under-test");
             runtime.session_taint.mark(&session);
 
             // Non-vacuity: the gate really is restricted before the RPC.
@@ -12999,7 +12999,7 @@ provider_id = "on-device"
         fn the_override_restores_nothing_above_the_configured_ceiling() {
             let runtime = runtime_with(WebTier::FetchUserUrl, false);
             let events = Arc::new(EventBus::new());
-            let session = SessionId::from("sess-1");
+            let session = SessionId::from("sess-under-test");
             runtime.session_taint.mark(&session);
 
             let result = runtime.web_override(
@@ -13072,7 +13072,7 @@ provider_id = "on-device"
         fn a_lift_writes_one_web_override_row_and_a_no_op_writes_none() {
             let runtime = runtime_with(WebTier::FetchAnyUrl, false);
             let events = Arc::new(EventBus::new());
-            let session = SessionId::from("sess-1");
+            let session = SessionId::from("sess-under-test");
 
             // A session that was never restricted lifts nothing and records
             // nothing — the row is evidence of a change, not of a keystroke.
@@ -13120,7 +13120,7 @@ provider_id = "on-device"
             let runtime = runtime_with(WebTier::Search, false);
             let events = Arc::new(EventBus::new());
             let mut sub = events.subscribe(16);
-            let session = SessionId::from("sess-1");
+            let session = SessionId::from("sess-under-test");
             runtime.session_taint.mark(&session);
             let params = WebOverrideParams {
                 session_id: session,
@@ -13190,7 +13190,7 @@ provider_id = "on-device"
             let runtime = runtime_with(WebTier::Search, false);
             let events = Arc::new(EventBus::new());
             let mut sub = events.subscribe(16);
-            let session = SessionId::from("sess-1");
+            let session = SessionId::from("sess-under-test");
             let recorder = runtime.lookup_recorder(&events);
 
             recorder.web_lookup(
@@ -13236,7 +13236,7 @@ provider_id = "on-device"
             let runtime = runtime_with(WebTier::Search, false);
             let events = Arc::new(EventBus::new());
             let recorder = runtime.lookup_recorder(&events);
-            let session = SessionId::from("sess-1");
+            let session = SessionId::from("sess-under-test");
 
             for outcome in WebLookupOutcome::ALL {
                 recorder.web_lookup(
@@ -13549,7 +13549,7 @@ provider_id = "on-device"
             let runtime = Arc::new(runtime_with(WebTier::Search, false));
             let config = runtime.config.lock().expect("config mutex").clone();
             let events = Arc::new(EventBus::new());
-            let session = SessionId::from("sess-1");
+            let session = SessionId::from("sess-under-test");
 
             let first = runtime.permission_gate_for(&session, &events, &config);
             let second = runtime.permission_gate_for(&session, &events, &config);
@@ -13560,7 +13560,8 @@ provider_id = "on-device"
             );
 
             // …and it really is per session: a different session gets its own.
-            let other = runtime.permission_gate_for(&SessionId::from("sess-2"), &events, &config);
+            let other =
+                runtime.permission_gate_for(&SessionId::from("sess-other"), &events, &config);
             assert!(
                 !Arc::ptr_eq(&first, &other),
                 "two sessions shared a grant map"

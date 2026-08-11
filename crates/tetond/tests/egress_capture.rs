@@ -126,7 +126,7 @@ async fn scripted_session_leaks_zero_boundary_bytes_and_blocks_deliberate_egress
     let capture = CaptureTransport::default();
     let sink = Arc::new(CapturingSink::default());
     let egress = Egress::new(capture.clone(), local_only_boundaries(), sink.clone());
-    let ctx = EgressContext::new("anthropic").with_session("sess-42");
+    let ctx = EgressContext::new("anthropic").with_session("sess-captured");
 
     // Turn 1 — an ordinary turn over public files only. Must be allowed and reach
     // the (captured) wire.
@@ -218,7 +218,7 @@ async fn scripted_session_leaks_zero_boundary_bytes_and_blocks_deliberate_egress
     assert!(paths.contains(&"secrets/prod.env"));
     assert!(paths.contains(&"secrets/config.yaml"));
     for (session_id, block) in &events {
-        assert_eq!(session_id.as_ref(), Some(&SessionId::from("sess-42")));
+        assert_eq!(session_id.as_ref(), Some(&SessionId::from("sess-captured")));
         assert_eq!(block.provider_id, ProviderId::from("anthropic"));
         assert_eq!(block.action, PrivacyAction::ReroutedToLocal);
     }

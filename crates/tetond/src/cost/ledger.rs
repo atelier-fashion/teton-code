@@ -1145,7 +1145,7 @@ mod tests {
         let (ledger, sink) = ledger();
         ledger
             .record_call(
-                "sess-1",
+                "sess-under-test",
                 "anthropic",
                 &CostAttribution::new("claude-opus-4")
                     .with_phase(Phase::Review)
@@ -1156,7 +1156,7 @@ mod tests {
             .expect("record");
         let rows = ledger.all_records().expect("read");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session_id, "sess-1");
+        assert_eq!(rows[0].session_id, "sess-under-test");
         assert_eq!(rows[0].phase, Some(Phase::Review));
         assert_eq!(rows[0].category, Some(Category::Review));
         assert_eq!(rows[0].provider_id, "anthropic");
@@ -1167,7 +1167,7 @@ mod tests {
         // The event fired with the same attribution.
         let recorded = sink.records.lock().unwrap();
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].session_id, SessionId::from("sess-1"));
+        assert_eq!(recorded[0].session_id, SessionId::from("sess-under-test"));
         assert_eq!(recorded[0].phase, Some(Phase::Review));
         assert_eq!(recorded[0].category, Some(Category::Review));
         assert_eq!(recorded[0].usd_micros, 15_000 + 37_500);
@@ -1181,7 +1181,7 @@ mod tests {
         let (ledger, sink) = ledger();
         ledger
             .record_call(
-                "sess-2",
+                "sess-under-test",
                 "anthropic",
                 &CostAttribution::new("claude-opus-4").with_category(Category::Design),
                 10,
@@ -1222,7 +1222,7 @@ mod tests {
         let (ledger, sink) = ledger();
         ledger
             .record_call(
-                "sess-1",
+                "sess-under-test",
                 "some-vllm",
                 &CostAttribution::new("llama-3-70b"),
                 2000,
@@ -1781,7 +1781,7 @@ CREATE TRIGGER cost_records_no_delete
         let metered = CostMeter::meter_response(
             ledger.as_ref(),
             response,
-            Some(SessionId::from("sess-9")),
+            Some(SessionId::from("sess-under-test")),
             ProviderId::from("anthropic"),
             CostAttribution::new("claude-opus-4").with_phase(Phase::Implement),
         );
@@ -1794,7 +1794,7 @@ CREATE TRIGGER cost_records_no_delete
         assert_eq!(rows[0].input_tokens, 1200);
         assert_eq!(rows[0].output_tokens, 340);
         assert_eq!(rows[0].phase, Some(Phase::Implement));
-        assert_eq!(rows[0].session_id, "sess-9");
+        assert_eq!(rows[0].session_id, "sess-under-test");
         assert_eq!(sink.records.lock().unwrap().len(), 1);
     }
 
@@ -1941,7 +1941,7 @@ CREATE TRIGGER cost_records_no_delete
         let metered = CostMeter::meter_response(
             ledger.as_ref(),
             response,
-            Some(SessionId::from("sess-429")),
+            Some(SessionId::from("sess-under-test")),
             ProviderId::from("anthropic"),
             CostAttribution::new("claude-opus-4"),
         );
