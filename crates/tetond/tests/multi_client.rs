@@ -757,6 +757,134 @@ async fn mutating_methods_are_refused_until_the_connection_attaches() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// REQ-568 BR-4 / F1: `web/override` is a mutating method — it lifts a session's
+/// web taint — so it is gated on attachment exactly like `session/prompt` and
+/// `session/clear`.
+///
+/// Same shape as the gate test above, over the raw socket: an unattached
+/// same-UID peer that learned the id from `session/list` is refused
+/// `NOT_ATTACHED` *before* the runtime is touched; once it attaches the same
+/// call reaches the runtime, whose answer is no longer `NOT_ATTACHED` (the code
+/// transition is the assertion — the runtime's own outcome is out of scope).
+/// Inverting the `may_drive` gate in `handle_web_override` lets the unattached
+/// call through and fails the first assertion.
+#[tokio::test]
+async fn web_override_is_refused_until_the_connection_attaches() {
+    let path = temp_socket("gate-wov");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut a = TestClient::connect(&path).await;
+    assert!(a.handshake(1).await.get("result").is_some());
+    a.send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let created = a.read_response(2).await;
+    let sid = created["result"]["session_id"].as_str().unwrap().to_owned();
+
+    let mut b = TestClient::connect(&path).await;
+    assert!(b.handshake(1).await.get("result").is_some());
+
+    // B learns the id the way any same-UID peer would: by asking.
+    b.send(2, "session/list", json!({})).await;
+    assert_eq!(session_ids(&b.read_response(2).await), vec![sid.clone()]);
+
+    // Unattached: refused before the runtime is consulted.
+    b.send(3, "web/override", json!({"session_id": sid.clone()}))
+        .await;
+    let refused = b.read_response(3).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "an unattached web/override must be refused: {refused}"
+    );
+
+    // Attachment is the grant, and the only thing that changes the answer.
+    b.send(4, "session/attach", json!({"session_id": sid.clone()}))
+        .await;
+    assert!(b.read_response(4).await.get("result").is_some());
+
+    b.send(5, "web/override", json!({"session_id": sid})).await;
+    let served = b.read_response(5).await;
+    assert_ne!(
+        served["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "after attaching, web/override must reach the runtime: {served}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REQ-568 BR-1 / F7: attachment *composes*. One connection that creates two
+/// sessions is attached to both and receives both their session-scoped
+/// envelopes, while a third session it never touched stays invisible.
+///
+/// This pins that `ConnState.attached` is a set, not a single `Option` a second
+/// attach would overwrite: were it the latter, the first session's envelopes
+/// would vanish the moment the second was created. The positive is the two
+/// create-time events the one connection receives; the negative — C's traffic —
+/// is armed with [`TestClient::forbid_session`] and bounded by a daemon-scoped
+/// marker, so a filtered envelope is a decidable fact rather than a race.
+#[tokio::test]
+async fn one_connection_attached_to_two_sessions_receives_both_and_only_those() {
+    let path = temp_socket("compose");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut multi = TestClient::connect(&path).await;
+    assert!(multi.handshake(1).await.get("result").is_some());
+    let mut other = TestClient::connect(&path).await;
+    assert!(other.handshake(1).await.get("result").is_some());
+
+    // `multi` creates two sessions — auto-attached to each. The helper asserts
+    // it received each session's own create-time envelope, so both A's and B's
+    // scoped events reach the one connection: the set holds two, not the last.
+    let sid_a = create_structured_session(&mut multi, 2).await;
+    let sid_b = create_structured_session(&mut multi, 3).await;
+    assert_ne!(sid_a, sid_b, "the two sessions must be distinct");
+
+    // A third session `multi` never created or attached — invisible from here.
+    let sid_c = create_structured_session(&mut other, 2).await;
+    multi.forbid_session(&sid_c);
+
+    // Fresh scoped traffic on all three: `multi` must receive A's and B's own
+    // `context_cleared`, and its forbid guard trips if C's ever arrives.
+    for (sid, id) in [(&sid_a, 4i64), (&sid_b, 5)] {
+        let (events, cleared) = multi
+            .call_collecting_events(id, "session/clear", json!({"session_id": sid}))
+            .await;
+        assert!(cleared.get("result").is_some(), "clear failed: {cleared}");
+        assert!(
+            events_for(&events, sid)
+                .iter()
+                .any(|e| e["event"] == "context_cleared"),
+            "the connection attached to `{sid}` must receive its clear: {events:?}"
+        );
+    }
+    let (_, cleared_c) = other
+        .call_collecting_events(3, "session/clear", json!({"session_id": sid_c}))
+        .await;
+    assert!(
+        cleared_c.get("result").is_some(),
+        "clear failed: {cleared_c}"
+    );
+
+    // A daemon-scoped marker bounds the negative: `multi` reaches it without C's
+    // envelope tripping the forbid guard, so C was filtered, not merely late.
+    let mut marker = TestClient::connect(&path).await;
+    assert!(marker.handshake(1).await.get("result").is_some());
+    let seen = multi.read_event("daemon_client_attach").await;
+    assert!(
+        seen["params"].get("session_id").is_none(),
+        "the marker is the daemon-scoped envelope every connection still receives: {seen}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// REQ-568 AC-6 and ADR-A's consequence: a filtered connection observes
 /// monotonic but **non-contiguous** `seq`, and a response gated on the event
 /// fence still completes.

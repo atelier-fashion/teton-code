@@ -32,14 +32,20 @@
 //! [`EventFence`] watermark exactly like a delivered one, or a response would
 //! wait forever on an event this connection was never going to receive.
 //!
-//! The same attachment set gates the *mutating* methods: `session/prompt` and
-//! `session/clear` against a session this connection never attached are refused
-//! with `NOT_ATTACHED` (REQ-568 BR-4). The two gates sit at the two seams every
-//! client crosses — [`forward_events`] for reads, [`handle_session_clear`] and
-//! [`spawn_prompt_turn`] for writes — never in a client, and never in the
-//! reader loop above them, so the direct-RPC tests exercise the real gate
-//! (LESSON-484). Attachment is the single grant: `monitor` buys sight of a
-//! session, never the right to drive it.
+//! The same attachment set gates the *mutating* methods: `session/prompt`,
+//! `session/clear`, and `web/override` against a session this connection never
+//! attached are refused with `NOT_ATTACHED` (REQ-568 BR-4). The write gates sit
+//! at the seams every client crosses — [`forward_events`] for reads, and
+//! [`handle_session_clear`], [`spawn_prompt_turn`], [`handle_web_override`] for
+//! writes — never in a client, and never in the reader loop above them, so the
+//! direct-RPC tests exercise the real gate (LESSON-484).
+//!
+//! Attachment is *not yet* the single grant. `permission/respond` is NOT gated:
+//! a monitor sees every session's `permission_request` and can answer it,
+//! driving another session's prompt. Closing that needs session-resolvable
+//! request ids (BUG-161) and is tracked in REQ-569 (BR-9); until then `monitor`
+//! buys sight of a session and the ability to answer its permission prompts,
+//! never the right to drive it with `prompt`/`clear`/`web/override`.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -87,6 +93,12 @@ const OUTBOUND_CAPACITY: usize = 1024;
 /// while keeping a connection's read buffer bounded by something an
 /// unauthenticated peer cannot grow.
 const MAX_FRAME: u64 = 4 * 1024 * 1024;
+
+/// Capacity above which the reader releases its line buffer between frames
+/// rather than retaining it. `MAX_FRAME` is a per-*frame* budget, not a standing
+/// reservation: one near-4 MiB legal frame would otherwise pin that much for the
+/// connection's whole life through the buffer's retained capacity (ADR-D).
+const LINE_RETAIN_CAP: usize = 64 * 1024;
 
 /// How long a disconnecting client's in-flight prompt turns are given to finish
 /// before they are abandoned (REQ-565 BR-2).
@@ -321,11 +333,13 @@ impl ConnState {
     /// `session/prompt` and `session/clear` (REQ-568 BR-4).
     ///
     /// Membership only, and deliberately not [`may_receive`](Self::may_receive):
-    /// `monitor` grants receipt of every session's events and nothing else (the
-    /// spec's Permissions table lists it against "receive", never against the
-    /// mutating methods). Reading the write gate off the delivery policy would
-    /// make one declaration mean two things and silently promote every observer
-    /// into a driver of every session it can see.
+    /// `monitor` grants receipt of every session's events, never the right to
+    /// drive one *through this gate* (the spec's Permissions table lists it
+    /// against "receive", never against `prompt`/`clear`/`web/override`).
+    /// Reading the write gate off the delivery policy would make one declaration
+    /// mean two things and silently promote every observer into a driver of
+    /// every session it can see. (`permission/respond` is a separate, still
+    /// ungated path — BUG-161, REQ-569 BR-9 — not covered by this gate.)
     fn may_drive(&self, session_id: &SessionId) -> bool {
         self.attached
             .read()
@@ -395,7 +409,14 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
     let mut line = String::new();
 
     loop {
-        line.clear();
+        // Reuse the buffer's capacity for the common small frame, but release it
+        // after a near-cap one so a single large frame does not pin ~4 MiB for
+        // the connection's lifetime (F8; ADR-D's bound is per-frame).
+        if line.capacity() > LINE_RETAIN_CAP {
+            line = String::new();
+        } else {
+            line.clear();
+        }
         // BR-6/AC-5: the read is capped by construction. A fresh `take` every
         // iteration is load-bearing — `MAX_FRAME` is a per-*frame* budget, and a
         // `Take` hoisted out of the loop would spend it once across the whole
@@ -405,7 +426,22 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
         let n = match read {
             Ok(0) => break, // EOF: the client disconnected.
             Ok(n) => n,
-            Err(_) => break, // Read error: tear the connection down.
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    // BR-6: an oversized frame whose MAX_FRAME cut split a UTF-8
+                    // sequence (or any non-UTF-8 frame) is refused, not silently
+                    // dropped — same refusal as the newline-terminated oversized
+                    // case. `read_line` returns `InvalidData` (not `Ok`) when the
+                    // budgeted bytes are not valid UTF-8, so it never reaches the
+                    // length check below.
+                    let _ = out_tx.try_send(error_string(
+                        Id::Null,
+                        error_code::INVALID_PARAMS,
+                        "frame exceeds maximum length or is not valid utf-8",
+                    ));
+                }
+                break; // any other read error: tear the connection down.
+            }
         };
 
         // This is not a length check standing in for the cap — by here the
@@ -504,7 +540,18 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
         // Bound *before* the prompt branch: the attachment gate (REQ-568 BR-4)
         // applies to `session/prompt` too, and that method never reaches
         // `dispatch`.
-        let Some(conn) = conn.as_ref() else { continue };
+        //
+        // Unreachable today (`conn` and `handshaked` are set together), but a
+        // bare `continue` would drop a request carrying an `id` and hang the
+        // client — every other refusal answers, so this one does too (F9).
+        let Some(conn) = conn.as_ref() else {
+            let _ = out_tx.try_send(error_string(
+                id,
+                error_code::INTERNAL_ERROR,
+                "connection state unavailable",
+            ));
+            continue;
+        };
 
         // `session/prompt` runs on its own task (see `prompt_tasks`); every other
         // method dispatches synchronously and replies immediately.
@@ -817,10 +864,17 @@ fn do_handshake(
 /// is merely same-UID, and `Debug` escapes the newline a client would otherwise
 /// embed in its name to forge a second log line under the daemon's own prefix.
 fn monitor_declaration_line(params: &HandshakeParams) -> String {
+    // `client_name` is bounded only by MAX_FRAME on the wire (~4 MiB, and ~6×
+    // that once `Debug` escapes it), so cap it to a fixed char budget before
+    // formatting or one handshake could flood the daemon log. `chars().take`
+    // keeps the prefix on a char boundary; the `{:?}` escaping stays (it is
+    // what stops the newline forgery, not the truncation).
+    const NAME_BUDGET: usize = 128;
+    let name: String = params.client_name.chars().take(NAME_BUDGET).collect();
     format!(
         "tetond: {:?} client {:?} declared monitor at handshake: \
          it receives every session's events",
-        params.client_kind, params.client_name
+        params.client_kind, name
     )
 }
 
@@ -854,7 +908,7 @@ fn dispatch(
         ConfigGetParams::METHOD => Some(handle_config_get(daemon, id)),
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, id)),
-        WebOverrideParams::METHOD => Some(handle_web_override(daemon, id, params)),
+        WebOverrideParams::METHOD => Some(handle_web_override(daemon, conn, id, params)),
         WebRefreshParams::METHOD => Some(handle_web_refresh(daemon, id, params)),
         _ => Some(error_string(
             id,
@@ -873,11 +927,20 @@ fn dispatch(
 /// no such tool, and is told so. The requirement's "the override is rejected
 /// when issued by the model" is a fact about which channel this code hangs off,
 /// not a check that could be omitted.
-fn handle_web_override(daemon: &Daemon, id: Id, params: Value) -> String {
+///
+/// `conn` is the issuing connection: lifting a session's web taint is driving
+/// that session, so it is gated on attachment (REQ-568 BR-4) exactly as
+/// `session/clear` is — the check sits before the runtime is touched, so an
+/// unattached caller cannot read a session's existence out of which refusal it
+/// got (ADR-B).
+fn handle_web_override(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     let params: WebOverrideParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
     ok_string(id, &daemon.runtime.web_override(&params, &daemon.events))
 }
 
@@ -1484,11 +1547,25 @@ mod tests {
 
         let forged = monitor_declaration_line(&HandshakeParams {
             client_name: "innocent\ntetond: listening on /tmp/other.sock".to_owned(),
-            ..params
+            ..params.clone()
         });
         assert!(
             !forged.contains('\n'),
             "a client-supplied name must not break the line: {forged}"
+        );
+
+        // F4: `client_name` is bounded only by MAX_FRAME on the wire, so the log
+        // line must bound it itself. A pathologically long name is truncated to
+        // a fixed budget, so the emitted line stays short rather than flooding
+        // the daemon log with megabytes per handshake.
+        let flood = monitor_declaration_line(&HandshakeParams {
+            client_name: "n".repeat(100_000),
+            ..params
+        });
+        assert!(
+            flood.len() < 512,
+            "an over-long client name must be truncated, not logged whole: {} bytes",
+            flood.len()
         );
     }
 
@@ -1669,6 +1746,47 @@ mod tests {
             serde_json::json!({"session_id": "sess-0"}),
         )
         .unwrap();
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "watching a session is not driving it: {refused}"
+        );
+    }
+
+    /// REQ-568 BR-4, the prompt gate specifically: a monitor that never attached
+    /// cannot *prompt* a session it only watches.
+    ///
+    /// `session/prompt` bypasses `dispatch`, so its gate is in `spawn_prompt_turn`
+    /// and not covered by the `session/clear` monitor test above. The mutation
+    /// this pins is reading that gate off `may_receive` instead of `may_drive`:
+    /// a monitor's `may_receive(sess-0)` is `true`, so the swap would spawn a
+    /// turn here — the handle would be `Some` and no refusal queued — handing a
+    /// passive observer a prompt against every session it can see.
+    #[tokio::test]
+    async fn a_monitor_cannot_prompt_a_session_it_only_watches() {
+        let daemon = Arc::new(Daemon::new());
+        let owner = unattached();
+        let created = handle_session_create(
+            &daemon,
+            &owner,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        assert!(created.contains("sess-0"), "{created}");
+
+        let monitor = ConnState::new(true);
+        assert!(
+            monitor.may_receive(Some(&SessionId::from("sess-0"))),
+            "a monitor sees the session's events — the receive side is not the gate"
+        );
+
+        let prompt = serde_json::json!({
+            "session_id": "sess-0",
+            "prompt": [{"type": "text", "text": "drive this session"}],
+        });
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let handle = spawn_prompt_turn(&daemon, &monitor, Id::Number(2), prompt, &tx, None);
+        assert!(handle.is_none(), "a monitor's prompt must spawn no turn");
+        let refused = rx.try_recv().expect("a refusal is queued for the monitor");
         assert!(
             refused.contains(&error_code::NOT_ATTACHED.to_string()),
             "watching a session is not driving it: {refused}"
