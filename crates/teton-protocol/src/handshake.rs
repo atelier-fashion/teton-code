@@ -24,6 +24,16 @@ pub struct HandshakeParams {
     pub protocol_min: ProtocolVersion,
     /// Highest protocol version the client can speak.
     pub protocol_max: ProtocolVersion,
+    /// Receive every session's events, not just this connection's own
+    /// (REQ-568 BR-5). An explicit opt-in the daemon logs at handshake, so a
+    /// monitor's existence is observable rather than inferred from traffic.
+    ///
+    /// Defaulted, and `false` is the *accurate* default rather than a
+    /// placeholder: a client that omits the key predates REQ-568 and asked for
+    /// nothing, so it must attach as an ordinary client rather than fail the
+    /// handshake on a field it has never heard of.
+    #[serde(default)]
+    pub monitor: bool,
 }
 
 /// The daemon's answer to a successful handshake.
@@ -338,18 +348,48 @@ mod tests {
             client_version: "0.1.0".to_owned(),
             protocol_min: ProtocolVersion(min),
             protocol_max: ProtocolVersion(max),
+            monitor: false,
         }
     }
 
     #[test]
     fn handshake_params_and_result_round_trip() {
         round_trip(&params(1, 1));
+        // A declared monitor survives the wire too — a declaration that only
+        // held on the sending side would be no declaration at all (BR-5).
+        round_trip(&HandshakeParams {
+            monitor: true,
+            ..params(1, 1)
+        });
         round_trip(&HandshakeResult {
             protocol_version: ProtocolVersion(1),
             daemon_name: "teton-code".to_owned(),
             daemon_version: "0.1.0".to_owned(),
             capabilities: vec!["structured_mode".to_owned(), "local_tier".to_owned()],
         });
+    }
+
+    /// A build that predates REQ-568 sends no `monitor` key at all, and the
+    /// handshake is the one frame that cannot be allowed to fail on an
+    /// unrecognized field — a client refused here never reaches a method that
+    /// could explain itself. Written as the JSON such a client actually emits
+    /// rather than as a re-serialized value, so the assertion runs through the
+    /// real decode path instead of through this build's own output.
+    #[test]
+    fn a_handshake_that_predates_the_monitor_field_attaches_as_a_non_monitor() {
+        let legacy = r#"{
+            "client_kind": "cli",
+            "client_name": "teton-cli",
+            "client_version": "0.1.13",
+            "protocol_min": 1,
+            "protocol_max": 1
+        }"#;
+        let params: HandshakeParams =
+            serde_json::from_str(legacy).expect("an older client's handshake must still decode");
+        assert!(!params.monitor, "silence is not a monitor declaration");
+        // The rest of the frame is unaffected — the field is additive.
+        assert_eq!(params.client_kind, ClientKind::Cli);
+        assert_eq!(params.protocol_max, ProtocolVersion(1));
     }
 
     #[test]

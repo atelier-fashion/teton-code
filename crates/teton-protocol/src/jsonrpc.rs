@@ -306,6 +306,19 @@ pub mod error_code {
         /// generic turn failure. The daemon classifies here; the client renders
         /// it as a waiting notice, exactly as it does `TIER_WARMING` (BUG-152).
         SESSION_BUSY = -32008;
+        /// A mutating method — `session/prompt`, `session/clear` — named a
+        /// session this connection is not attached to, and was refused before
+        /// it reached the runtime (REQ-568 BR-4).
+        ///
+        /// Distinct from [`UNKNOWN_SESSION`], which says the daemon has no
+        /// such session at all: this says the session is simply not this
+        /// connection's to drive, and the remedy is `session/attach` rather
+        /// than creating a session or retrying. Attachment is the single grant
+        /// seam for session access — a mutating method carries no implicit
+        /// grant of its own — so a client that folded the two codes together
+        /// would tell a user their session had vanished when it is only
+        /// someone else's.
+        NOT_ATTACHED = -32009;
     }
 }
 

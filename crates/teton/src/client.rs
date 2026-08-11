@@ -172,6 +172,9 @@ impl Connection {
             client_version: CLIENT_VERSION.to_owned(),
             protocol_min: PROTOCOL_VERSION_MIN,
             protocol_max: PROTOCOL_VERSION_MAX,
+            // The CLI drives one session and renders that session's stream;
+            // monitoring is for tools that watch every session (REQ-568 ADR-C).
+            monitor: false,
         };
         let id = self.send(params)?;
         loop {
@@ -244,7 +247,11 @@ impl Connection {
                         RespRoute::Ignore => {} // stray ack (e.g. a permission reply)
                     }
                 }
-                Incoming::Event(env) => self.dispatch_event(&env, ctx)?,
+                // Nothing to tear down mid-turn — the entry frame came down
+                // before the prompt was sent — so the render hook is empty here.
+                Incoming::Event(env) => {
+                    self.dispatch_event(&env, ctx, &mut || {})?;
+                }
                 Incoming::Lagged(err) => report_lag(&err, ctx.surface),
             }
         }
@@ -294,11 +301,19 @@ impl Connection {
             };
             match incoming {
                 Incoming::Event(env) => {
-                    if drained.rendered == 0 {
-                        on_first();
+                    // The teardown rides `before_render` rather than happening
+                    // here, so an envelope the own-session filter drops leaves
+                    // the caller's frame standing: it painted nothing, so there
+                    // is nothing to redraw (REQ-568 AC-8).
+                    let is_first = drained.rendered == 0;
+                    let rendered = self.dispatch_event(&env, ctx, &mut || {
+                        if is_first {
+                            on_first();
+                        }
+                    })?;
+                    if rendered {
+                        drained.rendered += 1;
                     }
-                    drained.rendered += 1;
-                    self.dispatch_event(&env, ctx)?;
                 }
                 Incoming::Lagged(err) => {
                     if drained.rendered == 0 {
@@ -317,11 +332,29 @@ impl Connection {
 
     /// Render one event and, if it is a permission request, resolve it and send
     /// the reply back (the ack returns later as a stray response and is ignored).
+    ///
+    /// Both pumps funnel through here, so this is the one place the own-session
+    /// rule has to hold and the one place it is written.
+    ///
+    /// `before_render` runs immediately before anything paints, and only if
+    /// something is going to — an envelope the filter drops never reaches it.
+    /// Returns whether the envelope rendered, so a caller that counts paints
+    /// counts the ones that happened.
     fn dispatch_event(
         &mut self,
         env: &teton_protocol::events::EventEnvelope,
         ctx: &mut UiContext,
-    ) -> anyhow::Result<()> {
+        before_render: &mut dyn FnMut(),
+    ) -> anyhow::Result<bool> {
+        // REQ-568 AC-8: defense in depth atop the daemon-side filter (BR-3),
+        // never a substitute for it — the daemon decides who may *see* a
+        // session's events, and it is the only place that decision is a control.
+        // This drop only keeps a stale or second daemon from painting somebody
+        // else's session onto this screen.
+        if !should_render(env.session_id.as_ref(), ctx.session_id.as_ref()) {
+            return Ok(false);
+        }
+        before_render();
         match session_ui::render_event(env, &mut *ctx.surface, &mut *ctx.state) {
             EventOutcome::Rendered => {}
             EventOutcome::Permission(req) if ctx.answer_permissions => {
@@ -370,7 +403,7 @@ impl Connection {
                 );
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Find and answer a proposal that was raised before this client attached.
@@ -483,6 +516,26 @@ fn route_response(pending: &Id, resp_id: &Id, has_error: bool) -> RespRoute {
         RespRoute::Surface
     } else {
         RespRoute::Ignore
+    }
+}
+
+/// Whether this client paints an envelope scoped to `envelope_session`, given
+/// that it owns `ours` (REQ-568 AC-8, ADR-E). Pure, like [`route_response`],
+/// so the rule is readable on its own.
+///
+/// Daemon-scoped envelopes (`None` — model download progress, daemon lifetime)
+/// always render, including while `ours` is still `None`: the window before
+/// `session/create` answers is exactly where first-run consent speaks, and a
+/// client that went quiet there would download 18 GiB in silence. A
+/// session-scoped envelope renders only when it names our session, so a client
+/// without one renders nothing session-scoped — none of it is its own.
+fn should_render(
+    envelope_session: Option<&teton_protocol::SessionId>,
+    ours: Option<&teton_protocol::SessionId>,
+) -> bool {
+    match envelope_session {
+        None => true,
+        Some(sid) => ours == Some(sid),
     }
 }
 
@@ -1061,6 +1114,23 @@ mod tests {
         }))
     }
 
+    /// A session-scoped envelope: `phase_transition` is the very event
+    /// REQ-568's multi-client test used to prove one client could read
+    /// another's stream, so it is the honest stand-in for "somebody's session
+    /// output".
+    fn phase_envelope(session: &str) -> Incoming {
+        use teton_protocol::events::{Event, EventEnvelope, PhaseTransition};
+        Incoming::Event(Box::new(EventEnvelope {
+            session_id: Some(teton_protocol::SessionId::from(session)),
+            seq: 1,
+            event: Event::PhaseTransition(PhaseTransition {
+                from_phase: None,
+                to_phase: teton_protocol::Phase::Implement,
+                artifacts: Vec::new(),
+            }),
+        }))
+    }
+
     /// REQ-556 BR-1. Before `drain_events`, the only thing that emptied this
     /// channel was `call`'s pump, so a lifecycle event that arrived while the
     /// entry loop sat in `read_line` stayed queued until the next turn — the
@@ -1212,6 +1282,92 @@ mod tests {
         };
         let drained = conn.drain_events(&mut ctx, || {}).expect("not an error");
         assert_eq!(drained.rendered, 0);
+    }
+
+    /// REQ-568 AC-8 / ADR-E: the pump paints this client's session and nothing
+    /// else's.
+    ///
+    /// Defense in depth atop the daemon-side filter (BR-3), never a substitute
+    /// for it — with that filter in place a foreign envelope should never
+    /// arrive at all, and this pins what happens to one that does (a stale or
+    /// second daemon). The daemon-scoped rows are the other half of the rule:
+    /// model download progress and lifecycle carry no session, and a client
+    /// that dropped them before `session/create` answered would sit through
+    /// first-run consent in silence.
+    ///
+    /// Driven through `drain_events` rather than around it, because "reached
+    /// `render_event`" is only interesting as "reached the user's screen", and
+    /// the teardown count is part of that: a dropped envelope must not pull the
+    /// entry frame down for a line it never draws.
+    #[test]
+    fn the_pump_renders_its_own_session_and_daemon_scope_only() {
+        let ours = || Some(teton_protocol::SessionId::from("s1"));
+        let ready = || lifecycle_envelope("qwen3-coder-30b-a3b", ModelLifecycleStage::Ready);
+        let cases: Vec<(&str, Incoming, Option<teton_protocol::SessionId>, bool)> = vec![
+            (
+                "our own session renders",
+                phase_envelope("s1"),
+                ours(),
+                true,
+            ),
+            (
+                "another session is dropped before it can paint",
+                phase_envelope("s2"),
+                ours(),
+                false,
+            ),
+            (
+                "daemon-scoped renders alongside a session of our own",
+                ready(),
+                ours(),
+                true,
+            ),
+            (
+                "pre-create: nothing session-scoped is ours yet",
+                phase_envelope("s2"),
+                None,
+                false,
+            ),
+            (
+                "pre-create: daemon-scoped still renders (first-run consent)",
+                ready(),
+                None,
+                true,
+            ),
+        ];
+
+        for (name, envelope, session_id, renders) in cases {
+            let (mut conn, tx, _peer) = test_connection();
+            tx.send(envelope).expect("queue");
+
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            let mut prompter = crate::prompt::ScriptedPrompter::new(&[]);
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id,
+            };
+
+            let mut teardowns = 0;
+            let drained = conn
+                .drain_events(&mut ctx, || teardowns += 1)
+                .expect("drain");
+
+            assert_eq!(
+                !surface.calls.is_empty(),
+                renders,
+                "{name}: surface {:?}",
+                surface.calls
+            );
+            assert_eq!(drained.rendered, usize::from(renders), "{name}: count");
+            assert_eq!(teardowns, usize::from(renders), "{name}: teardown");
+        }
     }
 
     #[test]

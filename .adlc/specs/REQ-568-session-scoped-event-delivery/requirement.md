@@ -1,7 +1,7 @@
 ---
 id: REQ-568
 title: "Session-scoped event delivery and bounded request frames"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-10
 updated: 2026-08-11
@@ -66,25 +66,25 @@ cap inbound frame length with a deterministic refusal.
 
 ## Business Rules
 
-- [ ] BR-1: A session-scoped envelope is delivered to a connection only if that connection is attached to the envelope's session or has declared monitor. Default delivery is session-scoped; ambient receipt of other sessions' events is impossible without the explicit monitor declaration (informed by LESSON-495).
-- [ ] BR-2: Daemon-scoped envelopes (`session_id = None` — model download/benchmark progress, lifecycle) are delivered to every handshaked connection, unchanged.
-- [ ] BR-3: The filter is enforced in the daemon at the forwarding seam, not in any client. Client-side rendering choices are presentation, never a privacy control — every current and future client (CLI, extension, ACP shim) crosses the daemon seam (informed by LESSON-484, LESSON-432).
-- [ ] BR-4: `session/prompt` and `session/clear` are refused with a distinct, stable error code when the issuing connection is not attached to the target session. Attachment is the single grant seam for session access; mutating methods do not carry an implicit grant (informed by LESSON-495, LESSON-484).
-- [ ] BR-5: Monitor declaration is explicit, visible, and never a default: it is stated at handshake, and the daemon records/announces it such that a monitor's existence is observable (at minimum in the daemon log).
-- [ ] BR-6: An inbound frame exceeding `max_frame_bytes` is refused with `INVALID_PARAMS` (null id — the frame was never parsed) and the daemon never buffers more than the cap for any connection. Post-refusal behavior is deterministic (resync to next newline or close; decided at architecture, then invariant).
-- [ ] BR-7: Filtering must not stall the response fence: an envelope skipped by the filter advances the connection's forwarded watermark exactly as a delivered one does, so no response can wait on an event the connection will never receive.
-- [ ] BR-8: Existing single-client flows are behavior-identical: a client that creates a session and prompts it observes the same events, ordering, and responses as today (informed by BUG-152 — state classification lives in the daemon; clients receive codes, not guesses).
+- [x] BR-1: A session-scoped envelope is delivered to a connection only if that connection is attached to the envelope's session or has declared monitor. Default delivery is session-scoped; ambient receipt of other sessions' events is impossible without the explicit monitor declaration (informed by LESSON-495). — `should_forward` + `may_receive` in `server.rs`, filtered in `forward_events`; pinned by `two_clients_prompting_their_own_sessions_see_only_their_own_envelopes`.
+- [x] BR-2: Daemon-scoped envelopes (`session_id = None` — model download/benchmark progress, lifecycle) are delivered to every handshaked connection, unchanged. — `should_forward`'s `None => true` arm; publisher audit re-walked, every session-output event passes `Some`.
+- [x] BR-3: The filter is enforced in the daemon at the forwarding seam, not in any client. Client-side rendering choices are presentation, never a privacy control — every current and future client (CLI, extension, ACP shim) crosses the daemon seam (informed by LESSON-484, LESSON-432). — `EVENT_METHOD` appears once daemon-side, inside the filtered arm; CLI `should_render` is additive defense-in-depth (AC-8).
+- [x] BR-4: `session/prompt`, `session/clear`, and `web/override` are refused with a distinct, stable error code (`NOT_ATTACHED`) when the issuing connection is not attached to the target session. Attachment is the single grant seam for session access; mutating methods do not carry an implicit grant (informed by LESSON-495, LESSON-484). — gated in `spawn_prompt_turn`, `handle_session_clear`, `handle_web_override`. **Residual:** `permission/respond` remains ungated here (a monitor can answer another session's prompt); gating it requires session-resolvable request ids — tracked as [[BUG-161]] and moved to REQ-569 BR-9/AC-9. Recorded like OQ-1 rather than silently narrowed.
+- [x] BR-5: Monitor declaration is explicit, visible, and never a default: it is stated at handshake, and the daemon records/announces it such that a monitor's existence is observable (at minimum in the daemon log). — `monitor_declaration_line` at `do_handshake`, asserted (incl. newline-forgery) by `a_monitor_declaration_is_announced_and_cannot_forge_a_log_line` + a call-site test; the log line's client-supplied strings are length-bounded before formatting.
+- [x] BR-6: An inbound frame exceeding `max_frame_bytes` is refused with `INVALID_PARAMS` (null id — the frame was never parsed) and the daemon never buffers more than the cap for any connection. Post-refusal behavior is deterministic (refuse-then-close, ADR-D). — `take(MAX_FRAME)` per-frame reader; the refusal is also emitted when a boundary-split UTF-8 sequence makes `read_line` return `InvalidData`, so a non-ASCII oversized frame is refused, not silently dropped.
+- [x] BR-7: Filtering must not stall the response fence: an envelope skipped by the filter advances the connection's forwarded watermark exactly as a delivered one does, so no response can wait on an event the connection will never receive. — the `count += 1; forwarded.send(count)` runs for filtered, serialization-failed, and delivered envelopes alike; regression-pinned (inverting it times out the AC-6 fenced call).
+- [x] BR-8: Existing single-client flows are behavior-identical: a client that creates a session and prompts it observes the same events, ordering, and responses as today (informed by BUG-152 — state classification lives in the daemon; clients receive codes, not guesses). — creator auto-attach; full workspace suite green.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Two connections, two sessions: connection B receives none of session A's envelopes (asserted at the socket, on raw NDJSON — not via CLI rendering), while both receive daemon-scoped envelopes.
-- [ ] AC-2: A handshaked connection that never created or attached a session receives only daemon-scoped envelopes.
-- [ ] AC-3: A connection declaring monitor at handshake receives all sessions' envelopes; the declaration is observable in the daemon log.
-- [ ] AC-4: `session/prompt` and `session/clear` against a session the connection never attached are refused with the BR-4 code; after `session/attach` the same calls succeed.
-- [ ] AC-5: A frame larger than `max_frame_bytes` is refused per BR-6, daemon memory for that connection's read buffer stays ≤ the cap (asserted by construction: the reader is incapable of buffering more), and a fresh connection still serves normally afterward.
-- [ ] AC-6: A response gated on the event fence completes when the filter drops events destined for other connections' sessions (no hang, no timeout).
-- [ ] AC-7: The full existing e2e suite passes unchanged for single-client attach → prompt → stream flows.
-- [ ] AC-8: The CLI renders only envelopes for its own attached session (defense in depth atop BR-3, not a substitute for it).
+- [x] AC-1: Two connections, two sessions: connection B receives none of session A's envelopes (asserted at the socket, on raw NDJSON — not via CLI rendering), while both receive daemon-scoped envelopes. — `tetond/tests/multi_client.rs::two_clients_prompting_their_own_sessions_see_only_their_own_envelopes`
+- [x] AC-2: A handshaked connection that never created or attached a session receives only daemon-scoped envelopes. — `tetond/tests/multi_client.rs::a_client_that_never_attached_receives_only_daemon_scoped_envelopes`
+- [x] AC-3: A connection declaring monitor at handshake receives all sessions' envelopes; the declaration is observable in the daemon log. — `tetond/tests/multi_client.rs::a_monitor_declared_at_handshake_receives_another_clients_events` (delivery, at the socket) + `tetond/src/server.rs::a_monitor_declaration_is_announced_and_cannot_forge_a_log_line` (the log line)
+- [x] AC-4: `session/prompt` and `session/clear` against a session the connection never attached are refused with the BR-4 code; after `session/attach` the same calls succeed. — `tetond/tests/multi_client.rs::mutating_methods_are_refused_until_the_connection_attaches`
+- [x] AC-5: A frame larger than `max_frame_bytes` is refused per BR-6, daemon memory for that connection's read buffer stays ≤ the cap (asserted by construction: the reader is incapable of buffering more), and a fresh connection still serves normally afterward. — `tetond/tests/frame_cap.rs::an_oversized_frame_is_refused_and_closed_and_the_daemon_keeps_serving` + `::a_large_but_legal_frame_round_trips`
+- [x] AC-6: A response gated on the event fence completes when the filter drops events destined for other connections' sessions (no hang, no timeout). — `tetond/tests/multi_client.rs::a_filtered_client_sees_gapped_seqs_and_its_fenced_response_still_completes` (which also pins ADR-A's seq-gap consequence: monotonic, non-contiguous, never asserted contiguous) + `tetond/tests/event_response_ordering.rs::a_turns_ordering_holds_while_another_client_holds_a_different_session`
+- [x] AC-7: The full existing e2e suite passes unchanged for single-client attach → prompt → stream flows. — full workspace run at TASK-102: `cargo build --workspace && cargo test --workspace --no-fail-fast` → 1989 passed / 0 failed / 1 ignored across 43 test targets (the ignored one is the pre-existing e2e case)
+- [x] AC-8: The CLI renders only envelopes for its own attached session (defense in depth atop BR-3, not a substitute for it). — `teton/src/client.rs::the_pump_renders_its_own_session_and_daemon_scope_only`
 
 ## External Dependencies
 
@@ -100,15 +100,17 @@ cap inbound frame length with a deterministic refusal.
 ## Open Questions
 
 - [x] OQ-1: RESOLVED 2026-08-11 — filed as REQ-569 (session attach requires a grant). This REQ stays a tight containment fix: attach remains open to same-UID connections here, recorded as an accepted residual until REQ-569 lands. (Original question: session ids are guessable and `session/attach` has no authorization beyond uid, so BR-1's filter stops passive receipt but not deliberate attachment; the daemon-spawned tool/MCP subprocess case is the sharp end.)
-- [ ] OQ-2: What is `max_frame_bytes`? `session/prompt` legitimately carries large pasted content; the cap must clear the largest supported prompt with margin. Candidate: single-digit MiB, decided with a measurement at architecture time.
-- [ ] OQ-3: Oversized frame: refuse-and-resync (discard until newline, keep the connection) or refuse-and-close? Resync keeps a sloppy client alive; close is simpler and an attacker reconnects either way.
-- [ ] OQ-4: Should a monitor declaration require anything beyond the handshake field — e.g., surfacing as a user-visible event so an interactive client can display "a monitor is attached"?
-- [ ] OQ-5: Should `session/attach` itself emit an event to the session's existing attachees (visibility of new readers)?
+- [x] OQ-2: RESOLVED 2026-08-11 (ADR-D) — `MAX_FRAME = 4 MiB`. Largest legitimate frame is a pasted `session/prompt` (observed well under 100 KiB); 4 MiB is ~40× headroom while bounding per-connection buffer memory.
+- [x] OQ-3: RESOLVED 2026-08-11 (ADR-D) — refuse-then-close, no resync. A legitimate client never hits the cap; an attacker reconnects either way; discard-until-newline is bookkeeping with no honest beneficiary.
+- [ ] OQ-4: Should a monitor declaration surface as a user-visible event (not just a daemon-log line) so an interactive client can display "a monitor is attached"? DEFERRED to REQ-569, which owns monitor grant-gating and its visibility (REQ-569 OQ-5 tracks the sibling `session/attach` visibility question). Shipped posture: log-only.
+- [ ] OQ-5: Should `session/attach` itself emit an event to the session's existing attachees (visibility of new readers)? DEFERRED to REQ-569 (same visibility family as OQ-4).
+- [x] OQ-6 (added during verify, 2026-08-11): `session/list` returns `title` (model-generated from the user's prompt) and `cwd` to any unattached connection — a content leak the event filter does not cover. RESOLVED by deferral: moved to REQ-569 BR-10/AC-10 (payload reduction for unattached connections), recorded as an accepted residual here rather than left implicit.
 
 ## Out of Scope
 
 - Cross-UID access, socket path/permission changes, or any change to the peer-credential auth layer (auth.rs stays as is).
 - Attach authorization and sandboxing daemon-spawned tool/MCP subprocesses away from the socket — filed as REQ-569; not solved here.
+- `permission/respond` attachment gating and `session/list` payload reduction — surfaced during verify, moved to REQ-569 (BR-9/BR-10); `permission/respond` also blocked on the [[BUG-161]] request-id collision. `web/override` IS gated here (BR-4), because it carries an explicit `session_id` and lifts a `local-only` taint pin, squarely inside this REQ's threat model.
 - Backpressure/lag policy changes — `SUBSCRIPTION_LAGGED` eviction semantics are untouched.
 - The ACP compatibility shim.
 - Rate limiting or any DoS surface beyond the single unbounded-frame finding (connection-count caps, event-flood throttling).

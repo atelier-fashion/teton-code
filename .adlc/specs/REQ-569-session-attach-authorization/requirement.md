@@ -74,7 +74,9 @@ are the architecture phase's decision, not this spec's.
 | session/attach (any other session) | holder of an attach-scope grant for that session |
 | declare monitor | holder of a monitor-scope grant |
 | mint a grant | the user, through an explicit, user-visible act — never derivable from environment or filesystem access alone |
-| session/list | any handshaked connection (listing remains open; ids stop being credentials) |
+| session/list (ids + mode + phase) | any handshaked connection (listing of the id namespace remains open; ids stop being credentials) |
+| session/list (title + cwd — prompt-derived / path content) | connection holding an attach/monitor grant for that session; reduced summary otherwise |
+| permission/respond, web/override, and any other method that mutates or answers on behalf of a session | connection attached to the target session (resolved from the request's owning session) |
 
 ## Business Rules
 
@@ -86,6 +88,8 @@ are the architecture phase's decision, not this spec's.
 - [ ] BR-6: An interactive user resuming their own session in a fresh client succeeds with at most one visible consent step, including when no other client is attached. The mechanism that lets them through must be one an ambient background process cannot silently satisfy.
 - [ ] BR-7: Consent defaults closed: an unanswered consent request resolves to denied after a bounded timeout, and a denied or timed-out request leaves no partial grant state (informed by LESSON-501 — the decision travels with the grant, re-asserted at the seam that stores it).
 - [ ] BR-8: New session ids are unguessable and `session/list` knowledge confers no access — ids are names, grants are credentials. Existing flows that only ever touch the creator connection are behavior-identical.
+- [ ] BR-9: Every session-mutating or session-answering method is attachment-gated, not just `session/prompt`/`session/clear`/`web/override` (which REQ-568 gates). In particular `permission/respond` resolves the request's owning session and requires attachment, so a `monitor` — which sees every session's `permission_request` — cannot answer one. This depends on request ids being session-resolvable; the per-session/daemon-wide id collision that blocks it is tracked as [[BUG-161]] and must be fixed first (informed by LESSON-484 — enforce where the "this names a session" decision is made, across every writer, not just the named methods).
+- [ ] BR-10: `session/list` returns the full summary (`title`, `cwd`) only for sessions the connection is attached to or holds a grant for; unattached connections receive a reduced summary (`session_id`, `mode`, `phase`). A session `title` is model-generated from the user's prompt text and `cwd` is an absolute path, so both are boundary content, not mere metadata (informed by LESSON-432 — the leak is in the payload, not only the id). Closes REQ-568's accepted residual on the `session/list` content leak.
 
 ## Acceptance Criteria
 
@@ -97,10 +101,13 @@ are the architecture phase's decision, not this spec's.
 - [ ] AC-6: Consent timeout resolves to denied within the bounded window, emits `attach_refused` with the timeout code, and leaves no grant state behind.
 - [ ] AC-7: The single-client create → prompt → stream flow runs with zero new prompts or consent steps, and the full existing e2e suite passes.
 - [ ] AC-8: Grant enforcement is asserted at the daemon seam by a test driving the RPC surface directly (not through the CLI), so no client-side check can mask a daemon-side gap (informed by BUG-155).
+- [ ] AC-9: An unattached (and separately, a monitor-only) connection calling `permission/respond` against another session's pending request is refused with the BR-5 code; after attaching, the same call succeeds. Asserted at the raw RPC surface (BUG-155 pattern). Requires [[BUG-161]] fixed so the request resolves to an owning session.
+- [ ] AC-10: `session/list` from an unattached connection returns no `title` and no `cwd` for sessions it is not attached to; an attached connection sees the full summary. Asserted on the wire.
 
 ## External Dependencies
 
 - REQ-568 (session-scoped event delivery) must land first: this REQ gates the attach/monitor primitives REQ-568 introduces.
+- [[BUG-161]] (permission request_id collision) must be fixed before BR-9/AC-9: `permission/respond` cannot be attachment-gated until a request id resolves to exactly one owning session.
 
 ## Assumptions
 
