@@ -1,10 +1,10 @@
 ---
 id: REQ-559
 title: "Global reasoning effort with per-provider clamping and thinking-token attribution"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-11
 component: "providers/openai-compat"
 domain: "providers"
 stack: ["rust", "daemon", "llm-providers", "cli"]
@@ -127,6 +127,16 @@ report gains the thinking split.
       alone; `none` sends neither. Emitting both is a 400 on Kimi K2.5/K2.6, so
       the mutual exclusion is a correctness constraint, not a style preference.
       The shape is declared per provider, never sniffed from a response.
+
+      **An OpenAI-compatible endpoint with no declared shape defaults to
+      `effort_only`** (resolves OQ-2; user decision 2026-08-11). Defaulting to
+      `none` would reintroduce the Kimi-defaults-to-`max` hazard at exactly the
+      BYOM endpoint REQ-544 BR-6 exists to serve — the defect this REQ was
+      written to fix, reappearing at the provider Teton knows least about. The
+      opposite risk is bounded and already handled: a server that rejects the
+      unknown field answers 400, which BR-12 turns into a typed error and a
+      fallback to the `none` shape. A stated effort some endpoints refuse is
+      recoverable; an unstated effort that silently bills at `max` is not.
 - [ ] BR-5: A canonical level is **clamped** into the provider's `effort_ladder`
       by nearest-supported-at-or-below, then nearest-supported-above if no lower
       level exists. Clamping is a pure function, table-driven-testable, and the
@@ -153,6 +163,12 @@ report gains the thinking split.
       render through **one** resolution function shared with the router — two
       surfaces describing one setting must not drift. (informed by LESSON-456,
       REQ-555 BR-4)
+
+      **This REQ owns the `/effort` row** in the `COMMANDS` table, including its
+      bare-argument read path and its appearance in `/help` (REQ-555 BR-7).
+      REQ-560 renders the effort *value* in the status line and adds the
+      `/permissions` row; it does not add, alias, or duplicate `/effort`. Stated
+      because both specs previously claimed the command.
 - [ ] BR-10: `reasoning_tokens` is parsed where the provider reports it
       (`completion_tokens_details.reasoning_tokens` on the OpenAI-compatible
       path) and recorded on the `CostRecord`. It is a **subset** of
@@ -186,6 +202,12 @@ report gains the thinking split.
       and **no** effort field; a provider declared `effort_only` receives the
       effort field and **no** thinking flag. A test asserts no request ever
       carries both. (BR-4)
+- [ ] AC-2b: A registered OpenAI-compatible provider with **no declared
+      `reasoning_shape`** sends the effort field on its first call — the
+      `effort_only` default. Against a mock endpoint that answers 400 on that
+      field, the call produces BR-12's typed error and falls back to the `none`
+      shape without a silent retry, and the capture contains no request carrying
+      both shapes. This is the BYOM leg of AC-1's regression. (BR-4, BR-12)
 - [ ] AC-3: Clamp table: canonical `xhigh` against a three-level ladder
       (`low/high/max`) resolves to `high`; canonical `medium` against the same
       resolves to `low`; canonical `low` against a ladder whose floor is `high`
@@ -261,15 +283,25 @@ report gains the thinking split.
       OpenAI-compatible endpoints (REQ-544 BR-6 promises any endpoint with no
       code change); user-declared is honest but is a knob nobody wants to fill in.
       Leaning: a per-kind default table the user may override.
-- [ ] OQ-2: What is a **safe default `reasoning_shape` for an unknown
-      OpenAI-compatible endpoint**? `effort_only` risks a 400 on a server that
-      rejects unknown fields; `none` reintroduces the Kimi-defaults-to-`max`
-      hazard for exactly the BYOM case REQ-544 BR-6 exists to serve. This is the
-      most consequential open question in this REQ.
-- [ ] OQ-3: Does the clamp round **down** or **to nearest**? BR-5 specifies
-      down-then-up, which is the cost-conservative reading. Nearest would put
-      canonical `xhigh` at `max` on a three-level ladder — more capable, more
-      expensive, and arguably what the user asked for.
+- [x] OQ-2 — **closed 2026-08-11: `effort_only`.** An unknown
+      OpenAI-compatible endpoint states its effort. Recorded in BR-4 with the
+      reasoning and pinned by AC-2b. The 400 risk is real but bounded and
+      already has a handler (BR-12); the `none` alternative silently
+      reintroduces this REQ's originating defect at the least-known provider,
+      which does not.
+- [x] OQ-3 — **closed 2026-08-11: down-then-up, as already specified.** This
+      question contradicted its own spec: BR-5 states nearest-supported-at-or-
+      below then nearest-above, and AC-3 pins `xhigh` → `high` against a
+      `low/high/max` ladder in a table-driven test. A spec cannot hold open a
+      behavior it asserts two sections earlier. The cost-conservative reading
+      stands — a user who wants the higher rung names it, rather than having a
+      clamp round up on their behalf and bill for it.
+- [ ] OQ-6: Does a BR-12 fallback **persist for the session**? BR-12 specifies
+      per-call fallback and forbids silent retries, so an endpoint that 400s on
+      the effort field 400s once per call for the life of the session — correct
+      but wasteful. Options: remember the refusal per provider for the session,
+      or downgrade that provider's declared shape to `none` and say so on the
+      surface. Raised by OQ-2's resolution; not created by it.
 - [ ] OQ-4: Does `teton cost` break out reasoning tokens per category (REQ-558)
       as well as in total? Per-category is the view that makes the dial tunable;
       it also widens this REQ's coupling to REQ-558's landing.
@@ -289,7 +321,8 @@ report gains the thinking split.
 - Surfacing thinking *content* to the user. This REQ carries token counts, not
   reasoning text.
 - The status line that displays the effort level — REQ-560 owns the rendering;
-  this REQ owns the setting, its persistence, and `/effort`.
+  this REQ owns the setting, its persistence, and the `/effort` command itself
+  (BR-9), including its `COMMANDS` row and `/help` entry.
 - Permission levels (REQ-560).
 - Automatic effort tuning from observed cost or task difficulty.
 

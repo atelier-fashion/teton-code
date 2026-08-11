@@ -9,7 +9,7 @@ component: "daemon/session"
 domain: "harness"
 stack: ["rust", "daemon", "json-rpc"]
 concerns: ["security"]
-tags: ["authorization", "request-id", "broadcast-prompt", "daemon-wide", "dispatch-audit", "REQ-569"]
+tags: ["authorization", "request-id", "broadcast-prompt", "daemon-wide", "dispatch-audit", "REQ-569", "REQ-570"]
 ---
 
 ## Description
@@ -62,12 +62,29 @@ which the daemon currently has no notion of.
 
 ## Resolution
 
-(filled after fix) — needs a design decision, not just a gate: daemon-wide
-prompts have no session to key on. Options: restrict answering to the
-connection that would be affected / raised the flow; require a non-descendant
-peer (reuse REQ-569's `Ancestry`); or introduce a first-answer-wins rule with
-the answerer recorded. Whatever is chosen, apply it to the sibling methods
-below rather than one at a time.
+**Scoped into REQ-570 (2026-08-11, OQ-5).** The design decision this bug needed
+is the same one REQ-570 exists to make — "who may speak for the machine" — so it
+is answered once, there, rather than twice. REQ-570 BR-10 carries it in two
+separable layers:
+
+- **(a) Connection binding** — every one of these methods takes and checks
+  connection context, so only the connection that raised a request may answer
+  it. This is REQ-569 TASK-107's pattern one scope up, needs no new mechanism,
+  and **ships independently of REQ-570's attestation work** — deliberately, so
+  this high-severity defect is not gated on REQ-570 OQ-1's unresolved mechanism
+  choice.
+- **(b) Attestation for daemon-wide commitments** — a model change or a
+  multi-GB download additionally requires a verified presence attestation,
+  because its blast radius is the whole machine.
+
+Verified per method by REQ-570 AC-10 (each seam tested, not one representative —
+LESSON-502) and guarded by AC-11's mutation check.
+
+Of the options originally listed here, "restrict answering to the connection
+that raised the flow" is the one BR-10(a) adopts. The `Ancestry` reuse is
+rejected on REQ-569 ADR-A's own evidence — the ancestry chain breaks on one
+shell word — and first-answer-wins is rejected because recording the answerer
+documents the hijack rather than preventing it.
 
 ## Related surface — the rest of the dispatch audit
 

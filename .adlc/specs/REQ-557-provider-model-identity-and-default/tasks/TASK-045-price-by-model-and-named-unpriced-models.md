@@ -1,10 +1,10 @@
 ---
 id: TASK-045
 title: "Price by model, and name the models the meter could not price"
-status: draft
+status: complete
 parent: REQ-557
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-11
 dependencies: [TASK-043]
 ---
 
@@ -33,19 +33,19 @@ name, so the report can say *how much* went unpriced but not *what* to price.
 
 ## Acceptance Criteria
 
-- [ ] Two providers declaring the same `model` are priced identically from one
+- [x] Two providers declaring the same `model` are priced identically from one
       price entry, with no duplicate entry required (AC-7).
-- [ ] A provider declaring a model absent from the price table produces a record
+- [x] A provider declaring a model absent from the price table produces a record
       in the unpriced bucket, not a `usd: 0` record — pinned by a test that would
       fail if a zero-cost record were emitted (AC-7).
-- [ ] `teton cost` names every model in the unpriced bucket. A session that calls
+- [x] `teton cost` names every model in the unpriced bucket. A session that calls
       two unpriced models lists both by name; the rendering states what to do
       (add a price entry), not merely that something was unpriced (AC-7b).
-- [ ] The existing `report.rs` unpriced-bucket tests pass **unmodified** —
+- [x] The existing `report.rs` unpriced-bucket tests pass **unmodified** —
       this task adds identity to the bucket, it does not change the accounting.
-- [ ] The savings estimate and baseline label are unchanged; a test pins
+- [x] The savings estimate and baseline label are unchanged; a test pins
       `baseline_model` still renders as `provider/model`.
-- [ ] The legacy provider-id→model helper no longer exists in the workspace.
+- [x] The legacy provider-id→model helper no longer exists in the workspace.
 
 ## Technical Notes
 

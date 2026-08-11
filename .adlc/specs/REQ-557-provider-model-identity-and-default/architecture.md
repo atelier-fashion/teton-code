@@ -12,9 +12,12 @@ REQ; everything else follows.
 Three seams, in dependency order:
 
 1. **Entity + config (`teton-core`)** — `ModelProvider` gains `model`;
-   `Config` gains `default_provider`; `Config::validate()` enforces both. The
-   one-shot migration lives here too, because this is the layer that already owns
-   load, validation, and serialization.
+   `Config` gains `default_provider`. `Config::validate()` enforces the
+   **structural** rules only (duplicate ids, raw-key `auth_ref`, a *dangling*
+   `default_provider`); a missing `model` is a **usability** condition handled by
+   a separate non-fatal pass — see ADR-E, which supersedes the obvious reading.
+   The one-shot migration lives here too, because this is the layer that already
+   owns load, validation, and serialization.
 2. **Router (`tetond`)** — `build_router` reads `p.model` rather than calling
    `billing_model`, and takes the default from config rather than array position.
    `billing_model()` is deleted.
@@ -74,11 +77,20 @@ while differing in `model` — verified viable, because `provider_transport`
 provider id. Pricing gains a genuine "model I have no entry for" state, which the
 report already models.
 
-### ADR-B: `model` is serde-optional in the struct, required in validation
+### ADR-B: `model` is serde-optional in the struct, enforced after load
 
-**Decision**: the field deserializes as absent and required-ness is enforced in
-`Config::validate()`, alongside the existing raw-key-shaped `auth_ref` rejection
-(`config.rs:269`).
+> **Amended by ADR-E.** This ADR was first written as "required in validation",
+> naming `Config::validate()` as the enforcement point. ADR-E supersedes that
+> half: `validate()` is the wrong pass, for reasons ADR-E sets out. What survives
+> here is the serde half — the field must deserialize as absent. The original
+> Decision text is corrected below rather than left standing, because an
+> implementer reads the Decision line and stops.
+
+**Decision**: the field deserializes as absent, and required-ness is enforced by
+a pass that runs **after** load rather than by the deserializer. That pass is
+**not** `Config::validate()` — it is the non-fatal usability pass of ADR-E.
+`validate()` keeps only the structural rules it already had (`config.rs:269`),
+plus the *dangling* `default_provider` check.
 
 **Rationale**: a bare required `String` makes every pre-REQ config fail to
 *deserialize*, and a config that cannot be opened cannot be migrated — the
@@ -179,7 +191,8 @@ Under **Key Patterns**, after "Workflow-aware routing":
 >   subsystem re-derives an identifier from another subsystem's table, and an
 >   absent identifier stays `None` rather than becoming a plausible literal.
 
-To be applied at `/wrapup`, not now.
+**Applied.** Verified present at `.adlc/context/architecture.md:54` under Key
+Patterns, verbatim plus an `(REQ-557 ADR-A/ADR-D)` citation.
 
 ## Task Graph
 

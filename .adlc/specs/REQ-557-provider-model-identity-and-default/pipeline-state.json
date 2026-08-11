@@ -2,7 +2,7 @@
   "req": "REQ-557",
   "branch": "feat/REQ-557-provider-model-identity-and-default",
   "startedAt": "2026-08-05T19:19:39Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -55,6 +56,12 @@
       "phase": 7,
       "name": "CI green",
       "completedAt": "2026-08-05T00:00:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup (merge, artifacts, knowledge)",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "note": "PR #56 merged 2026-08-05; wrapup ran 2026-08-11 after /validate found the artifacts stale. Merge sequence was a verified no-op: PR MERGED, remote branch deleted, .worktrees/REQ-557 already removed."
     }
   ],
   "repos": {
@@ -66,7 +73,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/56",
       "prNumber": 56,
-      "merged": false
+      "merged": true
     }
   },
   "mergeOrder": [
