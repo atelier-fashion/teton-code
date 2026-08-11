@@ -39,8 +39,9 @@ pub enum AuthError {
 /// The kernel-attested identity of the process on the other end of a socket.
 ///
 /// `uid` is what ADR-002's peer-credential check has always compared. `pid` is
-/// the REQ-569 addition and feeds the ancestry decision in [`crate::peer`]; no
-/// gate reads it yet (TASK-106 does).
+/// the REQ-569 addition and feeds the ancestry decision in [`crate::peer`],
+/// which TASK-106 made terminal at `session/attach`, the `monitor` declaration
+/// and `attach/consent`.
 ///
 /// The pid is an `Option` because it is not universally available: macOS and
 /// Linux both supply it, but the BSD arm's `getpeereid(2)` reports no pid at
@@ -175,15 +176,6 @@ pub fn peer_identity(stream: &UnixStream) -> io::Result<PeerIdentity> {
     }
 }
 
-/// Reads the effective uid of the process on the other end of `stream`.
-///
-/// # Errors
-///
-/// Returns the underlying OS error if the kernel refuses the query.
-pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    Ok(peer_identity(stream)?.uid)
-}
-
 /// The daemon's own effective uid.
 #[must_use]
 pub fn current_uid() -> u32 {
@@ -269,6 +261,24 @@ pub fn secure_socket_dir(dir: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// A temp path no other test in this process can collide with.
+    ///
+    /// **The counter, not the timestamp, is what guarantees uniqueness** —
+    /// `SystemTime::now()` can return the same value for two calls inside one
+    /// clock tick, and a suite run with `--test-threads` will make exactly that
+    /// call twice. The standard idiom across this repo's test helpers
+    /// (commit `ece1d0c`); these two helpers were the last holdouts building a
+    /// path from pid and nanos alone.
+    fn temp_path(tag: &str, suffix: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "teton-{tag}-{}-{}{suffix}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
     #[test]
     fn same_uid_is_authorized() {
         assert!(authorize_uid(501, 501).is_ok());
@@ -294,14 +304,7 @@ mod tests {
         // REQ-544 L-1: the socket's parent dir is created 0700 so the socket is
         // never briefly group/other-connectable.
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "teton-sockdir-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = temp_path("sockdir", "");
         let _ = std::fs::remove_dir_all(&dir);
         secure_socket_dir(&dir).expect("create secure dir");
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
@@ -316,15 +319,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_uid_of_a_local_socket_is_the_current_uid() {
-        let path = std::env::temp_dir().join(format!(
-            "teton-auth-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    async fn a_local_socket_peer_is_the_current_uid_and_is_authorized() {
+        let path = temp_path("auth", ".sock");
         let _ = std::fs::remove_file(&path);
 
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -332,7 +328,7 @@ mod tests {
         let _client = UnixStream::connect(&path).await.unwrap();
         let server_side = accept.await.unwrap();
 
-        assert_eq!(peer_uid(&server_side).unwrap(), current_uid());
+        assert_eq!(peer_identity(&server_side).unwrap().uid, current_uid());
         // A same-user peer therefore passes the full check.
         assert!(check_peer(&server_side).is_ok());
 
@@ -346,14 +342,7 @@ mod tests {
         // the kernel-attested peer pid must be our own. LESSON-433 — macOS goes
         // through `getsockopt(LOCAL_PEERPID)` and Linux through the `pid` field
         // of `SO_PEERCRED`, and CI runs both.
-        let path = std::env::temp_dir().join(format!(
-            "teton-auth-pid-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = temp_path("auth-pid", ".sock");
         let _ = std::fs::remove_file(&path);
 
         let listener = tokio::net::UnixListener::bind(&path).unwrap();

@@ -420,22 +420,34 @@ async fn a_large_but_legal_frame_round_trips() {
     // 64 KiB: above anything the protocol carries today and far below the cap.
     // That band is what ADR-D's headroom is for, so a frame in it must be
     // ordinary traffic, not a near miss.
-    let session_id = "s".repeat(64 * 1024);
+    //
+    // The bulk rides in an **ignored** member rather than in `session_id`, which
+    // it used to be. REQ-569's verify pass bounds a wire `session_id` to the
+    // length the daemon could have minted (F9) — a granted consent stores it as
+    // a grant-registry key, so an unbounded id is an unbounded allocation — and
+    // an over-long id now draws `INVALID_PARAMS`. That is the *same code the
+    // reader's size refusal answers with*, so keeping the payload there would
+    // have quietly turned this test into one that passes whether the frame was
+    // dispatched or refused unread. The padding moves; the claim does not.
+    let padding = "s".repeat(64 * 1024);
     client
-        .send(2, "session/attach", json!({"session_id": session_id}))
+        .send(
+            2,
+            "session/attach",
+            json!({"session_id": "sess-nosuchsessionatallhere00", "_pad": padding}),
+        )
         .await;
     let response = client.read_response(2).await;
 
     // Read whole and dispatched: the answer is a *handler* verdict, which only
-    // a fully-parsed frame can produce — not the reader's size refusal.
+    // a fully-parsed frame can produce — not the reader's size refusal, and not
+    // the length gate above it.
     //
     // `CONSENT_TIMEOUT` since REQ-569 TASK-108: this connection created no
     // session and holds no grant, so `session/attach` puts the question to a
     // user (BR-6) before it ever consults the registry — and it does so for a
-    // 64 KiB nonsense id exactly as for a real one, which is the point of that
+    // nonsense id exactly as for a real one, which is the point of that
     // ordering (BR-8). Nobody answers here, so the bounded window closes it.
-    // Any of these codes proves the same thing about *this* test: the frame was
-    // parsed and routed rather than refused by size.
     assert_eq!(
         response["error"]["code"].as_i64().unwrap(),
         error_code::CONSENT_TIMEOUT,

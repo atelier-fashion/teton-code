@@ -283,6 +283,54 @@ const SESSION_ID_BODY_LEN: usize = 26;
 /// and the prefix costs nothing — the entropy is entirely in what follows it.
 const SESSION_ID_PREFIX: &str = "sess-";
 
+/// Whether `session_id` is short enough to be one this daemon could have minted
+/// (REQ-569 verify, F9).
+///
+/// A wire `session_id` is otherwise bounded only by the frame cap — about four
+/// megabytes — and `session/attach` stores it verbatim as a key in the grant
+/// registry when a consent is granted, so an unbounded id is an unbounded
+/// allocation keyed to a connection.
+///
+/// **Length only, deliberately.** Validating the *alphabet* would make the
+/// refusal depend on the id's shape in a way an attacker can probe, and it would
+/// couple a wire gate to a minting detail that ADR-H is explicit must confer no
+/// authorization. This is a well-formedness bound on an untrusted string, not a
+/// second access check: every id of a plausible length still draws exactly the
+/// refusal the grant rules give it, whether it names a live session or nothing
+/// at all (BR-8 — no existence oracle).
+#[must_use]
+pub fn within_minted_length(session_id: &SessionId) -> bool {
+    session_id.0.len() <= SESSION_ID_PREFIX.len() + SESSION_ID_BODY_LEN
+}
+
+/// Why [`SessionRegistry::create`] refused (REQ-569 verify, F9).
+///
+/// Two failures with **opposite owners**, which is why they stopped being one
+/// `&'static str`. `MissingPhase` is the caller's params — they asked for a
+/// structured session and named no phase, and the remedy is to send different
+/// params. `NoEntropy` is the daemon's machine failing to supply randomness; no
+/// parameter the caller could have sent would have changed it, and reporting it
+/// as a params error sends the user off editing a request that was never wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCreateError {
+    /// A structured session was requested without a starting phase.
+    MissingPhase,
+    /// The OS entropy source would not mint a session id.
+    NoEntropy,
+}
+
+impl SessionCreateError {
+    /// The sentence the client is given. Carries no path and no content
+    /// (conventions: privacy in error messages).
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::MissingPhase => "structured session requires a starting phase",
+            Self::NoEntropy => "cannot mint a session id: the OS entropy source is unavailable",
+        }
+    }
+}
+
 /// Mint one session id: `sess-` plus 128 bits of OS entropy in base32
 /// (REQ-569 BR-8, ADR-H).
 ///
@@ -307,11 +355,11 @@ const SESSION_ID_PREFIX: &str = "sess-";
 ///
 /// # Errors
 ///
-/// Returns an error message when the OS entropy source is unavailable.
-fn mint_session_id() -> Result<SessionId, &'static str> {
+/// Returns `Err(())` when the OS entropy source is unavailable; the caller
+/// classifies it (see [`SessionCreateError::NoEntropy`]).
+fn mint_session_id() -> Result<SessionId, ()> {
     let mut entropy = [0u8; SESSION_ID_ENTROPY_BYTES];
-    getrandom::getrandom(&mut entropy)
-        .map_err(|_| "cannot mint a session id: the OS entropy source is unavailable")?;
+    getrandom::getrandom(&mut entropy).map_err(|_| ())?;
 
     let mut id = String::with_capacity(SESSION_ID_PREFIX.len() + SESSION_ID_BODY_LEN);
     id.push_str(SESSION_ID_PREFIX);
@@ -370,25 +418,26 @@ impl SessionRegistry {
     ///
     /// # Errors
     ///
-    /// Returns an error message when a structured session is requested without
-    /// a starting phase (the protocol requires one), or when the OS entropy
-    /// source cannot mint an id (see [`mint_session_id`]).
+    /// [`SessionCreateError::MissingPhase`] when a structured session is
+    /// requested without a starting phase (the protocol requires one), or
+    /// [`SessionCreateError::NoEntropy`] when the OS entropy source cannot mint
+    /// an id (see [`mint_session_id`]).
     pub fn create(
         &self,
         mode: SessionMode,
         phase: Option<Phase>,
         cwd: Option<PathBuf>,
-    ) -> Result<SessionSummary, &'static str> {
+    ) -> Result<SessionSummary, SessionCreateError> {
         let phase = match mode {
             SessionMode::Structured => match phase {
                 Some(phase) => Some(phase),
-                None => return Err("structured session requires a starting phase"),
+                None => return Err(SessionCreateError::MissingPhase),
             },
             SessionMode::Freeform => None,
         };
 
         let summary = SessionSummary {
-            session_id: mint_session_id()?,
+            session_id: mint_session_id().map_err(|()| SessionCreateError::NoEntropy)?,
             mode,
             phase,
             title: None,

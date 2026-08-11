@@ -22,15 +22,28 @@
 //! false confidence, so each arm has its own real-syscall test and CI runs the
 //! suite on both a macOS and a Linux runner.
 //!
-//! **Nothing here gates anything yet.** This module answers a question;
-//! TASK-106 decides what to do with the answer — in particular what
-//! [`Ancestry::Indeterminate`] should cost a connection.
+//! **This module answers a question; it does not ask it.** The policy lives at
+//! the callers: TASK-106 made [`Ancestry`] terminal at `session/attach`, the
+//! `monitor` declaration and `attach/consent`, and decided that
+//! [`Ancestry::Indeterminate`] costs a connection exactly what
+//! [`Ancestry::Descendant`] does (`crate::server`'s
+//! `ConnState::may_hold_session_access`).
 //!
-//! Known limits, recorded rather than hidden (ADR-A): a daemon-spawned child
-//! that double-forks and reparents to `launchd`/`init` breaks the chain, and
-//! PID reuse is a narrow race between `connect(2)` and the walk. Neither is
-//! chased with a heuristic here — a "reparented to init" rule would also catch
-//! a legitimate CLI whose terminal closed.
+//! Known limits, recorded rather than hidden (ADR-A):
+//!
+//! - **The chain is one shell word away from being broken, and the word is
+//!   model-supplied.** The `shell` tool runs `sh -c <command>`, so
+//!   `helper >/dev/null 2>&1 &` or `setsid helper` orphans a grandchild that
+//!   reparents to `launchd`/`init` and classifies [`Ancestry::NotDescendant`]
+//!   with full client rights. This is not a hypothetical "a child that
+//!   double-forks": it is one token in a command the model writes. The `shell`
+//!   tool kills its whole process group on every completion arm, which
+//!   compensates for the backgrounding form but not for `setsid`, which leaves
+//!   the group.
+//! - PID reuse is a narrow race between `connect(2)` and the walk.
+//!
+//! Neither is chased with a heuristic here — a "reparented to init" rule would
+//! also catch a legitimate CLI whose terminal closed.
 
 /// The answer to "did `peer` come out of `ancestor`'s process tree?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -43,11 +43,22 @@
 //!
 //! Nothing here mints a grant on its own, and nothing derives one from the
 //! environment, the socket path, or the filesystem (BR-3). Creating a session
-//! is the only standing on this seam today — it is not a registry entry at all,
-//! but the creator's own [`may_attach`] argument. The explicit user-consent
-//! path that mints registry entries lands in TASK-108; until it does,
-//! [`GrantRegistry::grant`] has no production caller and cross-session attach
-//! is deliberately closed.
+//! is standing without a registry entry at all — it is the creator's own
+//! [`may_attach`] argument, not a [`Grant`].
+//!
+//! Registry entries come from exactly **one** production caller: the
+//! `session/attach` handler, on a [`crate::consent::ConsentOutcome::Granted`]
+//! (`crate::server`). It mints [`GrantScope::Attach`] and nothing else.
+//!
+//! [`GrantScope::Monitor`] therefore has **no socket-reachable minter at all**
+//! (REQ-569 verify, F1). It had one — an `attach/consent` answered by any
+//! attached peer — and that was mintable by a single attacker holding two
+//! connections, because `session/create` is ungated: connection A created a
+//! throwaway session, which made A an attached surface, which made A the
+//! approver for connection B's monitor declaration, which A answered. The path
+//! is removed rather than re-predicated; `may_monitor` stays, so the scope is
+//! still the whole answer to the monitor question, and the question's answer is
+//! now always "no" over the socket.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -205,8 +216,10 @@ impl GrantRegistry {
     /// Records `grant`. Idempotent — a set, so re-granting changes nothing.
     ///
     /// The only caller that may reach this is an explicit user-consent decision
-    /// (TASK-108). Nothing derives a grant from the environment, the socket
-    /// path, or filesystem state (BR-3).
+    /// (`session/attach`'s `Granted` arm, TASK-108). Nothing derives a grant
+    /// from the environment, the socket path, or filesystem state (BR-3), and
+    /// nothing in production reaches it with [`GrantScope::Monitor`] — see the
+    /// module docs.
     pub fn grant(&self, grant: Grant) {
         self.granted
             .write()

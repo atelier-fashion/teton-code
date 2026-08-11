@@ -131,6 +131,9 @@ pub enum Event {
     AttachConsentRequested(AttachConsentRequested),
     /// An attach or monitor request was refused (REQ-569 BR-5).
     AttachRefused(AttachRefused),
+    /// The daemon minted a session grant (REQ-569 verify, F6). Daemon-scoped —
+    /// it names no session — so every handshaked connection is told.
+    SessionGrantMinted(SessionGrantMinted),
 }
 
 impl Event {
@@ -158,6 +161,7 @@ impl Event {
             Event::ContextCleared(_) => "context_cleared",
             Event::AttachConsentRequested(_) => "attach_consent_requested",
             Event::AttachRefused(_) => "attach_refused",
+            Event::SessionGrantMinted(_) => "session_grant_minted",
         }
     }
 }
@@ -1568,6 +1572,22 @@ pub enum AttachRefusedReason {
     /// A user was asked and the bounded window elapsed unanswered. Resolves to
     /// denied, and mints nothing (BR-7).
     ConsentTimeout,
+    /// The connection that asked went away before anyone answered (REQ-569
+    /// verify, F3).
+    ///
+    /// Its own error response reaches nobody — there is no longer a socket to
+    /// write it to — so this exists entirely for the *other* end: the surface
+    /// that rendered the prompt has a security dialog on screen asking about a
+    /// connection that no longer exists, and without this it stays there until a
+    /// user answers a question about nobody.
+    ///
+    /// Deliberately not folded into [`Self::ConsentTimeout`]. A timeout says a
+    /// user was asked and did not answer in time, which is a fact about the
+    /// user; this says the asker left, which is a fact about the peer — and a
+    /// client that reported "you were too slow" for a request nobody was still
+    /// waiting on would be telling the user something false about their own
+    /// behaviour.
+    RequesterGone,
 }
 
 /// An attach or monitor request ended in a refusal (REQ-569 BR-5).
@@ -1599,6 +1619,46 @@ pub struct AttachRefused {
     pub scope: ConsentScope,
     /// Which refusal this is.
     pub reason: AttachRefusedReason,
+}
+
+/// The daemon minted a session grant (REQ-569 verify, F6).
+///
+/// # Why this is on the wire and not only in the log
+///
+/// Minting a grant is the one act on this seam that widens who can see and
+/// drive a session, and until now the only record of the riskiest way it
+/// happens — a connection approving its own request, because nobody was
+/// attached to ask — was a sentence on the daemon's stderr. That stream is read
+/// on startup failure and almost never otherwise, is truncated by the CLI's
+/// spawn path, and is same-uid writable, so the process that self-approved can
+/// erase the evidence. This event is in-perimeter, unsuppressable by the
+/// requester, and delivered to a human who is looking at a screen now.
+///
+/// **Daemon-scoped**: [`EventEnvelope::session_id`] is `None`, so REQ-568's
+/// delivery rule broadcasts it to every handshaked connection rather than to
+/// the session's attachees. That is deliberate — the point is that somebody
+/// *else* sees it — and it is also why no session id appears anywhere in the
+/// payload: an announcement that reaches every connection must not carry an id
+/// BR-10 keeps from most of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGrantMinted {
+    /// What the grant opens.
+    pub scope: ConsentScope,
+    /// Who it was minted for — the same untrusted, daemon-bounded descriptor
+    /// [`AttachConsentRequested::requester`] carries, and to be treated the same
+    /// way: a hint, never an identity.
+    pub requester: String,
+    /// Whether the connection that asked is also the connection that approved
+    /// (REQ-569 BR-6's second arm).
+    ///
+    /// `true` is the accepted residual made visible: nobody was attached to the
+    /// target session, so the prompt was rendered at the requester and the
+    /// requester answered it. For a person resuming their own session that is
+    /// the intended flow; for a headless same-UID process it means no human was
+    /// involved at all, and the daemon cannot tell the two apart. Surfacing the
+    /// flag rather than making the reader infer it from the absence of a
+    /// prompt is the whole point — the inference is exactly what nobody does.
+    pub self_approved: bool,
 }
 
 #[cfg(test)]
@@ -3052,6 +3112,38 @@ mod tests {
         assert_eq!(no_prompt["reason"], "no_grant");
     }
 
+    /// REQ-569 verify (F6): the grant announcement is **daemon-scoped** and
+    /// says out loud whether it was self-approved.
+    ///
+    /// The absent `session_id` is the load-bearing assertion. It is what makes
+    /// REQ-568's delivery rule broadcast the frame to every handshaked
+    /// connection rather than to the target session's attachees — an
+    /// announcement only the beneficiary can see is not an announcement — and it
+    /// is simultaneously what keeps the frame from leaking an id BR-10 withholds
+    /// from those same connections.
+    #[test]
+    fn a_minted_grant_is_announced_daemon_wide_and_names_its_approver_arm() {
+        let minted = Event::SessionGrantMinted(SessionGrantMinted {
+            scope: ConsentScope::Attach,
+            requester: "cli client \"teton\"".to_owned(),
+            self_approved: true,
+        });
+        assert_eq!(minted.name(), "session_grant_minted");
+
+        let env = EventEnvelope::new(7, None, minted);
+        let wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+        assert_eq!(wire["event"], "session_grant_minted");
+        assert_eq!(wire["scope"], "attach");
+        assert_eq!(wire["requester"], "cli client \"teton\"");
+        assert_eq!(wire["self_approved"], true);
+        assert!(
+            wire.get("session_id").is_none(),
+            "a grant announcement goes to every connection, so it names no \
+             session: {wire}"
+        );
+    }
+
     /// BR-5: each refusal reason has its own spelling, and a monitor request
     /// names no session.
     ///
@@ -3065,6 +3157,7 @@ mod tests {
             (AttachRefusedReason::NoGrant, "\"no_grant\""),
             (AttachRefusedReason::ConsentDenied, "\"consent_denied\""),
             (AttachRefusedReason::ConsentTimeout, "\"consent_timeout\""),
+            (AttachRefusedReason::RequesterGone, "\"requester_gone\""),
         ] {
             assert_eq!(serde_json::to_string(&reason).unwrap(), expected);
         }

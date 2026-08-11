@@ -31,6 +31,9 @@
 //! - `a_monitor_declaration_is_refused_without_a_monitor_scope_grant` — replaces
 //!   REQ-568's test that a declaration alone bought sight of every session
 //!   (BR-2, AC-4).
+//! - `a_peers_own_second_connection_cannot_approve_it_a_monitor` — the
+//!   regression test for the consent path TASK-108 added and REQ-569's verify
+//!   pass removed: it was mintable by one actor holding two connections (F1).
 //! - `a_connection_from_the_daemons_own_process_tree_is_refused_attach_and_monitor`
 //!   — the ancestry gate, over the real kernel-attested peer pid (BR-4, ADR-A).
 //!
@@ -736,13 +739,14 @@ async fn a_client_that_never_attached_receives_only_daemon_scoped_envelopes() {
 /// connection to do something only a handshaked connection may do, and requires
 /// it to be told the handshake never happened.
 ///
-/// The refusal here is the **no-approver** arm (TASK-108): a monitor is a
-/// whole-daemon read capability, so it is approved only at a surface the user
-/// demonstrably already owns — a connection attached to some session — and
-/// never by the requester itself. No client is attached anywhere in this test,
-/// so there is nobody to ask and the answer is `NOT_GRANTED` rather than a
-/// prompt. `a_monitor_consent_granted_by_an_attached_client_produces_a_working_monitor`
-/// drives the other arm.
+/// The refusal is **terminal**: since REQ-569's verify pass there is no consent
+/// path to `monitor` at all, so `NOT_GRANTED` is the whole answer rather than
+/// the "nobody was available to ask" arm of one (F1). The arm that did exist was
+/// mintable by one peer holding two connections —
+/// `a_peers_own_second_connection_cannot_approve_it_a_monitor` is the regression
+/// test for that, and it is this test's other half: this one says an unattached
+/// daemon refuses, that one says an *attached* daemon refuses too, which is the
+/// case the removed path served.
 #[tokio::test]
 async fn a_monitor_declaration_is_refused_without_a_monitor_scope_grant() {
     let path = temp_socket("monitor");
@@ -792,40 +796,34 @@ async fn a_monitor_declaration_is_refused_without_a_monitor_scope_grant() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// REQ-569 BR-2/BR-6, AC-4 at the raw RPC surface: `monitor` is **reachable
-/// again**, and only through a user at a client that already holds a session.
+/// **REQ-569 verify, F3.** A requester that goes away mid-consent leaves the
+/// daemon holding nothing.
 ///
-/// TASK-106 grant-gated the declaration with nothing able to mint the grant,
-/// which made `monitor` permanently unreachable — a regression against REQ-568
-/// wearing a security posture. This is the test that says the capability exists
-/// and states its price.
+/// `handle_client`'s teardown aborts the in-flight `session/attach` tasks, and
+/// aborting a task **drops its future at the await point** — so none of
+/// `await_decision`'s three endings runs, and before this fix the waiter stayed
+/// in the daemon-wide registry for the life of the daemon. A `connect → attach →
+/// disconnect` loop grew it without bound, and since F4 every leaked entry also
+/// consumed one of the requester's three consent slots for a request that could
+/// never be answered.
 ///
-/// Four claims, and the last two are the ones a plausible implementation gets
-/// wrong:
-///
-/// 1. The declaration raises a prompt at the *attached* client, not at the
-///    requester. The requester cannot answer its own — structurally, since it
-///    has not completed a handshake and no method but `handshake` is accepted
-///    on that connection.
-/// 2. Granted, the monitor works: it receives an envelope for a session it
-///    never attached to, which is the whole capability.
-/// 3. **A pending handshake wedges nothing.** The daemon awaits the decision
-///    inside the monitor's own per-connection task, so a third client connects,
-///    handshakes and creates a session while the monitor is still waiting. A
-///    consent awaited on the accept loop would deadlock the daemon for
-///    everyone — including the client that has to answer it.
-/// 4. **Scope independence survives** (LESSON-495): the monitor grant buys
-///    sight of every session and standing to attach to none, so the monitor's
-///    own `session/attach` still has to ask.
+/// The daemon here runs the **shipped** thirty-second consent window rather than
+/// this file's shortened one, and that is the whole design of the test: with a
+/// 200 ms window a leak and a fix look identical after 200 ms, and the assertion
+/// would pass against the bug. Under the real window the timeout arm cannot
+/// possibly have run by the time the poll below gives up, so anything that
+/// empties the registry is the teardown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_monitor_consent_granted_by_an_attached_client_produces_a_working_monitor() {
-    let path = temp_socket("mon-ok");
+async fn a_requester_that_disconnects_mid_consent_leaves_no_waiter_behind() {
+    let path = temp_socket("consent-leak");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = test_daemon();
+    // The shipped window, deliberately: see the doc comment.
+    let daemon = Arc::new(Daemon::new());
     let held = Arc::clone(&daemon);
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
-    // The approver: a client attached to a session, by having created it.
+    // The owner keeps the session attached, so the requester's attach takes the
+    // peer arm and waits on a decision the owner never makes.
     let mut owner = TestClient::connect(&path).await;
     assert!(owner.handshake(1).await.get("result").is_some());
     owner
@@ -833,106 +831,159 @@ async fn a_monitor_consent_granted_by_an_attached_client_produces_a_working_moni
         .await;
     let sid = owner.read_response(2).await["result"]["session_id"]
         .as_str()
-        .unwrap()
+        .expect("the owner's session is created")
         .to_owned();
 
-    // The declaration, sent without waiting: the handshake response cannot
-    // arrive until somebody decides, which is the point.
-    let mut watcher = TestClient::connect(&path).await;
-    watcher
-        .send(
-            1,
-            "handshake",
-            json!({
-                "client_kind": "cli",
-                "client_name": "test-client",
-                "client_version": "0.1.0",
-                "protocol_min": PROTOCOL_VERSION_MIN,
-                "protocol_max": PROTOCOL_VERSION_MAX,
-                "monitor": true,
-            }),
-        )
-        .await;
+    {
+        let mut requester = TestClient::connect(&path).await;
+        assert!(requester.handshake(1).await.get("result").is_some());
+        requester
+            .send(2, "session/attach", json!({"session_id": sid.clone()}))
+            .await;
+        // Wait until the prompt is genuinely outstanding — reading it off the
+        // owner's stream rather than sleeping, so the drop below lands on a
+        // *live* consent rather than on a race the test never entered.
+        let prompt = owner.read_event("attach_consent_requested").await;
+        assert_eq!(prompt["params"]["session_id"].as_str(), Some(sid.as_str()));
+        assert_eq!(held.consents.pending_count(), 1);
+        // ...and the socket closes here, with the decision still outstanding.
+    }
 
-    // (3) The daemon is still serving everyone else while that decision is
-    // outstanding.
-    let mut bystander = TestClient::connect(&path).await;
-    assert!(
-        bystander.handshake(1).await.get("result").is_some(),
-        "a pending monitor consent must not wedge the accept loop"
+    // Teardown is another task's work, so poll rather than assume — bounded
+    // well under the thirty-second window whose expiry would otherwise be a
+    // second explanation for an empty registry.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while held.consents.pending_count() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        held.consents.pending_count(),
+        0,
+        "a consent whose requester disconnected must not sit in the registry \
+         until the daemon exits"
     );
-    bystander
+    assert!(
+        held.grants.is_empty(),
+        "and it must certainly not have minted anything: {} grants",
+        held.grants.len()
+    );
+
+    // The surface that rendered the prompt is told the request is over, so a
+    // security dialog is not left on screen asking about a connection that no
+    // longer exists.
+    let retired = owner.read_event("attach_refused").await;
+    assert_eq!(
+        retired["params"]["reason"].as_str(),
+        Some("requester_gone"),
+        "the prompt must be retired, and named as the peer leaving rather than \
+         as the user being slow: {retired}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **REQ-569 verify, F1 — the regression test for a working attack.**
+///
+/// This test used to be
+/// `a_monitor_consent_granted_by_an_attached_client_produces_a_working_monitor`,
+/// and it passed. It was also, exactly as written, the exploit: one actor
+/// holding two connections could mint itself a daemon-wide monitor with no
+/// human anywhere in the loop.
+///
+/// The sequence is the one below. `session/create` is ungated by design, so
+/// connection A creates a throwaway session — which makes A *attached*, which
+/// makes A a registered consent surface, which makes A the only candidate the
+/// monitor routing rule ("any attached peer other than the requester") had to
+/// pick from. Connection B then declares `monitor`, the prompt is routed to A,
+/// and A answers its own request. Nothing in the daemon noticed: the two
+/// connections have different `ConnectionId`s, so `self_approved_by` was false
+/// and even the self-approval log line stayed silent.
+///
+/// No approver predicate over these primitives fixes it — the daemon cannot
+/// tell an attacker's second connection from a user's real client, and a
+/// peer-pid check only forces a fork — so the consent path is **removed**.
+/// `monitor` keeps its grant gate (BR-2/AC-4) and simply has no minter a socket
+/// can reach.
+///
+/// Two claims, and the second is the one that makes this a regression test
+/// rather than a code assertion:
+///
+/// 1. B is refused `NOT_GRANTED`, immediately, and its handshake fails — it is
+///    not left holding a working connection with `monitor` silently downgraded.
+/// 2. **A is never asked.** No `attach_consent_requested` reaches the attached
+///    connection, so there is no prompt for the attacker's other half to
+///    answer. A positive control on the same daemon and the same connection
+///    bounds it: an ordinary cross-session attach *does* raise a prompt at A, so
+///    the silence above is the removed path and not a fixture that cannot
+///    observe prompts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peers_own_second_connection_cannot_approve_it_a_monitor() {
+    let path = temp_socket("mon-attack");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = test_daemon();
+    let held = Arc::clone(&daemon);
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    // Connection A: the attacker's first half. It creates a throwaway session,
+    // which is all it takes to become an attached, registered surface.
+    let mut conn_a = TestClient::connect(&path).await;
+    assert!(conn_a.handshake(1).await.get("result").is_some());
+    conn_a
         .send(2, "session/create", json!({"mode": "freeform"}))
         .await;
-    assert!(bystander.read_response(2).await["result"]["session_id"]
+    let sid = conn_a.read_response(2).await["result"]["session_id"]
         .as_str()
-        .is_some());
-
-    // (1) The prompt is rendered at the owner, and it names the wider scope.
-    let prompt = owner.read_event("attach_consent_requested").await;
-    assert_eq!(prompt["params"]["scope"].as_str(), Some("monitor"));
-    assert!(
-        prompt["params"].get("session_id").is_none(),
-        "a monitor request asks for every session, so it names none: {prompt}"
-    );
-    let request_id = prompt["params"]["request_id"]
-        .as_str()
-        .expect("the prompt carries a request id")
+        .expect("the throwaway session is created")
         .to_owned();
 
-    owner
-        .send(
-            3,
-            "attach/consent",
-            json!({ "request_id": request_id, "outcome": {"outcome": "granted"} }),
-        )
-        .await;
-    assert_eq!(
-        owner.read_response(3).await["result"]["resolved"].as_bool(),
-        Some(true),
-        "the decision must have reached the waiting handshake"
-    );
-
-    let admitted = watcher.read_response(1).await;
-    assert!(
-        admitted.get("result").is_some(),
-        "an approved monitor must complete its handshake: {admitted}"
-    );
-    assert_eq!(
-        held.grants.len(),
-        1,
-        "exactly one grant, minted by exactly one decision"
-    );
-
-    // (2) The capability itself: an envelope from a session the monitor never
-    // attached to reaches it.
-    owner
-        .send(4, "session/clear", json!({"session_id": sid.clone()}))
-        .await;
-    assert!(owner.read_response(4).await.get("result").is_some());
-    let seen = watcher.read_event("context_cleared").await;
-    assert_eq!(
-        seen["params"]["session_id"].as_str(),
-        Some(sid.as_str()),
-        "a monitor must receive a session it never attached to: {seen}"
-    );
-
-    // (4) And it buys nothing else. The monitor's own attach raises its own
-    // consent — which the owner does not answer — so a monitor grant is not an
-    // attach grant by another name.
-    watcher
-        .send(2, "session/attach", json!({"session_id": sid.clone()}))
-        .await;
-    let refused = watcher.read_response(2).await;
+    // Connection B: the attacker's second half, asking for sight of every
+    // session on the machine.
+    let mut conn_b = TestClient::connect(&path).await;
+    let refused = conn_b.handshake_declaring(1, true).await;
     assert_eq!(
         refused["error"]["code"].as_i64(),
-        Some(error_code::CONSENT_TIMEOUT),
-        "a monitor grant must not confer attach (LESSON-495): {refused}"
+        Some(error_code::NOT_GRANTED),
+        "a monitor declaration must be refused outright, with no consent path \
+         for the requester's own other connection to answer: {refused}"
     );
+
+    // (1) The handshake genuinely failed — no silently-downgraded `monitor`.
+    conn_b.send(2, "session/list", json!({})).await;
     assert_eq!(
-        held.grants.len(),
-        1,
-        "and the refused attach must not have added one"
+        conn_b.read_response(2).await["error"]["code"].as_i64(),
+        Some(error_code::INVALID_REQUEST),
+        "a refused monitor must not be left holding a working connection"
+    );
+    assert!(
+        held.grants.is_empty(),
+        "and nothing may have been minted: {} grants",
+        held.grants.len()
+    );
+
+    // (2) The control leg first, so the negative below is bounded: an ordinary
+    // cross-session attach *does* put a prompt in front of connection A.
+    let mut stranger = TestClient::connect(&path).await;
+    assert!(stranger.handshake(1).await.get("result").is_some());
+    stranger
+        .send(2, "session/attach", json!({"session_id": sid.clone()}))
+        .await;
+    let prompt = conn_a.read_event("attach_consent_requested").await;
+    assert_eq!(
+        prompt["params"]["scope"].as_str(),
+        Some("attach"),
+        "the fixture can observe a prompt — and the only one it observes is an \
+         attach: {prompt}"
+    );
+
+    // The refused attach is left to its own bounded window.
+    assert_eq!(
+        stranger.read_response(2).await["error"]["code"].as_i64(),
+        Some(error_code::CONSENT_TIMEOUT)
+    );
+    assert!(
+        held.grants.is_empty(),
+        "an unanswered consent mints nothing either"
     );
 
     server_task.abort();

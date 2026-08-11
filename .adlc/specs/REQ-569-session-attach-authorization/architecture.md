@@ -51,17 +51,76 @@ Two candidate mechanisms the spec named are **rejected**, on evidence:
 builds, is symmetric across macOS and Linux, and directly expresses BR-4's
 actual claim ("the daemon's own children are excluded").
 
-**Honest limits, recorded not hidden:**
-- A daemon-spawned child that double-forks and reparents to `launchd`/`init`
-  breaks the ancestry chain. No heuristic is added to chase this (a "reparented
-  to init" rule would also catch a legitimate CLI whose terminal closed —
-  precisely the incidental-property guard LESSON-443 warns against).
+**Honest limits, recorded not hidden** (the first was restated at the verify
+pass — the original wording understated it by an order of magnitude):
+
+- **Breaking the ancestry chain costs one shell word, and the word is
+  model-supplied.** The original text said "a daemon-spawned child that
+  double-forks and reparents to `launchd`/`init`", which reads as deliberate
+  `fork()` code somebody would have to write. It is not. The `shell` tool runs
+  `sh -c <command>` where the command comes from the model, so
+  `helper >/dev/null 2>&1 &` or `setsid helper` orphans a grandchild that
+  reparents to `launchd`/`init` and is then classified `NotDescendant` with full
+  client rights. No exploit engineering: one token in a tool call.
+
+  **And it composes.** An escapee is not merely "a connection the ancestry gate
+  lets through" — it is a connection that then *qualifies for the attach
+  self-render arm* (BR-6's second arm, Layer 3). It attaches to a session
+  nobody is holding by rendering and answering its own consent prompt, which is
+  exactly the residual this ADR accepts for an arbitrary same-UID process. So
+  the two limits recorded separately here are one attack when read together.
+
+  Partially compensated at the verify pass: the `shell` tool now `SIGKILL`s its
+  whole process group on **every** completion arm rather than only on timeout,
+  which kills the backgrounding form. `setsid` leaves the process group
+  entirely, so it is not reached — the escape is narrowed, not closed. No
+  ancestry heuristic is added to chase it: a "reparented to init" rule would
+  also catch a legitimate CLI whose terminal closed, precisely the
+  incidental-property guard LESSON-443 warns against.
 - PID reuse is a narrow race: the peer could exit between `connect` and the
   walk. The credential is a property of the connected socket, so the window is
   small, but it is not zero.
 - An arbitrary same-UID process that is *not* a daemon descendant can still
   puppet a legitimate CLI. That is outside the sharp end this REQ names and is
   not defeatable in userland — the same class as the accepted ptrace residual.
+
+### ADR-A-1 (verify pass): `monitor` has no socket-reachable minter
+
+TASK-108 gave the `monitor` declaration a consent path — routed to "any attached
+peer other than the requester" — on the theory that an attached connection is a
+surface whose user demonstrably owns something. **It was mintable over the socket
+by one actor holding two connections.** `session/create` is ungated by design, so
+connection A creates a throwaway session, becomes attached, and is registered as
+a consent surface; connection B then declares `monitor`; the routing picks A;
+A answers. Two different `ConnectionId`s, so it did not even register as a
+self-approval, and the result is a daemon-wide observer of every session with no
+human in the loop.
+
+The path is **removed**, not re-predicated. No sound approver predicate exists
+over the primitives this daemon has: it cannot distinguish an attacker's second
+connection from a user's real client (that is ADR-A's own residual, one step
+over), and a peer-pid check only forces the attacker to fork. `GrantScope::Monitor`
+and `may_monitor` stay, so BR-2/AC-4's grant gate is unchanged — the capability
+simply has nothing that mints it from a socket, and a declaration without a
+pre-existing grant is refused `NOT_GRANTED` outright. Regression test:
+`multi_client::a_peers_own_second_connection_cannot_approve_it_a_monitor`.
+
+### ADR-A-2 (verify pass): a consent surface is registered for routing even when it may not answer
+
+Consent surfaces were registered only for connections that pass the ancestry
+gate. That conflated two different questions the one registry answers: *is
+anyone attached to session S* (routing) and *who receives the prompt frame*
+(delivery). A connection excluded from the second was thereby dropped out of the
+first, so a session it held looked **unheld** — and a stranger attaching to that
+session took BR-6's self-render arm and approved itself in. A gate that fails
+closed at one door was fail-opening at the next, and `Indeterminate` is what a
+*legitimate* client gets from a vanished pid or a platform with no peer-pid
+option.
+
+Every handshaked connection is now registered; a `may_answer` flag withholds the
+frame. Authorization is unmoved — `attach/consent` already refuses an excluded
+connection an answer — so routing to an excluded holder fails closed into a
+consent timeout instead of open into a self-approval.
 
 Runtime signature verification remains available as **future hardening** that
 would raise Layer 3's assurance; it is deliberately not in this REQ.

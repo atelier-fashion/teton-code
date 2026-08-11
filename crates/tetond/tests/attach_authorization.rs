@@ -13,7 +13,7 @@
 //! |----|-----------|
 //! | AC-1 | [`a_client_driven_from_a_genuine_daemon_descendant_is_refused_at_every_door`] |
 //! | AC-2 / AC-3 | `e2e::conversation_carry::client_bs_prompt_carries_the_conversation_client_a_left_behind`, and [`a_consent_the_requester_granted_itself_is_named_as_such_in_the_daemon_log`]'s second leg (the resume arm, end to end) |
-//! | AC-4 | `multi_client::a_monitor_declaration_is_refused_without_a_monitor_scope_grant`, `multi_client::a_monitor_consent_granted_by_an_attached_client_produces_a_working_monitor` |
+//! | AC-4 | `multi_client::a_monitor_declaration_is_refused_without_a_monitor_scope_grant`, `multi_client::a_peers_own_second_connection_cannot_approve_it_a_monitor` (the regression test for the consent path REQ-569's verify pass removed), `grants::tests::attach_and_monitor_are_answered_by_their_own_scope_and_no_other` |
 //! | AC-5 | [`a_session_id_read_from_session_list_is_not_standing_to_attach`] |
 //! | AC-6 | `server::tests::a_denied_or_timed_out_consent_leaves_the_grant_registry_empty` (TASK-108) |
 //! | AC-7 | [`the_single_client_create_prompt_stream_flow_asks_for_nothing_new`] |

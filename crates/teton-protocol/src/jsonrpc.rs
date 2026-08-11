@@ -338,22 +338,32 @@ pub mod error_code {
         /// that folded them together would advise a daemon child to attach —
         /// the one thing it can never do.
         ATTACH_FORBIDDEN = -32010;
-        /// The connection did not create this session and holds no grant for
-        /// it, so `session/attach` (or a `monitor` declaration) was refused
-        /// (REQ-569 BR-1/BR-2).
+        /// The connection holds no grant, and none was sought (REQ-569
+        /// BR-1/BR-2).
         ///
-        /// **The remediable refusal**, and that is what separates it from
-        /// [`ATTACH_FORBIDDEN`]: a grant is a thing the user can decide to
-        /// give, so the client's remedy is to ask for one, where a forbidden
-        /// connection has nothing to ask. It is also distinct from
-        /// [`UNKNOWN_SESSION`]: this refusal is issued *before* the registry is
-        /// consulted and is identical for a session that exists and one that
-        /// does not, precisely so it cannot be read as an existence oracle.
+        /// Two things answer it, and neither is `session/attach`'s ordinary
+        /// ungranted path — that one raises a consent request and ends in
+        /// [`CONSENT_DENIED`] or [`CONSENT_TIMEOUT`] instead:
+        ///
+        /// - **A `monitor` declaration without a monitor-scope grant.**
+        ///   Terminal, like [`ATTACH_FORBIDDEN`]: REQ-569's verify pass removed
+        ///   the consent path to `monitor` (it was mintable by one peer holding
+        ///   two connections), so there is nothing to ask for and no retry that
+        ///   changes the answer.
+        /// - **A connection with too many consent requests already
+        ///   outstanding.** Remediable, and the only remedy is time: it stops
+        ///   applying as the caller's own pending prompts resolve.
+        ///
+        /// Distinct from [`UNKNOWN_SESSION`]: it is issued *before* the session
+        /// registry is consulted and is identical for a session that exists and
+        /// one that does not, precisely so it cannot be read as an existence
+        /// oracle.
         ///
         /// Distinct from [`NOT_ATTACHED`] by which door was closed:
         /// `NOT_ATTACHED` is refused at a *mutating* method and its remedy is
-        /// `session/attach`; this is refused at `session/attach` itself, so the
-        /// remedy `NOT_ATTACHED` names is the very thing being refused here.
+        /// `session/attach`; this is refused at the handshake or at
+        /// `session/attach` itself, so the remedy `NOT_ATTACHED` names is not
+        /// available here.
         NOT_GRANTED = -32011;
         /// A user was asked whether to grant this connection the session (or
         /// `monitor`) and answered **no** (REQ-569 BR-5/BR-7).

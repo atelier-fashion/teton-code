@@ -64,24 +64,36 @@ use crate::grants::ConnectionId;
 /// to make.
 pub const CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many consent requests one connection may have in flight at once
+/// (REQ-569 verify, F4).
+///
+/// A consent prompt is a security dialog whose "yes" mints a credential, and
+/// nothing else on this seam rate-limits one. Without a cap a single peer can
+/// raise prompts as fast as it can open `session/attach` calls: consent fatigue
+/// at the user's screen, and an unbounded pile of waiters and awaiting tasks in
+/// the daemon. Three is above anything a legitimate client does — a resuming CLI
+/// asks about one session — and low enough that a flooder is refused on its
+/// fourth attempt rather than its ten-thousandth. Beyond it the answer is
+/// `NOT_GRANTED`: fail closed, because the failure this bounds is a user being
+/// worn down into approving something.
+pub const MAX_PENDING_CONSENTS_PER_CONNECTION: usize = 3;
+
 /// How a consent request ended.
 ///
 /// Three outcomes, and two of them mint nothing. [`Denied`](Self::Denied) and
 /// [`TimedOut`](Self::TimedOut) are kept apart all the way out to the wire
 /// because they have different remedies (BR-5): a denial was a decision, a
 /// timeout was a prompt nobody answered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentOutcome {
-    /// A user approved it, at the surface described by `approved_at`.
-    Granted {
-        /// A session the approving surface holds — the session recorded in the
-        /// minted [`crate::grants::Grant`]'s key.
-        ///
-        /// `None` when the requester rendered its own prompt (BR-6's second
-        /// arm), where the only grant that can be minted is attach-scope and is
-        /// keyed to the session that was asked for anyway.
-        approved_at: Option<SessionId>,
-    },
+    /// A user approved it.
+    ///
+    /// Carries nothing. It used to name the session the approving surface held,
+    /// which existed only so a monitor-scope grant could be keyed to it — and
+    /// the monitor consent path is gone (REQ-569 verify, F1). An attach grant is
+    /// keyed to the session that was *asked* for, which the caller already
+    /// holds, so a second witness here would be a value nobody reads.
+    Granted,
     /// A user was asked and said no.
     Denied,
     /// The bounded window elapsed with no answer. Resolves to denied.
@@ -99,13 +111,24 @@ pub enum ConsentOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsentRoute {
     /// The connection whose request this is. It is part of every route because
-    /// two of the three rules are stated in terms of it, and because the
-    /// requester is always told how its own request ended.
+    /// one of the two rules is stated in terms of it, and because the requester
+    /// is always told how its own request ended.
     requester: ConnectionId,
     rendered_by: RenderedBy,
 }
 
-/// The three routing rules, one per case BR-6 distinguishes.
+/// The two routing rules, one per case BR-6 distinguishes.
+///
+/// There is deliberately **no monitor arm** (REQ-569 verify, F1). One existed —
+/// "any attached peer other than the requester" — and it was mintable over the
+/// socket by one attacker holding two connections: `session/create` is ungated,
+/// so connection A made a throwaway session, which made A an attached surface,
+/// which made A the approver for connection B's monitor request, which A then
+/// answered. Two different `ConnectionId`s, so it did not even read as a
+/// self-approval. No predicate over these primitives fixes it — the daemon
+/// cannot tell an attacker's second connection from the user's real client — so
+/// the path is gone rather than patched, and `monitor` has no socket-reachable
+/// minter at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RenderedBy {
     /// **Attach, first arm.** Some connection is already attached to the target
@@ -123,13 +146,6 @@ enum RenderedBy {
     /// reaches this module, so "ask the requester" can never mean "ask the
     /// daemon's own spawned code".
     TheRequesterItself,
-    /// **Monitor, and deliberately narrower than either attach arm.** A monitor
-    /// is a whole-daemon read capability, so it is approved only at a surface
-    /// the user demonstrably already owns — a connection attached to *some*
-    /// session — and never by the requester itself. If nobody is attached
-    /// anywhere there is no one to ask, and the request is refused rather than
-    /// self-approved.
-    AnyAttachedPeer,
 }
 
 impl ConsentRoute {
@@ -152,15 +168,6 @@ impl ConsentRoute {
         }
     }
 
-    /// The monitor rule: any attached peer, never the requester.
-    #[must_use]
-    pub fn any_attached_peer(requester: ConnectionId) -> Self {
-        Self {
-            requester,
-            rendered_by: RenderedBy::AnyAttachedPeer,
-        }
-    }
-
     /// The connection that asked.
     #[must_use]
     pub fn requester(&self) -> ConnectionId {
@@ -180,7 +187,6 @@ impl ConsentRoute {
         match &self.rendered_by {
             RenderedBy::ConnectionsAttachedTo(session) => attached.contains(session),
             RenderedBy::TheRequesterItself => connection == self.requester,
-            RenderedBy::AnyAttachedPeer => connection != self.requester && !attached.is_empty(),
         }
     }
 
@@ -214,26 +220,6 @@ impl ConsentRoute {
     #[must_use]
     pub fn renders_outcome(&self, connection: ConnectionId, attached: &HashSet<SessionId>) -> bool {
         connection == self.requester || self.renders_request(connection, attached)
-    }
-
-    /// The session whose consent minted the grant, as recorded in the grant's
-    /// key — see [`crate::grants::Grant`].
-    ///
-    /// For the attach arms it is the target session (or nothing, when the
-    /// requester approved its own request and the target is already known). For
-    /// a monitor request it is one of the approving surface's sessions: a
-    /// monitor grant's key does not turn on it ([`crate::grants::may_monitor`]
-    /// reads only the scope), but recording a real session keeps the entry
-    /// honest about where the consent came from. The pick is the smallest id
-    /// rather than "whichever the set yields first", so the recorded witness is
-    /// reproducible instead of hash-order dependent.
-    #[must_use]
-    pub fn approved_at(&self, attached: &HashSet<SessionId>) -> Option<SessionId> {
-        match &self.rendered_by {
-            RenderedBy::ConnectionsAttachedTo(session) => Some(session.clone()),
-            RenderedBy::TheRequesterItself => None,
-            RenderedBy::AnyAttachedPeer => attached.iter().min().cloned(),
-        }
     }
 }
 
@@ -281,7 +267,17 @@ impl PendingConsents {
     }
 
     /// Register a waiter for `id` and return the receiver the requesting task
-    /// awaits. `id` must come from [`Self::next_request_id`].
+    /// awaits, or `None` when the requester already holds
+    /// [`MAX_PENDING_CONSENTS_PER_CONNECTION`] in-flight requests.
+    ///
+    /// `id` must come from [`Self::next_request_id`].
+    ///
+    /// **The cap is counted under the same lock as the insert** (F4), not by
+    /// the caller beforehand. A caller-side check would be a check-then-act
+    /// across two `session/attach` tasks on one connection — which is exactly
+    /// how a bound of three becomes a bound of "three per scheduling
+    /// interleaving". `None` is the fail-closed answer: no waiter is stored, no
+    /// prompt is published, and the caller refuses `NOT_GRANTED`.
     ///
     /// Refuses to overwrite an existing waiter rather than replacing it. With
     /// ids minted above this is unreachable, so a collision here means a
@@ -295,12 +291,20 @@ impl PendingConsents {
         &self,
         id: RequestId,
         route: ConsentRoute,
-    ) -> oneshot::Receiver<ConsentOutcome> {
+    ) -> Option<oneshot::Receiver<ConsentOutcome>> {
         let (tx, rx) = oneshot::channel();
         let mut waiters = self
             .waiters
             .lock()
             .expect("pending consents mutex poisoned");
+        let requester = route.requester();
+        let in_flight = waiters
+            .values()
+            .filter(|waiter| waiter.route.requester() == requester)
+            .count();
+        if in_flight >= MAX_PENDING_CONSENTS_PER_CONNECTION {
+            return None;
+        }
         match waiters.entry(id) {
             Entry::Vacant(slot) => {
                 slot.insert(Waiter { route, tx });
@@ -317,7 +321,19 @@ impl PendingConsents {
                 // takes the `Denied` arm.
             }
         }
-        rx
+        Some(rx)
+    }
+
+    /// How many requests `connection` currently has awaiting a decision — the
+    /// quantity [`MAX_PENDING_CONSENTS_PER_CONNECTION`] bounds.
+    #[must_use]
+    pub fn in_flight_for(&self, connection: ConnectionId) -> usize {
+        self.waiters
+            .lock()
+            .expect("pending consents mutex poisoned")
+            .values()
+            .filter(|waiter| waiter.route.requester() == connection)
+            .count()
     }
 
     /// The route a live request was raised on, or `None` if no request by that
@@ -379,6 +395,13 @@ impl PendingConsents {
     /// dropped sender means no waiter was ever stored under this id for *this*
     /// caller — the collision path, where forgetting would evict the live
     /// request that legitimately owns the id.
+    ///
+    /// The fourth ending — this future being **dropped at its await point**,
+    /// which is what a connection teardown does — never reaches any arm here.
+    /// It is retired by the caller's RAII guard (`crate::server`'s
+    /// `ConsentInFlight`), whose `Drop` runs on cancellation; a waiter left in
+    /// this map by an aborted task would otherwise sit here for the life of the
+    /// daemon (REQ-569 verify, F3).
     pub async fn await_decision(
         &self,
         id: &RequestId,
@@ -419,6 +442,21 @@ struct Surface {
     attached: Arc<RwLock<HashSet<SessionId>>>,
     /// The connection's outbound frame channel.
     out: mpsc::Sender<String>,
+    /// Whether a consent prompt is actually *delivered* here (REQ-569 verify,
+    /// F2).
+    ///
+    /// The one thing that splits "counts for routing" from "receives the
+    /// frame", and the split is the fix. Every handshaked connection is
+    /// registered, because [`ConsentSurfaces::anyone_attached_to`] is the
+    /// question that decides whether an attach request goes to the session's
+    /// holder or to the requester's own face — and a connection left out of
+    /// this map is a connection whose held session looks *unheld*, which
+    /// downgrades a stranger's attach into a self-approval. So a connection the
+    /// ancestry gate excludes is still counted here; it simply is never sent
+    /// the prompt, and `attach/consent` refuses it an answer regardless. The
+    /// routing then fails **closed** into a timeout instead of open into a
+    /// self-render.
+    may_answer: bool,
 }
 
 /// Every live connection a consent prompt could be rendered at.
@@ -442,16 +480,28 @@ impl ConsentSurfaces {
     }
 
     /// Record a handshaked connection as a possible consent surface.
+    ///
+    /// **Every** handshaked connection is registered — see [`Surface::may_answer`],
+    /// which is what a connection the ancestry gate excludes gets `false` for
+    /// instead of being left out of the map.
     pub fn register(
         &self,
         connection: ConnectionId,
         attached: Arc<RwLock<HashSet<SessionId>>>,
         out: mpsc::Sender<String>,
+        may_answer: bool,
     ) {
         self.live
             .write()
             .expect("consent surfaces lock poisoned")
-            .insert(connection, Surface { attached, out });
+            .insert(
+                connection,
+                Surface {
+                    attached,
+                    out,
+                    may_answer,
+                },
+            );
     }
 
     /// Forget a connection that has ended. Idempotent.
@@ -485,28 +535,6 @@ impl ConsentSurfaces {
             })
     }
 
-    /// Is any live connection other than `connection` attached to *some*
-    /// session?
-    ///
-    /// The monitor precondition: a whole-daemon read capability is approved
-    /// only at a surface the user already owns, so if there is no such surface
-    /// the request is refused rather than put to the requester itself.
-    #[must_use]
-    pub fn anyone_attached_besides(&self, connection: ConnectionId) -> bool {
-        self.live
-            .read()
-            .expect("consent surfaces lock poisoned")
-            .iter()
-            .any(|(id, surface)| {
-                *id != connection
-                    && !surface
-                        .attached
-                        .read()
-                        .expect("connection attachment lock poisoned")
-                        .is_empty()
-            })
-    }
-
     /// Send `frame` to every surface this route offers the prompt to. Returns
     /// how many took it.
     pub fn deliver_request(&self, route: &ConsentRoute, frame: &str) -> usize {
@@ -529,6 +557,10 @@ impl ConsentSurfaces {
     /// to stall the connection that is asking about it — the event bus's
     /// posture, for the same reason. A dropped prompt costs the requester a
     /// timeout, which is the fail-closed direction (BR-7).
+    ///
+    /// [`Surface::may_answer`] is checked here rather than in the routing
+    /// predicate: a connection that may not answer still *counts* for
+    /// `anyone_attached_to`, and only the frame is withheld (F2).
     fn deliver(
         &self,
         frame: &str,
@@ -537,6 +569,9 @@ impl ConsentSurfaces {
         let live = self.live.read().expect("consent surfaces lock poisoned");
         let mut sent = 0;
         for (connection, surface) in live.iter() {
+            if !surface.may_answer {
+                continue;
+            }
             let attached = surface
                 .attached
                 .read()
@@ -594,7 +629,6 @@ mod tests {
 
         let arm1 = ConsentRoute::attached_to(requester, target.clone());
         let arm2 = ConsentRoute::requester_itself(requester);
-        let monitor = ConsentRoute::any_attached_peer(requester);
 
         // (case, route, who, what they are attached to, may render/answer)
         let cases: Vec<(&str, &ConsentRoute, ConnectionId, HashSet<SessionId>, bool)> = vec![
@@ -637,27 +671,6 @@ mod tests {
                 "arm 2: and nobody else may answer it",
                 &arm2,
                 peer,
-                attached_to(&["sess-target"]),
-                false,
-            ),
-            (
-                "monitor: any attached peer may answer",
-                &monitor,
-                peer,
-                attached_to(&["sess-other"]),
-                true,
-            ),
-            (
-                "monitor: an unattached peer may not",
-                &monitor,
-                peer,
-                HashSet::new(),
-                false,
-            ),
-            (
-                "monitor: the requester may never self-approve, attached or not",
-                &monitor,
-                requester,
                 attached_to(&["sess-target"]),
                 false,
             ),
@@ -721,32 +734,6 @@ mod tests {
             !ConsentRoute::attached_to(requester, target).self_approved_by(peer),
             "an attached peer approving is the good case, not the residual"
         );
-        assert!(
-            !ConsentRoute::any_attached_peer(requester).self_approved_by(requester),
-            "monitor has no self-render arm at all"
-        );
-    }
-
-    /// The session recorded in the minted grant's key, per arm.
-    #[test]
-    fn the_witness_session_is_the_target_for_attach_and_the_approvers_for_monitor() {
-        let registry = GrantRegistry::new();
-        let requester = registry.next_connection_id();
-        let target = session("sess-target");
-
-        assert_eq!(
-            ConsentRoute::attached_to(requester, target.clone()).approved_at(&HashSet::new()),
-            Some(target.clone())
-        );
-        assert_eq!(
-            ConsentRoute::requester_itself(requester).approved_at(&attached_to(&["sess-a"])),
-            None
-        );
-        // Deterministic across runs, not hash-order dependent.
-        let monitor = ConsentRoute::any_attached_peer(requester);
-        let approver = attached_to(&["sess-b", "sess-a", "sess-c"]);
-        assert_eq!(monitor.approved_at(&approver), Some(session("sess-a")));
-        assert_eq!(monitor.approved_at(&HashSet::new()), None);
     }
 
     /// LESSON-503: ids come from the map that resolves them, so no two requests
@@ -777,11 +764,12 @@ mod tests {
         let pending = PendingConsents::new();
         let id = pending.next_request_id();
 
-        let first = pending.register(id.clone(), ConsentRoute::requester_itself(first_requester));
-        let second = pending.register(
-            id.clone(),
-            ConsentRoute::any_attached_peer(second_requester),
-        );
+        let first = pending
+            .register(id.clone(), ConsentRoute::requester_itself(first_requester))
+            .expect("the first registration is under the cap");
+        let second = pending
+            .register(id.clone(), ConsentRoute::requester_itself(second_requester))
+            .expect("a different requester is under its own cap");
 
         assert_eq!(
             pending.pending_count(),
@@ -804,12 +792,85 @@ mod tests {
         );
 
         // And the first waiter is still the one an answer reaches.
-        assert!(pending.resolve(&id, ConsentOutcome::Granted { approved_at: None }));
-        assert_eq!(
-            first.await,
-            Ok(ConsentOutcome::Granted { approved_at: None })
-        );
+        assert!(pending.resolve(&id, ConsentOutcome::Granted));
+        assert_eq!(first.await, Ok(ConsentOutcome::Granted));
         assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// **F4.** A connection may hold only
+    /// [`MAX_PENDING_CONSENTS_PER_CONNECTION`] prompts at once, and the cap is
+    /// per *requester* rather than daemon-wide.
+    ///
+    /// The two halves are both load-bearing. The refusal is what stops a peer
+    /// grinding a user down with an unbounded stream of security dialogs (and
+    /// stops it holding an unbounded pile of waiters); the per-requester
+    /// counting is what stops one flooder from denying every other connection
+    /// the one prompt it legitimately needs — a daemon-wide cap would turn a
+    /// rate limit into a lockout.
+    #[test]
+    fn a_connection_may_not_hold_more_than_its_share_of_pending_prompts() {
+        let registry = GrantRegistry::new();
+        let flooder = registry.next_connection_id();
+        let honest = registry.next_connection_id();
+        let pending = PendingConsents::new();
+
+        let mut ids = Vec::new();
+        let mut _held = Vec::new();
+        for _ in 0..MAX_PENDING_CONSENTS_PER_CONNECTION {
+            let id = pending.next_request_id();
+            _held.push(
+                pending
+                    .register(id.clone(), ConsentRoute::requester_itself(flooder))
+                    .expect("every request up to the cap is registered"),
+            );
+            ids.push(id);
+        }
+        assert_eq!(
+            pending.in_flight_for(flooder),
+            MAX_PENDING_CONSENTS_PER_CONNECTION
+        );
+
+        let over = pending.next_request_id();
+        assert!(
+            pending
+                .register(over.clone(), ConsentRoute::requester_itself(flooder))
+                .is_none(),
+            "the request past the cap must be refused"
+        );
+        assert!(
+            pending.route_of(&over).is_none(),
+            "and must leave no waiter behind for anyone to answer"
+        );
+        assert_eq!(
+            pending.pending_count(),
+            MAX_PENDING_CONSENTS_PER_CONNECTION,
+            "a refused registration adds nothing"
+        );
+
+        // Another connection is unaffected — the cap is a rate limit, not a
+        // way for one peer to close the door on everybody else.
+        assert!(
+            pending
+                .register(
+                    pending.next_request_id(),
+                    ConsentRoute::requester_itself(honest)
+                )
+                .is_some(),
+            "one connection's flood must not refuse another connection's prompt"
+        );
+
+        // And the cap is a *live* count, not a lifetime quota: retiring one
+        // request makes room for the next.
+        assert!(pending.forget(&ids[0]));
+        assert!(
+            pending
+                .register(
+                    pending.next_request_id(),
+                    ConsentRoute::requester_itself(flooder)
+                )
+                .is_some(),
+            "a retired request must free its slot"
+        );
     }
 
     /// BR-7: every ending leaves the registry empty — asserted for each of the
@@ -823,7 +884,9 @@ mod tests {
 
         // Answered.
         let id = pending.next_request_id();
-        let rx = pending.register(id.clone(), ConsentRoute::requester_itself(requester));
+        let rx = pending
+            .register(id.clone(), ConsentRoute::requester_itself(requester))
+            .expect("under the cap");
         assert!(pending.resolve(&id, ConsentOutcome::Denied));
         assert_eq!(
             pending
@@ -835,7 +898,9 @@ mod tests {
 
         // Timed out.
         let id = pending.next_request_id();
-        let rx = pending.register(id.clone(), ConsentRoute::requester_itself(requester));
+        let rx = pending
+            .register(id.clone(), ConsentRoute::requester_itself(requester))
+            .expect("under the cap");
         assert_eq!(pending.pending_count(), 1);
         assert_eq!(
             pending
@@ -849,13 +914,15 @@ mod tests {
             "a timed-out request must not sit in the map for a late answer to find"
         );
         assert!(
-            !pending.resolve(&id, ConsentOutcome::Granted { approved_at: None }),
+            !pending.resolve(&id, ConsentOutcome::Granted),
             "and a late answer must find nothing to resolve"
         );
 
         // Forgotten (the requester's connection ended).
         let id = pending.next_request_id();
-        let _rx = pending.register(id.clone(), ConsentRoute::requester_itself(requester));
+        let _rx = pending
+            .register(id.clone(), ConsentRoute::requester_itself(requester))
+            .expect("under the cap");
         assert!(pending.forget(&id));
         assert!(!pending.forget(&id), "forget is idempotent");
         assert_eq!(pending.pending_count(), 0);
@@ -881,23 +948,17 @@ mod tests {
 
         let holder_attached = Arc::new(RwLock::new(HashSet::new()));
         let (holder_tx, _holder_rx) = mpsc::channel(8);
-        surfaces.register(holder, Arc::clone(&holder_attached), holder_tx);
+        surfaces.register(holder, Arc::clone(&holder_attached), holder_tx, true);
         let (idle_tx, _idle_rx) = mpsc::channel(8);
-        surfaces.register(idle, Arc::new(RwLock::new(HashSet::new())), idle_tx);
+        surfaces.register(idle, Arc::new(RwLock::new(HashSet::new())), idle_tx, true);
 
         assert!(!surfaces.anyone_attached_to(&target));
-        assert!(!surfaces.anyone_attached_besides(idle));
 
         // The registry shares the *same* set the connection mutates, so an
         // attach that happens elsewhere is visible here without anyone
         // re-registering anything.
         holder_attached.write().unwrap().insert(target.clone());
         assert!(surfaces.anyone_attached_to(&target));
-        assert!(surfaces.anyone_attached_besides(idle));
-        assert!(
-            !surfaces.anyone_attached_besides(holder),
-            "the only attached connection cannot be its own approver"
-        );
 
         surfaces.release(holder);
         assert!(
@@ -905,6 +966,46 @@ mod tests {
             "a departed connection is not a surface anyone can be asked at"
         );
         assert_eq!(surfaces.len(), 1);
+    }
+
+    /// **F2.** A surface that may not *answer* still counts for **routing**.
+    ///
+    /// This is the whole shape of the downgrade fix, at the level it is
+    /// decided. A connection the ancestry gate excludes — and, before F2, any
+    /// connection left out of the registry for any reason — holds its session
+    /// invisibly, so `anyone_attached_to` says nobody holds it, so a stranger's
+    /// attach takes the *self-render* arm and approves itself into someone
+    /// else's session. Counting it here makes that same attach take the peer
+    /// arm and fail closed on a timeout, while the frame is still withheld from
+    /// a connection that could never have answered it anyway.
+    #[tokio::test]
+    async fn a_surface_that_may_not_answer_still_counts_for_routing() {
+        let registry = GrantRegistry::new();
+        let surfaces = ConsentSurfaces::new();
+        let excluded = registry.next_connection_id();
+        let requester = registry.next_connection_id();
+        let target = session("sess-target");
+
+        let (excluded_tx, mut excluded_rx) = mpsc::channel(8);
+        surfaces.register(
+            excluded,
+            Arc::new(RwLock::new([target.clone()].into_iter().collect())),
+            excluded_tx,
+            false,
+        );
+
+        assert!(
+            surfaces.anyone_attached_to(&target),
+            "a session held by an excluded connection is still held"
+        );
+
+        let route = ConsentRoute::attached_to(requester, target);
+        assert_eq!(
+            surfaces.deliver_request(&route, "prompt"),
+            0,
+            "and it is still never sent the prompt"
+        );
+        assert!(excluded_rx.try_recv().is_err());
     }
 
     /// Delivery follows the route, and only the route.
@@ -922,15 +1023,17 @@ mod tests {
             requester,
             Arc::new(RwLock::new(HashSet::new())),
             requester_tx,
+            true,
         );
         let holder_attached = Arc::new(RwLock::new([target.clone()].into_iter().collect()));
         let (holder_tx, mut holder_rx) = mpsc::channel(8);
-        surfaces.register(holder, holder_attached, holder_tx);
+        surfaces.register(holder, holder_attached, holder_tx, true);
         let (bystander_tx, mut bystander_rx) = mpsc::channel(8);
         surfaces.register(
             bystander,
             Arc::new(RwLock::new([session("sess-other")].into_iter().collect())),
             bystander_tx,
+            true,
         );
 
         let route = ConsentRoute::attached_to(requester, target);

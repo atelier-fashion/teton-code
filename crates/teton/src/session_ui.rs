@@ -30,8 +30,9 @@ use teton_protocol::events::{
     Event, EventEnvelope, EvictionReason, FailureClass, ModelLifecycle, ModelSelectionProposed,
     PermissionOption, PermissionOptionKind, PermissionRequest, PhaseTransition, PrefixCache,
     PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProviderDegraded,
-    RouteDecided, SessionUpdatePayload, ToolCallStatus, WebConsentDecided, WebConsentScope,
-    WebLookup, WebLookupKind, WebLookupOutcome, WebTier, OPTION_ID_ENABLE_PERMANENT,
+    RouteDecided, SessionGrantMinted, SessionUpdatePayload, ToolCallStatus, WebConsentDecided,
+    WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome, WebTier,
+    OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
 use teton_protocol::{Phase, RequestId, SessionId};
@@ -444,6 +445,16 @@ pub fn render_event(
             // modal, so there is no prompt on screen to retire.
             EventOutcome::Rendered
         }
+        Event::SessionGrantMinted(minted) => {
+            // REQ-569 verify (F6). Daemon-scoped, so every connected client
+            // gets it — which is the point: the user whose session was just
+            // opened up to somebody else is told by a surface the requester
+            // cannot suppress. Never verbose-gated, for
+            // `attach_consent_requested`'s reason: a widened permission is
+            // news, not chrome.
+            surface.line(LineKind::Notice, &format_grant_minted(minted));
+            EventOutcome::Rendered
+        }
     }
 }
 
@@ -463,10 +474,42 @@ fn format_attach_consent(request: &AttachConsentRequested) -> String {
         ConsentScope::Monitor => "watch every session on this daemon",
     };
     format!(
-        "{} asked to {what}. This client cannot answer yet, so the request \
-         will be declined when the daemon's window closes.",
+        "{} asked to {what}. This client cannot answer it; another attached \
+         client may.",
         request.requester
     )
+}
+
+/// The one-line notice a `session_grant_minted` event draws (REQ-569 verify,
+/// F6).
+///
+/// Two sentences at most, and the second exists only for the self-approved
+/// case, because that is the one a reader has to act on: for an interactive
+/// resume it is the expected flow, and for anything else it means a grant was
+/// minted with no human in the loop. Stating it as what happened ("approved by
+/// the connection that asked") rather than as a verdict keeps the notice honest
+/// — the daemon genuinely cannot tell which of the two it was.
+///
+/// `requester` is peer-chosen text the daemon already bounded and stripped;
+/// [`format_attach_consent`]'s note applies here unchanged.
+fn format_grant_minted(minted: &SessionGrantMinted) -> String {
+    let what = match minted.scope {
+        ConsentScope::Attach => "attach to a session",
+        ConsentScope::Monitor => "watch every session on this daemon",
+    };
+    if minted.self_approved {
+        format!(
+            "the daemon granted {} permission to {what} — approved by the \
+             connection that asked, because nothing was attached to that \
+             session.",
+            minted.requester
+        )
+    } else {
+        format!(
+            "the daemon granted {} permission to {what}.",
+            minted.requester
+        )
+    }
 }
 
 /// The session an event belongs to when it is **not** the one this client is in
