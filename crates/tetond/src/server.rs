@@ -70,7 +70,8 @@ use teton_protocol::methods::{
     ModelConfirmParams, ModelListParams, ModelSetParams, ModelStatusParams,
     PermissionRespondParams, PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod,
     SessionAttachParams, SessionAttachResult, SessionClearParams, SessionCreateParams,
-    SessionCreateResult, SessionListParams, SessionListResult, WebOverrideParams, WebRefreshParams,
+    SessionCreateResult, SessionListParams, SessionListResult, SessionSummary, WebOverrideParams,
+    WebRefreshParams,
 };
 use teton_protocol::SessionId;
 
@@ -378,6 +379,42 @@ fn should_forward(
         // It belongs to no session, so no session can gate it (BR-2).
         None => true,
         Some(session_id) => monitor || attached.contains(session_id),
+    }
+}
+
+/// What a connection is shown of a session it may not see: ids and shape, never
+/// content (REQ-569 BR-10, ADR-G).
+///
+/// `session_id`, `mode` and `phase` survive unconditionally — they are the
+/// listing, and BR-10 is about the *payload*, not about which rows exist. A
+/// caller that dropped rows instead would break `session/list`'s job (a client
+/// still has to learn that a session it may ask to attach to is there) and would
+/// turn the listing into an oracle answering "does this id exist" by omission.
+///
+/// `title` and `cwd` are the two content fields on the wire type: a title is
+/// model-generated *from the user's prompt text*, and `cwd` is an absolute path
+/// naming a repo on this machine. Both are boundary content wearing the costume
+/// of metadata (LESSON-432), which is why they are the pair that goes.
+///
+/// Pure, and taking the answer rather than computing it: "may this connection
+/// see this session" has exactly one definition ([`ConnState::may_receive`],
+/// which already folds in `monitor`), and a second one derived here would be a
+/// second answer to drift out of step with it (LESSON-484). What this function
+/// owns is only *what reduction means*, so the redaction rule is table-testable
+/// without a socket.
+///
+/// Omission is expressible without a wire change: both fields are already
+/// `Option` with `skip_serializing_if = "Option::is_none"`, so a reduced row
+/// carries no `title`/`cwd` key at all — not an empty string, which would be a
+/// new value a client must learn to distinguish from a genuinely empty title.
+fn reduce_for(summary: SessionSummary, visible: bool) -> SessionSummary {
+    if visible {
+        return summary;
+    }
+    SessionSummary {
+        title: None,
+        cwd: None,
+        ..summary
     }
 }
 
@@ -893,8 +930,18 @@ fn dispatch(
     match method {
         SessionCreateParams::METHOD => Some(handle_session_create(daemon, conn, id, params)),
         SessionListParams::METHOD => {
+            // REQ-569 BR-10: every session is still *listed* — what varies is
+            // how much of each row this connection is shown.
             let result = SessionListResult {
-                sessions: daemon.sessions.list(),
+                sessions: daemon
+                    .sessions
+                    .list()
+                    .into_iter()
+                    .map(|summary| {
+                        let visible = conn.may_receive(Some(&summary.session_id));
+                        reduce_for(summary, visible)
+                    })
+                    .collect(),
             };
             Some(ok_string(id, &result))
         }
@@ -1518,6 +1565,134 @@ mod tests {
                 "{case}: expected delivered={expected}"
             );
         }
+    }
+
+    /// REQ-569 BR-10, all eight cells of the redaction rule: visibility crossed
+    /// with a title that is present or not and a `cwd` that is present or not.
+    ///
+    /// The cells where the field was already absent matter as much as the ones
+    /// where it is dropped: a reduction is not allowed to *invent* a value
+    /// (an empty string standing in for "redacted") on the way through, because
+    /// a client cannot tell that apart from a session that genuinely has no
+    /// title. `Option::is_none` is the only state either field ever reaches
+    /// here, in both directions.
+    ///
+    /// Identity on the visible side is asserted as a whole-struct equality
+    /// rather than field by field, so a field added to `SessionSummary` later
+    /// cannot be silently dropped from an attached connection's view.
+    #[test]
+    fn reduce_for_keeps_ids_and_drops_only_content_when_not_visible() {
+        use teton_protocol::{Phase, SessionMode};
+
+        let full = SessionSummary {
+            session_id: SessionId::from("sess-x"),
+            mode: SessionMode::Structured,
+            phase: Some(Phase::Spec),
+            title: Some("refactor the payroll importer".to_owned()),
+            cwd: Some(std::path::PathBuf::from("/Users/someone/work/payroll")),
+        };
+
+        // (case, title, cwd, visible)
+        for (case, title, cwd, visible) in [
+            ("both present, visible", true, true, true),
+            ("both present, not visible", true, true, false),
+            ("title only, visible", true, false, true),
+            ("title only, not visible", true, false, false),
+            ("cwd only, visible", false, true, true),
+            ("cwd only, not visible", false, true, false),
+            ("neither, visible", false, false, true),
+            ("neither, not visible", false, false, false),
+        ] {
+            let input = SessionSummary {
+                title: title.then(|| full.title.clone().unwrap()),
+                cwd: cwd.then(|| full.cwd.clone().unwrap()),
+                ..full.clone()
+            };
+            let reduced = reduce_for(input.clone(), visible);
+
+            // Always, in every cell: the listing itself is untouched.
+            assert_eq!(reduced.session_id, full.session_id, "{case}");
+            assert_eq!(reduced.mode, full.mode, "{case}");
+            assert_eq!(reduced.phase, full.phase, "{case}");
+
+            if visible {
+                assert_eq!(reduced, input, "{case}: a visible session is not reduced");
+            } else {
+                assert!(reduced.title.is_none(), "{case}: title must be dropped");
+                assert!(reduced.cwd.is_none(), "{case}: cwd must be dropped");
+            }
+        }
+    }
+
+    /// REQ-569 BR-10 at the dispatch seam: the reduction is *wired*, and it is
+    /// wired to the same predicate that gates event delivery.
+    ///
+    /// The table test above pins what reduction means; this pins that
+    /// `session/list` performs it, and that the connection which created the
+    /// session (auto-attached, REQ-568) is not reduced. Asserted on the response
+    /// text because the omission being claimed is a fact about the JSON, not
+    /// about the struct — `serde` is what turns `None` into an absent key.
+    #[test]
+    fn session_list_reduces_only_for_connections_that_may_not_see_the_session() {
+        let daemon = Daemon::new();
+        let creator = unattached();
+        let jail = std::env::temp_dir();
+        let created = handle_session_create(
+            &daemon,
+            &creator,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform", "cwd": jail}),
+        );
+        // The id comes out of the response rather than being assumed: session
+        // ids are the daemon's to choose, and a fixture that spells one out
+        // tests the naming scheme instead of the redaction rule.
+        let session = daemon.sessions.list()[0].session_id.clone();
+        assert!(
+            created.contains(&session.0),
+            "the create response names the session it made: {created}"
+        );
+        assert!(daemon
+            .sessions
+            .set_title(&session, "the user's own words, echoed back"));
+
+        let list = |conn: &ConnState| {
+            dispatch(
+                &daemon,
+                conn,
+                Id::Number(2),
+                SessionListParams::METHOD,
+                Value::Null,
+            )
+            .unwrap()
+        };
+
+        let onlooker = list(&unattached());
+        assert!(
+            onlooker.contains(&session.0),
+            "the row itself stays — BR-10 reduces the payload, not the listing: {onlooker}"
+        );
+        assert!(
+            !onlooker.contains("title") && !onlooker.contains("own words"),
+            "an unattached connection must be shown no title: {onlooker}"
+        );
+        assert!(
+            !onlooker.contains("cwd") && !onlooker.contains(&jail.display().to_string()),
+            "an unattached connection must be shown no cwd: {onlooker}"
+        );
+
+        let owner = list(&creator);
+        assert!(
+            owner.contains("own words") && owner.contains("cwd"),
+            "the creator is attached to what it made and sees it whole: {owner}"
+        );
+
+        // And the monitor, whose sight comes from the same predicate rather than
+        // from a second rule this handler would have had to remember.
+        let monitor = list(&ConnState::new(true));
+        assert!(
+            monitor.contains("own words"),
+            "a monitor sees every session whole: {monitor}"
+        );
     }
 
     /// REQ-568 BR-5: a monitor is announced in the daemon log, so its existence

@@ -90,6 +90,16 @@ impl TestClient {
     }
 
     async fn read_line(&mut self) -> Value {
+        self.read_line_raw().await.1
+    }
+
+    /// One frame, as the bytes that crossed the socket *and* parsed.
+    ///
+    /// The raw text is what makes an "the field is absent" claim checkable at
+    /// the wire (REQ-569 BR-10): a parsed value can only say the key is missing
+    /// from the map, where the text can say the characters never left the
+    /// daemon at all.
+    async fn read_line_raw(&mut self) -> (String, Value) {
         let mut line = String::new();
         let n = timeout(Duration::from_secs(2), self.reader.read_line(&mut line))
             .await
@@ -105,7 +115,7 @@ impl TestClient {
                  envelopes: {value}"
             );
         }
-        value
+        (line, value)
     }
 
     /// Reads until the response with a matching id arrives, skipping any event
@@ -115,6 +125,16 @@ impl TestClient {
             let value = self.read_line().await;
             if value.get("id").and_then(Value::as_i64) == Some(id) {
                 return value;
+            }
+        }
+    }
+
+    /// The response with a matching id, as the raw NDJSON line and parsed.
+    async fn read_response_raw(&mut self, id: i64) -> (String, Value) {
+        loop {
+            let (line, value) = self.read_line_raw().await;
+            if value.get("id").and_then(Value::as_i64) == Some(id) {
+                return (line, value);
             }
         }
     }
@@ -310,6 +330,17 @@ async fn register_a_provider_every_turn_fails_on(client: &mut TestClient) {
         Some(true),
         "tier binding failed: {routed}"
     );
+}
+
+/// The `session/list` row for `session_id`, failing if the session is not
+/// listed at all — REQ-569 reduces the payload, never the listing.
+fn row_for<'a>(list_response: &'a Value, session_id: &str) -> &'a Value {
+    list_response["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("session/list failed: {list_response}"))
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id))
+        .unwrap_or_else(|| panic!("{session_id} must still be listed: {list_response}"))
 }
 
 fn session_ids(list_response: &Value) -> Vec<String> {
@@ -967,6 +998,145 @@ async fn a_filtered_client_sees_gapped_seqs_and_its_fenced_response_still_comple
     );
 
     server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REQ-569 BR-10 / AC-10: `session/list` tells an unattached connection that a
+/// session exists, and nothing about what it is.
+///
+/// Asserted on raw NDJSON at the socket, for the same reason REQ-568's scoping
+/// tests are: the reduction is the daemon's, so a client's rendering is the
+/// wrong observation point (LESSON-484 — a gate a client enforces is a
+/// rendering choice). Two claims, and they are different claims:
+///
+/// 1. the `title` and `cwd` **keys are absent** from the JSON object, not
+///    present and empty. An empty string is a value a client would have to
+///    learn to tell apart from a session that genuinely has no title, and it is
+///    also the shape a "redact by blanking" implementation produces — so the
+///    key set is asserted, not the field's contents;
+/// 2. neither string appears **anywhere in the frame**, which is what rules out
+///    the leak arriving by some other field.
+///
+/// The positive controls that bound the negative sit in the same test and the
+/// same window: the row is still listed (BR-10 is about the payload, and a
+/// listing that dropped rows would be a different, worse answer), and three
+/// connections that *may* see the session — the creator, which `session/create`
+/// auto-attached (REQ-568); a peer that attached; and a monitor — each get it
+/// whole. Without them, an implementation that omitted `title`/`cwd` from
+/// everyone would pass.
+#[tokio::test]
+async fn session_list_omits_title_and_cwd_from_unattached_connections() {
+    let path = temp_socket("list-reduced");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    let server_task = tokio::spawn(server::serve(listener, Arc::clone(&daemon)));
+
+    // Boundary content, both halves of it: a title is model-generated from the
+    // user's prompt text, and `cwd` is an absolute path naming a repo on this
+    // machine. Distinctive enough that either string appearing in a frame can
+    // only have come from this session's summary.
+    const TITLE: &str = "rewrite the payroll importer's retry loop";
+    let jail = std::env::temp_dir().join(format!("teton-req569-jail-{}", std::process::id()));
+    std::fs::create_dir_all(&jail).unwrap();
+    let jail_text = jail.to_str().unwrap().to_owned();
+
+    let mut a = TestClient::connect(&path).await;
+    assert!(a.handshake(1).await.get("result").is_some());
+    let (_, created) = a
+        .call_collecting_events(
+            2,
+            "session/create",
+            json!({"mode": "structured", "phase": "spec", "cwd": jail}),
+        )
+        .await;
+    let sid = created["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/create failed: {created}"))
+        .to_owned();
+    // The title is set on the registry directly: a real one is written by the
+    // title duty at turn time, which needs a model, and what is under test here
+    // is the payload rather than the naming.
+    assert!(
+        daemon
+            .sessions
+            .set_title(&teton_protocol::SessionId::from(sid.clone()), TITLE),
+        "the fixture must actually have a title to redact"
+    );
+
+    // B is any same-UID peer: handshaked, attached to nothing.
+    let mut b = TestClient::connect(&path).await;
+    assert!(b.handshake(1).await.get("result").is_some());
+    b.send(2, "session/list", json!({})).await;
+    let (raw, listed) = b.read_response_raw(2).await;
+    let row = row_for(&listed, &sid);
+
+    // What a listing is for survives intact.
+    assert_eq!(row["mode"].as_str(), Some("structured"), "{raw}");
+    assert_eq!(row["phase"].as_str(), Some("spec"), "{raw}");
+
+    // Claim 1: the keys are gone, not blanked.
+    let fields = row.as_object().unwrap();
+    assert!(
+        !fields.contains_key("title"),
+        "an unattached connection must be sent no `title` key at all: {raw}"
+    );
+    assert!(
+        !fields.contains_key("cwd"),
+        "an unattached connection must be sent no `cwd` key at all: {raw}"
+    );
+    // Claim 2: and the content is nowhere else in the frame either.
+    assert!(
+        !raw.contains(TITLE),
+        "the user's words must not cross this socket: {raw}"
+    );
+    assert!(
+        !raw.contains(&jail_text),
+        "the session's path must not cross this socket: {raw}"
+    );
+
+    /// The whole summary, which is what every connection that may see the
+    /// session gets.
+    fn assert_whole(who: &str, raw: &str, listed: &Value, sid: &str, jail_text: &str) {
+        let row = row_for(listed, sid);
+        assert_eq!(
+            row["title"].as_str(),
+            Some(TITLE),
+            "{who} may see this session and must get its title: {raw}"
+        );
+        assert_eq!(
+            row["cwd"].as_str(),
+            Some(jail_text),
+            "{who} may see this session and must get its cwd: {raw}"
+        );
+    }
+
+    // A monitor declared its interest in every session at the handshake, and
+    // that declaration is the same predicate the reduction reads — so it is not
+    // reduced, without `session/list` having to know what a monitor is.
+    let mut m = TestClient::connect(&path).await;
+    assert!(m.handshake_declaring(1, true).await.get("result").is_some());
+    m.send(2, "session/list", json!({})).await;
+    let (raw_m, listed_m) = m.read_response_raw(2).await;
+    assert_whole("a monitor", &raw_m, &listed_m, &sid, &jail_text);
+
+    // Attaching is the grant here exactly as it is for events: the same B, one
+    // `session/attach` later, gets the row it was just refused.
+    b.send(3, "session/attach", json!({"session_id": sid.clone()}))
+        .await;
+    assert!(b.read_response(3).await.get("result").is_some());
+    b.send(4, "session/list", json!({})).await;
+    let (raw_b, listed_b) = b.read_response_raw(4).await;
+    assert_whole("an attached peer", &raw_b, &listed_b, &sid, &jail_text);
+
+    // And the creator, which never attached explicitly — `session/create` did
+    // it (REQ-568 BR-1). A reduction that keyed on "attached explicitly" would
+    // hide a client's own session from it.
+    a.send(3, "session/list", json!({})).await;
+    let (raw_a, listed_a) = a.read_response_raw(3).await;
+    assert_whole("the creator", &raw_a, &listed_a, &sid, &jail_text);
+
+    server_task.abort();
+    let _ = std::fs::remove_dir(&jail);
     let _ = std::fs::remove_file(&path);
 }
 
