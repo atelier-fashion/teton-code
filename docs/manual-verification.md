@@ -1017,4 +1017,57 @@ conversation reaches the model but not the KV: check that what was committed is
 byte-identical to what was rendered (REQ-554 determinism), because a boundary
 that re-renders differently diverges at the first changed token.
 
-**Status: NOT RUN.**
+**Status: RUN — sign-off below (2026-08-10).**
+
+### Sign-off: 2026-08-10, M5 Max 48 GB, qwen3-coder-30b-a3b (17 GB), main @ a8c779c
+
+Same isolated-daemon setup and piped driver as the REQ-564 sign-off (paced on
+the `› ` marker; files named in prompts 1–4 only). One eight-line session:
+six building prompts ending in a nothing-named recap, then `/clear`, then a
+no-tools probe. Benchmark at load: first token 193 ms, 92.5 tok/s.
+
+**The recap (step 4): PASS.** One generation, zero tool calls, and the answer
+names facts from all five prior prompts — the 5-entry checklist, the Aug 4
+cron line, invoice 102 (Borealis Cloud, 8,400) as the largest, the
+data.csv-reconciliation entry, and the Thursday vendor call. This is the exact
+prompt shape the REQ-564 sign-off recorded failing with "could you please
+share the relevant files?". Prompt 5 also answered from the carried
+conversation with no tool call.
+
+**Boundaries (step 5): PASS.** Every prompt boundary after the first was a
+`divergent: false` hit far above the ~814-token head, tracking the previous
+turn's prompt + generated total:
+
+| boundary | cached_tokens | divergent |
+|---|---|---|
+| prompt 2 | 1,101 | false |
+| prompt 3 | 1,383 | false |
+| prompt 4 | 1,658 | false |
+| prompt 5 | 1,889 | false |
+| prompt 6 (recap) | 1,985 | false |
+| post-`/clear` probe | 814 | true |
+
+The baseline's "5/5 boundaries divergent at ~814" is fully displaced; the one
+`divergent: true` boundary is the post-clear probe, exactly architecture
+D-5's no-eviction prediction, paired with its explanation (the clear).
+
+**Totals (step 6)** vs the REQ-564 baseline: 11 generations (was 14), 15,680
+prompt tokens, 13,951 reused — **89.0%** (was 83.9%) — 1 session context
+creation plus the load-time benchmark, wall 59.1 s including model load,
+peak daemon RSS 20.2 GiB. Turns 2–3 chose to re-read notes.txt anyway (weak
+model re-verifying); turns 5–6 did not need to, which is the claim under
+test.
+
+**Budget (step 7):** compaction never fired — a six-prompt two-file session
+stays well under the budget. The compaction-under-carry case remains covered
+by the scripted AC-3 leg only; a longer dogfood would be needed to observe it
+live.
+
+**`/clear` (step 8): PASS.** The notice rendered exactly once ("context
+cleared; 20 retained blocks dropped."), the next boundary dropped to exactly
+the 814-token head as a `divergent` hit, and the probe's answer named nothing
+from the cleared conversation. One behavior worth recording: asked "without
+using any tools, list what we have discussed", the post-clear model
+paraphrased its **system prompt** (tools, providers, configuration) rather
+than saying "nothing yet" — correct on the load-bearing claim (no cleared
+content resurfaced), just a weak model filling silence with what it can see.
