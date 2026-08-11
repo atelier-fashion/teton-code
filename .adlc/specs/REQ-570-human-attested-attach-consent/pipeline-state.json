@@ -94,5 +94,6 @@
       "holdState": "held",
       "rebaseAttempts": 0
     }
-  ]
+  ],
+  "notes": "Halted at Phase 8 with terminal state BLOCKED. PR #101 is OPEN, MERGEABLE, all 6 CI checks green. NOT merged: a blocker requiring human input is recorded, and the /proceed contract forbids merging while blocked. 5 of 10 tasks landed (TASK-001..005); TASK-006/007/008/009/010 remain. ACs satisfied: AC-1, AC-5, AC-6, AC-7, AC-7b, AC-8, AC-10(a), plus AC-11 for every rule built. Outstanding: AC-2, AC-2b, AC-3, AC-4, AC-9, AC-10(b)."
 }
