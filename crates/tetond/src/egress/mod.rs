@@ -1500,6 +1500,59 @@ mod tests {
     /// findings never made. So the whole statement is the needle, `eprintln!`
     /// included. Whitespace is normalized first because `rustfmt`'s indentation
     /// is not the thing under test.
+    /// **REQ-560 AC-5: no egress-path predicate references the permission
+    /// level.**
+    ///
+    /// BR-3 is the guarantee this REQ could most easily break silently, and it
+    /// is the one whose hole is invisible because the tests that would catch it
+    /// are the ones nobody wrote (LESSON-432). A level governs **which tools may
+    /// run**; the privacy boundary governs **what leaves the machine**. `full`
+    /// grants tool execution and touches neither the `local-only` boundary
+    /// (REQ-544 BR-1) nor the session-taint pin.
+    ///
+    /// Today that holds structurally — the level lives on `PermissionGate` and
+    /// reaches only its `decide`, and this module takes a `TaintView` rather
+    /// than the daemon runtime, so there is no handle through which a level
+    /// *could* arrive. This scan is about tomorrow: it makes a future call site
+    /// that couples them fail here rather than ship. Same shape as REQ-544's
+    /// enumerate-every-tool posture, and deliberately reusing
+    /// `call_sites::scan` so the "production source only" rule has one spelling
+    /// rather than two that can drift apart.
+    #[test]
+    fn no_egress_source_mentions_the_permission_level() {
+        let egress: Vec<(String, String)> = crate::call_sites::scan::production_sources()
+            .into_iter()
+            .filter(|(rel, _)| rel == "egress.rs" || rel.starts_with("egress/"))
+            .map(|(rel, src)| (rel, crate::call_sites::scan::code_only(&src)))
+            .collect();
+
+        // A scan that silently stops seeing its target is worse than no scan.
+        assert!(
+            !egress.is_empty(),
+            "the egress scan matched no files — the module layout moved and this \
+             assertion is no longer looking at anything"
+        );
+
+        for (rel, source) in &egress {
+            for needle in [
+                "PermissionLevel",
+                "permission_level",
+                "table_for",
+                "PermissionGate",
+                "PermissionConfig",
+            ] {
+                assert!(
+                    !source.contains(needle),
+                    "egress/{rel} names `{needle}`. Permission levels must not appear \
+                     in any predicate on the egress path (REQ-560 BR-3/BR-4): the level \
+                     decides which tools run, the boundary decides what leaves. Coupling \
+                     them — even as a convenience — turns REQ-544's guarantee into a \
+                     setting."
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_gate_arm_reports_a_forwarded_findings_verdict() {
         let source = crate::call_sites::scan::production_sources()

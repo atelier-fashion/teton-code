@@ -65,6 +65,74 @@ pub fn status_line(
     (row.chars().count() <= width).then_some(row)
 }
 
+/// Reading the **client's** own sources, for the seam assertion below.
+///
+/// The client twin of `tetond`'s `call_sites::scan`, and a separate copy rather
+/// than a shared one because the two live in different crates and each has to
+/// walk its own `CARGO_MANIFEST_DIR`. The rule they implement — production
+/// source only, test items stripped — is deliberately identical, and both rest
+/// on the same house convention that `#[cfg(test)]` items come last in a file.
+#[cfg(test)]
+pub(crate) mod scan {
+    use std::path::{Path, PathBuf};
+
+    /// The client's own `src/` directory.
+    fn client_src() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("readable source dir") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `text` truncated at its first `#[cfg(test)]` item.
+    fn strip_test_modules(text: &str) -> String {
+        match text.find("\n#[cfg(test)]") {
+            Some(at) => text[..at].to_owned(),
+            None => text.to_owned(),
+        }
+    }
+
+    /// `source` with whole-line comments removed, so an explanation of a rule is
+    /// not mistaken for a violation of it.
+    pub(crate) fn code_only(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every production source in the client, as `(relative path, text)`.
+    pub(crate) fn production_sources() -> Vec<(String, String)> {
+        let root = client_src();
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        files.sort();
+        files
+            .iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(path)
+                    .unwrap_or_else(|err| panic!("unreadable source {}: {err}", path.display()));
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("a file under src/")
+                    .to_string_lossy()
+                    .into_owned();
+                (rel, strip_test_modules(&text))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +211,90 @@ mod tests {
             assert_eq!(status_line(*level, None, 0), None, "{level}");
             assert_eq!(status_line(*level, Some("high"), 0), None, "{level}");
         }
+    }
+
+    /// **REQ-560 AC-16: no status-line write reaches stdout outside the
+    /// `Surface` / `Prompter` seams.**
+    ///
+    /// BR-12's point is forward-looking: the anticipated ratatui front-end
+    /// inherits every line this UI draws by implementing the same two seams, and
+    /// it inherits exactly nothing that went straight to stdout. A
+    /// direct-to-stdout side channel would not fail any test today — it would
+    /// look identical in a terminal — and would surface as a missing row in a
+    /// front-end nobody has written yet.
+    ///
+    /// So the assertion is structural, in the same shape as AC-5's
+    /// egress-predicate scan: this module composes content and never prints, and
+    /// the only code allowed to put a status row on a terminal is
+    /// `FramedStdinPrompter`, which **is** the `Prompter` seam.
+    #[test]
+    fn the_status_module_never_writes_to_a_terminal() {
+        let source = scan::production_sources()
+            .into_iter()
+            .find(|(rel, _)| rel == "status.rs")
+            .map(|(_, src)| scan::code_only(&src))
+            .expect("this module is a production source");
+
+        for needle in [
+            "print!",
+            "println!",
+            "eprint!",
+            "eprintln!",
+            "io::stdout",
+            "io::stderr",
+            "stdout()",
+            "stderr()",
+        ] {
+            assert!(
+                !source.contains(needle),
+                "status.rs names `{needle}`. The status row's content is a pure \
+                 function (BR-8) and its bytes go out through the Prompter seam \
+                 (BR-12); a direct-to-stdout side channel is invisible to the \
+                 ratatui front-end that will implement those seams."
+            );
+        }
+    }
+
+    /// The other half of AC-16: the row reaches a terminal from exactly **one**
+    /// place, and that place is the `Prompter` seam.
+    ///
+    /// Scans the whole client rather than one file, because the failure this
+    /// guards against is a *new* call site somewhere else — the direction a rule
+    /// like this actually rots in.
+    #[test]
+    fn only_the_prompter_seam_draws_the_status_row() {
+        let sources = scan::production_sources();
+        assert!(
+            !sources.is_empty(),
+            "the client source scan matched nothing — it is no longer looking at \
+             anything"
+        );
+
+        let mut writers: Vec<&str> = Vec::new();
+        for (rel, src) in &sources {
+            let code = scan::code_only(src);
+            // `set_status` hands *content* to the seam; only `draw` may emit it.
+            if code.contains("below_rows") && rel != "prompt.rs" {
+                writers.push(rel);
+            }
+        }
+        assert!(
+            writers.is_empty(),
+            "the frame's below-row geometry is owned by prompt.rs (the Prompter \
+             seam); these files also touch it and would be a second, drifting \
+             copy: {writers:?}"
+        );
+
+        // Non-vacuity: the seam really does own it.
+        let prompt = sources
+            .iter()
+            .find(|(rel, _)| rel == "prompt.rs")
+            .map(|(_, src)| scan::code_only(src))
+            .expect("prompt.rs is a production source");
+        assert!(
+            prompt.contains("below_rows"),
+            "this assertion is only meaningful while prompt.rs owns the geometry"
+        );
     }
 
     /// A wide effort label is measured in characters, so a multi-byte value does

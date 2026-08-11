@@ -1,7 +1,7 @@
 ---
 id: TASK-007
 title: "Source-level assertions: no level on the egress path, no status write outside the seams"
-status: pending
+status: complete
 parent: REQ-560
 created: 2026-08-11
 updated: 2026-08-11
