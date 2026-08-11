@@ -1,0 +1,32 @@
+{
+  "req": "REQ-570",
+  "branch": "feat/REQ-570-human-attested-attach-consent",
+  "startedAt": "2026-08-11T00:00:00Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "integrationBranch": "main",
+  "phaseHistory": [],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-570",
+      "branch": "feat/REQ-570-human-attested-attach-consent",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "blockers": []
+}
