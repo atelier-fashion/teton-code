@@ -207,6 +207,114 @@ impl PresenceVerifier for UnavailableVerifier {
     }
 }
 
+/// A verifier that accepts without asking anyone — **fixtures only**.
+///
+/// AC-1 and AC-3 need the *granted* path exercised end to end, and the real
+/// mechanism cannot be satisfied in CI by design: its whole purpose is that
+/// nothing gets past it without a human touching a sensor. So the seam takes a
+/// double, and this is it.
+///
+/// Three things keep it out of production, and they are worth stating because
+/// this type is exactly what an attacker would want to reach:
+///
+/// 1. [`default_verifier`] never returns it — no build configuration selects it.
+/// 2. The only way to install it is [`crate::server::Daemon::with_presence_verifier`],
+///    which a fixture has to name out loud (the same discipline
+///    `with_consent_timeout` follows).
+/// 3. `the_default_verifier_never_accepts_without_asking` asserts (1) mechanically,
+///    so a future edit to `default_verifier` that reached for this type fails the
+///    suite rather than shipping.
+///
+/// It is deliberately **not** `#[cfg(test)]`: the integration suites under
+/// `tests/` are separate crates compiled against the library without that flag,
+/// and AC-1's raw-RPC assertions live there.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptingVerifier {
+    method: AttestationMethod,
+}
+
+impl AcceptingVerifier {
+    /// A double that reports `method` verified every time.
+    ///
+    /// Panics on [`AttestationMethod::None`]: a double that minted "an
+    /// attestation by no method" would be asserting the exact hole
+    /// [`PresenceAttestation::verified`] exists to close, and a fixture built on
+    /// it would go green while the property under test was broken.
+    #[must_use]
+    pub fn new(method: AttestationMethod) -> Self {
+        assert!(
+            method != AttestationMethod::None,
+            "an accepting verifier must name a real method; `None` never mints"
+        );
+        Self { method }
+    }
+}
+
+impl Default for AcceptingVerifier {
+    fn default() -> Self {
+        Self::new(AttestationMethod::OsBiometric)
+    }
+}
+
+impl PresenceVerifier for AcceptingVerifier {
+    fn availability(&self) -> MechanismAvailability {
+        MechanismAvailability::Available(self.method)
+    }
+
+    fn verify(
+        &self,
+        subject: ConnectionId,
+        request: &RequestId,
+    ) -> Result<PresenceAttestation, AttestationRefusal> {
+        // Bound to the caller's subject and request like the real one — a double
+        // that returned an unbound attestation would quietly disable BR-6 in
+        // every test that used it, which is how a suite ends up proving nothing.
+        PresenceAttestation::verified(
+            self.method,
+            subject,
+            request.clone(),
+            std::time::Instant::now(),
+        )
+        .ok_or(AttestationRefusal::Failed)
+    }
+}
+
+/// The seam that lets the acceptance suite drive the *granted* path
+/// (`TETON_PRESENCE_ACCEPT`, DECISION 3).
+///
+/// AC-1 and AC-3 need a consent that actually completes, and the real mechanism
+/// cannot produce one without a human touching a sensor — which no CI runner
+/// has. The acceptance suite spawns a real daemon binary, so it cannot reach
+/// [`crate::server::Daemon::with_presence_verifier`] the way an in-process
+/// fixture can, and it needs an environment-level seam instead.
+///
+/// **Why this is safe against the adversary the REQ is about.** It rides the
+/// existing `TETON_TEST_SEAMS` master switch, whose contract (DECISION 3, E-6)
+/// is that a **release build refuses to start at all** when it is set. So the
+/// shipped binary cannot honour this seam no matter what a same-UID process puts
+/// in its environment — the bypass does not exist in the artifact users run. A
+/// debug build additionally has to be asked twice: the master switch *and* this
+/// variable.
+///
+/// It is deliberately an all-or-nothing accept rather than a "skip attestation"
+/// flag: the daemon still runs the whole record → consume → binding path, so the
+/// BR-6 rules under test stay live and only the human is simulated.
+fn seam_verifier() -> Option<Box<dyn PresenceVerifier>> {
+    if !crate::runtime::test_seams_enabled() {
+        return None;
+    }
+    match std::env::var("TETON_PRESENCE_ACCEPT").ok().as_deref() {
+        Some("1") => Some(Box::new(AcceptingVerifier::default())),
+        // A named refusal, so the suite can drive BR-8/BR-11's posture — AC-7's
+        // "injected no-mechanism seam" — against a real daemon process too.
+        Some("unavailable") => Some(Box::new(UnavailableVerifier::new(
+            UnavailableReason::PlatformUnsupported,
+        ))),
+        _ => None,
+    }
+}
+
 /// The verifier this build ships with.
 ///
 /// Default and CI builds compile no FFI and get [`UnavailableVerifier`], which
@@ -214,6 +322,9 @@ impl PresenceVerifier for UnavailableVerifier {
 /// there, never self-approved.
 #[must_use]
 pub fn default_verifier() -> Box<dyn PresenceVerifier> {
+    if let Some(seam) = seam_verifier() {
+        return seam;
+    }
     #[cfg(all(feature = "presence", target_os = "macos"))]
     {
         Box::new(mechanism::LocalAuthenticationVerifier::new())
@@ -336,6 +447,63 @@ mod tests {
         assert!(verifier
             .verify(subject, &RequestId::from("consent-0"))
             .is_err());
+    }
+
+    /// The guard that keeps [`AcceptingVerifier`] a fixture.
+    ///
+    /// Mechanical rather than by inspection: an edit to `default_verifier` that
+    /// reached for the accepting double — on any platform, under any feature
+    /// combination this build compiles — fails here instead of shipping a daemon
+    /// that grants without asking anyone.
+    #[test]
+    fn the_default_verifier_never_accepts_without_asking() {
+        let grants = GrantRegistry::new();
+        let subject = grants.next_connection_id();
+        let verifier = default_verifier();
+        let request = RequestId::from("consent-0");
+
+        // Either it refuses outright (no mechanism compiled), or it is a real
+        // mechanism whose availability depends on hardware — but it must never
+        // be a thing that hands back an attestation for free.
+        match verifier.availability() {
+            MechanismAvailability::Unavailable(_) => {
+                assert!(verifier.verify(subject, &request).is_err());
+            }
+            MechanismAvailability::Available(_) => {
+                // A real mechanism is present. We cannot drive it here (it needs
+                // a human), so assert the thing that would be wrong: the shipped
+                // verifier must not be the accepting double.
+                assert_ne!(
+                    format!("{:?}", std::any::type_name_of_val(&*verifier)),
+                    format!("{:?}", std::any::type_name::<AcceptingVerifier>()),
+                    "the shipped verifier must never be the test double"
+                );
+            }
+        }
+    }
+
+    /// The double binds like the real one, or every test using it proves nothing.
+    #[test]
+    fn the_accepting_double_binds_to_its_caller_and_request() {
+        let grants = GrantRegistry::new();
+        let subject = grants.next_connection_id();
+        let other = grants.next_connection_id();
+        let verifier = AcceptingVerifier::default();
+        let request = RequestId::from("consent-7");
+
+        let attestation = verifier
+            .verify(subject, &request)
+            .expect("the double accepts");
+        assert_eq!(attestation.subject(), subject);
+        assert_eq!(attestation.request(), &request);
+        assert_ne!(attestation.subject(), other);
+        assert_eq!(attestation.method(), AttestationMethod::OsBiometric);
+    }
+
+    #[test]
+    #[should_panic(expected = "must name a real method")]
+    fn an_accepting_double_cannot_be_built_on_the_none_method() {
+        let _ = AcceptingVerifier::new(AttestationMethod::None);
     }
 
     #[test]

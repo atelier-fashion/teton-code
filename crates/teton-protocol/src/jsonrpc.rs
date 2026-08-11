@@ -395,6 +395,77 @@ pub mod error_code {
         /// the prompt, and a user who walked away all end in the same place,
         /// holding nothing.
         CONSENT_TIMEOUT = -32013;
+        /// An approval that would mint a grant arrived with no verified human
+        /// presence behind it (REQ-570 BR-1, BR-3).
+        ///
+        /// **This is the refusal that closes the REQ-569 self-approval
+        /// residual.** REQ-569 routes a consent prompt back to the requesting
+        /// connection when nothing is attached to the target session — correct
+        /// for a user reopening their own CLI, and for a headless same-UID
+        /// process it meant the "consent" was self-issued with no human
+        /// involved. The routing arm survives, because refusing it would break
+        /// resume; what changed is that its answer now mints nothing without a
+        /// presence check the daemon itself performed.
+        ///
+        /// Distinct from [`CONSENT_DENIED`] by *who* refused: a denial is a
+        /// human saying no, this is the daemon declining to believe a human was
+        /// there at all. A client that folded them together would tell a user
+        /// they had declined something they never saw.
+        ///
+        /// Distinct from [`ATTESTATION_UNAVAILABLE`] by whether asking was even
+        /// possible: this says nobody proved presence, that one says nobody
+        /// *could*.
+        ATTESTATION_REQUIRED = -32014;
+        /// A human was asked to prove presence and did not authenticate
+        /// (REQ-570 BR-7; `LAError -1`).
+        ///
+        /// A decision-shaped ending, like [`CONSENT_DENIED`]: someone was at
+        /// the machine and the check did not pass. Kept apart from
+        /// [`ATTESTATION_CANCELLED`] because the remedies differ — a failed
+        /// fingerprint is worth retrying, a deliberate dismissal is not.
+        ATTESTATION_FAILED = -32015;
+        /// The presence prompt was dismissed — by the user, the system, or the
+        /// daemon itself (REQ-570 BR-7; `LAError -2 / -4 / -9`).
+        ///
+        /// `-9` (`appCancel`) is the arm the BR-12 spike actually observed, and
+        /// is what the daemon's own timeout produces when it takes a stale
+        /// dialog down.
+        ATTESTATION_CANCELLED = -32016;
+        /// The presence prompt went unanswered for its bounded window
+        /// (REQ-570 BR-7).
+        ///
+        /// [`CONSENT_TIMEOUT`]'s counterpart one layer in: that one is nobody
+        /// answering the *consent* question, this is nobody answering the
+        /// *presence* one. Both fail closed; a client renders them the same way
+        /// and they stay numbered apart so an operator can tell which surface
+        /// was ignored.
+        ATTESTATION_TIMEOUT = -32017;
+        /// No usable presence mechanism exists here, so cross-session attach is
+        /// refused outright (REQ-570 BR-8, BR-11).
+        ///
+        /// **Terminal, like [`ATTACH_FORBIDDEN`]** — no retry changes it, and
+        /// the accompanying message names the specific cause rather than
+        /// failing generically (AC-7b). The case this exists for is headless
+        /// Linux: the BR-12 spike confirmed a polkit authority can be on the
+        /// bus and still answer "no agent is available", and that the textual
+        /// agent fallback needs a `/dev/tty` neither a headless host nor the VS
+        /// Code extension has.
+        ///
+        /// It is a **refusal**, never a fall-through. A platform without a
+        /// mechanism must not quietly return to the self-approval residual this
+        /// REQ exists to close — that is the whole of BR-11.
+        ATTESTATION_UNAVAILABLE = -32018;
+        /// A monitor-scope request was answered by the connection that raised
+        /// it (REQ-570 BR-5).
+        ///
+        /// `monitor` is sight of every session on the machine, so the approver
+        /// must never be the requester **under any routing arm**. REQ-569's
+        /// verify pass found the previous monitor path was mintable by one
+        /// attacker holding two connections; attestation is what breaks that
+        /// attack, and this check remains as a structural invariant with its own
+        /// regression test rather than a property merely avoided by
+        /// construction (LESSON-502).
+        SELF_APPROVAL_REFUSED = -32019;
     }
 }
 

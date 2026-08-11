@@ -564,6 +564,12 @@ impl Daemon {
             // a debug build honours only with this master switch set. A release
             // build refuses them outright.
             .env("TETON_TEST_SEAMS", "1")
+            // REQ-570: a consent that mints a grant now needs verified human
+            // presence, and no CI runner has a human. This seam rides the same
+            // master switch above — a release build refuses to start with it
+            // set — and simulates only the person, leaving the whole
+            // record/consume/binding path (BR-6) live.
+            .env("TETON_PRESENCE_ACCEPT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));

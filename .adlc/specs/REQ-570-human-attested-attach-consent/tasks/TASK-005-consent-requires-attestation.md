@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 title: "attach/consent requires a verified attestation; the self-approval residual closes"
-status: pending
+status: complete
 parent: REQ-570
 created: 2026-08-11
 updated: 2026-08-11
@@ -25,19 +25,19 @@ must carry. See architecture.md §3.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: a headless same-UID process that requests attach to an unattended
+- [x] AC-1: a headless same-UID process that requests attach to an unattended
       session and answers its own prompt is refused, and **no grant is minted**.
       Asserted at the raw RPC surface, and by inspecting the grant registry.
-- [ ] BR-3: the self-render arm survives (resume must keep working) but its
+- [x] BR-3: the self-render arm survives (resume must keep working) but its
       answer mints nothing without a verified attestation.
-- [ ] A **deny** decision requires no attestation. Requiring one would let an
+- [x] A **deny** decision requires no attestation. Requiring one would let an
       absent mechanism force a grant to stay pending rather than be refused,
       which is fail-open in the wrong direction.
-- [ ] AC-6: failure/cancel/timeout each mint nothing and leave **both** the grant
+- [x] AC-6: failure/cancel/timeout each mint nothing and leave **both** the grant
       and attestation registries empty, asserted by inspection.
-- [ ] AC-8: the creator path is untouched — zero new prompts or attestation
+- [x] AC-8: the creator path is untouched — zero new prompts or attestation
       steps for single-client create → prompt → stream, or the creator's own attach.
-- [ ] `cargo test -p tetond --no-fail-fast` green.
+- [x] `cargo test -p tetond --no-fail-fast` green.
 
 ## Technical Notes
 
