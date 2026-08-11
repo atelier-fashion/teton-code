@@ -105,7 +105,6 @@ use teton_protocol::events::{
 };
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
-use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, AttachConsentResult, ConfigGetParams,
     ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams, ModelConfirmParams,
@@ -2826,6 +2825,8 @@ mod tests {
     /// Its ancestry is [`Ancestry::NotDescendant`] — the ordinary client the
     /// REQ-569 BR-4 gate lets through — so what these tests exercise is the
     /// *grant* gate behind it. The descendant cases say so explicitly.
+    use teton_protocol::permissions::PermissionLevel;
+
     fn unattached(daemon: &Daemon) -> ConnState {
         conn_with_ancestry(daemon, Ancestry::NotDescendant)
     }
