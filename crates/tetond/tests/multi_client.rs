@@ -1,12 +1,20 @@
-//! Integration test for AC-6 and the handshake gate.
+//! Integration test for AC-6, event scoping, and the handshake gate.
 //!
 //! Two clients attach over a real Unix socket, exchange the handshake, and
 //! observe: (1) a session created by one client appears identically in both
 //! clients' session lists; (2) a session-scoped event emitted by that creation
-//! reaches the *other*, subscribed client; and (3) the daemon and its sessions
+//! reaches the creator but **not** the other, unattached client, and does reach
+//! it once it attaches (REQ-568 BR-1); and (3) the daemon and its sessions
 //! survive a client disconnecting — a fresh client can still attach to the
-//! surviving session. A second test asserts that any method before the
-//! handshake is refused.
+//! surviving session. Further tests cover the monitor declaration that opts a
+//! connection back into everything (BR-1, ADR-C) and the refusal of any method
+//! before the handshake.
+//!
+//! Point (2) inverted at REQ-568: this test used to assert that the second
+//! client received the first's `phase_transition` without asking for it, which
+//! was the leak written down as a feature. The registry stays shared — sessions
+//! outlive their creators and every client can list them — but the *events* are
+//! now scoped to the connections that asked for them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,17 +83,39 @@ impl TestClient {
 
     /// Reads until an `event` notification with the given event name arrives.
     async fn read_event(&mut self, event_name: &str) -> Value {
+        self.read_event_before(event_name, None).await
+    }
+
+    /// Reads until the `event` notification named `expect` arrives, failing if
+    /// one named `forbidden` reaches this client first.
+    ///
+    /// This is how an event's *absence* is asserted without a sleep. One
+    /// subscription is FIFO, so an envelope published before `expect` either
+    /// arrives before it or was never delivered at all — which makes a
+    /// filtered-out event a decidable fact rather than a race against a timer.
+    async fn read_event_before(&mut self, expect: &str, forbidden: Option<&str>) -> Value {
         loop {
             let value = self.read_line().await;
-            if value.get("method").and_then(Value::as_str) == Some("event")
-                && value["params"]["event"].as_str() == Some(event_name)
-            {
+            if value.get("method").and_then(Value::as_str) != Some("event") {
+                continue;
+            }
+            let name = value["params"]["event"].as_str().unwrap_or_default();
+            if Some(name) == forbidden {
+                panic!("this client must not have received `{name}`: {value}");
+            }
+            if name == expect {
                 return value;
             }
         }
     }
 
     async fn handshake(&mut self, id: i64) -> Value {
+        self.handshake_declaring(id, false).await
+    }
+
+    /// A handshake that may declare `monitor` — the one-time, explicit opt-in
+    /// to every session's events (REQ-568 ADR-C).
+    async fn handshake_declaring(&mut self, id: i64, monitor: bool) -> Value {
         self.send(
             id,
             "handshake",
@@ -95,6 +125,7 @@ impl TestClient {
                 "client_version": "0.1.0",
                 "protocol_min": PROTOCOL_VERSION_MIN,
                 "protocol_max": PROTOCOL_VERSION_MAX,
+                "monitor": monitor,
             }),
         )
         .await;
@@ -148,15 +179,36 @@ async fn two_clients_share_sessions_and_daemon_survives_client_exit() {
         json!({"mode": "structured", "phase": "spec"}),
     )
     .await;
-    let created = a.read_response(2).await;
-    let sid = created["result"]["session_id"].as_str().unwrap().to_owned();
 
-    // AC-6: the event from A's newly created session reaches subscribed B.
-    let event = b.read_event("phase_transition").await;
-    assert_eq!(event["params"]["session_id"].as_str().unwrap(), sid);
+    // BR-8: A's own flow is unchanged — the creator is attached to what it made
+    // and receives its first event, ahead of the response (the daemon's fence).
+    // Read in that order because `read_response` would otherwise skip past it.
+    let event = a.read_event("phase_transition").await;
+    let sid = event["params"]["session_id"].as_str().unwrap().to_owned();
     assert_eq!(event["params"]["to_phase"].as_str().unwrap(), "spec");
+    let created = a.read_response(2).await;
+    assert_eq!(created["result"]["session_id"].as_str().unwrap(), sid);
 
-    // AC-6: both clients see the same session list.
+    // BR-1: B never created or attached that session, so the envelope was not
+    // delivered to it. Asserted by ordering, not by a timeout: a third client's
+    // handshake publishes a daemon-scoped `daemon_client_attach` *after* the
+    // phase transition, and one subscription is FIFO — so B reaching the attach
+    // without passing the phase transition means the phase transition was
+    // filtered rather than merely slow.
+    let mut c = TestClient::connect(&path).await;
+    assert!(c.handshake(1).await.get("result").is_some());
+    let daemon_scoped = b
+        .read_event_before("daemon_client_attach", Some("phase_transition"))
+        .await;
+    // BR-2: and that daemon-scoped envelope belongs to no session, which is
+    // exactly why every handshaked connection still gets it.
+    assert!(
+        daemon_scoped["params"].get("session_id").is_none(),
+        "a daemon-scoped envelope carries no session: {daemon_scoped}"
+    );
+
+    // AC-6: the session *registry* is still shared — scoping events changed
+    // nothing about which sessions a client can see exist.
     a.send(3, "session/list", json!({})).await;
     let list_a = a.read_response(3).await;
     b.send(3, "session/list", json!({})).await;
@@ -164,26 +216,80 @@ async fn two_clients_share_sessions_and_daemon_survives_client_exit() {
     assert_eq!(session_ids(&list_a), vec![sid.clone()]);
     assert_eq!(session_ids(&list_b), session_ids(&list_a));
 
+    // BR-1, the other direction: attaching is the grant. Once B has attached,
+    // the session's events reach it — a `session/clear` issued by A, so B is
+    // purely a receiver and what it sees is delivery, not an echo of its own
+    // request.
+    b.send(4, "session/attach", json!({"session_id": sid.clone()}))
+        .await;
+    assert!(b.read_response(4).await.get("result").is_some());
+
+    a.send(5, "session/clear", json!({"session_id": sid.clone()}))
+        .await;
+    let cleared = b.read_event("context_cleared").await;
+    assert_eq!(cleared["params"]["session_id"].as_str().unwrap(), sid);
+    assert!(a.read_response(5).await.get("result").is_some());
+
     // Client A exits. The daemon and its sessions must survive.
     drop(a);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    b.send(4, "session/list", json!({})).await;
-    let list_b_after = b.read_response(4).await;
+    b.send(6, "session/list", json!({})).await;
+    let list_b_after = b.read_response(6).await;
     assert_eq!(session_ids(&list_b_after), vec![sid.clone()]);
 
     // A fresh client can attach to the surviving session.
-    let mut c = TestClient::connect(&path).await;
-    assert!(c.handshake(1).await.get("result").is_some());
-    c.send(2, "session/attach", json!({"session_id": sid}))
+    let mut d = TestClient::connect(&path).await;
+    assert!(d.handshake(1).await.get("result").is_some());
+    d.send(2, "session/attach", json!({"session_id": sid}))
         .await;
-    let attached = c.read_response(2).await;
+    let attached = d.read_response(2).await;
     assert_eq!(
         attached["result"]["session"]["session_id"]
             .as_str()
             .unwrap(),
         sid
     );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REQ-568 BR-1 / AC-3: a connection that declared `monitor` at the handshake
+/// receives another client's session-scoped events without ever attaching.
+///
+/// The opt-in half of the filter, at the socket. It is deliberately the *only*
+/// way back to the old behaviour: the declaration is a field the client had to
+/// send, so a monitor exists because someone asked for one.
+#[tokio::test]
+async fn a_monitor_declared_at_handshake_receives_another_clients_events() {
+    let path = temp_socket("monitor");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut monitor = TestClient::connect(&path).await;
+    assert!(monitor
+        .handshake_declaring(1, true)
+        .await
+        .get("result")
+        .is_some());
+
+    let mut worker = TestClient::connect(&path).await;
+    assert!(worker.handshake(1).await.get("result").is_some());
+
+    worker
+        .send(
+            2,
+            "session/create",
+            json!({"mode": "structured", "phase": "spec"}),
+        )
+        .await;
+    let created = worker.read_response(2).await;
+    let sid = created["result"]["session_id"].as_str().unwrap().to_owned();
+
+    let event = monitor.read_event("phase_transition").await;
+    assert_eq!(event["params"]["session_id"].as_str().unwrap(), sid);
 
     server_task.abort();
     let _ = std::fs::remove_file(&path);

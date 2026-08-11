@@ -20,10 +20,22 @@
 //! is enqueued, the sender waits until every event the bus had already
 //! delivered to this client has been moved to the outbound channel. Events a
 //! handler publishes therefore always precede its response on the wire.
+//!
+//! ## Event scoping
+//!
+//! A connection receives a *session-scoped* event only for a session it is
+//! attached to — one it created, or one it named in `session/attach` — or if it
+//! declared `monitor` at handshake; *daemon-scoped* events (`session_id: None`)
+//! reach every handshaked connection (REQ-568 BR-1/BR-2). The decision is taken
+//! in [`forward_events`] against this connection's [`ConnState`], so the bus
+//! stays connection-agnostic. A skipped envelope still advances the
+//! [`EventFence`] watermark exactly like a delivered one, or a response would
+//! wait forever on an event this connection was never going to receive.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -45,6 +57,7 @@ use teton_protocol::methods::{
     SessionAttachParams, SessionAttachResult, SessionClearParams, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, WebOverrideParams, WebRefreshParams,
 };
+use teton_protocol::SessionId;
 
 use teton_core::lifetime::{BlockingActivity, PolicySource, ShutdownPolicy};
 
@@ -245,6 +258,80 @@ impl EventFence {
     }
 }
 
+/// One connection's view of the daemon's sessions (REQ-568 BR-1/BR-2).
+///
+/// `attached` starts empty and grows two ways: `session/create` attaches the
+/// creator to what it just made, and `session/attach` attaches on success.
+/// `session/clear` does **not** remove — attachment is connection-lifetime,
+/// where a cleared transcript is content-lifetime; a client that cleared its
+/// session is still watching it.
+///
+/// `monitor` is fixed at handshake and never changes (ADR-C). Immutability is
+/// what keeps the forwarder holding one shared set and a plain `bool` rather
+/// than two shared mutables; a client that wants to stop monitoring reconnects.
+///
+/// Cloning shares the set, which is the point: the dispatch path mutates it
+/// while the forwarder task reads it, and they must see one set, not two.
+#[derive(Clone)]
+struct ConnState {
+    attached: Arc<RwLock<HashSet<SessionId>>>,
+    monitor: bool,
+}
+
+impl ConnState {
+    /// A connection attached to nothing, monitoring or not as declared.
+    fn new(monitor: bool) -> Self {
+        Self {
+            attached: Arc::new(RwLock::new(HashSet::new())),
+            monitor,
+        }
+    }
+
+    /// Grant this connection sight of `session_id`'s events. Idempotent.
+    fn attach(&self, session_id: SessionId) {
+        self.attached
+            .write()
+            .expect("connection attachment lock poisoned")
+            .insert(session_id);
+    }
+
+    /// Whether an envelope scoped to `session_id` may be delivered here.
+    ///
+    /// Deliberately synchronous: the read guard cannot outlive this call, so it
+    /// is structurally impossible for the forwarder to hold the lock across the
+    /// `out_tx.send(...).await` that follows.
+    fn may_receive(&self, session_id: Option<&SessionId>) -> bool {
+        let attached = self
+            .attached
+            .read()
+            .expect("connection attachment lock poisoned");
+        should_forward(session_id, &attached, self.monitor)
+    }
+}
+
+/// The delivery policy: may an envelope scoped to `env_session` reach a
+/// connection attached to `attached` that declared `monitor`? (REQ-568 BR-1/BR-2)
+///
+/// Pure, so the policy is table-tested directly instead of being inferred from
+/// the forwarder's behaviour — mechanism is gated, policy is checkable.
+///
+/// Each arm names the real condition: daemon-scoped, monitor, attached. None of
+/// them is a proxy — an emptiness check standing in for "an old client that
+/// never learned to attach" would hand exactly the connection that attached to
+/// nothing everything there is to see (LESSON-443).
+fn should_forward(
+    env_session: Option<&SessionId>,
+    attached: &HashSet<SessionId>,
+    monitor: bool,
+) -> bool {
+    match env_session {
+        // Daemon-scoped: model lifecycle, install progress, daemon lifetime.
+        // It belongs to no session, so no session can gate it (BR-2).
+        None => true,
+        Some(session_id) => monitor || attached.contains(session_id),
+    }
+}
+
 /// Drives one client connection from handshake to disconnect.
 async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
     let (read_half, write_half) = stream.into_split();
@@ -261,6 +348,10 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
     let mut client_guard: Option<crate::lifetime::ClientGuard> = None;
     let mut forwarder: Option<JoinHandle<()>> = None;
     let mut fence: Option<EventFence> = None;
+    // This connection's attached sessions and monitor declaration (REQ-568).
+    // Installed by the handshake, alongside the fence and the forwarder, and
+    // `None` until then — an unhandshaked connection has no sessions to see.
+    let mut conn: Option<ConnState> = None;
     // In-flight `session/prompt` executions. A prompt turn is run on its own task
     // so the reader loop stays free to process the `permission/respond` that
     // unblocks the harness permission gate mid-turn (otherwise the loop would
@@ -351,7 +442,7 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
 
             // On success, subscribe and start forwarding events. On failure the
             // error response is already queued and the client stays unauthenticated.
-            if let Some((sub, guard)) = do_handshake(&daemon, id, params, &out_tx) {
+            if let Some((sub, guard, state)) = do_handshake(&daemon, id, params, &out_tx) {
                 handshaked = true;
                 client_guard = Some(guard);
                 let (forwarded_tx, forwarded_rx) = watch::channel(0u64);
@@ -359,11 +450,15 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
                     delivered: sub.delivered_counter(),
                     forwarded: forwarded_rx,
                 });
+                // The forwarder's clone shares the attached set with the one
+                // the dispatch path below mutates (REQ-568 BR-1).
                 forwarder = Some(tokio::spawn(forward_events(
                     sub,
                     out_tx.clone(),
                     forwarded_tx,
+                    state.clone(),
                 )));
+                conn = Some(state);
             }
             continue;
         }
@@ -382,7 +477,11 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
             continue;
         }
 
-        if let Some(response) = dispatch(&daemon, id, method, params) {
+        // Past the handshake gate `conn` is always set — it is installed with
+        // `handshaked` above. Stated as a pattern rather than an unwrap.
+        let Some(conn) = conn.as_ref() else { continue };
+
+        if let Some(response) = dispatch(&daemon, conn, id, method, params) {
             // Any event the handler just published (e.g. `session/create`'s
             // phase transition) must be on the outbound channel before its
             // response — see the module docs on ordering.
@@ -546,16 +645,21 @@ fn flatten_prompt(blocks: &[PromptBlock]) -> String {
 /// Performs the handshake, and on success subscribes this client to the bus and
 /// counts it against the daemon's lifetime.
 ///
-/// Returns the new [`Subscription`] and the client's lifetime claim on success
-/// (so the caller can start the event forwarder and hold the claim for the
-/// connection's life), or `None` on failure — an error response has been queued,
+/// Returns the new [`Subscription`], the client's lifetime claim, and the
+/// connection's fresh [`ConnState`] on success (so the caller can start the
+/// event forwarder, hold the claim for the connection's life, and carry the
+/// attachment set), or `None` on failure — an error response has been queued,
 /// and no claim was taken.
+///
+/// The `ConnState` is minted here rather than by the caller because this is the
+/// only place the `monitor` declaration exists: it arrives in the handshake
+/// frame and is fixed for the connection (ADR-C).
 fn do_handshake(
     daemon: &Daemon,
     id: Id,
     params: Value,
     out_tx: &mpsc::Sender<String>,
-) -> Option<(Subscription, crate::lifetime::ClientGuard)> {
+) -> Option<(Subscription, crate::lifetime::ClientGuard, ConnState)> {
     let params: HandshakeParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => {
@@ -630,21 +734,54 @@ fn do_handshake(
             .publish(None, Event::ModelLifecycle(lifecycle));
     }
 
-    Some((subscription, client_guard))
+    // REQ-568 BR-5: a monitor is announced, never inferred from traffic.
+    // Logged at the one moment the declaration is made, and only for a
+    // handshake that succeeded — a refused client never became a monitor.
+    if params.monitor {
+        eprintln!("{}", monitor_declaration_line(&params));
+    }
+
+    Some((subscription, client_guard, ConnState::new(params.monitor)))
+}
+
+/// The daemon-log sentence announcing a monitor declaration (REQ-568 BR-5).
+///
+/// A function rather than a bare `eprintln!` so the observability rule is
+/// assertable: "the daemon says so" is a claim a test can check, where a format
+/// string buried in the handshake can only be read.
+///
+/// Both client-supplied strings go through `{:?}`. They arrive from a peer that
+/// is merely same-UID, and `Debug` escapes the newline a client would otherwise
+/// embed in its name to forge a second log line under the daemon's own prefix.
+fn monitor_declaration_line(params: &HandshakeParams) -> String {
+    format!(
+        "tetond: {:?} client {:?} declared monitor at handshake: \
+         it receives every session's events",
+        params.client_kind, params.client_name
+    )
 }
 
 /// Dispatches a post-handshake request to its typed handler, returning the
 /// serialized response.
-fn dispatch(daemon: &Daemon, id: Id, method: &str, params: Value) -> Option<String> {
+///
+/// `conn` is the issuing connection's state: the session handlers grow its
+/// attachment set (REQ-568 BR-1).
+fn dispatch(
+    daemon: &Daemon,
+    conn: &ConnState,
+    id: Id,
+    method: &str,
+    params: Value,
+) -> Option<String> {
     match method {
-        SessionCreateParams::METHOD => Some(handle_session_create(daemon, id, params)),
+        SessionCreateParams::METHOD => Some(handle_session_create(daemon, conn, id, params)),
         SessionListParams::METHOD => {
             let result = SessionListResult {
                 sessions: daemon.sessions.list(),
             };
             Some(ok_string(id, &result))
         }
-        SessionAttachParams::METHOD => Some(handle_session_attach(daemon, id, params)),
+        SessionAttachParams::METHOD => Some(handle_session_attach(daemon, conn, id, params)),
         SessionClearParams::METHOD => Some(handle_session_clear(daemon, id, params)),
         PermissionRespondParams::METHOD => Some(handle_permission_respond(daemon, id, params)),
         ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, id, params)),
@@ -820,7 +957,9 @@ fn handle_cost_query(daemon: &Daemon, id: Id) -> String {
     }
 }
 
-fn handle_session_create(daemon: &Daemon, id: Id, params: Value) -> String {
+/// Create a session (`session/create`), attaching the creating connection to it
+/// (REQ-568 BR-1).
+fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     let params: SessionCreateParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -851,7 +990,15 @@ fn handle_session_create(daemon: &Daemon, id: Id, params: Value) -> String {
         .create(params.mode, params.phase, params.cwd)
     {
         Ok(summary) => {
-            // Broadcast a session-scoped event so subscribed peers learn of the
+            // REQ-568 BR-1: the creator sees what it just made. Before the
+            // publish below, not after — the envelope is queued into this
+            // connection's subscription the moment it is published, and the
+            // forwarder consults the attachment set when it drains, so an
+            // attach that landed second would race the session's own first
+            // event out of its creator's stream.
+            conn.attach(summary.session_id.clone());
+
+            // Broadcast a session-scoped event so attached peers learn of the
             // new session. Entering a structured session's first phase is a
             // phase transition from nothing to that phase.
             if let Some(phase) = summary.phase {
@@ -875,14 +1022,23 @@ fn handle_session_create(daemon: &Daemon, id: Id, params: Value) -> String {
     }
 }
 
-fn handle_session_attach(daemon: &Daemon, id: Id, params: Value) -> String {
+/// Attach a connection to an existing session (`session/attach`), which is what
+/// grants it that session's events from here on (REQ-568 BR-1).
+fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     let params: SessionAttachParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
 
     match daemon.sessions.get(&params.session_id) {
-        Some(session) => ok_string(id, &SessionAttachResult { session }),
+        Some(session) => {
+            // Only a successful attach grants sight: a name the registry does
+            // not know falls through to the error below with the set untouched,
+            // so a client cannot pre-attach to a session id it guessed and
+            // collect its events when someone later creates it.
+            conn.attach(session.session_id.clone());
+            ok_string(id, &SessionAttachResult { session })
+        }
         None => error_string(id, error_code::UNKNOWN_SESSION, "unknown session"),
     }
 }
@@ -919,23 +1075,35 @@ fn handle_session_clear(daemon: &Daemon, id: Id, params: Value) -> String {
 /// releases any response still waiting on the fence. If the bus evicted the
 /// subscription for lagging, emits a final [`SUBSCRIPTION_LAGGED_METHOD`]
 /// notice before stopping.
+///
+/// This is the forwarding seam REQ-568 BR-3 names: every client, present and
+/// future, crosses it, so the session filter is applied here against `conn`
+/// rather than left to any client's rendering.
 async fn forward_events(
     mut sub: Subscription,
     out_tx: mpsc::Sender<String>,
     forwarded: watch::Sender<u64>,
+    conn: ConnState,
 ) {
     let mut count: u64 = 0;
     loop {
         match sub.recv().await {
             Some(envelope) => {
-                let note = Notification::new(EVENT_METHOD, envelope);
-                if let Ok(text) = serde_json::to_string(&note) {
-                    if out_tx.send(text).await.is_err() {
-                        break; // client's writer is gone
+                // BR-1/BR-2: a session-scoped envelope goes out only to a
+                // connection attached to that session, or to a monitor.
+                if conn.may_receive(envelope.session_id.as_ref()) {
+                    let note = Notification::new(EVENT_METHOD, envelope);
+                    if let Ok(text) = serde_json::to_string(&note) {
+                        if out_tx.send(text).await.is_err() {
+                            break; // client's writer is gone
+                        }
                     }
                 }
-                // Counted even when serialization failed: the event will never
-                // be sent, so nothing should wait on it.
+                // Counted even when the envelope was filtered out or failed to
+                // serialize: either way it will never be sent, so nothing
+                // should wait on it. A skipped envelope that did not advance
+                // the watermark would hang the next fenced response on an event
+                // this connection was never going to receive (BR-7).
                 count += 1;
                 let _ = forwarded.send(count);
             }
@@ -1062,10 +1230,23 @@ mod tests {
         );
     }
 
+    /// A connection that has attached to nothing and declared nothing — the
+    /// state every direct-dispatch test starts from.
+    fn unattached() -> ConnState {
+        ConnState::new(false)
+    }
+
     #[test]
     fn dispatch_rejects_unknown_methods() {
         let daemon = Daemon::new();
-        let response = dispatch(&daemon, Id::Number(1), "does/not-exist", Value::Null).unwrap();
+        let response = dispatch(
+            &daemon,
+            &unattached(),
+            Id::Number(1),
+            "does/not-exist",
+            Value::Null,
+        )
+        .unwrap();
         assert!(response.contains("-32601")); // METHOD_NOT_FOUND
     }
 
@@ -1074,6 +1255,7 @@ mod tests {
         let daemon = Daemon::new();
         let created = handle_session_create(
             &daemon,
+            &unattached(),
             Id::Number(1),
             serde_json::json!({"mode": "freeform"}),
         );
@@ -1081,12 +1263,160 @@ mod tests {
 
         let listed = dispatch(
             &daemon,
+            &unattached(),
             Id::Number(2),
             SessionListParams::METHOD,
             Value::Null,
         )
         .unwrap();
         assert!(listed.contains("sess-0"));
+    }
+
+    /// REQ-568 BR-1: the two ways a connection comes to see a session, and the
+    /// one way it does not.
+    ///
+    /// Creating attaches the creator — checked *through* the handler rather
+    /// than by calling `attach` directly, because "the creator is attached" is
+    /// a property of `session/create`, not of the set. Attaching a session the
+    /// registry knows grants sight; attaching a name it does not know grants
+    /// nothing, so a client cannot stake a claim on a guessed id and collect
+    /// the events of whoever creates it later.
+    #[test]
+    fn create_attaches_the_creator_and_only_a_real_attach_grants_sight() {
+        let daemon = Daemon::new();
+        let creator = unattached();
+        let created = handle_session_create(
+            &daemon,
+            &creator,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        assert!(created.contains("sess-0"), "{created}");
+
+        let session = SessionId::from("sess-0");
+        assert!(
+            creator.may_receive(Some(&session)),
+            "the creator must see the session it just made"
+        );
+
+        let onlooker = unattached();
+        assert!(
+            !onlooker.may_receive(Some(&session)),
+            "a connection that did nothing must not see another's session"
+        );
+
+        let ghost = handle_session_attach(
+            &daemon,
+            &onlooker,
+            Id::Number(2),
+            serde_json::json!({"session_id": "sess-ghost"}),
+        );
+        assert!(
+            ghost.contains(&error_code::UNKNOWN_SESSION.to_string()),
+            "{ghost}"
+        );
+        assert!(
+            !onlooker.may_receive(Some(&SessionId::from("sess-ghost"))),
+            "a refused attach must not leave the name in the set"
+        );
+
+        let attached = handle_session_attach(
+            &daemon,
+            &onlooker,
+            Id::Number(3),
+            serde_json::json!({"session_id": "sess-0"}),
+        );
+        assert!(attached.contains("sess-0"), "{attached}");
+        assert!(
+            onlooker.may_receive(Some(&session)),
+            "attaching is the grant — after it the session's events are visible"
+        );
+    }
+
+    /// REQ-568 BR-1/BR-2, all six cells of the delivery policy: the envelope's
+    /// scope (daemon or session) crossed with the connection's standing
+    /// (attached, monitor, neither).
+    #[test]
+    fn should_forward_gates_session_scope_and_never_daemon_scope() {
+        let mine = SessionId::from("sess-mine");
+        let theirs = SessionId::from("sess-theirs");
+        let attached: HashSet<SessionId> = [mine.clone()].into_iter().collect();
+        let nothing: HashSet<SessionId> = HashSet::new();
+
+        // (case, envelope scope, attached set, monitor, delivered?)
+        for (case, scope, set, monitor, expected) in [
+            ("daemon-scoped, attached", None, &attached, false, true),
+            ("daemon-scoped, monitor", None, &nothing, true, true),
+            ("daemon-scoped, neither", None, &nothing, false, true),
+            (
+                "scoped, attached to it",
+                Some(&mine),
+                &attached,
+                false,
+                true,
+            ),
+            ("scoped, monitor", Some(&theirs), &nothing, true, true),
+            // The "neither" cell twice over: attached to *a* session but not
+            // this one, and attached to none at all. A filter that read
+            // emptiness as "a client too old to have attached" would pass the
+            // second — so the empty set is asserted to be refused rather than
+            // assumed to be.
+            (
+                "scoped, attached elsewhere",
+                Some(&theirs),
+                &attached,
+                false,
+                false,
+            ),
+            (
+                "scoped, attached to nothing",
+                Some(&theirs),
+                &nothing,
+                false,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                should_forward(scope, set, monitor),
+                expected,
+                "{case}: expected delivered={expected}"
+            );
+        }
+    }
+
+    /// REQ-568 BR-5: a monitor is announced in the daemon log, so its existence
+    /// is observable rather than inferred from who is receiving what.
+    ///
+    /// The second half is the reason the line is built by a function: the
+    /// client names itself, over a socket whose only gate is the uid, and a
+    /// name carrying a newline would otherwise let it write a second log line
+    /// of its own under the daemon's prefix.
+    #[test]
+    fn a_monitor_declaration_is_announced_and_cannot_forge_a_log_line() {
+        use teton_protocol::handshake::HandshakeParams;
+        use teton_protocol::{ClientKind, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
+
+        let params = HandshakeParams {
+            client_kind: ClientKind::Cli,
+            client_name: "teton-cli".to_owned(),
+            client_version: "0.1.0".to_owned(),
+            protocol_min: PROTOCOL_VERSION_MIN,
+            protocol_max: PROTOCOL_VERSION_MAX,
+            monitor: true,
+        };
+        let line = monitor_declaration_line(&params);
+        assert!(line.contains("monitor"), "{line}");
+        assert!(line.contains("teton-cli"), "{line}");
+        assert!(line.contains("Cli"), "{line}");
+
+        let forged = monitor_declaration_line(&HandshakeParams {
+            client_name: "innocent\ntetond: listening on /tmp/other.sock".to_owned(),
+            ..params
+        });
+        assert!(
+            !forged.contains('\n'),
+            "a client-supplied name must not break the line: {forged}"
+        );
     }
 
     /// REQ-567 BR-8 / D-2: `session/clear` is a dispatchable method, and its
@@ -1097,8 +1427,10 @@ mod tests {
     #[test]
     fn dispatch_routes_session_clear_and_tells_empty_from_unknown() {
         let daemon = Daemon::new();
+        let conn = unattached();
         let created = handle_session_create(
             &daemon,
+            &conn,
             Id::Number(1),
             serde_json::json!({"mode": "freeform"}),
         );
@@ -1106,6 +1438,7 @@ mod tests {
 
         let cleared = dispatch(
             &daemon,
+            &conn,
             Id::Number(2),
             SessionClearParams::METHOD,
             serde_json::json!({"session_id": "sess-0"}),
@@ -1122,6 +1455,7 @@ mod tests {
 
         let ghost = dispatch(
             &daemon,
+            &conn,
             Id::Number(3),
             SessionClearParams::METHOD,
             serde_json::json!({"session_id": "sess-ghost"}),
@@ -1141,6 +1475,7 @@ mod tests {
         let daemon = Daemon::new();
         let response = dispatch(
             &daemon,
+            &unattached(),
             Id::Number(1),
             WebRefreshParams::METHOD,
             serde_json::json!({"url": "https://docs.rs/serde"}),
@@ -1167,6 +1502,7 @@ mod tests {
         let daemon = Daemon::new();
         let response = dispatch(
             &daemon,
+            &unattached(),
             Id::Number(1),
             WebRefreshParams::METHOD,
             serde_json::json!({"not_a_url": 3}),
@@ -1183,7 +1519,8 @@ mod tests {
     fn both_web_controls_are_client_methods() {
         let daemon = Daemon::new();
         for method in [WebOverrideParams::METHOD, WebRefreshParams::METHOD] {
-            let response = dispatch(&daemon, Id::Number(1), method, Value::Null).unwrap();
+            let response =
+                dispatch(&daemon, &unattached(), Id::Number(1), method, Value::Null).unwrap();
             assert!(
                 !response.contains("-32601"),
                 "`{method}` must be a routed client method: {response}"

@@ -1,7 +1,7 @@
 ---
 id: TASK-098
 title: "Daemon: per-connection ConnState and session filter in forward_events"
-status: draft
+status: complete
 parent: REQ-568
 created: 2026-08-11
 updated: 2026-08-11
@@ -23,10 +23,10 @@ test that currently encodes the leak as a feature.
 
 ## Acceptance Criteria
 
-- [ ] `should_forward` unit test: daemon-scoped → everyone; session-scoped → attached ✓, monitor ✓, neither ✗ (6 cells, table-driven).
-- [ ] Rewritten multi_client test: unattached B receives none of A's session envelopes while still listing the session; after attach (or with monitor), B receives them; daemon survives A's exit.
-- [ ] Monitor handshake produces a daemon log line (assert via the test harness's log capture if available; otherwise assert the declaration is observable — BR-5).
-- [ ] `cargo test -p tetond --test multi_client` and tetond unit tests pass.
+- [x] `should_forward` unit test: daemon-scoped → everyone; session-scoped → attached ✓, monitor ✓, neither ✗ (6 cells, table-driven — 7 rows, the "neither" cell run twice so an empty attached set is asserted refused rather than assumed).
+- [x] Rewritten multi_client test: unattached B receives none of A's session envelopes while still listing the session; after attach (or with monitor), B receives them; daemon survives A's exit.
+- [x] Monitor handshake produces a daemon log line (`monitor_declaration_line`, unit-tested: it names the client and cannot be split by a client-supplied newline — BR-5).
+- [x] `cargo test -p tetond --test multi_client` and tetond unit tests pass.
 
 ## Technical Notes
 
@@ -34,3 +34,13 @@ test that currently encodes the leak as a feature.
 - The forwarder reads `attached` under a `std::sync::RwLock` (short critical section, no await inside the guard) or `tokio::sync::RwLock` — match the file's existing locking idiom; never hold the guard across `out_tx.send(...).await`.
 - Filtered clients observe seq gaps (ADR-A consequence) — do not "fix" seq; TASK-102 pins gap tolerance.
 - LESSON-443 guard-shape rule: the filter predicate names the real condition (attached/monitor), never a proxy like "set is empty means legacy client".
+
+## Plumbed for TASK-099 (no gating implemented here)
+
+`dispatch` now carries `conn: &ConnState` (second parameter) so
+`handle_session_create` / `handle_session_attach` can grow the attachment set;
+the direct-dispatch unit tests pass an `unattached()` fixture. `session/prompt`
+still bypasses `dispatch` through `spawn_prompt_turn`, which was **not** given
+the parameter — TASK-099 adds it along with the `NOT_ATTACHED` refusal on
+prompt/clear. `ConnState::may_receive` is the read side TASK-099's gate can
+reuse (or read `attached` directly).
