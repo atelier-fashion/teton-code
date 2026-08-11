@@ -527,6 +527,25 @@ pub struct CostRecord {
     /// shape reads the same bytes it always did.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cached_tokens: Option<u64>,
+    /// Of [`Self::output_tokens`], how many the provider attributed to reasoning
+    /// (REQ-559 BR-10), or `None` where it reported none — every Anthropic call,
+    /// every local call, and every row a pre-REQ build wrote.
+    ///
+    /// A **subset of** `output_tokens`, never added to it. Today's totals are
+    /// already correct because both providers' aggregate counts include
+    /// reasoning tokens; this column says how much of that total was thinking,
+    /// and nothing sums the two.
+    ///
+    /// `None` is **unreported**, never `0` — `teton cost` renders the word
+    /// rather than a number, because a `0` standing in for "the provider didn't
+    /// tell us" is displaying an estimate as an actual (BR-11, REQ-544 BR-2).
+    ///
+    /// Same shape as [`Self::cached_tokens`] and for the same reason: omitted
+    /// from the wire when absent, so a client built against the older shape
+    /// reads the same bytes it always did and neither
+    /// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`] moves.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Event payload wrapping a [`CostRecord`] (spec Events: `cost_recorded`).
@@ -1845,6 +1864,7 @@ mod tests {
                         output_tokens: 2,
                         usd_micros: 1234,
                         cached_tokens: None,
+                        reasoning_tokens: None,
                     },
                 }),
                 "cost_recorded",
@@ -2301,6 +2321,7 @@ mod tests {
                 output_tokens: 500,
                 usd_micros: 45_000,
                 cached_tokens: None,
+                reasoning_tokens: None,
             },
         });
     }

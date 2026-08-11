@@ -351,6 +351,11 @@ impl State {
             usage: TokenUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                // REQ-559 BR-10: Anthropic reports no reasoning-token count, so
+                // this stays `None` — unreported, which is the truth about it.
+                // Deliberate, not an oversight: `anthropic_reports_no_reasoning_split`
+                // pins it so a future reader does not read the absence as a gap.
+                reasoning_tokens: None,
             },
             stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
         })

@@ -375,6 +375,9 @@ impl CompletionSource for LocalEngineSource {
             usage: TokenUsage {
                 input_tokens: u64::from(completion.prompt_tokens),
                 output_tokens: u64::from(completion.completion_tokens),
+                // The local engine reports no reasoning split — thinking there
+                // is a chat-template property, not a counted category (BR-6).
+                reasoning_tokens: None,
             },
             dropped_calls: parsed.dropped_calls,
             cache: Some(cache),
@@ -767,6 +770,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 11,
                         output_tokens: 4,
+                        reasoning_tokens: None,
                     },
                     stop_reason: StopReason::ToolUse,
                 })),
@@ -844,7 +848,8 @@ mod tests {
             turn.usage,
             TokenUsage {
                 input_tokens: 11,
-                output_tokens: 4
+                output_tokens: 4,
+                reasoning_tokens: None,
             }
         );
     }

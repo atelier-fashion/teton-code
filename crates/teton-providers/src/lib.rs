@@ -103,6 +103,20 @@ pub struct TokenUsage {
     pub input_tokens: u64,
     /// Completion / output tokens.
     pub output_tokens: u64,
+    /// Of [`Self::output_tokens`], how many the provider attributes to
+    /// reasoning (REQ-559 BR-10).
+    ///
+    /// A **component of** `output_tokens`, never an addition to it: both
+    /// providers' aggregate counts already include reasoning tokens, so this is
+    /// an attribution change and not a totals change. Summing the two would
+    /// double-count and inflate every reported figure — for a product whose
+    /// headline promise is cost control, worse than not reporting the split.
+    ///
+    /// `None` means **unreported**, never `0`. A provider that does not tell us
+    /// is a different fact from one that reports zero reasoning, and collapsing
+    /// them would put an estimate where an actual belongs (REQ-544 BR-2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Normalized stop reason across providers.

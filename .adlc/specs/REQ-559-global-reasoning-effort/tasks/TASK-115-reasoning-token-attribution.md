@@ -1,7 +1,7 @@
 ---
 id: TASK-115
 title: "Parse completion_tokens_details.reasoning_tokens through TokenUsage, CostRecord, and the ledger"
-status: pending
+status: complete
 parent: REQ-559
 created: 2026-08-11
 updated: 2026-08-11

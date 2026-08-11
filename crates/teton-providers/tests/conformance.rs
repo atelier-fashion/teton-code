@@ -625,3 +625,68 @@ fn empty_body_still_finalizes_with_usage_zeroed() {
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0], TurnEvent::Completed(_)));
 }
+
+/// REQ-559 BR-10: the Anthropic API reports no reasoning-token count, so its
+/// `TokenUsage.reasoning_tokens` is `None` — unreported, which is the truth
+/// about it. Pinned so a future reader does not read the absence as a gap in
+/// this REQ's parsing and "fix" it by writing a zero.
+#[test]
+fn anthropic_reports_no_reasoning_split() {
+    let fixture = concat!(
+        "event: message_start\n",
+        "data: {\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"usage\":{\"output_tokens\":7}}\n\n",
+        "event: message_stop\ndata: {}\n\n",
+    );
+    let transport = MockTransport::ok(chunkify(fixture, 7));
+    let adapter = AnthropicAdapter::new("a", "https://api.anthropic.test");
+    let events = run(&adapter, &transport).expect("stream");
+    let TurnEvent::Completed(done) = events.last().expect("a terminal event") else {
+        panic!("the last event must be Completed");
+    };
+    assert_eq!(done.usage.output_tokens, 7);
+    assert_eq!(
+        done.usage.reasoning_tokens, None,
+        "Anthropic reports no split; None is unreported, not zero",
+    );
+}
+
+/// AC-9 at the adapter seam: an OpenAI-compatible usage chunk carrying
+/// `completion_tokens_details.reasoning_tokens` yields that value, and
+/// `output_tokens` is the same number the parser produced before this field
+/// existed — the subset relationship, proven rather than asserted in prose.
+#[test]
+fn openai_parses_the_reasoning_split_without_moving_the_total() {
+    fn usage_of(fixture: &str) -> teton_providers::TokenUsage {
+        let transport = MockTransport::ok(chunkify(fixture, 9));
+        let adapter =
+            OpenAiCompatAdapter::new(OpenAiCompatConfig::new("o", "https://api.openai.test"));
+        let events = run(&adapter, &transport).expect("stream");
+        match events.last().expect("a terminal event") {
+            TurnEvent::Completed(done) => done.usage,
+            other => panic!("the last event must be Completed, got {other:?}"),
+        }
+    }
+
+    let with_split = usage_of(concat!(
+        "data: {\"choices\":[]}\n\n",
+        "data: {\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":42,",
+        "\"completion_tokens_details\":{\"reasoning_tokens\":30}}}\n\n",
+        "data: [DONE]\n\n",
+    ));
+    let without = usage_of(concat!(
+        "data: {\"choices\":[]}\n\n",
+        "data: {\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":42}}\n\n",
+        "data: [DONE]\n\n",
+    ));
+
+    assert_eq!(with_split.reasoning_tokens, Some(30));
+    assert_eq!(without.reasoning_tokens, None, "unreported, never 0");
+    assert_eq!(
+        with_split.output_tokens, without.output_tokens,
+        "BR-10: parsing the split must not move the total",
+    );
+    assert_eq!(with_split.output_tokens, 42);
+    assert!(with_split.reasoning_tokens.unwrap() <= with_split.output_tokens);
+}

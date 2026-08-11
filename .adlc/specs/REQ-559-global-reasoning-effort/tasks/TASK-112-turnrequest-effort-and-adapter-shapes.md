@@ -1,7 +1,7 @@
 ---
 id: TASK-112
 title: "TurnRequest carries a required ResolvedEffort; both adapters emit exactly one shape"
-status: pending
+status: complete
 parent: REQ-559
 created: 2026-08-11
 updated: 2026-08-11

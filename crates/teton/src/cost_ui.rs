@@ -204,6 +204,7 @@ mod tests {
             output_tokens: 50,
             usd_micros,
             cached_tokens: None,
+            reasoning_tokens: None,
         }
     }
 

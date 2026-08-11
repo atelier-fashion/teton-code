@@ -1510,6 +1510,7 @@ mod tests {
                     output_tokens: 500,
                     usd_micros: 45_000,
                     cached_tokens: None,
+                    reasoning_tokens: None,
                 },
             })),
             &mut surface,

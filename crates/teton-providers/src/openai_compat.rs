@@ -239,6 +239,9 @@ fn event_stream(body: ByteStream) -> TurnStream {
 struct State {
     input_tokens: u64,
     output_tokens: u64,
+    /// REQ-559 BR-10: the reasoning subset of `output_tokens`, when the endpoint
+    /// reports it. `None` until a usage chunk carries the field.
+    reasoning_tokens: Option<u64>,
     stop_reason: Option<StopReason>,
     tools: Vec<PartialTool>,
     flushed: bool,
@@ -270,6 +273,15 @@ impl State {
             }
             if let Some(o) = usage.get("completion_tokens").and_then(Value::as_u64) {
                 self.output_tokens = o;
+            }
+            // REQ-559 BR-10. Absent, null, or non-integer all stay `None` —
+            // "the provider didn't tell us" is not zero, and `and_then` keeps
+            // them distinct without a branch that could collapse them.
+            if let Some(r) = usage
+                .pointer("/completion_tokens_details/reasoning_tokens")
+                .and_then(Value::as_u64)
+            {
+                self.reasoning_tokens = Some(r);
             }
         }
 
@@ -346,6 +358,7 @@ impl State {
             usage: TokenUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                reasoning_tokens: self.reasoning_tokens,
             },
             stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
         })

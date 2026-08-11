@@ -364,6 +364,7 @@ mod tests {
             output_tokens: output,
             usd_micros,
             cached_tokens: None,
+            reasoning_tokens: None,
         }
     }
 
