@@ -1,0 +1,37 @@
+{
+  "req": "REQ-560",
+  "branch": "feat/REQ-560-permission-levels-and-status-line",
+  "startedAt": "2026-08-11T00:00:00Z",
+  "completed": false,
+  "currentPhase": 1,
+  "completedPhases": [0],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    { "phase": 0, "name": "Create Worktree + Preflight", "completedAt": "2026-08-11T00:00:00Z" }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-560",
+      "branch": "feat/REQ-560-permission-levels-and-status-line",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "blockers": [],
+  "notes": [
+    "Subagent mode (/sprint pipeline-runner). Orchestrator merge override: STOP after Phase 7, report pr-ready. Do NOT self-merge — overlapping footprint with REQ-559 (COMMANDS table, CLI status/session surface)."
+  ]
+}
