@@ -54,9 +54,10 @@ use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     ConfigGetParams, ConfigSetParams, ConfigUpdate, ModelStatusParams, PromptBlock,
-    PromptTurnParams, SessionClearParams, WebOverrideParams, WebOverrideResult, WebRefreshOutcome,
-    WebRefreshParams, WebRefreshResult,
+    PromptTurnParams, SessionClearParams, SessionPermissionsParams, SessionPermissionsResult,
+    WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
 };
+use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::SessionId;
 
 use crate::client::{Connection, UiContext};
@@ -144,6 +145,16 @@ enum Args {
     /// work, and modelling it as `None` would reject the set form. The handler
     /// validates the argument when one is present, because only it knows the
     /// vocabulary.
+    ///
+    /// REQ-560's `/permissions` is the second row to need it, for the same
+    /// reason on both sides: its bare form is the read BR-10 requires to work on
+    /// a pipe, and its argument form is the only way to change the level. Two
+    /// commands, one variant — a second spelling of "optional" would be two
+    /// rules that can drift.
+    ///
+    /// Unlike the two variants above, this is never a rejection at [`resolve`]
+    /// time: the handler is entered either way and decides what an empty
+    /// argument means.
     Optional,
 }
 
@@ -249,6 +260,25 @@ const COMMANDS: &[CommandSpec] = &[
         summary: "Toggle the routing and turn-end notices for this session.",
         args: Args::None,
         handler: handle_verbose,
+    },
+    // REQ-560's permission level. Placed beside `/clear` and `/verbose` because
+    // all three are about *this session* rather than about the machine's
+    // configuration — the level resets every session (BR-6), so it belongs with
+    // the session-scoped commands and not with `/model set`, which writes.
+    //
+    // Listed here — and therefore in `/help` — because a command a user cannot
+    // discover is a command they do not have (BUG-153), and this one is how they
+    // find out what the session is allowed to do at all.
+    //
+    // `/effort` is deliberately **not** here: REQ-559 BR-9 owns that row. This
+    // REQ renders the effort value in the status line and adds no second way to
+    // type it (BR-14).
+    CommandSpec {
+        name: "permissions",
+        aliases: &[],
+        summary: "Show or set this session's permission level: /permissions [level].",
+        args: Args::Optional,
+        handler: handle_permissions,
     },
     // REQ-563's two user-only web actions. Both are client commands rather than
     // harness tools, and that placement is the enforcement: tool dispatch and
@@ -462,6 +492,8 @@ fn resolve<'a>(name: &str, args: &'a str) -> Resolution<'a> {
             "`{}` needs {usage} — {HELP_HINT}",
             typed_token(spec.name)
         )),
+        // `Args::Optional` never rejects here — both forms are real commands and
+        // the handler tells them apart.
         _ => Resolution::Run(spec, args),
     }
 }
@@ -501,18 +533,30 @@ fn typed_token(name: &str) -> String {
     if !name.starts_with('/') {
         token.push('/');
     }
-    let mut chars = name.chars();
+    token.push_str(&echoed(name));
+    token
+}
+
+/// Bound and sanitise arbitrary user bytes for quoting back in one line.
+///
+/// The shared half of [`typed_token`], split out so a rejection that quotes an
+/// *argument* rather than a command name — `/permissions bogus` — passes through
+/// the same guards instead of growing a second, subtly different copy of them.
+/// One place to check, on the way in.
+fn echoed(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
     for ch in chars.by_ref().take(ECHO_MAX_CHARS) {
-        token.push(if ch.is_control() {
+        out.push(if ch.is_control() {
             ECHO_REPLACEMENT
         } else {
             ch
         });
     }
     if chars.next().is_some() {
-        token.push('…');
+        out.push('…');
     }
-    token
+    out
 }
 
 /// Render a command line that never reaches a handler: exactly one line, and
@@ -763,6 +807,139 @@ fn handle_web_allow(
     }
     Ok(CommandOutcome::Continue)
 }
+
+/// What `/permissions` says when there is no session to read a level from.
+///
+/// Reachable only from a context that owns no session, the same guard
+/// [`WEB_NEEDS_A_SESSION`] is — it keeps the id from being fabricated rather
+/// than being a line users meet.
+const PERMISSIONS_NEEDS_A_SESSION: &str =
+    "`/permissions` needs a session to act on, and this command owns none.";
+
+/// The `/permissions [level]` handler (REQ-560 BR-10 / BR-14).
+///
+/// Bare, it **reads**: the level is otherwise visible only in the entry frame's
+/// status row, which BR-9 hides whenever stdin is not a terminal. A setting
+/// whose only surface is a TTY row is unreadable to exactly the users who
+/// script, so this form works on a pipe and is the non-visual read path the
+/// status row is allowed to exist without.
+///
+/// With an argument, it **sets** — for this session only. Nothing is written to
+/// config (BR-6); the daemon's gate is the one thing that changes, and the next
+/// session starts from `[permissions] default_level` again.
+///
+/// An unrecognised level renders the four valid spellings and their summaries
+/// and issues **no RPC**. Guessing at a near-miss is the one thing this must not
+/// do: the argument decides whether shell commands run without asking, and a
+/// lenient match would mean the spelling the user did not intend is the one
+/// nobody tests.
+///
+/// Unlike `/model set`, this is not typed-input-only. That restriction exists
+/// because `/model set` changes *machine* state; a permission level evaporates
+/// with the session, and BR-10 requires the read to work on a pipe.
+fn handle_permissions(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let Some(session_id) = ctx.session_id.clone() else {
+        ctx.surface
+            .line(LineKind::Error, PERMISSIONS_NEEDS_A_SESSION);
+        return Ok(CommandOutcome::Continue);
+    };
+
+    let level = if args.is_empty() {
+        None
+    } else {
+        match PermissionLevel::parse(args) {
+            Some(level) => Some(level),
+            None => {
+                // Rendered before any RPC: an unknown level is a typo, and the
+                // session's posture must not be touched to find that out.
+                ctx.surface
+                    .line(LineKind::Error, &unknown_level_line(args));
+                for level in PermissionLevel::ALL {
+                    ctx.surface
+                        .line(LineKind::Info, &render_level_option(*level));
+                }
+                return Ok(CommandOutcome::Continue);
+            }
+        }
+    };
+
+    let answered = conn.call(SessionPermissionsParams { session_id, level }, ctx)?;
+    if let Some(result) = permissions_or_report(answered, ctx.surface) {
+        ctx.surface
+            .line(LineKind::Notice, &render_permissions(&result));
+    }
+    Ok(CommandOutcome::Continue)
+}
+
+/// The rejection an unrecognised level gets back, quoting what was typed through
+/// the same bounded, sanitised echo an unknown command name goes through.
+fn unknown_level_line(typed: &str) -> String {
+    format!(
+        "unknown permission level: `{}` — this session was not changed.",
+        echoed(typed)
+    )
+}
+
+/// One level's line in the list an unrecognised argument prints.
+fn render_level_option(level: PermissionLevel) -> String {
+    format!("  {:<8} {}", level.name(), level.summary())
+}
+
+/// The line `/permissions` renders from the daemon's answer.
+///
+/// Three cases, and they are distinguishable on purpose: a read states the
+/// level, a real change announces it, and a set that changed nothing says so
+/// rather than confirming a change that did not happen — the same honesty
+/// `was_restricted` gives `/web allow`.
+fn render_permissions(result: &SessionPermissionsResult) -> String {
+    if result.changed {
+        format!(
+            "permission level: {} — {}",
+            result.level.name(),
+            result.level.summary()
+        )
+    } else {
+        format!(
+            "permission level: {} (unchanged) — {}",
+            result.level.name(),
+            result.level.summary()
+        )
+    }
+}
+
+/// Unwrap the daemon's answer, or render why there is none.
+///
+/// The daemon-too-old arm is separate from the error arm for the reason
+/// [`web_override_or_report`]'s is: a method a daemon does not serve is a
+/// version fact the user can act on, not a failure of the command.
+fn permissions_or_report(
+    answered: Result<SessionPermissionsResult, RpcError>,
+    surface: &mut dyn Surface,
+) -> Option<SessionPermissionsResult> {
+    match answered {
+        Ok(result) => Some(result),
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
+            surface.line(LineKind::Notice, PERMISSIONS_UNAVAILABLE);
+            None
+        }
+        Err(err) => {
+            surface.line(
+                LineKind::Error,
+                &format!("the permission level is unavailable: {}", err.message),
+            );
+            None
+        }
+    }
+}
+
+/// What `/permissions` says to a daemon that predates the method.
+const PERMISSIONS_UNAVAILABLE: &str =
+    "this daemon does not serve permission levels — restart it after upgrading to use \
+     /permissions.";
 
 /// The `/web refresh <url>` handler: drop a cached document (BR-12 / AC-10).
 ///
@@ -1156,6 +1333,10 @@ mod tests {
             optional.contains(&"effort"),
             "REQ-559 owns the /effort row and its bare read path (BR-9)",
         );
+        assert!(
+            optional.contains(&"permissions"),
+            "REQ-560 owns the /permissions row and its bare read path (BR-10)",
+        );
         for name in optional {
             for line in [format!("/{name}"), format!("/{name} high")] {
                 let Input::Command { name: n, args } = classify(&line) else {
@@ -1311,6 +1492,11 @@ mod tests {
             // and both specs previously claimed the command, which is why the
             // ownership is stated rather than assumed.
             "effort",
+            // REQ-560 BR-14: the session's permission level, and the other half
+            // of the pair above — one REQ owns each row, and the status line
+            // renders both values without either REQ growing a second way to
+            // type the other's command.
+            "permissions",
         ];
         for expected in promised {
             assert!(
@@ -1851,6 +2037,136 @@ mod tests {
         assert!(empty.contains("lifted"), "{empty}");
         assert!(empty.contains("nothing resumed"), "{empty}");
         assert!(!empty.contains("nothing was restricted"), "{empty}");
+    }
+
+    // ---- REQ-560: /permissions ---------------------------------------------
+
+    /// REQ-560 BR-10: bare `/permissions` reads, and the read states the level
+    /// plainly — this is the surface that works on a pipe, where BR-9 hides the
+    /// status row entirely.
+    #[test]
+    fn permissions_states_the_level_and_distinguishes_a_change_from_a_read() {
+        let changed = render_permissions(&SessionPermissionsResult {
+            level: PermissionLevel::Full,
+            changed: true,
+        });
+        assert!(changed.contains("full"), "{changed}");
+        assert!(changed.contains(PermissionLevel::Full.summary()), "{changed}");
+        assert!(!changed.contains("unchanged"), "{changed}");
+
+        // A read, and a set that changed nothing, must not confirm a change
+        // that did not happen — the honesty `was_restricted` gives `/web allow`.
+        let unchanged = render_permissions(&SessionPermissionsResult {
+            level: PermissionLevel::Guarded,
+            changed: false,
+        });
+        assert!(unchanged.contains("guarded"), "{unchanged}");
+        assert!(unchanged.contains("unchanged"), "{unchanged}");
+    }
+
+    /// Every level is renderable, driven off `ALL` so a fifth one is covered the
+    /// moment it exists (REQ-560 AC-17).
+    #[test]
+    fn every_level_renders_a_line_naming_itself() {
+        for level in PermissionLevel::ALL {
+            let line = render_permissions(&SessionPermissionsResult {
+                level: *level,
+                changed: true,
+            });
+            assert!(line.contains(level.name()), "{line}");
+            assert!(line.contains(level.summary()), "{line}");
+
+            let option = render_level_option(*level);
+            assert!(option.contains(level.name()), "{option}");
+            assert!(option.contains(level.summary()), "{option}");
+        }
+    }
+
+    /// An unrecognised level is a typo, and a typo must not change the session's
+    /// posture on the way to being reported.
+    ///
+    /// The echo goes through the same bounding and control-character stripping an
+    /// unknown *command* name does, because the argument is equally arbitrary
+    /// bytes reaching a `Surface`.
+    #[test]
+    fn an_unknown_level_is_quoted_safely_and_never_guessed_at() {
+        let line = unknown_level_line("gaurded");
+        assert!(line.contains("gaurded"), "{line}");
+        assert!(
+            line.contains("not changed"),
+            "the user must be told the session is untouched: {line}"
+        );
+        // No nearest-match guess: `gaurded` names nothing, and the argument
+        // decides whether shell commands run without asking.
+        assert!(!line.contains("guarded — reads"), "{line}");
+
+        // Control characters cannot reach the surface, and a long paste is
+        // quoted rather than replayed.
+        let nasty = unknown_level_line("full\u{1b}[31m\u{7}");
+        assert!(!nasty.contains('\u{1b}'), "{nasty}");
+        assert!(!nasty.contains('\u{7}'), "{nasty}");
+        let long = unknown_level_line(&"x".repeat(ECHO_MAX_CHARS * 3));
+        assert!(long.contains('…'), "a long argument must be elided: {long}");
+    }
+
+    /// REQ-560: `/permissions` is reachable in **both** forms, and neither is
+    /// rejected at resolve time — the bare form is BR-10's read path, so
+    /// answering it with "needs an argument" would refuse the requirement.
+    #[test]
+    fn both_forms_of_permissions_dispatch() {
+        for (typed, expected_args) in [
+            ("/permissions", ""),
+            ("/permissions edits", "edits"),
+            // An unknown level still dispatches: the handler rejects it, after
+            // deciding not to send anything.
+            ("/permissions bogus", "bogus"),
+        ] {
+            let Input::Command { name, args } = classify(typed) else {
+                panic!("`{typed}` did not classify as a command");
+            };
+            assert_eq!(name, "permissions");
+            let Resolution::Run(spec, run_args) = resolve(name, args) else {
+                panic!("`{typed}` must dispatch, not be rejected at resolve time");
+            };
+            assert_eq!(spec.name, "permissions");
+            assert_eq!(run_args, expected_args);
+        }
+    }
+
+    /// REQ-560 BR-14, the fence: this REQ owns `/permissions` and must not add,
+    /// alias, or duplicate `/effort`, which is REQ-559 BR-9's row.
+    ///
+    /// Asserted rather than assumed because the two REQs were built
+    /// concurrently, and a duplicated row is exactly the BUG-153 shape the one
+    /// -table rule exists to prevent.
+    #[test]
+    fn this_req_adds_no_effort_command() {
+        for spec in COMMANDS {
+            for spelling in spec.spellings() {
+                assert_ne!(
+                    spelling, "effort",
+                    "/effort belongs to REQ-559 and must not be added here"
+                );
+            }
+        }
+    }
+
+    /// A daemon too old to serve `session/permissions` is a **notice**, not an
+    /// `error:` line — a version fact is not a failure (BUG-152), the same
+    /// treatment the web methods get.
+    #[test]
+    fn a_daemon_without_session_permissions_is_a_notice_not_an_error() {
+        let mut surface = RecordingSurface::new();
+        assert!(permissions_or_report(
+            Err(RpcError::new(error_code::METHOD_NOT_FOUND, "no such method")),
+            &mut surface
+        )
+        .is_none());
+        assert!(surface.lines_of(LineKind::Error).is_empty());
+        assert!(surface
+            .lines_of(LineKind::Notice)
+            .join("\n")
+            .contains("does not serve permission levels"));
     }
 
     /// `/web allow` never fabricates a session id: with no session there is no

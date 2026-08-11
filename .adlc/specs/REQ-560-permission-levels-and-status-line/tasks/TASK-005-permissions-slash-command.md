@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 title: "/permissions as a row in the existing COMMANDS table"
-status: pending
+status: complete
 parent: REQ-560
 created: 2026-08-11
 updated: 2026-08-11
