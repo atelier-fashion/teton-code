@@ -1,7 +1,7 @@
 ---
 id: TASK-110
 title: "Canonical effort ladder, bitset EffortLadder, and the pure down-then-up clamp"
-status: pending
+status: complete
 parent: REQ-559
 created: 2026-08-11
 updated: 2026-08-11

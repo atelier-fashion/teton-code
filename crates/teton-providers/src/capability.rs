@@ -7,7 +7,7 @@
 //! the full agent loop (BR-6). The [`ToolCallTier`] enum itself is owned by
 //! `teton-core`; this crate reuses it rather than duplicating the vocabulary.
 
-use teton_core::{ProviderCapabilities, ToolCallTier};
+use teton_core::{EffortLadder, ProviderCapabilities, ReasoningShape, ToolCallTier};
 
 /// Full-loop iteration budget for a reliable (`Native`) tool-caller.
 const NATIVE_MAX_ITERATIONS: u32 = 25;
@@ -29,6 +29,18 @@ pub struct CapabilityProfile {
     pub parallel_calls: bool,
     /// Maximum context window in tokens (`0` means unknown / unset).
     pub max_context: u32,
+    /// Which reasoning field(s) this provider accepts (REQ-559 BR-4). `None`
+    /// means not declared; the per-kind default applies at resolution time.
+    ///
+    /// The adapter reads the *resolved* `ResolvedEffort` off the request rather
+    /// than consulting this field — it is carried here only so the projection
+    /// back to [`ProviderCapabilities`] stays lossless.
+    pub reasoning_shape: Option<ReasoningShape>,
+    /// The canonical levels this provider accepts (REQ-559 BR-5). `None` means
+    /// not declared.
+    ///
+    /// A bitset, so this struct keeps its `Copy` derive (REQ-559 ADR-C).
+    pub effort_ladder: Option<EffortLadder>,
 }
 
 impl CapabilityProfile {
@@ -39,6 +51,8 @@ impl CapabilityProfile {
             tool_call_tier: caps.tool_call_tier,
             parallel_calls: caps.parallel_calls,
             max_context: caps.max_context,
+            reasoning_shape: caps.reasoning_shape,
+            effort_ladder: caps.effort_ladder,
         }
     }
 
@@ -49,6 +63,8 @@ impl CapabilityProfile {
             tool_call_tier: self.tool_call_tier,
             parallel_calls: self.parallel_calls,
             max_context: self.max_context,
+            reasoning_shape: self.reasoning_shape,
+            effort_ladder: self.effort_ladder,
         }
     }
 
@@ -98,12 +114,29 @@ mod tests {
 
     #[test]
     fn core_roundtrip_is_lossless() {
+        // REQ-559: the effort declaration must survive the round trip too. A
+        // lossy projection here would silently drop a user's declared ladder
+        // between the config and the adapter, and the clamp would then quietly
+        // fall back to the per-kind default — a downgrade with nothing observing
+        // it (LESSON-456).
         let caps = ProviderCapabilities {
             tool_call_tier: ToolCallTier::Degraded,
             parallel_calls: true,
             max_context: 128_000,
+            reasoning_shape: Some(ReasoningShape::ThinkingFlagOnly),
+            effort_ladder: Some(EffortLadder::from_levels(&[
+                teton_core::EffortLevel::Low,
+                teton_core::EffortLevel::Xhigh,
+            ])),
         };
         assert_eq!(CapabilityProfile::from_core(caps).to_core(), caps);
+
+        // And the undeclared case round-trips as undeclared — `None` must not
+        // become a materialized default anywhere in the projection.
+        let bare = ProviderCapabilities::default();
+        let back = CapabilityProfile::from_core(bare).to_core();
+        assert_eq!(back, bare);
+        assert!(back.reasoning_shape.is_none() && back.effort_ladder.is_none());
     }
 
     #[test]
@@ -112,6 +145,7 @@ mod tests {
             tool_call_tier: ToolCallTier::Native,
             parallel_calls: true,
             max_context: 200_000,
+            ..CapabilityProfile::default()
         };
         let h = p.harness_profile();
         assert_eq!(h.max_tools, None);
@@ -126,6 +160,7 @@ mod tests {
             tool_call_tier: ToolCallTier::Degraded,
             parallel_calls: true, // ignored under degradation
             max_context: 32_000,
+            ..CapabilityProfile::default()
         };
         let h = p.harness_profile();
         assert_eq!(h.max_tools, Some(DEGRADED_MAX_TOOLS));
@@ -143,6 +178,7 @@ mod tests {
             tool_call_tier: ToolCallTier::None,
             parallel_calls: false,
             max_context: 8_000,
+            ..CapabilityProfile::default()
         };
         let h = p.harness_profile();
         assert_eq!(h.max_tools, Some(0));

@@ -50,6 +50,10 @@ impl OpenAiCompatConfig {
                 tool_call_tier: ToolCallTier::Degraded,
                 parallel_calls: false,
                 max_context: 0,
+                // REQ-559: undeclared, so `resolve_effort` applies the
+                // per-kind default (ADR-E) rather than a value duplicated here.
+                // Two sources for one default is the LESSON-456 drift.
+                ..CapabilityProfile::default()
             },
         }
     }

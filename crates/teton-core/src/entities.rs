@@ -66,6 +66,27 @@ pub struct ProviderCapabilities {
     /// Maximum context window in tokens (`0` means "unknown / unset").
     #[serde(default)]
     pub max_context: u32,
+    /// Which reasoning field(s) this provider's request body accepts (REQ-559
+    /// BR-4). `None` means **not declared**, and
+    /// [`crate::effort::default_shape_for`] supplies the per-kind default —
+    /// which for every remote kind is `effort_only`, not `none` (ADR-E/OQ-2).
+    ///
+    /// Declared per provider and **never sniffed from a response**: a capability
+    /// conclusion drawn from one HTTP status outlives the condition that
+    /// produced it. The runtime degradation for a provider that refuses the
+    /// field is session-scoped and deliberately leaves this field alone
+    /// (`EffortOmission::RefusedThisSession`, ADR-F).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_shape: Option<crate::effort::ReasoningShape>,
+    /// The canonical effort levels this provider actually accepts (REQ-559
+    /// BR-5). `None` means **not declared**, and
+    /// [`crate::effort::default_ladder_for`] supplies the per-kind default.
+    ///
+    /// A **bitset**, not a `Vec`, so this struct stays [`Copy`] — see REQ-559
+    /// ADR-C. A `Vec` here would ripple across ~30
+    /// `ProviderCapabilities::default()` sites in the daemon for no benefit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_ladder: Option<crate::effort::EffortLadder>,
 }
 
 /// A registered model provider (System Model: `ModelProvider`).

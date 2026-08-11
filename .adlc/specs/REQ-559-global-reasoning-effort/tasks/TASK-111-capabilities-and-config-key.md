@@ -1,7 +1,7 @@
 ---
 id: TASK-111
 title: "Declare reasoning_shape and effort_ladder on ProviderCapabilities; add the persisted Config.effort key"
-status: pending
+status: complete
 parent: REQ-559
 created: 2026-08-11
 updated: 2026-08-11

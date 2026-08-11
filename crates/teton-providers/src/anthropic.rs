@@ -48,6 +48,10 @@ impl AnthropicAdapter {
                 tool_call_tier: ToolCallTier::Native,
                 parallel_calls: true,
                 max_context: DEFAULT_MAX_CONTEXT,
+                // REQ-559: undeclared, so `resolve_effort` applies the
+                // per-kind default (ADR-E) rather than a value duplicated here.
+                // Two sources for one default is the LESSON-456 drift.
+                ..CapabilityProfile::default()
             },
         }
     }
