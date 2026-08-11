@@ -68,16 +68,29 @@ while the resolution namespace is daemon-wide.
 
 ## Resolution
 
-(filled after fix) — candidate: make the id globally unique (daemon-wide
-counter) or session-qualified (`perm-{session_id}-{n}`), and/or key the waiter
-map on `(SessionId, RequestId)`; `register` should refuse/log on an id collision
-rather than overwrite, so this class fails loudly. Fixing this is also the
-prerequisite that lets `permission/respond` be attachment-gated (REQ-569): a
-gate needs to resolve the request's owning session, which a session-qualified id
-provides. Add a regression test that runs two concurrent sessions each raising a
-permission request and asserts no cross-resolution.
+Moved the request-id counter off the per-session `PermissionGate` and onto the
+daemon-wide `PendingPermissions` — the same object that owns the waiter map — via
+a new `PendingPermissions::next_request_id()`. The id namespace and the
+resolution namespace are now the same (both daemon-wide), so a single monotonic
+counter makes every `perm-N` unique across all sessions by construction; the
+collision is impossible rather than merely unlikely. As defense in depth,
+`register` now uses the `Entry` API and **refuses to overwrite** an existing
+waiter — if a per-scope counter is ever reintroduced, the colliding registration
+is dropped (its caller resolves to the safe `Denied` default) and an error is
+logged naming BUG-161, instead of silently stealing the first prompt's answer.
+
+Deliberately NOT session-qualified ids (`perm-{session_id}-…`): that papers over
+the namespace mismatch rather than removing it, and leaks the session id into a
+string the client echoes back. REQ-569's `permission/respond` gating will resolve
+a request's owning session by storing it alongside the waiter, not by parsing the
+id.
+
+Regression test `concurrent_sessions_get_distinct_ids_and_resolve_independently`
+drives two sessions' gates (sharing one `PendingPermissions`, the production
+wiring) through concurrent prompts and asserts the ids differ and each answer
+resolves only its own session. Mutation-verified: reintroducing a per-session
+counter makes both ids `perm-0` and the test fails on exactly that assertion.
 
 ## Files Changed
 
-- `crates/tetond/src/harness/permissions.rs` — id minting + waiter keying (TBD)
-- `crates/tetond/src/runtime.rs` — gate/waiter wiring (TBD)
+- `crates/tetond/src/harness/permissions.rs` — counter moved to `PendingPermissions` with `next_request_id()`; `register` refuses-not-overwrites (Entry API); per-gate `counter` field removed; regression test added.
