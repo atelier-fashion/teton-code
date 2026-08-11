@@ -263,6 +263,158 @@ async fn a_turns_events_precede_the_turns_response_on_the_wire() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// REQ-568 ADR-A regression net: the ordering invariant is unchanged when a
+/// second client, attached to a *different* session, is connected for the whole
+/// racing run.
+///
+/// The filter added at the forwarding seam means the bystander's forwarder now
+/// *skips* almost every envelope the bus hands it. Two things could go wrong
+/// with that, and both would show up here:
+///
+/// 1. **A stall.** A skipped envelope that failed to advance the bystander's
+///    forwarded watermark, or a forwarder that stopped draining its
+///    subscription, would back the connection up. The prompting client's turns
+///    share the same bus, so a wedged peer is a wedged run — the loop would
+///    time out rather than fail an assertion.
+/// 2. **A leak under load.** The bystander drains its stream at the end and
+///    must find nothing scoped to any of the prompting client's sessions.
+///
+/// Iteration count: the existing [`TURNS`], unchanged. The bystander is passive
+/// — one connection, one session, two requests — so it adds no turns and no
+/// measurable runtime; the race being sampled is the same one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turns_ordering_holds_while_another_client_holds_a_different_session() {
+    let path = temp_socket("ord-scoped");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut client = TestClient::connect(&path).await;
+    client.handshake().await;
+
+    // The same provider fixture as the test above: a real route, an
+    // unresolvable credential, an immediate settled failure per turn.
+    let (_, registered) = client
+        .call_collecting_events(
+            1000,
+            "config/set",
+            json!({ "update": {
+                "op": "register_provider",
+                "id": "ordering",
+                "kind": "openai-compatible",
+                "endpoint": "http://127.0.0.1:1/v1/chat/completions",
+                "model": "deepseek-chat",
+                "auth_ref": "env:TETON_ORDERING_TEST_CREDENTIAL_ABSENT",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        registered["result"]["applied"].as_bool(),
+        Some(true),
+        "provider registration failed: {registered}"
+    );
+    let (_, routed) = client
+        .call_collecting_events(
+            1001,
+            "config/set",
+            json!({ "update": {
+                "op": "set_tier_binding",
+                "tier": "build",
+                "provider_id": "ordering",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        routed["result"]["applied"].as_bool(),
+        Some(true),
+        "tier binding failed: {routed}"
+    );
+
+    // The bystander: its own session, and then silence for the whole run. It
+    // reads nothing while the turns race, so a forwarder that wrongly delivered
+    // the prompting client's stream would also be filling this connection's
+    // outbound channel — the shape a stall would take.
+    let mut bystander = TestClient::connect(&path).await;
+    bystander.handshake().await;
+    let (_, bystander_session) = bystander
+        .call_collecting_events(
+            2000,
+            "session/create",
+            json!({"mode": "structured", "phase": "spec"}),
+        )
+        .await;
+    let bystander_sid = bystander_session["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/create failed: {bystander_session}"))
+        .to_owned();
+
+    for turn in 0..TURNS {
+        let id = 2 + 2 * turn as i64;
+        let (_, created) = client
+            .call_collecting_events(
+                id,
+                "session/create",
+                json!({"mode": "structured", "phase": "implement"}),
+            )
+            .await;
+        let sid = created["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session/create failed: {created}"))
+            .to_owned();
+
+        let (events, response) = client
+            .call_collecting_events(
+                id + 1,
+                "session/prompt",
+                json!({
+                    "session_id": sid,
+                    "prompt": [{ "type": "text", "text": "explain this" }],
+                }),
+            )
+            .await;
+
+        assert!(
+            response.get("error").is_some(),
+            "expected the unresolvable-credential error response, got: {response}"
+        );
+        assert!(
+            events.iter().any(|e| {
+                e.get("event").and_then(Value::as_str) == Some("route_decided")
+                    && e.get("session_id").and_then(Value::as_str) == Some(&sid)
+            }),
+            "turn {turn}: the turn's `route_decided` was not on the wire before the \
+             turn's own response while a filtered peer was connected \
+             (events seen first: {events:?})"
+        );
+    }
+
+    // The bystander is still live and still scoped: its fenced response comes
+    // back, and everything it drains on the way belongs to its own session or
+    // to no session at all.
+    let (seen, listed) = bystander
+        .call_collecting_events(2001, "session/list", json!({}))
+        .await;
+    assert!(
+        listed.get("result").is_some(),
+        "the filtered peer's fenced response never completed: {listed}"
+    );
+    let foreign: Vec<&Value> = seen
+        .iter()
+        .filter(|e| {
+            e.get("session_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s != bystander_sid)
+        })
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "the filtered peer received another session's envelopes: {foreign:?}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The synchronous-dispatch path holds the same line: a structured
 /// `session/create` publishes its `phase_transition` before its response.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

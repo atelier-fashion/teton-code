@@ -77,14 +77,14 @@ cap inbound frame length with a deterministic refusal.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Two connections, two sessions: connection B receives none of session A's envelopes (asserted at the socket, on raw NDJSON — not via CLI rendering), while both receive daemon-scoped envelopes.
-- [ ] AC-2: A handshaked connection that never created or attached a session receives only daemon-scoped envelopes.
-- [ ] AC-3: A connection declaring monitor at handshake receives all sessions' envelopes; the declaration is observable in the daemon log.
-- [ ] AC-4: `session/prompt` and `session/clear` against a session the connection never attached are refused with the BR-4 code; after `session/attach` the same calls succeed.
-- [ ] AC-5: A frame larger than `max_frame_bytes` is refused per BR-6, daemon memory for that connection's read buffer stays ≤ the cap (asserted by construction: the reader is incapable of buffering more), and a fresh connection still serves normally afterward.
-- [ ] AC-6: A response gated on the event fence completes when the filter drops events destined for other connections' sessions (no hang, no timeout).
-- [ ] AC-7: The full existing e2e suite passes unchanged for single-client attach → prompt → stream flows.
-- [ ] AC-8: The CLI renders only envelopes for its own attached session (defense in depth atop BR-3, not a substitute for it).
+- [x] AC-1: Two connections, two sessions: connection B receives none of session A's envelopes (asserted at the socket, on raw NDJSON — not via CLI rendering), while both receive daemon-scoped envelopes. — `tetond/tests/multi_client.rs::two_clients_prompting_their_own_sessions_see_only_their_own_envelopes`
+- [x] AC-2: A handshaked connection that never created or attached a session receives only daemon-scoped envelopes. — `tetond/tests/multi_client.rs::a_client_that_never_attached_receives_only_daemon_scoped_envelopes`
+- [x] AC-3: A connection declaring monitor at handshake receives all sessions' envelopes; the declaration is observable in the daemon log. — `tetond/tests/multi_client.rs::a_monitor_declared_at_handshake_receives_another_clients_events` (delivery, at the socket) + `tetond/src/server.rs::a_monitor_declaration_is_announced_and_cannot_forge_a_log_line` (the log line)
+- [x] AC-4: `session/prompt` and `session/clear` against a session the connection never attached are refused with the BR-4 code; after `session/attach` the same calls succeed. — `tetond/tests/multi_client.rs::mutating_methods_are_refused_until_the_connection_attaches`
+- [x] AC-5: A frame larger than `max_frame_bytes` is refused per BR-6, daemon memory for that connection's read buffer stays ≤ the cap (asserted by construction: the reader is incapable of buffering more), and a fresh connection still serves normally afterward. — `tetond/tests/frame_cap.rs::an_oversized_frame_is_refused_and_closed_and_the_daemon_keeps_serving` + `::a_large_but_legal_frame_round_trips`
+- [x] AC-6: A response gated on the event fence completes when the filter drops events destined for other connections' sessions (no hang, no timeout). — `tetond/tests/multi_client.rs::a_filtered_client_sees_gapped_seqs_and_its_fenced_response_still_completes` (which also pins ADR-A's seq-gap consequence: monotonic, non-contiguous, never asserted contiguous) + `tetond/tests/event_response_ordering.rs::a_turns_ordering_holds_while_another_client_holds_a_different_session`
+- [x] AC-7: The full existing e2e suite passes unchanged for single-client attach → prompt → stream flows. — full workspace run at TASK-102: `cargo build --workspace && cargo test --workspace --no-fail-fast` → 1989 passed / 0 failed / 1 ignored across 43 test targets (the ignored one is the pre-existing e2e case)
+- [x] AC-8: The CLI renders only envelopes for its own attached session (defense in depth atop BR-3, not a substitute for it). — `teton/src/client.rs::the_pump_renders_its_own_session_and_daemon_scope_only`
 
 ## External Dependencies
 
