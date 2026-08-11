@@ -3,10 +3,12 @@
   "branch": "feat/REQ-570-human-attested-attach-consent",
   "startedAt": "2026-08-11T00:00:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 4,
   "completedPhases": [
     0,
-    1
+    1,
+    2,
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -19,6 +21,16 @@
       "phase": 1,
       "name": "Validate Spec",
       "completedAt": "2026-08-11T23:07:13.546884+00:00"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-11T23:17:00.740933+00:00"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture",
+      "completedAt": "2026-08-11T23:17:34.213300+00:00"
     }
   ],
   "repos": {
