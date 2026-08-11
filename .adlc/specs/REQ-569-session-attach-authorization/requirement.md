@@ -1,7 +1,7 @@
 ---
 id: REQ-569
 title: "Session attach requires a grant: closing the same-UID ambient-attach path"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-11
 updated: 2026-08-11
@@ -93,7 +93,7 @@ are the architecture phase's decision, not this spec's.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: An e2e test spawns a process with exactly the daemon's subprocess spawn environment; its `session/attach`, monitor declaration, and `session/prompt` against another connection's session are all refused with the BR-5 codes.
+- [ ] AC-1: An e2e test drives a client connection **from a process that is a descendant of the daemon** (the shape a tool/MCP child actually has — amended at architecture 2026-08-11: the original wording said "with the daemon's spawn environment", but ADR-A keys the gate on kernel-attested ancestry, not environment, so an env-only fixture would assert nothing). Its `session/attach`, monitor declaration, and `session/prompt` against another connection's session are all refused with the BR-5 codes, and no consent prompt is offered for any of them.
 - [ ] AC-2: A second legitimate client can attach to a live session through the grant flow; after the grant, REQ-568 delivery rules apply to it as an attached client.
 - [ ] AC-3: The resume flow — create session, disconnect the only client, reconnect with a fresh client, attach — succeeds with at most one visible consent step, and the test demonstrates the same sequence performed by a non-interactive process is refused.
 - [ ] AC-4: A monitor declaration without a monitor-scope grant is refused; an attach-scope grant for one session does not enable monitor (informed by LESSON-495).
@@ -121,7 +121,7 @@ are the architecture phase's decision, not this spec's.
 - [ ] OQ-1: Which grant mechanism: peer-executable identity (kernel pid + signature check), OS-keychain-held grant material (ACL-bound to executable identity, as keychain provider keys already are per REQ-544 BR-7), user-mediated consent routed to an attached client, or a combination? Decide at architecture with a stated posture per platform.
 - [ ] OQ-2: What is the posture for unsigned/dev builds and Linux, where executable-identity attestation is weaker or absent? Fail-closed to consent-only, or accept a documented weaker perimeter?
 - [ ] OQ-3: Do grants persist across daemon restarts (and where), or is every daemon lifetime a fresh consent? Persistence trades one prompt for a stored credential whose storage becomes attack surface.
-- [ ] OQ-4: Should `session/list` redact sessions the caller holds no grant for (titles can carry boundary content), or is listing metadata acceptable while ids stop being credentials?
+- [x] OQ-4: RESOLVED 2026-08-11 — answered by BR-10 during the REQ-568 verify pass: `session/list` keeps the id namespace open (ids stop being credentials) but reduces the *payload* — `title` and `cwd` are served only to a connection attached to (or holding a grant for) that session, because a title is model-generated from the user's prompt text and `cwd` is an absolute path. Both are boundary content, not metadata. (Original question: redact unheld sessions, or accept listing metadata?)
 
 ## Out of Scope
 

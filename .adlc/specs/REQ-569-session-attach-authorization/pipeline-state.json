@@ -1,0 +1,66 @@
+{
+  "req": "REQ-569",
+  "branch": "feat/REQ-569-session-attach-authorization",
+  "startedAt": "2026-08-11T16:40:21Z",
+  "completed": false,
+  "currentPhase": 4,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Create Worktrees + Preflight",
+      "completedAt": "2026-08-11T16:40:21Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-11T16:45:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-11T17:05:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-11T17:08:00Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-569",
+      "branch": "feat/REQ-569-session-attach-authorization",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "notes": {
+    "specMergedToMainVia": "PR #90 (05ca703), amended with BR-9/BR-10 + AC-9/AC-10 in PR #91's verify pass",
+    "dependencies": "REQ-568 shipped (b092367); BUG-161 fixed (886d13e) \u2014 both prerequisites satisfied on main before this branch was cut",
+    "draftPrDeferred": "branch has no commits beyond origin/main at Step 0; PR creation deferred to Phase 2 once architecture artifacts land (LESSON-004)",
+    "openQuestionsForArchitecture": "OQ-1 (grant mechanism), OQ-2 (dev/Linux posture), OQ-3 (grant persistence) \u2014 spec delegates all three to the architecture phase",
+    "architectureDecisions": "OQ-1 resolved: ancestry (NOT signatures/keychain \u2014 no runtime signing exists, dev builds unsigned). OQ-2 dissolved: mechanism is signing-independent so dev==release. OQ-3: grants daemon-lifetime in-memory. OQ-4 resolved by BR-10. AC-1 amended: keys on ancestry, not env."
+  }
+}
