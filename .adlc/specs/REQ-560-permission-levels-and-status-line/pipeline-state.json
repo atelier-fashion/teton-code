@@ -3,11 +3,14 @@
   "branch": "feat/REQ-560-permission-levels-and-status-line",
   "startedAt": "2026-08-11T00:00:00Z",
   "completed": false,
-  "currentPhase": 1,
-  "completedPhases": [0],
+  "currentPhase": 4,
+  "completedPhases": [0, 1, 2, 3],
   "integrationBranch": "main",
   "phaseHistory": [
-    { "phase": 0, "name": "Create Worktree + Preflight", "completedAt": "2026-08-11T00:00:00Z" }
+    { "phase": 0, "name": "Create Worktree + Preflight", "completedAt": "2026-08-11T00:00:00Z" },
+    { "phase": 1, "name": "Validate Spec", "completedAt": "2026-08-11T00:00:00Z", "result": "APPROVED" },
+    { "phase": 2, "name": "Architect & Tasks", "completedAt": "2026-08-11T00:00:00Z", "result": "7 ADRs, 9 tasks" },
+    { "phase": 3, "name": "Validate Architecture & Tasks", "completedAt": "2026-08-11T00:00:00Z", "result": "APPROVED — all 17 ACs covered, DAG linear/acyclic" }
   ],
   "repos": {
     "teton-code": {
@@ -16,9 +19,9 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-560",
       "branch": "feat/REQ-560-permission-levels-and-status-line",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
-      "prCreatedAt": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/102",
+      "prNumber": 102,
+      "prCreatedAt": "2026-08-11T00:00:00Z",
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
