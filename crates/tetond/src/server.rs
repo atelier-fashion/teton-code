@@ -46,6 +46,29 @@
 //! request ids (BUG-161) and is tracked in REQ-569 (BR-9); until then `monitor`
 //! buys sight of a session and the ability to answer its permission prompts,
 //! never the right to drive it with `prompt`/`clear`/`web/override`.
+//!
+//! ## Who may attach at all (REQ-569)
+//!
+//! REQ-568 left `session/attach` itself open to any handshaked same-UID
+//! connection, so attachment was a grant anyone could help themselves to.
+//! REQ-569 puts two gates in front of it, applied in this order and both
+//! *before* the session registry is consulted:
+//!
+//! 1. **Ancestry (BR-4, ADR-A).** A connection whose process descends from this
+//!    daemon's own process tree — a tool child, an MCP server subprocess, or any
+//!    future daemon-spawned process that links the client crate — may never
+//!    attach and never declare `monitor`. `ATTACH_FORBIDDEN`, no consent path,
+//!    ever. It keys on kernel-attested process ancestry ([`crate::peer`]) rather
+//!    than on what such a child happens to do today, which is what makes it
+//!    survive the arrival of a child that does something new (LESSON-443).
+//! 2. **Grant (BR-1/BR-2).** Everyone else may attach only to a session they
+//!    created or hold an attach-scope grant for ([`crate::grants`]);
+//!    `monitor` needs its own monitor-scope grant. Otherwise `NOT_GRANTED`.
+//!
+//! Both refusals precede `daemon.sessions.get`, and both answer identically for
+//! a session that exists and one that does not, so neither becomes an existence
+//! oracle for a connection that guessed an id (BR-8: ids are names, grants are
+//! credentials).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -77,9 +100,11 @@ use teton_protocol::SessionId;
 
 use teton_core::lifetime::{BlockingActivity, PolicySource, ShutdownPolicy};
 
-use crate::auth;
+use crate::auth::{self, PeerIdentity};
 use crate::broadcast::{EventBus, Subscription, DEFAULT_CAPACITY};
+use crate::grants::{ConnectionId, GrantRegistry};
 use crate::lifetime::LifetimeSupervisor;
+use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
 use crate::runtime::DaemonRuntime;
 use crate::sessions::SessionRegistry;
 
@@ -109,6 +134,65 @@ const LINE_RETAIN_CAP: usize = 64 * 1024;
 /// minutes. It is an upper bound on pathology, not a normal-path timeout.
 const TURN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Whose process tree the attach/monitor gate excludes (REQ-569 BR-4, ADR-A).
+///
+/// The gate's question is "did this connection come out of the daemon's own
+/// process tree?", and answering it needs to know which process *is* the
+/// daemon. That is a property of how this `Daemon` was assembled, not a
+/// constant, because the daemon is not always its own process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonProcess {
+    /// The daemon runs as its own process, whose pid this is. Every tool child
+    /// and MCP subprocess it spawns is a descendant of that pid, and those are
+    /// exactly the connections BR-4 excludes. **This is the production answer**,
+    /// set from `std::process::id()` by [`Daemon::with_lifetime`].
+    Own(i32),
+    /// The daemon is embedded in a host process it does not own — an in-process
+    /// harness, where the daemon task, its clients, and the test all share one
+    /// pid.
+    ///
+    /// This is not the gate switched off; it is the honest answer to the gate's
+    /// question. An embedded daemon has spawned no children of its own, so no
+    /// connection is a descendant of it, and [`Ancestry::NotDescendant`] is
+    /// true rather than merely convenient. Stating it as
+    /// [`Own`](Self::Own)`(that shared pid)` would be the dishonest option: the
+    /// client *is* the host process, so every one of them would classify as the
+    /// daemon itself and the harness would test a daemon nobody can talk to.
+    ///
+    /// The production binary cannot reach this arm — `main` builds its daemon
+    /// through [`Daemon::with_lifetime`], which sets
+    /// [`Own`](Self::Own) unconditionally, and a fixture has to say
+    /// [`Daemon::with_daemon_process`] out loud to change it. Pinned by
+    /// `the_production_constructors_own_their_process`.
+    Embedded,
+}
+
+impl DaemonProcess {
+    /// Classifies a peer against this daemon's process tree.
+    ///
+    /// The walk is done **once per connection**, at the handshake, and the
+    /// verdict is then carried on the connection: one kernel read rather than
+    /// one per call, and — the reason that matters — a value that cannot drift
+    /// mid-connection as pids are reused underneath a long-lived client.
+    fn ancestry_of(self, peer_pid: Option<i32>) -> Ancestry {
+        match self {
+            // No process tree of our own, so nothing can have come out of it.
+            Self::Embedded => Ancestry::NotDescendant,
+            // A platform that reports no peer pid (the BSD arm of
+            // `auth::peer_identity`) leaves the question unanswerable rather
+            // than answered favourably — `None` is "we cannot tell", and the
+            // caller's policy turns that into a refusal.
+            Self::Own(_) if peer_pid.is_none() => Ancestry::Indeterminate,
+            Self::Own(root) => is_descendant_of(
+                peer_pid.unwrap_or_default(),
+                root,
+                &KernelParentOf,
+                MAX_ANCESTRY_DEPTH,
+            ),
+        }
+    }
+}
+
 /// Shared daemon state: the session registry and the event bus.
 ///
 /// A single `Daemon` is wrapped in an [`Arc`] and shared by every client task,
@@ -124,6 +208,12 @@ pub struct Daemon {
     /// for admission and every prompt turn holds one of its activity guards, so
     /// it is shared state like the registry and the bus.
     pub lifetime: Arc<LifetimeSupervisor>,
+    /// Who may attach to which session (REQ-569 BR-1/BR-2, ADR-C). Shared like
+    /// the registry and the bus, and in-memory only — nothing here is ever
+    /// persisted.
+    pub grants: GrantRegistry,
+    /// The process whose descendants may never attach or monitor (BR-4, ADR-A).
+    pub process: DaemonProcess,
 }
 
 impl Daemon {
@@ -146,7 +236,28 @@ impl Daemon {
             events,
             runtime: Arc::new(DaemonRuntime::minimal()),
             lifetime,
+            grants: GrantRegistry::new(),
+            // `Embedded`, for the same reason `ShutdownPolicy::Never` is above:
+            // a bare `Daemon::new()` is a fixture, and a fixture is run *inside*
+            // the process that also holds its clients. See
+            // [`DaemonProcess::Embedded`] — this is the honest classification of
+            // that topology, not a relaxation of the gate. The production path
+            // states its own process explicitly.
+            process: DaemonProcess::Embedded,
         }
+    }
+
+    /// Replaces the process this daemon excludes the descendants of (BR-4).
+    ///
+    /// For fixtures that need to state a topology the constructor cannot infer:
+    /// an in-process test that wants the ancestry gate to *bite* declares
+    /// `Own(std::process::id())`, which makes its own in-process clients genuine
+    /// kernel-attested descendants and exercises the real walk rather than a
+    /// stubbed verdict.
+    #[must_use]
+    pub fn with_daemon_process(mut self, process: DaemonProcess) -> Self {
+        self.process = process;
+        self
     }
 
     /// A daemon over an explicit event bus and assembled [`DaemonRuntime`]. This
@@ -178,6 +289,14 @@ impl Daemon {
             events,
             runtime,
             lifetime,
+            grants: GrantRegistry::new(),
+            // The production answer, and taken here rather than passed in so
+            // `main` cannot ship a daemon that forgot to state it: this daemon
+            // is its own process, and the children it spawns are what BR-4
+            // excludes (ADR-A).
+            process: DaemonProcess::Own(
+                i32::try_from(std::process::id()).expect("a pid fits in i32"),
+            ),
         }
     }
 }
@@ -234,9 +353,15 @@ pub async fn serve(listener: UnixListener, daemon: Arc<Daemon>) -> std::io::Resu
         };
         let (stream, _addr) = accepted?;
         match auth::check_peer(&stream) {
-            Ok(_uid) => {
+            Ok(peer) => {
+                // The identity travels with the connection rather than being
+                // re-read later: the credentials are a property of the socket as
+                // the kernel recorded them at `connect(2)`, so reading them once
+                // here is reading them at the only moment they are attested
+                // (REQ-569 ADR-A). What the *pid* costs is decided at the
+                // handshake, in `do_handshake`.
                 let daemon = Arc::clone(&daemon);
-                tokio::spawn(handle_client(stream, daemon));
+                tokio::spawn(handle_client(stream, daemon, peer));
             }
             Err(_err) => {
                 // Reject unauthorized peers by dropping the stream. The message
@@ -280,7 +405,8 @@ impl EventFence {
     }
 }
 
-/// One connection's view of the daemon's sessions (REQ-568 BR-1/BR-2).
+/// One connection's view of the daemon's sessions (REQ-568 BR-1/BR-2,
+/// REQ-569 BR-1/BR-4).
 ///
 /// `attached` starts empty and grows two ways: `session/create` attaches the
 /// creator to what it just made, and `session/attach` attaches on success.
@@ -288,23 +414,42 @@ impl EventFence {
 /// where a cleared transcript is content-lifetime; a client that cleared its
 /// session is still watching it.
 ///
-/// `monitor` is fixed at handshake and never changes (ADR-C). Immutability is
-/// what keeps the forwarder holding one shared set and a plain `bool` rather
-/// than two shared mutables; a client that wants to stop monitoring reconnects.
+/// `created` is the subset of those this connection actually *made*, and it is
+/// tracked separately rather than read off `attached` because the two answer
+/// different questions: `attached` is "may this connection see and drive the
+/// session", `created` is "is this connection the session's origin", which is
+/// the standing REQ-569 grants attach on. Folding them together would make a
+/// grant-based attach retroactively confer creator standing — a proxy for the
+/// real condition, which is the shape LESSON-443 warns about.
 ///
-/// Cloning shares the set, which is the point: the dispatch path mutates it
-/// while the forwarder task reads it, and they must see one set, not two.
+/// `monitor` and `ancestry` are both fixed at handshake and never change.
+/// Immutability is what keeps the forwarder holding one shared set and plain
+/// values rather than more shared mutables; for `ancestry` it is also the
+/// security property — a verdict computed once from the pid the kernel attested
+/// at `connect(2)` cannot drift mid-connection.
+///
+/// Cloning shares the sets, which is the point: the dispatch path mutates them
+/// while the forwarder task reads them, and they must see one set, not two.
 #[derive(Clone)]
 struct ConnState {
+    /// This connection's grant subject (REQ-569 ADR-D), minted at handshake.
+    id: ConnectionId,
+    /// Whether this connection's process came out of the daemon's own process
+    /// tree (BR-4). Computed once, at the handshake.
+    ancestry: Ancestry,
     attached: Arc<RwLock<HashSet<SessionId>>>,
+    created: Arc<RwLock<HashSet<SessionId>>>,
     monitor: bool,
 }
 
 impl ConnState {
     /// A connection attached to nothing, monitoring or not as declared.
-    fn new(monitor: bool) -> Self {
+    fn new(id: ConnectionId, ancestry: Ancestry, monitor: bool) -> Self {
         Self {
+            id,
+            ancestry,
             attached: Arc::new(RwLock::new(HashSet::new())),
+            created: Arc::new(RwLock::new(HashSet::new())),
             monitor,
         }
     }
@@ -315,6 +460,47 @@ impl ConnState {
             .write()
             .expect("connection attachment lock poisoned")
             .insert(session_id);
+    }
+
+    /// Record that this connection created `session_id`, and attach it.
+    ///
+    /// Both, in one call, because both are true of a creator and splitting them
+    /// at the call site is how one of them gets forgotten.
+    fn record_created(&self, session_id: SessionId) {
+        self.created
+            .write()
+            .expect("connection creation lock poisoned")
+            .insert(session_id.clone());
+        self.attach(session_id);
+    }
+
+    /// A snapshot of the sessions this connection created.
+    ///
+    /// Cloned rather than lent out under the lock so no caller can hold the
+    /// guard across an `await` or take the grant-registry lock while holding it.
+    fn created(&self) -> HashSet<SessionId> {
+        self.created
+            .read()
+            .expect("connection creation lock poisoned")
+            .clone()
+    }
+
+    /// Whether this connection is even *eligible* to hold session access —
+    /// the REQ-569 BR-4 ancestry gate, before any grant question is asked.
+    ///
+    /// [`Ancestry::Indeterminate`] is refused here alongside
+    /// [`Ancestry::Descendant`], and that is the deliberate policy TASK-103 left
+    /// to this caller: "I could not tell whether this process came out of my own
+    /// tree" must cost the same as "it did". Treating it as
+    /// [`Ancestry::NotDescendant`] would make every lookup failure — a vanished
+    /// pid, a platform with no peer-pid option, a chain that cycled — into a way
+    /// through the gate, and a guard whose failure mode is *open* is a guard an
+    /// attacker only has to break rather than beat. The two are still told apart
+    /// in the daemon log ([`ancestry_refusal_line`]), because an operator
+    /// debugging a refusal needs to know which one happened even though the
+    /// connection is told the same thing either way.
+    fn may_hold_session_access(&self) -> bool {
+        matches!(self.ancestry, Ancestry::NotDescendant)
     }
 
     /// Whether an envelope scoped to `session_id` may be delivered here.
@@ -358,6 +544,52 @@ impl ConnState {
 /// answering before the registry is consulted (ADR-B). It names the remedy,
 /// because `session/attach` is the one thing that changes the answer.
 const NOT_ATTACHED_MESSAGE: &str = "not attached to this session; attach to it first";
+
+/// The refusal a daemon descendant gets (REQ-569 BR-4, ADR-A).
+///
+/// Content-free like its neighbour, and identical whether the ancestry verdict
+/// was [`Ancestry::Descendant`] or [`Ancestry::Indeterminate`]: the connection
+/// is told the answer, never the daemon's confidence in it, or a probe could
+/// map the daemon's process tree by watching which refusal it drew. It names no
+/// remedy because there is none — this is the one refusal on this seam with no
+/// consent path.
+const ATTACH_FORBIDDEN_MESSAGE: &str =
+    "this connection may not attach to or monitor sessions on this daemon";
+
+/// The refusal an ungranted connection gets (REQ-569 BR-1/BR-2).
+///
+/// Deliberately says nothing about the named session — not whether it exists,
+/// not who holds it. `session/attach` answers this *before* the registry is
+/// consulted, so a connection that guessed an id learns exactly as much as one
+/// that named a real session: nothing (BR-8).
+const NOT_GRANTED_MESSAGE: &str = "no grant for this session; a grant must be given, not assumed";
+
+/// The daemon-log sentence for an ancestry refusal (REQ-569 BR-4).
+///
+/// The one place [`Ancestry::Descendant`] and [`Ancestry::Indeterminate`] are
+/// told apart. The client is refused identically either way, but the operator
+/// reading this log is answering a different question — "is my tool child being
+/// correctly excluded" versus "has the peer-pid lookup stopped working on this
+/// machine" — and those have opposite remedies. Collapsing them would turn a
+/// broken ancestry lookup into a silent, permanent refusal of every client,
+/// indistinguishable from the gate working.
+///
+/// A function rather than a bare `eprintln!` so the distinction is assertable
+/// (the [`monitor_declaration_line`] precedent), and it carries no session id,
+/// no path, and no client-supplied string (conventions: privacy in logs).
+fn ancestry_refusal_line(ancestry: Ancestry, what: &str) -> String {
+    let because = match ancestry {
+        Ancestry::Descendant => "it descends from this daemon's own process tree",
+        Ancestry::Indeterminate => {
+            "its process ancestry could not be determined, and this seam fails closed"
+        }
+        // Not reachable from the gate, which only logs a refusal — spelled out
+        // rather than left to a catch-all so a future arm cannot land here
+        // silently wearing one of the sentences above.
+        Ancestry::NotDescendant => "it was not refused",
+    };
+    format!("tetond: refused {what} for a connection because {because}")
+}
 
 /// The delivery policy: may an envelope scoped to `env_session` reach a
 /// connection attached to `attached` that declared `monitor`? (REQ-568 BR-1/BR-2)
@@ -419,7 +651,11 @@ fn reduce_for(summary: SessionSummary, visible: bool) -> SessionSummary {
 }
 
 /// Drives one client connection from handshake to disconnect.
-async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
+///
+/// `peer` is the kernel's attestation of who is on the other end, read once at
+/// `accept` (REQ-569 ADR-B). Its uid has already authorized the connection; its
+/// pid is spent at the handshake, where the ancestry verdict is taken.
+async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdentity) {
     let (read_half, write_half) = stream.into_split();
     let (out_tx, out_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
     let writer = tokio::spawn(write_loop(write_half, out_rx));
@@ -550,7 +786,7 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
 
             // On success, subscribe and start forwarding events. On failure the
             // error response is already queued and the client stays unauthenticated.
-            if let Some((sub, guard, state)) = do_handshake(&daemon, id, params, &out_tx) {
+            if let Some((sub, guard, state)) = do_handshake(&daemon, peer, id, params, &out_tx) {
                 handshaked = true;
                 client_guard = Some(guard);
                 let (forwarded_tx, forwarded_rx) = watch::channel(0u64);
@@ -621,6 +857,18 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
     // abandon in-flight prompt turns.
     if let Some(forwarder) = forwarder {
         forwarder.abort();
+    }
+
+    // REQ-569 ADR-C: grants die with the connection that holds them. Done here,
+    // at the one place a connection ends, rather than beside each site that
+    // might have minted one — a release that had to be remembered per mint is a
+    // release that is eventually forgotten, and a grant outliving its subject is
+    // a credential nobody can revoke. Unconditional: most connections were never
+    // granted anything, and `release` on a connection holding nothing is a
+    // no-op. A connection that never handshaked has no id and therefore no
+    // grants to release.
+    if let Some(state) = conn.as_ref() {
+        daemon.grants.release(state.id);
     }
 
     // REQ-565 BR-2/AC-3, and the order here is the whole mechanism:
@@ -801,8 +1049,15 @@ fn flatten_prompt(blocks: &[PromptBlock]) -> String {
 /// The `ConnState` is minted here rather than by the caller because this is the
 /// only place the `monitor` declaration exists: it arrives in the handshake
 /// frame and is fixed for the connection (ADR-C).
+///
+/// It is also where the connection's [`Ancestry`] is settled, once, from the
+/// pid the kernel attested at `connect(2)` (REQ-569 BR-4). Computing it per
+/// call would spend a kernel read on every request and — the part that matters —
+/// would let the verdict change under a connection whose pid was reused, so the
+/// gate a request meets could differ from the gate the handshake meant.
 fn do_handshake(
     daemon: &Daemon,
+    peer: PeerIdentity,
     id: Id,
     params: Value,
     out_tx: &mpsc::Sender<String>,
@@ -826,6 +1081,52 @@ fn do_handshake(
             return None;
         }
     };
+
+    let ancestry = daemon.process.ancestry_of(peer.pid);
+    let connection = daemon.grants.next_connection_id();
+
+    // REQ-569 BR-2/BR-4: the monitor declaration is gated here, and the
+    // *handshake itself* is what fails.
+    //
+    // Not a silent downgrade of `monitor` to false. A client that asked to watch
+    // every session and was quietly given a connection that watches none would
+    // go on believing it was monitoring — and the daemon would have turned a
+    // refused request into a successful one, which is a guard that disables
+    // itself the moment anyone stops reading its output (LESSON-443). The
+    // refusal is the answer; the client decides what to do about it.
+    //
+    // Placed after negotiation so a version-incompatible monitor still gets its
+    // version diagnosis, and before `admit()` so a refused monitor takes no
+    // lifetime claim, publishes no attach event, and subscribes to nothing.
+    //
+    // Two reasons, two codes (BR-5): ancestry is checked first and is terminal,
+    // so a daemon descendant is never told "ask for a grant" about a grant it
+    // may not have. Everyone else is refused for want of a monitor-scope grant —
+    // and since a connection is brand new here and nothing mints monitor grants
+    // yet, that is *every* connection until TASK-108's consent path lands. That
+    // is the fail-closed posture BR-2 asks for, stated rather than approximated.
+    if params.monitor {
+        if !matches!(ancestry, Ancestry::NotDescendant) {
+            eprintln!(
+                "{}",
+                ancestry_refusal_line(ancestry, "a monitor declaration")
+            );
+            let _ = out_tx.try_send(error_string(
+                id,
+                error_code::ATTACH_FORBIDDEN,
+                ATTACH_FORBIDDEN_MESSAGE,
+            ));
+            return None;
+        }
+        if !daemon.grants.may_monitor(connection) {
+            let _ = out_tx.try_send(error_string(
+                id,
+                error_code::NOT_GRANTED,
+                "no monitor-scope grant; monitor must be granted, not declared",
+            ));
+            return None;
+        }
+    }
 
     // REQ-565 BR-3, second arm. Admission is the last gate and it is atomic with
     // the daemon's decision to exit: either this client is counted in (which
@@ -888,7 +1189,11 @@ fn do_handshake(
         eprintln!("{}", monitor_declaration_line(&params));
     }
 
-    Some((subscription, client_guard, ConnState::new(params.monitor)))
+    Some((
+        subscription,
+        client_guard,
+        ConnState::new(connection, ancestry, params.monitor),
+    ))
 }
 
 /// The daemon-log sentence announcing a monitor declaration (REQ-568 BR-5).
@@ -1169,7 +1474,13 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
             // forwarder consults the attachment set when it drains, so an
             // attach that landed second would race the session's own first
             // event out of its creator's stream.
-            conn.attach(summary.session_id.clone());
+            //
+            // REQ-569 BR-1: this is also the moment the connection acquires the
+            // one standing that needs no grant. Creating a session is the
+            // capability — recorded here, where the session is made, rather than
+            // inferred later from the attachment set (which a granted attach
+            // also writes to).
+            conn.record_created(summary.session_id.clone());
 
             // Broadcast a session-scoped event so attached peers learn of the
             // new session. Entering a structured session's first phase is a
@@ -1196,13 +1507,52 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
 }
 
 /// Attach a connection to an existing session (`session/attach`), which is what
-/// grants it that session's events from here on (REQ-568 BR-1).
+/// grants it that session's events from here on (REQ-568 BR-1) — and, since
+/// REQ-569, is itself the thing that must be authorized (BR-1/BR-2/BR-4).
+///
+/// **Three answers, in this order, and the order is the requirement.**
+///
+/// 1. *Ancestry* (BR-4, ADR-A). A connection out of the daemon's own process
+///    tree is refused `ATTACH_FORBIDDEN` — before the params are even parsed,
+///    let alone the registry consulted. There is no consent path from here and
+///    never will be: [`crate::grants`] cannot mint what this gate refuses,
+///    because the gate is asked first.
+/// 2. *Grant* (BR-1). Everyone else must have created the session or hold an
+///    attach-scope grant for it; otherwise `NOT_GRANTED`.
+/// 3. Only then is the session looked up and attached, exactly as before.
+///
+/// Both refusals precede `daemon.sessions.get`, and that placement is
+/// load-bearing rather than tidy: answering `UNKNOWN_SESSION` first for an id
+/// the connection may not have would turn `session/attach` into an oracle that
+/// confirms guessed session ids, which is the whole property BR-8 is protecting
+/// (ids are names, grants are credentials). A guessed id and a real one draw the
+/// same refusal.
 fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // (1) Ahead of the parse, not merely ahead of the registry. A daemon
+    // descendant learns nothing at all here — not whether the session exists,
+    // and not even whether its own request was well-formed.
+    if !conn.may_hold_session_access() {
+        eprintln!("{}", ancestry_refusal_line(conn.ancestry, "session/attach"));
+        return error_string(id, error_code::ATTACH_FORBIDDEN, ATTACH_FORBIDDEN_MESSAGE);
+    }
+
     let params: SessionAttachParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
 
+    // (2) The grant question, asked of the one module that answers it. The
+    // creator's own attach comes through the same call rather than being
+    // short-circuited above it, so there is a single definition of "may attach"
+    // instead of one here and one in `grants` (LESSON-484).
+    if !daemon
+        .grants
+        .may_attach(conn.id, &params.session_id, &conn.created())
+    {
+        return error_string(id, error_code::NOT_GRANTED, NOT_GRANTED_MESSAGE);
+    }
+
+    // (3) Authorized. From here the behaviour is REQ-568's, unchanged.
     match daemon.sessions.get(&params.session_id) {
         Some(session) => {
             // Only a successful attach grants sight: a name the registry does
@@ -1413,10 +1763,34 @@ mod tests {
         );
     }
 
-    /// A connection that has attached to nothing and declared nothing — the
-    /// state every direct-dispatch test starts from.
-    fn unattached() -> ConnState {
-        ConnState::new(false)
+    /// A connection on `daemon` that created nothing, attached to nothing and
+    /// declared nothing — the state every direct-dispatch test starts from.
+    ///
+    /// Its id is minted from the daemon it will talk to, because grants are
+    /// keyed by connection: a `ConnState` carrying an id from some other
+    /// registry would ask its questions of a namespace nothing answers in.
+    ///
+    /// Its ancestry is [`Ancestry::NotDescendant`] — the ordinary client the
+    /// REQ-569 BR-4 gate lets through — so what these tests exercise is the
+    /// *grant* gate behind it. The descendant cases say so explicitly.
+    fn unattached(daemon: &Daemon) -> ConnState {
+        conn_with_ancestry(daemon, Ancestry::NotDescendant)
+    }
+
+    /// A connection that declared `monitor` at the handshake (REQ-568's
+    /// delivery policy, which REQ-569 does not change for a connection that
+    /// got past the declaration gate).
+    fn monitoring(daemon: &Daemon) -> ConnState {
+        ConnState::new(
+            daemon.grants.next_connection_id(),
+            Ancestry::NotDescendant,
+            true,
+        )
+    }
+
+    /// A connection whose process this daemon classified as `ancestry`.
+    fn conn_with_ancestry(daemon: &Daemon, ancestry: Ancestry) -> ConnState {
+        ConnState::new(daemon.grants.next_connection_id(), ancestry, false)
     }
 
     /// The id `session/create` just minted, read back off its response
@@ -1441,7 +1815,7 @@ mod tests {
         let daemon = Daemon::new();
         let response = dispatch(
             &daemon,
-            &unattached(),
+            &unattached(&daemon),
             Id::Number(1),
             "does/not-exist",
             Value::Null,
@@ -1455,7 +1829,7 @@ mod tests {
         let daemon = Daemon::new();
         let created = handle_session_create(
             &daemon,
-            &unattached(),
+            &unattached(&daemon),
             Id::Number(1),
             serde_json::json!({"mode": "freeform"}),
         );
@@ -1464,7 +1838,7 @@ mod tests {
 
         let listed = dispatch(
             &daemon,
-            &unattached(),
+            &unattached(&daemon),
             Id::Number(2),
             SessionListParams::METHOD,
             Value::Null,
@@ -1473,19 +1847,26 @@ mod tests {
         assert!(listed.contains(&session.to_string()), "{listed}");
     }
 
-    /// REQ-568 BR-1: the two ways a connection comes to see a session, and the
-    /// one way it does not.
+    /// REQ-568 BR-1 + REQ-569 BR-1: the ways a connection comes to see a
+    /// session, and the ways it does not.
     ///
     /// Creating attaches the creator — checked *through* the handler rather
     /// than by calling `attach` directly, because "the creator is attached" is
-    /// a property of `session/create`, not of the set. Attaching a session the
-    /// registry knows grants sight; attaching a name it does not know grants
-    /// nothing, so a client cannot stake a claim on a guessed id and collect
-    /// the events of whoever creates it later.
+    /// a property of `session/create`, not of the set. The creator may then
+    /// re-attach to what it made, which is the standing REQ-569 leaves
+    /// ungated.
+    ///
+    /// A connection that created nothing is refused `NOT_GRANTED` — and refused
+    /// *identically* for the session that exists and for a name the registry
+    /// never had. That pair is the assertion, not a detail of it: two different
+    /// codes here would rebuild the existence oracle BR-8 closes, letting a
+    /// client confirm a guessed session id by which refusal it drew. The old
+    /// `UNKNOWN_SESSION` answer this replaces was exactly that oracle, sitting
+    /// in front of an attach anyone could have.
     #[test]
-    fn create_attaches_the_creator_and_only_a_real_attach_grants_sight() {
+    fn create_attaches_the_creator_and_an_ungranted_attach_is_refused() {
         let daemon = Daemon::new();
-        let creator = unattached();
+        let creator = unattached(&daemon);
         let created = handle_session_create(
             &daemon,
             &creator,
@@ -1498,37 +1879,248 @@ mod tests {
             "the creator must see the session it just made"
         );
 
-        let onlooker = unattached();
+        // The creator's own attach is unchanged by REQ-569 — the one standing
+        // that needs no grant.
+        let reattached = handle_session_attach(
+            &daemon,
+            &creator,
+            Id::Number(2),
+            serde_json::json!({"session_id": session.to_string()}),
+        );
+        assert!(
+            reattached.contains(&session.to_string()),
+            "the creator may attach to what it created: {reattached}"
+        );
+
+        let onlooker = unattached(&daemon);
         assert!(
             !onlooker.may_receive(Some(&session)),
             "a connection that did nothing must not see another's session"
         );
 
-        let ghost = handle_session_attach(
-            &daemon,
-            &onlooker,
-            Id::Number(2),
-            serde_json::json!({"session_id": "sess-nonexistent"}),
-        );
+        for (case, target) in [
+            ("a session that exists", session.to_string()),
+            (
+                "a name the registry never had",
+                "sess-nonexistent".to_owned(),
+            ),
+        ] {
+            let refused = handle_session_attach(
+                &daemon,
+                &onlooker,
+                Id::Number(3),
+                serde_json::json!({"session_id": target}),
+            );
+            assert!(
+                refused.contains(&error_code::NOT_GRANTED.to_string()),
+                "{case}: an ungranted attach must be refused: {refused}"
+            );
+            assert!(
+                !refused.contains(&error_code::UNKNOWN_SESSION.to_string()),
+                "{case}: the refusal must not say whether the session exists: {refused}"
+            );
+        }
         assert!(
-            ghost.contains(&error_code::UNKNOWN_SESSION.to_string()),
-            "{ghost}"
+            !onlooker.may_receive(Some(&session)),
+            "a refused attach must leave the set untouched"
         );
         assert!(
             !onlooker.may_receive(Some(&SessionId::from("sess-nonexistent"))),
             "a refused attach must not leave the name in the set"
         );
 
+        // And the grant is what changes the answer — the same connection, the
+        // same call, one registry entry later. (TASK-108's consent path is what
+        // will mint this in production; here it stands in for that decision so
+        // the *gate* is what the test pins, not the absence of a minter.)
+        daemon
+            .grants
+            .grant(crate::grants::Grant::attach(onlooker.id, session.clone()));
         let attached = handle_session_attach(
             &daemon,
             &onlooker,
-            Id::Number(3),
+            Id::Number(4),
             serde_json::json!({"session_id": session.to_string()}),
         );
         assert!(attached.contains(&session.to_string()), "{attached}");
         assert!(
             onlooker.may_receive(Some(&session)),
-            "attaching is the grant — after it the session's events are visible"
+            "after the grant, attaching is the grant — the session's events are visible"
+        );
+    }
+
+    /// REQ-569 BR-4 / ADR-A: a connection out of the daemon's own process tree
+    /// is refused attach, before the session registry is touched.
+    ///
+    /// Both ancestry verdicts that refuse are checked, and both are checked
+    /// against a session that genuinely exists *and* one that does not — four
+    /// cells, all `ATTACH_FORBIDDEN`. The uniformity is the point twice over:
+    /// the refusal must not leak whether the session exists, and it must not
+    /// leak whether the daemon was sure about the ancestry.
+    ///
+    /// `NOT_GRANTED` is asserted absent in every cell, which is what pins the
+    /// *ordering*. A descendant holds no grant either, so a gate that ran the
+    /// grant check first would refuse it too — and the test would pass for the
+    /// wrong reason, hiding that a descendant could reach a consent path the
+    /// moment TASK-108 puts one in the `NOT_GRANTED` branch.
+    #[test]
+    fn a_daemon_descendant_is_refused_attach_before_any_session_lookup() {
+        let daemon = Daemon::new();
+        let creator = unattached(&daemon);
+        let created = handle_session_create(
+            &daemon,
+            &creator,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        let session = created_session_id(&created);
+
+        for ancestry in [Ancestry::Descendant, Ancestry::Indeterminate] {
+            let child = conn_with_ancestry(&daemon, ancestry);
+            for target in [session.to_string(), "sess-nonexistent".to_owned()] {
+                let refused = handle_session_attach(
+                    &daemon,
+                    &child,
+                    Id::Number(2),
+                    serde_json::json!({"session_id": target}),
+                );
+                assert!(
+                    refused.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                    "{ancestry:?} attaching `{target}` must be forbidden: {refused}"
+                );
+                assert!(
+                    !refused.contains(&error_code::NOT_GRANTED.to_string()),
+                    "{ancestry:?}: the ancestry gate must answer first, not the grant gate: \
+                     {refused}"
+                );
+                assert!(
+                    !refused.contains(&error_code::UNKNOWN_SESSION.to_string()),
+                    "{ancestry:?}: the refusal must not say whether the session exists: {refused}"
+                );
+                assert!(
+                    !child.may_receive(Some(&session)),
+                    "{ancestry:?}: a forbidden attach must grant nothing"
+                );
+            }
+
+            // Not even a grant lets it through: the ancestry gate is asked
+            // first and is terminal, so minting one for a descendant — which
+            // TASK-108 must never do — still changes nothing here.
+            daemon
+                .grants
+                .grant(crate::grants::Grant::attach(child.id, session.clone()));
+            let still_refused = handle_session_attach(
+                &daemon,
+                &child,
+                Id::Number(3),
+                serde_json::json!({"session_id": session.to_string()}),
+            );
+            assert!(
+                still_refused.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                "{ancestry:?}: a grant must not override the ancestry gate: {still_refused}"
+            );
+        }
+    }
+
+    /// REQ-569 BR-4: the operator can tell "refused because it is a descendant"
+    /// from "refused because we could not tell", even though the connection
+    /// cannot.
+    ///
+    /// The two verdicts cost a connection exactly the same thing, which is the
+    /// fail-closed policy — but they have opposite remedies for whoever runs
+    /// the daemon (exclude the child, versus fix a peer-pid lookup that has
+    /// stopped working), and a log that collapsed them would present a broken
+    /// ancestry lookup as the gate working perfectly.
+    #[test]
+    fn an_indeterminate_ancestry_is_refused_like_a_descendant_but_logged_apart() {
+        let descendant = ancestry_refusal_line(Ancestry::Descendant, "session/attach");
+        let unknown = ancestry_refusal_line(Ancestry::Indeterminate, "session/attach");
+        assert_ne!(
+            descendant, unknown,
+            "the two refusal reasons must be distinguishable in the log"
+        );
+        assert!(descendant.contains("descends from"), "{descendant}");
+        assert!(unknown.contains("could not be determined"), "{unknown}");
+        // Content-free, like every other refusal on this seam.
+        assert!(!descendant.contains("sess-"), "{descendant}");
+        assert!(!unknown.contains("sess-"), "{unknown}");
+
+        // And the policy itself: only `NotDescendant` opens the gate.
+        let daemon = Daemon::new();
+        assert!(!conn_with_ancestry(&daemon, Ancestry::Descendant).may_hold_session_access());
+        assert!(!conn_with_ancestry(&daemon, Ancestry::Indeterminate).may_hold_session_access());
+        assert!(conn_with_ancestry(&daemon, Ancestry::NotDescendant).may_hold_session_access());
+    }
+
+    /// REQ-569 ADR-A: which process tree a daemon excludes is a property it
+    /// carries, and the production constructors always carry their own.
+    ///
+    /// The one thing that must never happen by accident is a shipped daemon
+    /// classifying its own children as strangers. `main` builds through
+    /// [`Daemon::with_lifetime`], so this pins the arm `main` gets — and pins
+    /// that [`DaemonProcess::Embedded`] is reachable only by a fixture saying
+    /// so out loud.
+    #[test]
+    fn the_production_constructors_own_their_process() {
+        let me = i32::try_from(std::process::id()).unwrap();
+        let events = Arc::new(EventBus::new());
+        let runtime = Arc::new(DaemonRuntime::minimal());
+        let production = Daemon::with_runtime(Arc::clone(&events), Arc::clone(&runtime));
+        assert_eq!(production.process, DaemonProcess::Own(me));
+
+        let lifetime = Arc::new(LifetimeSupervisor::new(
+            ShutdownPolicy::Never,
+            PolicySource::Default,
+            Arc::clone(&events),
+        ));
+        let production = Daemon::with_lifetime(events, runtime, lifetime);
+        assert_eq!(production.process, DaemonProcess::Own(me));
+
+        // The fixture constructor states the embedded topology, and it takes an
+        // explicit call to state anything else.
+        assert_eq!(Daemon::new().process, DaemonProcess::Embedded);
+        assert_eq!(
+            Daemon::new()
+                .with_daemon_process(DaemonProcess::Own(me))
+                .process,
+            DaemonProcess::Own(me)
+        );
+    }
+
+    /// REQ-569 BR-4: the daemon's own classification of a peer, over the three
+    /// inputs it can get.
+    ///
+    /// The `Own` + absent-pid row is the one worth writing down: a platform that
+    /// reports no peer pid must land on [`Ancestry::Indeterminate`], which the
+    /// gate refuses. A `None` pid quietly reading as "not a descendant" would
+    /// make the whole control evaporate on any arm whose kernel will not answer
+    /// — the fail-open TASK-103 built the three-valued answer to prevent.
+    #[test]
+    fn a_peer_with_no_pid_is_unanswerable_not_admitted() {
+        let me = i32::try_from(std::process::id()).unwrap();
+        assert_eq!(
+            DaemonProcess::Own(me).ancestry_of(None),
+            Ancestry::Indeterminate
+        );
+        // This process is trivially a descendant of itself, which is the
+        // in-process-harness topology and the reason `Embedded` exists.
+        assert_eq!(
+            DaemonProcess::Own(me).ancestry_of(Some(me)),
+            Ancestry::Descendant
+        );
+        // pid 1 never descends from us.
+        assert_eq!(
+            DaemonProcess::Own(me).ancestry_of(Some(1)),
+            Ancestry::NotDescendant
+        );
+        // An embedded daemon owns no process tree, so nothing came out of one.
+        assert_eq!(
+            DaemonProcess::Embedded.ancestry_of(Some(me)),
+            Ancestry::NotDescendant
+        );
+        assert_eq!(
+            DaemonProcess::Embedded.ancestry_of(None),
+            Ancestry::NotDescendant
         );
     }
 
@@ -1651,7 +2243,7 @@ mod tests {
     #[test]
     fn session_list_reduces_only_for_connections_that_may_not_see_the_session() {
         let daemon = Daemon::new();
-        let creator = unattached();
+        let creator = unattached(&daemon);
         let jail = std::env::temp_dir();
         let created = handle_session_create(
             &daemon,
@@ -1682,7 +2274,7 @@ mod tests {
             .unwrap()
         };
 
-        let onlooker = list(&unattached());
+        let onlooker = list(&unattached(&daemon));
         assert!(
             onlooker.contains(&session.0),
             "the row itself stays — BR-10 reduces the payload, not the listing: {onlooker}"
@@ -1704,7 +2296,7 @@ mod tests {
 
         // And the monitor, whose sight comes from the same predicate rather than
         // from a second rule this handler would have had to remember.
-        let monitor = list(&ConnState::new(true));
+        let monitor = list(&monitoring(&daemon));
         assert!(
             monitor.contains("own words"),
             "a monitor sees every session whole: {monitor}"
@@ -1779,7 +2371,7 @@ mod tests {
     #[test]
     fn dispatch_routes_session_clear_and_tells_attached_from_unattached() {
         let daemon = Daemon::new();
-        let conn = unattached();
+        let conn = unattached(&daemon);
         let created = handle_session_create(
             &daemon,
             &conn,
@@ -1810,7 +2402,7 @@ mod tests {
         // for a session that exists and one that does not — the pair is the
         // assertion, since two different codes here would be the existence
         // oracle ADR-B refuses to build.
-        let stranger = unattached();
+        let stranger = unattached(&daemon);
         for target in [session.to_string(), "sess-nonexistent".to_owned()] {
             let refused = dispatch(
                 &daemon,
@@ -1860,7 +2452,7 @@ mod tests {
     #[tokio::test]
     async fn an_unattached_prompt_is_refused_without_spawning_a_turn() {
         let daemon = Arc::new(Daemon::new());
-        let creator = unattached();
+        let creator = unattached(&daemon);
         let created = handle_session_create(
             &daemon,
             &creator,
@@ -1875,7 +2467,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<String>(4);
 
-        let stranger = unattached();
+        let stranger = unattached(&daemon);
         let handle =
             spawn_prompt_turn(&daemon, &stranger, Id::Number(2), prompt.clone(), &tx, None);
         assert!(
@@ -1914,7 +2506,7 @@ mod tests {
     #[test]
     fn a_monitor_may_watch_every_session_and_drive_none() {
         let daemon = Daemon::new();
-        let owner = unattached();
+        let owner = unattached(&daemon);
         let created = handle_session_create(
             &daemon,
             &owner,
@@ -1923,7 +2515,7 @@ mod tests {
         );
         let session = created_session_id(&created);
 
-        let monitor = ConnState::new(true);
+        let monitor = monitoring(&daemon);
         assert!(
             monitor.may_receive(Some(&session)),
             "a monitor sees every session's events"
@@ -1955,7 +2547,7 @@ mod tests {
     #[tokio::test]
     async fn a_monitor_cannot_prompt_a_session_it_only_watches() {
         let daemon = Arc::new(Daemon::new());
-        let owner = unattached();
+        let owner = unattached(&daemon);
         let created = handle_session_create(
             &daemon,
             &owner,
@@ -1964,7 +2556,7 @@ mod tests {
         );
         let session = created_session_id(&created);
 
-        let monitor = ConnState::new(true);
+        let monitor = monitoring(&daemon);
         assert!(
             monitor.may_receive(Some(&session)),
             "a monitor sees the session's events — the receive side is not the gate"
@@ -1992,7 +2584,7 @@ mod tests {
         let daemon = Daemon::new();
         let response = dispatch(
             &daemon,
-            &unattached(),
+            &unattached(&daemon),
             Id::Number(1),
             WebRefreshParams::METHOD,
             serde_json::json!({"url": "https://docs.rs/serde"}),
@@ -2019,7 +2611,7 @@ mod tests {
         let daemon = Daemon::new();
         let response = dispatch(
             &daemon,
-            &unattached(),
+            &unattached(&daemon),
             Id::Number(1),
             WebRefreshParams::METHOD,
             serde_json::json!({"not_a_url": 3}),
@@ -2036,8 +2628,14 @@ mod tests {
     fn both_web_controls_are_client_methods() {
         let daemon = Daemon::new();
         for method in [WebOverrideParams::METHOD, WebRefreshParams::METHOD] {
-            let response =
-                dispatch(&daemon, &unattached(), Id::Number(1), method, Value::Null).unwrap();
+            let response = dispatch(
+                &daemon,
+                &unattached(&daemon),
+                Id::Number(1),
+                method,
+                Value::Null,
+            )
+            .unwrap();
             assert!(
                 !response.contains("-32601"),
                 "`{method}` must be a routed client method: {response}"

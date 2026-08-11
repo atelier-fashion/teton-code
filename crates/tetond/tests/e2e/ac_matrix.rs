@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use teton_protocol::jsonrpc::error_code;
 
 use crate::harness::{
     anthropic_turn, assert_no_boundary_bytes, edit_answer_script, mcp_call_script, mcp_stdio_toml,
@@ -523,13 +524,27 @@ fn ac6_two_clients_share_sessions_daemon_survives_exit() {
         "session did not survive client exit"
     );
 
-    // A fresh client can still attach to the surviving session.
+    // A fresh client still *sees* the surviving session — that listing, above
+    // and here, is what AC-6's survival claim rests on.
+    //
+    // Attaching to it is a separate question, and since REQ-569 the answer is
+    // no: a connection that created nothing and holds no grant is refused
+    // `NOT_GRANTED` (BR-1), because knowing an id is not standing (BR-8). The
+    // resume flow this closes is reopened by REQ-569 TASK-108's explicit
+    // consent step (BR-6) — and only by it. Asserted rather than skipped: this
+    // is the branch's real behaviour today, and a test that quietly stopped
+    // exercising the seam would be the place a regression hides.
     let mut c = daemon.connect();
-    let attached = c.call("session/attach", json!({ "session_id": sid }));
     assert_eq!(
-        attached["result"]["session"]["session_id"].as_str(),
-        Some(sid.as_str()),
-        "{attached}"
+        c.session_ids(),
+        vec![sid.clone()],
+        "a fresh client must still see the surviving session"
+    );
+    let refused = c.call("session/attach", json!({ "session_id": sid }));
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::NOT_GRANTED),
+        "a fresh client holds no grant for another connection's session: {refused}"
     );
 
     assert_no_boundary_bytes();

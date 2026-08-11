@@ -319,6 +319,42 @@ pub mod error_code {
         /// would tell a user their session had vanished when it is only
         /// someone else's.
         NOT_ATTACHED = -32009;
+        /// The connection's process descends from this daemon's own process
+        /// tree — or could not be shown not to — so it may never attach to a
+        /// session or declare `monitor` (REQ-569 BR-4, ADR-A).
+        ///
+        /// **The terminal refusal.** Unlike [`NOT_GRANTED`], this one has no
+        /// remedy and no consent path: there is nothing the connection can ask
+        /// for, nothing a user can approve, and no retry that changes the
+        /// answer. It keys on kernel-attested process ancestry rather than on
+        /// what the connection happens to do, so it holds for a tool child, an
+        /// MCP server subprocess, and any future daemon-spawned process that
+        /// links the client crate.
+        ///
+        /// Distinct from [`NOT_ATTACHED`] in *which* question was asked:
+        /// `NOT_ATTACHED` answers "may this connection drive a session it never
+        /// attached to" and names `session/attach` as the remedy; this answers
+        /// "may this connection attach at all", and the answer is no. A client
+        /// that folded them together would advise a daemon child to attach —
+        /// the one thing it can never do.
+        ATTACH_FORBIDDEN = -32010;
+        /// The connection did not create this session and holds no grant for
+        /// it, so `session/attach` (or a `monitor` declaration) was refused
+        /// (REQ-569 BR-1/BR-2).
+        ///
+        /// **The remediable refusal**, and that is what separates it from
+        /// [`ATTACH_FORBIDDEN`]: a grant is a thing the user can decide to
+        /// give, so the client's remedy is to ask for one, where a forbidden
+        /// connection has nothing to ask. It is also distinct from
+        /// [`UNKNOWN_SESSION`]: this refusal is issued *before* the registry is
+        /// consulted and is identical for a session that exists and one that
+        /// does not, precisely so it cannot be read as an existence oracle.
+        ///
+        /// Distinct from [`NOT_ATTACHED`] by which door was closed:
+        /// `NOT_ATTACHED` is refused at a *mutating* method and its remedy is
+        /// `session/attach`; this is refused at `session/attach` itself, so the
+        /// remedy `NOT_ATTACHED` names is the very thing being refused here.
+        NOT_GRANTED = -32011;
     }
 }
 

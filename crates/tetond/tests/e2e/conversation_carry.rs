@@ -267,7 +267,30 @@ fn boundary_content_read_in_prompt_one_blocks_the_remote_prompt_two() {
 /// open, so B's connection is what keeps it alive across A's departure. Under
 /// the default policy the conversation dies with the daemon (BR-9), and this is
 /// the case where it must not: a client left, not the last one.
+///
+/// # Blocked on the grant path (REQ-569 TASK-106 → TASK-108)
+///
+/// REQ-569 closed `session/attach` to a connection that neither created the
+/// session nor holds a grant for it (BR-1), and the only minter of a grant —
+/// the explicit user-consent step — lands in TASK-108. Client B here is exactly
+/// that connection, so its `session/attach` is refused `NOT_GRANTED` and the
+/// carry claim below cannot be reached over two connections.
+///
+/// It is **ignored rather than rewritten**, deliberately. Every assertion in
+/// this body is still the right assertion — it is the door in front of them
+/// that is temporarily shut — and rewriting them into a refusal check would
+/// duplicate coverage that
+/// `multi_client::knowing_a_session_id_does_not_let_another_connection_attach`
+/// and `ac_matrix::ac6_two_clients_share_sessions_daemon_survives_exit` already
+/// carry, then have to be undone. TASK-108 restores this by minting B's grant
+/// through the consent flow and deleting the `#[ignore]`; that is the AC-2/AC-3
+/// evidence it owes. The body still compiles, so it cannot rot while it waits.
+///
+/// The carry mechanism itself is not uncovered in the meantime: the
+/// `conversation_carry` integration suite exercises it daemon-side. What is
+/// suspended is specifically the *second client joining* it.
 #[test]
+#[ignore = "REQ-569 BR-1 closed ungranted cross-session attach; TASK-108's consent flow reopens it"]
 fn client_bs_prompt_carries_the_conversation_client_a_left_behind() {
     let provider =
         MockProvider::always(openai_turn("Three attempts, as configured.", None, 120, 20));

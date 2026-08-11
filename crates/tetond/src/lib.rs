@@ -12,6 +12,10 @@
 //! - [`peer`] — process ancestry (REQ-569 ADR-A/ADR-B): a thin per-platform
 //!   `pid -> ppid` seam under a pure, table-testable "is this peer a descendant
 //!   of this daemon?" decision. Answers the question; gates nothing.
+//! - [`grants`] — session grants (REQ-569 BR-1/BR-2, ADR-C/ADR-D): the
+//!   in-memory, daemon-lifetime registry keyed by
+//!   `(connection, session, scope)`, and the pure `may_attach`/`may_monitor`
+//!   predicates over it. Decides who may attach; [`server`] applies it.
 //! - [`sessions`] — the authoritative, client-independent session registry.
 //! - [`broadcast`] — the bounded, slow-client-evicting event bus.
 //! - [`egress`] — the single egress choke point: privacy-boundary enforcement
@@ -66,6 +70,7 @@ pub mod classify;
 pub mod cost;
 pub mod download;
 pub mod egress;
+pub mod grants;
 pub mod harness;
 pub mod install;
 pub mod keychain;

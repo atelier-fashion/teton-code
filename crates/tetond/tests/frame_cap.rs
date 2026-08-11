@@ -418,12 +418,18 @@ async fn a_large_but_legal_frame_round_trips() {
         .await;
     let response = client.read_response(2).await;
 
-    // Read whole and dispatched: the answer is the handler's unknown-session
-    // verdict, which only a fully-parsed frame can produce — not the reader's
-    // size refusal.
+    // Read whole and dispatched: the answer is a *handler* verdict, which only
+    // a fully-parsed frame can produce — not the reader's size refusal.
+    //
+    // `NOT_GRANTED` rather than `UNKNOWN_SESSION` since REQ-569: this
+    // connection created no session and holds no grant, so `session/attach`
+    // answers before it consults the registry (BR-1), and it answers the same
+    // way for a 64 KiB nonsense id as for a real one — which is the point of
+    // that ordering. Either code proves the same thing here: the frame was
+    // parsed and routed rather than refused by size.
     assert_eq!(
         response["error"]["code"].as_i64().unwrap(),
-        error_code::UNKNOWN_SESSION,
+        error_code::NOT_GRANTED,
         "a legal 64 KiB frame must reach its handler, got: {response}"
     );
 

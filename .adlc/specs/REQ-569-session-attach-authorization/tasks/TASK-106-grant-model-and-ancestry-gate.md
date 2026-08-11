@@ -1,7 +1,7 @@
 ---
 id: TASK-106
 title: "Grant model and the ancestry hard gate on attach/monitor"
-status: draft
+status: complete
 parent: REQ-569
 created: 2026-08-11
 updated: 2026-08-11
@@ -29,13 +29,13 @@ this task alone is deliberately fail-closed for cross-session attach.
 
 ## Acceptance Criteria
 
-- [ ] A `Descendant` peer is refused attach AND monitor, before any session lookup, with `ATTACH_FORBIDDEN` — and receives no consent request of any kind.
-- [ ] `Indeterminate` fails closed (refused) and is logged distinguishably from `Descendant`.
-- [ ] A non-creator, non-granted connection is refused `NOT_GRANTED`; the creator's own attach is unchanged.
-- [ ] Monitor and attach scopes are independent — an attach grant does not enable monitor (dedicated test, per LESSON-495).
-- [ ] Refusals are asserted at the raw RPC surface, not through the CLI (BUG-155).
-- [ ] Mutation checks, each in isolation: inverting the ancestry gate fails the descendant test; inverting the grant check fails the non-creator test; making `may_monitor` read `may_attach` fails the scope-independence test. See each fail, restore.
-- [ ] `cargo test -p tetond --no-fail-fast` green.
+- [x] A `Descendant` peer is refused attach AND monitor, before any session lookup, with `ATTACH_FORBIDDEN` — and receives no consent request of any kind.
+- [x] `Indeterminate` fails closed (refused) and is logged distinguishably from `Descendant`.
+- [x] A non-creator, non-granted connection is refused `NOT_GRANTED`; the creator's own attach is unchanged.
+- [x] Monitor and attach scopes are independent — an attach grant does not enable monitor (dedicated test, per LESSON-495).
+- [x] Refusals are asserted at the raw RPC surface, not through the CLI (BUG-155).
+- [x] Mutation checks, each in isolation: inverting the ancestry gate fails the descendant test; inverting the grant check fails the non-creator test; making `may_monitor` read `may_attach` fails the scope-independence test. See each fail, restore.
+- [x] `cargo test -p tetond --no-fail-fast` green.
 
 ## Technical Notes
 
@@ -43,3 +43,33 @@ this task alone is deliberately fail-closed for cross-session attach.
 - Do not gate `session/list` here — TASK-105 owns its payload; the listing stays open.
 - REQ-568's `may_drive` gates (prompt/clear/web-override) are unchanged; this task adds the *attach* seam beneath them.
 - Grants are never derived from env, socket path, or filesystem state (BR-3) — the registry is only written by TASK-108's consent path and by session creation.
+
+## Outcome — what TASK-108 inherits
+
+The gate landed as specified and is fail-closed, so three behaviours that
+REQ-568 shipped are **deliberately shut on this branch** until the consent path
+mints grants. TASK-108 must reopen each, and each is asserted in its closed
+state today rather than left untested:
+
+1. **Cross-session attach.** Refused `NOT_GRANTED`. Pinned by
+   `multi_client::knowing_a_session_id_does_not_let_another_connection_attach`
+   and `e2e::ac_matrix::ac6_two_clients_share_sessions_daemon_survives_exit`.
+2. **The resume flow (BR-6).** Same refusal — a fresh client cannot rejoin a
+   session it did not create. `e2e::conversation_carry::client_bs_prompt_carries_
+   the_conversation_client_a_left_behind` (REQ-567 AC-9) is `#[ignore]`d with
+   that reason and its body left intact; deleting the `#[ignore]` is part of
+   TASK-108's AC-2/AC-3 evidence.
+3. **The `monitor` declaration.** Refused `NOT_GRANTED` at the handshake for
+   every connection, because nothing mints a monitor-scope grant. BR-2 and AC-4
+   ask for exactly this, but **no task in the current breakdown mints one**, so
+   as things stand REQ-569 ships `monitor` permanently unreachable. TASK-108 or
+   TASK-109 has to either add a monitor-scope consent path or record the
+   unavailability as an intended outcome — it should not be discovered at
+   wrap-up.
+
+Also landed, not in the original file list: `DaemonProcess` on `Daemon`, which
+names the process tree the ancestry gate excludes. Production constructors set
+`Own(std::process::id())`; `Daemon::new()` (the fixture constructor) is
+`Embedded`, because an in-process harness shares one pid with its clients and
+`Own` would classify every one of them as the daemon itself. Pinned by
+`server::tests::the_production_constructors_own_their_process`.

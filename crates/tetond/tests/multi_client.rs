@@ -1,15 +1,13 @@
-//! Integration test for AC-6, event scoping, and the handshake gate.
+//! Integration test for AC-6, event scoping, and the attach/handshake gates.
 //!
 //! Two clients attach over a real Unix socket, exchange the handshake, and
 //! observe: (1) a session created by one client appears identically in both
 //! clients' session lists; (2) a session-scoped event emitted by that creation
-//! reaches the creator but **not** the other, unattached client, and does reach
-//! it once it attaches (REQ-568 BR-1); and (3) the daemon and its sessions
-//! survive a client disconnecting — a fresh client can still attach to the
-//! surviving session. Further tests cover two clients each prompting a session
-//! of their own (AC-1), a connection that never attached anything
-//! (AC-2), the monitor declaration that opts a connection back into everything
-//! (BR-1, AC-3, ADR-C), the attachment gate on the mutating methods
+//! reaches the creator but **not** the other, unattached client (REQ-568 BR-1);
+//! and (3) the daemon and its sessions survive a client disconnecting — a fresh
+//! client still *sees* the surviving session in the listing. Further tests cover
+//! two clients each prompting a session of their own (AC-1), a connection that
+//! never attached anything (AC-2), the attachment gate on the mutating methods
 //! (BR-4/AC-4), the seq gaps a filtered stream necessarily has and the fenced
 //! response that must complete anyway (AC-6, ADR-A), and the refusal of any
 //! method before the handshake.
@@ -19,6 +17,29 @@
 //! was the leak written down as a feature. The registry stays shared — sessions
 //! outlive their creators and every client can list them — but the *events* are
 //! now scoped to the connections that asked for them.
+//!
+//! ## What REQ-569 inverted in turn
+//!
+//! REQ-568 left the *grant itself* — `session/attach`, and the `monitor`
+//! declaration — available to any handshaked same-UID peer, so scoping was a
+//! lock whose key was lying next to it. REQ-569 closes that, and this file is
+//! where the closure is asserted at the wire:
+//!
+//! - `knowing_a_session_id_does_not_let_another_connection_attach` — a peer that
+//!   read the id out of `session/list` is still refused `NOT_GRANTED`, while the
+//!   creator's own attach is untouched (BR-1/BR-8, AC-5/AC-8).
+//! - `a_monitor_declaration_is_refused_without_a_monitor_scope_grant` — replaces
+//!   REQ-568's test that a declaration alone bought sight of every session
+//!   (BR-2, AC-4).
+//! - `a_connection_from_the_daemons_own_process_tree_is_refused_attach_and_monitor`
+//!   — the ancestry gate, over the real kernel-attested peer pid (BR-4, ADR-A).
+//!
+//! Because nothing mints a grant until REQ-569 TASK-108's consent flow, the
+//! cross-session attaches the older tests performed are refused here rather than
+//! served. Where a test needed a second *attached* connection to make some other
+//! point, it now has that connection create its own session — attachment by
+//! creation is REQ-568's other route into the same set, and the gates below it
+//! cannot tell the two apart.
 //!
 //! ## How an absence is asserted here
 //!
@@ -410,18 +431,27 @@ async fn two_clients_share_sessions_and_daemon_survives_client_exit() {
     assert_eq!(session_ids(&list_a), vec![sid.clone()]);
     assert_eq!(session_ids(&list_b), session_ids(&list_a));
 
-    // BR-1, the other direction: attaching is the grant. Once B has attached,
-    // the session's events reach it — a `session/clear` issued by A, so B is
-    // purely a receiver and what it sees is delivery, not an echo of its own
-    // request.
+    // REQ-569 BR-1, the change this REQ is: attaching is no longer something a
+    // connection can help itself to. B knows the id — it just read it out of
+    // `session/list` — and that buys it nothing (BR-8: ids are names, grants
+    // are credentials).
     b.send(4, "session/attach", json!({"session_id": sid.clone()}))
         .await;
-    assert!(b.read_response(4).await.get("result").is_some());
+    let refused = b.read_response(4).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::NOT_GRANTED),
+        "a connection that created nothing must not attach on its own say-so: {refused}"
+    );
 
+    // And the refusal is real rather than cosmetic: A clears the session and
+    // the envelope does not reach B. Bounded by ordering, not a timer — B's
+    // forbidden-session arm fails any frame scoped to `sid`, and the
+    // daemon-scoped marker published afterwards is what proves B's stream was
+    // live through the window.
+    b.forbid_session(&sid);
     a.send(5, "session/clear", json!({"session_id": sid.clone()}))
         .await;
-    let cleared = b.read_event("context_cleared").await;
-    assert_eq!(cleared["params"]["session_id"].as_str().unwrap(), sid);
     assert!(a.read_response(5).await.get("result").is_some());
 
     // Client A exits. The daemon and its sessions must survive.
@@ -432,17 +462,32 @@ async fn two_clients_share_sessions_and_daemon_survives_client_exit() {
     let list_b_after = b.read_response(6).await;
     assert_eq!(session_ids(&list_b_after), vec![sid.clone()]);
 
-    // A fresh client can attach to the surviving session.
+    // A fresh client is refused the same way — the survival of the session is
+    // read off the listing above, not off an attach anyone could have.
+    //
+    // This is the resume flow, and it is *deliberately* closed here: REQ-569
+    // TASK-108 reopens it through an explicit consent step (BR-6), which is the
+    // only thing that may reopen it. Until then the honest state of this branch
+    // is that a fresh client cannot rejoin a session it did not create.
     let mut d = TestClient::connect(&path).await;
     assert!(d.handshake(1).await.get("result").is_some());
     d.send(2, "session/attach", json!({"session_id": sid}))
         .await;
-    let attached = d.read_response(2).await;
+    let refused_fresh = d.read_response(2).await;
     assert_eq!(
-        attached["result"]["session"]["session_id"]
-            .as_str()
-            .unwrap(),
-        sid
+        refused_fresh["error"]["code"].as_i64(),
+        Some(error_code::NOT_GRANTED),
+        "a fresh client holds no grant either: {refused_fresh}"
+    );
+
+    // The marker that closes B's window: D's handshake published a
+    // daemon-scoped `daemon_client_attach` *after* A's `context_cleared`, and
+    // one subscription is FIFO — so B reaching it having read no `sid`-scoped
+    // frame means the clear was filtered, not merely late.
+    let marker = b.read_event("daemon_client_attach").await;
+    assert!(
+        marker["params"].get("session_id").is_none(),
+        "the marker is the daemon-scoped envelope BR-2 keeps broadcasting: {marker}"
     );
 
     server_task.abort();
@@ -650,41 +695,223 @@ async fn a_client_that_never_attached_receives_only_daemon_scoped_envelopes() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// REQ-568 BR-1 / AC-3: a connection that declared `monitor` at the handshake
-/// receives another client's session-scoped events without ever attaching.
+/// REQ-569 BR-2: `monitor` is grant-gated with its own scope, so declaring it
+/// is refused — and the **handshake itself** fails.
 ///
-/// The opt-in half of the filter, at the socket. It is deliberately the *only*
-/// way back to the old behaviour: the declaration is a field the client had to
-/// send, so a monitor exists because someone asked for one.
+/// This inverts REQ-568's `a_monitor_declared_at_handshake_receives_another_
+/// clients_events`, which pinned the old behaviour: a declaration was enough,
+/// and any same-UID peer could ask for sight of every session on the machine.
+/// REQ-568 shipped that knowingly ("a monitor exists because someone asked for
+/// one"); REQ-569 is the REQ that says asking is not standing.
+///
+/// The load-bearing half is the *second* assertion. A daemon that answered the
+/// handshake with an error but went on treating the connection as handshaked —
+/// or that quietly set `monitor: false` and handed back a success — would pass
+/// a test that only looked at the error code, while leaving the client
+/// believing something untrue about what it can see. So the test asks the
+/// connection to do something only a handshaked connection may do, and requires
+/// it to be told the handshake never happened.
+///
+/// Nothing mints monitor grants yet (TASK-108 owns minting), so today this is
+/// every connection. That is the fail-closed posture BR-2 asks for, and it is
+/// stated here rather than left to be discovered.
 #[tokio::test]
-async fn a_monitor_declared_at_handshake_receives_another_clients_events() {
+async fn a_monitor_declaration_is_refused_without_a_monitor_scope_grant() {
     let path = temp_socket("monitor");
     let listener = server::bind_listener(&path).unwrap();
     let daemon = Arc::new(Daemon::new());
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut monitor = TestClient::connect(&path).await;
-    assert!(monitor
-        .handshake_declaring(1, true)
-        .await
-        .get("result")
-        .is_some());
+    let refused = monitor.handshake_declaring(1, true).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::NOT_GRANTED),
+        "a monitor declaration without a monitor-scope grant must be refused: {refused}"
+    );
 
-    let mut worker = TestClient::connect(&path).await;
-    assert!(worker.handshake(1).await.get("result").is_some());
+    // The handshake *failed*: not a success with `monitor` silently downgraded,
+    // and not a refusal the daemon then ignored. The connection is still
+    // pre-handshake, which is the only state that produces this answer.
+    monitor.send(2, "session/list", json!({})).await;
+    let before_handshake = monitor.read_response(2).await;
+    assert_eq!(
+        before_handshake["error"]["code"].as_i64(),
+        Some(error_code::INVALID_REQUEST),
+        "a refused monitor must not be left holding a working connection: {before_handshake}"
+    );
 
-    worker
+    // The positive control, in the same test: the identical handshake without
+    // the declaration succeeds. Without it, a daemon that refused every
+    // handshake would pass everything above.
+    let mut plain = TestClient::connect(&path).await;
+    assert!(
+        plain.handshake(1).await.get("result").is_some(),
+        "only the declaration is refused — an ordinary client still connects"
+    );
+    plain
         .send(
             2,
             "session/create",
             json!({"mode": "structured", "phase": "spec"}),
         )
         .await;
-    let created = worker.read_response(2).await;
-    let sid = created["result"]["session_id"].as_str().unwrap().to_owned();
+    assert!(plain.read_response(2).await["result"]["session_id"]
+        .as_str()
+        .is_some());
 
-    let event = monitor.read_event("phase_transition").await;
-    assert_eq!(event["params"]["session_id"].as_str().unwrap(), sid);
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REQ-569 BR-1/BR-8 at the raw RPC surface (AC-5/AC-8): knowing a session id
+/// does not enable attaching to it.
+///
+/// B learns the id exactly as any same-UID peer would — by asking
+/// `session/list`, which REQ-569 deliberately keeps open — and is still
+/// refused. That is the BR-8 claim in one test: ids are names, grants are
+/// credentials.
+///
+/// Three things are pinned beyond the refusal itself:
+///
+/// 1. **The creator is unaffected.** A's own attach to what it made still
+///    succeeds, so the gate discriminates on standing rather than just closing
+///    the method.
+/// 2. **No existence oracle.** A session that exists and a name that never did
+///    draw the *same* code, so B cannot confirm a guessed id by which refusal
+///    it drew (the reason the grant check precedes `sessions.get`).
+/// 3. **The refusal is not `NOT_ATTACHED`.** That code names `session/attach`
+///    as the remedy, and here `session/attach` is the thing being refused — a
+///    client folding the two together would loop.
+#[tokio::test]
+async fn knowing_a_session_id_does_not_let_another_connection_attach() {
+    let path = temp_socket("grant-attach");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut a = TestClient::connect(&path).await;
+    assert!(a.handshake(1).await.get("result").is_some());
+    a.send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let sid = a.read_response(2).await["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The creator's own attach: unchanged by REQ-569.
+    a.send(3, "session/attach", json!({"session_id": sid.clone()}))
+        .await;
+    let mine = a.read_response(3).await;
+    assert_eq!(
+        mine["result"]["session"]["session_id"].as_str(),
+        Some(sid.as_str()),
+        "the creator must still attach to what it created: {mine}"
+    );
+
+    let mut b = TestClient::connect(&path).await;
+    assert!(b.handshake(1).await.get("result").is_some());
+    b.send(2, "session/list", json!({})).await;
+    assert_eq!(
+        session_ids(&b.read_response(2).await),
+        vec![sid.clone()],
+        "the listing stays open — that is what makes this test mean something"
+    );
+
+    for (n, (case, target)) in [
+        ("a session that exists", sid.clone()),
+        ("a name no session ever had", "sess-imaginary".to_owned()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 3 + i64::try_from(n).unwrap();
+        b.send(id, "session/attach", json!({"session_id": target}))
+            .await;
+        let refused = b.read_response(id).await;
+        assert_eq!(
+            refused["error"]["code"].as_i64(),
+            Some(error_code::NOT_GRANTED),
+            "{case}: an ungranted attach must be refused: {refused}"
+        );
+    }
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REQ-569 BR-4 / ADR-A at the raw RPC surface: a connection whose process
+/// descends from the daemon's own is refused attach and monitor outright, with
+/// no consent path and no session lookup.
+///
+/// The ancestry here is **real**, not injected: the daemon is told its own
+/// process is this test process (`DaemonProcess::Own`), and the clients connect
+/// from that same process, so the kernel-attested peer pid genuinely resolves to
+/// a member of the daemon's process tree — the walk in `tetond::peer` runs for
+/// real over `getsockopt(LOCAL_PEERPID)` / `SO_PEERCRED`. It is the in-process
+/// analogue of the tool child AC-1 names; TASK-109 drives the genuine spawned
+/// descendant end to end.
+///
+/// `ATTACH_FORBIDDEN` rather than `NOT_GRANTED` is the assertion that pins the
+/// *ordering*. A descendant holds no grant either, so a daemon that ran the
+/// grant check first would refuse it too — and look correct — right up until
+/// TASK-108 puts a consent request in the `NOT_GRANTED` branch, at which point
+/// the daemon's own children would start being offered consent prompts.
+#[tokio::test]
+async fn a_connection_from_the_daemons_own_process_tree_is_refused_attach_and_monitor() {
+    let path = temp_socket("ancestry");
+    let listener = server::bind_listener(&path).unwrap();
+    let me = i32::try_from(std::process::id()).unwrap();
+    let daemon = Arc::new(Daemon::new().with_daemon_process(server::DaemonProcess::Own(me)));
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    // `session/create` is not gated — a daemon child may hold its own session,
+    // it just may never reach anyone else's. That is also how this test gets a
+    // real session id to aim at.
+    let mut owner = TestClient::connect(&path).await;
+    assert!(
+        owner.handshake(1).await.get("result").is_some(),
+        "a descendant that declares no monitor still handshakes"
+    );
+    owner
+        .send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let sid = owner.read_response(2).await["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut child = TestClient::connect(&path).await;
+    assert!(child.handshake(1).await.get("result").is_some());
+
+    for (n, (case, target)) in [
+        ("a session that exists", sid.clone()),
+        ("a name no session ever had", "sess-imaginary".to_owned()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 2 + i64::try_from(n).unwrap();
+        child
+            .send(id, "session/attach", json!({"session_id": target}))
+            .await;
+        let refused = child.read_response(id).await;
+        assert_eq!(
+            refused["error"]["code"].as_i64(),
+            Some(error_code::ATTACH_FORBIDDEN),
+            "{case}: a daemon descendant must be forbidden, not merely ungranted: {refused}"
+        );
+    }
+
+    // The monitor declaration, refused at the handshake and for the ancestry
+    // reason rather than the grant one.
+    let mut watcher = TestClient::connect(&path).await;
+    let refused = watcher.handshake_declaring(1, true).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::ATTACH_FORBIDDEN),
+        "a daemon descendant must not be able to declare monitor: {refused}"
+    );
 
     server_task.abort();
     let _ = std::fs::remove_file(&path);
@@ -754,25 +981,49 @@ async fn mutating_methods_are_refused_until_the_connection_attaches() {
         "an unattached clear must be refused: {refused_clear}"
     );
 
-    // Attachment is the grant, and it is the only thing that changed.
+    // REQ-569 BR-1: B cannot attach to A's session at all any more — knowing
+    // the id is not standing (asserted on its own in
+    // `knowing_a_session_id_does_not_let_another_connection_attach`). So the
+    // *served* half of this gate is shown on a session B is legitimately
+    // attached to: one it created, which attaches its creator (REQ-568 BR-1).
+    // The gate under test is `may_drive`, and what it reads is the attachment
+    // set — which route put the session in that set is not its business.
     b.send(5, "session/attach", json!({"session_id": sid.clone()}))
         .await;
-    assert!(b.read_response(5).await.get("result").is_some());
+    let refused_attach = b.read_response(5).await;
+    assert_eq!(
+        refused_attach["error"]["code"].as_i64(),
+        Some(error_code::NOT_GRANTED),
+        "B holds no grant for A's session: {refused_attach}"
+    );
 
-    b.send(6, "session/clear", json!({"session_id": sid})).await;
-    let cleared = b.read_response(6).await;
+    b.send(6, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let own = b.read_response(6).await["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(own, sid, "B's own session must be a different one");
+
+    b.send(7, "session/clear", json!({"session_id": own.clone()}))
+        .await;
+    let cleared = b.read_response(7).await;
     assert_eq!(
         cleared["result"]["blocks_dropped"].as_u64(),
         Some(0),
-        "after attaching, the clear is served: {cleared}"
+        "attached to its own session, the clear is served: {cleared}"
     );
 
-    b.send(7, "session/prompt", prompt).await;
-    let served = b.read_response(7).await;
+    let own_prompt = json!({
+        "session_id": own,
+        "prompt": [{"type": "text", "text": "what has this session been told?"}],
+    });
+    b.send(8, "session/prompt", own_prompt).await;
+    let served = b.read_response(8).await;
     assert_ne!(
         served["error"]["code"].as_i64(),
         Some(error_code::NOT_ATTACHED),
-        "after attaching, the prompt must reach the runtime: {served}"
+        "attached to its own session, the prompt must reach the runtime: {served}"
     );
     // Neither of the two refusals `spawn_prompt_turn` can issue *before* the
     // runtime. Ruling both out is what makes the transition mean "it was
@@ -830,17 +1081,33 @@ async fn web_override_is_refused_until_the_connection_attaches() {
         "an unattached web/override must be refused: {refused}"
     );
 
-    // Attachment is the grant, and the only thing that changes the answer.
+    // REQ-569 BR-1: B cannot attach to A's session, so the served half runs on
+    // a session B created — which attaches its creator (REQ-568 BR-1). The gate
+    // under test is `may_drive`, which reads the attachment set and does not
+    // care which route filled it.
     b.send(4, "session/attach", json!({"session_id": sid.clone()}))
         .await;
-    assert!(b.read_response(4).await.get("result").is_some());
+    let refused_attach = b.read_response(4).await;
+    assert_eq!(
+        refused_attach["error"]["code"].as_i64(),
+        Some(error_code::NOT_GRANTED),
+        "B holds no grant for A's session: {refused_attach}"
+    );
 
-    b.send(5, "web/override", json!({"session_id": sid})).await;
-    let served = b.read_response(5).await;
+    b.send(5, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let own = b.read_response(5).await["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(own, sid, "B's own session must be a different one");
+
+    b.send(6, "web/override", json!({"session_id": own})).await;
+    let served = b.read_response(6).await;
     assert_ne!(
         served["error"]["code"].as_i64(),
         Some(error_code::NOT_ATTACHED),
-        "after attaching, web/override must reach the runtime: {served}"
+        "attached to its own session, web/override must reach the runtime: {served}"
     );
 
     server_task.abort();
@@ -1110,27 +1377,33 @@ async fn session_list_omits_title_and_cwd_from_unattached_connections() {
         );
     }
 
-    // A monitor declared its interest in every session at the handshake, and
-    // that declaration is the same predicate the reduction reads — so it is not
-    // reduced, without `session/list` having to know what a monitor is.
-    let mut m = TestClient::connect(&path).await;
-    assert!(m.handshake_declaring(1, true).await.get("result").is_some());
-    m.send(2, "session/list", json!({})).await;
-    let (raw_m, listed_m) = m.read_response_raw(2).await;
-    assert_whole("a monitor", &raw_m, &listed_m, &sid, &jail_text);
-
-    // Attaching is the grant here exactly as it is for events: the same B, one
-    // `session/attach` later, gets the row it was just refused.
+    // B stays reduced for as long as it holds no grant, and REQ-569 means it
+    // cannot lift that on its own: the `session/attach` that used to be the
+    // whole story is refused (BR-1). The two gates compose the way they should —
+    // the reduction is not a second, weaker copy of the attach rule.
     b.send(3, "session/attach", json!({"session_id": sid.clone()}))
         .await;
-    assert!(b.read_response(3).await.get("result").is_some());
+    let refused = b.read_response(3).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::NOT_GRANTED),
+        "B cannot promote itself out of the reduced view: {refused}"
+    );
     b.send(4, "session/list", json!({})).await;
-    let (raw_b, listed_b) = b.read_response_raw(4).await;
-    assert_whole("an attached peer", &raw_b, &listed_b, &sid, &jail_text);
+    let (raw_still, listed_still) = b.read_response_raw(4).await;
+    let row_still = row_for(&listed_still, &sid);
+    assert!(
+        !row_still.as_object().unwrap().contains_key("title")
+            && !raw_still.contains(TITLE)
+            && !raw_still.contains(&jail_text),
+        "a refused attach must leave the view reduced: {raw_still}"
+    );
 
-    // And the creator, which never attached explicitly — `session/create` did
-    // it (REQ-568 BR-1). A reduction that keyed on "attached explicitly" would
-    // hide a client's own session from it.
+    // The positive control, and it is what keeps this test from passing for a
+    // daemon that reduced everyone: the creator, which never attached
+    // explicitly — `session/create` did it (REQ-568 BR-1) — sees the session
+    // whole. A reduction that keyed on "attached explicitly" would hide a
+    // client's own session from it.
     a.send(3, "session/list", json!({})).await;
     let (raw_a, listed_a) = a.read_response_raw(3).await;
     assert_whole("the creator", &raw_a, &listed_a, &sid, &jail_text);
