@@ -2,14 +2,18 @@
   "req": "REQ-569",
   "branch": "feat/REQ-569-session-attach-authorization",
   "startedAt": "2026-08-11T16:40:21Z",
-  "completed": false,
-  "currentPhase": 5,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5,
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -36,6 +40,26 @@
       "phase": 4,
       "name": "Implement",
       "completedAt": "2026-08-11T21:30:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (Reflect + Review)",
+      "completedAt": "2026-08-11T23:10:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-08-12T00:05:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-12T00:20:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-12T00:35:00Z"
     }
   ],
   "integrationBranch": "main",
@@ -49,7 +73,7 @@
       "prUrl": null,
       "prNumber": null,
       "prCreatedAt": null,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
@@ -75,6 +99,8 @@
     "dependencies": "REQ-568 shipped (b092367); BUG-161 fixed (886d13e) \u2014 both prerequisites satisfied on main before this branch was cut",
     "draftPrDeferred": "branch has no commits beyond origin/main at Step 0; PR creation deferred to Phase 2 once architecture artifacts land (LESSON-004)",
     "openQuestionsForArchitecture": "OQ-1 (grant mechanism), OQ-2 (dev/Linux posture), OQ-3 (grant persistence) \u2014 spec delegates all three to the architecture phase",
-    "architectureDecisions": "OQ-1 resolved: ancestry (NOT signatures/keychain \u2014 no runtime signing exists, dev builds unsigned). OQ-2 dissolved: mechanism is signing-independent so dev==release. OQ-3: grants daemon-lifetime in-memory. OQ-4 resolved by BR-10. AC-1 amended: keys on ancestry, not env."
+    "architectureDecisions": "OQ-1 resolved: ancestry (NOT signatures/keychain \u2014 no runtime signing exists, dev builds unsigned). OQ-2 dissolved: mechanism is signing-independent so dev==release. OQ-3: grants daemon-lifetime in-memory. OQ-4 resolved by BR-10. AC-1 amended: keys on ancestry, not env.",
+    "verifyOutcome": "6-agent review found a CONFIRMED CRITICAL (monitor self-mint, live PoC) + 2 High. Fix pass closed it but introduced 1 High + 3 Medium, caught by a second adversarial pass with live probes and fixed in bd85047. Lessons 504/505.",
+    "mergedAs": "0619e90 (PR #95), rebased onto main after REQ-570 spec landed"
   }
 }
