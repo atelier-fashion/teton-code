@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 use teton_core::config::WebTier;
+use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::events::{
     Event, PermissionOption, PermissionOptionKind, PermissionRequest, WebConsentDecided,
     WebConsentScope, OPTION_ID_ENABLE_PERMANENT,
@@ -98,7 +99,7 @@ pub enum RememberedGrant {
 }
 
 /// The per-tool policy table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionConfig {
     default: PermissionPolicy,
     per_tool: HashMap<String, PermissionPolicy>,
@@ -115,15 +116,15 @@ impl PermissionConfig {
     }
 
     /// Sensible coding defaults: read-only tools auto-allow, mutating tools ask.
+    ///
+    /// Since REQ-560 this is the [`PermissionLevel::Guarded`] table, and it is
+    /// spelled as a delegation rather than as a second copy of the same rows:
+    /// two constructors producing "the same" table is exactly the drift BR-15
+    /// exists to prevent, and the only way to be sure they agree is for there to
+    /// be one of them ([`table_for`]).
     #[must_use]
     pub fn coding_defaults() -> Self {
-        let mut cfg = Self::with_default(PermissionPolicy::Ask);
-        cfg.set("read", PermissionPolicy::Allow);
-        cfg.set("glob", PermissionPolicy::Allow);
-        cfg.set("grep", PermissionPolicy::Allow);
-        cfg.set("edit", PermissionPolicy::Ask);
-        cfg.set("shell", PermissionPolicy::Ask);
-        cfg
+        table_for(PermissionLevel::Guarded)
     }
 
     /// A config that allows every **local, jailed** tool — the offline demo
@@ -139,13 +140,15 @@ impl PermissionConfig {
     /// A machine that genuinely wants unprompted web lookups says so in config,
     /// with `[web] permission_allow`, which the daemon maps onto these same three
     /// keys — one member, one key.
+    ///
+    /// Since REQ-560 this is the [`PermissionLevel::Full`] table, delegating for
+    /// the same reason [`Self::coding_defaults`] does. Note what that makes true
+    /// of the level: `full` stops asking about `shell`, and still asks about the
+    /// web — because "allow every tool" must not quietly come to mean "and talk
+    /// to the internet without asking".
     #[must_use]
     pub fn permissive() -> Self {
-        let mut cfg = Self::with_default(PermissionPolicy::Allow);
-        for key in WEB_PERMISSION_KEYS {
-            cfg.set(key, PermissionPolicy::Ask);
-        }
-        cfg
+        table_for(PermissionLevel::Full)
     }
 
     /// Map `[web] permission_allow` onto the web consent keys (REQ-563 BR-3/BR-4).
@@ -170,16 +173,30 @@ impl PermissionConfig {
     /// config file behind it.
     ///
     /// It never *widens* the ceiling — `[web] tier` is checked before any prompt
-    /// exists to answer — and it is where REQ-560's named permission levels will
-    /// attach when they land: a level names a set of tiers, which is the shape
-    /// this already reads.
+    /// exists to answer.
+    ///
+    /// ## It relaxes an `ask`; it never overrules a `deny` (REQ-560 ADR-C)
+    ///
+    /// A listed tier is upgraded **only** when its key currently sits at
+    /// [`PermissionPolicy::Ask`]. A standing consent is an answer to a question,
+    /// and a level that has already refused to *ask* the question has not left
+    /// one for config to answer.
+    ///
+    /// Without this narrowing, a machine carrying `[web] permission_allow` would
+    /// punch a hole straight through [`PermissionLevel::Plan`] — the one level
+    /// whose entire promise is that nothing changes and nothing leaves — and it
+    /// would do so from a config file, silently, on a session the user had just
+    /// asked to be read-only. Every pre-REQ-560 case is unaffected, because
+    /// every level except `plan` leaves the web keys at `ask`.
     pub fn apply_web_permission(&mut self, allow: &[WebTier]) {
         for tier in allow {
             // `Off` has no key (config validation refuses it as a member, and
             // `permission_key_for` answers `None`), so an unmappable member
             // silently changes nothing rather than borrowing a neighbour's key.
             if let Some(key) = permission_key_for(*tier) {
-                self.set(key, PermissionPolicy::Allow);
+                if self.policy_for(key) == PermissionPolicy::Ask {
+                    self.set(key, PermissionPolicy::Allow);
+                }
             }
         }
     }
@@ -199,6 +216,98 @@ impl PermissionConfig {
 impl Default for PermissionConfig {
     fn default() -> Self {
         Self::coding_defaults()
+    }
+}
+
+/// The tools that read and change nothing — the **only** set any level
+/// enumerates by name (REQ-560 ADR-A).
+///
+/// Safe to enumerate because it is first-party and closed. Its complement — the
+/// set of tools that might change something — is open (every MCP server adds to
+/// it), and is never enumerated anywhere.
+const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep"];
+
+/// Expand a [`PermissionLevel`] into the policy table the gate enforces.
+///
+/// **This is the classifier** (REQ-560 BR-1, BR-15). One function, one
+/// exhaustive match, and the only place in the daemon where a level becomes
+/// policy. `coding_defaults()` and `permissive()` delegate here rather than
+/// holding their own rows, so there is no second table left to drift from.
+///
+/// ## How a level classifies a tool it has never heard of (REQ-560 OQ-2)
+///
+/// By its `default` policy, and never by name. MCP tool names are
+/// server-supplied and untrusted (ADR-003, ADR-009's residual), so a level that
+/// enumerated mutating tools could not cover them and would be wrong the moment
+/// a user registered a server. It does not have to: every name a level does not
+/// mention falls to `default`, and `default` **is** the level's answer to
+/// "something I do not recognise". So an MCP tool asks at `guarded` and `edits`,
+/// **denies at `plan`**, and allows at `full`.
+///
+/// That inverts the risk in the direction it should be inverted. Adding a tool
+/// to the tree without touching this function gets the conservative treatment at
+/// every level, rather than being silently unclassified. A new *read-only*
+/// first-party tool that nobody adds to [`READ_ONLY_TOOLS`] merely asks — a
+/// degradation, not a hole.
+///
+/// ## `full` is an allow-all table, not a skipped gate (REQ-560 BR-4)
+///
+/// Every level, including `full`, produces a table that
+/// [`PermissionGate::decide`] evaluates. There is no `if level == Full { skip }`
+/// anywhere, because a gate skipped when a flag is set is a guard whose
+/// condition names something unrelated to what it guards — it becomes a silent
+/// no-op the moment anything else moves that condition (LESSON-443).
+#[must_use]
+pub fn table_for(level: PermissionLevel) -> PermissionConfig {
+    match level {
+        // Byte-equal to the pre-REQ-560 `coding_defaults()`, including its
+        // redundant explicit `edit`/`shell` rows: BR-1 asks for byte-equality,
+        // not equivalence, and the rows also state the posture at the two tools
+        // users ask about rather than leaving it implied by the default.
+        PermissionLevel::Guarded => {
+            let mut cfg = PermissionConfig::with_default(PermissionPolicy::Ask);
+            allow_read_only(&mut cfg);
+            cfg.set("edit", PermissionPolicy::Ask);
+            cfg.set("shell", PermissionPolicy::Ask);
+            cfg
+        }
+        // The one row that separates this from `guarded`. `shell` stays asking,
+        // which is the whole request this level exists to answer: "stop asking
+        // me about every edit, but keep asking before you run a shell command".
+        PermissionLevel::Edits => {
+            let mut cfg = PermissionConfig::with_default(PermissionPolicy::Ask);
+            allow_read_only(&mut cfg);
+            cfg.set("edit", PermissionPolicy::Allow);
+            cfg.set("shell", PermissionPolicy::Ask);
+            cfg
+        }
+        // Deny-by-default with a read-only allowlist. `edit` and `shell` are
+        // *not* listed: they fall to the default, which is the point — listing
+        // them would suggest the denial comes from naming them, when it comes
+        // from not being on the read-only list. Web keys fall to the default
+        // too, so `plan` performs no egress.
+        PermissionLevel::Plan => {
+            let mut cfg = PermissionConfig::with_default(PermissionPolicy::Deny);
+            allow_read_only(&mut cfg);
+            cfg
+        }
+        // Byte-equal to the pre-REQ-560 `permissive()`. The three web keys stay
+        // asking: `full` is about tools this machine runs, and a web lookup is
+        // neither local nor jailed.
+        PermissionLevel::Full => {
+            let mut cfg = PermissionConfig::with_default(PermissionPolicy::Allow);
+            for key in WEB_PERMISSION_KEYS {
+                cfg.set(key, PermissionPolicy::Ask);
+            }
+            cfg
+        }
+    }
+}
+
+/// Set every read-only tool to `allow` — the one enumeration any level performs.
+fn allow_read_only(cfg: &mut PermissionConfig) {
+    for tool in READ_ONLY_TOOLS {
+        cfg.set(*tool, PermissionPolicy::Allow);
     }
 }
 
@@ -711,6 +820,173 @@ mod tests {
         permission_key_for, PERMISSION_KEY_FETCH_ANY_URL, PERMISSION_KEY_FETCH_USER_URL,
         PERMISSION_KEY_SEARCH,
     };
+
+    // ---- REQ-560: the level → table classifier -------------------------------
+
+    /// The expected table for every level, **spelled out here rather than
+    /// derived from the code under test** (REQ-560 AC-1).
+    ///
+    /// This is the point of the test. `coding_defaults()` and `permissive()` now
+    /// delegate to [`table_for`], so asserting `table_for(Guarded) ==
+    /// coding_defaults()` would be a tautology that catches nothing. Writing the
+    /// rows out by hand is what makes a change to the one table fail here — the
+    /// rows are the specification, and the code has to keep agreeing with them.
+    ///
+    /// `None` in the second slot means "this tool is not listed and must resolve
+    /// to the level's default".
+    fn expected_rows(level: PermissionLevel) -> (PermissionPolicy, Vec<(&'static str, PermissionPolicy)>) {
+        use PermissionPolicy::{Allow, Ask, Deny};
+        match level {
+            PermissionLevel::Guarded => (
+                Ask,
+                vec![
+                    ("read", Allow),
+                    ("glob", Allow),
+                    ("grep", Allow),
+                    ("edit", Ask),
+                    ("shell", Ask),
+                ],
+            ),
+            PermissionLevel::Edits => (
+                Ask,
+                vec![
+                    ("read", Allow),
+                    ("glob", Allow),
+                    ("grep", Allow),
+                    ("edit", Allow),
+                    ("shell", Ask),
+                ],
+            ),
+            PermissionLevel::Plan => (
+                Deny,
+                vec![
+                    ("read", Allow),
+                    ("glob", Allow),
+                    ("grep", Allow),
+                    ("edit", Deny),
+                    ("shell", Deny),
+                ],
+            ),
+            PermissionLevel::Full => (
+                Allow,
+                vec![
+                    ("read", Allow),
+                    ("edit", Allow),
+                    ("shell", Allow),
+                    (PERMISSION_KEY_FETCH_USER_URL, Ask),
+                    (PERMISSION_KEY_FETCH_ANY_URL, Ask),
+                    (PERMISSION_KEY_SEARCH, Ask),
+                ],
+            ),
+        }
+    }
+
+    #[test]
+    fn each_level_expands_to_its_documented_table() {
+        for level in PermissionLevel::ALL {
+            let table = table_for(*level);
+            let (default, rows) = expected_rows(*level);
+            for (tool, want) in rows {
+                assert_eq!(
+                    table.policy_for(tool),
+                    want,
+                    "{level}: `{tool}` should be {want:?}"
+                );
+            }
+            // An unlisted name resolves to the level's default — which is what
+            // makes the default the level's classification of the open set.
+            assert_eq!(
+                table.policy_for("a-tool-no-level-mentions"),
+                default,
+                "{level}: an unlisted tool should fall to the default"
+            );
+        }
+    }
+
+    /// The delegation itself, so a future edit that reintroduces a second copy
+    /// of these rows fails here rather than drifting quietly (REQ-560 BR-1).
+    #[test]
+    fn the_legacy_presets_are_exactly_the_guarded_and_full_levels() {
+        assert_eq!(
+            PermissionConfig::coding_defaults(),
+            table_for(PermissionLevel::Guarded)
+        );
+        assert_eq!(
+            PermissionConfig::permissive(),
+            table_for(PermissionLevel::Full)
+        );
+    }
+
+    /// REQ-560 AC-17, table half: driven off `ALL`, so a fifth level is covered
+    /// the moment it joins the array.
+    #[test]
+    fn every_level_answers_for_every_surface() {
+        for level in PermissionLevel::ALL {
+            let table = table_for(*level);
+            // Total: every tool name resolves to *some* policy, listed or not.
+            for tool in ["read", "edit", "shell", "", "wildly::unknown"] {
+                let _: PermissionPolicy = table.policy_for(tool);
+            }
+            assert!(!level.summary().is_empty());
+            assert!(level.denial_sentence("edit").contains(level.name()));
+        }
+    }
+
+    /// REQ-560 OQ-2: an MCP tool's name is server-supplied, so no level may
+    /// enumerate it — and none has to. The name below appears nowhere in the
+    /// daemon, which is exactly the point.
+    #[test]
+    fn an_unknown_server_supplied_tool_is_classified_by_the_levels_default() {
+        let unknown = "mcp__some_server__some_tool_nobody_declared";
+        assert_eq!(
+            table_for(PermissionLevel::Guarded).policy_for(unknown),
+            PermissionPolicy::Ask
+        );
+        assert_eq!(
+            table_for(PermissionLevel::Edits).policy_for(unknown),
+            PermissionPolicy::Ask
+        );
+        // Fail-closed at the level whose promise is that nothing changes.
+        assert_eq!(
+            table_for(PermissionLevel::Plan).policy_for(unknown),
+            PermissionPolicy::Deny
+        );
+        assert_eq!(
+            table_for(PermissionLevel::Full).policy_for(unknown),
+            PermissionPolicy::Allow
+        );
+    }
+
+    /// REQ-560 ADR-C: a standing config consent relaxes an `ask` and never
+    /// overrules a `deny`, so `[web] permission_allow` cannot punch through
+    /// `plan`.
+    #[test]
+    fn a_config_web_consent_relaxes_an_ask_but_never_a_deny() {
+        // Today's behaviour, unchanged: at `full` the web keys ask, and a listed
+        // tier upgrades its own key to allow.
+        let mut full = table_for(PermissionLevel::Full);
+        full.apply_web_permission(&[WebTier::FetchUserUrl]);
+        assert_eq!(
+            full.policy_for(PERMISSION_KEY_FETCH_USER_URL),
+            PermissionPolicy::Allow
+        );
+        // One member, one key — the neighbours are untouched.
+        assert_eq!(
+            full.policy_for(PERMISSION_KEY_FETCH_ANY_URL),
+            PermissionPolicy::Ask
+        );
+
+        // The new rule: `plan` denies web by default, and config cannot lift it.
+        let mut plan = table_for(PermissionLevel::Plan);
+        plan.apply_web_permission(&[WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search]);
+        for key in WEB_PERMISSION_KEYS {
+            assert_eq!(
+                plan.policy_for(key),
+                PermissionPolicy::Deny,
+                "`{key}` must stay denied at plan even with a standing consent"
+            );
+        }
+    }
 
     fn gate(config: PermissionConfig) -> (Arc<EventBus>, Arc<PendingPermissions>, PermissionGate) {
         let bus = Arc::new(EventBus::new());
@@ -1447,25 +1723,37 @@ mod tests {
     /// `[web] permission` that fanned onto all three keys, which made one durable
     /// answer about a pasted URL a durable answer about model-composed URLs and
     /// searches as well.
+    ///
+    /// **Base changed from `deny` to `ask` by REQ-560 (ADR-C).** The `deny` base
+    /// was a synthetic sentinel for "this row was not written", never a claim
+    /// that config may lift a denial — and since REQ-560 a standing consent
+    /// relaxes an `ask` and leaves a `deny` alone, so the sentinel had to become
+    /// a policy the mapping actually acts on. `ask` is also what every real
+    /// composition holds for these keys, so the test now starts from the
+    /// production precondition rather than from one that only existed here.
+    /// Every assertion about the *narrowness* — one member, one key, no non-web
+    /// tool touched — is unchanged, which is what this test is for. The new
+    /// deny-is-not-config's-to-lift rule is pinned separately by
+    /// [`a_config_web_consent_relaxes_an_ask_but_never_a_deny`].
     #[test]
     fn the_web_permission_config_maps_each_member_onto_exactly_its_own_key() {
         for tier in [WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search] {
             let listed = permission_key_for(tier).expect("every tier above off has a key");
-            let mut config = PermissionConfig::with_default(PermissionPolicy::Deny);
+            let mut config = PermissionConfig::with_default(PermissionPolicy::Ask);
             config.apply_web_permission(&[tier]);
             for key in WEB_PERMISSION_KEYS {
                 let expected = if key == listed {
                     PermissionPolicy::Allow
                 } else {
-                    // Untouched — which for a `Deny` default means `Deny`, and
-                    // is the point: this mapping writes one row, not three.
-                    PermissionPolicy::Deny
+                    // Untouched — which for an `Ask` default means `Ask`, and is
+                    // the point: this mapping writes one row, not three.
+                    PermissionPolicy::Ask
                 };
                 assert_eq!(config.policy_for(key), expected, "{tier:?} -> {key}");
             }
             assert_eq!(
                 config.policy_for("shell"),
-                PermissionPolicy::Deny,
+                PermissionPolicy::Ask,
                 "a web config value reached a non-web tool"
             );
         }
@@ -1478,7 +1766,7 @@ mod tests {
         }
 
         // Every member is honoured when several are listed.
-        let mut all = PermissionConfig::with_default(PermissionPolicy::Deny);
+        let mut all = PermissionConfig::with_default(PermissionPolicy::Ask);
         all.apply_web_permission(&[WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search]);
         for key in WEB_PERMISSION_KEYS {
             assert_eq!(all.policy_for(key), PermissionPolicy::Allow, "{key}");

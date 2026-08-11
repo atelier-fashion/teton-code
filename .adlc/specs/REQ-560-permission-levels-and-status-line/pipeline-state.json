@@ -4,13 +4,37 @@
   "startedAt": "2026-08-11T00:00:00Z",
   "completed": false,
   "currentPhase": 4,
-  "completedPhases": [0, 1, 2, 3],
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
   "integrationBranch": "main",
   "phaseHistory": [
-    { "phase": 0, "name": "Create Worktree + Preflight", "completedAt": "2026-08-11T00:00:00Z" },
-    { "phase": 1, "name": "Validate Spec", "completedAt": "2026-08-11T00:00:00Z", "result": "APPROVED" },
-    { "phase": 2, "name": "Architect & Tasks", "completedAt": "2026-08-11T00:00:00Z", "result": "7 ADRs, 9 tasks" },
-    { "phase": 3, "name": "Validate Architecture & Tasks", "completedAt": "2026-08-11T00:00:00Z", "result": "APPROVED — all 17 ACs covered, DAG linear/acyclic" }
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-08-11T00:00:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "APPROVED"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "7 ADRs, 9 tasks"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "APPROVED \u2014 all 17 ACs covered, DAG linear/acyclic"
+    }
   ],
   "repos": {
     "teton-code": {
@@ -27,14 +51,19 @@
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
+  "mergeOrder": [
+    "teton-code"
+  ],
   "phase4": {
-    "currentTask": null,
-    "completedTasks": [],
+    "currentTask": "TASK-003",
+    "completedTasks": [
+      "TASK-001",
+      "TASK-002"
+    ],
     "failedTasks": []
   },
   "blockers": [],
   "notes": [
-    "Subagent mode (/sprint pipeline-runner). Orchestrator merge override: STOP after Phase 7, report pr-ready. Do NOT self-merge — overlapping footprint with REQ-559 (COMMANDS table, CLI status/session surface)."
+    "Subagent mode (/sprint pipeline-runner). Orchestrator merge override: STOP after Phase 7, report pr-ready. Do NOT self-merge \u2014 overlapping footprint with REQ-559 (COMMANDS table, CLI status/session surface)."
   ]
 }

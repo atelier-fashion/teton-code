@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 title: "table_for: the one function that turns a level into a policy table"
-status: pending
+status: complete
 parent: REQ-560
 created: 2026-08-11
 updated: 2026-08-11
