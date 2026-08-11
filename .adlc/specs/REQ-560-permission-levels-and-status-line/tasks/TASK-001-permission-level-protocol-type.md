@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 title: "PermissionLevel in teton-protocol: the level's shared identity"
-status: pending
+status: complete
 parent: REQ-560
 created: 2026-08-11
 updated: 2026-08-11
