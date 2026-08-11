@@ -506,6 +506,41 @@ mod tests {
         let _ = AcceptingVerifier::new(AttestationMethod::None);
     }
 
+    /// The seam is unreachable without the master switch, on any build.
+    ///
+    /// This is the claim the `TETON_PRESENCE_ACCEPT` seam's safety rests on, so
+    /// it is asserted rather than argued: with `TETON_TEST_SEAMS` unset — which
+    /// is every real run, and every run of this suite — the accepting double is
+    /// not selected no matter what the presence variable says.
+    ///
+    /// The release-build half of the contract (a release build *refuses to
+    /// start* when the master switch is set) belongs to `runtime::seam_policy`
+    /// and is tested there; what matters here is that this seam sits behind that
+    /// same switch rather than beside it.
+    #[test]
+    fn the_presence_seam_is_unreachable_without_the_master_switch() {
+        // The suite never sets TETON_TEST_SEAMS in-process; the acceptance suite
+        // sets it on a spawned daemon. So this is the ordinary path.
+        assert!(
+            !crate::runtime::test_seams_enabled(),
+            "this assertion is only meaningful with the master switch off"
+        );
+        assert!(
+            seam_verifier().is_none(),
+            "no seam verifier may be selected without the master switch"
+        );
+
+        // And with the switch off, the presence variable alone changes nothing.
+        std::env::set_var("TETON_PRESENCE_ACCEPT", "1");
+        let selected = seam_verifier().is_none();
+        std::env::remove_var("TETON_PRESENCE_ACCEPT");
+        assert!(
+            selected,
+            "TETON_PRESENCE_ACCEPT must do nothing on its own — it rides the \
+             master switch, it does not bypass it"
+        );
+    }
+
     #[test]
     fn the_wire_spellings_are_stable() {
         assert_eq!(AttestationMethod::OsBiometric.as_str(), "os_biometric");

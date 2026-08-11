@@ -3242,11 +3242,6 @@ mod tests {
         Arc::new(Daemon::new().with_consent_timeout(TEST_CONSENT_WINDOW))
     }
 
-    /// A session created by `conn`, for fixtures that need a real id.
-    fn session_id_of(daemon: &Daemon, conn: &ConnState) -> SessionId {
-        seed_created_session(daemon, conn)
-    }
-
     /// Register `conn` as a consent surface and return the channel a prompt
     /// routed to it would arrive on.
     ///
@@ -3326,8 +3321,7 @@ mod tests {
     async fn an_unattested_self_approval_mints_nothing() {
         let daemon = daemon_with_short_consent_unattested();
         let requester = unattached(&daemon);
-        let prompts = as_surface(&daemon, &requester);
-        let target = session_id_of(&daemon, &requester);
+        let _prompts = as_surface(&daemon, &requester);
 
         // BR-6 arm 2: nothing is attached to the target, so the requester is
         // handed its own prompt. The fixture is only meaningful if that is the
@@ -3366,11 +3360,11 @@ mod tests {
             daemon.attestations.is_empty(),
             "AC-6: and no attestation may be left behind either"
         );
-        assert!(
-            !target.to_string().is_empty(),
-            "the fixture's session id is real"
+        assert_eq!(
+            daemon.consents.pending_count(),
+            1,
+            "and the prompt is left standing for whoever may rightfully answer it"
         );
-        drop(prompts);
     }
 
     /// **AC-6.** Each ending mints nothing and leaves both registries empty.

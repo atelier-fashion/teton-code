@@ -403,3 +403,69 @@ failure.
 - **A ptrace-capable same-UID adversary remains out of model**, and this REQ
   leans on that for nothing (the spec is explicit that REQ-569's framing of this
   was found misleading).
+
+
+---
+
+## 8. Verify-phase findings (Phase 5)
+
+Run inline over the delivered diff. Two were fixed in place; the rest are
+recorded because they outlive this REQ.
+
+**Fixed during verify:**
+
+- `an_unattested_self_approval_mints_nothing` seeded a session and asserted its
+  id was non-empty. The route under test (`requester_itself`) references no
+  session, so both were dead weight asserting nothing. Replaced with the
+  assertion that actually matters and was missing: the refused prompt is left
+  **standing** (`pending_count == 1`), so a failed presence check cannot be used
+  to cancel somebody else's consent.
+- The `TETON_PRESENCE_ACCEPT` seam's safety was argued in prose but not
+  asserted. Now guarded by
+  `the_presence_seam_is_unreachable_without_the_master_switch`, which proves the
+  variable does nothing on its own — it rides the master switch rather than
+  bypassing it.
+
+**Open — needs a human decision (see §9).** AC-3 as written cannot be satisfied
+by any automated test.
+
+**Reported, not fixed:** `model/list` and `model/status` also take no connection
+context. They are **out of scope by the spec's own wording** ("Daemon-wide
+methods beyond the seven BUG-162 enumerates"), and both are read-only status
+reads, so the omission is deliberate rather than missed. Worth a follow-up audit
+of the whole dispatch table, which the spec also names as separate work.
+
+## 9. The AC-3 contradiction — unresolved, and needs a product decision
+
+AC-3 requires:
+
+> A user resuming their own session in a fresh CLI succeeds with exactly one
+> visible consent step, end to end through the shipped client — **no
+> test-harness auto-consent anywhere in the path.**
+
+This cannot be satisfied by an automated test, and the reason is the REQ's own
+thesis. BR-2 requires a mechanism "a headless same-UID process cannot satisfy
+without a human acting at the machine". CI *is* a headless process. So any
+automated proof that the granted path works end to end requires exactly the
+test-harness auto-consent AC-3 forbids — the criterion asks for a machine to
+demonstrate that a machine cannot do something, by doing it.
+
+The implementation currently resolves this by adding `TETON_PRESENCE_ACCEPT`
+behind the existing `TETON_TEST_SEAMS` master switch (a release build refuses to
+start when it is set, so the seam does not exist in the shipped artifact). That
+keeps the acceptance suite meaningful and is release-safe, but it is
+**literally** the thing AC-3's last clause rules out.
+
+Three ways out, none of which should be chosen unilaterally:
+
+1. **Amend AC-3** to "no auto-consent in any shipped build", which is what the
+   seam already guarantees and is mechanically checkable.
+2. **Accept a manual acceptance step** — a human runs the resume flow once on a
+   macOS build with `--features presence` and records it, the way ADR-008's
+   grant-survival criterion is only observable at the second signed release.
+3. **Split AC-3**: the daemon-side flow is asserted with the seam; the "one
+   visible consent step" claim is verified manually.
+
+Option 1 plus a recorded manual pass (option 2) is the combination this
+architecture would recommend, but AC-3 is a product statement about what the
+project is willing to claim it has verified, so it is left open here.
