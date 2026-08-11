@@ -118,6 +118,7 @@ use teton_protocol::methods::{
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
     SessionClearParams, SessionClearResult, TierRouteView, WebOverrideParams, WebOverrideResult,
     WebRefreshOutcome, WebRefreshParams, WebRefreshResult, WebTotalsView,
+    SessionPermissionsParams, SessionPermissionsResult,
 };
 use teton_protocol::{
     BindingSource, ConfigurableCategory as ProtoConfigurableCategory, Phase as ProtoPhase,
@@ -1482,6 +1483,11 @@ impl DaemonRuntime {
         // --- MCP servers (ADR-003 / AC-9): the main TOML config is the source of
         // truth; TETON_MCP_CONFIG is a test-only override (see `load_mcp_servers`).
         let mcp_servers = load_mcp_servers(&config);
+        // REQ-560: read before `config` is moved into the mutex. The level is
+        // session-scoped from here on — nothing writes back — so a config edit
+        // changes what the *next* daemon start seeds sessions with, never a
+        // running one.
+        let default_permission_level = config.permissions.default_level;
 
         Ok(Self {
             config: Mutex::new(config),
@@ -1495,7 +1501,7 @@ impl DaemonRuntime {
             scripted_engine,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
-            default_permission_level: PermissionLevel::default(),
+            default_permission_level,
             mcp_servers,
             probe: Some(probe),
             turn_counter: AtomicU64::new(0),
@@ -3486,6 +3492,55 @@ impl DaemonRuntime {
     /// `web_overrides` row beside the `web_lookups` rows it re-enables. Written
     /// only on the transition, for the same reason the event is: a re-override
     /// removed nothing.
+    /// Read or set a session's permission level (REQ-560 ADR-D).
+    ///
+    /// `params.level` is `None` for a read and `Some(l)` for a set; either way
+    /// the answer is the level now in force, so a client's rendered status row
+    /// cannot drift from the daemon's actual posture.
+    ///
+    /// ## It writes nothing (BR-6)
+    ///
+    /// The level lives on the session's [`PermissionGate`] and nowhere else.
+    /// There is deliberately no path from here to `self.config` or to the config
+    /// file: a `full` that survived a restart would remove a guardrail invisibly,
+    /// in a session the user does not remember configuring. Every new session is
+    /// seeded from `[permissions] default_level` again.
+    ///
+    /// ## A session that has not run a turn yet
+    ///
+    /// The gate is created lazily by [`Self::permission_gate_for`], on the first
+    /// thing that needs one. Setting a level before then has to create it, or the
+    /// set would be silently discarded and the *next* turn would build a gate at
+    /// the configured default — the user's typed instruction quietly undone. So
+    /// this resolves the gate the same way a turn does.
+    /// The level a **new** session is seeded with — `[permissions] default_level`
+    /// as it stood when the daemon started (REQ-560).
+    ///
+    /// Read-only on purpose: nothing in the daemon writes it back, which is what
+    /// makes BR-6's "the level persists nothing" checkable rather than merely
+    /// stated.
+    #[must_use]
+    pub fn default_permission_level(&self) -> PermissionLevel {
+        self.default_permission_level
+    }
+
+    pub fn session_permissions(
+        self: &Arc<Self>,
+        params: &SessionPermissionsParams,
+    ) -> SessionPermissionsResult {
+        let events = Arc::new(EventBus::new());
+        let config = self.config.lock().expect("config mutex poisoned").clone();
+        let gate = self.permission_gate_for(&params.session_id, &events, &config);
+        let changed = params.level.is_some_and(|level| gate.set_level(level));
+        SessionPermissionsResult {
+            // Read back from the gate rather than echoing the request: the gate
+            // is the authority, and echoing would report a success the gate
+            // might not have performed.
+            level: gate.level().unwrap_or_default(),
+            changed,
+        }
+    }
+
     pub fn web_override(
         &self,
         params: &WebOverrideParams,
@@ -8877,6 +8932,7 @@ provider_id = "on-device"
             privacy: teton_core::PrivacyConfig::default(),
             web: teton_core::WebConfig::default(),
             lifetime: teton_core::LifetimeConfig::default(),
+            permissions: teton_core::PermissionsConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -9192,6 +9248,7 @@ provider_id = "on-device"
             privacy: teton_core::PrivacyConfig::default(),
             web: teton_core::WebConfig::default(),
             lifetime: teton_core::LifetimeConfig::default(),
+            permissions: teton_core::PermissionsConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),

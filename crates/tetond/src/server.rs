@@ -105,6 +105,7 @@ use teton_protocol::events::{
 };
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
+use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, AttachConsentResult, ConfigGetParams,
     ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams, ModelConfirmParams,
@@ -112,6 +113,7 @@ use teton_protocol::methods::{
     PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod, SessionAttachParams,
     SessionAttachResult, SessionClearParams, SessionCreateParams, SessionCreateResult,
     SessionListParams, SessionListResult, SessionSummary, WebOverrideParams, WebRefreshParams,
+    SessionPermissionsParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
@@ -1744,6 +1746,9 @@ fn dispatch(
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, id)),
         WebOverrideParams::METHOD => Some(handle_web_override(daemon, conn, id, params)),
+        SessionPermissionsParams::METHOD => {
+            Some(handle_session_permissions(daemon, conn, id, params))
+        }
         WebRefreshParams::METHOD => Some(handle_web_refresh(daemon, id, params)),
         _ => Some(error_string(
             id,
@@ -1777,6 +1782,37 @@ fn handle_web_override(daemon: &Daemon, conn: &ConnState, id: Id, params: Value)
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
     ok_string(id, &daemon.runtime.web_override(&params, &daemon.events))
+}
+
+/// Read or set a session's permission level (`session/permissions`, REQ-560
+/// ADR-D).
+///
+/// **This function is the entire path to a session's level.** The setter behind
+/// it is reached through the runtime, and tool dispatch holds a `ToolContext`
+/// rather than a `DaemonRuntime` — so a model that emits a tool call named
+/// `session/permissions`, or a tool result containing the text
+/// `/permissions full`, reaches the tool registry, finds no such tool, and is
+/// told so. The requirement's "never inferable from model output, tool output,
+/// or file content" is a fact about which channel this code hangs off, not a
+/// check that could be omitted.
+///
+/// Gated on attachment exactly as `web/override` is, and for the same reason:
+/// changing what a session is allowed to run is driving that session. The check
+/// sits before the runtime is touched, so an unattached caller cannot read a
+/// session's existence out of which refusal it got (ADR-B).
+///
+/// A read (`level: None`) is gated identically. Reading a session's posture is
+/// still reading that session, and splitting the gate would make the refusal an
+/// oracle for which sessions exist.
+fn handle_session_permissions(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: SessionPermissionsParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    ok_string(id, &daemon.runtime.session_permissions(&params))
 }
 
 /// Evict a cached document so the next lookup re-fetches (`web/refresh`,
@@ -4742,6 +4778,178 @@ mod tests {
     /// runtime's classifier, not a replacement for it, so an attached id still
     /// gets the runtime's `UNKNOWN_SESSION`. A gate that had swallowed that
     /// answer would pass every other assertion here.
+    #[test]
+    fn dispatch_routes_session_permissions_and_tells_attached_from_unattached() {
+        let daemon = Daemon::new();
+        let conn = unattached(&daemon);
+        let created = handle_session_create(
+            &daemon,
+            &conn,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        let session = created_session_id(&created);
+
+        // A bare read reports the configured default and changes nothing.
+        let read = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(2),
+            SessionPermissionsParams::METHOD,
+            serde_json::json!({"session_id": session.to_string()}),
+        )
+        .unwrap();
+        assert!(
+            !read.contains("-32601"),
+            "the method must be routed, not rejected as unknown: {read}"
+        );
+        assert!(read.contains("\"level\":\"guarded\""), "{read}");
+        assert!(
+            read.contains("\"changed\":false"),
+            "a read is never a change: {read}"
+        );
+
+        // A set reports the new level and that it changed.
+        let set = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(3),
+            SessionPermissionsParams::METHOD,
+            serde_json::json!({"session_id": session.to_string(), "level": "full"}),
+        )
+        .unwrap();
+        assert!(set.contains("\"level\":\"full\""), "{set}");
+        assert!(set.contains("\"changed\":true"), "{set}");
+
+        // Setting the level it already holds is not a change — so a CLI
+        // confirmation cannot announce something that did not happen.
+        let again = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(4),
+            SessionPermissionsParams::METHOD,
+            serde_json::json!({"session_id": session.to_string(), "level": "full"}),
+        )
+        .unwrap();
+        assert!(again.contains("\"changed\":false"), "{again}");
+
+        // An unknown level is invalid params, not a silent fallback to a
+        // posture nobody chose.
+        let bogus = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(5),
+            SessionPermissionsParams::METHOD,
+            serde_json::json!({"session_id": session.to_string(), "level": "unrestricted"}),
+        )
+        .unwrap();
+        assert!(
+            bogus.contains(&error_code::INVALID_PARAMS.to_string()),
+            "an unknown level must be refused: {bogus}"
+        );
+        // …and it left the session where it was.
+        let after = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(6),
+            SessionPermissionsParams::METHOD,
+            serde_json::json!({"session_id": session.to_string()}),
+        )
+        .unwrap();
+        assert!(after.contains("\"level\":\"full\""), "{after}");
+
+        // Not attached: refused before the runtime, and refused *identically*
+        // for a session that exists and one that does not — the pair is the
+        // assertion, since two different codes here would be the existence
+        // oracle ADR-B refuses to build. Reads are gated too: reading a
+        // session's posture is still reading that session.
+        let stranger = unattached(&daemon);
+        for target in [session.to_string(), "sess-nonexistent".to_owned()] {
+            for body in [
+                serde_json::json!({"session_id": target}),
+                serde_json::json!({"session_id": target, "level": "plan"}),
+            ] {
+                let refused = dispatch(
+                    &daemon,
+                    &stranger,
+                    Id::Number(7),
+                    SessionPermissionsParams::METHOD,
+                    body,
+                )
+                .unwrap();
+                assert!(
+                    refused.contains(&error_code::NOT_ATTACHED.to_string()),
+                    "`{target}` unattached must be refused: {refused}"
+                );
+                assert!(
+                    !refused.contains("\"level\""),
+                    "a refused call must not report a level: {refused}"
+                );
+            }
+        }
+    }
+
+    /// REQ-560 BR-6: the level is session-scoped and **writes nothing**.
+    ///
+    /// Asserted two ways, because the requirement has two halves: a second
+    /// session in the same daemon starts at the configured default rather than
+    /// inheriting the first's level, and the daemon's config is byte-identical
+    /// afterwards. AC-6's full restart leg lives in the piped e2e; this is the
+    /// in-process half that pins the write path itself.
+    #[test]
+    fn a_level_set_in_one_session_reaches_neither_config_nor_the_next_session() {
+        let daemon = Daemon::new();
+        let conn = unattached(&daemon);
+        let before = daemon.runtime.default_permission_level();
+
+        let first = created_session_id(&handle_session_create(
+            &daemon,
+            &conn,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        ));
+        let set = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(2),
+            SessionPermissionsParams::METHOD,
+            serde_json::json!({"session_id": first.to_string(), "level": "full"}),
+        )
+        .unwrap();
+        assert!(set.contains("\"level\":\"full\""), "{set}");
+
+        // A second session in the same daemon is seeded from config, not from
+        // its neighbour.
+        let second = created_session_id(&handle_session_create(
+            &daemon,
+            &conn,
+            Id::Number(3),
+            serde_json::json!({"mode": "freeform"}),
+        ));
+        let read = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(4),
+            SessionPermissionsParams::METHOD,
+            serde_json::json!({"session_id": second.to_string()}),
+        )
+        .unwrap();
+        assert!(
+            read.contains("\"level\":\"guarded\""),
+            "a new session inherited its neighbour's level: {read}"
+        );
+
+        // And the daemon's own seed — what `[permissions] default_level`
+        // became at startup — is untouched, so the next session (and the next
+        // daemon start) is unaffected by what this one typed.
+        assert_eq!(
+            before,
+            daemon.runtime.default_permission_level(),
+            "a session-scoped level reached the daemon's configured default"
+        );
+        assert_eq!(before, PermissionLevel::Guarded);
+    }
+
     #[test]
     fn dispatch_routes_session_clear_and_tells_attached_from_unattached() {
         let daemon = Daemon::new();

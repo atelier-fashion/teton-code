@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 title: "default_permission_level config plus the session/permissions RPC"
-status: pending
+status: complete
 parent: REQ-560
 created: 2026-08-11
 updated: 2026-08-11

@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::effort::{EffortLevel, ResolvedEffort};
+use crate::permissions::PermissionLevel;
 use crate::events::{
     CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource, WebTier,
 };
@@ -1250,6 +1251,53 @@ impl RpcMethod for WebOverrideParams {
     type Result = WebOverrideResult;
 }
 
+/// Read or set a session's permission level (REQ-560, ADR-D).
+///
+/// One method for both because they are one question asked two ways, and because
+/// a set that did not return the resulting level would let a client's rendered
+/// status row drift from the daemon's actual posture. `level: None` reads;
+/// `Some(l)` sets and reads back.
+///
+/// Like [`WebOverrideParams`], this is a **client** RPC and never a harness
+/// tool, and that placement is the enforcement rather than a convention: tool
+/// dispatch and the client socket are structurally distinct channels, so a model
+/// that emits a tool call named `session/permissions` — or tool output
+/// containing the text `/permissions full` — reaches nothing at all. Permission
+/// posture is not inferable from model output, tool output, or file content;
+/// only the session user can change it, by typing.
+///
+/// It carries a `session_id` because the level is session-scoped state and the
+/// daemon holds many sessions. A second client attached to the same session sees
+/// a level set by the first — the level lives on the daemon's per-session gate,
+/// which is the surface-parity rule (REQ-544 BR-4) working as intended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPermissionsParams {
+    /// The session whose level is being read or set.
+    pub session_id: SessionId,
+    /// The level to set, or `None` to read the current one without changing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<PermissionLevel>,
+}
+
+/// Result of [`SessionPermissionsParams`] — always the level now in force.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPermissionsResult {
+    /// The session's permission level after this call.
+    pub level: PermissionLevel,
+    /// Whether this call changed it.
+    ///
+    /// A read is never a change, and setting the level a session already holds
+    /// is not one either. The distinction keeps a confirmation honest — the same
+    /// reason [`WebOverrideResult::was_restricted`] exists — so the CLI can say
+    /// "already at full" instead of announcing a change that did not happen.
+    pub changed: bool,
+}
+
+impl RpcMethod for SessionPermissionsParams {
+    const METHOD: &'static str = "session/permissions";
+    type Result = SessionPermissionsResult;
+}
+
 /// Evict a cached document so the next lookup of that URL re-fetches (BR-12's
 /// explicit-refresh clause, AC-10).
 ///
@@ -2180,6 +2228,7 @@ mod tests {
         assert_eq!(ModelSetParams::METHOD, "model/set");
         assert_eq!(ModelStatusParams::METHOD, "model/status");
         assert_eq!(WebOverrideParams::METHOD, "web/override");
+        assert_eq!(SessionPermissionsParams::METHOD, "session/permissions");
         assert_eq!(WebRefreshParams::METHOD, "web/refresh");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
