@@ -1,7 +1,7 @@
 ---
 id: REQ-569
 title: "Session attach requires a grant: closing the same-UID ambient-attach path"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-11
 updated: 2026-08-11
