@@ -26,6 +26,7 @@ closed.
   - On `Granted` → mint the grant, then attach. On `Denied` / timeout / dropped waiter → refuse with the distinct BR-5 code and publish `attach_refused` with a stable reason (`no_grant` / `consent_denied` / `consent_timeout`).
   - The await must not block the reader loop (the `session/prompt` precedent: run it so `attach/consent` can still be read on the same or another connection — otherwise the flow deadlocks awaiting a reply it cannot read).
 - `crates/teton-protocol/src/jsonrpc.rs` — `CONSENT_DENIED` and `CONSENT_TIMEOUT` codes (BR-5's third and fourth distinct reasons), doc-commented.
+- **Monitor-scope consent (BR-2/AC-4) — added 2026-08-11 after TASK-106 reported that nothing mints a monitor grant.** Without this, REQ-569 ships `monitor` permanently unreachable, which is a regression against REQ-568, not a security posture. `do_handshake`'s monitor branch (currently refusing `NOT_GRANTED` for everyone) raises a `Monitor`-scope consent request. **Routing rule, deliberately narrower than attach's:** monitor consent is offered **only** to connections already attached to some session — a monitor is a whole-daemon read capability, so it is approved by a surface the user demonstrably already owns, never self-rendered by the requester. If no connection is attached anywhere, monitor is refused (`NOT_GRANTED`) rather than self-approved. This does not weaken BR-6, which is about the *resume* flow for attach, not monitor. Ancestry still precedes everything: a descendant is refused `ATTACH_FORBIDDEN` and no consent is raised. Note the handshake now awaits a bounded consent; make sure that await cannot wedge the accept loop for other connections.
 - Tests: consent granted → attach succeeds and REQ-568 delivery applies; denied → refused, no grant left behind; timeout → refused within the bounded window, `attach_refused` emitted with the timeout reason, **and the registry has no residual entry** (BR-7/LESSON-501 — the decision travels with the grant; assert the absence, do not assume it).
 
 ## Acceptance Criteria
@@ -35,7 +36,9 @@ closed.
 - [ ] Timeout resolves to denied within the bounded window and emits `attach_refused` with the timeout reason code (AC-6).
 - [ ] A descendant peer never reaches this flow at all — no consent event is published for it (asserted; TASK-106's gate precedes this).
 - [ ] Consent-request ids are minted daemon-wide and `resolve` refuses to overwrite (LESSON-503/BUG-161 shape not reintroduced) — dedicated test.
-- [ ] The reader loop stays responsive while a consent is pending (a second request on the same connection is still served).
+- [ ] The reader loop stays responsive while a consent is pending (a second request on the same connection is still served), and a pending monitor consent in `do_handshake` does not wedge the accept loop for other connections.
+- [ ] **Monitor is reachable again (BR-2/AC-4):** a monitor-scope consent granted by an already-attached connection produces a working monitor; refused/absent-approver leaves it `NOT_GRANTED`. A monitor grant still does not confer attach, and an attach grant still does not confer monitor (the scope-independence test from TASK-106 must stay green).
+- [ ] **Un-ignore `e2e::conversation_carry::client_bs_prompt_carries_the_conversation_client_a_left_behind`** (REQ-567 AC-9, which TASK-106 `#[ignore]`d because cross-session attach was shut). Deleting that `#[ignore]` and seeing the test pass through the consent flow IS this task's AC-2/AC-3 evidence — do not write a parallel test and leave the original ignored.
 - [ ] `cargo test -p tetond --no-fail-fast` green.
 
 ## Technical Notes
