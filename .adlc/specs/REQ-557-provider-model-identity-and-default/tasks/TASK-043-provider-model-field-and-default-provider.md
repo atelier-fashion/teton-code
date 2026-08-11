@@ -1,19 +1,22 @@
 ---
 id: TASK-043
 title: "Declare ModelProvider.model and Config.default_provider, with validation and one-shot migration"
-status: draft
+status: complete
 parent: REQ-557
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-11
 dependencies: []
 ---
 
 ## Description
 
 The foundational schema change. `ModelProvider` gains a declared `model`;
-`Config` gains an explicit `default_provider`. Both are enforced in
-`Config::validate()` rather than by the deserializer, and a one-shot migration
-resolves `model` for pre-REQ configs.
+`Config` gains an explicit `default_provider`. Neither is enforced by the
+deserializer. `Config::validate()` enforces `default_provider`'s referential
+integrity — a *dangling* id is a validity error — but a missing `model` is
+**not** a validation error: it is a usability condition handled by a separate
+non-fatal pass (**ADR-E**, which supersedes ADR-B's original wording). A one-shot
+migration resolves `model` for pre-REQ configs.
 
 This task is the whole of the `teton-core` change and blocks the other four.
 It deliberately does **not** touch the router, the price table, or the CLI —
@@ -31,32 +34,35 @@ those consume this shape and are separate tasks.
 
 ## Acceptance Criteria
 
-- [ ] `ModelProvider` carries `model: Option<String>` and a pre-REQ config TOML
+- [x] `ModelProvider` carries `model: Option<String>` and a pre-REQ config TOML
       (no `model` key on any provider) **deserializes successfully** — asserted
       by a test that loads a fixture written in the old shape. This is the ADR-B
       guarantee that makes migration reachable at all.
-- [ ] `Config::validate()` **accepts** a remote-kind provider whose `model` is
+- [x] `Config::validate()` **accepts** a remote-kind provider whose `model` is
       `None` — see ADR-E. Making this a validation error refuses daemon startup
       (`runtime.rs:1532`), which both blocks migration on a pre-REQ config and
       contradicts BR-7's "the daemon starts with that provider unusable". A test
       pins that such a config **loads**.
-- [ ] A separate, non-fatal **usability** pass reports every remote provider with
+- [x] A separate, non-fatal **usability** pass reports every remote provider with
       `model: None` by id and marks it unusable. A config with one usable and one
       unusable provider loads, reports the unusable one, and leaves the usable one
       routable.
-- [ ] `Config::validate()` rejects a `default_provider` naming an id absent from
+- [x] `Config::validate()` rejects a `default_provider` naming an id absent from
       `providers`, with an error naming both the dangling id and the registered
       ids (AC-5).
-- [ ] Two providers sharing `kind`, `endpoint`, and `auth_ref` but differing in
+- [x] Two providers sharing `kind`, `endpoint`, and `auth_ref` but differing in
       `id` and `model` both validate — the BR-3 case (AC-1).
-- [ ] Migration: given a config whose providers lack `model`, a one-shot pass
+- [x] Migration: given a config whose providers lack `model`, a one-shot pass
       resolves each via an injected legacy resolver, writes the value into the
       provider record, and returns the list of providers it could **not**
       resolve. Providers it cannot resolve keep `model: None` and are left for
-      `validate()` to reject by id — the migration never guesses (BR-7).
-- [ ] Migration is idempotent: running it twice on an already-migrated config is
+      the **usability pass** to report by id and mark unusable — **not** for
+      `validate()` to reject, which would refuse daemon startup and contradict
+      BR-7's "the daemon starts with that provider unusable" (ADR-E). The
+      migration never guesses (BR-7).
+- [x] Migration is idempotent: running it twice on an already-migrated config is
       a no-op and reports nothing.
-- [ ] Table-driven unit tests cover validation across the matrix
+- [x] Table-driven unit tests cover validation across the matrix
       (kind × model-present × default-provider-resolvable) per conventions.md's
       "router policy decisions are pure functions in teton-core" rule.
 

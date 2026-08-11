@@ -1,10 +1,10 @@
 ---
 id: TASK-047
 title: "End-to-end migration, egress-capture, and mutation checks"
-status: draft
+status: complete
 parent: REQ-557
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-11
 dependencies: [TASK-044, TASK-045, TASK-046]
 ---
 
@@ -28,35 +28,35 @@ the mutation checks proving both deleted fallbacks are actually gone.
 
 ## Acceptance Criteria
 
-- [ ] **Migration, both legs in one test** (AC-6): a config written in the
+- [x] **Migration, both legs in one test** (AC-6): a config written in the
       pre-REQ shape with two providers — one resolvable through the legacy price
       lookup, one not — loads with the resolvable provider migrated to a declared
       model, the unresolvable one reported by id and unusable, and a second start
       re-running nothing.
-- [ ] **Egress-capture** (BR-8): a session with a `local-only` boundary produces
+- [x] **Egress-capture** (BR-8): a session with a `local-only` boundary produces
       zero remote calls containing boundary content, and a tainted session stays
       pinned to the local tier — with a `default_provider` configured and a
       declared model on every provider. Verified by mock-transport capture, not
       by code inspection, per conventions.md.
-- [ ] **Mutation check A** (AC-8): restoring `billing_model`'s provider-id
+- [x] **Mutation check A** (AC-8): restoring `billing_model`'s provider-id
       fallback makes at least one test red.
-- [ ] **Mutation check B** (AC-8): restoring the positional default-provider
+- [x] **Mutation check B** (AC-8): restoring the positional default-provider
       `.find` — **or** its `local_provider` / literal-`"local"` tail — makes at
       least one test red. Both halves must be pinned separately; a single test
       covering only the outer `.find` leaves the literal reachable.
-- [ ] **The daemon starts on a pre-REQ config** (ADR-E): a config in the old
+- [x] **The daemon starts on a pre-REQ config** (ADR-E): a config in the old
       shape — every provider `model: None` — loads and the daemon starts, so
       migration can run at all. Pinned separately from the migration test,
       because this is the precondition migration depends on.
-- [ ] **The daemon starts with one unresolvable provider** (ADR-E, BR-7): a
+- [x] **The daemon starts with one unresolvable provider** (ADR-E, BR-7): a
       config where migration could resolve one provider and not the other starts,
       reports the unresolvable one by id, serves turns on the usable provider, and
       refuses turns routed to the unusable one. A daemon that refuses to start
       here is the regression this criterion exists to catch.
-- [ ] **Mutation check C**: moving the model requirement into `Config::validate()`
+- [x] **Mutation check C**: moving the model requirement into `Config::validate()`
       — the obvious-but-wrong design ADR-E rejects — makes at least one of the two
       startup tests above red.
-- [ ] Both existing e2e suites (`cli_e2e`, `tetond/tests/e2e`) pass with only
+- [x] Both existing e2e suites (`cli_e2e`, `tetond/tests/e2e`) pass with only
       the provider-construction updates the new required field forces — no test
       is edited to accommodate a behavior change.
 

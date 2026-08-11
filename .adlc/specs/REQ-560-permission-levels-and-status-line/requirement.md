@@ -1,10 +1,10 @@
 ---
 id: REQ-560
 title: "Named permission levels and the interactive session status line"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-11
 component: "cli"
 domain: "harness"
 stack: ["rust", "cli", "daemon", "json-rpc"]
@@ -155,16 +155,20 @@ call (OQ-3).
       assertions pass **unmodified** — a test edited to accommodate status-line
       bytes is a violation, not an accommodation. (informed by REQ-549 BR-4,
       REQ-556 BR-2)
-- [ ] BR-10: Because BR-9 hides both settings in piped use, **both have a
-      non-visual read path**: `/permissions` and `/effort` with no argument print
-      the current value, and they work on a pipe (REQ-555 BR-9). A setting whose
-      only surface is a TTY row is unreadable to exactly the users who script.
+- [ ] BR-10: Because BR-9 hides both settings in piped use, **every value the
+      status row shows has a non-visual read path**. This REQ delivers it for
+      `/permissions`: bare `/permissions` prints the current level and works on a
+      pipe (REQ-555 BR-9). The same guarantee for `/effort` is REQ-559 BR-9's and
+      lands with that REQ — this REQ neither implements nor duplicates it. A
+      setting whose only surface is a TTY row is unreadable to exactly the users
+      who script.
 - [ ] BR-11: The status row is drawn **below the bottom rule**, making the frame
-      four rows. `draw`'s cursor-up count and `erase`'s upward count move
-      **together** — they are a matched pair and the existing code says so.
-      Rows drawn below the frame are counted separately from `status_rows`, which
-      counts REQ-556's indicator rows drawn *above* it; a single count for both
-      directions strands one of them on redraw.
+      four rows, and a redraw strands **no** row in either direction — neither
+      the status row below the frame nor REQ-556's loading indicator above it.
+      Rows above and below the frame are counted independently; one count
+      serving both directions strands one of them. The redraw arithmetic that
+      delivers this is an architecture decision, not a requirement (see
+      Assumptions).
 - [ ] BR-12: All status-line output goes through the existing `Surface`/`Prompter`
       seams — no direct-to-stdout side channel — so the anticipated ratatui
       front-end inherits it by implementing the same seams. (informed by
@@ -173,11 +177,13 @@ call (OQ-3).
       a terminal too narrow for the row, or a write error, degrades to no status
       row with the session fully usable and the values still readable via BR-10.
       (informed by LESSON-447, REQ-556 BR-9)
-- [ ] BR-14: `/permissions` and `/effort` are rows in the **existing** `COMMANDS`
-      table, so `/help` lists them from the same table the dispatcher matches
-      against and neither can exist without appearing in `/help` (REQ-555 BR-7).
-      A second name for either is an alias on the same row, never a second row.
-      (informed by BUG-153)
+- [ ] BR-14: `/permissions` is a row in the **existing** `COMMANDS` table, so
+      `/help` lists it from the same table the dispatcher matches against and it
+      cannot exist without appearing in `/help` (REQ-555 BR-7). A second name for
+      it is an alias on the same row, never a second row. **`/effort`'s row
+      belongs to REQ-559 (BR-9)** — this REQ renders the effort value in the
+      status line and must not add, alias, or duplicate the command. (informed by
+      BUG-153)
 - [ ] BR-15: The permission level and its effect are described by **one
       classifier**: the level a session is in, the table it expands to, and the
       sentence a denied call returns all derive from one function. Two surfaces
@@ -216,16 +222,17 @@ call (OQ-3).
 - [ ] AC-8 *(piped)*: Non-TTY invocation is byte-identical to the pre-REQ binary;
       the existing `cli_e2e` whole-output tests and the
       `/quit`-equals-Ctrl-D equivalence tests pass **unmodified**. (BR-9)
-- [ ] AC-9 *(piped)*: Bare `/permissions` and bare `/effort` each print the
-      current value on a pipe. (BR-10)
+- [ ] AC-9 *(piped)*: Bare `/permissions` prints the current level on a pipe.
+      When REQ-559 has landed, the same test covers bare `/effort`; until then
+      its absence is not a gap in this REQ. (BR-10)
 - [ ] AC-10 *(pty)*: At a real terminal the status row renders below the bottom
       rule, a typed line is accepted intact with the frame uncorrupted, and a
       REQ-556 loading indicator drawn above the frame at the same time leaves
       neither row stranded after a redraw. This is the criterion BR-11 exists
       for and it cannot be reached on a pipe. (BR-11)
-- [ ] AC-11 *(piped)*: `/help` lists `/permissions` and `/effort` from the
-      dispatch table; the BR-8 bidirectional table test from REQ-555 still
-      passes with the new rows. (BR-14)
+- [ ] AC-11 *(piped)*: `/help` lists `/permissions` from the dispatch table; the
+      BR-8 bidirectional table test from REQ-555 still passes with the new row.
+      `/effort`'s row is REQ-559's and is covered there. (BR-14)
 - [ ] AC-12 *(unit)*: A simulated narrow terminal / write failure produces no
       status row, no panic, and a usable session. (BR-13)
 - [ ] AC-13: Verified on **both** macOS and Linux in CI — TTY detection and
@@ -236,13 +243,30 @@ call (OQ-3).
       `full` skip the gate rather than allow-all (BR-4), each makes at least one
       test red. A suite that stays green with the feature disabled has not tested
       it. (informed by LESSON-441, LESSON-481)
+- [ ] AC-15 *(piped)*: An in-flight permission prompt is **not** resolved by a
+      level change. With a prompt pending on `shell`, a `/permissions full`
+      arriving before the answer leaves the prompt pending and still awaiting the
+      user; the user's own answer decides that call, and the *next* `shell`
+      evaluates at `full`. The inverse leg — pending prompt, then `/permissions
+      plan` — likewise does not auto-deny the in-flight call. (BR-7)
+- [ ] AC-16 *(unit)*: A source-level assertion that no status-line write reaches
+      stdout outside the `Surface`/`Prompter` seams — the same shape as AC-5's
+      egress-predicate assertion, so a future direct-to-stdout call site cannot
+      quietly bypass the seam the ratatui front-end will implement. (BR-12)
+- [ ] AC-17 *(unit)*: One classifier — the level a session is in, the
+      `PermissionConfig` it expands to, and the sentence a denied call returns
+      all derive from a single function, asserted by calling that function rather
+      than by comparing two rendered strings. Adding a fifth level in the test
+      exercises every surface without touching a second table. (BR-15)
 
 ## External Dependencies
 
-- **REQ-559** for the effort value the status line renders. The permission half
-  of this REQ is independently shippable; the status row can land showing only
-  the permission level and gain the effort field when REQ-559 does. Named here
-  so the sequencing is a decision rather than a discovery.
+- **REQ-559** for the effort value the status line renders **and for the
+  `/effort` command itself** (REQ-559 BR-9 owns the `COMMANDS` row; this REQ owns
+  `/permissions`). The permission half of this REQ is independently shippable;
+  the status row can land showing only the permission level and gain the effort
+  field when REQ-559 does. Named here so the sequencing is a decision rather than
+  a discovery.
 - **A PTY test harness** — already a dev-dependency from REQ-556, reused by
   AC-10. No new crate expected.
 - No runtime dependencies. `PermissionConfig`, `PermissionGate`, `SessionGrants`,
@@ -265,6 +289,12 @@ call (OQ-3).
   separate below-frame count is an addition rather than a change in meaning.
   Verified against `erase`'s doc comment, which states the above-frame intent
   explicitly.
+- The likely shape of BR-11's arithmetic — recorded here as a starting point for
+  `/architect`, not as a requirement: `draw`'s cursor-up count and `erase`'s
+  upward count are a **matched pair** and the existing code says so, so a
+  below-frame row has to move both together. Any design satisfying BR-11's
+  no-stranded-row property is acceptable; this one is merely the one the current
+  code suggests.
 - `erase`'s `\x1b[J` (erase to end of screen) already clears anything drawn below
   the cursor, so the status row is removed by today's erase without a new escape
   — only the cursor arithmetic in `draw` changes. To be confirmed empirically at

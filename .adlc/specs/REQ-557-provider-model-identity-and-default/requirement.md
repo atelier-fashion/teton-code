@@ -1,10 +1,10 @@
 ---
 id: REQ-557
 title: "Provider model identity and an explicit default provider"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-11
 component: "daemon/router"
 domain: "providers"
 stack: ["rust", "daemon", "cli", "llm-providers"]
@@ -97,21 +97,21 @@ No new events and no new RPCs. `config/get`'s `ProviderConfig` projection gains
 
 ## Business Rules
 
-- [ ] BR-1: `ModelProvider` carries a declared `model` string. For every remote
+- [x] BR-1: `ModelProvider` carries a declared `model` string. For every remote
       kind it is **required** at registration; `teton provider add` without
       `--model` fails with a message naming the flag, and never invents a value.
       The provider id MUST NOT be usable as a stand-in for the model — the
       `map_or_else(|| provider_id.to_owned(), …)` fallback in `billing_model()`
       is deleted, not relocated. (informed by LESSON-456, BUG-146)
-- [ ] BR-2: A provider's `model` is the string sent to the provider's API. The
+- [x] BR-2: A provider's `model` is the string sent to the provider's API. The
       router reads it from the provider record; nothing derives a model
       identifier from the price table, from the provider id, or from the
       endpoint. Pricing is a **consumer** of the model string, never its source.
-- [ ] BR-3: Multiple providers MAY share a `kind`, `endpoint`, and `auth_ref`
+- [x] BR-3: Multiple providers MAY share a `kind`, `endpoint`, and `auth_ref`
       while differing in `model` and `id` — this is the shape that makes
       "Opus for design, Sonnet for build" expressible, and it is the point of
       the REQ. Registering two providers with the same `id` remains an error.
-- [ ] BR-4: `default_provider` is an explicit, user-set config key.
+- [x] BR-4: `default_provider` is an explicit, user-set config key.
       `build_router`'s positional selection is removed — **both halves of it**.
       Today `default_provider` falls back to `local_provider` when no remote is
       registered, and `local_provider` itself falls back to the literal string
@@ -122,15 +122,15 @@ No new events and no new RPCs. `config/get`'s `ProviderConfig` projection gains
       carried in the type, which the router surfaces as a nameable "no default
       provider configured" condition, never as a synthesized id.
       (informed by LESSON-456, BUG-146)
-- [ ] BR-5: An unroutable turn caused by a missing or dangling
+- [x] BR-5: An unroutable turn caused by a missing or dangling
       `default_provider` reports **that** cause, classified in the same branch
       that chooses the sentence, and reuses `unserved_turn_error`'s existing
       precedence rather than adding a second classifier for the same machine
       state. (informed by BUG-146, BUG-152, LESSON-456)
-- [ ] BR-6: A `default_provider` naming an unregistered id is rejected at config
+- [x] BR-6: A `default_provider` naming an unregistered id is rejected at config
       load with a message naming the id and the registered ids — it must not
       become a route that fails later, further from the cause.
-- [ ] BR-7: **Migration is one-time and loud.** An existing config whose
+- [x] BR-7: **Migration is one-time and loud.** An existing config whose
       providers lack `model` is migrated by resolving each provider's model
       through today's price-table lookup exactly once and writing the result
       back as a declared field. Any provider the lookup cannot resolve is
@@ -158,11 +158,11 @@ No new events and no new RPCs. `config/get`'s `ProviderConfig` projection gains
       structural errors (duplicate ids, raw keys, a **dangling**
       `default_provider` — which is invalid rather than merely incomplete,
       because it names something that does not exist).
-- [ ] BR-8: `default_provider` is **not** a permission to bypass BR-1 of
+- [x] BR-8: `default_provider` is **not** a permission to bypass BR-1 of
       REQ-544. Boundary enforcement, session taint pinning, and egress recording
       are unchanged by this REQ; a default provider is a routing convenience,
       not an egress decision. (informed by LESSON-432)
-- [ ] BR-9: **Every model Teton calls is tracked, with its cost.** The cost
+- [x] BR-9: **Every model Teton calls is tracked, with its cost.** The cost
       surface accounts for models — not providers — so: two providers declaring
       the same model are priced identically from one source of price truth; a
       model with no price is reported as **unpriced and named**, never as a `$0`
@@ -175,36 +175,36 @@ No new events and no new RPCs. `config/get`'s `ProviderConfig` projection gains
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `teton provider add opus --kind anthropic --model claude-opus-5` and
+- [x] AC-1: `teton provider add opus --kind anthropic --model claude-opus-5` and
       `teton provider add sonnet --kind anthropic --model claude-sonnet-5`
       both succeed; `teton provider list` shows two providers with distinct
       models and the same kind. Registering a third with `id: opus` fails.
-- [ ] AC-2: `teton provider add x --kind anthropic` (no `--model`) exits
+- [x] AC-2: `teton provider add x --kind anthropic` (no `--model`) exits
       non-zero with a message naming `--model`, and registers nothing.
-- [ ] AC-3: A turn routed to a provider emits `route_decided` whose `model`
+- [x] AC-3: A turn routed to a provider emits `route_decided` whose `model`
       equals that provider's declared `model`, asserted against a provider whose
       id appears **nowhere** in the price table — proving the value is declared,
       not looked up. This test fails against today's binary.
-- [ ] AC-4: With no `default_provider` set and no category policy matching, a
+- [x] AC-4: With no `default_provider` set and no category policy matching, a
       turn fails with a message naming the missing default and the
       `teton provider` remedy — not a route to a synthesized provider id. A unit
       test asserts the router's default is `None`, not a string. (informed by
       BUG-146)
-- [ ] AC-5: A config naming `default_provider = "ghost"` with no such provider
+- [x] AC-5: A config naming `default_provider = "ghost"` with no such provider
       is rejected at load, naming `ghost` and listing the registered ids.
-- [ ] AC-6: Migration: a config written by the pre-REQ binary (providers with no
+- [x] AC-6: Migration: a config written by the pre-REQ binary (providers with no
       `model`, one resolvable through the price table and one not) loads with
       the resolvable provider migrated to a declared model, the unresolvable one
       reported by id and marked unusable, and the migration recorded so a second
       start does not re-run it. Both legs in one test.
-- [ ] AC-7: Cost: two providers declaring the same model produce CostRecords
+- [x] AC-7: Cost: two providers declaring the same model produce CostRecords
       priced identically from one source of price truth; a provider declaring a
       model absent from that source produces a record flagged unpriced rather
       than `usd: 0`.
-- [ ] AC-7b: `teton cost` enumerates every model the session actually called,
+- [x] AC-7b: `teton cost` enumerates every model the session actually called,
       including unpriced ones, naming each unpriced model — a user can read off
       which model needs a price without inspecting config or logs. (BR-9)
-- [ ] AC-8: Mutation check — restoring the provider-id fallback in
+- [x] AC-8: Mutation check — restoring the provider-id fallback in
       `billing_model()`, or restoring the positional default-provider `.find`,
       each makes at least one test red. (informed by LESSON-441)
 
@@ -241,24 +241,43 @@ No new events and no new RPCs. `config/get`'s `ProviderConfig` projection gains
 
 ## Open Questions
 
-- [ ] OQ-1: Does `teton provider add` validate the model string against the
-      vendor (e.g. an Anthropic `models/list` call) at registration time, or
-      accept any string and fail at first use? Validation catches typos at the
-      moment the user can fix them; it also makes registration require network
-      and an already-working credential. Leaning accept-and-fail-late with a
-      `teton doctor` check, but this is a UX call.
-- [ ] OQ-2: Should `default_provider` be settable by a command
-      (`teton provider default <id>`) or config-file only in v1? REQ-555's
-      out-of-scope list keeps `/provider` shell-only; a subcommand is consistent
-      with `teton model set`.
-- [ ] OQ-3: When exactly one remote provider is registered, is it the implicit
-      default? Convenient, but it means adding a second provider silently
-      changes routing — the BUG-146 shape one layer out. Leaning **no implicit
-      default**, with a first-registration prompt or a `doctor` warning instead.
-- [ ] OQ-4: Does the local provider's `model` field mirror the REQ-547 consent
-      selection as a read-only projection, or is it absent for the local kind
-      entirely? A mirrored copy is a second source of a fact the consent flow
-      owns (the drift LESSON-456 warns about).
+All four were settled by the implementation; dispositions verified against `main`
+at wrapup (2026-08-11) rather than asserted from the tasks.
+
+- [x] OQ-1 — **accept-and-fail-late.** `teton provider add` takes the model
+      string as given; no vendor `models/list` call at registration. Registration
+      therefore needs neither network nor a working credential. On the
+      `teton doctor` half the spec leaned on: `doctor` exists and renders the
+      provider table, which now carries `model` via TASK-046's projection — so a
+      *missing* model is visible there. What it does **not** do is validate a
+      model string against the vendor or flag a typo, and the unusable-provider
+      report lands at daemon startup (ADR-E) rather than in `doctor`. See
+      Deferred.
+- [x] OQ-2 — **config-file only in v1.** No `teton provider default <id>`
+      subcommand exists (verified: `ProviderAction` has no `Default` variant).
+      Consistent with REQ-555's out-of-scope posture for `/provider`.
+- [x] OQ-3 — **no implicit default.** `build_router` reads
+      `config.default_provider` directly with no `.find` over remote providers
+      (`runtime.rs:5782`), so registering a second provider cannot silently
+      change routing. This is ADR-D and it is the whole point of BR-4.
+- [x] OQ-4 — **not mirrored.** The local provider's `model` stays absent from
+      this surface; the REQ-547 consent flow remains the single owner of the
+      local model selection (TASK-046 pinned this explicitly). Avoids the
+      second-source drift LESSON-456 warns about.
+
+## Deferred
+
+Recorded at wrapup (2026-08-11). Neither was descoped mid-flight — both are
+consequences of OQ dispositions made during architecture.
+
+- **A `teton doctor` check for model-string validity** (OQ-1). `doctor` renders
+  the provider table including `model`, so an *absent* model is visible, but
+  nothing catches a *wrong* one — a typo'd model string is discovered at first
+  use, as accept-and-fail-late intends. Worth a follow-up only if typo'd models
+  turn out to be a real support cost.
+- **`teton provider default <id>`** (OQ-2). Setting the default requires a
+  config-file edit in v1. If REQ-560's permission/status work makes routing state
+  more visible, a subcommand becomes the obvious companion.
 
 ## Out of Scope
 

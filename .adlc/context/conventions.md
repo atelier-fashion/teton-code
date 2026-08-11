@@ -42,6 +42,14 @@ teton-code/
   never abort a session on a single provider error.
 - No credential, file content, or prompt text in error messages or logs that
   leave the machine.
+- **Config validity vs usability.** `Config::validate()` is fail-closed and gates
+  daemon startup, so it carries *structural* errors only — duplicate ids, a raw
+  key where a reference belongs, a reference naming something that does not
+  exist. A record that is merely **incomplete** in one field is reported by a
+  separate non-fatal pass, marked unusable, and refused at the point of use; the
+  daemon still starts and every other record still works. Enforcing
+  incompleteness at load makes one bad entry fatal for all of them, and vetoes
+  any migration meant to fix it (REQ-557 ADR-E, LESSON-506).
 
 ## Git Conventions
 

@@ -1,10 +1,10 @@
 ---
 id: TASK-044
 title: "Router reads the declared model and an explicit default; delete billing_model and both fallbacks"
-status: draft
+status: complete
 parent: REQ-557
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-11
 dependencies: [TASK-043]
 ---
 
@@ -30,26 +30,26 @@ positional default selection with its literal-`"local"` tail.
 
 ## Acceptance Criteria
 
-- [ ] `route_decided` for a turn carries the provider's **declared** `model`,
+- [x] `route_decided` for a turn carries the provider's **declared** `model`,
       asserted against a provider whose `id` appears **nowhere** in the price
       table. This test fails against the pre-REQ binary (AC-3).
-- [ ] `Router`'s default provider is an `Option` at the type level — a unit test
+- [x] `Router`'s default provider is an `Option` at the type level — a unit test
       asserts `None` when no `default_provider` is configured, and the code
       contains no string literal `"local"` as a provider-id fallback (AC-4).
-- [ ] With no `default_provider` and no matching policy, a turn fails with a
+- [x] With no `default_provider` and no matching policy, a turn fails with a
       message naming the missing default and the `teton provider` remedy, routed
       through `unserved_turn_error`'s existing precedence — **not** a new
       classifier (BR-5).
-- [ ] A provider marked **unusable** by TASK-043's usability pass (remote kind,
+- [x] A provider marked **unusable** by TASK-043's usability pass (remote kind,
       `model: None` after migration) is not routable: a turn that would resolve
       to it fails naming that provider and the `--model` remedy, while other
       providers keep working. This is the router half of ADR-E — the daemon
       started, so the refusal has to happen here.
-- [ ] `billing_model` no longer exists anywhere in the workspace (grep-level
+- [x] `billing_model` no longer exists anywhere in the workspace (grep-level
       assertion in the test or a compile failure if referenced).
-- [ ] Existing router policy tests pass unmodified where they do not construct
+- [x] Existing router policy tests pass unmodified where they do not construct
       providers; those that do are updated to declare a `model`.
-- [ ] Table-driven tests cover (default configured / absent) ×
+- [x] Table-driven tests cover (default configured / absent) ×
       (policy match / no match).
 
 ## Technical Notes

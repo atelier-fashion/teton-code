@@ -1,10 +1,10 @@
 ---
 id: TASK-046
 title: "Expose the model on the CLI and in the protocol projection"
-status: draft
+status: complete
 parent: REQ-557
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-11
 dependencies: [TASK-043]
 ---
 
@@ -30,19 +30,19 @@ and any attached client read.
 
 ## Acceptance Criteria
 
-- [ ] `teton provider add opus --kind anthropic --model claude-opus-5` and
+- [x] `teton provider add opus --kind anthropic --model claude-opus-5` and
       `teton provider add sonnet --kind anthropic --model claude-sonnet-5` both
       succeed; `teton provider list` shows two providers with distinct models and
       the same kind; a third `add` reusing id `opus` fails (AC-1).
-- [ ] `teton provider add x --kind anthropic` with no `--model` exits non-zero
+- [x] `teton provider add x --kind anthropic` with no `--model` exits non-zero
       naming `--model`, registers nothing, **and does not prompt for a
       credential** — the argument check precedes `read_secret` (AC-2).
-- [ ] A local-kind `provider add` still succeeds without `--model` — the local
+- [x] A local-kind `provider add` still succeeds without `--model` — the local
       model is owned by the REQ-547 consent flow and is read, never set here.
-- [ ] `config/get`'s `ProviderConfig` carries the model; a round-trip test
+- [x] `config/get`'s `ProviderConfig` carries the model; a round-trip test
       asserts a registered model survives daemon persistence and reappears in the
       projection.
-- [ ] The existing CLI arg-parsing tests (`main.rs:1437`) are updated for the new
+- [x] The existing CLI arg-parsing tests (`main.rs:1437`) are updated for the new
       argument and continue to assert the other fields unchanged.
 
 ## Technical Notes
