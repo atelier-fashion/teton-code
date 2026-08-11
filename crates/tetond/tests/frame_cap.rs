@@ -112,6 +112,14 @@ async fn read_line(reader: &mut BufReader<OwnedReadHalf>) -> Option<Value> {
     Some(serde_json::from_str(&line).unwrap())
 }
 
+/// The daemon these tests drive: the real one, with a consent window short
+/// enough that an ungranted `session/attach` — which since REQ-569 TASK-108
+/// raises a consent prompt rather than refusing outright — resolves inside a
+/// test's read deadline instead of the shipped human-sized window.
+fn test_daemon() -> Arc<Daemon> {
+    Arc::new(Daemon::new().with_consent_timeout(Duration::from_millis(200)))
+}
+
 /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
 /// can return the same value for two calls within one clock tick.
 fn temp_socket(tag: &str) -> PathBuf {
@@ -151,7 +159,7 @@ fn oversized_frame() -> String {
 async fn an_oversized_frame_is_refused_and_closed_and_the_daemon_keeps_serving() {
     let path = temp_socket("frame-cap");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     // Deliberately no handshake first: the cap has to hold for a peer that has
@@ -243,7 +251,7 @@ fn boundary_split_frame() -> Vec<u8> {
 async fn a_boundary_split_oversized_frame_is_refused_not_dropped() {
     let path = temp_socket("frame-split");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let TestClient {
@@ -309,7 +317,7 @@ fn exact_cap_frame_with_newline() -> String {
 async fn a_frame_that_is_exactly_the_cap_including_its_newline_round_trips() {
     let path = temp_socket("fr-ok");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let TestClient {
@@ -364,7 +372,7 @@ fn exact_cap_frame_no_newline() -> Vec<u8> {
 async fn a_frame_of_exactly_the_cap_without_a_newline_is_refused() {
     let path = temp_socket("fr-nonl");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let TestClient {
@@ -403,7 +411,7 @@ async fn a_frame_of_exactly_the_cap_without_a_newline_is_refused() {
 async fn a_large_but_legal_frame_round_trips() {
     let path = temp_socket("frame-legal");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut client = TestClient::connect(&path).await;
@@ -421,15 +429,16 @@ async fn a_large_but_legal_frame_round_trips() {
     // Read whole and dispatched: the answer is a *handler* verdict, which only
     // a fully-parsed frame can produce — not the reader's size refusal.
     //
-    // `NOT_GRANTED` rather than `UNKNOWN_SESSION` since REQ-569: this
-    // connection created no session and holds no grant, so `session/attach`
-    // answers before it consults the registry (BR-1), and it answers the same
-    // way for a 64 KiB nonsense id as for a real one — which is the point of
-    // that ordering. Either code proves the same thing here: the frame was
+    // `CONSENT_TIMEOUT` since REQ-569 TASK-108: this connection created no
+    // session and holds no grant, so `session/attach` puts the question to a
+    // user (BR-6) before it ever consults the registry — and it does so for a
+    // 64 KiB nonsense id exactly as for a real one, which is the point of that
+    // ordering (BR-8). Nobody answers here, so the bounded window closes it.
+    // Any of these codes proves the same thing about *this* test: the frame was
     // parsed and routed rather than refused by size.
     assert_eq!(
         response["error"]["code"].as_i64().unwrap(),
-        error_code::NOT_GRANTED,
+        error_code::CONSENT_TIMEOUT,
         "a legal 64 KiB frame must reach its handler, got: {response}"
     );
 

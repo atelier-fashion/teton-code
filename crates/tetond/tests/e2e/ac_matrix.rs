@@ -9,7 +9,6 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use teton_protocol::jsonrpc::error_code;
 
 use crate::harness::{
     anthropic_turn, assert_no_boundary_bytes, edit_answer_script, mcp_call_script, mcp_stdio_toml,
@@ -528,23 +527,41 @@ fn ac6_two_clients_share_sessions_daemon_survives_exit() {
     // and here, is what AC-6's survival claim rests on.
     //
     // Attaching to it is a separate question, and since REQ-569 the answer is
-    // no: a connection that created nothing and holds no grant is refused
-    // `NOT_GRANTED` (BR-1), because knowing an id is not standing (BR-8). The
-    // resume flow this closes is reopened by REQ-569 TASK-108's explicit
-    // consent step (BR-6) — and only by it. Asserted rather than skipped: this
-    // is the branch's real behaviour today, and a test that quietly stopped
-    // exercising the seam would be the place a regression hides.
-    let mut c = daemon.connect();
+    // "only by a decision" (BR-1/BR-6): a connection that created nothing and
+    // holds no grant has the question put to a user, because knowing an id is
+    // not standing (BR-8). This is **AC-3's resume flow** end to end — the last
+    // client that held the session is gone, so nothing is attached to it and
+    // the prompt is rendered by the client the user just opened. One consent
+    // step, and exactly one.
+    //
+    // `with_auto_consent` is the user saying yes. Every other client in this
+    // suite lacks it, which is what keeps the gate real:
+    // `multi_client::two_clients_share_sessions_and_daemon_survives_client_exit`
+    // drives the identical sequence with nobody answering and the fresh client
+    // stays out.
+    let mut c = daemon.connect().with_auto_consent();
     assert_eq!(
         c.session_ids(),
         vec![sid.clone()],
         "a fresh client must still see the surviving session"
     );
-    let refused = c.call("session/attach", json!({ "session_id": sid }));
+    let attached = c.call("session/attach", json!({ "session_id": sid.clone() }));
     assert_eq!(
-        refused["error"]["code"].as_i64(),
-        Some(error_code::NOT_GRANTED),
-        "a fresh client holds no grant for another connection's session: {refused}"
+        attached["result"]["session"]["session_id"].as_str(),
+        Some(sid.as_str()),
+        "an approved resume must attach the fresh client: {attached}"
+    );
+    let prompts = c.events_named("attach_consent_requested");
+    assert_eq!(
+        prompts.len(),
+        1,
+        "AC-3: at most one visible consent step, and it is this one: {prompts:?}"
+    );
+    assert_eq!(prompts[0]["scope"].as_str(), Some("attach"));
+    assert_eq!(prompts[0]["session_id"].as_str(), Some(sid.as_str()));
+    assert!(
+        !c.saw_event("attach_refused"),
+        "an approved request must not also be announced as refused"
     );
 
     assert_no_boundary_bytes();

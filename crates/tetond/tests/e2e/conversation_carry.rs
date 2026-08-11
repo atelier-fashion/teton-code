@@ -268,29 +268,26 @@ fn boundary_content_read_in_prompt_one_blocks_the_remote_prompt_two() {
 /// the default policy the conversation dies with the daemon (BR-9), and this is
 /// the case where it must not: a client left, not the last one.
 ///
-/// # Blocked on the grant path (REQ-569 TASK-106 → TASK-108)
+/// # B joins through the grant path (REQ-569 TASK-106 → TASK-108)
 ///
 /// REQ-569 closed `session/attach` to a connection that neither created the
-/// session nor holds a grant for it (BR-1), and the only minter of a grant —
-/// the explicit user-consent step — lands in TASK-108. Client B here is exactly
-/// that connection, so its `session/attach` is refused `NOT_GRANTED` and the
-/// carry claim below cannot be reached over two connections.
+/// session nor holds a grant for it (BR-1), which suspended this test — client
+/// B is exactly that connection. TASK-108 reopened it the only way it may be
+/// reopened: B's attach now puts the question to a user, and A — the client
+/// that created the session and is still attached to it — is the surface the
+/// prompt is rendered at (BR-6's first arm).
 ///
-/// It is **ignored rather than rewritten**, deliberately. Every assertion in
-/// this body is still the right assertion — it is the door in front of them
-/// that is temporarily shut — and rewriting them into a refusal check would
-/// duplicate coverage that
-/// `multi_client::knowing_a_session_id_does_not_let_another_connection_attach`
-/// and `ac_matrix::ac6_two_clients_share_sessions_daemon_survives_exit` already
-/// carry, then have to be undone. TASK-108 restores this by minting B's grant
-/// through the consent flow and deleting the `#[ignore]`; that is the AC-2/AC-3
-/// evidence it owes. The body still compiles, so it cannot rot while it waits.
+/// That is why `a` is built `with_auto_consent`: it is the user saying yes, and
+/// A's *reader thread* answers while the test is blocked on B's attach, which
+/// is the interleaving the real flow has. Nothing else about this test changed;
+/// every assertion below is the one REQ-567 AC-9 always made, which is why it
+/// was ignored rather than rewritten.
 ///
-/// The carry mechanism itself is not uncovered in the meantime: the
-/// `conversation_carry` integration suite exercises it daemon-side. What is
-/// suspended is specifically the *second client joining* it.
+/// So this test is now double duty: REQ-567's carry claim, and REQ-569's
+/// AC-2/AC-3 evidence — a second legitimate client reaching a live session
+/// through the consent flow, after which REQ-568's delivery rules apply to it
+/// like any attached client.
 #[test]
-#[ignore = "REQ-569 BR-1 closed ungranted cross-session attach; TASK-108's consent flow reopens it"]
 fn client_bs_prompt_carries_the_conversation_client_a_left_behind() {
     let provider =
         MockProvider::always(openai_turn("Three attempts, as configured.", None, 120, 20));
@@ -311,7 +308,9 @@ fn client_bs_prompt_carries_the_conversation_client_a_left_behind() {
     let script = ws.write_script("Unused by this fixture.");
     let mut daemon = Daemon::spawn(&ws, probe_with_local(script).real_lifetime());
 
-    let mut a = daemon.connect();
+    // A is the surface B's consent prompt is rendered at (REQ-569 BR-6), so it
+    // is the client that says yes.
+    let mut a = daemon.connect().with_auto_consent();
     let mut b = daemon.connect();
 
     // --- A prompts, then leaves. --------------------------------------------

@@ -120,6 +120,25 @@ impl EventBus {
         });
     }
 
+    /// Reserves the next sequence number without publishing anything.
+    ///
+    /// For the one delivery path that is not a fan-out: REQ-569's consent
+    /// frames are *routed* to named connections (BR-6) rather than broadcast,
+    /// so the caller builds and sends the envelope itself — but the number on
+    /// it has to come from this counter, or a routed frame and a broadcast one
+    /// could reach the same client wearing the same `seq`.
+    ///
+    /// Reserving a number that no subscriber receives leaves a gap in every
+    /// other client's sequence, which is already the norm after REQ-568: the
+    /// counter is bus-wide while delivery is filtered per connection, so a
+    /// client sees only the subsequence it was entitled to.
+    pub fn next_seq(&self) -> u64 {
+        let mut inner = self.inner.lock().expect("event bus mutex poisoned");
+        let seq = inner.seq;
+        inner.seq += 1;
+        seq
+    }
+
     /// Number of currently registered subscribers.
     #[must_use]
     pub fn subscriber_count(&self) -> usize {

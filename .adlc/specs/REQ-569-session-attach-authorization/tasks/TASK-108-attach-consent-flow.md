@@ -1,7 +1,7 @@
 ---
 id: TASK-108
 title: "Attach consent: event, attach/consent RPC, bounded timeout, fail-closed"
-status: draft
+status: complete
 parent: REQ-569
 created: 2026-08-11
 updated: 2026-08-11
@@ -31,15 +31,57 @@ closed.
 
 ## Acceptance Criteria
 
-- [ ] Granted consent mints exactly one grant of exactly the requested scope and the attach then succeeds (AC-2).
-- [ ] Denied and timed-out requests mint nothing — asserted by inspecting the grant registry after, not inferred from the error code (BR-7).
-- [ ] Timeout resolves to denied within the bounded window and emits `attach_refused` with the timeout reason code (AC-6).
-- [ ] A descendant peer never reaches this flow at all — no consent event is published for it (asserted; TASK-106's gate precedes this).
-- [ ] Consent-request ids are minted daemon-wide and `resolve` refuses to overwrite (LESSON-503/BUG-161 shape not reintroduced) — dedicated test.
-- [ ] The reader loop stays responsive while a consent is pending (a second request on the same connection is still served), and a pending monitor consent in `do_handshake` does not wedge the accept loop for other connections.
-- [ ] **Monitor is reachable again (BR-2/AC-4):** a monitor-scope consent granted by an already-attached connection produces a working monitor; refused/absent-approver leaves it `NOT_GRANTED`. A monitor grant still does not confer attach, and an attach grant still does not confer monitor (the scope-independence test from TASK-106 must stay green).
-- [ ] **Un-ignore `e2e::conversation_carry::client_bs_prompt_carries_the_conversation_client_a_left_behind`** (REQ-567 AC-9, which TASK-106 `#[ignore]`d because cross-session attach was shut). Deleting that `#[ignore]` and seeing the test pass through the consent flow IS this task's AC-2/AC-3 evidence — do not write a parallel test and leave the original ignored.
-- [ ] `cargo test -p tetond --no-fail-fast` green.
+- [x] Granted consent mints exactly one grant of exactly the requested scope and the attach then succeeds (AC-2).
+  — `server::tests::a_granted_consent_mints_exactly_one_attach_grant_and_the_attach_succeeds`
+  asserts `grants.held_by(newcomer) == [Grant::attach(newcomer, session)]`, `grants.len() == 1`,
+  and `!may_monitor(newcomer)`.
+- [x] Denied and timed-out requests mint nothing — asserted by inspecting the grant registry after, not inferred from the error code (BR-7).
+  — `server::tests::a_denied_or_timed_out_consent_leaves_the_grant_registry_empty` runs both
+  endings and asserts `held_by(...).is_empty()` and `grants.is_empty()` after each.
+- [x] Timeout resolves to denied within the bounded window and emits `attach_refused` with the timeout reason code (AC-6).
+  — same test: elapsed time bounded by the injected window, and exactly one `attach_refused`
+  frame carrying `reason: consent_timeout` reaches the requester.
+- [x] A descendant peer never reaches this flow at all — no consent event is published for it (asserted; TASK-106's gate precedes this).
+  — `server::tests::a_daemon_descendant_is_refused_attach_before_any_session_lookup_or_prompt`,
+  with an ordinary connection's prompt on the *same* surface as the positive control.
+  Extended beyond the task's ask: a descendant may not **approve** one either
+  (`a_daemon_descendant_may_not_approve_a_consent_request_either`) — see the deviation note below.
+- [x] Consent-request ids are minted daemon-wide and `resolve` refuses to overwrite (LESSON-503/BUG-161 shape not reintroduced) — dedicated test.
+  — `consent::tests::consent_ids_are_minted_daemon_wide_and_never_repeat` and
+  `consent::tests::a_colliding_registration_cannot_steal_a_live_consent_request`.
+- [x] The reader loop stays responsive while a consent is pending (a second request on the same connection is still served), and a pending monitor consent in `do_handshake` does not wedge the accept loop for other connections.
+  — `multi_client::the_reader_loop_keeps_serving_while_a_consent_is_pending` (ordering, not
+  liveness) and claim (3) of
+  `multi_client::a_monitor_consent_granted_by_an_attached_client_produces_a_working_monitor`.
+- [x] **Monitor is reachable again (BR-2/AC-4):** a monitor-scope consent granted by an already-attached connection produces a working monitor; refused/absent-approver leaves it `NOT_GRANTED`. A monitor grant still does not confer attach, and an attach grant still does not confer monitor (the scope-independence test from TASK-106 must stay green).
+  — `multi_client::a_monitor_consent_granted_by_an_attached_client_produces_a_working_monitor`
+  (works, and its own attach still has to ask); `a_monitor_declaration_is_refused_without_a_
+  monitor_scope_grant` (no approver → `NOT_GRANTED`);
+  `grants::tests::attach_and_monitor_are_answered_by_their_own_scope_and_no_other` unchanged.
+- [x] **Un-ignore `e2e::conversation_carry::client_bs_prompt_carries_the_conversation_client_a_left_behind`** (REQ-567 AC-9, which TASK-106 `#[ignore]`d because cross-session attach was shut). Deleting that `#[ignore]` and seeing the test pass through the consent flow IS this task's AC-2/AC-3 evidence — do not write a parallel test and leave the original ignored.
+  — `#[ignore]` deleted; the only body change is that client A is built
+  `.with_auto_consent()` (the user who says yes). Every assertion is REQ-567's original.
+- [x] `cargo test -p tetond --no-fail-fast` green.
+  — workspace: 2046 passed, 0 failed, 1 ignored (the pre-existing `--features live` smoke test).
+
+## Deviations
+
+- **`session/attach` no longer answers `NOT_GRANTED`.** Every ungranted attach now raises a
+  prompt, so its refusals are `CONSENT_DENIED`/`CONSENT_TIMEOUT`. `NOT_GRANTED` survives on the
+  monitor path only (no attached client to ask). Tests that asserted the old code were updated,
+  not deleted.
+- **Two additions the task did not name but the design needed.** (1) `ConsentSurfaces`, a
+  daemon-wide registry of live connections, because BR-6's routing asks a question no single
+  connection can answer ("is anyone else attached to this session?"); it shares each connection's
+  attachment `Arc` rather than copying it. (2) An ancestry gate on `attach/consent` itself: a tool
+  child *can* hold a session it created, which would have made it an eligible **approver** of a
+  peer's monitor request — BR-4 holding on the door and failing on the door handle.
+- **`Daemon::with_consent_timeout`** is a fixture-only knob (the `with_daemon_process` precedent),
+  so a test can assert the timeout arm without waiting out the shipped 30 s window.
+- **Client-side consent UI is out of scope and remains so.** The CLI renders
+  `attach_consent_requested` as a notice and cannot answer it; nothing in `crates/teton` calls
+  `session/attach`, so no shipped flow regressed. BR-6's user-facing half needs client work
+  (TASK-109 / follow-up).
 
 ## Technical Notes
 

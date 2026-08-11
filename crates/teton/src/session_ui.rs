@@ -26,12 +26,12 @@
 use std::collections::{HashMap, HashSet};
 
 use teton_protocol::events::{
-    BlockCause, DaemonClientAttach, DaemonLifetimeStage, Event, EventEnvelope, EvictionReason,
-    FailureClass, ModelLifecycle, ModelSelectionProposed, PermissionOption, PermissionOptionKind,
-    PermissionRequest, PhaseTransition, PrefixCache, PrefixCacheMiss, PrefixCacheOutcome,
-    PrivacyAction, PrivacyBlock, ProviderDegraded, RouteDecided, SessionUpdatePayload,
-    ToolCallStatus, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome,
-    WebTier, OPTION_ID_ENABLE_PERMANENT,
+    AttachConsentRequested, BlockCause, ConsentScope, DaemonClientAttach, DaemonLifetimeStage,
+    Event, EventEnvelope, EvictionReason, FailureClass, ModelLifecycle, ModelSelectionProposed,
+    PermissionOption, PermissionOptionKind, PermissionRequest, PhaseTransition, PrefixCache,
+    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProviderDegraded,
+    RouteDecided, SessionUpdatePayload, ToolCallStatus, WebConsentDecided, WebConsentScope,
+    WebLookup, WebLookupKind, WebLookupOutcome, WebTier, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
 use teton_protocol::{Phase, RequestId, SessionId};
@@ -425,7 +425,48 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+        Event::AttachConsentRequested(request) => {
+            // REQ-569 BR-6. This client can *see* the question and cannot yet
+            // answer it — `attach/consent` has no CLI surface on this branch.
+            //
+            // Rendered as a notice rather than swallowed, and that is the whole
+            // decision here: a silent security prompt is worse than an
+            // unanswerable one. The user would otherwise learn nothing about a
+            // peer asking for their session, and would see only that peer
+            // quietly fail. Never verbose-gated, for `context_cleared`'s
+            // reason — this is news, not chrome.
+            surface.line(LineKind::Notice, &format_attach_consent(request));
+            EventOutcome::Rendered
+        }
+        Event::AttachRefused(_) => {
+            // Nothing to draw. The connection that was refused is told by its
+            // own RPC error, and this client rendered a notice rather than a
+            // modal, so there is no prompt on screen to retire.
+            EventOutcome::Rendered
+        }
     }
+}
+
+/// The one-line notice an `attach_consent_requested` event draws (REQ-569 BR-6).
+///
+/// It says what would be granted rather than repeating the wire scope name,
+/// because the two scopes are wildly different asks and a user deciding between
+/// them needs the difference in the sentence.
+///
+/// `requester` is a peer-chosen string. The daemon already bounds it and strips
+/// its control characters before publishing, which is where that has to happen —
+/// this is one renderer of several, and a guard that lived here would protect
+/// only this one.
+fn format_attach_consent(request: &AttachConsentRequested) -> String {
+    let what = match request.scope {
+        ConsentScope::Attach => "attach to this session",
+        ConsentScope::Monitor => "watch every session on this daemon",
+    };
+    format!(
+        "{} asked to {what}. This client cannot answer yet, so the request \
+         will be declined when the daemon's window closes.",
+        request.requester
+    )
 }
 
 /// The session an event belongs to when it is **not** the one this client is in

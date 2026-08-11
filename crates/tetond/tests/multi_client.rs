@@ -259,6 +259,24 @@ impl TestClient {
     }
 }
 
+/// A consent window short enough that a test can assert on the *timeout* arm
+/// (REQ-569 BR-7) without waiting out the shipped, human-sized one.
+///
+/// Every refusal on this seam now runs through the consent flow — an ungranted
+/// `session/attach` raises a prompt rather than answering `NOT_GRANTED` — so a
+/// test whose client does not answer is a test that waits for this window. Two
+/// hundred milliseconds is comfortably above the scheduling noise of a loaded
+/// runner and comfortably below [`TestClient::read_line_raw`]'s two-second
+/// read deadline, which is what keeps the refusal a *consent timeout* rather
+/// than a test timeout.
+const TEST_CONSENT_WINDOW: Duration = Duration::from_millis(200);
+
+/// The daemon every test in this file drives: the real one, with a consent
+/// window a test can outlast.
+fn test_daemon() -> Arc<Daemon> {
+    Arc::new(Daemon::new().with_consent_timeout(TEST_CONSENT_WINDOW))
+}
+
 /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
 /// can return the same value for two calls within one clock tick.
 fn temp_socket(tag: &str) -> PathBuf {
@@ -380,7 +398,7 @@ fn session_ids(list_response: &Value) -> Vec<String> {
 async fn two_clients_share_sessions_and_daemon_survives_client_exit() {
     let path = temp_socket("mc");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     // Both clients attach and handshake.
@@ -434,16 +452,17 @@ async fn two_clients_share_sessions_and_daemon_survives_client_exit() {
     assert_eq!(session_ids(&list_a), vec![sid.clone()]);
     assert_eq!(session_ids(&list_b), session_ids(&list_a));
 
-    // REQ-569 BR-1, the change this REQ is: attaching is no longer something a
-    // connection can help itself to. B knows the id — it just read it out of
-    // `session/list` — and that buys it nothing (BR-8: ids are names, grants
-    // are credentials).
+    // REQ-569 BR-1/BR-6, the change this REQ is: attaching is no longer
+    // something a connection can help itself to. B knows the id — it just read
+    // it out of `session/list` — and that buys it a *question put to A*, not an
+    // attachment (BR-8: ids are names, grants are credentials). A is attached
+    // and never answers, so the window closes and B is refused.
     b.send(4, "session/attach", json!({"session_id": sid.clone()}))
         .await;
     let refused = b.read_response(4).await;
     assert_eq!(
         refused["error"]["code"].as_i64(),
-        Some(error_code::NOT_GRANTED),
+        Some(error_code::CONSENT_TIMEOUT),
         "a connection that created nothing must not attach on its own say-so: {refused}"
     );
 
@@ -468,10 +487,12 @@ async fn two_clients_share_sessions_and_daemon_survives_client_exit() {
     // A fresh client is refused the same way — the survival of the session is
     // read off the listing above, not off an attach anyone could have.
     //
-    // This is the resume flow, and it is *deliberately* closed here: REQ-569
-    // TASK-108 reopens it through an explicit consent step (BR-6), which is the
-    // only thing that may reopen it. Until then the honest state of this branch
-    // is that a fresh client cannot rejoin a session it did not create.
+    // This is the resume flow, and since TASK-108 it is open *through an
+    // explicit consent step and nothing else* (BR-6). A is gone, so nothing is
+    // attached to the session and the prompt is rendered by D itself (the
+    // second arm) — which D here never answers, so the window closes and the
+    // fresh client stays out. `ac_matrix::ac6_two_clients_share_sessions_daemon_
+    // survives_exit` drives the answering half of the same flow.
     let mut d = TestClient::connect(&path).await;
     assert!(d.handshake(1).await.get("result").is_some());
     d.send(2, "session/attach", json!({"session_id": sid}))
@@ -479,8 +500,8 @@ async fn two_clients_share_sessions_and_daemon_survives_client_exit() {
     let refused_fresh = d.read_response(2).await;
     assert_eq!(
         refused_fresh["error"]["code"].as_i64(),
-        Some(error_code::NOT_GRANTED),
-        "a fresh client holds no grant either: {refused_fresh}"
+        Some(error_code::CONSENT_TIMEOUT),
+        "a fresh client is let in by a decision or not at all: {refused_fresh}"
     );
 
     // The marker that closes B's window: D's handshake published a
@@ -526,7 +547,7 @@ async fn two_clients_share_sessions_and_daemon_survives_client_exit() {
 async fn two_clients_prompting_their_own_sessions_see_only_their_own_envelopes() {
     let path = temp_socket("scope-two");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut a = TestClient::connect(&path).await;
@@ -648,7 +669,7 @@ async fn two_clients_prompting_their_own_sessions_see_only_their_own_envelopes()
 async fn a_client_that_never_attached_receives_only_daemon_scoped_envelopes() {
     let path = temp_socket("scope-none");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut a = TestClient::connect(&path).await;
@@ -715,14 +736,18 @@ async fn a_client_that_never_attached_receives_only_daemon_scoped_envelopes() {
 /// connection to do something only a handshaked connection may do, and requires
 /// it to be told the handshake never happened.
 ///
-/// Nothing mints monitor grants yet (TASK-108 owns minting), so today this is
-/// every connection. That is the fail-closed posture BR-2 asks for, and it is
-/// stated here rather than left to be discovered.
+/// The refusal here is the **no-approver** arm (TASK-108): a monitor is a
+/// whole-daemon read capability, so it is approved only at a surface the user
+/// demonstrably already owns — a connection attached to some session — and
+/// never by the requester itself. No client is attached anywhere in this test,
+/// so there is nobody to ask and the answer is `NOT_GRANTED` rather than a
+/// prompt. `a_monitor_consent_granted_by_an_attached_client_produces_a_working_monitor`
+/// drives the other arm.
 #[tokio::test]
 async fn a_monitor_declaration_is_refused_without_a_monitor_scope_grant() {
     let path = temp_socket("monitor");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut monitor = TestClient::connect(&path).await;
@@ -767,6 +792,211 @@ async fn a_monitor_declaration_is_refused_without_a_monitor_scope_grant() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// REQ-569 BR-2/BR-6, AC-4 at the raw RPC surface: `monitor` is **reachable
+/// again**, and only through a user at a client that already holds a session.
+///
+/// TASK-106 grant-gated the declaration with nothing able to mint the grant,
+/// which made `monitor` permanently unreachable — a regression against REQ-568
+/// wearing a security posture. This is the test that says the capability exists
+/// and states its price.
+///
+/// Four claims, and the last two are the ones a plausible implementation gets
+/// wrong:
+///
+/// 1. The declaration raises a prompt at the *attached* client, not at the
+///    requester. The requester cannot answer its own — structurally, since it
+///    has not completed a handshake and no method but `handshake` is accepted
+///    on that connection.
+/// 2. Granted, the monitor works: it receives an envelope for a session it
+///    never attached to, which is the whole capability.
+/// 3. **A pending handshake wedges nothing.** The daemon awaits the decision
+///    inside the monitor's own per-connection task, so a third client connects,
+///    handshakes and creates a session while the monitor is still waiting. A
+///    consent awaited on the accept loop would deadlock the daemon for
+///    everyone — including the client that has to answer it.
+/// 4. **Scope independence survives** (LESSON-495): the monitor grant buys
+///    sight of every session and standing to attach to none, so the monitor's
+///    own `session/attach` still has to ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_monitor_consent_granted_by_an_attached_client_produces_a_working_monitor() {
+    let path = temp_socket("mon-ok");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = test_daemon();
+    let held = Arc::clone(&daemon);
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    // The approver: a client attached to a session, by having created it.
+    let mut owner = TestClient::connect(&path).await;
+    assert!(owner.handshake(1).await.get("result").is_some());
+    owner
+        .send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let sid = owner.read_response(2).await["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The declaration, sent without waiting: the handshake response cannot
+    // arrive until somebody decides, which is the point.
+    let mut watcher = TestClient::connect(&path).await;
+    watcher
+        .send(
+            1,
+            "handshake",
+            json!({
+                "client_kind": "cli",
+                "client_name": "test-client",
+                "client_version": "0.1.0",
+                "protocol_min": PROTOCOL_VERSION_MIN,
+                "protocol_max": PROTOCOL_VERSION_MAX,
+                "monitor": true,
+            }),
+        )
+        .await;
+
+    // (3) The daemon is still serving everyone else while that decision is
+    // outstanding.
+    let mut bystander = TestClient::connect(&path).await;
+    assert!(
+        bystander.handshake(1).await.get("result").is_some(),
+        "a pending monitor consent must not wedge the accept loop"
+    );
+    bystander
+        .send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    assert!(bystander.read_response(2).await["result"]["session_id"]
+        .as_str()
+        .is_some());
+
+    // (1) The prompt is rendered at the owner, and it names the wider scope.
+    let prompt = owner.read_event("attach_consent_requested").await;
+    assert_eq!(prompt["params"]["scope"].as_str(), Some("monitor"));
+    assert!(
+        prompt["params"].get("session_id").is_none(),
+        "a monitor request asks for every session, so it names none: {prompt}"
+    );
+    let request_id = prompt["params"]["request_id"]
+        .as_str()
+        .expect("the prompt carries a request id")
+        .to_owned();
+
+    owner
+        .send(
+            3,
+            "attach/consent",
+            json!({ "request_id": request_id, "outcome": {"outcome": "granted"} }),
+        )
+        .await;
+    assert_eq!(
+        owner.read_response(3).await["result"]["resolved"].as_bool(),
+        Some(true),
+        "the decision must have reached the waiting handshake"
+    );
+
+    let admitted = watcher.read_response(1).await;
+    assert!(
+        admitted.get("result").is_some(),
+        "an approved monitor must complete its handshake: {admitted}"
+    );
+    assert_eq!(
+        held.grants.len(),
+        1,
+        "exactly one grant, minted by exactly one decision"
+    );
+
+    // (2) The capability itself: an envelope from a session the monitor never
+    // attached to reaches it.
+    owner
+        .send(4, "session/clear", json!({"session_id": sid.clone()}))
+        .await;
+    assert!(owner.read_response(4).await.get("result").is_some());
+    let seen = watcher.read_event("context_cleared").await;
+    assert_eq!(
+        seen["params"]["session_id"].as_str(),
+        Some(sid.as_str()),
+        "a monitor must receive a session it never attached to: {seen}"
+    );
+
+    // (4) And it buys nothing else. The monitor's own attach raises its own
+    // consent — which the owner does not answer — so a monitor grant is not an
+    // attach grant by another name.
+    watcher
+        .send(2, "session/attach", json!({"session_id": sid.clone()}))
+        .await;
+    let refused = watcher.read_response(2).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::CONSENT_TIMEOUT),
+        "a monitor grant must not confer attach (LESSON-495): {refused}"
+    );
+    assert_eq!(
+        held.grants.len(),
+        1,
+        "and the refused attach must not have added one"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REQ-569 BR-6: the reader loop keeps serving the connection whose consent is
+/// pending.
+///
+/// The flow is a round trip through the *same* socket — a client asks to
+/// attach, and the answer may have to come back on that very connection (BR-6's
+/// second arm, where the requester renders its own prompt). A daemon that
+/// awaited the decision on the reader loop could never read the frame that
+/// ends the wait: the flow would deadlock on itself, and the only symptom
+/// would be every ungranted attach timing out, which looks exactly like the
+/// fail-closed behaviour working.
+///
+/// So the assertion is *ordering*, not liveness: a request issued after the
+/// attach is answered **before** it. A blocked loop cannot produce that, and no
+/// amount of waiting makes a blocked loop produce it either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reader_loop_keeps_serving_while_a_consent_is_pending() {
+    let path = temp_socket("live");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = test_daemon();
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut owner = TestClient::connect(&path).await;
+    assert!(owner.handshake(1).await.get("result").is_some());
+    owner
+        .send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let sid = owner.read_response(2).await["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut newcomer = TestClient::connect(&path).await;
+    assert!(newcomer.handshake(1).await.get("result").is_some());
+    newcomer
+        .send(2, "session/attach", json!({"session_id": sid.clone()}))
+        .await;
+    // Issued while the attach is still awaiting a decision.
+    newcomer.send(3, "session/list", json!({})).await;
+
+    let listed = newcomer.read_response(3).await;
+    assert!(
+        listed.get("result").is_some(),
+        "a pending consent must not stop this connection being served: {listed}"
+    );
+
+    // The attach then resolves on its own timetable — after the request that
+    // overtook it.
+    let refused = newcomer.read_response(2).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::CONSENT_TIMEOUT),
+        "{refused}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// REQ-569 BR-1/BR-8 at the raw RPC surface (AC-5/AC-8): knowing a session id
 /// does not enable attaching to it.
 ///
@@ -790,7 +1020,7 @@ async fn a_monitor_declaration_is_refused_without_a_monitor_scope_grant() {
 async fn knowing_a_session_id_does_not_let_another_connection_attach() {
     let path = temp_socket("grant-attach");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut a = TestClient::connect(&path).await;
@@ -834,10 +1064,21 @@ async fn knowing_a_session_id_does_not_let_another_connection_attach() {
         let refused = b.read_response(id).await;
         assert_eq!(
             refused["error"]["code"].as_i64(),
-            Some(error_code::NOT_GRANTED),
-            "{case}: an ungranted attach must be refused: {refused}"
+            Some(error_code::CONSENT_TIMEOUT),
+            "{case}: an unapproved attach must be refused: {refused}"
         );
     }
+
+    // And the refusal really did leave B with nothing, rather than with an
+    // attachment it can use: the mutating gate is the observable form of "no
+    // grant was minted" at the wire (BR-7).
+    b.send(9, "session/clear", json!({"session_id": sid.clone()}))
+        .await;
+    assert_eq!(
+        b.read_response(9).await["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "a timed-out consent must not have attached B to anything"
+    );
 
     server_task.abort();
     let _ = std::fs::remove_file(&path);
@@ -865,7 +1106,11 @@ async fn a_connection_from_the_daemons_own_process_tree_is_refused_attach_and_mo
     let path = temp_socket("ancestry");
     let listener = server::bind_listener(&path).unwrap();
     let me = i32::try_from(std::process::id()).unwrap();
-    let daemon = Arc::new(Daemon::new().with_daemon_process(server::DaemonProcess::Own(me)));
+    let daemon = Arc::new(
+        Daemon::new()
+            .with_daemon_process(server::DaemonProcess::Own(me))
+            .with_consent_timeout(TEST_CONSENT_WINDOW),
+    );
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     // `session/create` is not gated — a daemon child may hold its own session,
@@ -945,7 +1190,7 @@ async fn a_connection_from_the_daemons_own_process_tree_is_refused_attach_and_mo
 async fn mutating_methods_are_refused_until_the_connection_attaches() {
     let path = temp_socket("gate-attach");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut a = TestClient::connect(&path).await;
@@ -996,8 +1241,8 @@ async fn mutating_methods_are_refused_until_the_connection_attaches() {
     let refused_attach = b.read_response(5).await;
     assert_eq!(
         refused_attach["error"]["code"].as_i64(),
-        Some(error_code::NOT_GRANTED),
-        "B holds no grant for A's session: {refused_attach}"
+        Some(error_code::CONSENT_TIMEOUT),
+        "B holds no grant for A's session and nobody approved one: {refused_attach}"
     );
 
     b.send(6, "session/create", json!({"mode": "freeform"}))
@@ -1057,7 +1302,7 @@ async fn mutating_methods_are_refused_until_the_connection_attaches() {
 async fn web_override_is_refused_until_the_connection_attaches() {
     let path = temp_socket("gate-wov");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut a = TestClient::connect(&path).await;
@@ -1093,8 +1338,8 @@ async fn web_override_is_refused_until_the_connection_attaches() {
     let refused_attach = b.read_response(4).await;
     assert_eq!(
         refused_attach["error"]["code"].as_i64(),
-        Some(error_code::NOT_GRANTED),
-        "B holds no grant for A's session: {refused_attach}"
+        Some(error_code::CONSENT_TIMEOUT),
+        "B holds no grant for A's session and nobody approved one: {refused_attach}"
     );
 
     b.send(5, "session/create", json!({"mode": "freeform"}))
@@ -1153,7 +1398,7 @@ async fn web_override_is_refused_until_the_connection_attaches() {
 async fn an_unattached_connection_cannot_answer_another_sessions_permission_prompt() {
     let path = temp_socket("gate-perm");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     // Kept alive beside the server so the test can raise a prompt in the
     // daemon's own registry and read back whether it is still pending.
     let held = Arc::clone(&daemon);
@@ -1261,7 +1506,7 @@ async fn an_unattached_connection_cannot_answer_another_sessions_permission_prom
 async fn one_connection_attached_to_two_sessions_receives_both_and_only_those() {
     let path = temp_socket("compose");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut multi = TestClient::connect(&path).await;
@@ -1337,7 +1582,7 @@ async fn one_connection_attached_to_two_sessions_receives_both_and_only_those() 
 async fn a_filtered_client_sees_gapped_seqs_and_its_fenced_response_still_completes() {
     let path = temp_socket("scope-seq");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut a = TestClient::connect(&path).await;
@@ -1428,7 +1673,7 @@ async fn a_filtered_client_sees_gapped_seqs_and_its_fenced_response_still_comple
 async fn session_list_omits_title_and_cwd_from_unattached_connections() {
     let path = temp_socket("list-reduced");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, Arc::clone(&daemon)));
 
     // Boundary content, both halves of it: a title is model-generated from the
@@ -1512,14 +1757,15 @@ async fn session_list_omits_title_and_cwd_from_unattached_connections() {
 
     // B stays reduced for as long as it holds no grant, and REQ-569 means it
     // cannot lift that on its own: the `session/attach` that used to be the
-    // whole story is refused (BR-1). The two gates compose the way they should —
-    // the reduction is not a second, weaker copy of the attach rule.
+    // whole story now costs a decision it cannot make for itself (BR-1/BR-6).
+    // The two gates compose the way they should — the reduction is not a
+    // second, weaker copy of the attach rule.
     b.send(3, "session/attach", json!({"session_id": sid.clone()}))
         .await;
     let refused = b.read_response(3).await;
     assert_eq!(
         refused["error"]["code"].as_i64(),
-        Some(error_code::NOT_GRANTED),
+        Some(error_code::CONSENT_TIMEOUT),
         "B cannot promote itself out of the reduced view: {refused}"
     );
     b.send(4, "session/list", json!({})).await;
@@ -1550,7 +1796,7 @@ async fn session_list_omits_title_and_cwd_from_unattached_connections() {
 async fn a_method_before_handshake_is_refused() {
     let path = temp_socket("gate");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut a = TestClient::connect(&path).await;
@@ -1587,7 +1833,7 @@ async fn a_method_before_handshake_is_refused() {
 async fn a_client_from_the_previous_protocol_is_refused_at_the_handshake() {
     let path = temp_socket("skew");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::new());
+    let daemon = test_daemon();
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut old = TestClient::connect(&path).await;

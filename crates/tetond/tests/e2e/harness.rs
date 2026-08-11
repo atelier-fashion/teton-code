@@ -675,6 +675,15 @@ enum Incoming {
     Event(Value),
 }
 
+/// Where the reader thread's own request ids start.
+///
+/// Far above anything the main thread's counter reaches, because the two share
+/// one socket: an auto-answer written from the reader thread must not collide
+/// with a request the test is waiting on, or [`Client::await_response`] would
+/// return the wrong frame. Unmatched responses are simply skipped by every
+/// reader here, so the answers themselves need no correlation.
+const READER_THREAD_ID_BASE: i64 = 900_000;
+
 /// A minimal blocking JSON-RPC client over the daemon socket. A reader thread
 /// classifies incoming frames; the main thread writes requests, auto-answers
 /// permission prompts, and accumulates every event it observed.
@@ -684,16 +693,28 @@ pub struct Client {
     next_id: i64,
     events: Vec<Value>,
     auto_approve: bool,
+    /// Whether the **reader thread** answers `attach_consent_requested` with
+    /// `granted` (REQ-569 BR-6). Shared with that thread, so a test can arm it
+    /// after the client is connected.
+    auto_consent: Arc<AtomicBool>,
 }
 
 impl Client {
     fn connect(socket: &Path) -> Self {
         let writer = UnixStream::connect(socket).expect("connect daemon socket");
         let reader_stream = writer.try_clone().unwrap();
+        // The reader thread answers consent prompts on its own, which needs its
+        // own handle on the socket: the whole point is that it can reply while
+        // the main thread is blocked awaiting some *other* connection's
+        // response.
+        let mut consent_writer = writer.try_clone().unwrap();
+        let auto_consent = Arc::new(AtomicBool::new(false));
+        let armed = Arc::clone(&auto_consent);
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut reader = BufReader::new(reader_stream);
             let mut line = String::new();
+            let mut next_id = READER_THREAD_ID_BASE;
             loop {
                 line.clear();
                 match reader.read_line(&mut line) {
@@ -714,6 +735,37 @@ impl Client {
                     Some(_) => continue, // lag notice etc.
                     None => Incoming::Response(value),
                 };
+                // REQ-569 BR-6: answered *here* rather than in `on_event`,
+                // because the surface a consent prompt is rendered at is
+                // routinely a client that is not the one blocked on the
+                // request. In a real client that is a UI thread; here it is
+                // this one. Answering on the main thread's pump would mean the
+                // approver could only answer while the test happened to be
+                // driving it — which is exactly the interleaving the daemon's
+                // flow does *not* have.
+                if let Incoming::Event(event) = &incoming {
+                    if armed.load(Ordering::SeqCst)
+                        && event.get("event").and_then(Value::as_str)
+                            == Some("attach_consent_requested")
+                    {
+                        if let Some(request_id) = event.get("request_id").and_then(Value::as_str) {
+                            let answer = json!({
+                                "jsonrpc": "2.0",
+                                "id": next_id,
+                                "method": "attach/consent",
+                                "params": {
+                                    "request_id": request_id,
+                                    "outcome": { "outcome": "granted" },
+                                },
+                            });
+                            next_id += 1;
+                            let mut text = serde_json::to_string(&answer).unwrap();
+                            text.push('\n');
+                            let _ = consent_writer.write_all(text.as_bytes());
+                            let _ = consent_writer.flush();
+                        }
+                    }
+                }
                 if tx.send(incoming).is_err() {
                     break;
                 }
@@ -726,6 +778,7 @@ impl Client {
             next_id: 1,
             events: Vec::new(),
             auto_approve: true,
+            auto_consent,
         };
         client.handshake();
         client
@@ -735,6 +788,20 @@ impl Client {
     /// can observe an unanswered prompt).
     pub fn without_auto_approve(mut self) -> Self {
         self.auto_approve = false;
+        self
+    }
+
+    /// Approve every attach/monitor consent prompt this client is offered
+    /// (REQ-569 BR-6) — the stand-in for the user who says yes.
+    ///
+    /// **Opt-in, unlike `auto_approve`, and deliberately so.** Approving an
+    /// attach hands another connection a session; a suite that did it by
+    /// default would let any test that happened to call `session/attach` walk
+    /// through the gate this REQ exists to build, and the test would look like
+    /// it had proved the attach was allowed. A test that wants a user to say
+    /// yes has to say so.
+    pub fn with_auto_consent(self) -> Self {
+        self.auto_consent.store(true, Ordering::SeqCst);
         self
     }
 

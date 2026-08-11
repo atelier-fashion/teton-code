@@ -66,12 +66,24 @@
 //!    survive the arrival of a child that does something new (LESSON-443).
 //! 2. **Grant (BR-1/BR-2).** Everyone else may attach only to a session they
 //!    created or hold an attach-scope grant for ([`crate::grants`]);
-//!    `monitor` needs its own monitor-scope grant. Otherwise `NOT_GRANTED`.
+//!    `monitor` needs its own monitor-scope grant.
+//! 3. **Consent (BR-6, [`crate::consent`]).** A connection with no standing is
+//!    not simply refused: the question is put to a user, and their answer is
+//!    the only thing in this daemon that mints a grant. Approved →
+//!    exactly one grant, at exactly the scope asked for. Declined, unanswered,
+//!    or asked with nobody to ask → `CONSENT_DENIED` / `CONSENT_TIMEOUT` /
+//!    `NOT_GRANTED`, and nothing minted (BR-7).
 //!
-//! Both refusals precede `daemon.sessions.get`, and both answer identically for
-//! a session that exists and one that does not, so neither becomes an existence
-//! oracle for a connection that guessed an id (BR-8: ids are names, grants are
-//! credentials).
+//! Gate (1) and every outcome of (3) precede `daemon.sessions.get`, and all of
+//! them answer identically for a session that exists and one that does not, so
+//! none becomes an existence oracle for a connection that guessed an id (BR-8:
+//! ids are names, grants are credentials). The prompt is raised for a
+//! nonexistent id too, for that reason.
+//!
+//! `session/attach` therefore runs on its own task, like `session/prompt`: it
+//! awaits a decision that may arrive as an `attach/consent` on this very
+//! connection, and a reader loop that awaited it inline could not read the
+//! answer that would end the wait.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -87,25 +99,29 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use teton_protocol::events::{
-    DaemonClientAttach, Event, PhaseTransition, EVENT_METHOD, SUBSCRIPTION_LAGGED_METHOD,
+    AttachConsentRequested, AttachRefused, AttachRefusedReason, ConsentScope, DaemonClientAttach,
+    Event, EventEnvelope, PhaseTransition, EVENT_METHOD, SUBSCRIPTION_LAGGED_METHOD,
 };
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
 use teton_protocol::methods::{
-    ConfigGetParams, ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams,
-    ModelConfirmParams, ModelListParams, ModelSetParams, ModelStatusParams,
-    PermissionRespondParams, PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod,
-    SessionAttachParams, SessionAttachResult, SessionClearParams, SessionCreateParams,
-    SessionCreateResult, SessionListParams, SessionListResult, SessionSummary, WebOverrideParams,
-    WebRefreshParams,
+    AttachConsentOutcome, AttachConsentParams, AttachConsentResult, ConfigGetParams,
+    ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams, ModelConfirmParams,
+    ModelListParams, ModelSetParams, ModelStatusParams, PermissionRespondParams,
+    PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod, SessionAttachParams,
+    SessionAttachResult, SessionClearParams, SessionCreateParams, SessionCreateResult,
+    SessionListParams, SessionListResult, SessionSummary, WebOverrideParams, WebRefreshParams,
 };
-use teton_protocol::SessionId;
+use teton_protocol::{RequestId, SessionId};
 
 use teton_core::lifetime::{BlockingActivity, PolicySource, ShutdownPolicy};
 
 use crate::auth::{self, PeerIdentity};
 use crate::broadcast::{EventBus, Subscription, DEFAULT_CAPACITY};
-use crate::grants::{ConnectionId, GrantRegistry};
+use crate::consent::{
+    ConsentOutcome, ConsentRoute, ConsentSurfaces, PendingConsents, CONSENT_TIMEOUT,
+};
+use crate::grants::{ConnectionId, Grant, GrantRegistry};
 use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
 use crate::runtime::DaemonRuntime;
@@ -215,8 +231,24 @@ pub struct Daemon {
     /// the registry and the bus, and in-memory only — nothing here is ever
     /// persisted.
     pub grants: GrantRegistry,
+    /// The consent requests in flight, and the ids that resolve them
+    /// (REQ-569 BR-6/BR-7, ADR-E). The only thing that mints an entry in
+    /// [`Self::grants`].
+    pub consents: PendingConsents,
+    /// Every live connection a consent prompt can be rendered at (BR-6's
+    /// routing question, which no single connection can answer for itself).
+    pub surfaces: ConsentSurfaces,
     /// The process whose descendants may never attach or monitor (BR-4, ADR-A).
     pub process: DaemonProcess,
+    /// How long a consent request waits before it defaults closed (BR-7).
+    ///
+    /// A field rather than the [`CONSENT_TIMEOUT`] constant read at the use
+    /// site, for the reason [`Self::process`] is a field: a test that has to
+    /// observe the *timeout* arm should not have to wait out a window sized for
+    /// a human. Production never sets it — [`Daemon::with_lifetime`] and
+    /// [`Daemon::new`] both take the constant — and a fixture has to say
+    /// [`Daemon::with_consent_timeout`] out loud to change it.
+    pub consent_timeout: std::time::Duration,
 }
 
 impl Daemon {
@@ -240,6 +272,9 @@ impl Daemon {
             runtime: Arc::new(DaemonRuntime::minimal()),
             lifetime,
             grants: GrantRegistry::new(),
+            consents: PendingConsents::new(),
+            surfaces: ConsentSurfaces::new(),
+            consent_timeout: CONSENT_TIMEOUT,
             // `Embedded`, for the same reason `ShutdownPolicy::Never` is above:
             // a bare `Daemon::new()` is a fixture, and a fixture is run *inside*
             // the process that also holds its clients. See
@@ -260,6 +295,19 @@ impl Daemon {
     #[must_use]
     pub fn with_daemon_process(mut self, process: DaemonProcess) -> Self {
         self.process = process;
+        self
+    }
+
+    /// Replaces the window a consent request waits before defaulting closed
+    /// (BR-7).
+    ///
+    /// For fixtures that assert on the *timeout* arm. [`CONSENT_TIMEOUT`] is
+    /// sized for a human noticing a prompt; a test that waited it out would
+    /// spend half a minute proving a branch it can prove in milliseconds, and a
+    /// suite that slow is a suite people stop running.
+    #[must_use]
+    pub fn with_consent_timeout(mut self, window: std::time::Duration) -> Self {
+        self.consent_timeout = window;
         self
     }
 
@@ -293,6 +341,8 @@ impl Daemon {
             runtime,
             lifetime,
             grants: GrantRegistry::new(),
+            consents: PendingConsents::new(),
+            surfaces: ConsentSurfaces::new(),
             // The production answer, and taken here rather than passed in so
             // `main` cannot ship a daemon that forgot to state it: this daemon
             // is its own process, and the children it spawns are what BR-4
@@ -300,6 +350,7 @@ impl Daemon {
             process: DaemonProcess::Own(
                 i32::try_from(std::process::id()).expect("a pid fits in i32"),
             ),
+            consent_timeout: CONSENT_TIMEOUT,
         }
     }
 }
@@ -440,6 +491,13 @@ struct ConnState {
     /// Whether this connection's process came out of the daemon's own process
     /// tree (BR-4). Computed once, at the handshake.
     ancestry: Ancestry,
+    /// What a consent prompt calls this connection: the kind and name it gave
+    /// at the handshake, bounded and stripped of control characters
+    /// ([`requester_descriptor`]). Fixed at the handshake like `monitor` and
+    /// `ancestry`, because that is the only moment the strings exist — and
+    /// because a descriptor that could change mid-connection would describe one
+    /// requester in the prompt and another in the log.
+    requester: String,
     attached: Arc<RwLock<HashSet<SessionId>>>,
     created: Arc<RwLock<HashSet<SessionId>>>,
     monitor: bool,
@@ -447,10 +505,11 @@ struct ConnState {
 
 impl ConnState {
     /// A connection attached to nothing, monitoring or not as declared.
-    fn new(id: ConnectionId, ancestry: Ancestry, monitor: bool) -> Self {
+    fn new(id: ConnectionId, ancestry: Ancestry, monitor: bool, requester: String) -> Self {
         Self {
             id,
             ancestry,
+            requester,
             attached: Arc::new(RwLock::new(HashSet::new())),
             created: Arc::new(RwLock::new(HashSet::new())),
             monitor,
@@ -485,6 +544,18 @@ impl ConnState {
         self.created
             .read()
             .expect("connection creation lock poisoned")
+            .clone()
+    }
+
+    /// A snapshot of the sessions this connection is attached to.
+    ///
+    /// Cloned rather than lent out under the lock, for [`Self::created`]'s
+    /// reason: the consent rule reads it and then takes other locks, and a
+    /// guard held across that is a deadlock waiting for the right interleaving.
+    fn attached(&self) -> HashSet<SessionId> {
+        self.attached
+            .read()
+            .expect("connection attachment lock poisoned")
             .clone()
     }
 
@@ -562,13 +633,15 @@ const NOT_ATTACHED_MESSAGE: &str = "not attached to this session; attach to it f
 const ATTACH_FORBIDDEN_MESSAGE: &str =
     "this connection may not attach to or monitor sessions on this daemon";
 
-/// The refusal an ungranted connection gets (REQ-569 BR-1/BR-2).
+/// The refusal a `monitor` declaration gets when there is nobody to ask
+/// (REQ-569 BR-2).
 ///
-/// Deliberately says nothing about the named session — not whether it exists,
-/// not who holds it. `session/attach` answers this *before* the registry is
-/// consulted, so a connection that guessed an id learns exactly as much as one
-/// that named a real session: nothing (BR-8).
-const NOT_GRANTED_MESSAGE: &str = "no grant for this session; a grant must be given, not assumed";
+/// The only `NOT_GRANTED` this seam still issues. `session/attach` no longer
+/// answers it at all — an ungranted attach raises a consent request instead
+/// (BR-6), so its refusals are `CONSENT_DENIED` and `CONSENT_TIMEOUT` — while a
+/// monitor declared on a daemon where no connection is attached anywhere has no
+/// prompt to raise and no surface to raise it at.
+const NOT_GRANTED_MESSAGE: &str = "no monitor-scope grant, and no attached client to ask for one";
 
 /// The daemon-log sentence for an ancestry refusal (REQ-569 BR-4).
 ///
@@ -595,6 +668,60 @@ fn ancestry_refusal_line(ancestry: Ancestry, what: &str) -> String {
         Ancestry::NotDescendant => "it was not refused",
     };
     format!("tetond: refused {what} for a connection because {because}")
+}
+
+/// The refusal a connection gets when a user was asked and said no
+/// (REQ-569 BR-5/BR-7).
+const CONSENT_DENIED_MESSAGE: &str = "the request was declined";
+
+/// The refusal a connection gets when the consent window closed unanswered
+/// (REQ-569 BR-7, AC-6).
+///
+/// Names the remedy, because unlike a denial this one is worth retrying: the
+/// prompt may have been rendered where nobody was looking.
+const CONSENT_TIMEOUT_MESSAGE: &str =
+    "the request was not answered in time and defaulted to declined; ask again";
+
+/// The refusal an answer to somebody else's consent request gets
+/// (REQ-569 BR-6).
+///
+/// Content-free, and identical whether the request exists and was routed
+/// elsewhere or the connection simply is not a surface it was offered to: a
+/// stranger must not be able to map who is attached to what by watching which
+/// consent requests it is allowed to answer.
+const CONSENT_NOT_OFFERED_MESSAGE: &str = "this consent request was not offered to this connection";
+
+/// How much of a client's self-declared name a consent prompt carries.
+///
+/// Sixty-four characters is generous for "teton", "code-vscode" and the like,
+/// and short enough that the whole descriptor stays renderable in one line of a
+/// prompt a user has to read and decide on.
+const REQUESTER_BUDGET: usize = 64;
+
+/// What a consent prompt calls the connection that is asking (REQ-569 BR-6).
+///
+/// **Every character here is chosen by an unprivileged same-UID peer**, which
+/// is what shapes the whole function. It is bounded (`client_name` is limited
+/// only by `MAX_FRAME` on the wire, ~4 MiB, and this string is published to
+/// other clients) and stripped of control characters, so a requester cannot
+/// forge extra lines, move a cursor, or inject an ANSI sequence into whatever
+/// surface renders the prompt — the same treatment REQ-568's monitor log line
+/// gives the same field, applied here because the destination is a user's
+/// screen rather than a log.
+///
+/// It carries the kind and the name and **nothing else**: no pid, no executable
+/// path, no environment, no command line. Those would read as identity, and
+/// this string is not identity — it is a hint, offered alongside a decision the
+/// user is making. The identity claim on this seam is the ancestry gate, which
+/// already ran.
+fn requester_descriptor(params: &HandshakeParams) -> String {
+    let name: String = params
+        .client_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(REQUESTER_BUDGET)
+        .collect();
+    format!("{:?} client {name:?}", params.client_kind)
 }
 
 /// The delivery policy: may an envelope scoped to `env_session` reach a
@@ -685,6 +812,11 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
     // unblocks the harness permission gate mid-turn (otherwise the loop would
     // deadlock awaiting a reply it cannot read).
     let mut prompt_tasks: Vec<JoinHandle<()>> = Vec::new();
+    // In-flight `session/attach` calls, for exactly the same reason (REQ-569
+    // BR-6): an attach that needs consent awaits an `attach/consent` that may
+    // arrive on *this* connection, so running it here would deadlock the loop
+    // that has to read the answer.
+    let mut attach_tasks: Vec<JoinHandle<()>> = Vec::new();
     let mut line = String::new();
 
     loop {
@@ -792,7 +924,9 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
 
             // On success, subscribe and start forwarding events. On failure the
             // error response is already queued and the client stays unauthenticated.
-            if let Some((sub, guard, state)) = do_handshake(&daemon, peer, id, params, &out_tx) {
+            if let Some((sub, guard, state)) =
+                do_handshake(&daemon, peer, id, params, &out_tx).await
+            {
                 handshaked = true;
                 client_guard = Some(guard);
                 let (forwarded_tx, forwarded_rx) = watch::channel(0u64);
@@ -800,6 +934,25 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                     delivered: sub.delivered_counter(),
                     forwarded: forwarded_rx,
                 });
+                // REQ-569 BR-6: this connection becomes a surface a consent
+                // prompt can be rendered at. It shares the *same* attachment
+                // set the dispatch path mutates rather than a copy, so the
+                // routing rule always reads what this connection is attached to
+                // now — there is no second answer to keep in step.
+                //
+                // **Unless it is a daemon descendant** (BR-4). A tool child may
+                // hold a session of its own — `session/create` is ungated — so
+                // it would otherwise qualify as an approver under the monitor
+                // rule and could grant a same-UID peer sight of every session.
+                // It is not offered the prompt here, and `handle_attach_consent`
+                // refuses it an answer even if it learns a request id another
+                // way; delivery and decision are gated separately because
+                // either alone would leave the other reachable.
+                if state.may_hold_session_access() {
+                    daemon
+                        .surfaces
+                        .register(state.id, Arc::clone(&state.attached), out_tx.clone());
+                }
                 // The forwarder's clone shares the attached set with the one
                 // the dispatch path below mutates (REQ-568 BR-1).
                 forwarder = Some(tokio::spawn(forward_events(
@@ -848,6 +1001,28 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
             continue;
         }
 
+        // `session/attach` runs on its own task for `session/prompt`'s reason
+        // (REQ-569 BR-6): it may await a consent decision that arrives on this
+        // same connection, and the reader loop has to stay free to read it.
+        if method == SessionAttachParams::METHOD {
+            let daemon = Arc::clone(&daemon);
+            let conn = conn.clone();
+            let out_tx = out_tx.clone();
+            let fence = fence.clone();
+            attach_tasks.retain(|h| !h.is_finished());
+            attach_tasks.push(tokio::spawn(async move {
+                let response = handle_session_attach(&daemon, &conn, id, params).await;
+                // The fence for the same reason `dispatch`'s responses take it:
+                // any event already delivered to this client's subscription
+                // must reach the wire ahead of the response ordering it.
+                if let Some(fence) = fence {
+                    fence.sync().await;
+                }
+                let _ = out_tx.send(response).await;
+            }));
+            continue;
+        }
+
         if let Some(response) = dispatch(&daemon, conn, id, method, params) {
             // Any event the handler just published (e.g. `session/create`'s
             // phase transition) must be on the outbound channel before its
@@ -865,14 +1040,34 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         forwarder.abort();
     }
 
-    // REQ-569 ADR-C: grants die with the connection that holds them. Done here,
-    // at the one place a connection ends, rather than beside each site that
-    // might have minted one — a release that had to be remembered per mint is a
-    // release that is eventually forgotten, and a grant outliving its subject is
-    // a credential nobody can revoke. Unconditional: most connections were never
-    // granted anything, and `release` on a connection holding nothing is a
-    // no-op. A connection that never handshaked has no id and therefore no
-    // grants to release.
+    // REQ-569 BR-6/ADR-C, and the order is the mechanism:
+    //
+    //   1. stop being a consent surface  → no new prompt is routed here, and
+    //                                      no in-flight attach can pick this
+    //                                      connection as an approver
+    //   2. end the in-flight attaches    → each is awaiting a decision that can
+    //                                      still *mint a grant*, so they must
+    //                                      be finished before the release below
+    //   3. release the grants            → nothing can add one after this point
+    //
+    // Aborting before awaiting is what makes step 2 bounded rather than up to
+    // one consent window long, and awaiting after aborting is what makes it
+    // *deterministic*: dropping a `JoinHandle` detaches the task, so a bare
+    // abort would leave a task that might still mint a grant for a connection
+    // whose grants have just been released — a credential with no subject and
+    // nobody to revoke it (LESSON-501: state carried past its creator's
+    // lifetime sheds its invariants).
+    //
+    // Unconditional: most connections were never granted anything, and
+    // `release` on a connection holding nothing is a no-op. A connection that
+    // never handshaked has no id, so it has neither surface nor grants.
+    if let Some(state) = conn.as_ref() {
+        daemon.surfaces.release(state.id);
+    }
+    for task in attach_tasks {
+        task.abort();
+        let _ = task.await;
+    }
     if let Some(state) = conn.as_ref() {
         daemon.grants.release(state.id);
     }
@@ -1061,7 +1256,7 @@ fn flatten_prompt(blocks: &[PromptBlock]) -> String {
 /// call would spend a kernel read on every request and — the part that matters —
 /// would let the verdict change under a connection whose pid was reused, so the
 /// gate a request meets could differ from the gate the handshake meant.
-fn do_handshake(
+async fn do_handshake(
     daemon: &Daemon,
     peer: PeerIdentity,
     id: Id,
@@ -1107,10 +1302,9 @@ fn do_handshake(
     //
     // Two reasons, two codes (BR-5): ancestry is checked first and is terminal,
     // so a daemon descendant is never told "ask for a grant" about a grant it
-    // may not have. Everyone else is refused for want of a monitor-scope grant —
-    // and since a connection is brand new here and nothing mints monitor grants
-    // yet, that is *every* connection until TASK-108's consent path lands. That
-    // is the fail-closed posture BR-2 asks for, stated rather than approximated.
+    // may not have — and, since TASK-108, so it cannot make a consent prompt
+    // appear on a user's screen by asking. Everyone else may *ask*, and what
+    // they get is a question put to somebody else.
     if params.monitor {
         if !matches!(ancestry, Ancestry::NotDescendant) {
             eprintln!(
@@ -1125,12 +1319,83 @@ fn do_handshake(
             return None;
         }
         if !daemon.grants.may_monitor(connection) {
-            let _ = out_tx.try_send(error_string(
-                id,
-                error_code::NOT_GRANTED,
-                "no monitor-scope grant; monitor must be granted, not declared",
-            ));
-            return None;
+            // The monitor routing rule, and it is deliberately narrower than
+            // either attach arm (BR-2/AC-4): a monitor is sight of every
+            // session there is and every session there will be, so it is
+            // approved only at a surface the user demonstrably already owns —
+            // a connection attached to *some* session — and **never** by the
+            // requester itself. There is no self-approval arm here, which is
+            // the difference from `session/attach`: attach's second arm exists
+            // because BR-6 requires the resume flow to work when the user's
+            // last client is gone, and a monitor has no resume flow to
+            // preserve.
+            let route = ConsentRoute::any_attached_peer(connection);
+            let requester = requester_descriptor(&params);
+            if !daemon.surfaces.anyone_attached_besides(connection) {
+                // Nobody to ask, so nobody is asked and nothing is granted.
+                // Refused rather than self-approved: "there is no user
+                // available to consent" must never resolve to "consent".
+                publish_attach_refusal(
+                    daemon,
+                    &route,
+                    None,
+                    None,
+                    ConsentScope::Monitor,
+                    AttachRefusedReason::NoGrant,
+                );
+                let _ = out_tx.try_send(error_string(
+                    id,
+                    error_code::NOT_GRANTED,
+                    NOT_GRANTED_MESSAGE,
+                ));
+                return None;
+            }
+
+            // The await is bounded and happens on this connection's own task,
+            // which is what keeps it off the accept loop: `serve` spawns
+            // `handle_client` per connection, so a handshake waiting on a
+            // decision blocks nothing but itself. It also cannot block the peer
+            // that has to answer — that peer is a different connection with a
+            // different reader loop.
+            let outcome =
+                seek_consent(daemon, &requester, ConsentScope::Monitor, None, &route).await;
+            match outcome {
+                // The one place a monitor-scope grant is minted. Keyed to the
+                // session whose surface approved it: `may_monitor` reads only
+                // the scope, but a key naming a real session is what makes the
+                // entry honest about where the consent came from.
+                ConsentOutcome::Granted {
+                    approved_at: Some(session),
+                } => daemon.grants.grant(Grant::monitor(connection, session)),
+                // Approved by a surface that turns out to hold no session — the
+                // approver detached between rendering and answering. Fail
+                // closed rather than mint a grant we cannot key: a monitor
+                // approved by nobody's session is a monitor approved by nobody.
+                ConsentOutcome::Granted { approved_at: None } => {
+                    let _ = out_tx.try_send(error_string(
+                        id,
+                        error_code::NOT_GRANTED,
+                        "the approving client no longer holds a session; ask again",
+                    ));
+                    return None;
+                }
+                ConsentOutcome::Denied => {
+                    let _ = out_tx.try_send(error_string(
+                        id,
+                        error_code::CONSENT_DENIED,
+                        CONSENT_DENIED_MESSAGE,
+                    ));
+                    return None;
+                }
+                ConsentOutcome::TimedOut => {
+                    let _ = out_tx.try_send(error_string(
+                        id,
+                        error_code::CONSENT_TIMEOUT,
+                        CONSENT_TIMEOUT_MESSAGE,
+                    ));
+                    return None;
+                }
+            }
         }
     }
 
@@ -1198,7 +1463,12 @@ fn do_handshake(
     Some((
         subscription,
         client_guard,
-        ConnState::new(connection, ancestry, params.monitor),
+        ConnState::new(
+            connection,
+            ancestry,
+            params.monitor,
+            requester_descriptor(&params),
+        ),
     ))
 }
 
@@ -1256,8 +1526,11 @@ fn dispatch(
             };
             Some(ok_string(id, &result))
         }
-        SessionAttachParams::METHOD => Some(handle_session_attach(daemon, conn, id, params)),
+        // `session/attach` is deliberately absent, exactly as `session/prompt`
+        // is: both run on their own task (see `handle_client`), because both
+        // await something this reader loop has to stay free to read.
         SessionClearParams::METHOD => Some(handle_session_clear(daemon, conn, id, params)),
+        AttachConsentParams::METHOD => Some(handle_attach_consent(daemon, conn, id, params)),
         PermissionRespondParams::METHOD => {
             Some(handle_permission_respond(daemon, conn, id, params))
         }
@@ -1545,31 +1818,158 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
     }
 }
 
+/// Serializes a routed event into the wire frame a connection's outbound
+/// channel carries.
+///
+/// The consent events are the daemon's only *routed* events (BR-6): every other
+/// event goes on the bus and is filtered per connection by [`forward_events`],
+/// while these two are addressed to named surfaces by
+/// [`crate::consent::ConsentSurfaces`]. They still take their sequence number
+/// from the bus, so a routed frame can never collide with a broadcast one on
+/// the same connection.
+///
+/// The session, when there is one, rides on the envelope rather than in the
+/// payload — [`Event`] is flattened, so a `session_id` field on the payload
+/// would emit the key twice.
+///
+/// That envelope is session-scoped while one recipient — the requester — is by
+/// definition *not* attached to that session, which looks like a hole in
+/// REQ-568's scoping and is not one. These frames never cross
+/// [`forward_events`], so the delivery policy is not being bypassed; and the id
+/// is not news to anyone who receives it, because the requester is the
+/// connection that named it and the other recipients are attached to it.
+fn consent_event_frame(daemon: &Daemon, session_id: Option<SessionId>, event: Event) -> String {
+    let envelope = EventEnvelope::new(daemon.events.next_seq(), session_id, event);
+    // Infallible for these payloads (plain strings and closed enums); a
+    // hypothetical failure costs the prompt a delivery, which the bounded
+    // window already turns into a refusal.
+    serde_json::to_string(&Notification::new(EVENT_METHOD, envelope)).unwrap_or_default()
+}
+
+/// Tell the surfaces a request was offered to how it ended (BR-5).
+///
+/// Published on the request's own route, so exactly the people who were asked
+/// learn the answer — plus the requester, which
+/// [`ConsentRoute::renders_outcome`] adds because it is the one connection that
+/// must retire its own pending state and the one connection no
+/// attachment-shaped delivery would reach.
+///
+/// For [`AttachRefusedReason::NoGrant`] that route is empty by construction:
+/// nobody was attached anywhere, which is *why* the answer is "no grant" rather
+/// than a prompt. It is published through the same site anyway, because the
+/// alternative is a publisher that has to know which refusals are worth
+/// announcing — and that is a second policy to keep in step with this one.
+fn publish_attach_refusal(
+    daemon: &Daemon,
+    route: &ConsentRoute,
+    session_id: Option<SessionId>,
+    request_id: Option<RequestId>,
+    scope: ConsentScope,
+    reason: AttachRefusedReason,
+) {
+    let frame = consent_event_frame(
+        daemon,
+        session_id,
+        Event::AttachRefused(AttachRefused {
+            request_id,
+            scope,
+            reason,
+        }),
+    );
+    daemon.surfaces.deliver_outcome(route, &frame);
+}
+
+/// Put the question to a user and wait for the answer (BR-6/BR-7, ADR-E).
+///
+/// The whole consent round trip in one place, so the attach path and the
+/// monitor path cannot drift into two subtly different flows: register the
+/// waiter **before** publishing (an answer that arrives instantly must find
+/// something to resolve), publish on the route, await under the daemon's
+/// bounded window, and announce a refusal on the same route.
+///
+/// Defaults closed on every ending it does not understand. Nothing here mints
+/// anything — the caller does that, and only on
+/// [`ConsentOutcome::Granted`] — which is what keeps "a denied or timed-out
+/// request leaves no partial grant state" a property of one branch rather than
+/// of every path through two handlers (BR-7, LESSON-501).
+async fn seek_consent(
+    daemon: &Daemon,
+    requester: &str,
+    scope: ConsentScope,
+    session_id: Option<SessionId>,
+    route: &ConsentRoute,
+) -> ConsentOutcome {
+    let request_id = daemon.consents.next_request_id();
+    let rx = daemon.consents.register(request_id.clone(), route.clone());
+    let frame = consent_event_frame(
+        daemon,
+        session_id.clone(),
+        Event::AttachConsentRequested(AttachConsentRequested {
+            request_id: request_id.clone(),
+            scope,
+            requester: requester.to_owned(),
+        }),
+    );
+    daemon.surfaces.deliver_request(route, &frame);
+
+    let outcome = daemon
+        .consents
+        .await_decision(&request_id, rx, daemon.consent_timeout)
+        .await;
+    let reason = match outcome {
+        ConsentOutcome::Granted { .. } => return outcome,
+        ConsentOutcome::Denied => AttachRefusedReason::ConsentDenied,
+        ConsentOutcome::TimedOut => AttachRefusedReason::ConsentTimeout,
+    };
+    publish_attach_refusal(daemon, route, session_id, Some(request_id), scope, reason);
+    outcome
+}
+
 /// Attach a connection to an existing session (`session/attach`), which is what
 /// grants it that session's events from here on (REQ-568 BR-1) — and, since
-/// REQ-569, is itself the thing that must be authorized (BR-1/BR-2/BR-4).
+/// REQ-569, is itself the thing that must be authorized (BR-1/BR-2/BR-4/BR-6).
 ///
-/// **Three answers, in this order, and the order is the requirement.**
+/// **Four answers, in this order, and the order is the requirement.**
 ///
 /// 1. *Ancestry* (BR-4, ADR-A). A connection out of the daemon's own process
 ///    tree is refused `ATTACH_FORBIDDEN` — before the params are even parsed,
 ///    let alone the registry consulted. There is no consent path from here and
-///    never will be: [`crate::grants`] cannot mint what this gate refuses,
-///    because the gate is asked first.
-/// 2. *Grant* (BR-1). Everyone else must have created the session or hold an
-///    attach-scope grant for it; otherwise `NOT_GRANTED`.
-/// 3. Only then is the session looked up and attached, exactly as before.
+///    never will be: no prompt is raised, so the daemon's own children can
+///    neither obtain a grant nor make a user's screen light up by asking for
+///    one.
+/// 2. *Standing* (BR-1). A connection that created the session or already holds
+///    an attach-scope grant attaches with **no prompt at all** — the
+///    single-client create-and-prompt flow costs exactly what it used to
+///    (AC-7).
+/// 3. *Consent* (BR-6). Everyone else has the question put to a user, and the
+///    answer is the only thing in this daemon that mints an attach grant.
+/// 4. Only then is the session looked up and attached, exactly as before.
 ///
-/// Both refusals precede `daemon.sessions.get`, and that placement is
-/// load-bearing rather than tidy: answering `UNKNOWN_SESSION` first for an id
-/// the connection may not have would turn `session/attach` into an oracle that
-/// confirms guessed session ids, which is the whole property BR-8 is protecting
-/// (ids are names, grants are credentials). A guessed id and a real one draw the
-/// same refusal.
-fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+/// Refusals (1) and (3) both precede `daemon.sessions.get`, and that placement
+/// is load-bearing rather than tidy: answering `UNKNOWN_SESSION` first for an
+/// id the connection may not have would turn `session/attach` into an oracle
+/// that confirms guessed session ids, which is the whole property BR-8
+/// protects (ids are names, grants are credentials). A guessed id and a real
+/// one raise the same prompt and draw the same refusal.
+///
+/// Which is also why a granted consent for a session that does not exist mints
+/// a grant and *then* answers `UNKNOWN_SESSION`: the alternative is to check
+/// existence before asking, which rebuilds the oracle. The residual entry is a
+/// grant over an id that names nothing, keyed to this connection, and released
+/// when it ends.
+///
+/// # Not on the reader loop
+///
+/// This is `async` and run on its own task ([`handle_client`]) for the reason
+/// `session/prompt` is: it awaits a reply that has to be *read* — the
+/// `attach/consent` that answers it may arrive on this very connection (BR-6's
+/// second arm). Awaiting it inline would deadlock the loop that must deliver
+/// the answer.
+async fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     // (1) Ahead of the parse, not merely ahead of the registry. A daemon
     // descendant learns nothing at all here — not whether the session exists,
-    // and not even whether its own request was well-formed.
+    // not whether its own request was well-formed, and not what a user would
+    // have said, because no user is asked.
     if !conn.may_hold_session_access() {
         eprintln!("{}", ancestry_refusal_line(conn.ancestry, "session/attach"));
         return error_string(id, error_code::ATTACH_FORBIDDEN, ATTACH_FORBIDDEN_MESSAGE);
@@ -1580,19 +1980,73 @@ fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
 
-    // (2) The grant question, asked of the one module that answers it. The
+    // (2) The standing question, asked of the one module that answers it. The
     // creator's own attach comes through the same call rather than being
     // short-circuited above it, so there is a single definition of "may attach"
     // instead of one here and one in `grants` (LESSON-484).
-    if !daemon
+    if daemon
         .grants
         .may_attach(conn.id, &params.session_id, &conn.created())
     {
-        return error_string(id, error_code::NOT_GRANTED, NOT_GRANTED_MESSAGE);
+        return attach_to(daemon, conn, id, &params.session_id);
     }
 
-    // (3) Authorized. From here the behaviour is REQ-568's, unchanged.
-    match daemon.sessions.get(&params.session_id) {
+    // (3) No standing, so ask. **Which arm runs is decided here, once** (BR-6):
+    //
+    //   - Arm 1, `attached_to`: some connection is already attached to the
+    //     target, so the prompt goes to it. That is the good case — the user
+    //     approving is the user who already has the session open.
+    //   - Arm 2, `requester_itself`: nothing is attached to the target, so the
+    //     requester renders its own prompt. This is the resume flow BR-6
+    //     requires to keep working after the last client left, and it is sound
+    //     *only* because step (1) already refused every connection out of the
+    //     daemon's own process tree — "ask the requester" can never mean "ask a
+    //     tool child".
+    //
+    // The check races an attach or a disconnect by nature, and deliberately is
+    // not locked against: the worst it can produce is a prompt offered to the
+    // requester while a peer was also entitled to answer, or offered to a peer
+    // that then leaves — which the bounded window already ends.
+    let route = if daemon.surfaces.anyone_attached_to(&params.session_id) {
+        ConsentRoute::attached_to(conn.id, params.session_id.clone())
+    } else {
+        ConsentRoute::requester_itself(conn.id)
+    };
+    let outcome = seek_consent(
+        daemon,
+        &conn.requester,
+        ConsentScope::Attach,
+        Some(params.session_id.clone()),
+        &route,
+    )
+    .await;
+
+    match outcome {
+        // The one place an attach-scope grant is minted, and it mints exactly
+        // one, at exactly the scope that was asked for and for exactly the
+        // session that was named (LESSON-495).
+        ConsentOutcome::Granted { .. } => {
+            daemon
+                .grants
+                .grant(Grant::attach(conn.id, params.session_id.clone()));
+            attach_to(daemon, conn, id, &params.session_id)
+        }
+        // (4) Both refusals mint nothing — there is no branch here that
+        // touches the grant registry, which is what makes BR-7 a property of
+        // the code's shape rather than of remembering to undo something.
+        ConsentOutcome::Denied => {
+            error_string(id, error_code::CONSENT_DENIED, CONSENT_DENIED_MESSAGE)
+        }
+        ConsentOutcome::TimedOut => {
+            error_string(id, error_code::CONSENT_TIMEOUT, CONSENT_TIMEOUT_MESSAGE)
+        }
+    }
+}
+
+/// The authorized tail of [`handle_session_attach`]: look the session up and
+/// attach. REQ-568's behaviour, unchanged.
+fn attach_to(daemon: &Daemon, conn: &ConnState, id: Id, session_id: &SessionId) -> String {
+    match daemon.sessions.get(session_id) {
         Some(session) => {
             // Only a successful attach grants sight: a name the registry does
             // not know falls through to the error below with the set untouched,
@@ -1603,6 +2057,72 @@ fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
         }
         None => error_string(id, error_code::UNKNOWN_SESSION, "unknown session"),
     }
+}
+
+/// Deliver a user's decision to the request waiting on it (`attach/consent`,
+/// REQ-569 BR-6, ADR-E).
+///
+/// **Receiving the prompt is not standing to answer it.** The route the request
+/// was raised on is read back and asked whether *this* connection is one of the
+/// surfaces it was offered to — the same predicate that decided delivery, so
+/// there is one rule rather than a delivery rule and an authorization rule to
+/// drift apart. A `monitor` is the case that makes the point: it receives every
+/// session's events, and it may answer none of these (LESSON-502 — seeing a
+/// decision and making it are different rights).
+///
+/// **The refusal does not consume the waiter.** [`PendingConsents::route_of`]
+/// is a read; `resolve` is the only thing that takes it, and it runs only past
+/// the gate. A refusal that consumed the request would let any connected peer
+/// cancel any pending consent at will — a denial of service dressed as a
+/// security check (the [`handle_permission_respond`] shape, for the same
+/// reason).
+///
+/// An unknown `request_id` is acknowledged rather than refused, with
+/// `resolved: false`: the window may simply have closed. Answering it as a
+/// refusal would tell the answering connection whether some other consent is
+/// outstanding, and this seam does not hand out oracles.
+///
+/// # A daemon descendant may not answer either (BR-4)
+///
+/// The ancestry gate runs here too, and it is not belt-and-braces. A tool child
+/// **can** hold a session — it creates its own, and `session/create` is not
+/// gated — so it is a connection with a non-empty attachment set, which is
+/// precisely what the monitor rule asks for in an approver. Without this check a
+/// daemon-spawned child could approve a *peer's* monitor request and hand a
+/// same-UID process sight of every session on the machine: BR-4 would hold on
+/// the door and fail on the door handle. "May not hold session access" has to
+/// mean "may not confer it" (LESSON-484 — the rule belongs where the decision
+/// is made, and this is a decision).
+fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    if !conn.may_hold_session_access() {
+        eprintln!("{}", ancestry_refusal_line(conn.ancestry, "attach/consent"));
+        return error_string(id, error_code::ATTACH_FORBIDDEN, ATTACH_FORBIDDEN_MESSAGE);
+    }
+
+    let params: AttachConsentParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        // A closed enum by design: an `outcome` this build cannot read is an
+        // error, never a silent fallback — and here one of the two fallbacks
+        // would mint a credential.
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+
+    let Some(route) = daemon.consents.route_of(&params.request_id) else {
+        return ok_string(id, &AttachConsentResult { resolved: false });
+    };
+    let attached = conn.attached();
+    if !route.renders_request(conn.id, &attached) {
+        return error_string(id, error_code::NOT_ATTACHED, CONSENT_NOT_OFFERED_MESSAGE);
+    }
+
+    let outcome = match params.outcome {
+        AttachConsentOutcome::Granted => ConsentOutcome::Granted {
+            approved_at: route.approved_at(&attached),
+        },
+        AttachConsentOutcome::Denied => ConsentOutcome::Denied,
+    };
+    let resolved = daemon.consents.resolve(&params.request_id, outcome);
+    ok_string(id, &AttachConsentResult { resolved })
 }
 
 /// Empty a session's retained conversation (`session/clear`, REQ-567 BR-8).
@@ -1830,12 +2350,57 @@ mod tests {
             daemon.grants.next_connection_id(),
             Ancestry::NotDescendant,
             true,
+            TEST_REQUESTER.to_owned(),
         )
     }
 
     /// A connection whose process this daemon classified as `ancestry`.
     fn conn_with_ancestry(daemon: &Daemon, ancestry: Ancestry) -> ConnState {
-        ConnState::new(daemon.grants.next_connection_id(), ancestry, false)
+        ConnState::new(
+            daemon.grants.next_connection_id(),
+            ancestry,
+            false,
+            TEST_REQUESTER.to_owned(),
+        )
+    }
+
+    /// What a consent prompt calls a fixture connection.
+    const TEST_REQUESTER: &str = "Cli client \"test\"";
+
+    /// A window short enough that a test can assert on the *timeout* arm
+    /// without waiting out [`CONSENT_TIMEOUT`]'s human-sized window (BR-7).
+    const TEST_CONSENT_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// A daemon whose consent window a test can outlast.
+    fn daemon_with_short_consent() -> Arc<Daemon> {
+        Arc::new(Daemon::new().with_consent_timeout(TEST_CONSENT_WINDOW))
+    }
+
+    /// Register `conn` as a consent surface and return the channel a prompt
+    /// routed to it would arrive on.
+    ///
+    /// In production this happens in `handle_client` at the handshake; a
+    /// handler-level test has no handshake, so it says so explicitly. The
+    /// *same* attachment set is shared, exactly as the real registration does —
+    /// a copy here would let the fixture drift from the rule it is testing.
+    fn as_surface(daemon: &Daemon, conn: &ConnState) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(16);
+        daemon
+            .surfaces
+            .register(conn.id, Arc::clone(&conn.attached), tx);
+        rx
+    }
+
+    /// The `attach_consent_requested` frames on `rx`, as parsed event payloads.
+    fn consent_prompts(rx: &mut mpsc::Receiver<String>) -> Vec<Value> {
+        let mut prompts = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let value: Value = serde_json::from_str(&frame).expect("a routed frame is JSON");
+            if value["params"]["event"] == "attach_consent_requested" {
+                prompts.push(value["params"].clone());
+            }
+        }
+        prompts
     }
 
     /// The id `session/create` just minted, read back off its response
@@ -1892,25 +2457,25 @@ mod tests {
         assert!(listed.contains(&session.to_string()), "{listed}");
     }
 
-    /// REQ-568 BR-1 + REQ-569 BR-1: the ways a connection comes to see a
+    /// REQ-568 BR-1 + REQ-569 BR-1/BR-7: the ways a connection comes to see a
     /// session, and the ways it does not.
     ///
     /// Creating attaches the creator — checked *through* the handler rather
     /// than by calling `attach` directly, because "the creator is attached" is
     /// a property of `session/create`, not of the set. The creator may then
     /// re-attach to what it made, which is the standing REQ-569 leaves
-    /// ungated.
+    /// ungated — and, since TASK-108, the standing that costs **no prompt**
+    /// (AC-7: the everyday single-client flow is unchanged).
     ///
-    /// A connection that created nothing is refused `NOT_GRANTED` — and refused
-    /// *identically* for the session that exists and for a name the registry
-    /// never had. That pair is the assertion, not a detail of it: two different
-    /// codes here would rebuild the existence oracle BR-8 closes, letting a
-    /// client confirm a guessed session id by which refusal it drew. The old
-    /// `UNKNOWN_SESSION` answer this replaces was exactly that oracle, sitting
-    /// in front of an attach anyone could have.
-    #[test]
-    fn create_attaches_the_creator_and_an_ungranted_attach_is_refused() {
-        let daemon = Daemon::new();
+    /// A connection that created nothing raises a consent request instead, and
+    /// with nobody answering it is refused `CONSENT_TIMEOUT` — *identically*
+    /// for the session that exists and for a name the registry never had. That
+    /// pair is the assertion, not a detail of it: two different codes here
+    /// would rebuild the existence oracle BR-8 closes, letting a client confirm
+    /// a guessed session id by which refusal it drew.
+    #[tokio::test]
+    async fn create_attaches_the_creator_and_an_unanswered_attach_is_refused() {
+        let daemon = daemon_with_short_consent();
         let creator = unattached(&daemon);
         let created = handle_session_create(
             &daemon,
@@ -1925,16 +2490,23 @@ mod tests {
         );
 
         // The creator's own attach is unchanged by REQ-569 — the one standing
-        // that needs no grant.
+        // that needs no grant, and the one that raises no prompt. Its own
+        // surface is registered, so a prompt raised here would be visible.
+        let mut creator_prompts = as_surface(&daemon, &creator);
         let reattached = handle_session_attach(
             &daemon,
             &creator,
             Id::Number(2),
             serde_json::json!({"session_id": session.to_string()}),
-        );
+        )
+        .await;
         assert!(
             reattached.contains(&session.to_string()),
             "the creator may attach to what it created: {reattached}"
+        );
+        assert!(
+            consent_prompts(&mut creator_prompts).is_empty(),
+            "standing costs no prompt — AC-7's zero-new-steps claim"
         );
 
         let onlooker = unattached(&daemon);
@@ -1955,10 +2527,11 @@ mod tests {
                 &onlooker,
                 Id::Number(3),
                 serde_json::json!({"session_id": target}),
-            );
+            )
+            .await;
             assert!(
-                refused.contains(&error_code::NOT_GRANTED.to_string()),
-                "{case}: an ungranted attach must be refused: {refused}"
+                refused.contains(&error_code::CONSENT_TIMEOUT.to_string()),
+                "{case}: an unanswered attach must be refused: {refused}"
             );
             assert!(
                 !refused.contains(&error_code::UNKNOWN_SESSION.to_string()),
@@ -1973,24 +2546,517 @@ mod tests {
             !onlooker.may_receive(Some(&SessionId::from("sess-nonexistent"))),
             "a refused attach must not leave the name in the set"
         );
+        assert!(
+            daemon.grants.held_by(onlooker.id).is_empty(),
+            "and it must leave no grant behind either (BR-7)"
+        );
 
         // And the grant is what changes the answer — the same connection, the
-        // same call, one registry entry later. (TASK-108's consent path is what
-        // will mint this in production; here it stands in for that decision so
-        // the *gate* is what the test pins, not the absence of a minter.)
+        // same call, one registry entry later, and no prompt this time.
         daemon
             .grants
-            .grant(crate::grants::Grant::attach(onlooker.id, session.clone()));
+            .grant(Grant::attach(onlooker.id, session.clone()));
         let attached = handle_session_attach(
             &daemon,
             &onlooker,
             Id::Number(4),
             serde_json::json!({"session_id": session.to_string()}),
-        );
+        )
+        .await;
         assert!(attached.contains(&session.to_string()), "{attached}");
         assert!(
             onlooker.may_receive(Some(&session)),
             "after the grant, attaching is the grant — the session's events are visible"
+        );
+    }
+
+    /// Answer the consent prompt `rx` is about to receive, as `approver`.
+    ///
+    /// Spawned rather than inlined because the request and the answer genuinely
+    /// live on two tasks in production: the requester is blocked awaiting a
+    /// decision while a *different* connection's reader loop delivers it. A
+    /// test that answered inline would be testing a flow the daemon does not
+    /// have.
+    fn answer_consent(
+        daemon: &Arc<Daemon>,
+        approver: &ConnState,
+        mut rx: mpsc::Receiver<String>,
+        outcome: &'static str,
+    ) -> JoinHandle<Value> {
+        let daemon = Arc::clone(daemon);
+        let approver = approver.clone();
+        tokio::spawn(async move {
+            let prompt = loop {
+                let frame = rx.recv().await.expect("a prompt must be routed here");
+                let value: Value = serde_json::from_str(&frame).expect("a routed frame is JSON");
+                if value["params"]["event"] == "attach_consent_requested" {
+                    break value["params"].clone();
+                }
+            };
+            let answered = handle_attach_consent(
+                &daemon,
+                &approver,
+                Id::Number(99),
+                serde_json::json!({
+                    "request_id": prompt["request_id"],
+                    "outcome": { "outcome": outcome },
+                }),
+            );
+            assert!(
+                answered.contains("\"resolved\":true"),
+                "the answer must have decided something: {answered}"
+            );
+            prompt
+        })
+    }
+
+    /// **AC-2 / BR-6, first arm.** A user at an already-attached client
+    /// approves, and the requester attaches — holding exactly one grant, at
+    /// exactly the scope it asked for.
+    ///
+    /// The grant count is asserted against the *registry*, not inferred from
+    /// the response, because "the attach succeeded" and "exactly one
+    /// attach-scope grant exists" are different claims and only the second one
+    /// rules out a consent path that also handed out something broader
+    /// (LESSON-495).
+    #[tokio::test]
+    async fn a_granted_consent_mints_exactly_one_attach_grant_and_the_attach_succeeds() {
+        let daemon = daemon_with_short_consent();
+        let holder = unattached(&daemon);
+        let created = handle_session_create(
+            &daemon,
+            &holder,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        let session = created_session_id(&created);
+        let holder_prompts = as_surface(&daemon, &holder);
+
+        let newcomer = unattached(&daemon);
+        let mut newcomer_prompts = as_surface(&daemon, &newcomer);
+        let answering = answer_consent(&daemon, &holder, holder_prompts, "granted");
+
+        let response = handle_session_attach(
+            &daemon,
+            &newcomer,
+            Id::Number(2),
+            serde_json::json!({"session_id": session.to_string()}),
+        )
+        .await;
+        let prompt = answering.await.expect("the approver task must not panic");
+
+        assert!(
+            response.contains(&session.to_string()),
+            "an approved attach must succeed: {response}"
+        );
+        assert!(
+            newcomer.may_receive(Some(&session)),
+            "and the newcomer is attached, so REQ-568 delivery applies to it"
+        );
+        assert_eq!(
+            prompt["session_id"].as_str(),
+            Some(session.to_string().as_str()),
+            "the prompt must name the session being asked for: {prompt}"
+        );
+        assert_eq!(prompt["scope"], "attach");
+        assert_eq!(prompt["requester"], TEST_REQUESTER);
+
+        // Exactly one grant, of exactly the requested scope, keyed to exactly
+        // this connection and session.
+        assert_eq!(
+            daemon.grants.held_by(newcomer.id),
+            vec![Grant::attach(newcomer.id, session.clone())]
+        );
+        assert_eq!(daemon.grants.len(), 1, "and nothing else was minted");
+        assert!(
+            !daemon.grants.may_monitor(newcomer.id),
+            "an approved attach must not confer monitor (LESSON-495)"
+        );
+        assert_eq!(
+            daemon.consents.pending_count(),
+            0,
+            "a decided request leaves no waiter behind"
+        );
+        assert!(
+            consent_prompts(&mut newcomer_prompts).is_empty(),
+            "arm 1 routes the prompt to the attached holder, never to the requester"
+        );
+    }
+
+    /// **BR-7 / AC-6.** A denial and a timeout both mint **nothing** — asserted
+    /// by looking in the grant registry afterwards, not by reading the error
+    /// code back.
+    ///
+    /// The distinction matters because the error code is what the *handler*
+    /// decided to say, and the claim is about what the daemon *kept*. A consent
+    /// path that answered `CONSENT_DENIED` while leaving a grant behind would
+    /// pass an error-code assertion and fail this one — and it is the failure
+    /// that would matter, because the next `session/attach` from that
+    /// connection would then walk straight through.
+    ///
+    /// The timeout half also pins the window: it resolves inside a bound the
+    /// test sets, which is what makes "defaults closed" an observable behaviour
+    /// rather than a promise.
+    #[tokio::test]
+    async fn a_denied_or_timed_out_consent_leaves_the_grant_registry_empty() {
+        for (case, answer) in [("denied", Some("denied")), ("unanswered", None)] {
+            let daemon = daemon_with_short_consent();
+            let holder = unattached(&daemon);
+            let created = handle_session_create(
+                &daemon,
+                &holder,
+                Id::Number(1),
+                serde_json::json!({"mode": "freeform"}),
+            );
+            let session = created_session_id(&created);
+            let holder_prompts = as_surface(&daemon, &holder);
+
+            let newcomer = unattached(&daemon);
+            let mut newcomer_frames = as_surface(&daemon, &newcomer);
+            let answering =
+                answer.map(|outcome| answer_consent(&daemon, &holder, holder_prompts, outcome));
+
+            let started = std::time::Instant::now();
+            let refused = handle_session_attach(
+                &daemon,
+                &newcomer,
+                Id::Number(2),
+                serde_json::json!({"session_id": session.to_string()}),
+            )
+            .await;
+            if let Some(answering) = answering {
+                answering.await.expect("the approver task must not panic");
+            }
+
+            let expected = if answer.is_some() {
+                error_code::CONSENT_DENIED
+            } else {
+                error_code::CONSENT_TIMEOUT
+            };
+            assert!(refused.contains(&expected.to_string()), "{case}: {refused}");
+
+            // The claim, read off the registry rather than off the answer.
+            assert!(
+                daemon.grants.held_by(newcomer.id).is_empty(),
+                "{case}: a refused consent must mint nothing for the requester"
+            );
+            assert!(
+                daemon.grants.is_empty(),
+                "{case}: nor for anyone else — {} grants live",
+                daemon.grants.len()
+            );
+            assert_eq!(
+                daemon.consents.pending_count(),
+                0,
+                "{case}: and no waiter may be left in the registry"
+            );
+            assert!(
+                !newcomer.may_receive(Some(&session)),
+                "{case}: nor may the connection have been attached"
+            );
+
+            // AC-6: the timeout resolves inside the bounded window rather than
+            // whenever, and the refusal is announced with its own reason.
+            if answer.is_none() {
+                assert!(
+                    started.elapsed() < TEST_CONSENT_WINDOW * 8,
+                    "{case}: the window must bound the wait, and it took {:?}",
+                    started.elapsed()
+                );
+            }
+            let refusals: Vec<Value> = std::iter::from_fn(|| newcomer_frames.try_recv().ok())
+                .map(|frame| serde_json::from_str::<Value>(&frame).expect("a routed frame is JSON"))
+                .filter(|frame| frame["params"]["event"] == "attach_refused")
+                .collect();
+            assert_eq!(
+                refusals.len(),
+                1,
+                "{case}: the requester must be told how its request ended: {refusals:?}"
+            );
+            assert_eq!(
+                refusals[0]["params"]["reason"],
+                if answer.is_some() {
+                    "consent_denied"
+                } else {
+                    "consent_timeout"
+                },
+                "{case}: with the reason that actually happened"
+            );
+            assert_eq!(refusals[0]["params"]["scope"], "attach");
+        }
+    }
+
+    /// **BR-6, second arm.** With nothing attached to the target, the prompt is
+    /// rendered by the requester itself — and by nobody else.
+    ///
+    /// This is the resume flow (AC-3): the user's last client is gone, so the
+    /// only surface left is the one they just opened. It is sound *only*
+    /// because the ancestry gate already refused every connection out of the
+    /// daemon's process tree, which the neighbouring test pins.
+    ///
+    /// The bystander is the control. It is a live, handshaked connection
+    /// attached to a session of its own, and it must see nothing: a routing
+    /// rule that fell back to "tell everyone" would put a stranger's attach
+    /// request in front of a user who has no standing to answer it.
+    #[tokio::test]
+    async fn with_nothing_attached_the_requester_renders_its_own_prompt() {
+        let daemon = daemon_with_short_consent();
+        // A session whose creator is *not* a registered surface: the sessions
+        // outlived the client that made them, which is the resume shape.
+        let departed = unattached(&daemon);
+        let created = handle_session_create(
+            &daemon,
+            &departed,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        let session = created_session_id(&created);
+
+        let bystander = unattached(&daemon);
+        let elsewhere = handle_session_create(
+            &daemon,
+            &bystander,
+            Id::Number(2),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        assert!(elsewhere.contains("session_id"));
+        let mut bystander_prompts = as_surface(&daemon, &bystander);
+
+        let resuming = unattached(&daemon);
+        let resuming_prompts = as_surface(&daemon, &resuming);
+        let answering = answer_consent(&daemon, &resuming, resuming_prompts, "granted");
+
+        let response = handle_session_attach(
+            &daemon,
+            &resuming,
+            Id::Number(3),
+            serde_json::json!({"session_id": session.to_string()}),
+        )
+        .await;
+        let prompt = answering.await.expect("the approver task must not panic");
+
+        assert!(
+            response.contains(&session.to_string()),
+            "the resume flow must succeed after one consent step: {response}"
+        );
+        assert_eq!(
+            prompt["session_id"].as_str(),
+            Some(session.to_string().as_str())
+        );
+        assert_eq!(
+            daemon.grants.held_by(resuming.id),
+            vec![Grant::attach(resuming.id, session.clone())]
+        );
+        assert!(
+            consent_prompts(&mut bystander_prompts).is_empty(),
+            "a connection attached to some other session is not asked about this one"
+        );
+    }
+
+    /// **BR-6.** Receiving a prompt is not standing to answer it.
+    ///
+    /// A `monitor` is the sharp case: REQ-568 gives it sight of every session's
+    /// events, so a consent flow that let "whoever got the frame" answer would
+    /// hand every observer the power to admit anyone to any session. It is
+    /// refused, and — the second half, and the one a naive fix breaks — the
+    /// prompt is **still pending** afterwards, so the refusal cannot be used to
+    /// cancel somebody else's consent request.
+    #[tokio::test]
+    async fn a_connection_the_prompt_was_not_offered_to_cannot_answer_or_cancel_it() {
+        let daemon = daemon_with_short_consent();
+        let holder = unattached(&daemon);
+        let created = handle_session_create(
+            &daemon,
+            &holder,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        let session = created_session_id(&created);
+        as_surface(&daemon, &holder);
+
+        let requester = unattached(&daemon);
+        let route = ConsentRoute::attached_to(requester.id, session.clone());
+        let request_id = daemon.consents.next_request_id();
+        let _rx = daemon.consents.register(request_id.clone(), route);
+
+        let watcher = monitoring(&daemon);
+        for (case, conn) in [
+            ("a monitor", &watcher),
+            ("the requester itself", &requester),
+        ] {
+            let refused = handle_attach_consent(
+                &daemon,
+                conn,
+                Id::Number(2),
+                serde_json::json!({
+                    "request_id": request_id.to_string(),
+                    "outcome": { "outcome": "granted" },
+                }),
+            );
+            assert!(
+                refused.contains(&error_code::NOT_ATTACHED.to_string()),
+                "{case} must not be able to answer this prompt: {refused}"
+            );
+            assert_eq!(
+                daemon.consents.pending_count(),
+                1,
+                "{case}: a refused answer must leave the request standing"
+            );
+            assert!(
+                daemon.grants.is_empty(),
+                "{case}: and must certainly mint nothing"
+            );
+        }
+
+        // The rightful surface still decides it, which is what makes the
+        // refusals above a gate rather than a broken flow.
+        let answered = handle_attach_consent(
+            &daemon,
+            &holder,
+            Id::Number(3),
+            serde_json::json!({
+                "request_id": request_id.to_string(),
+                "outcome": { "outcome": "denied" },
+            }),
+        );
+        assert!(answered.contains("\"resolved\":true"), "{answered}");
+        assert_eq!(daemon.consents.pending_count(), 0);
+    }
+
+    /// **BR-4, the door handle.** A daemon descendant cannot *approve* a
+    /// consent request either, even one it would otherwise qualify for.
+    ///
+    /// This is the hole a gate placed only on `session/attach` leaves open. A
+    /// tool child may create its own session — `session/create` is deliberately
+    /// ungated, since a child holding its own session reaches nobody else — so
+    /// it is a connection with a non-empty attachment set, which is exactly
+    /// what the monitor rule looks for in an approver. A daemon that only
+    /// refused the child's *own* attach would let it hand a same-UID peer a
+    /// monitor grant: sight of every session on the machine, minted with no
+    /// user in the loop, by the one process class BR-4 exists to exclude.
+    ///
+    /// Both verdicts that refuse are checked, and the request is asserted to be
+    /// still pending afterwards — a refusal that consumed the waiter would let
+    /// a daemon child cancel every consent prompt on the machine instead.
+    #[tokio::test]
+    async fn a_daemon_descendant_may_not_approve_a_consent_request_either() {
+        let daemon = daemon_with_short_consent();
+        let requester = unattached(&daemon);
+        let route = ConsentRoute::any_attached_peer(requester.id);
+
+        for ancestry in [Ancestry::Descendant, Ancestry::Indeterminate] {
+            let child = conn_with_ancestry(&daemon, ancestry);
+            // The child holds a session of its own — the standing that would
+            // otherwise make it an eligible approver.
+            let created = handle_session_create(
+                &daemon,
+                &child,
+                Id::Number(1),
+                serde_json::json!({"mode": "freeform"}),
+            );
+            let own = created_session_id(&created);
+            assert!(
+                child.may_receive(Some(&own)),
+                "{ancestry:?}: the fixture is only meaningful if the child is attached"
+            );
+            assert!(
+                route.renders_request(child.id, &child.attached()),
+                "{ancestry:?}: and only if the routing rule would otherwise have asked it — \
+                 this is the non-vacuity of the refusal below"
+            );
+
+            let request_id = daemon.consents.next_request_id();
+            let _rx = daemon.consents.register(request_id.clone(), route.clone());
+            let refused = handle_attach_consent(
+                &daemon,
+                &child,
+                Id::Number(2),
+                serde_json::json!({
+                    "request_id": request_id.to_string(),
+                    "outcome": { "outcome": "granted" },
+                }),
+            );
+            assert!(
+                refused.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                "{ancestry:?}: a daemon child must not confer what it may not hold: {refused}"
+            );
+            assert!(
+                daemon.grants.is_empty(),
+                "{ancestry:?}: and must certainly mint nothing"
+            );
+            assert_eq!(
+                daemon.consents.pending_count(),
+                1,
+                "{ancestry:?}: nor may its refusal cancel somebody else's request"
+            );
+            daemon.consents.forget(&request_id);
+        }
+    }
+
+    /// An answer to a request id nobody is waiting on is acknowledged, not
+    /// refused — and says it decided nothing.
+    ///
+    /// A refusal would answer "is some consent outstanding right now?" for any
+    /// connected peer, which is an oracle this seam does not hand out. The
+    /// `resolved: false` is what stops a client reporting success for an answer
+    /// that arrived after the window closed.
+    #[test]
+    fn an_answer_to_an_unknown_consent_request_decides_nothing_and_says_so() {
+        let daemon = Daemon::new();
+        let stranger = unattached(&daemon);
+        let response = handle_attach_consent(
+            &daemon,
+            &stranger,
+            Id::Number(1),
+            serde_json::json!({
+                "request_id": "consent-404",
+                "outcome": { "outcome": "granted" },
+            }),
+        );
+        assert!(response.contains("\"resolved\":false"), "{response}");
+        assert!(daemon.grants.is_empty());
+    }
+
+    /// The descriptor a consent prompt carries is bounded and cannot forge a
+    /// second line, however the peer spells its name.
+    ///
+    /// It goes to a *user's screen* by way of another client, and every
+    /// character in it was chosen by an unprivileged same-UID peer — so this is
+    /// REQ-568's monitor-log treatment applied one seam further out, where the
+    /// consequence of getting it wrong is a forged prompt rather than a forged
+    /// log line.
+    #[test]
+    fn the_requester_descriptor_is_bounded_and_carries_no_control_characters() {
+        let hostile = HandshakeParams {
+            client_kind: teton_protocol::ClientKind::Cli,
+            client_name: format!(
+                "teton\n\u{1b}[31mDANGER: this client is trusted\u{1b}[0m{}",
+                "A".repeat(10_000)
+            ),
+            client_version: "0.1.0".to_owned(),
+            protocol_min: teton_protocol::PROTOCOL_VERSION_MIN,
+            protocol_max: teton_protocol::PROTOCOL_VERSION_MAX,
+            monitor: false,
+        };
+        let descriptor = requester_descriptor(&hostile);
+        assert!(
+            !descriptor.contains('\n') && !descriptor.contains('\u{1b}'),
+            "a peer must not be able to put a newline or an escape sequence in a \
+             prompt a user reads: {descriptor:?}"
+        );
+        assert!(
+            descriptor.chars().count() < REQUESTER_BUDGET + 32,
+            "the descriptor must stay renderable in one line: {} chars",
+            descriptor.chars().count()
+        );
+        // Non-vacuity: the ordinary name survives intact.
+        let ordinary = HandshakeParams {
+            client_name: "teton".to_owned(),
+            ..hostile
+        };
+        assert!(
+            requester_descriptor(&ordinary).contains("teton"),
+            "an honest client is still named"
         );
     }
 
@@ -2006,11 +3072,21 @@ mod tests {
     /// `NOT_GRANTED` is asserted absent in every cell, which is what pins the
     /// *ordering*. A descendant holds no grant either, so a gate that ran the
     /// grant check first would refuse it too — and the test would pass for the
-    /// wrong reason, hiding that a descendant could reach a consent path the
-    /// moment TASK-108 puts one in the `NOT_GRANTED` branch.
-    #[test]
-    fn a_daemon_descendant_is_refused_attach_before_any_session_lookup() {
-        let daemon = Daemon::new();
+    /// wrong reason.
+    ///
+    /// Since TASK-108 that ordering is worth more than a code. The
+    /// `NOT_GRANTED` branch now **raises a consent prompt**, so a gate in the
+    /// wrong order would not merely mislabel a refusal: it would put the
+    /// daemon's own tool children in front of a user, asking to be let into
+    /// their session — and a user who clicks yes on a prompt they did not
+    /// expect would hand a grant to exactly the process BR-4 exists to
+    /// exclude. So the assertion is that **no prompt is published for a
+    /// descendant at all**, and the ordinary connection's prompt in the same
+    /// test is the positive control: it proves the fixture *can* observe a
+    /// prompt, so the descendant's silence is the gate rather than the wiring.
+    #[tokio::test]
+    async fn a_daemon_descendant_is_refused_attach_before_any_session_lookup_or_prompt() {
+        let daemon = daemon_with_short_consent();
         let creator = unattached(&daemon);
         let created = handle_session_create(
             &daemon,
@@ -2019,16 +3095,19 @@ mod tests {
             serde_json::json!({"mode": "freeform"}),
         );
         let session = created_session_id(&created);
+        let mut creator_prompts = as_surface(&daemon, &creator);
 
         for ancestry in [Ancestry::Descendant, Ancestry::Indeterminate] {
             let child = conn_with_ancestry(&daemon, ancestry);
+            let mut child_prompts = as_surface(&daemon, &child);
             for target in [session.to_string(), "sess-nonexistent".to_owned()] {
                 let refused = handle_session_attach(
                     &daemon,
                     &child,
                     Id::Number(2),
                     serde_json::json!({"session_id": target}),
-                );
+                )
+                .await;
                 assert!(
                     refused.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
                     "{ancestry:?} attaching `{target}` must be forbidden: {refused}"
@@ -2048,23 +3127,63 @@ mod tests {
                 );
             }
 
+            // The claim TASK-108 adds: nobody was asked, so nobody could have
+            // said yes. Checked at both surfaces — the session's holder, who
+            // would render arm 1's prompt, and the child itself, who would
+            // render arm 2's.
+            assert!(
+                consent_prompts(&mut creator_prompts).is_empty(),
+                "{ancestry:?}: a daemon child must not be able to put a consent prompt \
+                 in front of the session's own user"
+            );
+            assert!(
+                consent_prompts(&mut child_prompts).is_empty(),
+                "{ancestry:?}: nor render one for itself"
+            );
+
             // Not even a grant lets it through: the ancestry gate is asked
             // first and is terminal, so minting one for a descendant — which
-            // TASK-108 must never do — still changes nothing here.
+            // the consent path must never do — still changes nothing here.
             daemon
                 .grants
-                .grant(crate::grants::Grant::attach(child.id, session.clone()));
+                .grant(Grant::attach(child.id, session.clone()));
             let still_refused = handle_session_attach(
                 &daemon,
                 &child,
                 Id::Number(3),
                 serde_json::json!({"session_id": session.to_string()}),
-            );
+            )
+            .await;
             assert!(
                 still_refused.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
                 "{ancestry:?}: a grant must not override the ancestry gate: {still_refused}"
             );
+            daemon.grants.release(child.id);
         }
+
+        // **The positive control**, in the same test and on the same surface:
+        // an ordinary connection asking for the same session *does* raise a
+        // prompt there. Without it, every assertion above would also pass on a
+        // daemon that had simply stopped publishing consent prompts.
+        let ordinary = unattached(&daemon);
+        let refused = handle_session_attach(
+            &daemon,
+            &ordinary,
+            Id::Number(4),
+            serde_json::json!({"session_id": session.to_string()}),
+        )
+        .await;
+        assert!(
+            refused.contains(&error_code::CONSENT_TIMEOUT.to_string()),
+            "the control must reach the consent path: {refused}"
+        );
+        let prompts = consent_prompts(&mut creator_prompts);
+        assert_eq!(
+            prompts.len(),
+            1,
+            "the control must produce exactly the prompt the descendants did not: {prompts:?}"
+        );
+        assert_eq!(prompts[0]["scope"], "attach");
     }
 
     /// REQ-569 BR-4: the operator can tell "refused because it is a descendant"

@@ -67,6 +67,7 @@ pub mod broadcast;
 pub mod call_sites;
 pub mod carry;
 pub mod classify;
+pub mod consent;
 pub mod cost;
 pub mod download;
 pub mod egress;

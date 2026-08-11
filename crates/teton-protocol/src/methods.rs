@@ -118,6 +118,78 @@ impl RpcMethod for SessionAttachParams {
     type Result = SessionAttachResult;
 }
 
+/// A user's answer to an `attach_consent_requested` event (REQ-569 BR-6,
+/// ADR-E).
+///
+/// The counterpart of [`PermissionRespondParams`], and deliberately the same
+/// shape: the daemon raises a prompt carrying a `request_id` and the deciding
+/// client answers by that id while the daemon's reader loop stays free.
+///
+/// **Its own method, not a reuse of `permission/respond`** (ADR-E). Two
+/// reasons: the permission registry is session-scoped by construction and an
+/// attach request has no attachment yet, and `permission/respond` is a gated
+/// method (REQ-569 BR-9) — routing consent through it would put the gate in
+/// front of the thing that opens the gate.
+///
+/// **Who may send it is not "whoever received it".** The daemon offers the
+/// prompt to a surface a user already owns — a connection attached to the
+/// target session, or (only when nothing is attached to it) the requester
+/// itself — and enforces that same rule when the answer comes back. A `monitor`
+/// receives every session's events and may answer none of these: seeing a
+/// prompt and deciding it are the two things this REQ separates
+/// (LESSON-502).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachConsentParams {
+    /// Correlates with the `attach_consent_requested` event's `request_id`.
+    pub request_id: RequestId,
+    /// The decision.
+    pub outcome: AttachConsentOutcome,
+}
+
+/// The two answers to a consent prompt.
+///
+/// A **closed** enum with no catch-all and no `Default`, for
+/// [`ModelConfirmOutcome`]'s reason and one stronger: an `outcome` this build
+/// cannot read is a deserialization error the daemon returns as
+/// [`crate::jsonrpc::error_code::INVALID_PARAMS`], never a silent fallback.
+/// There is no safe default to fall back *to* — one direction mints a
+/// credential and the other refuses one — so the only correct answer to an
+/// unreadable decision is to refuse to read it. Timeout is not a variant here
+/// because it is not something a client says: it is what the daemon does when
+/// nobody says anything (BR-7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AttachConsentOutcome {
+    /// Mint the grant that was asked for — and only that one, at only that
+    /// scope.
+    Granted,
+    /// Refuse it. Mints nothing.
+    Denied,
+}
+
+/// Result of [`AttachConsentParams`].
+///
+/// Carries no decision, like [`PermissionRespondResult`] — the authoritative
+/// outcome is what the *requester* is told, and echoing it here would put the
+/// record in two places that could disagree. It carries the one fact the
+/// answering client cannot otherwise learn: whether its answer arrived in time
+/// to be the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachConsentResult {
+    /// Whether a request was still waiting on this `request_id`.
+    ///
+    /// `false` means the window had already closed (or the request was already
+    /// answered): the requester has been — or is about to be — refused, and a
+    /// client that reported success regardless would tell a user they let
+    /// someone in when the daemon let nobody in.
+    pub resolved: bool,
+}
+
+impl RpcMethod for AttachConsentParams {
+    const METHOD: &'static str = "attach/consent";
+    type Result = AttachConsentResult;
+}
+
 /// Empty a session's retained conversation (REQ-567 BR-8, architecture D-2).
 ///
 /// No ACP equivalent — ACP has no clear, and a bespoke addition is ADR-002's
@@ -2113,5 +2185,38 @@ mod tests {
         let parsed: SessionCreateParams = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.mode, SessionMode::Structured);
         assert_eq!(parsed.phase, Some(Phase::Spec));
+    }
+
+    /// REQ-569 ADR-E: `attach/consent` round-trips both decisions under its own
+    /// method name, and an answer this build cannot read is an error rather
+    /// than a default.
+    ///
+    /// The rejection half is the one that matters. Every other closed enum in
+    /// this crate refuses an unknown tag to avoid guessing a user's intent;
+    /// here a wrong guess in one direction *mints a credential*, so there is no
+    /// safe side to fall back to and the parse must simply fail.
+    #[test]
+    fn attach_consent_round_trips_both_answers_and_rejects_an_unknown_one() {
+        assert_eq!(AttachConsentParams::METHOD, "attach/consent");
+        for outcome in [AttachConsentOutcome::Granted, AttachConsentOutcome::Denied] {
+            round_trip(&AttachConsentParams {
+                request_id: RequestId::from("consent-3"),
+                outcome,
+            });
+        }
+        round_trip(&AttachConsentResult { resolved: true });
+
+        let wire = serde_json::to_value(AttachConsentParams {
+            request_id: RequestId::from("consent-3"),
+            outcome: AttachConsentOutcome::Granted,
+        })
+        .unwrap();
+        assert_eq!(wire["outcome"]["outcome"], "granted");
+
+        let unknown = r#"{"request_id":"consent-3","outcome":{"outcome":"maybe"}}"#;
+        assert!(
+            serde_json::from_str::<AttachConsentParams>(unknown).is_err(),
+            "an unreadable decision must not deserialize to one the daemon acts on"
+        );
     }
 }
