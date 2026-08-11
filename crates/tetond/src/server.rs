@@ -1811,7 +1811,10 @@ fn handle_session_permissions(daemon: &Daemon, conn: &ConnState, id: Id, params:
     if !conn.may_drive(&params.session_id) {
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
-    ok_string(id, &daemon.runtime.session_permissions(&params))
+    ok_string(
+        id,
+        &daemon.runtime.session_permissions(&params, &daemon.events),
+    )
 }
 
 /// Evict a cached document so the next lookup re-fetches (`web/refresh`,

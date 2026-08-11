@@ -60,13 +60,47 @@ pub struct FramedStdinPrompter {
     framed: bool,
     /// Dim the rules (and nothing else) when colour is on.
     color: bool,
+    /// The status row's content, or `None` for no row (REQ-560).
+    ///
+    /// Content only — composed by [`crate::status::status_line`], which is a
+    /// pure function with no terminal. This type owns *placement*, which is the
+    /// half that needs one.
+    status: Option<String>,
+    /// How many rows [`Self::draw`] actually emitted **below** the bottom rule.
+    ///
+    /// The matched half of the frame's geometry, and the reason it is a field
+    /// rather than a recomputation: `draw` writes the rows and `read_line` has
+    /// to step past exactly the rows that were written. Deriving it twice from
+    /// [`Self::status`] would be two answers to one question, and the one that
+    /// drifted would strand a row.
+    ///
+    /// Deliberately **separate** from `erase`'s `status_rows`, which counts rows
+    /// drawn *above* the frame (REQ-556's loading indicator). One count serving
+    /// both directions strands one of them (REQ-560 BR-11).
+    below_rows: usize,
 }
 
 impl FramedStdinPrompter {
     /// A new entry prompter. `framed` gates the frame, `color` the dimming.
     #[must_use]
     pub fn new(framed: bool, color: bool) -> Self {
-        Self { framed, color }
+        Self {
+            framed,
+            color,
+            status: None,
+            below_rows: 0,
+        }
+    }
+
+    /// Set the status row's content for the next [`Self::draw`], or clear it.
+    ///
+    /// Takes composed content rather than the state it is composed from: what
+    /// the row says is [`crate::status`]'s decision and is unit-tested there
+    /// with no terminal in the way (REQ-560 BR-8). A `None` — which is what a
+    /// terminal too narrow for the row yields — means no row at all, and the
+    /// frame is the three rows it always was.
+    pub(crate) fn set_status(&mut self, status: Option<String>) {
+        self.status = status;
     }
 
     /// The horizontal rule sized to the terminal, dimmed when colour is on.
@@ -91,11 +125,37 @@ impl FramedStdinPrompter {
         if !self.framed {
             return;
         }
+        let bytes = self.draw_bytes(question);
         let mut out = io::stdout();
-        let rule = self.rule();
-        // Rule, blank input row, rule — then cursor up two, into the input row.
-        let _ = write!(out, "{rule}\n\n{rule}\n\x1b[2A{question}");
+        let _ = write!(out, "{bytes}");
         let _ = out.flush();
+    }
+
+    /// Exactly what [`Self::draw`] writes, and the place [`Self::below_rows`] is
+    /// decided.
+    ///
+    /// Split out so the frame's geometry — the part that stands a row up or
+    /// strands it — is assertable without a terminal (REQ-560 BR-11). `draw`
+    /// itself is then a `write!` of this, which is the only part that needs one.
+    fn draw_bytes(&mut self, question: &str) -> String {
+        let rule = self.rule();
+        // Rule, blank input row, rule, then the status row if there is one.
+        let mut bytes = format!("{rule}\n\n{rule}\n");
+        self.below_rows = match &self.status {
+            Some(status) => {
+                bytes.push_str(status);
+                bytes.push('\n');
+                1
+            }
+            None => 0,
+        };
+        // The cursor is now at the start of the row after everything drawn. Two
+        // rows up is the input row when nothing sits below the bottom rule, and
+        // one further up per below-row — the count this same call just wrote,
+        // which is what keeps the pair matched.
+        let up = 2 + self.below_rows;
+        bytes.push_str(&format!("\x1b[{up}A{question}"));
+        bytes
     }
 
     /// Erase a frame drawn by [`Self::draw`], leaving the cursor where ordinary
@@ -111,6 +171,15 @@ impl FramedStdinPrompter {
     /// has nothing to say) — they are erased together, because they were drawn
     /// together and a partial erase would leave a stale indicator stranded
     /// above the redrawn frame.
+    ///
+    /// **`status_rows` counts rows above the frame only, and REQ-560's status
+    /// row below the bottom rule is not among them** — the two directions are
+    /// counted independently, because one count serving both would strand
+    /// whichever it was not measuring (BR-11). The below-row still goes: `\x1b[J`
+    /// erases from the cursor to the end of the *screen*, so everything drawn
+    /// below is already inside what this clears. That is why moving a row below
+    /// the frame changed [`Self::draw_bytes`] and [`Self::advance_bytes`] but
+    /// left this function alone.
     pub(crate) fn erase(&mut self, status_rows: usize) {
         if !self.framed {
             return;
@@ -126,25 +195,37 @@ impl FramedStdinPrompter {
     pub(crate) fn read_line(&mut self) -> Option<String> {
         let mut out = io::stdout();
         let mut line = String::new();
-        match io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => {
-                if self.framed {
-                    // EOF echoes no newline: the cursor is still on the input
-                    // row, two steps above where output should resume.
-                    let _ = writeln!(out, "\n");
-                    let _ = out.flush();
-                }
-                None
-            }
-            Ok(_) => {
-                if self.framed {
-                    // Enter's echo landed the cursor on the bottom rule; step past.
-                    let _ = writeln!(out);
-                    let _ = out.flush();
-                }
-                Some(line.trim_end_matches(['\n', '\r']).to_owned())
-            }
+        let read = io::stdin().read_line(&mut line);
+        if self.framed {
+            let _ = write!(out, "{}", self.advance_bytes(matches!(read, Ok(0) | Err(_))));
+            let _ = out.flush();
         }
+        match read {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim_end_matches(['\n', '\r']).to_owned()),
+        }
+    }
+
+    /// The newlines that step the cursor from wherever the read left it to where
+    /// ordinary output should resume.
+    ///
+    /// Two starting points, because the terminal's own echo differs:
+    ///
+    /// - **Enter** echoed a newline, so the cursor is on the bottom rule — one
+    ///   row from clear.
+    /// - **EOF** (Ctrl-D) echoed nothing, so the cursor is still in the input
+    ///   row — two rows from clear.
+    ///
+    /// Both then have to clear [`Self::below_rows`] more, and that is the whole
+    /// of REQ-560's stranding hazard: with a status row below the bottom rule,
+    /// the pre-REQ single newline would have parked the cursor **on** the status
+    /// row and let the next output overwrite it in place, leaving whatever was
+    /// wider than that output stranded behind it. The count comes from the same
+    /// field [`Self::draw_bytes`] set, so the rows stepped over are exactly the
+    /// rows written.
+    fn advance_bytes(&self, eof: bool) -> String {
+        let rows = if eof { 2 } else { 1 } + self.below_rows;
+        "\n".repeat(rows)
     }
 }
 
@@ -191,7 +272,11 @@ pub(crate) fn stdin_ready(timeout: std::time::Duration) -> bool {
 
 /// The terminal's column count, or a conservative 80 when stdout is not a
 /// terminal or the query fails.
-fn terminal_width() -> usize {
+///
+/// `pub(crate)` since REQ-560: the status row's content function needs the width
+/// to decide whether the row fits, and takes it as a parameter so that decision
+/// stays pure (BR-8). This is the one place the width is *queried*.
+pub(crate) fn terminal_width() -> usize {
     // SAFETY: TIOCGWINSZ writes a plain `winsize` struct through the pointer
     // and touches nothing else; a failure is reported through the return code
     // and leaves the zeroed struct untouched.
@@ -251,6 +336,101 @@ impl Prompter for ScriptedPrompter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- REQ-560 BR-11: the frame's geometry, with no terminal ------------
+    //
+    // Asserted against the bytes `draw` and `read_line` would write, which is
+    // what `draw_bytes`/`advance_bytes` exist to expose. A real terminal is
+    // AC-10's job; what is checked here is that the two counts stay a matched
+    // pair, because a mismatch is exactly what strands a row.
+
+    /// Without a status row the frame is byte-identical to the pre-REQ-560 one.
+    ///
+    /// This is the assertion that keeps the change to the *un*-configured case
+    /// zero — including the non-interactive path, where `framed` is false and
+    /// nothing is written at all (BR-9).
+    #[test]
+    fn a_frame_with_no_status_row_is_the_frame_it_always_was() {
+        let mut p = FramedStdinPrompter::new(true, false);
+        let bytes = p.draw_bytes("> ");
+        assert!(
+            bytes.ends_with("\x1b[2A> "),
+            "the cursor must rise two rows into the input row: {bytes:?}"
+        );
+        assert_eq!(p.below_rows, 0);
+        // Enter: one newline. EOF: two. Exactly as before.
+        assert_eq!(p.advance_bytes(false), "\n");
+        assert_eq!(p.advance_bytes(true), "\n\n");
+    }
+
+    /// With a status row the frame is four rows, and every count moves together.
+    #[test]
+    fn a_status_row_adds_one_row_below_and_one_to_every_matching_count() {
+        let mut p = FramedStdinPrompter::new(true, false);
+        p.set_status(Some("permissions: guarded".to_owned()));
+        let bytes = p.draw_bytes("> ");
+
+        assert!(
+            bytes.contains("permissions: guarded\n"),
+            "the status row must be drawn: {bytes:?}"
+        );
+        assert!(
+            bytes.ends_with("\x1b[3A> "),
+            "a below-row means the cursor rises one further: {bytes:?}"
+        );
+        assert_eq!(p.below_rows, 1);
+
+        // The stranding hazard: after Enter the cursor is on the bottom rule, so
+        // output resuming one newline later would land *on* the status row.
+        assert_eq!(p.advance_bytes(false), "\n\n");
+        assert_eq!(p.advance_bytes(true), "\n\n\n");
+    }
+
+    /// The status row sits **below** the bottom rule, not above the top one —
+    /// which is what makes it independent of REQ-556's above-frame count.
+    #[test]
+    fn the_status_row_is_drawn_below_the_bottom_rule() {
+        let mut p = FramedStdinPrompter::new(true, false);
+        p.set_status(Some("permissions: plan".to_owned()));
+        let bytes = p.draw_bytes("> ");
+        let rows: Vec<&str> = bytes.split('\n').collect();
+        // [top rule][blank input row][bottom rule][status row][cursor escape…]
+        assert_eq!(rows.len(), 5, "the frame should be four rows: {rows:?}");
+        assert_eq!(rows[1], "", "the input row is drawn blank");
+        assert_eq!(rows[0], rows[2], "the two rules must match");
+        assert_eq!(rows[3], "permissions: plan");
+    }
+
+    /// Clearing the status row returns the frame to three rows and the counts
+    /// with it — the field is what `read_line` reads, so a stale `below_rows`
+    /// would step over a row that is no longer there.
+    #[test]
+    fn clearing_the_status_row_restores_every_count() {
+        let mut p = FramedStdinPrompter::new(true, false);
+        p.set_status(Some("permissions: full".to_owned()));
+        let _ = p.draw_bytes("> ");
+        assert_eq!(p.below_rows, 1);
+
+        p.set_status(None);
+        let bytes = p.draw_bytes("> ");
+        assert!(bytes.ends_with("\x1b[2A> "), "{bytes:?}");
+        assert_eq!(p.below_rows, 0);
+        assert_eq!(p.advance_bytes(false), "\n");
+    }
+
+    /// REQ-560 BR-9: with the frame off, nothing is drawn and no status byte is
+    /// produced — whatever the status is set to.
+    #[test]
+    fn an_unframed_prompter_emits_no_status_bytes() {
+        let mut p = FramedStdinPrompter::new(false, false);
+        p.set_status(Some("permissions: full".to_owned()));
+        // `draw` returns before composing anything.
+        p.draw("> ");
+        assert_eq!(
+            p.below_rows, 0,
+            "an unframed prompter must not accrue rows to step over"
+        );
+    }
 
     #[test]
     fn scripted_prompter_replays_then_reports_eof() {

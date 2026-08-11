@@ -869,6 +869,11 @@ fn handle_permissions(
 
     let answered = conn.call(SessionPermissionsParams { session_id, level }, ctx)?;
     if let Some(result) = permissions_or_report(answered, ctx.surface) {
+        // The status row renders from session state, so it has to learn what the
+        // daemon just told us — otherwise the row would keep showing the old
+        // level until the next session. Cached from the daemon's answer rather
+        // than from the request, so what is rendered is what actually happened.
+        ctx.state.permission_level = Some(result.level);
         ctx.surface
             .line(LineKind::Notice, &render_permissions(&result));
     }

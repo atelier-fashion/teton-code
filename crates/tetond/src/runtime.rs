@@ -3524,13 +3524,23 @@ impl DaemonRuntime {
         self.default_permission_level
     }
 
+    /// ## `events` is the daemon's real bus, and that is load-bearing
+    ///
+    /// [`Self::permission_gate_for`] *creates* the gate when none exists, and
+    /// the gate it creates publishes its prompts to whichever bus it was handed
+    /// — for the life of the session, because the gate is cached. Handing this a
+    /// convenient throwaway bus would bind the session's gate to something
+    /// nobody subscribes to, and every later permission prompt in that session
+    /// would be published into a void: the tool would sit `[running]` forever
+    /// and the user would never be asked. Take the daemon's own bus, exactly as
+    /// [`Self::web_override`] does.
     pub fn session_permissions(
         self: &Arc<Self>,
         params: &SessionPermissionsParams,
+        events: &Arc<EventBus>,
     ) -> SessionPermissionsResult {
-        let events = Arc::new(EventBus::new());
         let config = self.config.lock().expect("config mutex poisoned").clone();
-        let gate = self.permission_gate_for(&params.session_id, &events, &config);
+        let gate = self.permission_gate_for(&params.session_id, events, &config);
         let changed = params.level.is_some_and(|level| gate.set_level(level));
         SessionPermissionsResult {
             // Read back from the gate rather than echoing the request: the gate
@@ -14312,7 +14322,67 @@ provider_id = "on-device"
             }
         }
 
-        /// **BR-1 / AC-1's structural half, through the real registry builder.**
+        /// **REQ-560 regression: the gate `session/permissions` creates must publish
+    /// to the daemon's own bus.**
+    ///
+    /// [`DaemonRuntime::permission_gate_for`] creates the session's gate when
+    /// none exists and then **caches** it, so whichever `EventBus` the first
+    /// caller hands it is the bus that session's prompts go to for the rest of
+    /// its life. `session/permissions` can easily be that first caller — the
+    /// CLI reads the level at session start, before any turn has run — and an
+    /// early implementation of it passed a freshly-constructed bus for
+    /// convenience. Every later permission prompt in that session was then
+    /// published to a bus with no subscribers: the tool sat `[running]`, the
+    /// user was never asked, and nothing errored.
+    ///
+    /// Caught by `pty_e2e`, which is the only place the whole chain is real.
+    /// This test is the cheap twin that fails in milliseconds instead of at a
+    /// twenty-second timeout.
+    #[tokio::test]
+    async fn a_gate_created_by_reading_the_level_still_reaches_the_daemons_subscribers() {
+        let runtime = Arc::new(DaemonRuntime::minimal());
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("sess-under-test");
+
+        // The read creates the gate — this is the ordering the bug needed.
+        let read = runtime.session_permissions(
+            &SessionPermissionsParams {
+                session_id: session.clone(),
+                level: None,
+            },
+            &events,
+        );
+        assert_eq!(read.level, PermissionLevel::Guarded);
+        assert!(!read.changed);
+
+        // A later turn resolves the *same* cached gate…
+        let config = runtime.config.lock().expect("config mutex").clone();
+        let gate = runtime.permission_gate_for(&session, &events, &config);
+
+        // …and its prompt must reach a subscriber of the bus we passed in.
+        let mut sub = events.subscribe(16);
+        let asking = tokio::spawn(async move { gate.authorize("shell", None).await });
+        let env = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .expect("the prompt must reach the daemon's own bus, not a throwaway one")
+            .expect("a prompt was published");
+        let request_id = match env.event {
+            Event::PermissionRequest(pr) => pr.request_id,
+            other => panic!("expected permission_request, got {other:?}"),
+        };
+        assert!(runtime.pending.resolve(
+            &request_id,
+            teton_protocol::methods::PermissionOutcome::Selected {
+                option_id: "allow_once".to_owned()
+            }
+        ));
+        assert_eq!(
+            asking.await.expect("the authorize task joins"),
+            crate::harness::PermissionDecision::Allowed
+        );
+    }
+
+    /// **BR-1 / AC-1's structural half, through the real registry builder.**
         ///
         /// `off` is not a tool behind a flag: the registry does not hold one, so
         /// there is nothing for a later change to accidentally expose.

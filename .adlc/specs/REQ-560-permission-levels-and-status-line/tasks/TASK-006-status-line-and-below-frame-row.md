@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 title: "Pure status-line content function and the TTY-gated row below the frame"
-status: pending
+status: complete
 parent: REQ-560
 created: 2026-08-11
 updated: 2026-08-11
