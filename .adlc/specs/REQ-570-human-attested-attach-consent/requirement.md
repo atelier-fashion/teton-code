@@ -1,7 +1,7 @@
 ---
 id: REQ-570
 title: "Human-attested attach consent: a surface a headless process cannot satisfy, and a client that can answer"
-status: approved
+status: in-progress
 deployable: true
 created: 2026-08-11
 updated: 2026-08-11
