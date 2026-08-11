@@ -1,7 +1,7 @@
 ---
 id: TASK-116
 title: "`teton effort` and `/effort` through one resolver and one renderer; `teton cost` reports the thinking split"
-status: pending
+status: complete
 parent: REQ-559
 created: 2026-08-11
 updated: 2026-08-11

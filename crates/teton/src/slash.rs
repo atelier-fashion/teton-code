@@ -50,10 +50,12 @@
 //! and names `teton model set` as the auditable surface for the unattended case.
 //! Every other command is pipe-friendly exactly as BR-9 says.
 
+use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    ModelStatusParams, PromptBlock, PromptTurnParams, SessionClearParams, WebOverrideParams,
-    WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
+    ConfigGetParams, ConfigSetParams, ConfigUpdate, ModelStatusParams, PromptBlock,
+    PromptTurnParams, SessionClearParams, WebOverrideParams, WebOverrideResult, WebRefreshOutcome,
+    WebRefreshParams, WebRefreshResult,
 };
 use teton_protocol::SessionId;
 
@@ -134,6 +136,15 @@ enum Args {
     /// line gets back, so the hint says what to type rather than only that
     /// something is missing.
     Required(&'static str),
+    /// An argument is meaningful but optional: the bare form does something
+    /// useful in its own right.
+    ///
+    /// Added for REQ-559's `/effort`, whose bare form is a **read** (BR-9) —
+    /// modelling it as `Required` would reject the very line the spec asks to
+    /// work, and modelling it as `None` would reject the set form. The handler
+    /// validates the argument when one is present, because only it knows the
+    /// vocabulary.
+    Optional,
 }
 
 /// One row of the dispatch table.
@@ -184,6 +195,21 @@ const COMMANDS: &[CommandSpec] = &[
         summary: "Show the daemon's cost report, exactly as `teton cost` does.",
         args: Args::None,
         handler: handle_cost,
+    },
+    // REQ-559 BR-9: this REQ owns the `/effort` row, its bare-argument read
+    // path, and therefore its `/help` entry — `/help` is generated from this
+    // array (BR-7), so a command cannot exist without appearing there.
+    // REQ-560 renders the effort *value* in its status line and adds
+    // `/permissions`; it does not add, alias, or duplicate this row.
+    CommandSpec {
+        name: "effort",
+        aliases: &[],
+        summary: "Show or set the global reasoning effort: /effort [low|medium|high|xhigh|max].",
+        // Deliberately NOT `Args::Required`: the bare form is a *read*, which
+        // BR-9 requires, so an argument-less line must dispatch rather than be
+        // rejected as half-typed.
+        args: Args::Optional,
+        handler: handle_effort,
     },
     CommandSpec {
         // Argument-less: `model set` is its own row below, and [`split_name`]'s
@@ -586,6 +612,57 @@ fn handle_cost(
     // an event arriving while this RPC pumps behaves exactly as it would
     // between turns.
     crate::query_and_render_cost(conn, ctx)?;
+    Ok(CommandOutcome::Continue)
+}
+
+/// The `/effort` handler (REQ-559 BR-9).
+///
+/// Bare: read the current level and each provider's clamped level. With an
+/// argument: set it — persisted (BR-8) — then read back, so the user sees the
+/// clamp their new level lands on rather than only the number they typed.
+///
+/// Renders through [`crate::effort_ui::render`], the **same** function
+/// `teton effort` calls, over the same `config/get` snapshot. Two surfaces
+/// describing one setting must not be able to disagree (BR-9, LESSON-456), and
+/// there is exactly one renderer so they cannot.
+fn handle_effort(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let args = args.trim();
+    if !args.is_empty() {
+        let level: EffortLevel = match args.parse() {
+            Ok(level) => level,
+            Err(err) => {
+                // One line, no RPC — the same shape every other rejected
+                // command line takes (BR-2). The error names every accepted
+                // spelling, from the list that also defines the enum.
+                ctx.surface
+                    .line(LineKind::Error, &format!("{err} — {HELP_HINT}"));
+                return Ok(CommandOutcome::Continue);
+            }
+        };
+        if let Err(err) = conn.call(
+            ConfigSetParams {
+                update: ConfigUpdate::SetEffort(level),
+            },
+            ctx,
+        )? {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!("could not set the effort level: {}", err.message),
+            );
+            return Ok(CommandOutcome::Continue);
+        }
+    }
+    match conn.call(ConfigGetParams::default(), ctx)? {
+        Ok(cfg) => crate::effort_ui::render(ctx.surface, cfg.snapshot.effort.as_ref()),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("could not read the effort setting: {}", err.message),
+        ),
+    }
     Ok(CommandOutcome::Continue)
 }
 
@@ -1064,6 +1141,50 @@ mod tests {
         }
     }
 
+    /// REQ-559 BR-9: `/effort` must dispatch **both** bare (read) and with a
+    /// level (set). `Args::Optional` exists for exactly this shape, and a row
+    /// that only worked one way would fail half the requirement silently —
+    /// `Required` would reject the read, `None` would reject the set.
+    #[test]
+    fn an_optional_argument_row_dispatches_both_ways() {
+        let optional: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|s| matches!(s.args, Args::Optional))
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            optional.contains(&"effort"),
+            "REQ-559 owns the /effort row and its bare read path (BR-9)",
+        );
+        for name in optional {
+            for line in [format!("/{name}"), format!("/{name} high")] {
+                let Input::Command { name: n, args } = classify(&line) else {
+                    panic!("`{line}` did not classify as a command");
+                };
+                assert!(
+                    matches!(resolve(n, args), Resolution::Run(..)),
+                    "`{line}` must dispatch, not be rejected",
+                );
+            }
+        }
+    }
+
+    /// BR-9 / REQ-555 BR-7: `/help` is generated from `COMMANDS`, so the
+    /// `/effort` row appears there by construction. Asserted rather than
+    /// assumed — the claim is what makes a separate `/help` edit unnecessary.
+    #[test]
+    fn effort_appears_in_help_because_help_is_generated_from_the_table() {
+        let mut surface = RecordingSurface::new();
+        render_help(&mut surface);
+        assert!(
+            surface
+                .lines_of(LineKind::Info)
+                .iter()
+                .any(|l| l.contains("/effort")),
+            "the /effort row must reach /help without a separate edit",
+        );
+    }
+
     // BR-8, forward direction (LESSON-479): iterate the dispatch table and prove
     // every entry is reachable from parsed input. This direction alone would
     // stay green while the passthrough drifted, so the two tests below cover the
@@ -1076,6 +1197,12 @@ mod tests {
             let expected_args = match spec.args {
                 Args::None => "",
                 Args::Required(_) => "qwen2.5-coder-3b",
+                // REQ-559: an `Optional` row is reachable both ways, and the
+                // *bare* form is the one BR-9 requires to work (it is the read
+                // path). The bare case is what this loop types; the argument
+                // case is covered by `an_optional_argument_row_dispatches_both_ways`
+                // below, which asserts the pair rather than only one side.
+                Args::Optional => "",
             };
             // Every spelling, not just the canonical one: an alias that is in
             // the table but unreachable from typed input is the same defect as
@@ -1177,6 +1304,13 @@ mod tests {
             // REQ-567 BR-8: the user-only clear, declared here for the same
             // reason the web rows were — a new command is a spec decision.
             "clear",
+            // REQ-559 BR-9: this REQ owns `/effort` — the row, its bare-argument
+            // read path, and its `/help` entry. Declared here first, as the
+            // rows above were. REQ-560 renders the effort *value* in its status
+            // line and adds `/permissions`; it does not add or alias this one,
+            // and both specs previously claimed the command, which is why the
+            // ownership is stated rather than assumed.
+            "effort",
         ];
         for expected in promised {
             assert!(

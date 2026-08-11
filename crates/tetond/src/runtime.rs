@@ -5964,7 +5964,27 @@ pub(crate) fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBo
 /// `router` so that `teton policy show` and `route_decided` are two renderings of
 /// one value rather than two computations of one question (ADR-D, BR-6, AC-11).
 fn snapshot_from_config(config: &Config, router: &Router) -> ConfigSnapshot {
+    // REQ-559 BR-9 / AC-8: every row comes from `Router::effort_for`, the SAME
+    // function the router calls per model call. The surfaces therefore cannot
+    // describe a provider differently from the request that goes to it — which
+    // a second, surface-local computation could, and would do silently.
+    let effort = Some(teton_protocol::methods::EffortView {
+        level: router.effort(),
+        providers: config
+            .providers
+            .iter()
+            .filter_map(|p| {
+                router.effort_for(Some(&p.id)).map(|resolved| {
+                    teton_protocol::methods::ProviderEffortView {
+                        provider_id: ProviderId::from(p.id.as_str()),
+                        resolved,
+                    }
+                })
+            })
+            .collect(),
+    });
     ConfigSnapshot {
+        effort,
         providers: config
             .providers
             .iter()
@@ -6073,7 +6093,12 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
                 .chain(cb.fallback_id.iter().map(|f| f.0.as_str()))
                 .collect(),
         ),
-        ConfigUpdate::RegisterProvider(_) | ConfigUpdate::SetPrivacyBoundary(_) => {
+        // REQ-559: `SetEffort` names no provider, so there is no binding to
+        // reject. An effort level is valid against every provider by
+        // construction — the per-provider clamp is what makes it so.
+        ConfigUpdate::RegisterProvider(_)
+        | ConfigUpdate::SetPrivacyBoundary(_)
+        | ConfigUpdate::SetEffort(_) => {
             return Ok(());
         }
     };
@@ -6100,6 +6125,10 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
 /// Apply a single [`ConfigUpdate`] to `config` in place (replace-or-insert).
 fn apply_update(config: &mut Config, update: ConfigUpdate) {
     match update {
+        // REQ-559 BR-8: written to the persisted config, so the next session
+        // starts here. The session override (ADR-I) is applied by the caller
+        // that owns a session; this is the durable floor.
+        ConfigUpdate::SetEffort(level) => config.effort = level,
         ConfigUpdate::RegisterProvider(pc) => {
             let id = pc.id.0;
             // BUG-155: re-registering an existing id keeps the capability
@@ -6193,6 +6222,8 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
         total_calls: report.total.calls,
         priced_calls: report.total.priced_calls,
         unpriced_calls: report.total.unpriced_calls,
+        reasoning_tokens: report.total.reasoning_tokens,
+        calls_reporting_reasoning: report.total.calls_reporting_reasoning,
         // REQ-557 AC-7b: the models the meter could not price travel to the
         // client by name, so `teton cost` can say what to add a price for.
         unpriced_models: report.unpriced.models.iter().cloned().collect(),

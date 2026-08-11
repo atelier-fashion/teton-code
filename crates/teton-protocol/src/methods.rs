@@ -9,6 +9,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::effort::{EffortLevel, ResolvedEffort};
 use crate::events::{
     CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource, WebTier,
 };
@@ -974,6 +975,44 @@ pub struct ConfigSnapshot {
     /// user their outbound payloads are scanned when nothing is scanning them.
     #[serde(default)]
     pub redact_enabled: bool,
+    /// The global reasoning-effort setting and what it resolves to per provider
+    /// (REQ-559 BR-9).
+    ///
+    /// Carried on the existing snapshot rather than behind a new RPC — the spec
+    /// adds none — so `teton effort`, `/effort` and (REQ-560) the status line
+    /// all read one answer the daemon computed with the **same** function the
+    /// router calls. Two surfaces describing one setting must not be able to
+    /// drift (LESSON-456, REQ-555 BR-4).
+    ///
+    /// `Option` for wire additivity only: a daemon that has this field always
+    /// populates it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub effort: Option<EffortView>,
+}
+
+/// The global effort setting, plus what it resolves to for each registered
+/// provider (REQ-559 BR-9, AC-8).
+///
+/// Every row is produced by `teton_core::effort::resolve_effort` — the same
+/// function the router calls per model call — so a row here cannot describe a
+/// provider differently from the request that actually goes to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffortView {
+    /// The level the user set (or the declared default). This is the
+    /// **pre-clamp** request; each row below says what that becomes.
+    pub level: EffortLevel,
+    /// One row per registered provider, in configuration order.
+    pub providers: Vec<ProviderEffortView>,
+}
+
+/// What the global effort resolves to for one provider (REQ-559 BR-9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderEffortView {
+    /// The provider this row describes.
+    pub provider_id: ProviderId,
+    /// What its requests actually carry — already clamped, and carrying the
+    /// reason when nothing is sent (BR-6).
+    pub resolved: ResolvedEffort,
 }
 
 /// Result of [`ConfigGetParams`].
@@ -1003,6 +1042,17 @@ pub enum ConfigUpdate {
     SetCategoryBinding(CategoryBindingConfig),
     /// Add or replace a privacy boundary.
     SetPrivacyBoundary(PrivacyBoundaryConfig),
+    /// Set the global reasoning-effort level (REQ-559 BR-8, `teton effort <level>`
+    /// / `/effort <level>`).
+    ///
+    /// **Persisted**, unlike REQ-560's session-scoped permission level. The
+    /// asymmetry is deliberate: an effort level that survives a restart costs
+    /// money predictably, while a permission level that survives one removes a
+    /// guardrail invisibly.
+    ///
+    /// A new `ConfigUpdate` variant, not a new RPC — `config/set` already
+    /// carries every configuration mutation.
+    SetEffort(EffortLevel),
 }
 
 /// Apply a configuration mutation.
@@ -1068,6 +1118,18 @@ pub struct CostReportView {
     pub priced_calls: u64,
     /// Calls with no price-table entry (never guessed a cost).
     pub unpriced_calls: u64,
+    /// Reasoning tokens summed over the calls that **reported** a split, or
+    /// `None` when none did (REQ-559 BR-11).
+    ///
+    /// A **subset** of the output tokens, never added to them. `None` renders
+    /// as "unreported": a `0` standing in for "the provider didn't tell us" is
+    /// displaying an estimate as an actual, which REQ-544 BR-2 forbids.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reasoning_tokens: Option<u64>,
+    /// How many calls reported a reasoning split, so a partial figure can say
+    /// so rather than reading as a whole-ledger total.
+    #[serde(default)]
+    pub calls_reporting_reasoning: u64,
     /// The models behind [`Self::unpriced_calls`], by name, deduplicated and
     /// ordered (REQ-557 BR-9 / AC-7b).
     ///
@@ -1698,6 +1760,7 @@ mod tests {
         round_trip(&ConfigGetParams::default());
         round_trip(&ConfigGetResult {
             snapshot: ConfigSnapshot {
+                effort: None,
                 providers: vec![ProviderConfig {
                     id: ProviderId::from("anthropic"),
                     kind: ProviderKind::Anthropic,
@@ -2074,6 +2137,8 @@ mod tests {
                     lookups: 2,
                     bytes_in: 8_192,
                 }],
+                reasoning_tokens: None,
+                calls_reporting_reasoning: 0,
             },
         });
     }

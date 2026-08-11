@@ -58,9 +58,7 @@ use teton_core::category::{
     resolve as resolve_category, Category as CoreCategory, CategoryResolution, CategoryTable,
     JudgmentCategory, Tier as CoreTier, TierBinding,
 };
-use teton_core::effort::{
-    resolve_effort, EffortLadder, EffortLevel, EffortOmission, ResolvedEffort,
-};
+use teton_core::effort::{resolve_effort, EffortLevel, EffortOmission, ResolvedEffort};
 use teton_core::entities::{ProviderCapabilities, ProviderKind};
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::{ProviderHealth, RouteOutcome};
@@ -1199,6 +1197,7 @@ mod tests {
     use super::*;
     use crate::classify::ClassificationSignal;
     use teton_core::category::category_for_phase;
+    use teton_core::effort::EffortLadder;
     use teton_core::ToolCallTier;
 
     /// A `Route` carrying `resolution`, with everything else fixed. The point of
