@@ -172,6 +172,9 @@ impl Connection {
             client_version: CLIENT_VERSION.to_owned(),
             protocol_min: PROTOCOL_VERSION_MIN,
             protocol_max: PROTOCOL_VERSION_MAX,
+            // The CLI drives one session and renders that session's stream;
+            // monitoring is for tools that watch every session (REQ-568 ADR-C).
+            monitor: false,
         };
         let id = self.send(params)?;
         loop {

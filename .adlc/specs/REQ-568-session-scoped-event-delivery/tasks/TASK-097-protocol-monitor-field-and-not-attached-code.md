@@ -1,7 +1,7 @@
 ---
 id: TASK-097
 title: "Protocol: HandshakeParams.monitor field and NOT_ATTACHED error code"
-status: draft
+status: complete
 parent: REQ-568
 created: 2026-08-11
 updated: 2026-08-11
@@ -23,10 +23,10 @@ per ADR-B.
 
 ## Acceptance Criteria
 
-- [ ] `HandshakeParams` JSON lacking `monitor` deserializes with `monitor == false` (test asserts on a hand-written legacy JSON literal, not on re-serialized output — LESSON-490: fixtures through the real decode path).
-- [ ] `monitor: true` survives a serialize→deserialize round trip.
-- [ ] `error_code::NOT_ATTACHED == -32009`, present in the macro's `ALL` array, uniqueness guard green.
-- [ ] `cargo test -p teton-protocol` passes AND the workspace still compiles (`cargo check --workspace`) — the new field must not leave any construction site behind.
+- [x] `HandshakeParams` JSON lacking `monitor` deserializes with `monitor == false` (test asserts on a hand-written legacy JSON literal, not on re-serialized output — LESSON-490: fixtures through the real decode path).
+- [x] `monitor: true` survives a serialize→deserialize round trip.
+- [x] `error_code::NOT_ATTACHED == -32009`, present in the macro's `ALL` array, uniqueness guard green.
+- [x] `cargo test -p teton-protocol` passes AND the workspace still compiles (`cargo check --workspace`) — the new field must not leave any construction site behind.
 
 ## Technical Notes
 
