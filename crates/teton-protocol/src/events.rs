@@ -1648,17 +1648,49 @@ pub struct SessionGrantMinted {
     /// [`AttachConsentRequested::requester`] carries, and to be treated the same
     /// way: a hint, never an identity.
     pub requester: String,
-    /// Whether the connection that asked is also the connection that approved
+    /// Who approved it — the answering connection's descriptor, bounded and
+    /// stripped exactly like [`Self::requester`], and exactly as untrusted
+    /// (REQ-569 re-verify, R1).
+    ///
+    /// **This is the field that shows self-dealing**, and it exists because
+    /// [`Self::self_approved`] does not. One actor holding two connections has
+    /// X approve Y's attach: two different connection ids, so the flag is
+    /// `false` and the announcement reads as an ordinary peer approval. What
+    /// gives that away is the *relation* between the two parties, so the
+    /// announcement carries both parties rather than a verdict about them — a
+    /// reader who sees the same name asked and answered has something to act on.
+    ///
+    /// Matching descriptors are evidence, never proof: the string is peer-chosen
+    /// and two honest clients may well spell themselves the same way. A reader
+    /// is being handed the relation, not a decision.
+    pub approver: String,
+    /// Whether the connection that asked is the *same connection* that approved
     /// (REQ-569 BR-6's second arm).
     ///
-    /// `true` is the accepted residual made visible: nobody was attached to the
+    /// `true` is one accepted residual made visible: nobody was attached to the
     /// target session, so the prompt was rendered at the requester and the
     /// requester answered it. For a person resuming their own session that is
     /// the intended flow; for a headless same-UID process it means no human was
-    /// involved at all, and the daemon cannot tell the two apart. Surfacing the
-    /// flag rather than making the reader infer it from the absence of a
-    /// prompt is the whole point — the inference is exactly what nobody does.
+    /// involved at all, and the daemon cannot tell the two apart.
+    ///
+    /// **`false` is not a clean bill of health**, and reading it as one is the
+    /// blindness R1 records: it is a fact about connection ids, so an attacker
+    /// who holds two connections and answers its own request with the second one
+    /// is announced with `self_approved: false`. Use [`Self::approver`] for the
+    /// question "did somebody else really decide this".
     pub self_approved: bool,
+    /// How many announcements the daemon's per-connection bound dropped since
+    /// the last one that got through (REQ-569 re-verify, R3). `0` in the
+    /// ordinary case.
+    ///
+    /// Minting a grant is attacker-triggerable — a peer loops `session/attach`
+    /// and self-approves — and this event is daemon-scoped, so every unbounded
+    /// announcement is a line on every connected client's screen. The daemon
+    /// rate-limits it per requesting connection and reports the arrears here, so
+    /// the bound never costs a reader the knowledge that something was
+    /// suppressed: a burst is one notice that says how much it stands for
+    /// instead of a thousand notices that scroll the real one away.
+    pub suppressed: u32,
 }
 
 #[cfg(test)]
@@ -3126,7 +3158,9 @@ mod tests {
         let minted = Event::SessionGrantMinted(SessionGrantMinted {
             scope: ConsentScope::Attach,
             requester: "cli client \"teton\"".to_owned(),
+            approver: "cli client \"teton\"".to_owned(),
             self_approved: true,
+            suppressed: 0,
         });
         assert_eq!(minted.name(), "session_grant_minted");
 
@@ -3142,6 +3176,25 @@ mod tests {
             "a grant announcement goes to every connection, so it names no \
              session: {wire}"
         );
+
+        // R1: the announcement names **both** parties. The peer-approved shape
+        // is the one that needs it — `self_approved` is `false` there whether a
+        // real second user answered or an attacker's second connection did, so
+        // the descriptors are the only thing on the wire that tells them apart.
+        let peer = envelope_wire(Event::SessionGrantMinted(SessionGrantMinted {
+            scope: ConsentScope::Attach,
+            requester: "cli client \"attacker\"".to_owned(),
+            approver: "cli client \"attacker\"".to_owned(),
+            self_approved: false,
+            suppressed: 12,
+        }));
+        assert_eq!(peer["self_approved"], false);
+        assert_eq!(
+            peer["requester"], peer["approver"],
+            "two connections, one name: the relation is what a reader acts on, \
+             and it has to survive the wire: {peer}"
+        );
+        assert_eq!(peer["suppressed"], 12);
     }
 
     /// BR-5: each refusal reason has its own spelling, and a monitor request

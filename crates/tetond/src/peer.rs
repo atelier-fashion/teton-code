@@ -37,9 +37,11 @@
 //!   reparents to `launchd`/`init` and classifies [`Ancestry::NotDescendant`]
 //!   with full client rights. This is not a hypothetical "a child that
 //!   double-forks": it is one token in a command the model writes. The `shell`
-//!   tool kills its whole process group on every completion arm, which
-//!   compensates for the backgrounding form but not for `setsid`, which leaves
-//!   the group.
+//!   tool kills its whole process group **on the timeout arm only**, so neither
+//!   form is reached on an ordinary completion. Killing the group on every arm
+//!   was tried and reverted (REQ-569 re-verify, R4): it destroyed work a command
+//!   backgrounded on purpose, signalled a pgid whose leader had already been
+//!   reaped, and still did not reach `setsid`, which leaves the group outright.
 //! - PID reuse is a narrow race between `connect(2)` and the walk.
 //!
 //! Neither is chased with a heuristic here — a "reparented to init" rule would

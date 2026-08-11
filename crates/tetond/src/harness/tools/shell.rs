@@ -193,62 +193,70 @@ impl Tool for ShellTool {
         // sentences below buy no model call either — the same argument the
         // `None` above makes, one step further along.
         const NO_OUTPUT_CAPTURED: usize = 0;
-        let ended = rx.recv_timeout(Duration::from_millis(timeout_ms));
-
-        // Kill the whole process group on **every** ending, not just the
-        // timeout (REQ-569 verify, F5b).
+        // **The group is killed on the timeout arm only** — and the alternative
+        // was tried and reverted (REQ-569 re-verify, R4).
         //
-        // It was the timeout arm only, which left the ordinary ending — the
-        // command finished — as a way to leave a process behind: `sh -c 'helper
-        // >/dev/null 2>&1 &'` backgrounds a grandchild, closes the pipes, so
-        // `wait_with_output` returns *promptly and successfully* and nothing
-        // ever kills the group. The escapee then reparents to `launchd`/`init`,
-        // which breaks the ancestry chain REQ-569 BR-4 keys on: it connects to
-        // the daemon's socket classified `NotDescendant`, with full client
-        // rights, and qualifies for the attach self-render arm. That is one
-        // shell word, in a command the model writes.
+        // The verify pass moved the `kill(-pgid)` up here, ahead of the match,
+        // so it ran on *every* ending. The intent was to reach the escapee in
+        // `sh -c 'helper >/dev/null 2>&1 &'`: the command backgrounds a
+        // grandchild, closes the pipes, `wait_with_output` returns promptly and
+        // successfully, and on the old shape nothing killed the group. The
+        // escapee reparents to `launchd`/`init`, which breaks the ancestry
+        // chain REQ-569 BR-4 keys on — it reconnects classified
+        // `NotDescendant`, with full client rights.
         //
-        // **This is mitigation, not closure.** `setsid helper` leaves the
-        // process group entirely, so the signal below never reaches it; the
-        // escape is narrowed, not shut. It is recorded as such in
+        // It is reverted because it cost more than it bought:
+        //
+        // - **It killed work a command legitimately backgrounded.** `npm run dev
+        //   &`, a fixture server, a language server — anything an agent starts
+        //   on purpose and expects to outlive one tool call died on the
+        //   *success* path. That is a functional regression in the common case,
+        //   paid for a security case the same change did not close.
+        // - **On a success arm the group leader has already been reaped** by
+        //   `wait_with_output`, so the pgid may already have been released.
+        //   Signalling it then is not the `ESRCH` no-op the timeout arm's
+        //   reasoning describes: it can reach a *recycled* group.
+        // - **It did not close the escape it was aimed at.** `setsid helper`
+        //   leaves the process group outright, so no group-directed signal on
+        //   any arm reaches it.
+        //
+        // So the escape stands, recorded rather than papered over, in
         // `crate::peer`'s module docs and in the REQ-569 architecture ADR-A
-        // residuals.
-        //
-        // A command that legitimately backgrounds something long-lived loses it
-        // here. That is the trade this makes on purpose: the harness cannot tell
-        // a wanted daemon from an escapee, and the escapee is the one with
-        // security consequences.
-        //
-        // `wait_with_output` moved the child into the watcher thread, so
-        // `Child::kill` is not available here, and a bare `kill(pid)` would
-        // leave grandchildren running (REQ-544 L-2). The child is its own group
-        // leader (`process_group(0)`), so its pgid equals its pid and a negative
-        // target signals the whole group.
-        //
-        // Signalling after the leader has been reaped is safe rather than a pid
-        // race: POSIX will not reuse a pid while it is still in use as a process
-        // group id, so for as long as the group has any member left to kill, the
-        // pgid still names *our* group. Once it is empty there is nothing to
-        // reach and the call is an `ESRCH` no-op.
-        //
-        // SAFETY: kill(2) with the negated pgid of a group we created ourselves
-        // and a valid signal.
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-        }
-        let _ = handle.join();
-
-        match ended {
-            Ok(Ok(output)) => render_output(&command, &output).with_unknown_provenance(),
-            Ok(Err(e)) => ToolOutcome::error(format!("command failed to run: {}", e.kind()))
+        // residuals. Closing it needs a mechanism that does not key on the
+        // process group at all.
+        match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+            Ok(Ok(output)) => {
+                let _ = handle.join();
+                render_output(&command, &output).with_unknown_provenance()
+            }
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                ToolOutcome::error(format!("command failed to run: {}", e.kind()))
+                    .with_unknown_provenance()
+                    .measuring(NO_OUTPUT_CAPTURED)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Kill the whole process group, not just the direct child:
+                // `wait_with_output` moved the child into the watcher thread, so
+                // we cannot call `Child::kill` here, and a bare `kill(pid)` would
+                // leave backgrounded grandchildren running (REQ-544 L-2). The
+                // child is its own group leader (`process_group(0)`), so its pgid
+                // equals its pid; a negative target signals the entire group.
+                // libc is already a daemon dependency (peer-cred / flock).
+                // SAFETY: kill(2) with the negated pgid of a group we just created
+                // and a valid signal.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+                let _ = handle.join();
+                ToolOutcome::error(format!(
+                    "command timed out after {timeout_ms}ms and was killed"
+                ))
                 .with_unknown_provenance()
-                .measuring(NO_OUTPUT_CAPTURED),
-            Err(RecvTimeoutError::Timeout) => ToolOutcome::error(format!(
-                "command timed out after {timeout_ms}ms and was killed"
-            ))
-            .with_unknown_provenance()
-            .measuring(NO_OUTPUT_CAPTURED),
+                .measuring(NO_OUTPUT_CAPTURED)
+            }
             Err(RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
                 ToolOutcome::error("command watcher disconnected")
                     .with_unknown_provenance()
                     .measuring(NO_OUTPUT_CAPTURED)

@@ -84,16 +84,30 @@ pub const MAX_PENDING_CONSENTS_PER_CONNECTION: usize = 3;
 /// [`TimedOut`](Self::TimedOut) are kept apart all the way out to the wire
 /// because they have different remedies (BR-5): a denial was a decision, a
 /// timeout was a prompt nobody answered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsentOutcome {
-    /// A user approved it.
+    /// A user approved it, at the surface `approver` describes.
     ///
-    /// Carries nothing. It used to name the session the approving surface held,
-    /// which existed only so a monitor-scope grant could be keyed to it — and
-    /// the monitor consent path is gone (REQ-569 verify, F1). An attach grant is
+    /// The descriptor travels with the decision because the connection that
+    /// *asked* is not the connection that answered, and only the answering side
+    /// knows who it was: the requester's task is parked on a `oneshot` while a
+    /// different connection's reader loop resolves it. Announcing the grant
+    /// without carrying this would leave the announcement able to say only which
+    /// *route* ran — which is R1's blindness, since one actor holding two
+    /// connections takes the peer route (see
+    /// [`teton_protocol::SessionGrantMinted::approver`]).
+    ///
+    /// It briefly named the session the approving surface held instead, which
+    /// existed only so a monitor-scope grant could be keyed to it — and the
+    /// monitor consent path is gone (REQ-569 verify, F1). The attach grant is
     /// keyed to the session that was *asked* for, which the caller already
-    /// holds, so a second witness here would be a value nobody reads.
-    Granted,
+    /// holds, so that witness really was a value nobody read; this one is read
+    /// at the announcement.
+    Granted {
+        /// The answering connection's bounded, control-stripped descriptor.
+        /// Untrusted, peer-chosen text — a hint, never an identity.
+        approver: String,
+    },
     /// A user was asked and said no.
     Denied,
     /// The bounded window elapsed with no answer. Resolves to denied.
@@ -194,12 +208,21 @@ impl ConsentRoute {
     /// (BR-6's second arm, REQ-569 TASK-109).
     ///
     /// True only for [`RenderedBy::TheRequesterItself`] answered by the
-    /// requester — the one arm in which no second party is involved at all. For
-    /// a headless same-UID process that is not a daemon descendant, this is the
-    /// accepted, documented residual of ADR-A's perimeter: the requester is
-    /// asked, and it answers itself. Accepted, but never *silent* — the daemon
-    /// says so in its log ([`crate::server`]'s self-approval line), and this
-    /// predicate is what decides when.
+    /// requester — the one arm in which no second *connection* is involved at
+    /// all. For a headless same-UID process that is not a daemon descendant,
+    /// this is the accepted, documented residual of ADR-A's perimeter: the
+    /// requester is asked, and it answers itself. Accepted, but never *silent* —
+    /// the daemon says so in its log ([`crate::server`]'s self-approval line),
+    /// and this predicate is what decides when.
+    ///
+    /// **It is not the self-dealing detector, and must never be presented as
+    /// one** (REQ-569 re-verify, R1). It is a question about connection ids, so
+    /// it is `false` for the whole of arm 1 — including the case where one actor
+    /// holds two connections and has the first approve the second's request. The
+    /// grant announcement therefore carries the *approver's descriptor* beside
+    /// the requester's rather than leaning on this flag: an operator can see
+    /// "the same name asked and answered", which is a relation this predicate
+    /// structurally cannot express.
     ///
     /// Stated as "the self-render arm **and** the requester" rather than as
     /// either half alone. The arm alone would be a claim about routing, not
@@ -613,6 +636,13 @@ mod tests {
         sessions.iter().map(|s| session(s)).collect()
     }
 
+    /// A granted outcome from a surface calling itself `approver`.
+    fn granted(approver: &str) -> ConsentOutcome {
+        ConsentOutcome::Granted {
+            approver: approver.to_owned(),
+        }
+    }
+
     /// BR-6's routing rule as a table: every arm crossed with every kind of
     /// connection that could try to answer.
     ///
@@ -792,8 +822,8 @@ mod tests {
         );
 
         // And the first waiter is still the one an answer reaches.
-        assert!(pending.resolve(&id, ConsentOutcome::Granted));
-        assert_eq!(first.await, Ok(ConsentOutcome::Granted));
+        assert!(pending.resolve(&id, granted("the real user")));
+        assert_eq!(first.await, Ok(granted("the real user")));
         assert_eq!(pending.pending_count(), 0);
     }
 
@@ -914,7 +944,7 @@ mod tests {
             "a timed-out request must not sit in the map for a late answer to find"
         );
         assert!(
-            !pending.resolve(&id, ConsentOutcome::Granted),
+            !pending.resolve(&id, granted("a late answer")),
             "and a late answer must find nothing to resolve"
         );
 

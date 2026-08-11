@@ -39,6 +39,13 @@
 //! connection id can never be inherited along with the grants that were keyed
 //! to it.
 //!
+//! That bounds each **entry**, not the capability. Consent arm 1 admits any
+//! connection attached to the target as an approver, so a grant holder can
+//! approve a second connection, leave, and hand the approver role on — the row
+//! dies with its subject while the access propagates past it. Recorded honestly
+//! rather than implied away: see architecture.md ADR-C's correction, open as a
+//! residual owned by REQ-570.
+//!
 //! ## What can mint one
 //!
 //! Nothing here mints a grant on its own, and nothing derives one from the
@@ -225,6 +232,28 @@ impl GrantRegistry {
             .write()
             .expect("grant registry lock poisoned")
             .insert(grant);
+    }
+
+    /// Drops exactly `grant`, if it is held. Returns whether it was.
+    ///
+    /// The narrow counterpart to [`Self::release`], and narrow on purpose: the
+    /// whole [`Grant`] is the key, so this can retract one entry without
+    /// touching another the same connection holds over a different session or at
+    /// a different scope.
+    ///
+    /// **Not a revocation mechanism** — mid-session revocation is out of scope
+    /// for REQ-569 (requirement.md, Out of Scope), and no user-reachable path
+    /// calls this. Its one caller is `session/attach` undoing a grant it had to
+    /// mint before it was allowed to learn that the session does not exist
+    /// (`crate::server`, R2): the consent must run in full for an id that names
+    /// nothing, or the handler becomes the existence oracle BR-8 forbids, and
+    /// the entry it leaves behind would otherwise be permanent and keyed by a
+    /// string the requester chose.
+    pub fn revoke(&self, grant: &Grant) -> bool {
+        self.granted
+            .write()
+            .expect("grant registry lock poisoned")
+            .remove(grant)
     }
 
     /// [`may_attach`] against the live registry.

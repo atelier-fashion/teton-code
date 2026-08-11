@@ -70,13 +70,20 @@ pass — the original wording understated it by an order of magnitude):
   exactly the residual this ADR accepts for an arbitrary same-UID process. So
   the two limits recorded separately here are one attack when read together.
 
-  Partially compensated at the verify pass: the `shell` tool now `SIGKILL`s its
-  whole process group on **every** completion arm rather than only on timeout,
-  which kills the backgrounding form. `setsid` leaves the process group
-  entirely, so it is not reached — the escape is narrowed, not closed. No
-  ancestry heuristic is added to chase it: a "reparented to init" rule would
-  also catch a legitimate CLI whose terminal closed, precisely the
-  incidental-property guard LESSON-443 warns against.
+  **Not compensated.** The verify pass moved the `shell` tool's process-group
+  `SIGKILL` from the timeout arm to *every* completion arm, on the theory that
+  it would kill the backgrounding form. That change is **reverted** (re-verify,
+  R4), because it cost more than it bought: it destroyed work a command
+  backgrounded on purpose (`npm run dev &`, a fixture server, a language
+  server) on the *success* path; on a success arm the group leader has already
+  been reaped by `wait_with_output`, so the pgid may have been released and the
+  signal can reach a recycled group; and it did not close the escape anyway,
+  since `setsid` leaves the process group outright and no group-directed signal
+  on any arm reaches it. The group is killed on timeout only, as before, and the
+  escape stands recorded here rather than half-chased. No ancestry heuristic is
+  added to chase it either: a "reparented to init" rule would also catch a
+  legitimate CLI whose terminal closed, precisely the incidental-property guard
+  LESSON-443 warns against.
 - PID reuse is a narrow race: the peer could exit between `connect` and the
   walk. The credential is a property of the connected socket, so the window is
   small, but it is not zero.
@@ -104,6 +111,28 @@ and `may_monitor` stay, so BR-2/AC-4's grant gate is unchanged — the capabilit
 simply has nothing that mints it from a socket, and a declaration without a
 pre-existing grant is refused `NOT_GRANTED` outright. Regression test:
 `multi_client::a_peers_own_second_connection_cannot_approve_it_a_monitor`.
+
+**The surviving attach arm has the same shape** (recorded at the re-verify, R1).
+The reason given above for removing the monitor path — one actor holding two
+connections, `session/create` ungated, the first connection made an eligible
+approver for the second, two `ConnectionId`s so nothing reads as self-approval —
+is *not* specific to `monitor`. It is a property of BR-6's arm 1
+(`ConnectionsAttachedTo`), which admits any connection attached to the target and
+is therefore satisfiable the same way for `attach`. The difference, and the
+reason arm 1 is kept where the monitor path was removed, is blast radius: an
+attach grant opens the one session that was named, to one connection, until that
+connection ends; a monitor grant opens every session on the machine, present and
+future. The first is a residual worth accepting with the decision made visible;
+the second was not.
+
+Made visible, concretely: the daemon can neither refuse this nor detect it, so
+`session_grant_minted` carries **both** descriptors — who asked and who
+answered — rather than only `self_approved`, which is a fact about connection
+ids and reads `false` for an attacker's second connection exactly as it does for
+a real second user (`crate::server::publish_grant_minted`,
+`teton_protocol::SessionGrantMinted::approver`). Closing it, rather than
+announcing it, needs a user-owned surface the daemon can address — the same
+mechanism ADR-A defers for its own residual.
 
 ### ADR-A-2 (verify pass): a consent surface is registered for routing even when it may not answer
 
@@ -146,8 +175,10 @@ suite on both macOS and Linux runners (both already exist in the workflow).
 
 ### ADR-C: Grants are daemon-lifetime and in-memory (resolves OQ-3)
 
-A grant lives in the daemon's memory for the life of the daemon and is keyed by
-`(subject, session, scope)`. Nothing is persisted to disk or keychain.
+A grant lives in the daemon's memory for the life of the connection it was
+minted for, is keyed by `(subject, session, scope)`, and is dropped by
+`GrantRegistry::release` when that connection ends. Nothing is persisted to disk
+or keychain.
 
 Rationale: persistence buys one avoided prompt and costs a stored credential
 whose storage becomes attack surface — a bad trade for a control whose entire
@@ -155,6 +186,33 @@ purpose is that possession of local state must not confer access (BR-3). Because
 the daemon outlives clients (REQ-565/567), the *session* survives a client
 restart anyway; only the grant is re-established, which is exactly the one
 consent step BR-6 budgets for.
+
+**Correction (re-verify, R1/R5): the *entry* is not inherited, but the
+*capability* propagates transitively — the original wording claimed more than
+the code delivers.** This ADR used to say a grant "can never be inherited",
+resting on connection ids never being reused. That is true of the registry row
+and false of the access it confers, because BR-6's arm 1 admits **any**
+connection attached to the target session as an approver, with no relation to who
+originally held the grant or who the user approved. So:
+
+1. The victim approves connection X once. X attaches, and is now an eligible
+   approver for that session.
+2. X's owner opens a second connection Y, asks to attach, and X approves it.
+3. X disconnects. `release` drops X's row — and Y is still attached, so Y is now
+   the eligible approver, and approves Z.
+
+Two live grants, over a session whose user consented once, with the connection
+they were derived from gone. Nothing here is a bug in `release`; the grant graph
+simply has no edge back to the original consent, so "grants die with the
+connection" bounds each row's lifetime without bounding the capability's reach.
+
+Not changed in this round — narrowing arm 1 is an authorization change with its
+own failure modes (the obvious "only the session's creator may approve" breaks
+the multi-client hand-off BR-6 exists for), and it is recorded as an open
+residual owned by REQ-570 rather than patched under a fix commit. What this round
+does is stop the documentation asserting a property the code does not have, and
+make each mint announce both parties so a propagation chain is at least visible
+as it happens (ADR-A-1).
 
 ### ADR-D: The grant subject is the connection, and scope is graded
 

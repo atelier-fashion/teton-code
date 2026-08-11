@@ -119,9 +119,12 @@ what a residual was believed to be is part of the record:
    `setsid helper` produces exactly that escapee — one token in a tool call.
    **And it composes with residual 2 below**: an escapee is classified
    `NotDescendant`, which makes it eligible for the self-render arm, so it
-   attaches to any unheld session by answering its own prompt. Partially
-   compensated (the `shell` tool now kills its process group on every completion
-   arm, not only on timeout); `setsid` still escapes. See architecture.md ADR-A.
+   attaches to any unheld session by answering its own prompt. **Not
+   compensated**: the verify pass had the `shell` tool kill its process group on
+   every completion arm rather than only on timeout, and the re-verify reverted
+   that (R4) — it destroyed work a command backgrounded on purpose, signalled a
+   pgid whose leader had already been reaped, and still did not reach `setsid`,
+   which leaves the group. See architecture.md ADR-A.
 2. **`monitor`'s consent path was mintable over the socket and has been
    removed.** BR-2/AC-4 recorded `monitor` as reachable through an attached
    client's consent. One actor holding two connections could satisfy that:
@@ -141,7 +144,32 @@ what a residual was believed to be is part of the record:
    whether the grant was self-approved. In-perimeter, unsuppressable by the
    requester, and delivered to every handshaked connection.
 
-Three things this REQ does **not** close, stated here rather than left to be
+### Correction (re-verify pass, 2026-08-11)
+
+The fixes above introduced regressions of their own, closed in the same file
+history; the one finding that is *not* a regression but a pre-existing defect the
+re-verify made visible is recorded as residual 4 below.
+
+4. **`self_approved` was presented as the field that catches self-dealing, and
+   it does not.** It is a fact about connection ids, so it is `false` for the
+   whole of BR-6's arm 1 — including one actor holding two connections and
+   having the first approve the second, which is the exact shape residual 2
+   above gives as the reason the monitor path was unfixable. The announcement
+   now carries the **approver's descriptor** beside the requester's, and the CLI
+   names who approved, so an operator can see the same name asked and answered
+   (R1).
+5. **A granted consent for a session that does not exist no longer leaves a
+   grant behind.** The consent still runs in full for a fabricated id — checking
+   existence first would rebuild the oracle BR-8 denies — but the entry is
+   retracted once the attach reports `UNKNOWN_SESSION`, so a peer self-approving
+   guesses no longer inserts one permanent registry row per guess, keyed by
+   strings it chose (R2).
+6. **The grant announcement is rate-limited per connection.** It is daemon-scoped
+   and attacker-triggerable, so an unbounded stream of them floods every client's
+   screen. At most three per connection per minute; the arrears ride out on the
+   next announcement that gets through (R3).
+
+Four things this REQ does **not** close, stated here rather than left to be
 discovered:
 
 1. **The client surface for BR-6 is outstanding.** The daemon side of the
@@ -164,6 +192,18 @@ discovered:
 3. **Daemon-wide methods (BR-9).** `permission/respond` is gated;
    `model/confirm` and five sibling methods that take no connection at all are
    not. Filed as [[BUG-162]] and deliberately not fixed here.
+4. **A grant's *capability* propagates transitively, even though its registry
+   entry does not (re-verify, R5).** ADR-C said a grant "can never be inherited";
+   that is true of the row and false of the access. BR-6's arm 1 admits any
+   connection attached to the target as an approver, with no relation to who
+   originally held the grant — so an approved connection X can approve its
+   owner's second connection Y, disconnect (dropping X's row), and leave Y as the
+   eligible approver for Z. One user consent, an unbounded chain, and the
+   connection it came from gone. Narrowing arm 1 is an authorization change with
+   its own failure modes — the obvious "only the creator may approve" breaks the
+   multi-client hand-off BR-6 exists for — so it is **owned by REQ-570**, not
+   patched here. This round corrected the false claim in ADR-C and made each mint
+   announce both parties, so a chain is visible as it forms.
 
 ## External Dependencies
 
