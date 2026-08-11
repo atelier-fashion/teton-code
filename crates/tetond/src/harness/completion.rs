@@ -789,7 +789,7 @@ mod tests {
         let provider = TwoToolProvider;
         let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
         let mut source =
-            RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-1");
+            RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-under-test");
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let prompt = flat_prompt("prompt");
@@ -1149,7 +1149,8 @@ mod tests {
         // it.
         let provider = TwoToolProvider;
         let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
-        let source = RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-1");
+        let source =
+            RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-under-test");
         assert_eq!(source.chat_format(), ChatFormat::Flat);
     }
 

@@ -7,6 +7,12 @@
 //! `getpeereid(2)` on macOS/BSD, `getsockopt(SO_PEERCRED)` on Linux) and refuses
 //! any peer whose uid differs from the daemon's own. Error text never carries
 //! paths, content, or credentials (conventions: privacy in error messages).
+//!
+//! REQ-569 ADR-B adds the peer's **pid** alongside the uid, because process
+//! ancestry is what BR-4 keys on ([`crate::peer`]). That addition is strictly
+//! additive: the uid is read by the same call as before, the refusal taxonomy
+//! is unchanged, and a pid that cannot be read is reported absent rather than
+//! turned into a new way to refuse a connection.
 
 use std::io;
 use std::os::fd::AsRawFd;
@@ -30,16 +36,38 @@ pub enum AuthError {
     PeerCred(#[source] io::Error),
 }
 
-/// Reads the effective uid of the process on the other end of `stream`.
+/// The kernel-attested identity of the process on the other end of a socket.
 ///
-/// The kernel-attested peer credential is obtained per platform: `getpeereid(2)`
-/// on macOS/BSD (glibc does **not** provide it), and `getsockopt(SO_PEERCRED)`
-/// on Linux. Both report the peer's uid for an `AF_UNIX` stream socket and are
-/// not TOCTOU-spoofable (the credential is a property of the connected socket).
+/// `uid` is what ADR-002's peer-credential check has always compared. `pid` is
+/// the REQ-569 addition and feeds the ancestry decision in [`crate::peer`],
+/// which TASK-106 made terminal at `session/attach`, the `monitor` declaration
+/// and `attach/consent`.
+///
+/// The pid is an `Option` because it is not universally available: macOS and
+/// Linux both supply it, but the BSD arm's `getpeereid(2)` reports no pid at
+/// all. An absent pid must stay visibly absent — a default of `0` would be a
+/// plausible-looking number that an ancestry walk would happily consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerIdentity {
+    /// Effective uid of the connecting process.
+    pub uid: u32,
+    /// Process id of the connecting process, when the platform reports one.
+    pub pid: Option<i32>,
+}
+
+/// Reads the kernel-attested credentials of the process on the other end of
+/// `stream`.
+///
+/// The credentials are obtained per platform: `getpeereid(2)` on macOS/BSD
+/// (glibc does **not** provide it), and `getsockopt(SO_PEERCRED)` on Linux.
+/// Both report the peer's uid for an `AF_UNIX` stream socket and are not
+/// TOCTOU-spoofable (the credential is a property of the connected socket).
 ///
 /// # Errors
 ///
-/// Returns the underlying OS error if the kernel refuses the query.
+/// Returns the underlying OS error if the kernel refuses the *uid* query. A pid
+/// the platform cannot supply is not an error — it comes back as `None`, so
+/// this call refuses exactly the connections it refused before REQ-569.
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",
@@ -49,7 +77,7 @@ pub enum AuthError {
     target_os = "netbsd",
     target_os = "dragonfly"
 ))]
-pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub fn peer_identity(stream: &UnixStream) -> io::Result<PeerIdentity> {
     let fd = stream.as_raw_fd();
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
@@ -57,17 +85,69 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     // duration of the call, and both out-pointers reference live stack storage.
     let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
     if rc == 0 {
-        Ok(uid)
+        Ok(PeerIdentity {
+            uid,
+            pid: peer_pid(fd),
+        })
     } else {
         Err(io::Error::last_os_error())
     }
 }
 
+/// macOS/iOS: the peer's pid via `getsockopt(SOL_LOCAL, LOCAL_PEERPID)`.
+///
+/// `getpeereid(2)` — the call that supplies the uid on this arm — carries no
+/// pid, so this is a second, independent query against the same connected
+/// socket. Both constants are in `libc` for Apple targets (`SOL_LOCAL`,
+/// `LOCAL_PEERPID`, from `<sys/un.h>`); nothing needs declaring locally here.
+#[cfg(target_vendor = "apple")]
+fn peer_pid(fd: std::os::fd::RawFd) -> Option<i32> {
+    let mut pid: libc::pid_t = 0;
+    let wanted = std::mem::size_of::<libc::pid_t>();
+    let mut len = wanted as libc::socklen_t;
+    // SAFETY: `fd` is a valid, open socket descriptor owned by the caller's
+    // `stream`; `pid` and `len` reference live stack storage sized exactly for
+    // a `pid_t`, and both borrows end when the call returns.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            std::ptr::addr_of_mut!(pid).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc == 0 && len as usize == wanted && pid > 0 {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+/// FreeBSD/OpenBSD/NetBSD/DragonFly: no peer-pid option this arm can rely on,
+/// so the pid stays absent. REQ-569 ships to macOS and Linux, both of which
+/// report one; anywhere else the ancestry decision is simply
+/// [`crate::peer::Ancestry::Indeterminate`] and the caller must say what that
+/// costs rather than silently getting a "not a descendant".
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn peer_pid(_fd: std::os::fd::RawFd) -> Option<i32> {
+    None
+}
+
 /// Linux variant: peer credentials via `getsockopt(SOL_SOCKET, SO_PEERCRED)`,
 /// which fills a `ucred { pid, uid, gid }` with the connecting process's
 /// credentials as recorded by the kernel at `connect(2)` time.
+///
+/// The pid was already in that struct and was simply discarded before REQ-569;
+/// this arm needs no second syscall. A kernel that cannot attribute the peer to
+/// a process in our pid namespace reports `0`, which is reported as absent.
 #[cfg(target_os = "linux")]
-pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub fn peer_identity(stream: &UnixStream) -> io::Result<PeerIdentity> {
     let fd = stream.as_raw_fd();
     let mut cred = libc::ucred {
         pid: 0,
@@ -87,7 +167,10 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
         )
     };
     if rc == 0 {
-        Ok(cred.uid)
+        Ok(PeerIdentity {
+            uid: cred.uid,
+            pid: (cred.pid > 0).then_some(cred.pid),
+        })
     } else {
         Err(io::Error::last_os_error())
     }
@@ -115,13 +198,18 @@ pub fn authorize_uid(peer: u32, expected: u32) -> Result<(), AuthError> {
 
 /// Reads and authorizes the peer credentials of a freshly accepted connection.
 ///
+/// Returns the whole [`PeerIdentity`] rather than a bare `u32` so a caller
+/// cannot pass a uid where a pid belongs, or the reverse — the two are both
+/// small integers describing the same process, which is precisely when a
+/// distinct type earns its keep.
+///
 /// # Errors
 ///
 /// Returns [`AuthError::PeerCred`] if the credentials cannot be read, or
 /// [`AuthError::Unauthorized`] if the peer is a different user.
-pub fn check_peer(stream: &UnixStream) -> Result<u32, AuthError> {
-    let peer = peer_uid(stream).map_err(AuthError::PeerCred)?;
-    authorize_uid(peer, current_uid())?;
+pub fn check_peer(stream: &UnixStream) -> Result<PeerIdentity, AuthError> {
+    let peer = peer_identity(stream).map_err(AuthError::PeerCred)?;
+    authorize_uid(peer.uid, current_uid())?;
     Ok(peer)
 }
 
@@ -173,6 +261,24 @@ pub fn secure_socket_dir(dir: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// A temp path no other test in this process can collide with.
+    ///
+    /// **The counter, not the timestamp, is what guarantees uniqueness** —
+    /// `SystemTime::now()` can return the same value for two calls inside one
+    /// clock tick, and a suite run with `--test-threads` will make exactly that
+    /// call twice. The standard idiom across this repo's test helpers
+    /// (commit `ece1d0c`); these two helpers were the last holdouts building a
+    /// path from pid and nanos alone.
+    fn temp_path(tag: &str, suffix: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "teton-{tag}-{}-{}{suffix}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
     #[test]
     fn same_uid_is_authorized() {
         assert!(authorize_uid(501, 501).is_ok());
@@ -198,14 +304,7 @@ mod tests {
         // REQ-544 L-1: the socket's parent dir is created 0700 so the socket is
         // never briefly group/other-connectable.
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "teton-sockdir-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = temp_path("sockdir", "");
         let _ = std::fs::remove_dir_all(&dir);
         secure_socket_dir(&dir).expect("create secure dir");
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
@@ -220,15 +319,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_uid_of_a_local_socket_is_the_current_uid() {
-        let path = std::env::temp_dir().join(format!(
-            "teton-auth-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    async fn a_local_socket_peer_is_the_current_uid_and_is_authorized() {
+        let path = temp_path("auth", ".sock");
         let _ = std::fs::remove_file(&path);
 
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -236,9 +328,37 @@ mod tests {
         let _client = UnixStream::connect(&path).await.unwrap();
         let server_side = accept.await.unwrap();
 
-        assert_eq!(peer_uid(&server_side).unwrap(), current_uid());
+        assert_eq!(peer_identity(&server_side).unwrap().uid, current_uid());
         // A same-user peer therefore passes the full check.
         assert!(check_peer(&server_side).is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn peer_identity_reports_the_connecting_process() {
+        // The real-syscall check for the REQ-569 addition, on whichever arm the
+        // runner compiles: the client side of this socket is *this* process, so
+        // the kernel-attested peer pid must be our own. LESSON-433 — macOS goes
+        // through `getsockopt(LOCAL_PEERPID)` and Linux through the `pid` field
+        // of `SO_PEERCRED`, and CI runs both.
+        let path = temp_path("auth-pid", ".sock");
+        let _ = std::fs::remove_file(&path);
+
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let _client = UnixStream::connect(&path).await.unwrap();
+        let server_side = accept.await.unwrap();
+
+        let peer = check_peer(&server_side).expect("a same-user peer is authorized");
+        assert_eq!(peer.uid, current_uid());
+
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        assert_eq!(
+            peer.pid,
+            Some(i32::try_from(std::process::id()).expect("a pid fits in i32")),
+            "the peer of this socket is this very process"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

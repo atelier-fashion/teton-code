@@ -1988,15 +1988,15 @@ mod tests {
 
         fn tainted() -> Self {
             Self {
-                tainted: HashSet::from([SessionId::from("sess-1")]),
+                tainted: HashSet::from([SessionId::from("sess-under-test")]),
                 overridden: HashSet::new(),
             }
         }
 
         fn tainted_and_overridden() -> Self {
             Self {
-                tainted: HashSet::from([SessionId::from("sess-1")]),
-                overridden: HashSet::from([SessionId::from("sess-1")]),
+                tainted: HashSet::from([SessionId::from("sess-under-test")]),
+                overridden: HashSet::from([SessionId::from("sess-under-test")]),
             }
         }
     }
@@ -2150,7 +2150,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "<html/>");
         let egress = egress_over(inner.clone());
         let flags = Flags::tainted();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -2180,7 +2180,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "<html/>");
         let egress = egress_over(inner.clone());
         let flags = Flags::tainted();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let refused = egress
             .lookup(
@@ -2205,7 +2205,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "ok");
         let egress = egress_over(inner.clone());
         let flags = Flags::tainted_and_overridden();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -2222,7 +2222,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "ok");
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -2242,7 +2242,7 @@ mod tests {
         let gate = CountingGate::new(RedactionVerdict::clean());
         let egress = egress_over(inner.clone()).with_search_redaction_gate(gate.clone());
         let flags = Flags::tainted();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         let outcome = egress
@@ -2283,7 +2283,7 @@ mod tests {
         let egress =
             egress_over(redact_off.clone()).with_search_redaction_gate(search_gate.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         egress
@@ -2354,7 +2354,7 @@ mod tests {
             let gate = CountingGate::new(a_high_finding());
             let egress = egress_over(inner.clone()).with_fetch_redaction_gate(gate.clone());
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+            let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
             let outcome = egress
                 .lookup(
@@ -2389,7 +2389,7 @@ mod tests {
         let egress = egress_over(inner.clone())
             .with_fetch_redaction_gate(CountingGate::new(RedactionVerdict::unavailable()));
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -2418,7 +2418,7 @@ mod tests {
         let fetch_gate = CountingGate::new(RedactionVerdict::clean());
         let egress = egress_over(inner.clone()).with_fetch_redaction_gate(fetch_gate.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         let outcome = egress
@@ -2449,7 +2449,7 @@ mod tests {
         )
         .with_fetch_redaction_gate(Arc::new(OrderingGate { log: log.clone() }));
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         egress
             .lookup(
@@ -2470,7 +2470,7 @@ mod tests {
         let gate = CountingGate::new(RedactionVerdict::clean());
         let egress = egress_over(inner.clone()).with_fetch_redaction_gate(gate.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         for url in [
@@ -2492,7 +2492,7 @@ mod tests {
         let gate = CountingGate::new(a_high_finding());
         let egress = egress_over(inner.clone()).with_search_redaction_gate(gate.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         let outcome = egress
@@ -2522,7 +2522,7 @@ mod tests {
         let gate = CountingGate::new(RedactionVerdict::unavailable());
         let egress = egress_over(inner.clone()).with_search_redaction_gate(gate);
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         let outcome = egress
@@ -2550,7 +2550,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "{}");
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         let outcome = egress
@@ -2584,7 +2584,7 @@ mod tests {
         )
         .with_search_redaction_gate(Arc::new(OrderingGate { log: log.clone() }));
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         egress
@@ -2603,7 +2603,7 @@ mod tests {
         let gate = CountingGate::new(RedactionVerdict::clean());
         let egress = egress_over(inner.clone()).with_search_redaction_gate(gate.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(&LookupRequest::search("rust", Authorship::UserPasted), &ctx)
@@ -2620,7 +2620,7 @@ mod tests {
         let gate = CountingGate::new(RedactionVerdict::clean());
         let egress = egress_over(inner.clone()).with_search_redaction_gate(gate);
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api?count=5");
 
         egress
@@ -2654,7 +2654,7 @@ mod tests {
         ]);
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -2684,7 +2684,7 @@ mod tests {
         ))]);
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &deny_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &deny_any_host);
 
         let outcome = egress
             .lookup(
@@ -2710,7 +2710,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "ok");
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &deny_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &deny_any_host);
 
         let outcome = egress
             .lookup(
@@ -2731,7 +2731,7 @@ mod tests {
         ]);
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         egress
             .lookup(
@@ -2754,7 +2754,7 @@ mod tests {
         ]);
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -2777,7 +2777,7 @@ mod tests {
         let inner = CaptureTransport::new(vec![Ok((302, None, Vec::new()))]);
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -2815,7 +2815,7 @@ mod tests {
             ]);
             let egress = egress_over(inner.clone());
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+            let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
             let outcome = egress
                 .lookup(
@@ -2843,7 +2843,7 @@ mod tests {
         ]);
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
         let outcome = egress
             .lookup(
                 &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
@@ -2895,7 +2895,7 @@ mod tests {
             let inner = CaptureTransport::answering(200, "secrets");
             let egress = egress_over(inner.clone());
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+            let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
             let outcome = egress
                 .lookup(&LookupRequest::fetch(*url, Authorship::ModelComposed), &ctx)
@@ -2930,7 +2930,7 @@ mod tests {
             let inner = CaptureTransport::answering(200, "my dev server");
             let egress = egress_over(inner.clone());
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+            let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
             let outcome = egress
                 .lookup(&LookupRequest::fetch(url, Authorship::UserPasted), &ctx)
@@ -2970,7 +2970,7 @@ mod tests {
             let inner = CaptureTransport::answering(200, "iam credentials");
             let egress = egress_over(inner.clone());
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+            let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
             let outcome = egress
                 .lookup(&LookupRequest::fetch(url, Authorship::UserPasted), &ctx)
@@ -3007,7 +3007,7 @@ mod tests {
                 ]);
                 let egress = egress_over(inner.clone());
                 let flags = Flags::clean();
-                let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+                let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
                 let outcome = egress
                     .lookup(&LookupRequest::fetch("https://docs.rs/x", authorship), &ctx)
@@ -3043,7 +3043,7 @@ mod tests {
         ]);
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -3404,7 +3404,7 @@ mod tests {
                 let inner = CaptureTransport::answering(200, "{}");
                 let egress = egress_over(inner.clone());
                 let flags = Flags::clean();
-                let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+                let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
                     .with_search_endpoint("https://search.example/api");
 
                 let outcome = egress
@@ -3438,7 +3438,7 @@ mod tests {
             let inner = CaptureTransport::answering(200, "docs");
             let egress = egress_over(inner.clone());
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+            let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
                 .with_search_endpoint("https://search.example/api");
 
             let outcome = egress
@@ -3464,7 +3464,7 @@ mod tests {
         ]);
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         let outcome = egress
@@ -3483,7 +3483,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "docs");
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -3519,7 +3519,7 @@ mod tests {
             let closure = check.as_check();
             let egress = egress_over(inner.clone());
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &closure);
+            let ctx = LookupContext::new("sess-under-test", &flags, &closure);
 
             let outcome = egress
                 .lookup(&LookupRequest::fetch(from, Authorship::UserPasted), &ctx)
@@ -3557,7 +3557,7 @@ mod tests {
             let closure = check.as_check();
             let egress = egress_over(inner.clone());
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &closure);
+            let ctx = LookupContext::new("sess-under-test", &flags, &closure);
 
             let outcome = egress
                 .lookup(
@@ -3593,7 +3593,7 @@ mod tests {
         let closure = check.as_check();
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &closure);
+        let ctx = LookupContext::new("sess-under-test", &flags, &closure);
 
         let outcome = egress
             .lookup(
@@ -3670,7 +3670,7 @@ mod tests {
         )
         .with_lookup_recorder(recorder.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let started = tokio::time::Instant::now();
         let outcome = egress
@@ -3713,7 +3713,7 @@ mod tests {
         // never reached, so only a clock ends it.
         let egress = Egress::new(StallingBodyTransport, boundaries(), Arc::new(NoopSink));
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -3765,7 +3765,7 @@ mod tests {
             Arc::new(NoopSink),
         );
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let started = tokio::time::Instant::now();
         let outcome = egress
@@ -3800,7 +3800,7 @@ mod tests {
             Arc::new(NoopSink),
         );
         let flags = Flags::tainted();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let started = tokio::time::Instant::now();
         let outcome = egress
@@ -3835,7 +3835,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "<p>hi</p>");
         let egress = egress_over(inner.clone()).with_fetch_redaction_gate(Arc::new(HangingGate));
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let started = tokio::time::Instant::now();
         let outcome = egress
@@ -3869,7 +3869,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "{}");
         let egress = egress_over(inner.clone()).with_search_redaction_gate(Arc::new(HangingGate));
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         let outcome = egress
@@ -3915,7 +3915,7 @@ mod tests {
         )
         .with_fetch_redaction_gate(gate.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -3951,7 +3951,7 @@ mod tests {
         )
         .with_search_redaction_gate(gate.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         let outcome = egress
@@ -3977,7 +3977,7 @@ mod tests {
             let inner = CaptureTransport::new(vec![Err(error)]);
             let egress = egress_over(inner.clone());
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+            let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
             let outcome = egress
                 .lookup(
@@ -3999,7 +3999,7 @@ mod tests {
         let inner = CaptureTransport::new(vec![Ok((404, None, b"nope".to_vec()))]);
         let egress = egress_over(inner.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -4145,7 +4145,7 @@ mod tests {
                 &flags_clean
             };
             let check: &(dyn Fn(&str) -> bool + Send + Sync) = &case.host_check;
-            let mut ctx = LookupContext::new("sess-1", flags, check);
+            let mut ctx = LookupContext::new("sess-under-test", flags, check);
             if let Some(endpoint) = case.endpoint {
                 ctx = ctx.with_search_endpoint(endpoint);
             }
@@ -4206,7 +4206,7 @@ mod tests {
             .with_search_redaction_gate(CountingGate::new(a_high_finding()))
             .with_lookup_recorder(recorder.clone());
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api");
 
         let outcome = egress
@@ -4232,7 +4232,7 @@ mod tests {
         let inner = CaptureTransport::answering(200, "ok");
         let egress = egress_over(inner);
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
         let outcome = egress
             .lookup(
                 &LookupRequest::fetch("https://docs.rs/x", Authorship::UserPasted),
@@ -4250,7 +4250,7 @@ mod tests {
         let inner = CaptureTransport::new(vec![Ok((200, None, oversize))]);
         let egress = egress_over(inner);
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
         let outcome = egress
             .lookup(
@@ -4277,7 +4277,7 @@ mod tests {
             let inner = CaptureTransport::new(vec![Ok((200, None, vec![b'x'; len]))]);
             let egress = egress_over(inner);
             let flags = Flags::clean();
-            let ctx = LookupContext::new("sess-1", &flags, &allow_any_host);
+            let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host);
 
             let outcome = egress
                 .lookup(
@@ -4310,7 +4310,7 @@ mod tests {
         let egress = egress_over(inner.clone())
             .with_search_redaction_gate(CountingGate::new(RedactionVerdict::clean()));
         let flags = Flags::clean();
-        let ctx = LookupContext::new("sess-1", &flags, &allow_any_host)
+        let ctx = LookupContext::new("sess-under-test", &flags, &allow_any_host)
             .with_search_endpoint("https://search.example/api?q=preset&count=5");
 
         egress

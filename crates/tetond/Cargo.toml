@@ -69,6 +69,14 @@ anyhow = "1"
 thiserror = "2"
 # Peer-credential (`getpeereid`) and single-instance (`flock`) syscalls.
 libc = "0.2"
+# Session ids are minted from the OS entropy source (REQ-569 BR-8, ADR-H).
+# `getrandom` and nothing larger: it is a thin `getentropy(2)`/`getrandom(2)`
+# wrapper with no generator state to seed, reseed, or fork-safely inherit, and
+# version 0.2 is ALREADY compiled into this binary via ring -> rustls ->
+# reqwest, so making it direct adds zero crates to the build (ADR-001, lean
+# binary). A `rand`-family dependency would add a userspace CSPRNG stack for a
+# call site that mints 16 bytes per session.
+getrandom = "0.2"
 # The single egress choke point (architecture D-2): `reqwest` is the ONE real
 # HTTP client in the whole workspace — a CI deny-check (egress::deny_http_client)
 # fails the build if any other crate grows a client. `rustls-tls` keeps the

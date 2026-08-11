@@ -2923,7 +2923,7 @@ mod tests {
         render_turn_failure(
             &RpcError::new(
                 error_code::SESSION_BUSY,
-                "session sess-0 is already running turn turn-3; one session runs one \
+                "session sess-under-test is already running turn turn-3; one session runs one \
                  turn at a time — retry when it finishes",
             ),
             &mut surface,

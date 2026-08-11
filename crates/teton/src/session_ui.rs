@@ -26,12 +26,13 @@
 use std::collections::{HashMap, HashSet};
 
 use teton_protocol::events::{
-    BlockCause, DaemonClientAttach, DaemonLifetimeStage, Event, EventEnvelope, EvictionReason,
-    FailureClass, ModelLifecycle, ModelSelectionProposed, PermissionOption, PermissionOptionKind,
-    PermissionRequest, PhaseTransition, PrefixCache, PrefixCacheMiss, PrefixCacheOutcome,
-    PrivacyAction, PrivacyBlock, ProviderDegraded, RouteDecided, SessionUpdatePayload,
-    ToolCallStatus, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome,
-    WebTier, OPTION_ID_ENABLE_PERMANENT,
+    AttachConsentRequested, BlockCause, ConsentScope, DaemonClientAttach, DaemonLifetimeStage,
+    Event, EventEnvelope, EvictionReason, FailureClass, ModelLifecycle, ModelSelectionProposed,
+    PermissionOption, PermissionOptionKind, PermissionRequest, PhaseTransition, PrefixCache,
+    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProviderDegraded,
+    RouteDecided, SessionGrantMinted, SessionUpdatePayload, ToolCallStatus, WebConsentDecided,
+    WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome, WebTier,
+    OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
 use teton_protocol::{Phase, RequestId, SessionId};
@@ -425,6 +426,120 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+        Event::AttachConsentRequested(request) => {
+            // REQ-569 BR-6. This client can *see* the question and cannot yet
+            // answer it — `attach/consent` has no CLI surface on this branch.
+            //
+            // Rendered as a notice rather than swallowed, and that is the whole
+            // decision here: a silent security prompt is worse than an
+            // unanswerable one. The user would otherwise learn nothing about a
+            // peer asking for their session, and would see only that peer
+            // quietly fail. Never verbose-gated, for `context_cleared`'s
+            // reason — this is news, not chrome.
+            surface.line(LineKind::Notice, &format_attach_consent(request));
+            EventOutcome::Rendered
+        }
+        Event::AttachRefused(_) => {
+            // Nothing to draw. The connection that was refused is told by its
+            // own RPC error, and this client rendered a notice rather than a
+            // modal, so there is no prompt on screen to retire.
+            EventOutcome::Rendered
+        }
+        Event::SessionGrantMinted(minted) => {
+            // REQ-569 verify (F6). Daemon-scoped, so every connected client
+            // gets it — which is the point: the user whose session was just
+            // opened up to somebody else is told by a surface the requester
+            // cannot suppress. Never verbose-gated, for
+            // `attach_consent_requested`'s reason: a widened permission is
+            // news, not chrome.
+            surface.line(LineKind::Notice, &format_grant_minted(minted));
+            EventOutcome::Rendered
+        }
+    }
+}
+
+/// The one-line notice an `attach_consent_requested` event draws (REQ-569 BR-6).
+///
+/// It says what would be granted rather than repeating the wire scope name,
+/// because the two scopes are wildly different asks and a user deciding between
+/// them needs the difference in the sentence.
+///
+/// `requester` is a peer-chosen string. The daemon already bounds it and strips
+/// its control characters before publishing, which is where that has to happen —
+/// this is one renderer of several, and a guard that lived here would protect
+/// only this one.
+fn format_attach_consent(request: &AttachConsentRequested) -> String {
+    let what = match request.scope {
+        ConsentScope::Attach => "attach to this session",
+        ConsentScope::Monitor => "watch every session on this daemon",
+    };
+    format!(
+        "{} asked to {what}. This client cannot answer it; another attached \
+         client may.",
+        request.requester
+    )
+}
+
+/// The one-line notice a `session_grant_minted` event draws (REQ-569 verify,
+/// F6).
+///
+/// **Every grant names who approved it** (REQ-569 re-verify, R1). The first cut
+/// branched on `self_approved` alone and rendered everything else as a bare "the
+/// daemon granted … permission to attach" — which is precisely the benign
+/// reading an attacker holding two connections earns for free, since having its
+/// first connection approve its second sets `self_approved: false`. A reader
+/// cannot act on a flag that is false in both the good case and the bad one, so
+/// the notice states the relation instead: who asked, and who answered.
+///
+/// Three shapes, and the middle one is why this exists:
+///
+/// - self-approved — nobody was attached, so the requester answered its own
+///   prompt. The accepted ADR-A residual, named as what happened.
+/// - approved by a connection giving the **same name** as the requester. Said
+///   plainly and without a verdict: two honest clients may well spell themselves
+///   identically, and the daemon cannot tell that from one actor working both
+///   ends. The reader is handed the coincidence, not a conclusion.
+/// - approved by a differently-named connection — the ordinary case, which still
+///   names the approver rather than leaving "somebody" implied.
+///
+/// Both descriptors are peer-chosen text the daemon already bounded and
+/// stripped; [`format_attach_consent`]'s note applies to each unchanged. A
+/// trailing clause reports announcements the daemon's own rate limit dropped
+/// (R3), so a quieted burst is still legible as a burst.
+fn format_grant_minted(minted: &SessionGrantMinted) -> String {
+    let what = match minted.scope {
+        ConsentScope::Attach => "attach to a session",
+        ConsentScope::Monitor => "watch every session on this daemon",
+    };
+    let line = if minted.self_approved {
+        format!(
+            "the daemon granted {} permission to {what} — approved by the \
+             connection that asked, because nothing was attached to that \
+             session.",
+            minted.requester
+        )
+    } else if minted.approver == minted.requester {
+        format!(
+            "the daemon granted {} permission to {what} — approved by a second \
+             connection giving that same name. Both sides of this decision call \
+             themselves {}.",
+            minted.requester, minted.approver
+        )
+    } else {
+        format!(
+            "the daemon granted {} permission to {what} — approved by {}.",
+            minted.requester, minted.approver
+        )
+    };
+    match minted.suppressed {
+        0 => line,
+        1 => format!(
+            "{line} (1 further grant announcement was held back by the daemon's rate limit.)"
+        ),
+        n => format!(
+            "{line} ({n} further grant announcements were held back by the \
+             daemon's rate limit.)"
+        ),
     }
 }
 
@@ -2039,6 +2154,110 @@ mod tests {
                     !surface.any_line_contains(LineKind::Notice, "tier ="),
                     "the notice points at a key this answer does not change: {:?}",
                     surface.calls
+                );
+            }
+        }
+    }
+
+    /// **REQ-569 re-verify, R1.** A grant notice names who approved it, and a
+    /// peer approval never renders as the bare, benign sentence.
+    ///
+    /// The middle case is the one this exists for. One actor holding two
+    /// connections has the first approve the second, which sets
+    /// `self_approved: false` — indistinguishable, on that flag, from a real
+    /// second user's decision. Rendered off the flag alone it read "the daemon
+    /// granted X permission to attach to a session." and stopped, which is the
+    /// benign sentence. Both descriptors are on the line now, so the coincidence
+    /// is visible to whoever is looking at the screen.
+    ///
+    /// Not verbose-gated, on purpose and asserted: a widened permission is news.
+    #[test]
+    fn a_grant_notice_names_both_parties_and_never_hides_a_peer_approval() {
+        /// One announcement shape and the phrases its notice must carry.
+        struct Case {
+            what: &'static str,
+            requester: &'static str,
+            approver: &'static str,
+            self_approved: bool,
+            suppressed: u32,
+            expected: &'static [&'static str],
+        }
+        let cases = [
+            Case {
+                what: "the resume flow: one connection, both roles",
+                requester: "cli \"resume\"",
+                approver: "cli \"resume\"",
+                self_approved: true,
+                suppressed: 0,
+                expected: &["cli \"resume\"", "the connection that asked"],
+            },
+            Case {
+                what: "one actor, two connections, one name",
+                requester: "cli \"attacker\"",
+                approver: "cli \"attacker\"",
+                self_approved: false,
+                suppressed: 0,
+                expected: &[
+                    "cli \"attacker\"",
+                    "a second connection giving that same name",
+                ],
+            },
+            Case {
+                what: "a real second party",
+                requester: "cli \"newcomer\"",
+                approver: "cli \"holder\"",
+                self_approved: false,
+                suppressed: 0,
+                expected: &["cli \"newcomer\"", "approved by cli \"holder\""],
+            },
+            Case {
+                what: "a burst the daemon quieted still says how much it stands for",
+                requester: "cli \"flooder\"",
+                approver: "cli \"flooder\"",
+                self_approved: false,
+                suppressed: 9,
+                expected: &["9 further grant announcements were held back"],
+            },
+        ];
+
+        for Case {
+            what: case,
+            requester,
+            approver,
+            self_approved,
+            suppressed,
+            expected,
+        } in cases
+        {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.verbose = false;
+
+            render_event(
+                &envelope(Event::SessionGrantMinted(SessionGrantMinted {
+                    scope: ConsentScope::Attach,
+                    requester: requester.to_owned(),
+                    approver: approver.to_owned(),
+                    self_approved,
+                    suppressed,
+                })),
+                &mut surface,
+                &mut state,
+            );
+
+            let notices = surface.lines_of(LineKind::Notice);
+            assert_eq!(
+                notices.len(),
+                1,
+                "{case}: a widened permission is news, not chrome — it renders \
+                 without `verbose`: {:?}",
+                surface.calls
+            );
+            for needle in expected {
+                assert!(
+                    notices[0].contains(needle),
+                    "{case}: notice must contain {needle:?}: {}",
+                    notices[0]
                 );
             }
         }

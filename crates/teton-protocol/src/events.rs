@@ -126,6 +126,14 @@ pub enum Event {
     PrefixCache(PrefixCache),
     /// The user cleared a session's retained conversation (REQ-567 BR-8).
     ContextCleared(ContextCleared),
+    /// The daemon is asking whether to let an ungranted connection attach, or
+    /// monitor (REQ-569 BR-6). Answered by `attach/consent`.
+    AttachConsentRequested(AttachConsentRequested),
+    /// An attach or monitor request was refused (REQ-569 BR-5).
+    AttachRefused(AttachRefused),
+    /// The daemon minted a session grant (REQ-569 verify, F6). Daemon-scoped —
+    /// it names no session — so every handshaked connection is told.
+    SessionGrantMinted(SessionGrantMinted),
 }
 
 impl Event {
@@ -151,6 +159,9 @@ impl Event {
             Event::WebTaintOverridden(_) => "web_taint_overridden",
             Event::PrefixCache(_) => "prefix_cache",
             Event::ContextCleared(_) => "context_cleared",
+            Event::AttachConsentRequested(_) => "attach_consent_requested",
+            Event::AttachRefused(_) => "attach_refused",
+            Event::SessionGrantMinted(_) => "session_grant_minted",
         }
     }
 }
@@ -1482,6 +1493,204 @@ pub struct ContextCleared {
     /// Blocks rather than tokens: the conversation is stored as blocks, so this
     /// is the one count the daemon can state exactly rather than estimate.
     pub blocks_dropped: u64,
+}
+
+// ---------------------------------------------------------------------------
+// attach_consent_requested / attach_refused (REQ-569)
+// ---------------------------------------------------------------------------
+
+/// What a consent request — and the grant it may mint — is *for* (REQ-569
+/// BR-2, ADR-D).
+///
+/// The wire half of the daemon's grant scope. Kept as its own enum rather than
+/// a boolean because the two are never interchangeable: an attach grant opens
+/// one named session, a monitor grant is sight of every session there is and
+/// every session there will be. A client that rendered both prompts with one
+/// sentence would be asking the user to approve the wrong thing half the time
+/// (LESSON-495 — the key encodes the whole question, and so must the prompt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentScope {
+    /// `session/attach` against the session named by
+    /// [`EventEnvelope::session_id`].
+    Attach,
+    /// The `monitor` declaration — every session's events, present and future.
+    Monitor,
+}
+
+/// The daemon is asking a user whether to let a connection in (REQ-569 BR-6,
+/// ADR-E).
+///
+/// Raised when a connection that neither created the session nor holds a grant
+/// asks to attach, and when a connection asks to `monitor` without a
+/// monitor-scope grant. Answered with `attach/consent` by `request_id`, exactly
+/// as a `permission_request` is answered by `permission/respond`. An unanswered
+/// request defaults **closed** after the daemon's bounded window (BR-7), so a
+/// client that renders this and never replies costs the requester a refusal,
+/// never a grant.
+///
+/// The session is named by [`EventEnvelope::session_id`] rather than by a field
+/// here — the flatten rule [`ContextCleared`] documents — and is absent
+/// entirely for [`ConsentScope::Monitor`], which names no single session
+/// because it asks for all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachConsentRequested {
+    /// Correlates this prompt with the `attach/consent` that answers it.
+    pub request_id: RequestId,
+    /// What is being asked for.
+    pub scope: ConsentScope,
+    /// A short, non-sensitive description of who is asking — the client kind
+    /// and the name it gave at the handshake.
+    ///
+    /// **Deliberately not identity and deliberately not a path.** It carries no
+    /// pid, no executable path, no environment and no command line: a consent
+    /// prompt is rendered to a user, and everything in it is a string an
+    /// unprivileged same-UID peer chose. The daemon bounds its length and strips
+    /// control characters before it is published (REQ-568's monitor-log
+    /// precedent), so a requester cannot forge extra lines in whatever surface
+    /// renders it — but a client must still treat it as untrusted text and never
+    /// as an authorization fact. The authorization fact is the ancestry gate the
+    /// daemon already applied.
+    pub requester: String,
+}
+
+/// Why an attach or monitor request was refused (REQ-569 BR-5).
+///
+/// Stable wire names so a client renders from the code rather than from prose
+/// (BUG-152). Deliberately three, not one: they have three different remedies —
+/// ask a user who is looking at another client, ask again because the user said
+/// no, or ask again because nobody answered in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachRefusedReason {
+    /// No grant, and no consent could be raised — for `monitor`, that means no
+    /// connection was attached anywhere to ask (the daemon never approves a
+    /// monitor to the requester's own face).
+    NoGrant,
+    /// A user was asked and said no.
+    ConsentDenied,
+    /// A user was asked and the bounded window elapsed unanswered. Resolves to
+    /// denied, and mints nothing (BR-7).
+    ConsentTimeout,
+    /// The connection that asked went away before anyone answered (REQ-569
+    /// verify, F3).
+    ///
+    /// Its own error response reaches nobody — there is no longer a socket to
+    /// write it to — so this exists entirely for the *other* end: the surface
+    /// that rendered the prompt has a security dialog on screen asking about a
+    /// connection that no longer exists, and without this it stays there until a
+    /// user answers a question about nobody.
+    ///
+    /// Deliberately not folded into [`Self::ConsentTimeout`]. A timeout says a
+    /// user was asked and did not answer in time, which is a fact about the
+    /// user; this says the asker left, which is a fact about the peer — and a
+    /// client that reported "you were too slow" for a request nobody was still
+    /// waiting on would be telling the user something false about their own
+    /// behaviour.
+    RequesterGone,
+}
+
+/// An attach or monitor request ended in a refusal (REQ-569 BR-5).
+///
+/// The *observability* half of the refusal: the requester learns the outcome
+/// from its own error response, and this is what tells the surface that
+/// rendered the prompt how it ended, so a consent prompt does not sit on a
+/// user's screen after the window closed.
+///
+/// Not published for an ancestry refusal ([`crate::jsonrpc::error_code::ATTACH_FORBIDDEN`]).
+/// That one is terminal and raises no prompt, so there is no prompt to retire —
+/// and announcing it would let a daemon-spawned child make itself heard on
+/// every attached client's stream by probing.
+///
+/// The session, when there is one, is named by [`EventEnvelope::session_id`]
+/// (the flatten rule again).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachRefused {
+    /// The request this ends, when a request was raised at all.
+    ///
+    /// The correlation key, and the reason this field exists rather than the
+    /// session alone: two connections can have a prompt outstanding for the
+    /// same session at once, and a surface rendering both has to know *which*
+    /// one to retire. `None` for [`AttachRefusedReason::NoGrant`], where the
+    /// daemon refused without ever raising one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub request_id: Option<RequestId>,
+    /// What was being asked for.
+    pub scope: ConsentScope,
+    /// Which refusal this is.
+    pub reason: AttachRefusedReason,
+}
+
+/// The daemon minted a session grant (REQ-569 verify, F6).
+///
+/// # Why this is on the wire and not only in the log
+///
+/// Minting a grant is the one act on this seam that widens who can see and
+/// drive a session, and until now the only record of the riskiest way it
+/// happens — a connection approving its own request, because nobody was
+/// attached to ask — was a sentence on the daemon's stderr. That stream is read
+/// on startup failure and almost never otherwise, is truncated by the CLI's
+/// spawn path, and is same-uid writable, so the process that self-approved can
+/// erase the evidence. This event is in-perimeter, unsuppressable by the
+/// requester, and delivered to a human who is looking at a screen now.
+///
+/// **Daemon-scoped**: [`EventEnvelope::session_id`] is `None`, so REQ-568's
+/// delivery rule broadcasts it to every handshaked connection rather than to
+/// the session's attachees. That is deliberate — the point is that somebody
+/// *else* sees it — and it is also why no session id appears anywhere in the
+/// payload: an announcement that reaches every connection must not carry an id
+/// BR-10 keeps from most of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGrantMinted {
+    /// What the grant opens.
+    pub scope: ConsentScope,
+    /// Who it was minted for — the same untrusted, daemon-bounded descriptor
+    /// [`AttachConsentRequested::requester`] carries, and to be treated the same
+    /// way: a hint, never an identity.
+    pub requester: String,
+    /// Who approved it — the answering connection's descriptor, bounded and
+    /// stripped exactly like [`Self::requester`], and exactly as untrusted
+    /// (REQ-569 re-verify, R1).
+    ///
+    /// **This is the field that shows self-dealing**, and it exists because
+    /// [`Self::self_approved`] does not. One actor holding two connections has
+    /// X approve Y's attach: two different connection ids, so the flag is
+    /// `false` and the announcement reads as an ordinary peer approval. What
+    /// gives that away is the *relation* between the two parties, so the
+    /// announcement carries both parties rather than a verdict about them — a
+    /// reader who sees the same name asked and answered has something to act on.
+    ///
+    /// Matching descriptors are evidence, never proof: the string is peer-chosen
+    /// and two honest clients may well spell themselves the same way. A reader
+    /// is being handed the relation, not a decision.
+    pub approver: String,
+    /// Whether the connection that asked is the *same connection* that approved
+    /// (REQ-569 BR-6's second arm).
+    ///
+    /// `true` is one accepted residual made visible: nobody was attached to the
+    /// target session, so the prompt was rendered at the requester and the
+    /// requester answered it. For a person resuming their own session that is
+    /// the intended flow; for a headless same-UID process it means no human was
+    /// involved at all, and the daemon cannot tell the two apart.
+    ///
+    /// **`false` is not a clean bill of health**, and reading it as one is the
+    /// blindness R1 records: it is a fact about connection ids, so an attacker
+    /// who holds two connections and answers its own request with the second one
+    /// is announced with `self_approved: false`. Use [`Self::approver`] for the
+    /// question "did somebody else really decide this".
+    pub self_approved: bool,
+    /// How many announcements the daemon's per-connection bound dropped since
+    /// the last one that got through (REQ-569 re-verify, R3). `0` in the
+    /// ordinary case.
+    ///
+    /// Minting a grant is attacker-triggerable — a peer loops `session/attach`
+    /// and self-approves — and this event is daemon-scoped, so every unbounded
+    /// announcement is a line on every connected client's screen. The daemon
+    /// rate-limits it per requesting connection and reports the arrears here, so
+    /// the bound never costs a reader the knowledge that something was
+    /// suppressed: a burst is one notice that says how much it stands for
+    /// instead of a thousand notices that scroll the real one away.
+    pub suppressed: u32,
 }
 
 #[cfg(test)]
@@ -2884,5 +3093,149 @@ mod tests {
         assert!(BlockingActivity::Turn < BlockingActivity::ModelDownload);
         assert!(BlockingActivity::ModelDownload < BlockingActivity::ModelLoad);
         assert!(BlockingActivity::ModelLoad < BlockingActivity::LedgerFlush);
+    }
+
+    /// REQ-569's two events on the wire: the names the spec's Events table
+    /// fixes, and the four payload keys `attach_consent_requested` carries —
+    /// one of which (`session_id`) comes from the envelope rather than from the
+    /// struct, because the flatten would emit it twice otherwise.
+    #[test]
+    fn the_attach_consent_events_carry_the_spec_payload_under_their_spec_names() {
+        let requested = Event::AttachConsentRequested(AttachConsentRequested {
+            request_id: RequestId::from("consent-0"),
+            scope: ConsentScope::Attach,
+            requester: "cli client \"teton\"".to_owned(),
+        });
+        assert_eq!(requested.name(), "attach_consent_requested");
+        let wire = envelope_wire(requested);
+        assert_eq!(wire["event"], "attach_consent_requested");
+        assert_eq!(wire["request_id"], "consent-0");
+        assert_eq!(wire["scope"], "attach");
+        assert_eq!(wire["requester"], "cli client \"teton\"");
+        assert_eq!(
+            wire["session_id"], "s1",
+            "the session comes off the envelope — a field here would collide \
+             with it under the flatten"
+        );
+
+        let refused = Event::AttachRefused(AttachRefused {
+            request_id: Some(RequestId::from("consent-0")),
+            scope: ConsentScope::Attach,
+            reason: AttachRefusedReason::ConsentTimeout,
+        });
+        assert_eq!(refused.name(), "attach_refused");
+        let wire = envelope_wire(refused);
+        assert_eq!(wire["event"], "attach_refused");
+        assert_eq!(wire["reason"], "consent_timeout");
+        assert_eq!(
+            wire["request_id"], "consent-0",
+            "a refusal names the request it ends, so a surface rendering two \
+             prompts for one session retires the right one"
+        );
+
+        // The one refusal that ends no request carries no id — and omits the
+        // key rather than sending a null a client would have to special-case.
+        let no_prompt = envelope_wire(Event::AttachRefused(AttachRefused {
+            request_id: None,
+            scope: ConsentScope::Monitor,
+            reason: AttachRefusedReason::NoGrant,
+        }));
+        assert!(no_prompt.get("request_id").is_none(), "{no_prompt}");
+        assert_eq!(no_prompt["reason"], "no_grant");
+    }
+
+    /// REQ-569 verify (F6): the grant announcement is **daemon-scoped** and
+    /// says out loud whether it was self-approved.
+    ///
+    /// The absent `session_id` is the load-bearing assertion. It is what makes
+    /// REQ-568's delivery rule broadcast the frame to every handshaked
+    /// connection rather than to the target session's attachees — an
+    /// announcement only the beneficiary can see is not an announcement — and it
+    /// is simultaneously what keeps the frame from leaking an id BR-10 withholds
+    /// from those same connections.
+    #[test]
+    fn a_minted_grant_is_announced_daemon_wide_and_names_its_approver_arm() {
+        let minted = Event::SessionGrantMinted(SessionGrantMinted {
+            scope: ConsentScope::Attach,
+            requester: "cli client \"teton\"".to_owned(),
+            approver: "cli client \"teton\"".to_owned(),
+            self_approved: true,
+            suppressed: 0,
+        });
+        assert_eq!(minted.name(), "session_grant_minted");
+
+        let env = EventEnvelope::new(7, None, minted);
+        let wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+        assert_eq!(wire["event"], "session_grant_minted");
+        assert_eq!(wire["scope"], "attach");
+        assert_eq!(wire["requester"], "cli client \"teton\"");
+        assert_eq!(wire["self_approved"], true);
+        assert!(
+            wire.get("session_id").is_none(),
+            "a grant announcement goes to every connection, so it names no \
+             session: {wire}"
+        );
+
+        // R1: the announcement names **both** parties. The peer-approved shape
+        // is the one that needs it — `self_approved` is `false` there whether a
+        // real second user answered or an attacker's second connection did, so
+        // the descriptors are the only thing on the wire that tells them apart.
+        let peer = envelope_wire(Event::SessionGrantMinted(SessionGrantMinted {
+            scope: ConsentScope::Attach,
+            requester: "cli client \"attacker\"".to_owned(),
+            approver: "cli client \"attacker\"".to_owned(),
+            self_approved: false,
+            suppressed: 12,
+        }));
+        assert_eq!(peer["self_approved"], false);
+        assert_eq!(
+            peer["requester"], peer["approver"],
+            "two connections, one name: the relation is what a reader acts on, \
+             and it has to survive the wire: {peer}"
+        );
+        assert_eq!(peer["suppressed"], 12);
+    }
+
+    /// BR-5: each refusal reason has its own spelling, and a monitor request
+    /// names no session.
+    ///
+    /// The spellings are what a client renders from (BUG-152), so a rename is a
+    /// wire break rather than a refactor. The daemon-scoped case is asserted
+    /// alongside them because "monitor" and "attach to the session that is
+    /// null" must not become the same frame.
+    #[test]
+    fn every_refusal_reason_has_its_own_spelling_and_monitor_names_no_session() {
+        for (reason, expected) in [
+            (AttachRefusedReason::NoGrant, "\"no_grant\""),
+            (AttachRefusedReason::ConsentDenied, "\"consent_denied\""),
+            (AttachRefusedReason::ConsentTimeout, "\"consent_timeout\""),
+            (AttachRefusedReason::RequesterGone, "\"requester_gone\""),
+        ] {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), expected);
+        }
+        for (scope, expected) in [
+            (ConsentScope::Attach, "\"attach\""),
+            (ConsentScope::Monitor, "\"monitor\""),
+        ] {
+            assert_eq!(serde_json::to_string(&scope).unwrap(), expected);
+        }
+
+        let env = EventEnvelope::new(
+            7,
+            None,
+            Event::AttachConsentRequested(AttachConsentRequested {
+                request_id: RequestId::from("consent-1"),
+                scope: ConsentScope::Monitor,
+                requester: "cli client \"watcher\"".to_owned(),
+            }),
+        );
+        let wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+        assert!(
+            wire.get("session_id").is_none(),
+            "a monitor request asks for every session, so it names none: {wire}"
+        );
+        assert_eq!(wire["scope"], "monitor");
     }
 }

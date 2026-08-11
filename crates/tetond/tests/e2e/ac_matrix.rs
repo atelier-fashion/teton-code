@@ -523,13 +523,45 @@ fn ac6_two_clients_share_sessions_daemon_survives_exit() {
         "session did not survive client exit"
     );
 
-    // A fresh client can still attach to the surviving session.
-    let mut c = daemon.connect();
-    let attached = c.call("session/attach", json!({ "session_id": sid }));
+    // A fresh client still *sees* the surviving session — that listing, above
+    // and here, is what AC-6's survival claim rests on.
+    //
+    // Attaching to it is a separate question, and since REQ-569 the answer is
+    // "only by a decision" (BR-1/BR-6): a connection that created nothing and
+    // holds no grant has the question put to a user, because knowing an id is
+    // not standing (BR-8). This is **AC-3's resume flow** end to end — the last
+    // client that held the session is gone, so nothing is attached to it and
+    // the prompt is rendered by the client the user just opened. One consent
+    // step, and exactly one.
+    //
+    // `with_auto_consent` is the user saying yes. Every other client in this
+    // suite lacks it, which is what keeps the gate real:
+    // `multi_client::two_clients_share_sessions_and_daemon_survives_client_exit`
+    // drives the identical sequence with nobody answering and the fresh client
+    // stays out.
+    let mut c = daemon.connect().with_auto_consent();
+    assert_eq!(
+        c.session_ids(),
+        vec![sid.clone()],
+        "a fresh client must still see the surviving session"
+    );
+    let attached = c.call("session/attach", json!({ "session_id": sid.clone() }));
     assert_eq!(
         attached["result"]["session"]["session_id"].as_str(),
         Some(sid.as_str()),
-        "{attached}"
+        "an approved resume must attach the fresh client: {attached}"
+    );
+    let prompts = c.events_named("attach_consent_requested");
+    assert_eq!(
+        prompts.len(),
+        1,
+        "AC-3: at most one visible consent step, and it is this one: {prompts:?}"
+    );
+    assert_eq!(prompts[0]["scope"].as_str(), Some("attach"));
+    assert_eq!(prompts[0]["session_id"].as_str(), Some(sid.as_str()));
+    assert!(
+        !c.saw_event("attach_refused"),
+        "an approved request must not also be announced as refused"
     );
 
     assert_no_boundary_bytes();

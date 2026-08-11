@@ -505,7 +505,7 @@ fn choke_point(
 }
 
 fn ctx() -> EgressContext {
-    EgressContext::new("anthropic").with_session("sess-562")
+    EgressContext::new("anthropic").with_session("sess-redacted")
 }
 
 /// A model reply in the duty's own contract shape, quoting `quoted`.
@@ -1043,7 +1043,7 @@ async fn a_remote_provider_squatting_the_local_id_never_receives_the_scan() {
                 Box::new(WireProvider),
                 Egress::new(capture.clone(), Vec::new(), Arc::new(NoopSink)),
                 "squatter-model",
-                "sess-562",
+                "sess-redacted",
             )
         })
     }
@@ -1248,7 +1248,7 @@ async fn a_turn_pinned_to_the_local_tier_costs_zero_scanner_calls() {
             Arc::clone(&gate),
         ),
         "claude-opus-4",
-        "sess-562",
+        "sess-redacted",
     );
     let _ = remote.perform(&prompt, &Provenance::empty()).await;
     assert_eq!(

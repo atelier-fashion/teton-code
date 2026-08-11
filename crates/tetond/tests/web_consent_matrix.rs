@@ -1581,7 +1581,7 @@ async fn a_search_with_no_gate_installed_is_a_block_not_a_skip() {
     let ungated = Egress::new(transport.clone(), Vec::new(), Arc::new(NoopSink))
         .with_lookup_recorder(Arc::clone(&recorder) as Arc<dyn LookupRecorder>);
     let clean = Flags::default();
-    let ctx = LookupContext::new("sess-13", &clean, &allow_any_host)
+    let ctx = LookupContext::new("sess-consent", &clean, &allow_any_host)
         .with_search_endpoint(SEARCH_ENDPOINT);
 
     let refused = ungated
@@ -1606,7 +1606,7 @@ async fn a_search_with_no_gate_installed_is_a_block_not_a_skip() {
     let gated_transport = LookupCapture::answering("{\"results\":[]}");
     let gated = Egress::new(gated_transport.clone(), Vec::new(), Arc::new(NoopSink))
         .with_search_redaction_gate(Arc::new(ForwardingGate));
-    let ctx = LookupContext::new("sess-13", &clean, &allow_any_host)
+    let ctx = LookupContext::new("sess-consent", &clean, &allow_any_host)
         .with_search_endpoint(SEARCH_ENDPOINT);
     let sent = gated
         .lookup(

@@ -10,10 +10,15 @@
 //!   event and wait for a client to answer.
 //!
 //! The round-trip uses the daemon's real machinery: the request goes out over
-//! TASK-004's [`EventBus`], and the client's reply arrives — in a later task's
-//! server wiring — as a `permission/respond` method that calls
-//! [`PendingPermissions::resolve`]. That call is the seam; this module owns
-//! everything up to it.
+//! TASK-004's [`EventBus`], and the client's reply arrives — in the server's
+//! `permission/respond` handler — as a call to [`PendingPermissions::resolve`].
+//! That call is the seam; this module owns everything up to it.
+//!
+//! Each waiter carries the [`SessionId`] whose tool call it blocks, and
+//! [`PendingPermissions::owner_of`] hands that back. The server answers "may
+//! this connection answer this prompt" with it (REQ-569 BR-9, ADR-F) — the
+//! authorization lives there, not here; this module only makes the question
+//! answerable.
 //!
 //! A `*_always` answer is remembered for the **session only** ([`PermissionGate`]
 //! holds the grants), so the user is asked once per tool per session and never
@@ -197,16 +202,33 @@ impl Default for PermissionConfig {
     }
 }
 
+/// One in-flight prompt: who is waiting, and **whose session** raised it.
+///
+/// The owner is stored beside the sender rather than derived later because
+/// nothing else in the daemon can answer the question. The map is daemon-wide
+/// and a `RequestId` is an opaque `perm-N`, so once a waiter is registered the
+/// only record of which session's tool call it belongs to is this field — which
+/// is what [`PendingPermissions::owner_of`] reads, and what lets
+/// `permission/respond` require attachment to *that* session (REQ-569 BR-9,
+/// ADR-F).
+struct Waiter {
+    /// The session whose tool call is blocked on this answer.
+    owner: SessionId,
+    /// Resolved by [`PendingPermissions::resolve`]; dropping it denies.
+    tx: oneshot::Sender<PermissionOutcome>,
+}
+
 /// The registry of in-flight permission prompts, keyed by request id.
 ///
 /// The harness registers a waiter here and awaits it; a client's
-/// `permission/respond` (wired in a later task) calls [`Self::resolve`]. Kept
-/// separate from [`PermissionGate`] because it is daemon-wide (one client reply
-/// must find the waiter regardless of which session raised it), whereas grants
-/// are per-session.
+/// `permission/respond` calls [`Self::resolve`]. Kept separate from
+/// [`PermissionGate`] because it is daemon-wide (one client reply must find the
+/// waiter regardless of which session raised it), whereas grants are
+/// per-session — and because being daemon-wide is exactly why each waiter has to
+/// carry its owning [`SessionId`] ([`Waiter`]).
 #[derive(Default)]
 pub struct PendingPermissions {
-    waiters: Mutex<HashMap<RequestId, oneshot::Sender<PermissionOutcome>>>,
+    waiters: Mutex<HashMap<RequestId, Waiter>>,
     // The request-id counter lives HERE — daemon-wide — not on `PermissionGate`,
     // so the id namespace matches the resolution namespace this map defines
     // (BUG-161). A per-session counter minted `perm-0`, `perm-1`, … in every
@@ -233,15 +255,24 @@ impl PendingPermissions {
         ))
     }
 
-    /// Register a waiter and return the receiver the caller awaits.
+    /// Register a waiter for `owner`'s prompt and return the receiver the caller
+    /// awaits.
+    ///
+    /// `owner` is the session whose tool call is blocked. It is taken as a
+    /// parameter rather than read off anything global because
+    /// [`PermissionGate`] is the only thing that knows it, and it is the fact
+    /// `permission/respond` later authorizes against ([`Self::owner_of`]).
     ///
     /// Refuses to overwrite an existing waiter rather than replacing it. With
     /// [`next_request_id`](Self::next_request_id) minting unique ids this is
     /// unreachable, so a collision here means a per-scope counter has crept back
     /// (the BUG-161 shape) — we keep the first waiter and let this caller's
     /// receiver resolve to the safe default (`Denied`, via the dropped sender),
-    /// never silently stealing another prompt's answer.
-    fn register(&self, id: RequestId) -> oneshot::Receiver<PermissionOutcome> {
+    /// never silently stealing another prompt's answer. Note what that now also
+    /// protects: the *owner* recorded for a live request id can never be
+    /// rewritten by a later registration, so the authorization subject of a
+    /// pending prompt is fixed the moment it is raised.
+    fn register(&self, id: RequestId, owner: SessionId) -> oneshot::Receiver<PermissionOutcome> {
         let (tx, rx) = oneshot::channel();
         let mut waiters = self
             .waiters
@@ -249,7 +280,7 @@ impl PendingPermissions {
             .expect("pending permissions mutex poisoned");
         match waiters.entry(id) {
             Entry::Vacant(slot) => {
-                slot.insert(tx);
+                slot.insert(Waiter { owner, tx });
             }
             Entry::Occupied(existing) => {
                 // request_id is `perm-N`, never content — safe to log (conventions).
@@ -264,17 +295,36 @@ impl PendingPermissions {
         rx
     }
 
+    /// The session whose tool call is waiting on `id`, or `None` if no prompt by
+    /// that id is outstanding (never raised, already answered, or expired with
+    /// its turn).
+    ///
+    /// The authorization question `permission/respond` asks (REQ-569 BR-9,
+    /// ADR-F): *whose* prompt is this, so the daemon can require that the
+    /// answering connection is attached to that session. A read only — it never
+    /// consumes the waiter, because a caller that is about to be **refused**
+    /// must leave the prompt standing for whoever may rightfully answer it.
+    #[must_use]
+    pub fn owner_of(&self, id: &RequestId) -> Option<SessionId> {
+        self.waiters
+            .lock()
+            .expect("pending permissions mutex poisoned")
+            .get(id)
+            .map(|waiter| waiter.owner.clone())
+    }
+
     /// Deliver a client's answer to the waiting harness. Returns `true` if a
     /// waiter was present. This is the entry point the server's
-    /// `permission/respond` handler calls.
+    /// `permission/respond` handler calls — *after* it has checked
+    /// [`Self::owner_of`], because this call consumes the waiter.
     pub fn resolve(&self, id: &RequestId, outcome: PermissionOutcome) -> bool {
-        let sender = self
+        let waiter = self
             .waiters
             .lock()
             .expect("pending permissions mutex poisoned")
             .remove(id);
-        match sender {
-            Some(tx) => tx.send(outcome).is_ok(),
+        match waiter {
+            Some(waiter) => waiter.tx.send(outcome).is_ok(),
             None => false,
         }
     }
@@ -442,7 +492,12 @@ impl PermissionGate {
         // Register the waiter, publish the prompt, then await — no lock is held
         // across the await.
         let request_id = self.pending.next_request_id();
-        let rx = self.pending.register(request_id.clone());
+        // The owning session travels with the waiter, so the answer that comes
+        // back can be authorized against it (REQ-569 BR-9): this gate is the
+        // only place that knows whose tool call is about to block.
+        let rx = self
+            .pending
+            .register(request_id.clone(), self.session_id.clone());
 
         self.events.publish(
             Some(self.session_id.clone()),
@@ -794,6 +849,137 @@ mod tests {
         assert_eq!(decision_a, PermissionDecision::Allowed);
         assert_eq!(decision_b, PermissionDecision::Denied);
         assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// REQ-569 BR-9: a live request id resolves to the session that raised it,
+    /// an unknown one to nothing, and an answered one to nothing again.
+    ///
+    /// The three arms are one test because the gate above this reads all three:
+    /// `Some(owner)` is what it authorizes against, and both `None`s are the
+    /// "no waiter" path that must stay the unchanged, always-acknowledged
+    /// idempotent reply. Driven through two gates sharing one registry — the
+    /// production wiring — so what is asserted is that each id carries *its own*
+    /// session rather than the last one to register.
+    #[tokio::test]
+    async fn owner_of_names_the_session_that_raised_the_prompt() {
+        let bus = Arc::new(EventBus::new());
+        let pending = Arc::new(PendingPermissions::new());
+        let cfg = PermissionConfig::with_default(PermissionPolicy::Ask);
+        let gate_a = PermissionGate::new(
+            SessionId::from("s1"),
+            cfg.clone(),
+            Arc::clone(&bus),
+            Arc::clone(&pending),
+        );
+        let gate_b = PermissionGate::new(
+            SessionId::from("s2"),
+            cfg,
+            Arc::clone(&bus),
+            Arc::clone(&pending),
+        );
+        let mut sub = bus.subscribe(16);
+
+        let decide_a = gate_a.authorize("shell", None);
+        let decide_b = gate_b.authorize("edit", None);
+        let drive = async {
+            let mut a_rid: Option<RequestId> = None;
+            let mut b_rid: Option<RequestId> = None;
+            while a_rid.is_none() || b_rid.is_none() {
+                let env = sub.recv().await.unwrap();
+                let session = env.session_id.clone();
+                if let Event::PermissionRequest(pr) = env.event {
+                    if session == Some(SessionId::from("s1")) {
+                        a_rid = Some(pr.request_id);
+                    } else {
+                        b_rid = Some(pr.request_id);
+                    }
+                }
+            }
+            let a_rid = a_rid.unwrap();
+            let b_rid = b_rid.unwrap();
+
+            // Each id names its own session — not the other's, and not the last
+            // registration to touch the map.
+            assert_eq!(pending.owner_of(&a_rid), Some(SessionId::from("s1")));
+            assert_eq!(pending.owner_of(&b_rid), Some(SessionId::from("s2")));
+
+            // An id nobody registered belongs to nobody. This is the arm the
+            // server turns into "no waiter, acknowledge anyway", so it must be
+            // an absence rather than a guess.
+            assert_eq!(
+                pending.owner_of(&RequestId::from("perm-never-minted")),
+                None
+            );
+
+            // Reading the owner does not consume the waiter: a refused answer
+            // must leave the prompt standing for whoever may rightfully answer.
+            assert_eq!(pending.pending_count(), 2);
+            assert_eq!(pending.owner_of(&a_rid), Some(SessionId::from("s1")));
+
+            assert!(pending.resolve(
+                &a_rid,
+                PermissionOutcome::Selected {
+                    option_id: "allow_once".to_owned()
+                }
+            ));
+            assert!(pending.resolve(
+                &b_rid,
+                PermissionOutcome::Selected {
+                    option_id: "reject_once".to_owned()
+                }
+            ));
+
+            // Answered is indistinguishable from never-asked, which is what
+            // makes a duplicate `permission/respond` harmless rather than a
+            // second authorization decision.
+            assert_eq!(pending.owner_of(&a_rid), None);
+            assert_eq!(pending.owner_of(&b_rid), None);
+        };
+        let (decision_a, decision_b, ()) = tokio::join!(decide_a, decide_b, drive);
+        assert_eq!(decision_a, PermissionDecision::Allowed);
+        assert_eq!(decision_b, PermissionDecision::Denied);
+    }
+
+    /// The BUG-161 tripwire, read for what REQ-569 now also rests on it: a
+    /// colliding registration cannot rewrite the **owner** of a live request id.
+    ///
+    /// If it could, a second session could claim an answer already promised to
+    /// the first — the gate above would then check attachment against the wrong
+    /// session and let the wrong connection answer. The refuse-not-overwrite arm
+    /// is what makes the authorization subject of a pending prompt immutable.
+    #[test]
+    fn a_colliding_registration_cannot_steal_the_owner_of_a_live_request() {
+        let pending = PendingPermissions::new();
+        let id = RequestId::from("perm-0");
+        let mut first = pending.register(id.clone(), SessionId::from("s1"));
+        let mut second = pending.register(id.clone(), SessionId::from("s2"));
+
+        assert_eq!(
+            pending.owner_of(&id),
+            Some(SessionId::from("s1")),
+            "the second registration must not repoint the id at its own session"
+        );
+        // The loser's sender was dropped by `register`, so its caller's
+        // `authorize` takes the safe `Denied` arm rather than sharing the
+        // winner's answer.
+        assert!(
+            second.try_recv().is_err(),
+            "the colliding registration must not have been given a live channel"
+        );
+
+        assert!(pending.resolve(
+            &id,
+            PermissionOutcome::Selected {
+                option_id: "allow_once".to_owned()
+            }
+        ));
+        assert_eq!(
+            first.try_recv().ok(),
+            Some(PermissionOutcome::Selected {
+                option_id: "allow_once".to_owned()
+            }),
+            "the first waiter keeps its own prompt's answer"
+        );
     }
 
     #[tokio::test]

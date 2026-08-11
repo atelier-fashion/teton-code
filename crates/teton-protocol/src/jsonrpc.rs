@@ -319,6 +319,82 @@ pub mod error_code {
         /// would tell a user their session had vanished when it is only
         /// someone else's.
         NOT_ATTACHED = -32009;
+        /// The connection's process descends from this daemon's own process
+        /// tree — or could not be shown not to — so it may never attach to a
+        /// session or declare `monitor` (REQ-569 BR-4, ADR-A).
+        ///
+        /// **The terminal refusal.** Unlike [`NOT_GRANTED`], this one has no
+        /// remedy and no consent path: there is nothing the connection can ask
+        /// for, nothing a user can approve, and no retry that changes the
+        /// answer. It keys on kernel-attested process ancestry rather than on
+        /// what the connection happens to do, so it holds for a tool child, an
+        /// MCP server subprocess, and any future daemon-spawned process that
+        /// links the client crate.
+        ///
+        /// Distinct from [`NOT_ATTACHED`] in *which* question was asked:
+        /// `NOT_ATTACHED` answers "may this connection drive a session it never
+        /// attached to" and names `session/attach` as the remedy; this answers
+        /// "may this connection attach at all", and the answer is no. A client
+        /// that folded them together would advise a daemon child to attach —
+        /// the one thing it can never do.
+        ATTACH_FORBIDDEN = -32010;
+        /// The connection holds no grant, and none was sought (REQ-569
+        /// BR-1/BR-2).
+        ///
+        /// Two things answer it, and neither is `session/attach`'s ordinary
+        /// ungranted path — that one raises a consent request and ends in
+        /// [`CONSENT_DENIED`] or [`CONSENT_TIMEOUT`] instead:
+        ///
+        /// - **A `monitor` declaration without a monitor-scope grant.**
+        ///   Terminal, like [`ATTACH_FORBIDDEN`]: REQ-569's verify pass removed
+        ///   the consent path to `monitor` (it was mintable by one peer holding
+        ///   two connections), so there is nothing to ask for and no retry that
+        ///   changes the answer.
+        /// - **A connection with too many consent requests already
+        ///   outstanding.** Remediable, and the only remedy is time: it stops
+        ///   applying as the caller's own pending prompts resolve.
+        ///
+        /// Distinct from [`UNKNOWN_SESSION`]: it is issued *before* the session
+        /// registry is consulted and is identical for a session that exists and
+        /// one that does not, precisely so it cannot be read as an existence
+        /// oracle.
+        ///
+        /// Distinct from [`NOT_ATTACHED`] by which door was closed:
+        /// `NOT_ATTACHED` is refused at a *mutating* method and its remedy is
+        /// `session/attach`; this is refused at the handshake or at
+        /// `session/attach` itself, so the remedy `NOT_ATTACHED` names is not
+        /// available here.
+        NOT_GRANTED = -32011;
+        /// A user was asked whether to grant this connection the session (or
+        /// `monitor`) and answered **no** (REQ-569 BR-5/BR-7).
+        ///
+        /// BR-5's third distinct reason, and the difference from
+        /// [`NOT_GRANTED`] is *whether anyone was asked*: `NOT_GRANTED` says no
+        /// grant existed and none could be sought, while this says the question
+        /// was put to a user and the user declined. A client folding them
+        /// together would tell someone their request was never seen when it was
+        /// seen and refused — and would go on to retry a request a human just
+        /// turned down.
+        ///
+        /// Mints nothing. A denied decision leaves the grant registry exactly
+        /// as it found it (BR-7, LESSON-501 — the decision travels with the
+        /// grant).
+        CONSENT_DENIED = -32012;
+        /// A consent request went unanswered for the daemon's bounded window
+        /// and resolved to denied (REQ-569 BR-7, AC-6).
+        ///
+        /// BR-5's fourth reason, and the one that is **not** a decision: no
+        /// user said no, no user said anything. It is distinct from
+        /// [`CONSENT_DENIED`] because it is the one refusal on this seam that a
+        /// plain retry can legitimately fix — the prompt may have been rendered
+        /// on a surface nobody was looking at — whereas retrying past a denial
+        /// is asking a user who already answered to answer again.
+        ///
+        /// Fail-closed by construction: the window elapsing *is* the refusal,
+        /// so a daemon that crashed mid-consent, a client that never rendered
+        /// the prompt, and a user who walked away all end in the same place,
+        /// holding nothing.
+        CONSENT_TIMEOUT = -32013;
     }
 }
 

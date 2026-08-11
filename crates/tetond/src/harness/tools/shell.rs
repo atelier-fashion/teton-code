@@ -193,6 +193,37 @@ impl Tool for ShellTool {
         // sentences below buy no model call either — the same argument the
         // `None` above makes, one step further along.
         const NO_OUTPUT_CAPTURED: usize = 0;
+        // **The group is killed on the timeout arm only** — and the alternative
+        // was tried and reverted (REQ-569 re-verify, R4).
+        //
+        // The verify pass moved the `kill(-pgid)` up here, ahead of the match,
+        // so it ran on *every* ending. The intent was to reach the escapee in
+        // `sh -c 'helper >/dev/null 2>&1 &'`: the command backgrounds a
+        // grandchild, closes the pipes, `wait_with_output` returns promptly and
+        // successfully, and on the old shape nothing killed the group. The
+        // escapee reparents to `launchd`/`init`, which breaks the ancestry
+        // chain REQ-569 BR-4 keys on — it reconnects classified
+        // `NotDescendant`, with full client rights.
+        //
+        // It is reverted because it cost more than it bought:
+        //
+        // - **It killed work a command legitimately backgrounded.** `npm run dev
+        //   &`, a fixture server, a language server — anything an agent starts
+        //   on purpose and expects to outlive one tool call died on the
+        //   *success* path. That is a functional regression in the common case,
+        //   paid for a security case the same change did not close.
+        // - **On a success arm the group leader has already been reaped** by
+        //   `wait_with_output`, so the pgid may already have been released.
+        //   Signalling it then is not the `ESRCH` no-op the timeout arm's
+        //   reasoning describes: it can reach a *recycled* group.
+        // - **It did not close the escape it was aimed at.** `setsid helper`
+        //   leaves the process group outright, so no group-directed signal on
+        //   any arm reaches it.
+        //
+        // So the escape stands, recorded rather than papered over, in
+        // `crate::peer`'s module docs and in the REQ-569 architecture ADR-A
+        // residuals. Closing it needs a mechanism that does not key on the
+        // process group at all.
         match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
             Ok(Ok(output)) => {
                 let _ = handle.join();

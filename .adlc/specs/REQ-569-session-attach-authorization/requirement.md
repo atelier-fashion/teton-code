@@ -1,7 +1,7 @@
 ---
 id: REQ-569
 title: "Session attach requires a grant: closing the same-UID ambient-attach path"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-11
 updated: 2026-08-11
@@ -80,29 +80,130 @@ are the architecture phase's decision, not this spec's.
 
 ## Business Rules
 
-- [ ] BR-1: A connection may attach only to sessions it created or holds an attach-scope grant for; `session/attach` without a grant is refused with a distinct, stable error code (informed by LESSON-484, BUG-155 — enforced at the daemon decision point every client crosses, not in any client).
-- [ ] BR-2: The monitor declaration is grant-gated with its own scope. A grant that permits attaching to one session never implies monitor, and vice versa — the grant key encodes the whole question (informed by LESSON-495).
-- [ ] BR-3: No grant is ambient: possessing the socket path, the daemon's spawn environment, or same-UID filesystem access must not suffice to mint or exercise a grant. The daemon never writes grant-conferring material into the environment or into files its spawned subprocesses can read (informed by LESSON-432 — the capability derives from an explicit act, not from the shape of the requester's access).
-- [ ] BR-4: The daemon's own spawned tool and MCP subprocesses are verifiably excluded: the exclusion is an explicit mechanism, not a side effect of what those children currently happen to do — it must hold even when a future subprocess links the client crate (informed by LESSON-443).
-- [ ] BR-5: Grant checks and consent outcomes are decided in the daemon in one place; every refusal carries a stable code distinguishing "no grant" from "consent denied" from "consent timed out", and clients render from codes, never from prose (informed by BUG-152).
-- [ ] BR-6: An interactive user resuming their own session in a fresh client succeeds with at most one visible consent step, including when no other client is attached. The mechanism that lets them through must be one an ambient background process cannot silently satisfy.
-- [ ] BR-7: Consent defaults closed: an unanswered consent request resolves to denied after a bounded timeout, and a denied or timed-out request leaves no partial grant state (informed by LESSON-501 — the decision travels with the grant, re-asserted at the seam that stores it).
-- [ ] BR-8: New session ids are unguessable and `session/list` knowledge confers no access — ids are names, grants are credentials. Existing flows that only ever touch the creator connection are behavior-identical.
-- [ ] BR-9: Every session-mutating or session-answering method is attachment-gated, not just `session/prompt`/`session/clear`/`web/override` (which REQ-568 gates). In particular `permission/respond` resolves the request's owning session and requires attachment, so a `monitor` — which sees every session's `permission_request` — cannot answer one. This depends on request ids being session-resolvable; the per-session/daemon-wide id collision that blocks it is tracked as [[BUG-161]] and must be fixed first (informed by LESSON-484 — enforce where the "this names a session" decision is made, across every writer, not just the named methods).
-- [ ] BR-10: `session/list` returns the full summary (`title`, `cwd`) only for sessions the connection is attached to or holds a grant for; unattached connections receive a reduced summary (`session_id`, `mode`, `phase`). A session `title` is model-generated from the user's prompt text and `cwd` is an absolute path, so both are boundary content, not mere metadata (informed by LESSON-432 — the leak is in the payload, not only the id). Closes REQ-568's accepted residual on the `session/list` content leak.
+- [x] BR-1: A connection may attach only to sessions it created or holds an attach-scope grant for; `session/attach` without a grant is refused with a distinct, stable error code (informed by LESSON-484, BUG-155 — enforced at the daemon decision point every client crosses, not in any client). — `GrantRegistry::may_attach` is the single definition, called from `handle_session_attach` below `dispatch`; refusals are `CONSENT_DENIED`/`CONSENT_TIMEOUT` (an ungranted attach raises a prompt rather than answering `NOT_GRANTED`). Pinned by `attach_authorization::a_session_id_read_from_session_list_is_not_standing_to_attach` and `multi_client::knowing_a_session_id_does_not_let_another_connection_attach`.
+- [x] BR-2: The monitor declaration is grant-gated with its own scope. A grant that permits attaching to one session never implies monitor, and vice versa — the grant key encodes the whole question (informed by LESSON-495). — `Grant`'s key carries the scope and `may_monitor` reads only it; pinned by `grants::tests::attach_and_monitor_are_answered_by_their_own_scope_and_no_other` and `multi_client::a_monitor_declaration_is_refused_without_a_monitor_scope_grant`. **Discharged, and as of the verify pass the gate is the *only* thing here: `monitor` has no socket-reachable minter at all** (ADR-A-1). The consent path TASK-108 gave it was self-serviceable — one actor with two connections, because `session/create` is ungated and self-attaches — so it was removed rather than re-predicated; no sound approver predicate exists over this daemon's primitives. `monitor` is therefore grant-gated *and* currently unreachable; REQ-570 is what makes it mintable again, under human attestation. Regression: `multi_client::a_peers_own_second_connection_cannot_approve_it_a_monitor`.
+- [~] BR-3: No grant is ambient: possessing the socket path, the daemon's spawn environment, or same-UID filesystem access must not suffice to mint or exercise a grant. The daemon never writes grant-conferring material into the environment or into files its spawned subprocesses can read (informed by LESSON-432 — the capability derives from an explicit act, not from the shape of the requester's access). — **Partially discharged, and the gap is named.** Nothing grant-conferring is written anywhere: grants are in-memory, keyed to a live connection, minted only by an `attach/consent` decision, and never persisted (ADR-C, `consent.rs`). For the population BR-4 names — the daemon's own children — possession of the socket path demonstrably confers nothing (`attach_authorization::a_client_driven_from_a_genuine_daemon_descendant_is_refused_at_every_door`). **But** for an arbitrary same-UID process that is *not* a daemon descendant, possessing the socket path is enough: when no client is attached to the target session, BR-6's second arm renders the prompt at the requester, which a headless process answers itself. That is the ADR-A residual stated out loud, and it is **not closed here — REQ-570 closes it** with a human-attested consent surface. Two corrections from the verify pass: (a) the residual is *wider* than first written, because breaking the ancestry chain costs one model-supplied shell word (`… &` or `setsid`), so a daemon child can become the "arbitrary non-descendant" this arm admits — the two limits recorded separately in ADR-A are one attack read together; (b) the "not silent" claim no longer rests on a daemon-stderr line the adversary can truncate — every mint now publishes a daemon-scoped `session_grant_minted` event carrying `self_approved`, which REQ-568's own rules deliver to every handshaked connection.
+- [x] BR-4: The daemon's own spawned tool and MCP subprocesses are verifiably excluded: the exclusion is an explicit mechanism, not a side effect of what those children currently happen to do — it must hold even when a future subprocess links the client crate (informed by LESSON-443). — kernel-attested peer pid + parent-chain walk (`peer.rs`, `DaemonProcess::ancestry_of`), taken once at the handshake and terminal at `session/attach`, the `monitor` declaration, and `attach/consent`. Pinned end to end by `attach_authorization::a_client_driven_from_a_genuine_daemon_descendant_is_refused_at_every_door`, whose client runs in a process the daemon actually spawned (the probe asserts the daemon's pid is in its own parent chain), and at the seam by `multi_client::a_connection_from_the_daemons_own_process_tree_is_refused_attach_and_monitor`.
+- [x] BR-5: Grant checks and consent outcomes are decided in the daemon in one place; every refusal carries a stable code distinguishing "no grant" from "consent denied" from "consent timed out", and clients render from codes, never from prose (informed by BUG-152). — four distinct doc-commented codes (`ATTACH_FORBIDDEN`, `NOT_GRANTED`, `CONSENT_DENIED`, `CONSENT_TIMEOUT`), one decision site per question (`grants::may_attach`/`may_monitor`, `ConsentRoute`, `seek_consent`). Asserted at the wire throughout `attach_authorization` and `multi_client`. *Daemon-side only:* no shipped client renders these codes yet, because nothing in `crates/teton` calls `session/attach` — see BR-6.
+- [ ] BR-6: An interactive user resuming their own session in a fresh client succeeds with at most one visible consent step, including when no other client is attached. The mechanism that lets them through must be one an ambient background process cannot silently satisfy. — **Deliberately not ticked; two halves, one done.** The daemon half is complete: a resume with nobody attached costs exactly one prompt and one answer, end to end, pinned by `attach_authorization::a_consent_the_requester_granted_itself_is_named_as_such_in_the_daemon_log` (leg 2) and `e2e::conversation_carry::client_bs_prompt_carries_the_conversation_client_a_left_behind`. **Outstanding:** (a) *the client surface* — nothing in `crates/teton` calls `session/attach`, and the CLI renders `attach_consent_requested` as a notice it cannot answer, so no shipped user can walk this flow; (b) *the second sentence* — the self-render arm **is** one an ambient background process can silently satisfy, since the daemon cannot tell a headless same-UID requester from an interactive one. That residual is announced at the moment it happens — both in the daemon log (`server::self_approval_line`) and, since the verify pass, as a daemon-scoped `session_grant_minted` event delivered to every handshaked connection, because the log alone is read only on startup failure, truncated at 256 KiB, and writable by the same-UID adversary whose self-approval it records. Observable, not closed. **Both halves are REQ-570's scope** (BR-4 there gives the CLI an answering surface; BR-1/BR-2/BR-3 there require a human-attested approval a headless process cannot satisfy).
+- [x] BR-7: Consent defaults closed: an unanswered consent request resolves to denied after a bounded timeout, and a denied or timed-out request leaves no partial grant state (informed by LESSON-501 — the decision travels with the grant, re-asserted at the seam that stores it). — `PendingConsents::await_decision` folds all three endings in one place and `forget`s the timed-out id; only the `Granted` arm touches the registry. Pinned by `consent::tests::every_ending_leaves_no_residual_entry`, `server::tests::a_denied_or_timed_out_consent_leaves_the_grant_registry_empty` (grant registry inspected, not inferred), and at the wire by the "nothing was left behind" leg of `attach_authorization::a_session_id_read_from_session_list_is_not_standing_to_attach`.
+- [x] BR-8: New session ids are unguessable and `session/list` knowledge confers no access — ids are names, grants are credentials. Existing flows that only ever touch the creator connection are behavior-identical. — 128-bit random ids (TASK-104); the grant check precedes `sessions.get`, so a real id and a fabricated one draw the same refusal (no existence oracle). Pinned by `multi_client::knowing_a_session_id_does_not_let_another_connection_attach` and, for the behaviour-identical half, `attach_authorization::the_single_client_create_prompt_stream_flow_asks_for_nothing_new`.
+- [~] BR-9: Every session-mutating or session-answering method is attachment-gated, not just `session/prompt`/`session/clear`/`web/override` (which REQ-568 gates). In particular `permission/respond` resolves the request's owning session and requires attachment, so a `monitor` — which sees every session's `permission_request` — cannot answer one. This depends on request ids being session-resolvable; the per-session/daemon-wide id collision that blocks it is tracked as [[BUG-161]] and must be fixed first (informed by LESSON-484 — enforce where the "this names a session" decision is made, across every writer, not just the named methods). — **Partially discharged.** The named half is done: [[BUG-161]] is fixed, `PendingPermissions::owner_of` resolves the owning session, and `permission/respond` requires `may_drive` (not `may_receive`, so a monitor is refused) without consuming the waiter — pinned by `multi_client::an_unattached_connection_cannot_answer_another_sessions_permission_prompt` and `server::tests::a_monitor_may_see_a_permission_prompt_and_may_not_answer_it`. **Outstanding:** TASK-107's dispatch audit found six methods that take no connection at all and affect or expose every session daemon-wide — `config/set`, `model/set`, `model/confirm`, `web/refresh`, `config/get`, `cost/query` — of which `model/confirm` is this same defect one scope up. Filed as [[BUG-162]] and reported rather than fixed here; `session/create` is likewise not ancestry-gated (a daemon child may hold a session of its own, by design).
+- [x] BR-10: `session/list` returns the full summary (`title`, `cwd`) only for sessions the connection is attached to or holds a grant for; unattached connections receive a reduced summary (`session_id`, `mode`, `phase`). A session `title` is model-generated from the user's prompt text and `cwd` is an absolute path, so both are boundary content, not mere metadata (informed by LESSON-432 — the leak is in the payload, not only the id). Closes REQ-568's accepted residual on the `session/list` content leak. — `reduce_for` + `may_receive`, values omitted rather than emptied; pinned on the raw wire text by `multi_client::session_list_omits_title_and_cwd_from_unattached_connections`.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: An e2e test spawns a process with exactly the daemon's subprocess spawn environment; its `session/attach`, monitor declaration, and `session/prompt` against another connection's session are all refused with the BR-5 codes.
-- [ ] AC-2: A second legitimate client can attach to a live session through the grant flow; after the grant, REQ-568 delivery rules apply to it as an attached client.
-- [ ] AC-3: The resume flow — create session, disconnect the only client, reconnect with a fresh client, attach — succeeds with at most one visible consent step, and the test demonstrates the same sequence performed by a non-interactive process is refused.
-- [ ] AC-4: A monitor declaration without a monitor-scope grant is refused; an attach-scope grant for one session does not enable monitor (informed by LESSON-495).
-- [ ] AC-5: Knowing a session id (via `session/list` or guessing) demonstrably does not enable attach: the test attaches by id without a grant and is refused.
-- [ ] AC-6: Consent timeout resolves to denied within the bounded window, emits `attach_refused` with the timeout code, and leaves no grant state behind.
-- [ ] AC-7: The single-client create → prompt → stream flow runs with zero new prompts or consent steps, and the full existing e2e suite passes.
-- [ ] AC-8: Grant enforcement is asserted at the daemon seam by a test driving the RPC surface directly (not through the CLI), so no client-side check can mask a daemon-side gap (informed by BUG-155).
-- [ ] AC-9: An unattached (and separately, a monitor-only) connection calling `permission/respond` against another session's pending request is refused with the BR-5 code; after attaching, the same call succeeds. Asserted at the raw RPC surface (BUG-155 pattern). Requires [[BUG-161]] fixed so the request resolves to an owning session.
-- [ ] AC-10: `session/list` from an unattached connection returns no `title` and no `cwd` for sessions it is not attached to; an attached connection sees the full summary. Asserted on the wire.
+- [x] AC-1: An e2e test drives a client connection **from a process that is a descendant of the daemon** (the shape a tool/MCP child actually has — amended at architecture 2026-08-11: the original wording said "with the daemon's spawn environment", but ADR-A keys the gate on kernel-attested ancestry, not environment, so an env-only fixture would assert nothing). Its `session/attach`, monitor declaration, and `session/prompt` against another connection's session are all refused with the BR-5 codes, and no consent prompt is offered for any of them. — `attach_authorization::a_client_driven_from_a_genuine_daemon_descendant_is_refused_at_every_door`. A **genuine** descendant, not an injected verdict: the daemon runs a `shell` tool whose command re-executes the test binary as a probe (`tetond` → `sh` → probe), and the probe reports its own parent chain, which the test asserts contains the daemon's pid. Refusals: `ATTACH_FORBIDDEN`, `ATTACH_FORBIDDEN`, `NOT_ATTACHED`. The "no prompt was offered" negative is read off the attached owner's stream — the surface all three would have been rendered at — and bounded by a positive control on the same daemon and the same connection: an ordinary same-UID client then asks and the prompt does appear.
+- [x] AC-2: A second legitimate client can attach to a live session through the grant flow; after the grant, REQ-568 delivery rules apply to it as an attached client. — the attach half by `e2e::conversation_carry::client_bs_prompt_carries_the_conversation_client_a_left_behind` (REQ-567 AC-9, un-`#[ignore]`d by TASK-108 and passing *through* the consent flow) and the control leg of `attach_authorization::a_session_id_read_from_session_list_is_not_standing_to_attach`; the delivery half by `attach_authorization::a_client_that_attached_through_the_grant_flow_receives_that_sessions_events`, which decides it by envelope `seq` — the newcomer receives the session-scoped event published after its grant and never the one published before it.
+- [x] AC-3: The resume flow — create session, disconnect the only client, reconnect with a fresh client, attach — succeeds with at most one visible consent step, and the test demonstrates the same sequence performed by a non-interactive process is refused. — the resume half by `attach_authorization::a_consent_the_requester_granted_itself_is_named_as_such_in_the_daemon_log` (leg 2: every attached client leaves, a fresh client attaches, exactly one `attach_consent_requested` is asserted); the refusal half by AC-1's descendant test, which performs the same sequence from a process the daemon spawned and is refused before any prompt is raised. The transition between the legs is an ordering marker (the `daemon_lifetime` frame the departing connection's guard publishes *after* its consent surface is released), not a sleep.
+- [x] AC-4: A monitor declaration without a monitor-scope grant is refused; an attach-scope grant for one session does not enable monitor (informed by LESSON-495). — `multi_client::a_monitor_declaration_is_refused_without_a_monitor_scope_grant` (no approver → `NOT_GRANTED`), `grants::tests::attach_and_monitor_are_answered_by_their_own_scope_and_no_other` (scope independence in both directions), and `multi_client::a_peers_own_second_connection_cannot_approve_it_a_monitor` (the verify-pass regression: the two-connection self-mint is refused). Note the shape of this AC changed at the verify pass — it previously also cited a test showing the monitor grant was *reachable*; that test was the attack, and reachability is now REQ-570's job (ADR-A-1).
+- [x] AC-5: Knowing a session id (via `session/list` or guessing) demonstrably does not enable attach: the test attaches by id without a grant and is refused. — `attach_authorization::a_session_id_read_from_session_list_is_not_standing_to_attach` at the real daemon binary (the id comes from `session/list`; the user says no; the refused peer is then shown to hold nothing) and `multi_client::knowing_a_session_id_does_not_let_another_connection_attach` at the seam (which also pins the no-existence-oracle half: a real id and a fabricated one draw the same code).
+- [x] AC-6: Consent timeout resolves to denied within the bounded window, emits `attach_refused` with the timeout code, and leaves no grant state behind. — `server::tests::a_denied_or_timed_out_consent_leaves_the_grant_registry_empty` (both endings; elapsed time bounded by the injected window; the grant registry inspected afterwards rather than inferred from the error code; exactly one `attach_refused` carrying `reason: consent_timeout` reaches the requester) and `consent::tests::every_ending_leaves_no_residual_entry`. Not re-driven at the wire in `attach_authorization`: the shipped window is 30 s and is a fixture knob on an in-process `Daemon`, not an env seam on the spawned binary, so an e2e leg would buy a slower copy of the same assertion — `multi_client::knowing_a_session_id_does_not_let_another_connection_attach` already asserts `CONSENT_TIMEOUT` on a real socket under a shortened window.
+- [x] AC-7: The single-client create → prompt → stream flow runs with zero new prompts or consent steps, and the full existing e2e suite passes. — `attach_authorization::the_single_client_create_prompt_stream_flow_asks_for_nothing_new`: the turn completes and streams (asserted on the streamed text, so "nothing was asked" cannot be true of a flow that never ran), and `attach_consent_requested`, `attach_refused` and `permission_request` are each asserted empty. Bounded by a control in the same test — a second client then attaches to that same session and the prompt appears at once on the same connection, so the empty lists are not an event this daemon cannot publish. Full workspace suite green.
+- [x] AC-8: Grant enforcement is asserted at the daemon seam by a test driving the RPC surface directly (not through the CLI), so no client-side check can mask a daemon-side gap (informed by BUG-155). — structural: every test in `crates/tetond/tests/attach_authorization.rs` speaks NDJSON JSON-RPC to the daemon's socket, and `multi_client.rs` does the same at the seam. No CLI is involved in any refusal asserted for this REQ.
+- [x] AC-9: An unattached (and separately, a monitor-only) connection calling `permission/respond` against another session's pending request is refused with the BR-5 code; after attaching, the same call succeeds. Asserted at the raw RPC surface (BUG-155 pattern). Requires [[BUG-161]] fixed so the request resolves to an owning session. — `multi_client::an_unattached_connection_cannot_answer_another_sessions_permission_prompt` (raw wire; the waiter stays pending and the rightful answer still resolves it) and `server::tests::a_monitor_may_see_a_permission_prompt_and_may_not_answer_it` for the monitor case, which is asserted one layer down because it also asserts the thing a socket test cannot: that the refused connection *did* receive the prompt (TASK-107's recorded deviation).
+- [x] AC-10: `session/list` from an unattached connection returns no `title` and no `cwd` for sessions it is not attached to; an attached connection sees the full summary. Asserted on the wire. — `multi_client::session_list_omits_title_and_cwd_from_unattached_connections`, asserted on the raw NDJSON text so the claim is that the characters never left the daemon, not merely that a parsed key was absent (TASK-105).
+
+## Residuals at close (recorded by TASK-109, 2026-08-11; corrected at the verify pass)
+
+### Correction (verify pass, 2026-08-11)
+
+Two of the three residuals below were **understated**, and one thing recorded as
+a closed capability was not safe. Recorded here rather than edited away, because
+what a residual was believed to be is part of the record:
+
+1. **The ancestry escape is one shell word, not a double-fork.** ADR-A described
+   it as "a daemon-spawned child that double-forks and reparents to
+   `launchd`/`init`", which reads as deliberate `fork()` code. The `shell` tool
+   runs `sh -c <model-supplied command>`, so `helper >/dev/null 2>&1 &` or
+   `setsid helper` produces exactly that escapee — one token in a tool call.
+   **And it composes with residual 2 below**: an escapee is classified
+   `NotDescendant`, which makes it eligible for the self-render arm, so it
+   attaches to any unheld session by answering its own prompt. **Not
+   compensated**: the verify pass had the `shell` tool kill its process group on
+   every completion arm rather than only on timeout, and the re-verify reverted
+   that (R4) — it destroyed work a command backgrounded on purpose, signalled a
+   pgid whose leader had already been reaped, and still did not reach `setsid`,
+   which leaves the group. See architecture.md ADR-A.
+2. **`monitor`'s consent path was mintable over the socket and has been
+   removed.** BR-2/AC-4 recorded `monitor` as reachable through an attached
+   client's consent. One actor holding two connections could satisfy that:
+   `session/create` is ungated, so connection A created a throwaway session and
+   became an eligible approver for connection B's monitor declaration, then
+   answered it — two `ConnectionId`s, so not even logged as a self-approval.
+   `monitor` keeps its grant gate and now has **no socket-reachable minter at
+   all**; a declaration without a pre-existing grant is refused `NOT_GRANTED`.
+   See architecture.md ADR-A-1.
+3. **The self-approval residual is now announced on the wire, not only in the
+   log.** Residual 2 below says the daemon "logs a distinct sentence". That
+   record goes to daemon stderr: read on startup failure and almost never
+   otherwise, truncated at 256 KiB by the CLI's spawn path, and writable by the
+   same uid the perimeter is drawn against — so the process that self-approved
+   can erase it. The log line stays, and a daemon-scoped `session_grant_minted`
+   event now accompanies it, carrying the scope, the requester descriptor, and
+   whether the grant was self-approved. In-perimeter, unsuppressable by the
+   requester, and delivered to every handshaked connection.
+
+### Correction (re-verify pass, 2026-08-11)
+
+The fixes above introduced regressions of their own, closed in the same file
+history; the one finding that is *not* a regression but a pre-existing defect the
+re-verify made visible is recorded as residual 4 below.
+
+4. **`self_approved` was presented as the field that catches self-dealing, and
+   it does not.** It is a fact about connection ids, so it is `false` for the
+   whole of BR-6's arm 1 — including one actor holding two connections and
+   having the first approve the second, which is the exact shape residual 2
+   above gives as the reason the monitor path was unfixable. The announcement
+   now carries the **approver's descriptor** beside the requester's, and the CLI
+   names who approved, so an operator can see the same name asked and answered
+   (R1).
+5. **A granted consent for a session that does not exist no longer leaves a
+   grant behind.** The consent still runs in full for a fabricated id — checking
+   existence first would rebuild the oracle BR-8 denies — but the entry is
+   retracted once the attach reports `UNKNOWN_SESSION`, so a peer self-approving
+   guesses no longer inserts one permanent registry row per guess, keyed by
+   strings it chose (R2).
+6. **The grant announcement is rate-limited per connection.** It is daemon-scoped
+   and attacker-triggerable, so an unbounded stream of them floods every client's
+   screen. At most three per connection per minute; the arrears ride out on the
+   next announcement that gets through (R3).
+
+Four things this REQ does **not** close, stated here rather than left to be
+discovered:
+
+1. **The client surface for BR-6 is outstanding.** The daemon side of the
+   attach/consent flow is complete and tested end to end, but nothing in
+   `crates/teton` calls `session/attach` and the CLI renders
+   `attach_consent_requested` as a notice it cannot answer — so no shipped user
+   can walk the resume flow yet. No shipped flow *regressed* (nothing called
+   `session/attach` before either), but BR-6 is a user-facing rule and it is
+   not user-reachable.
+2. **The self-approval arm (BR-3/BR-6's second sentence).** When no client is
+   attached to the target session, the requesting connection renders its own
+   consent prompt. For a headless same-UID process that is not a daemon
+   descendant, that means approving itself with no human involved. The daemon
+   cannot tell the two apart, so this is accepted — and, since TASK-109, it is
+   **announced**: the daemon logs a distinct sentence naming the grant as
+   self-approved at the moment it is minted (`server::self_approval_line`).
+   Closing it needs a mechanism outside this REQ's perimeter (a user-owned
+   surface the daemon can address, or the runtime signature verification ADR-A
+   defers as future hardening).
+3. **Daemon-wide methods (BR-9).** `permission/respond` is gated;
+   `model/confirm` and five sibling methods that take no connection at all are
+   not. Filed as [[BUG-162]] and deliberately not fixed here.
+4. **A grant's *capability* propagates transitively, even though its registry
+   entry does not (re-verify, R5).** ADR-C said a grant "can never be inherited";
+   that is true of the row and false of the access. BR-6's arm 1 admits any
+   connection attached to the target as an approver, with no relation to who
+   originally held the grant — so an approved connection X can approve its
+   owner's second connection Y, disconnect (dropping X's row), and leave Y as the
+   eligible approver for Z. One user consent, an unbounded chain, and the
+   connection it came from gone. Narrowing arm 1 is an authorization change with
+   its own failure modes — the obvious "only the creator may approve" breaks the
+   multi-client hand-off BR-6 exists for — so it is **owned by REQ-570**, not
+   patched here. This round corrected the false claim in ADR-C and made each mint
+   announce both parties, so a chain is visible as it forms.
 
 ## External Dependencies
 
@@ -118,10 +219,10 @@ are the architecture phase's decision, not this spec's.
 
 ## Open Questions
 
-- [ ] OQ-1: Which grant mechanism: peer-executable identity (kernel pid + signature check), OS-keychain-held grant material (ACL-bound to executable identity, as keychain provider keys already are per REQ-544 BR-7), user-mediated consent routed to an attached client, or a combination? Decide at architecture with a stated posture per platform.
-- [ ] OQ-2: What is the posture for unsigned/dev builds and Linux, where executable-identity attestation is weaker or absent? Fail-closed to consent-only, or accept a documented weaker perimeter?
-- [ ] OQ-3: Do grants persist across daemon restarts (and where), or is every daemon lifetime a fresh consent? Persistence trades one prompt for a stored credential whose storage becomes attack surface.
-- [ ] OQ-4: Should `session/list` redact sessions the caller holds no grant for (titles can carry boundary content), or is listing metadata acceptable while ids stop being credentials?
+- [x] OQ-1: RESOLVED at architecture (ADR-A) — process ancestry, plus user-mediated consent for everything ancestry does not exclude. Runtime code-signature verification and keychain-held grants were both rejected on evidence (no runtime signing machinery exists, and dev builds are unsigned, so either guard would be inert exactly where it is developed). (Original question: which grant mechanism?)
+- [x] OQ-2: RESOLVED at architecture (ADR-B) — the question dissolves rather than being answered with a compromise: ancestry needs only the peer pid, so dev and release builds get identical enforcement, and macOS and Linux are both first class (`LOCAL_PEERPID`/`SO_PEERCRED`, with a platform-free policy layer over a `pid -> ppid` lookup). (Original question: what is the posture for unsigned/dev builds and Linux?)
+- [x] OQ-3: RESOLVED at architecture (ADR-C) — no. A grant lives in the daemon's memory for the life of the connection that holds it and is never written to disk or keychain: persistence would buy one avoided prompt and cost a stored credential, which is a bad trade for a control whose whole point is that possession of local state must not confer access (BR-3). (Original question: do grants persist across daemon restarts?)
+- [x] OQ-4: RESOLVED 2026-08-11 — answered by BR-10 during the REQ-568 verify pass: `session/list` keeps the id namespace open (ids stop being credentials) but reduces the *payload* — `title` and `cwd` are served only to a connection attached to (or holding a grant for) that session, because a title is model-generated from the user's prompt text and `cwd` is an absolute path. Both are boundary content, not metadata. (Original question: redact unheld sessions, or accept listing metadata?)
 
 ## Out of Scope
 

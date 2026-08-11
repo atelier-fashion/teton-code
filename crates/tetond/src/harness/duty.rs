@@ -1059,7 +1059,7 @@ pub(crate) mod testing {
             }),
             egress,
             "claude-opus-4",
-            "sess-1",
+            "sess-under-test",
         );
         (route, sent)
     }
