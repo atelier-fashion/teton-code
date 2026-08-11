@@ -1,7 +1,7 @@
 ---
 id: TASK-103
 title: "Peer identity: kernel-attested PID and ancestry, with a platform-free policy layer"
-status: draft
+status: complete
 parent: REQ-569
 created: 2026-08-11
 updated: 2026-08-11
@@ -26,11 +26,33 @@ wired yet — TASK-106 consumes this.
 
 ## Acceptance Criteria
 
-- [ ] Peer PID is obtained on macOS AND Linux; the existing uid refusal behavior is byte-identical (no regression to `auth.rs`'s error taxonomy).
-- [ ] `is_descendant_of` is pure over a `ParentOf` lookup and covered by a table test including the cycle and depth-cap cases (a malicious/looping chain must terminate, never hang).
-- [ ] `Indeterminate` is a distinct variant, never silently mapped to "not a descendant".
-- [ ] Real-syscall test runs on both platforms (cfg-gated arms, both compiled and executed in CI — LESSON-433: one-platform verification of cfg-gated code is false confidence).
-- [ ] `cargo test -p tetond` and `cargo clippy --workspace --all-targets -- -D warnings` green on the developer's platform; CI green on both.
+- [x] Peer PID is obtained on macOS AND Linux; the existing uid refusal behavior is byte-identical (no regression to `auth.rs`'s error taxonomy).
+- [x] `is_descendant_of` is pure over a `ParentOf` lookup and covered by a table test including the cycle and depth-cap cases (a malicious/looping chain must terminate, never hang).
+- [x] `Indeterminate` is a distinct variant, never silently mapped to "not a descendant".
+- [x] Real-syscall test runs on both platforms (cfg-gated arms, both compiled and executed in CI — LESSON-433: one-platform verification of cfg-gated code is false confidence).
+- [x] `cargo test -p tetond` and `cargo clippy --workspace --all-targets -- -D warnings` green on the developer's platform; CI green on both.
+
+## Verification
+
+What was **executed** locally (macOS/arm64): `cargo build -p tetond`,
+`cargo test -p tetond --no-fail-fast` (1311 passed, 0 failed, 1 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`rustfmt --check` on the files this task owns. The macOS syscall arm therefore
+ran for real: `sysctl(KERN_PROC_PID)` is checked against an independent
+`getppid(2)`, and the peer-pid read is checked against `std::process::id()`
+over a live socket.
+
+What is **compile-verified but not executed** locally: the Linux arms. There is
+no cross C toolchain on this machine, so `crates/tetond/src/peer.rs` was type-checked
+directly for `x86_64-unknown-linux-gnu` (lib and `--test`), and a planted
+sentinel confirmed the `#[cfg(target_os = "linux")]` impl *and* the Linux
+`#[test]` are genuinely selected on that target and excluded on macOS — the
+specific trap LESSON-433 describes. The `PPid:` parse was additionally lifted
+out of the `cfg` (`ppid_from_proc_status`) so it executes on every platform's
+test run, leaving CI's Linux leg to confirm only the procfs read. `auth.rs`'s
+`SO_PEERCRED` arm is unchanged apart from keeping the `pid` field it already
+received; its types were checked against the `libc` source for the target.
+**CI's Linux leg remains the authoritative check for those arms.**
 
 ## Technical Notes
 

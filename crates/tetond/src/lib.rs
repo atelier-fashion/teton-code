@@ -8,7 +8,10 @@
 //!
 //! Module map:
 //! - [`server`] — the UDS listener, per-client tasks, and JSON-RPC dispatch.
-//! - [`auth`] — socket permissions and the peer-credential uid check.
+//! - [`auth`] — socket permissions and the peer-credential uid/pid check.
+//! - [`peer`] — process ancestry (REQ-569 ADR-A/ADR-B): a thin per-platform
+//!   `pid -> ppid` seam under a pure, table-testable "is this peer a descendant
+//!   of this daemon?" decision. Answers the question; gates nothing.
 //! - [`sessions`] — the authoritative, client-independent session registry.
 //! - [`broadcast`] — the bounded, slow-client-evicting event bus.
 //! - [`egress`] — the single egress choke point: privacy-boundary enforcement
@@ -69,6 +72,7 @@ pub mod keychain;
 pub mod lifetime;
 pub mod mcp;
 pub mod model_consent;
+pub mod peer;
 pub mod router;
 pub mod runtime;
 pub mod selection_store;
