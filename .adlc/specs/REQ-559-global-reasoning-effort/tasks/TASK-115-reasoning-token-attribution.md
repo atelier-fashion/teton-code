@@ -55,7 +55,11 @@ reasoning tokens are already inside `completion_tokens` / `output_tokens`, so
 - [ ] `cost_records` gains a nullable `reasoning_tokens INTEGER` column in
       `SCHEMA` **and** a matching `ADDITIVE_COLUMNS` entry — a column added to
       `SCHEMA` alone never reaches an existing `cost.db`, because
-      `CREATE TABLE IF NOT EXISTS` is a no-op there.
+      `CREATE TABLE IF NOT EXISTS` is a no-op there. `ADDITIVE_COLUMNS` is a
+      **fixed-size array** (`[(&str, &str); 2]` at `ledger.rs:130`); its length
+      must go to `3`. The compiler catches a forgotten bump, but only if the
+      entry is actually added — adding the column to `SCHEMA` alone compiles
+      cleanly and silently fails to migrate existing ledgers.
 - [ ] Opening a `cost.db` written by a pre-REQ build succeeds, adds the column,
       and reads historical rows back with `reasoning_tokens: None`. Rows are
       **never backfilled** — a row written before the column existed predates the
