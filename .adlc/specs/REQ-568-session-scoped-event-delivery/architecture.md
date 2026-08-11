@@ -51,6 +51,24 @@ delivered, the invariant is untouched and BR-7 holds with zero fence changes.
 client observes monotonic but non-contiguous `seq`. Nothing may assume
 contiguity; the scoping test pins gap tolerance.
 
+**Two known properties recorded for REQ-569** (found in the REQ-568 verify pass;
+both harmless while attach is unauthenticated, both sharpen once REQ-569 adds
+attach authorization — so REQ-569 must not assume the boundary is instantaneous
+or side-channel-free):
+- *Retroactive attach window.* `may_receive` is evaluated when the forwarder
+  drains an envelope, not when the bus queues it, and `attached` only grows. A
+  `session/attach` at time T therefore releases session-S envelopes published
+  *before* T that are still sitting in this connection's subscription channel
+  (bounded by `DEFAULT_CAPACITY`), and a peer that stops reading its socket can
+  widen that backlog before attaching. Today this buys nothing over attaching
+  earlier (attach is unauthenticated); under REQ-569 it is a pre-authorization
+  history leak unless the delivery decision is stamped at publish time.
+- *Seq activity oracle.* Because `seq` is global and filtering is after-the-fact,
+  a filtered connection can count how many events other sessions produce (volume
+  metadata, never content). Strictly better than the pre-fix full-content leak
+  and deliberately accepted; a per-connection sequence assigned at the forwarding
+  seam would remove it.
+
 ### ADR-B: `NOT_ATTACHED` (-32009) is distinct from `UNKNOWN_SESSION` (-32001)
 
 Prompt/clear against an existing-but-unattached session → `NOT_ATTACHED`;
