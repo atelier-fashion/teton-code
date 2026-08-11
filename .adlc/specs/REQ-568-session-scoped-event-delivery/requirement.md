@@ -1,7 +1,7 @@
 ---
 id: REQ-568
 title: "Session-scoped event delivery and bounded request frames"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-10
 updated: 2026-08-11

@@ -1,0 +1,53 @@
+{
+  "req": "REQ-568",
+  "branch": "feat/REQ-568-session-scoped-event-delivery",
+  "startedAt": "2026-08-11T12:35:12Z",
+  "completed": false,
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Create Worktrees + Preflight",
+      "completedAt": "2026-08-11T12:35:12Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-11T12:36:30Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-568",
+      "branch": "feat/REQ-568-session-scoped-event-delivery",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "notes": {
+    "specMergedToMainVia": "PR #90 (05ca703) before pipeline start, per normal flow; carries both REQ-568 and its OQ-1 follow-up spec REQ-569",
+    "draftPrDeferred": "branch had no commits beyond origin/main at Step 0; PR creation deferred to Phase 6 fallback per LESSON-004 (same posture as REQ-567)",
+    "manifestAdvisory": "REQ-568 sole in-flight item at Step 0; no overlaps, no stale blockers",
+    "idRecheck": "refs/adlc/ids/req/568 reservation confirmed self (this machine's allocator), REQ-545 recheck clear"
+  }
+}
