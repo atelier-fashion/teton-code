@@ -36,6 +36,7 @@
 //! The one thing keyed on the *tier* rather than the key is the fifth prompt
 //! option, `enable_permanent` — see [`options_for`].
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -206,6 +207,14 @@ impl Default for PermissionConfig {
 #[derive(Default)]
 pub struct PendingPermissions {
     waiters: Mutex<HashMap<RequestId, oneshot::Sender<PermissionOutcome>>>,
+    // The request-id counter lives HERE — daemon-wide — not on `PermissionGate`,
+    // so the id namespace matches the resolution namespace this map defines
+    // (BUG-161). A per-session counter minted `perm-0`, `perm-1`, … in every
+    // session, and this map is shared across all sessions' gates, so two
+    // sessions collided on `perm-0` and one's `register` overwrote the other's
+    // waiter — resolving one session's prompt then answered the other's tool
+    // call. A single monotonic counter makes every id unique by construction.
+    counter: AtomicU64,
 }
 
 impl PendingPermissions {
@@ -215,13 +224,43 @@ impl PendingPermissions {
         Self::default()
     }
 
+    /// Mint the next request id. Daemon-wide and monotonic, so no two prompts —
+    /// in the same session or across sessions — ever share an id (BUG-161).
+    fn next_request_id(&self) -> RequestId {
+        RequestId::from(format!(
+            "perm-{}",
+            self.counter.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
     /// Register a waiter and return the receiver the caller awaits.
+    ///
+    /// Refuses to overwrite an existing waiter rather than replacing it. With
+    /// [`next_request_id`](Self::next_request_id) minting unique ids this is
+    /// unreachable, so a collision here means a per-scope counter has crept back
+    /// (the BUG-161 shape) — we keep the first waiter and let this caller's
+    /// receiver resolve to the safe default (`Denied`, via the dropped sender),
+    /// never silently stealing another prompt's answer.
     fn register(&self, id: RequestId) -> oneshot::Receiver<PermissionOutcome> {
         let (tx, rx) = oneshot::channel();
-        self.waiters
+        let mut waiters = self
+            .waiters
             .lock()
-            .expect("pending permissions mutex poisoned")
-            .insert(id, tx);
+            .expect("pending permissions mutex poisoned");
+        match waiters.entry(id) {
+            Entry::Vacant(slot) => {
+                slot.insert(tx);
+            }
+            Entry::Occupied(existing) => {
+                // request_id is `perm-N`, never content — safe to log (conventions).
+                eprintln!(
+                    "tetond: permission request_id collision on {:?} — refusing to overwrite the waiting prompt (BUG-161 tripwire)",
+                    existing.key()
+                );
+                // `tx` drops here → `rx` yields `RecvError` → the caller's
+                // `authorize` takes its `Denied` arm.
+            }
+        }
         rx
     }
 
@@ -281,7 +320,6 @@ pub struct PermissionGate {
     grants: Mutex<HashMap<String, RememberedGrant>>,
     events: Arc<EventBus>,
     pending: Arc<PendingPermissions>,
-    counter: AtomicU64,
     /// Where `enable_permanent` writes, when anything offers it (REQ-563 BR-4).
     ///
     /// `None` on a gate nobody wired one into: the option is still offered and
@@ -307,7 +345,6 @@ impl PermissionGate {
             grants: Mutex::new(HashMap::new()),
             events,
             pending,
-            counter: AtomicU64::new(0),
             web_persistence: None,
         }
     }
@@ -404,10 +441,7 @@ impl PermissionGate {
 
         // Register the waiter, publish the prompt, then await — no lock is held
         // across the await.
-        let request_id = RequestId::from(format!(
-            "perm-{}",
-            self.counter.fetch_add(1, Ordering::SeqCst)
-        ));
+        let request_id = self.pending.next_request_id();
         let rx = self.pending.register(request_id.clone());
 
         self.events.publish(
@@ -685,6 +719,80 @@ mod tests {
             gate.authorize("shell", None).await,
             PermissionDecision::Denied
         );
+        assert_eq!(pending.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_get_distinct_ids_and_resolve_independently() {
+        // BUG-161 regression. Two sessions' gates share one `PendingPermissions`
+        // (the production wiring: `session_gates` all hold the same
+        // `Arc<PendingPermissions>`). A per-session counter minted `perm-0` in
+        // both, so the second `register` overwrote the first's waiter and one
+        // session's answer resolved the other's tool call. With a daemon-wide
+        // counter the two ids differ and each answer routes to its own session.
+        let bus = Arc::new(EventBus::new());
+        let pending = Arc::new(PendingPermissions::new());
+        let mut cfg = PermissionConfig::permissive();
+        cfg.set("shell", PermissionPolicy::Ask);
+        let gate_a = PermissionGate::new(
+            SessionId::from("s1"),
+            cfg.clone(),
+            Arc::clone(&bus),
+            Arc::clone(&pending),
+        );
+        let gate_b = PermissionGate::new(
+            SessionId::from("s2"),
+            cfg,
+            Arc::clone(&bus),
+            Arc::clone(&pending),
+        );
+        let mut sub = bus.subscribe(16);
+
+        // Both sessions prompt at once; A is answered allow, B is answered reject.
+        let decide_a = gate_a.authorize("shell", Some("A".to_owned()));
+        let decide_b = gate_b.authorize("shell", Some("B".to_owned()));
+        let drive = async {
+            // Collect the two prompts and the id each session was assigned.
+            let mut a_rid: Option<RequestId> = None;
+            let mut b_rid: Option<RequestId> = None;
+            while a_rid.is_none() || b_rid.is_none() {
+                let env = sub.recv().await.unwrap();
+                let session = env.session_id.clone();
+                if let Event::PermissionRequest(pr) = env.event {
+                    if session == Some(SessionId::from("s1")) {
+                        a_rid = Some(pr.request_id);
+                    } else if session == Some(SessionId::from("s2")) {
+                        b_rid = Some(pr.request_id);
+                    } else {
+                        panic!("unexpected session {session:?}");
+                    }
+                }
+            }
+            let a_rid = a_rid.unwrap();
+            let b_rid = b_rid.unwrap();
+            // The heart of the fix: the two sessions did NOT collide on one id.
+            assert_ne!(
+                a_rid, b_rid,
+                "concurrent sessions must not share a request id"
+            );
+            // Each answer resolves exactly its own session's waiter.
+            assert!(pending.resolve(
+                &a_rid,
+                PermissionOutcome::Selected {
+                    option_id: "allow_once".to_owned()
+                }
+            ));
+            assert!(pending.resolve(
+                &b_rid,
+                PermissionOutcome::Selected {
+                    option_id: "reject_once".to_owned()
+                }
+            ));
+        };
+        let (decision_a, decision_b, ()) = tokio::join!(decide_a, decide_b, drive);
+        // A said allow, B said reject — no cross-answer.
+        assert_eq!(decision_a, PermissionDecision::Allowed);
+        assert_eq!(decision_b, PermissionDecision::Denied);
         assert_eq!(pending.pending_count(), 0);
     }
 
