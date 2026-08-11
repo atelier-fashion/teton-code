@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 title: "BR-10(a): every daemon-wide method takes and checks connection context"
-status: pending
+status: complete
 parent: REQ-570
 created: 2026-08-11
 updated: 2026-08-11
@@ -40,17 +40,17 @@ ancestry gate.
 
 ## Acceptance Criteria
 
-- [ ] Each of the seven methods refuses a connection failing the ancestry gate,
+- [x] Each of the seven methods refuses a connection failing the ancestry gate,
       asserted **per method at the raw RPC surface**, not for one representative.
-- [ ] `Ancestry::Indeterminate` is refused alongside `Descendant`, inheriting
+- [x] `Ancestry::Indeterminate` is refused alongside `Descendant`, inheriting
       `may_hold_session_access`'s fail-closed policy.
-- [ ] The happy path is untouched: an ordinary non-descendant CLI still reaches
+- [x] The happy path is untouched: an ordinary non-descendant CLI still reaches
       all seven.
-- [ ] AC-8 regression bar: single-client create → prompt → stream, and the
+- [x] AC-8 regression bar: single-client create → prompt → stream, and the
       creator's own attach, gain **zero** new prompts or refusals.
-- [ ] Mutation check (AC-11, BR-10a arm): removing any one method's gate makes
+- [x] Mutation check (AC-11, BR-10a arm): removing any one method's gate makes
       at least one test red. See it fail, restore.
-- [ ] `cargo test -p tetond --no-fail-fast` green.
+- [x] `cargo test -p tetond --no-fail-fast` green.
 
 ## Technical Notes
 

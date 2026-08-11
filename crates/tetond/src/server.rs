@@ -774,6 +774,58 @@ const ATTACH_FORBIDDEN_MESSAGE: &str =
 const NOT_GRANTED_MESSAGE: &str =
     "no monitor-scope grant, and this daemon has no way to mint one over the socket";
 
+/// The BR-10(a) standing check for a **daemon-wide** method (REQ-570 ADR-A,
+/// closes BUG-162).
+///
+/// Seven methods took no connection context at all, so any handshaked same-UID
+/// connection — including a daemon-spawned tool/MCP child that REQ-569 BR-4
+/// otherwise excludes from session access — could commit a multi-gigabyte
+/// download and a daemon-wide model change on the user's behalf.
+///
+/// **Why a standing rule and not "the connection that raised the request".**
+/// BUG-162 proposes binding the answer to the raiser, and REQ-570's Permissions
+/// table inherits that wording. For `model/confirm` there is no such connection:
+/// `model_consent` raises the proposal from the first-run flow spawned beside
+/// `serve`, which its own comment notes "may publish before the daemon accepts
+/// its first connection", and publishes it `None`-scoped because local model
+/// selection is a machine-wide fact. The raiser is the *daemon*. Inventing a
+/// raiser (first-claim-wins) would hand the proposal to whichever connection
+/// races fastest, which an attacker wins as easily as a user.
+///
+/// So the rule is the standing that already exists and is exactly right —
+/// REQ-569's ancestry gate — which is what BUG-162's own *Expected Behavior*
+/// names as the minimum bar: "answerable only by a connection entitled to answer
+/// it — minimally, not by the daemon's own spawned children".
+///
+/// It inherits [`ConnState::may_hold_session_access`]'s fail-closed treatment of
+/// [`Ancestry::Indeterminate`], so a vanished pid or an unreadable chain costs
+/// the same as a confirmed descendant.
+///
+/// **What it does not claim.** It cannot distinguish a user's real CLI from a
+/// non-descendant headless same-UID process; that distinction is unavailable to
+/// this layer by construction and is what BR-10(b)'s attestation supplies. This
+/// is a real reduction in blast radius — the daemon's own children lose the
+/// capability outright — recorded at that strength rather than oversold.
+///
+/// Returns the refusal to hand back, or `None` to proceed. Called as a **single
+/// line at the top of each of the seven handlers** rather than once in
+/// [`dispatch`], deliberately: AC-11's mutation check requires removing *a
+/// method's* check to make a test red, per method rather than for one
+/// representative (LESSON-502), and a single shared gate has only one thing to
+/// remove.
+/// Borrows `id` and clones only on the refusal path, so the overwhelmingly
+/// common "allowed" case leaves the caller's `id` untouched to pass on.
+fn refuse_daemon_wide(conn: &ConnState, id: &Id) -> Option<String> {
+    if conn.may_hold_session_access() {
+        return None;
+    }
+    Some(error_string(
+        id.clone(),
+        error_code::ATTACH_FORBIDDEN,
+        ATTACH_FORBIDDEN_MESSAGE,
+    ))
+}
+
 /// The refusal a connection gets when it already has
 /// [`MAX_PENDING_CONSENTS_PER_CONNECTION`] prompts outstanding (REQ-569 verify,
 /// F4).
@@ -1737,18 +1789,18 @@ fn dispatch(
         PermissionRespondParams::METHOD => {
             Some(handle_permission_respond(daemon, conn, id, params))
         }
-        ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, id, params)),
+        ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, conn, id, params)),
         ModelListParams::METHOD => Some(ok_string(id, &daemon.runtime.model_list())),
-        ModelSetParams::METHOD => Some(handle_model_set(daemon, id, params)),
+        ModelSetParams::METHOD => Some(handle_model_set(daemon, conn, id, params)),
         ModelStatusParams::METHOD => Some(ok_string(id, &daemon.runtime.model_status())),
-        ConfigGetParams::METHOD => Some(handle_config_get(daemon, id)),
-        ConfigSetParams::METHOD => Some(handle_config_set(daemon, id, params)),
-        CostQueryParams::METHOD => Some(handle_cost_query(daemon, id)),
+        ConfigGetParams::METHOD => Some(handle_config_get(daemon, conn, id)),
+        ConfigSetParams::METHOD => Some(handle_config_set(daemon, conn, id, params)),
+        CostQueryParams::METHOD => Some(handle_cost_query(daemon, conn, id)),
         WebOverrideParams::METHOD => Some(handle_web_override(daemon, conn, id, params)),
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
-        WebRefreshParams::METHOD => Some(handle_web_refresh(daemon, id, params)),
+        WebRefreshParams::METHOD => Some(handle_web_refresh(daemon, conn, id, params)),
         _ => Some(error_string(
             id,
             error_code::METHOD_NOT_FOUND,
@@ -1825,7 +1877,11 @@ fn handle_session_permissions(daemon: &Daemon, conn: &ConnState, id: Id, params:
 /// fallible — a cached file that will not unlink is the one outcome that would
 /// otherwise leave the user's next lookup silently reading the copy they asked
 /// to drop, so it comes back as an error rather than as `absent`.
-fn handle_web_refresh(daemon: &Daemon, id: Id, params: Value) -> String {
+fn handle_web_refresh(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162: see `refuse_daemon_wide`.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     let params: WebRefreshParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -1894,7 +1950,14 @@ fn handle_permission_respond(daemon: &Daemon, conn: &ConnState, id: Id, params: 
 /// can fix (an unknown catalog name, an above-RAM-floor pick with no second
 /// confirmation, BR-3). Those come back as `INVALID_PARAMS` with the proposal
 /// still open, rather than silently consuming the user's one chance to answer.
-fn handle_model_confirm(daemon: &Daemon, id: Id, params: Value) -> String {
+fn handle_model_confirm(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162, the bug's headline case: this method commits a
+    // multi-gigabyte download and a daemon-wide model change, and took no
+    // connection context at all. See `refuse_daemon_wide` for why the check is a
+    // standing rule rather than a raiser-identity one.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     let params: ModelConfirmParams = match serde_json::from_value(params) {
         Ok(params) => params,
         // A closed enum by design (TASK-001): an `outcome` this build does not
@@ -1912,7 +1975,12 @@ fn handle_model_confirm(daemon: &Daemon, id: Id, params: Value) -> String {
 /// Records and announces the decision synchronously so the client gets an
 /// immediate answer, then installs the newly chosen weights on its own task —
 /// a multi-gigabyte download must not hold the reader loop.
-fn handle_model_set(daemon: &Daemon, id: Id, params: Value) -> String {
+fn handle_model_set(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162: the same daemon-wide commitment as `model/confirm`,
+    // reached by a different door.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     let params: ModelSetParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -1957,7 +2025,14 @@ fn handle_model_set(daemon: &Daemon, id: Id, params: Value) -> String {
 }
 
 /// Serve the current configuration snapshot (`config/get`).
-fn handle_config_get(daemon: &Daemon, id: Id) -> String {
+fn handle_config_get(daemon: &Daemon, conn: &ConnState, id: Id) -> String {
+    // BR-10(a) / BUG-162: exposes provider endpoints and `auth_ref` names (not
+    // secret material) to any connection. Low severity — the same-UID
+    // file-access refutation in the bug applies — but gated for the same reason
+    // as its neighbours: one rule at seven seams, not six and an exception.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     ok_string(
         id,
         &ConfigGetResult {
@@ -1968,7 +2043,15 @@ fn handle_config_get(daemon: &Daemon, id: Id) -> String {
 
 /// Apply a configuration mutation (`config/set`), rejecting it on validation
 /// failure (e.g. a raw key in `auth_ref`, BR-7).
-fn handle_config_set(daemon: &Daemon, id: Id, params: Value) -> String {
+fn handle_config_set(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162, deliberately downgraded there and gated here anyway:
+    // config lives at `base_dir/config.toml`, which any same-UID process can
+    // already write directly, so this removes *immediacy* (no daemon restart
+    // needed) rather than a capability. Defense in depth, not the emergency the
+    // raw audit finding suggested.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     let params: ConfigSetParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -1980,7 +2063,14 @@ fn handle_config_set(daemon: &Daemon, id: Id, params: Value) -> String {
 }
 
 /// Serve the authoritative cost report from the ledger (`cost/query`, BR-2).
-fn handle_cost_query(daemon: &Daemon, id: Id) -> String {
+fn handle_cost_query(daemon: &Daemon, conn: &ConnState, id: Id) -> String {
+    // BR-10(a) / BUG-162: returns a daemon-wide roll-up spanning *every* session
+    // (phase names, provider ids, token counts) — a genuine cross-session
+    // metadata read, directly adjacent to the payload reduction REQ-569 landed
+    // for `session/list`.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     match daemon.runtime.cost_report() {
         Ok(result) => ok_string(id, &result),
         Err(err) => error_from(id, err),
@@ -1990,6 +2080,14 @@ fn handle_cost_query(daemon: &Daemon, id: Id) -> String {
 /// Create a session (`session/create`), attaching the creating connection to it
 /// (REQ-568 BR-1).
 fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162: the odd one of the seven. This handler already
+    // *receives* the connection and simply never consulted the gate, so a daemon
+    // descendant that BR-4 forbids from attaching could still create and drive
+    // its **own** session, spending the user's provider credits — outside BR-4's
+    // literal wording, inside REQ-569 ADR-A's rationale.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     let params: SessionCreateParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -2856,6 +2954,33 @@ mod tests {
         )
     }
 
+    /// Give `conn` a session it created, **without** going through the
+    /// `session/create` RPC (REQ-570 TASK-002).
+    ///
+    /// Needed because BR-10(a) now gates that RPC on the ancestry check, so a
+    /// `Descendant` / `Indeterminate` connection can no longer acquire
+    /// session-holding standing over the socket at all — which is the point of
+    /// the gate.
+    ///
+    /// The REQ-569 fixtures that hand a daemon child a session of its own are
+    /// asking a *different* question: "even a descendant that **is** attached
+    /// may not approve a consent request". That question is still live and still
+    /// worth asserting, and it needs the child genuinely attached to be
+    /// non-vacuous — so those fixtures establish the standing directly here
+    /// rather than through the gate that now, correctly, refuses them.
+    ///
+    /// Deliberately not a bypass anything in production can reach: it pokes the
+    /// session registry and the connection's own bookkeeping, which is exactly
+    /// what `handle_session_create` does after its checks pass.
+    fn seed_created_session(daemon: &Daemon, conn: &ConnState) -> SessionId {
+        let summary = daemon
+            .sessions
+            .create(teton_protocol::SessionMode::Freeform, None, None)
+            .expect("the test session registry accepts a freeform session");
+        conn.record_created(summary.session_id.clone());
+        summary.session_id
+    }
+
     /// An ordinary connection that calls itself `requester` at the handshake.
     ///
     /// The descriptor has to be settable for the R1 tests: what a grant
@@ -2941,6 +3066,118 @@ mod tests {
         )
         .unwrap();
         assert!(response.contains("-32601")); // METHOD_NOT_FOUND
+    }
+
+    /// The seven daemon-wide methods BUG-162 enumerates, with the params each
+    /// needs to get *past* parsing — so a refusal below is the ancestry gate
+    /// answering and never a malformed-params rejection wearing the same shape.
+    fn daemon_wide_methods() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                ModelConfirmParams::METHOD,
+                serde_json::json!({"request_id": "model-0", "outcome": {"outcome": "accept"}}),
+            ),
+            (
+                ModelSetParams::METHOD,
+                serde_json::json!({"name": "small-fit", "confirmed_above_ram_floor": false}),
+            ),
+            (ConfigGetParams::METHOD, serde_json::json!({})),
+            (
+                ConfigSetParams::METHOD,
+                serde_json::json!({"update": {"local_model": {"auto_accept": true}}}),
+            ),
+            (CostQueryParams::METHOD, serde_json::json!({})),
+            (
+                WebRefreshParams::METHOD,
+                serde_json::json!({"url": "https://example.invalid/a"}),
+            ),
+            (
+                SessionCreateParams::METHOD,
+                serde_json::json!({"mode": "freeform"}),
+            ),
+        ]
+    }
+
+    /// **REQ-570 AC-10, layer (a) — BUG-162.** Every daemon-wide method refuses a
+    /// connection that fails the ancestry gate.
+    ///
+    /// Asserted **per method**, not for one representative, and that is the whole
+    /// point: LESSON-502 says an invariant enforced at several seams needs a test
+    /// at each seam, and these seven are seven separate one-line checks that a
+    /// future edit can drop one at a time. A single representative test would go
+    /// green with six of the seven gates deleted.
+    ///
+    /// Both refused ancestries are covered, because
+    /// `may_hold_session_access` treats `Indeterminate` as `Descendant` — "I
+    /// could not tell" must cost the same as "it did", or the guard's failure
+    /// mode is open.
+    #[test]
+    fn every_daemon_wide_method_refuses_a_connection_that_fails_the_ancestry_gate() {
+        for ancestry in [Ancestry::Descendant, Ancestry::Indeterminate] {
+            for (method, params) in daemon_wide_methods() {
+                let daemon = Daemon::new();
+                let child = conn_with_ancestry(&daemon, ancestry);
+                let response =
+                    dispatch(&daemon, &child, Id::Number(1), method, params.clone()).unwrap();
+                assert!(
+                    response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                    "{ancestry:?} calling `{method}` must be refused by the ancestry gate: \
+                     {response}"
+                );
+            }
+        }
+    }
+
+    /// The non-vacuity half: an ordinary connection reaches all seven.
+    ///
+    /// Without this, the test above would still pass if a typo made every method
+    /// name unroutable — it would be asserting that seven strings are not
+    /// methods. What is asserted here is narrow on purpose: **not** that the call
+    /// succeeds (several of these legitimately fail on an empty test daemon —
+    /// an unknown catalog entry, no such pending proposal), only that whatever
+    /// comes back is not the *ancestry* refusal.
+    #[test]
+    fn an_ordinary_connection_is_not_refused_the_daemon_wide_methods_by_ancestry() {
+        for (method, params) in daemon_wide_methods() {
+            let daemon = Daemon::new();
+            let ordinary = unattached(&daemon);
+            assert!(
+                ordinary.may_hold_session_access(),
+                "the fixture is only meaningful if this connection passes the gate"
+            );
+            let response =
+                dispatch(&daemon, &ordinary, Id::Number(1), method, params.clone()).unwrap();
+            assert!(
+                !response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                "`{method}` must not refuse an ordinary connection on ancestry: {response}"
+            );
+        }
+    }
+
+    /// **AC-8 regression bar, at this layer.** The creator path gains nothing.
+    ///
+    /// `session/create` is the one of the seven an ordinary client calls as its
+    /// very first act, so a gate placed slightly wrong there would break every
+    /// session in the product rather than fail a security test.
+    #[test]
+    fn the_ordinary_create_path_is_untouched_by_the_daemon_wide_gate() {
+        let daemon = Daemon::new();
+        let creator = unattached(&daemon);
+        let created = handle_session_create(
+            &daemon,
+            &creator,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        let session = created_session_id(&created);
+        assert!(
+            creator.may_receive(Some(&session)),
+            "the creator is attached to what it just made, exactly as before"
+        );
+        assert!(
+            daemon.grants.is_empty(),
+            "and the creator path still mints no grant at all"
+        );
     }
 
     #[test]
@@ -3516,13 +3753,14 @@ mod tests {
             let child = conn_with_ancestry(&daemon, ancestry);
             // The child holds a session of its own — the standing that would
             // otherwise make it an eligible approver.
-            let created = handle_session_create(
-                &daemon,
-                &child,
-                Id::Number(1),
-                serde_json::json!({"mode": "freeform"}),
-            );
-            let own = created_session_id(&created);
+            //
+            // Seeded directly rather than through `session/create`: REQ-570
+            // BR-10(a) now gates that RPC on the same ancestry check, so a child
+            // cannot acquire this standing over the socket at all. The question
+            // *this* test asks is the other one — whether a descendant that
+            // genuinely holds a session may approve — and it needs the standing
+            // to be real to be worth asking.
+            let own = seed_created_session(&daemon, &child);
             assert!(
                 child.may_receive(Some(&own)),
                 "{ancestry:?}: the fixture is only meaningful if the child is attached"
@@ -3595,15 +3833,18 @@ mod tests {
             let daemon = daemon_with_short_consent();
 
             // The holder: excluded from *answering*, but a genuine holder of a
-            // session it created (`session/create` is ungated by design).
+            // session it created.
+            //
+            // REQ-570 BR-10(a) closed the "`session/create` is ungated by
+            // design" premise this fixture was originally written against — a
+            // daemon child can no longer create one over the socket. The F2
+            // property under test is unchanged and still matters: a session held
+            // by a connection that may not answer is **still held**, so a
+            // stranger's attach fails closed on a timeout instead of falling
+            // through to a self-render. Seeded directly so the holder is a real
+            // holder.
             let holder = conn_with_ancestry(&daemon, ancestry);
-            let created = handle_session_create(
-                &daemon,
-                &holder,
-                Id::Number(1),
-                serde_json::json!({"mode": "freeform"}),
-            );
-            let session = created_session_id(&created);
+            let session = seed_created_session(&daemon, &holder);
             let mut holder_prompts = as_surface(&daemon, &holder);
 
             // The attacker: an ordinary connection the ancestry gate lets

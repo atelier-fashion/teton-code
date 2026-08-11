@@ -1162,23 +1162,33 @@ async fn a_connection_from_the_daemons_own_process_tree_is_refused_attach_and_mo
             .with_daemon_process(server::DaemonProcess::Own(me))
             .with_consent_timeout(TEST_CONSENT_WINDOW),
     );
+    // A real session id to aim at, seeded straight into the registry.
+    //
+    // This used to be created over the socket by a descendant client, on the
+    // premise — stated in this test's original comment — that "`session/create`
+    // is not gated". REQ-570 BR-10(a) closed exactly that: a daemon descendant
+    // may no longer create and drive its own session on the user's provider
+    // credits (BUG-162's `session/create` row). Every client in this test is a
+    // descendant, because the daemon's "own process" is the test process, so
+    // there is no longer any socket path to a session id here.
+    //
+    // What this test asserts is unchanged and is about `session/attach`: a
+    // descendant is refused, and refused *identically* whether the target
+    // exists or not.
+    let sid = daemon
+        .sessions
+        .create(teton_protocol::SessionMode::Freeform, None, None)
+        .expect("the registry accepts a freeform session")
+        .session_id
+        .to_string();
+
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
-    // `session/create` is not gated — a daemon child may hold its own session,
-    // it just may never reach anyone else's. That is also how this test gets a
-    // real session id to aim at.
     let mut owner = TestClient::connect(&path).await;
     assert!(
         owner.handshake(1).await.get("result").is_some(),
         "a descendant that declares no monitor still handshakes"
     );
-    owner
-        .send(2, "session/create", json!({"mode": "freeform"}))
-        .await;
-    let sid = owner.read_response(2).await["result"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
 
     let mut child = TestClient::connect(&path).await;
     assert!(child.handshake(1).await.get("result").is_some());
