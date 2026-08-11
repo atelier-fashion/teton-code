@@ -1,7 +1,7 @@
 ---
 id: TASK-099
 title: "Daemon: attachment gate on session/prompt and session/clear"
-status: draft
+status: complete
 parent: REQ-568
 created: 2026-08-11
 updated: 2026-08-11
@@ -22,11 +22,11 @@ surface exercises the gate (LESSON-484 / BUG-155 pattern, ADR-B).
 
 ## Acceptance Criteria
 
-- [ ] Unattached `session/prompt` → `-32009` before any turn work starts (no turn task spawned, no runtime mutation).
-- [ ] Unattached `session/clear` → `-32009`; attached clear behavior unchanged (idempotent zero for untouched sessions).
-- [ ] After `session/attach`, the same calls succeed (AC-4 of the spec).
-- [ ] Gate verified at the dispatch/raw-RPC surface, not through the CLI (BUG-155).
-- [ ] `cargo test -p tetond` passes.
+- [x] Unattached `session/prompt` → `-32009` before any turn work starts (no turn task spawned, no runtime mutation).
+- [x] Unattached `session/clear` → `-32009`; attached clear behavior unchanged (idempotent zero for untouched sessions).
+- [x] After `session/attach`, the same calls succeed (AC-4 of the spec).
+- [x] Gate verified at the dispatch/raw-RPC surface, not through the CLI (BUG-155).
+- [x] `cargo test -p tetond` passes.
 
 ## Technical Notes
 

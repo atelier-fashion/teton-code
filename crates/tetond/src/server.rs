@@ -31,6 +31,15 @@
 //! stays connection-agnostic. A skipped envelope still advances the
 //! [`EventFence`] watermark exactly like a delivered one, or a response would
 //! wait forever on an event this connection was never going to receive.
+//!
+//! The same attachment set gates the *mutating* methods: `session/prompt` and
+//! `session/clear` against a session this connection never attached are refused
+//! with `NOT_ATTACHED` (REQ-568 BR-4). The two gates sit at the two seams every
+//! client crosses — [`forward_events`] for reads, [`handle_session_clear`] and
+//! [`spawn_prompt_turn`] for writes — never in a client, and never in the
+//! reader loop above them, so the direct-RPC tests exercise the real gate
+//! (LESSON-484). Attachment is the single grant: `monitor` buys sight of a
+//! session, never the right to drive it.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -307,7 +316,33 @@ impl ConnState {
             .expect("connection attachment lock poisoned");
         should_forward(session_id, &attached, self.monitor)
     }
+
+    /// Whether this connection may *drive* `session_id` — the gate on
+    /// `session/prompt` and `session/clear` (REQ-568 BR-4).
+    ///
+    /// Membership only, and deliberately not [`may_receive`](Self::may_receive):
+    /// `monitor` grants receipt of every session's events and nothing else (the
+    /// spec's Permissions table lists it against "receive", never against the
+    /// mutating methods). Reading the write gate off the delivery policy would
+    /// make one declaration mean two things and silently promote every observer
+    /// into a driver of every session it can see.
+    fn may_drive(&self, session_id: &SessionId) -> bool {
+        self.attached
+            .read()
+            .expect("connection attachment lock poisoned")
+            .contains(session_id)
+    }
 }
+
+/// The refusal every unattached mutating call gets (REQ-568 BR-4).
+///
+/// One sentence, shared by `session/prompt` and `session/clear` so the two
+/// refusals are indistinguishable to the caller. Content-free by design: it
+/// carries no session id, no prompt text and no path (conventions), and it says
+/// nothing about whether the named session exists — the whole point of
+/// answering before the registry is consulted (ADR-B). It names the remedy,
+/// because `session/attach` is the one thing that changes the answer.
+const NOT_ATTACHED_MESSAGE: &str = "not attached to this session; attach to it first";
 
 /// The delivery policy: may an envelope scoped to `env_session` reach a
 /// connection attached to `attached` that declared `monitor`? (REQ-568 BR-1/BR-2)
@@ -463,10 +498,20 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
             continue;
         }
 
+        // Past the handshake gate `conn` is always set — it is installed with
+        // `handshaked` above. Stated as a pattern rather than an unwrap.
+        //
+        // Bound *before* the prompt branch: the attachment gate (REQ-568 BR-4)
+        // applies to `session/prompt` too, and that method never reaches
+        // `dispatch`.
+        let Some(conn) = conn.as_ref() else { continue };
+
         // `session/prompt` runs on its own task (see `prompt_tasks`); every other
         // method dispatches synchronously and replies immediately.
         if method == PromptTurnParams::METHOD {
-            if let Some(handle) = spawn_prompt_turn(&daemon, id, params, &out_tx, fence.clone()) {
+            if let Some(handle) =
+                spawn_prompt_turn(&daemon, conn, id, params, &out_tx, fence.clone())
+            {
                 // Prune completed turns before tracking a new one so the vector
                 // does not grow unbounded across a long-lived connection's turns
                 // (REQ-544 minor). Only still-running handles are kept, to be
@@ -476,10 +521,6 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
             }
             continue;
         }
-
-        // Past the handshake gate `conn` is always set — it is installed with
-        // `handshaked` above. Stated as a pattern rather than an unwrap.
-        let Some(conn) = conn.as_ref() else { continue };
 
         if let Some(response) = dispatch(&daemon, conn, id, method, params) {
             // Any event the handler just published (e.g. `session/create`'s
@@ -550,8 +591,15 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
 /// channel, so the response cannot overtake them on the wire. Returns the task
 /// handle so teardown can abandon it, or `None` when the request could not be
 /// started (an error response is queued).
+///
+/// `conn` is the issuing connection: a prompt against a session it never
+/// attached is refused here (REQ-568 BR-4). This function is the *only* gate on
+/// that path — `session/prompt` bypasses [`dispatch`] entirely — which is why
+/// the check lives beside the spawn rather than in the reader loop that calls
+/// it (ADR-B, LESSON-484).
 fn spawn_prompt_turn(
     daemon: &Arc<Daemon>,
+    conn: &ConnState,
     id: Id,
     params: Value,
     out_tx: &mpsc::Sender<String>,
@@ -568,6 +616,21 @@ fn spawn_prompt_turn(
             return None;
         }
     };
+
+    // REQ-568 BR-4, and its position is the requirement: ahead of the registry
+    // lookup below, ahead of the lifetime claim, ahead of the spawn. A refused
+    // prompt starts no task and touches no runtime state — so a connection that
+    // guessed a session id learns nothing from the answer, not even whether the
+    // id was real. `UNKNOWN_SESSION` for an id this connection is not attached
+    // to would be an existence oracle sitting behind a refusal (ADR-B).
+    if !conn.may_drive(&params.session_id) {
+        let _ = out_tx.try_send(error_string(
+            id,
+            error_code::NOT_ATTACHED,
+            NOT_ATTACHED_MESSAGE,
+        ));
+        return None;
+    }
 
     let Some(summary) = daemon.sessions.get(&params.session_id) else {
         let _ = out_tx.try_send(error_string(
@@ -782,7 +845,7 @@ fn dispatch(
             Some(ok_string(id, &result))
         }
         SessionAttachParams::METHOD => Some(handle_session_attach(daemon, conn, id, params)),
-        SessionClearParams::METHOD => Some(handle_session_clear(daemon, id, params)),
+        SessionClearParams::METHOD => Some(handle_session_clear(daemon, conn, id, params)),
         PermissionRespondParams::METHOD => Some(handle_permission_respond(daemon, id, params)),
         ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, id, params)),
         ModelListParams::METHOD => Some(ok_string(id, &daemon.runtime.model_list())),
@@ -1051,14 +1114,24 @@ fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
 /// cleared before it is told how much went, never the reverse.
 ///
 /// The unknown-session and busy-session answers both come from the runtime's
-/// single claim, so this handler decides nothing: [`handle_session_attach`]'s
-/// `UNKNOWN_SESSION` and a concurrent prompt's `SESSION_BUSY` reach a client
-/// through one classifier rather than two agreeing ones.
-fn handle_session_clear(daemon: &Daemon, id: Id, params: Value) -> String {
+/// single claim, so this handler decides nothing about *those*:
+/// [`handle_session_attach`]'s `UNKNOWN_SESSION` and a concurrent prompt's
+/// `SESSION_BUSY` reach a client through one classifier rather than two
+/// agreeing ones.
+///
+/// It decides exactly one thing: whether this connection may drive the session
+/// at all (REQ-568 BR-4). That answer cannot come off the runtime, because it
+/// is a fact about the connection rather than about the session — and it is
+/// given *before* the runtime is consulted, so an unattached caller cannot read
+/// a session's existence out of which refusal it got (ADR-B).
+fn handle_session_clear(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     let params: SessionClearParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
     match daemon
         .runtime
         .clear_session(&params, &daemon.sessions, &daemon.events)
@@ -1419,13 +1492,24 @@ mod tests {
         );
     }
 
-    /// REQ-567 BR-8 / D-2: `session/clear` is a dispatchable method, and its
-    /// two answers come off the runtime's claim rather than off a check here —
-    /// a live session clears (idempotently, so an untouched one reports `0`),
-    /// and a session the registry never had is `UNKNOWN_SESSION`, the same code
-    /// `session/attach` answers that fact with.
+    /// REQ-567 BR-8 / D-2 and REQ-568 BR-4: `session/clear` is a dispatchable
+    /// method, and it has three answers, one per state the caller can be in.
+    ///
+    /// The connection here reaches the attached state the way a real one does —
+    /// through `session/create`, which attaches the creator — rather than by
+    /// poking the set, so what is asserted is the gate a client actually meets.
+    ///
+    /// The third state, *attached to an id the registry does not know*, is
+    /// unreachable through the handlers: `session/attach` only grants ids the
+    /// registry has, `session/create` grants what it just made, the registry
+    /// has no removal, and an attachment set cannot outlive the daemon holding
+    /// that registry. It is constructed directly below because the property it
+    /// pins is real anyway — the gate is a check placed *in front of* the
+    /// runtime's classifier, not a replacement for it, so an attached id still
+    /// gets the runtime's `UNKNOWN_SESSION`. A gate that had swallowed that
+    /// answer would pass every other assertion here.
     #[test]
-    fn dispatch_routes_session_clear_and_tells_empty_from_unknown() {
+    fn dispatch_routes_session_clear_and_tells_attached_from_unattached() {
         let daemon = Daemon::new();
         let conn = unattached();
         let created = handle_session_create(
@@ -1436,6 +1520,7 @@ mod tests {
         );
         assert!(created.contains("sess-0"), "{created}");
 
+        // Attached and live: clears, idempotently, and says how much went.
         let cleared = dispatch(
             &daemon,
             &conn,
@@ -1453,10 +1538,37 @@ mod tests {
             "a session that has said nothing clears to zero, and says so: {cleared}"
         );
 
+        // Not attached: refused before the runtime, and refused *identically*
+        // for a session that exists and one that does not — the pair is the
+        // assertion, since two different codes here would be the existence
+        // oracle ADR-B refuses to build.
+        let stranger = unattached();
+        for target in ["sess-0", "sess-ghost"] {
+            let refused = dispatch(
+                &daemon,
+                &stranger,
+                Id::Number(3),
+                SessionClearParams::METHOD,
+                serde_json::json!({"session_id": target}),
+            )
+            .unwrap();
+            assert!(
+                refused.contains(&error_code::NOT_ATTACHED.to_string()),
+                "clearing `{target}` unattached must be refused: {refused}"
+            );
+            assert!(
+                !refused.contains("blocks_dropped"),
+                "a refused clear must not report a count: {refused}"
+            );
+        }
+
+        // Attached to a name the registry never had: the runtime still
+        // classifies it, and the gate did not take that answer away.
+        conn.attach(SessionId::from("sess-ghost"));
         let ghost = dispatch(
             &daemon,
             &conn,
-            Id::Number(3),
+            Id::Number(4),
             SessionClearParams::METHOD,
             serde_json::json!({"session_id": "sess-ghost"}),
         )
@@ -1464,6 +1576,102 @@ mod tests {
         assert!(
             ghost.contains(&error_code::UNKNOWN_SESSION.to_string()),
             "an unknown session must not clear cheerfully: {ghost}"
+        );
+    }
+
+    /// REQ-568 BR-4: an unattached `session/prompt` is refused before any turn
+    /// work starts.
+    ///
+    /// `spawn_prompt_turn` returning `None` *is* the "no task spawned" claim —
+    /// the handle it would otherwise return is the task — and it is checked
+    /// against a session that genuinely exists, so the refusal cannot be the
+    /// pre-existing `UNKNOWN_SESSION` arm wearing a new code. The attached
+    /// counterpart is asserted by transition rather than by outcome: this
+    /// daemon has no provider to route to, so the turn it spawns will fail, but
+    /// spawning at all means the gate opened.
+    #[tokio::test]
+    async fn an_unattached_prompt_is_refused_without_spawning_a_turn() {
+        let daemon = Arc::new(Daemon::new());
+        let creator = unattached();
+        let created = handle_session_create(
+            &daemon,
+            &creator,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        assert!(created.contains("sess-0"), "{created}");
+
+        let prompt = serde_json::json!({
+            "session_id": "sess-0",
+            "prompt": [{"type": "text", "text": "what is in this session?"}],
+        });
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+
+        let stranger = unattached();
+        let handle =
+            spawn_prompt_turn(&daemon, &stranger, Id::Number(2), prompt.clone(), &tx, None);
+        assert!(
+            handle.is_none(),
+            "a refused prompt must not spawn a turn task"
+        );
+        let refused = rx.try_recv().expect("a refusal is queued for the client");
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "{refused}"
+        );
+        assert!(
+            !refused.contains(&error_code::UNKNOWN_SESSION.to_string()),
+            "the session exists — this must not be answered as unknown: {refused}"
+        );
+
+        // The creator is attached, so the same call is accepted and run.
+        let accepted = spawn_prompt_turn(&daemon, &creator, Id::Number(3), prompt, &tx, None);
+        let accepted = accepted.expect("an attached prompt must start its turn");
+        accepted.await.unwrap();
+        let response = rx.try_recv().expect("the turn answered");
+        assert!(
+            !response.contains(&error_code::NOT_ATTACHED.to_string()),
+            "an attached prompt must never be refused as unattached: {response}"
+        );
+    }
+
+    /// REQ-568 BR-4 boundary: `monitor` is a receive-side declaration, so it
+    /// grants sight of every session and the right to drive none of them.
+    ///
+    /// The two halves are asserted together on one connection, because the bug
+    /// this guards is precisely reading the write gate off the read policy: a
+    /// `may_drive` implemented as `may_receive` passes every other test in this
+    /// file while handing a passive observer the ability to clear and prompt
+    /// every session on the machine.
+    #[test]
+    fn a_monitor_may_watch_every_session_and_drive_none() {
+        let daemon = Daemon::new();
+        let owner = unattached();
+        let created = handle_session_create(
+            &daemon,
+            &owner,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        assert!(created.contains("sess-0"), "{created}");
+
+        let monitor = ConnState::new(true);
+        assert!(
+            monitor.may_receive(Some(&SessionId::from("sess-0"))),
+            "a monitor sees every session's events"
+        );
+
+        let refused = dispatch(
+            &daemon,
+            &monitor,
+            Id::Number(2),
+            SessionClearParams::METHOD,
+            serde_json::json!({"session_id": "sess-0"}),
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "watching a session is not driving it: {refused}"
         );
     }
 

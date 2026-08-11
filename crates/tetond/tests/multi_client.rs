@@ -7,8 +7,9 @@
 //! it once it attaches (REQ-568 BR-1); and (3) the daemon and its sessions
 //! survive a client disconnecting — a fresh client can still attach to the
 //! surviving session. Further tests cover the monitor declaration that opts a
-//! connection back into everything (BR-1, ADR-C) and the refusal of any method
-//! before the handshake.
+//! connection back into everything (BR-1, ADR-C), the attachment gate on the
+//! mutating methods (BR-4/AC-4), and the refusal of any method before the
+//! handshake.
 //!
 //! Point (2) inverted at REQ-568: this test used to assert that the second
 //! client received the first's `phase_transition` without asking for it, which
@@ -290,6 +291,104 @@ async fn a_monitor_declared_at_handshake_receives_another_clients_events() {
 
     let event = monitor.read_event("phase_transition").await;
     assert_eq!(event["params"]["session_id"].as_str().unwrap(), sid);
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REQ-568 BR-4 / AC-4: the mutating methods are refused for a session the
+/// connection never attached, and the same calls go through once it has.
+///
+/// Driven over the raw socket rather than through the CLI, which is the whole
+/// point: a gate a client enforces is a rendering choice, and BUG-155 is what
+/// happens when the test surface is not the enforcement surface (LESSON-484).
+/// Client B here is an arbitrary same-UID peer holding a session id it did not
+/// create — `session/list` hands it one to anyone who asks — so this is the
+/// exact shape of the finding.
+///
+/// **The post-attach prompt assertion is a code transition, not a success.**
+/// This daemon has no provider configured and no local tier answered, so B's
+/// second `session/prompt` reaches the runtime, runs, and comes back
+/// `UNKNOWN_PROVIDER` (-32002): "nothing can serve this turn". That is the
+/// evidence the gate opened — `NOT_ATTACHED` is issued *before* the runtime is
+/// consulted, as is the only other pre-runtime refusal (`UNKNOWN_SESSION`), so
+/// an answer that is neither of those was produced by the turn itself. Pinning
+/// -32002 exactly would pin the fixture's lack of a provider rather than the
+/// gate, so the two pre-runtime codes are excluded instead.
+/// `session/clear` needs no model at all, so its post-attach half is asserted
+/// as an outright success.
+#[tokio::test]
+async fn mutating_methods_are_refused_until_the_connection_attaches() {
+    let path = temp_socket("gate-attach");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut a = TestClient::connect(&path).await;
+    assert!(a.handshake(1).await.get("result").is_some());
+    a.send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let created = a.read_response(2).await;
+    let sid = created["result"]["session_id"].as_str().unwrap().to_owned();
+
+    let mut b = TestClient::connect(&path).await;
+    assert!(b.handshake(1).await.get("result").is_some());
+
+    // B learns the id the way any same-UID peer would: by asking.
+    b.send(2, "session/list", json!({})).await;
+    assert_eq!(session_ids(&b.read_response(2).await), vec![sid.clone()]);
+
+    let prompt = json!({
+        "session_id": sid.clone(),
+        "prompt": [{"type": "text", "text": "what has this session been told?"}],
+    });
+
+    b.send(3, "session/prompt", prompt.clone()).await;
+    let refused_prompt = b.read_response(3).await;
+    assert_eq!(
+        refused_prompt["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "an unattached prompt must be refused: {refused_prompt}"
+    );
+
+    b.send(4, "session/clear", json!({"session_id": sid.clone()}))
+        .await;
+    let refused_clear = b.read_response(4).await;
+    assert_eq!(
+        refused_clear["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "an unattached clear must be refused: {refused_clear}"
+    );
+
+    // Attachment is the grant, and it is the only thing that changed.
+    b.send(5, "session/attach", json!({"session_id": sid.clone()}))
+        .await;
+    assert!(b.read_response(5).await.get("result").is_some());
+
+    b.send(6, "session/clear", json!({"session_id": sid})).await;
+    let cleared = b.read_response(6).await;
+    assert_eq!(
+        cleared["result"]["blocks_dropped"].as_u64(),
+        Some(0),
+        "after attaching, the clear is served: {cleared}"
+    );
+
+    b.send(7, "session/prompt", prompt).await;
+    let served = b.read_response(7).await;
+    assert_ne!(
+        served["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "after attaching, the prompt must reach the runtime: {served}"
+    );
+    // Neither of the two refusals `spawn_prompt_turn` can issue *before* the
+    // runtime. Ruling both out is what makes the transition mean "it was
+    // served" rather than "it was refused for some other reason": the turn ran
+    // and failed on routing, which is this daemon's honest answer.
+    assert_ne!(
+        served["error"]["code"].as_i64(),
+        Some(error_code::UNKNOWN_SESSION),
+        "the session exists and B is attached to it: {served}"
+    );
 
     server_task.abort();
     let _ = std::fs::remove_file(&path);
