@@ -184,6 +184,27 @@ impl ConsentRoute {
         }
     }
 
+    /// Whether `connection` answering this request is approving **its own**
+    /// (BR-6's second arm, REQ-569 TASK-109).
+    ///
+    /// True only for [`RenderedBy::TheRequesterItself`] answered by the
+    /// requester — the one arm in which no second party is involved at all. For
+    /// a headless same-UID process that is not a daemon descendant, this is the
+    /// accepted, documented residual of ADR-A's perimeter: the requester is
+    /// asked, and it answers itself. Accepted, but never *silent* — the daemon
+    /// says so in its log ([`crate::server`]'s self-approval line), and this
+    /// predicate is what decides when.
+    ///
+    /// Stated as "the self-render arm **and** the requester" rather than as
+    /// either half alone. The arm alone would be a claim about routing, not
+    /// about who answered; the requester alone would also match a peer arm that
+    /// the requester is (wrongly) allowed to answer — and a rule that names both
+    /// keeps the log honest if either half ever changes.
+    #[must_use]
+    pub fn self_approved_by(&self, connection: ConnectionId) -> bool {
+        matches!(self.rendered_by, RenderedBy::TheRequesterItself) && connection == self.requester
+    }
+
     /// Whether `connection` is told how the request *ended*.
     ///
     /// Everyone who was offered the prompt, plus the requester — which is a
@@ -667,6 +688,42 @@ mod tests {
         assert!(
             !route.renders_outcome(stranger, &nothing),
             "an uninvolved connection learns nothing either way"
+        );
+    }
+
+    /// REQ-569 TASK-109: which answers count as a **self-approval** — the arm
+    /// where nobody but the requester was ever involved.
+    ///
+    /// The negative cells are the point. A grant approved by an attached peer
+    /// is a decision two connections took part in and must never be logged as a
+    /// self-approval, or the log line stops distinguishing the residual from
+    /// the good case and becomes noise a reader learns to skip.
+    #[test]
+    fn only_the_requester_answering_its_own_rendered_prompt_is_a_self_approval() {
+        let registry = GrantRegistry::new();
+        let requester = registry.next_connection_id();
+        let peer = registry.next_connection_id();
+        let target = session("sess-target");
+
+        assert!(
+            ConsentRoute::requester_itself(requester).self_approved_by(requester),
+            "the resume arm answered by the connection that asked IS the residual"
+        );
+        assert!(
+            !ConsentRoute::requester_itself(requester).self_approved_by(peer),
+            "a different connection cannot self-approve somebody else's request"
+        );
+        assert!(
+            !ConsentRoute::attached_to(requester, target.clone()).self_approved_by(requester),
+            "the peer arm is a second party's decision, whoever answers it"
+        );
+        assert!(
+            !ConsentRoute::attached_to(requester, target).self_approved_by(peer),
+            "an attached peer approving is the good case, not the residual"
+        );
+        assert!(
+            !ConsentRoute::any_attached_peer(requester).self_approved_by(requester),
+            "monitor has no self-render arm at all"
         );
     }
 

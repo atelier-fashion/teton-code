@@ -724,6 +724,51 @@ fn requester_descriptor(params: &HandshakeParams) -> String {
     format!("{:?} client {name:?}", params.client_kind)
 }
 
+/// The daemon-log sentence for a consent a connection granted **to itself**
+/// (REQ-569 BR-6's second arm, TASK-109).
+///
+/// # Why this exists
+///
+/// BR-6's second arm is what makes the resume flow work: when no client is
+/// attached to the target session there is nobody to ask, so the prompt is
+/// rendered at the requesting connection and its user answers it. For an
+/// *interactive* client that is exactly right — the person reopening the
+/// session is the person being asked. For a headless same-UID process that is
+/// not a daemon descendant, the same arm means it approves itself with no human
+/// anywhere in the loop.
+///
+/// That is an accepted residual of ADR-A's perimeter (ancestry excludes the
+/// daemon's own children; an arbitrary same-UID process is the ptrace-class
+/// residual the spec records). Accepted — but it must not be **silent**. Every
+/// other way a grant is minted has a second party who saw the request; this one
+/// does not, and an operator reading the log has to be able to tell the two
+/// apart. So the daemon says which happened, at the moment it happens.
+///
+/// A function rather than a bare `eprintln!` for [`monitor_declaration_line`]'s
+/// reason: "the daemon says so" is then a claim a test can check.
+///
+/// `requester` is [`ConnState::requester`], which is already built from a
+/// client-supplied name — so it is re-bounded and stripped of control
+/// characters here too, exactly as REQ-568's monitor log line treats the same
+/// field. Defence in depth rather than duplication: this function must not be
+/// the place a future unbounded descriptor turns into a forged log line.
+fn self_approval_line(requester: &str) -> String {
+    // The descriptor is `{kind} client {name}` with the name already capped at
+    // `REQUESTER_BUDGET`; twice that leaves the whole of a legitimate one
+    // intact while still bounding anything that grows.
+    const DESCRIPTOR_BUDGET: usize = REQUESTER_BUDGET * 2;
+    let requester: String = requester
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(DESCRIPTOR_BUDGET)
+        .collect();
+    format!(
+        "tetond: {requester} approved its own attach consent — no other client was attached \
+         to that session, so the prompt was rendered at the connection that asked for it \
+         (REQ-569 BR-6 second arm)"
+    )
+}
+
 /// The delivery policy: may an envelope scoped to `env_session` reach a
 /// connection attached to `attached` that declared `monitor`? (REQ-568 BR-1/BR-2)
 ///
@@ -2115,6 +2160,7 @@ fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
         return error_string(id, error_code::NOT_ATTACHED, CONSENT_NOT_OFFERED_MESSAGE);
     }
 
+    let granted = matches!(params.outcome, AttachConsentOutcome::Granted);
     let outcome = match params.outcome {
         AttachConsentOutcome::Granted => ConsentOutcome::Granted {
             approved_at: route.approved_at(&attached),
@@ -2122,6 +2168,20 @@ fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
         AttachConsentOutcome::Denied => ConsentOutcome::Denied,
     };
     let resolved = daemon.consents.resolve(&params.request_id, outcome);
+    // REQ-569 TASK-109: the one grant nobody but the requester took part in, and
+    // therefore the one an operator has to be able to see (see
+    // [`self_approval_line`]).
+    //
+    // All three conditions, and each rules out a false entry: `resolved` because
+    // an answer that reached no waiter mints nothing (the window had closed, or
+    // another surface answered first), `granted` because a denial mints nothing
+    // either, and `self_approved_by` because a peer-approved grant is a decision
+    // two connections took part in. Logged after `resolve` rather than before
+    // it for the first of those: what is being reported is a grant that is
+    // actually about to exist.
+    if resolved && granted && route.self_approved_by(conn.id) {
+        eprintln!("{}", self_approval_line(&conn.requester));
+    }
     ok_string(id, &AttachConsentResult { resolved })
 }
 
@@ -3512,6 +3572,43 @@ mod tests {
         assert!(
             flood.len() < 512,
             "an over-long client name must be truncated, not logged whole: {} bytes",
+            flood.len()
+        );
+    }
+
+    /// REQ-569 BR-6 / TASK-109: the self-approval line names what it is, and a
+    /// client that chose its own name cannot forge a second log line through it.
+    ///
+    /// The wording is a contract, not decoration:
+    /// `attach_authorization::a_consent_the_requester_granted_itself_is_named_
+    /// as_such_in_the_daemon_log` greps a spawned daemon's stderr for the same
+    /// phrase, so a reworded sentence fails there rather than quietly ending the
+    /// only visibility this residual has.
+    #[test]
+    fn a_self_approved_consent_is_named_as_such_and_cannot_forge_a_log_line() {
+        let line = self_approval_line("Cli client \"teton-cli\"");
+        assert!(
+            line.contains("approved its own attach consent"),
+            "the line must say what happened, not merely that something did: {line}"
+        );
+        assert!(line.contains("teton-cli"), "{line}");
+
+        // The descriptor reaches here from a same-UID peer's chosen name. A
+        // newline in it would write a second line under the daemon's prefix.
+        let forged =
+            self_approval_line("Cli client \"innocent\ntetond: listening on /tmp/other.sock\"");
+        assert!(
+            !forged.contains('\n'),
+            "a client-supplied descriptor must not break the line: {forged}"
+        );
+
+        // And it is bounded, for `monitor_declaration_line`'s reason: the field
+        // is capped upstream, and this function must not be where an
+        // uncapped one turns into a flooded log.
+        let flood = self_approval_line(&"n".repeat(100_000));
+        assert!(
+            flood.len() < 512,
+            "an over-long descriptor must be truncated, not logged whole: {} bytes",
             flood.len()
         );
     }

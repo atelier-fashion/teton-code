@@ -633,6 +633,17 @@ impl Daemon {
         &self.socket
     }
 
+    /// This daemon's process id.
+    ///
+    /// REQ-569 AC-1 is a claim about **process ancestry**: a client driven from
+    /// a process the daemon spawned is refused. A test can only assert its own
+    /// fixture is that shape by walking the probe's parent chain and finding
+    /// this pid in it — otherwise "a descendant" is a comment rather than a
+    /// checked property.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Wait for the daemon to exit **on its own**, up to `window`.
     ///
     /// `None` means it was still running when the window ran out. Deliberately
