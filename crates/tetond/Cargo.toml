@@ -28,6 +28,11 @@ path = "src/main.rs"
 # and needs cmake; default builds and CI never compile it.
 [features]
 live = []
+# REQ-570: the OS presence-attestation mechanism (macOS LocalAuthentication FFI).
+# Non-default and macOS-only: default/CI builds compile no FFI and ship the
+# fail-closed UnavailableVerifier, which refuses cross-session attach rather
+# than falling back to the REQ-569 self-approval residual (BR-8, BR-11).
+presence = []
 llama = ["teton-inference/llama"]
 
 [dependencies]

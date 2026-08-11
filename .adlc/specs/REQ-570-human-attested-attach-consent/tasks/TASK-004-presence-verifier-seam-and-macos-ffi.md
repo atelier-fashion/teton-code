@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 title: "PresenceVerifier seam, macOS LAContext mechanism, and the fail-closed posture"
-status: pending
+status: complete
 parent: REQ-570
 created: 2026-08-11
 updated: 2026-08-11
@@ -31,18 +31,18 @@ observed.
 
 ## Acceptance Criteria
 
-- [ ] AC-7: on a platform with no usable mechanism, cross-session attach is
+- [x] AC-7: on a platform with no usable mechanism, cross-session attach is
       refused with the BR-8 posture code — **never** self-approved. Asserted via
       the injected "no mechanism available" seam so it runs on any platform.
-- [ ] AC-7b: the Linux-without-a-polkit-agent case reaches that refusal and names
+- [x] AC-7b: the Linux-without-a-polkit-agent case reaches that refusal and names
       **that** cause, not a generic failure — and is reachable in CI on a
       headless Linux runner.
-- [ ] `MechanismAvailability::Unavailable { reason }` is a first-class value, not
+- [x] `MechanismAvailability::Unavailable { reason }` is a first-class value, not
       an error path; the reason enum carries `NoPolkitAgent` specifically.
-- [ ] BR-11: a degraded platform never falls back to the REQ-569 self-approval
+- [x] BR-11: a degraded platform never falls back to the REQ-569 self-approval
       residual. Asserted as a refusal, not as an absence.
-- [ ] LAError -1/-2/-4/-9 map to distinct refusals (BR-7), per §0's finding.
-- [ ] Default/CI builds compile none of the FFI and keep the honest-refusal
+- [x] LAError -1/-2/-4/-9 map to distinct refusals (BR-7), per §0's finding.
+- [x] Default/CI builds compile none of the FFI and keep the honest-refusal
       behaviour.
 
 ## Technical Notes
