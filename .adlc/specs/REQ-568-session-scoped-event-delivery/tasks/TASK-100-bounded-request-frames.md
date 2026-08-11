@@ -1,7 +1,7 @@
 ---
 id: TASK-100
 title: "Daemon: MAX_FRAME bounded request reader with refuse-then-close"
-status: draft
+status: complete
 parent: REQ-568
 created: 2026-08-11
 updated: 2026-08-11
@@ -22,10 +22,10 @@ connection (no resync — ADR-D resolves spec OQ-3).
 
 ## Acceptance Criteria
 
-- [ ] The reader cannot buffer more than MAX_FRAME bytes for a single frame — enforced by the `take` construction, and the review confirms no post-read length check stands in for it (the naive check is the defect, not the fix).
-- [ ] Oversized frame → `INVALID_PARAMS`, null id, connection closed deterministically.
-- [ ] Fresh connection afterwards serves normally; legal large frames unaffected.
-- [ ] `cargo test -p tetond --test frame_cap` passes; existing tests unaffected.
+- [x] The reader cannot buffer more than MAX_FRAME bytes for a single frame — enforced by the `take` construction, and the review confirms no post-read length check stands in for it (the naive check is the defect, not the fix).
+- [x] Oversized frame → `INVALID_PARAMS`, null id, connection closed deterministically.
+- [x] Fresh connection afterwards serves normally; legal large frames unaffected.
+- [x] `cargo test -p tetond --test frame_cap` passes; existing tests unaffected.
 
 ## Technical Notes
 

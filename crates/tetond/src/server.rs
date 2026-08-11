@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
@@ -56,6 +56,15 @@ use crate::sessions::SessionRegistry;
 
 /// Depth of a client's outbound message queue (responses + events).
 const OUTBOUND_CAPACITY: usize = 1024;
+
+/// Largest inbound frame the reader will buffer, in bytes (REQ-568 BR-6, ADR-D).
+///
+/// Measured, not guessed: the only method that carries bulk is `session/prompt`
+/// with pasted text, and observed prompts sit well under 100 KiB; every other
+/// method is sub-KiB. 4 MiB is ~40× headroom over the largest legitimate frame
+/// while keeping a connection's read buffer bounded by something an
+/// unauthenticated peer cannot grow.
+const MAX_FRAME: u64 = 4 * 1024 * 1024;
 
 /// How long a disconnecting client's in-flight prompt turns are given to finish
 /// before they are abandoned (REQ-565 BR-2).
@@ -261,10 +270,43 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>) {
 
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        // BR-6/AC-5: the read is capped by construction. A fresh `take` every
+        // iteration is load-bearing — `MAX_FRAME` is a per-*frame* budget, and a
+        // `Take` hoisted out of the loop would spend it once across the whole
+        // connection lifetime, refusing the second legal frame of a long-lived
+        // client.
+        let read = (&mut reader).take(MAX_FRAME).read_line(&mut line).await;
+        let n = match read {
             Ok(0) => break, // EOF: the client disconnected.
-            Ok(_) => {}
+            Ok(n) => n,
             Err(_) => break, // Read error: tear the connection down.
+        };
+
+        // This is not a length check standing in for the cap — by here the
+        // buffer is already bounded, which is the property AC-5 asks for. It
+        // only classifies *why* the read stopped: `read_line` returns at a
+        // newline or when the budget runs out, so a full budget with no
+        // terminator means the frame was still going.
+        //
+        // The neighbouring case is a legitimate final frame that ends at EOF
+        // without a newline; that one stops short of the budget, is processed
+        // normally below, and the next iteration's `Ok(0)` ends the loop. A
+        // frame that fills the budget exactly *and* ends at EOF is
+        // indistinguishable from a truncated oversized one without reading the
+        // byte after it — the byte we are refusing to buy — so it classifies as
+        // oversized.
+        if n as u64 == MAX_FRAME && !line.ends_with('\n') {
+            // ADR-D: refuse, then close — no resync to the next newline. The
+            // send is best-effort (`try_send`) because the outbound channel may
+            // be full and this connection is ending either way; the teardown
+            // below stops the forwarder and drains the writer, so a queued
+            // refusal still reaches the wire before the socket closes.
+            let _ = out_tx.try_send(error_string(
+                Id::Null,
+                error_code::INVALID_PARAMS,
+                "frame exceeds maximum length",
+            ));
+            break;
         }
 
         let trimmed = line.trim();
