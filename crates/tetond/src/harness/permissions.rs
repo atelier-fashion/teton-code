@@ -469,13 +469,68 @@ pub trait WebTierPersistence: Send + Sync {
     fn persist_web_tier(&self, tier: WebTier) -> Result<(), String>;
 }
 
+/// Where a gate's policy table comes from (REQ-560).
+///
+/// Two sources, **one enforcement path**: whichever this is, the table it yields
+/// is evaluated by the same [`PermissionGate::decide`]. BR-1 forbids a second
+/// path around the gate; a second way to *obtain a table* is not that.
+#[derive(Debug, Clone)]
+enum PolicySource {
+    /// A named level, expanded through [`table_for`], with the tiers
+    /// `[web] permission_allow` listed folded on top. What the daemon uses.
+    Level {
+        level: PermissionLevel,
+        web_allow: Vec<WebTier>,
+    },
+    /// An exact table, used as given.
+    ///
+    /// For fixtures that need a policy no level expresses — "every tool asks",
+    /// or one tool denied and the rest allowed. Keeping this available means a
+    /// test can still say precisely what it means instead of reaching for the
+    /// nearest level and inheriting rows it did not ask for.
+    Fixed(PermissionConfig),
+}
+
+impl PolicySource {
+    /// The table this source yields right now.
+    fn table(&self) -> PermissionConfig {
+        match self {
+            Self::Level { level, web_allow } => {
+                let mut cfg = table_for(*level);
+                // REQ-563 BR-4: one listed tier, one key — and since REQ-560
+                // this can only relax an `ask`, so it cannot lift `plan`'s deny.
+                cfg.apply_web_permission(web_allow);
+                cfg
+            }
+            Self::Fixed(cfg) => cfg.clone(),
+        }
+    }
+
+    /// The level this source names, if it names one.
+    const fn level(&self) -> Option<PermissionLevel> {
+        match self {
+            Self::Level { level, .. } => Some(*level),
+            Self::Fixed(_) => None,
+        }
+    }
+}
+
 /// The session-scoped permission authority.
 ///
 /// Publishes prompts to the event bus, awaits answers via [`PendingPermissions`],
 /// and remembers `*_always` answers for the life of the session.
 pub struct PermissionGate {
     session_id: SessionId,
-    config: PermissionConfig,
+    /// Where this session's policy table comes from (REQ-560).
+    ///
+    /// Behind a `Mutex` because a level is **session-scoped and mutable**:
+    /// `/permissions <level>` writes here and nowhere else, which is what makes
+    /// BR-6 true by construction — there is no path from this field to disk, so
+    /// every new session starts from config again.
+    ///
+    /// Read once at the top of [`Self::decide`] and never again for that
+    /// decision, which is what makes BR-7 structural rather than guarded.
+    policy: Mutex<PolicySource>,
     grants: Mutex<HashMap<String, RememberedGrant>>,
     events: Arc<EventBus>,
     pending: Arc<PendingPermissions>,
@@ -489,8 +544,12 @@ pub struct PermissionGate {
 }
 
 impl PermissionGate {
-    /// A gate for `session_id` using `config`, publishing to `events` and
-    /// awaiting answers on `pending`.
+    /// A gate for `session_id` pinned to an exact `config`, publishing to
+    /// `events` and awaiting answers on `pending`.
+    ///
+    /// The gate has **no level**: [`Self::level`] answers `None` and the status
+    /// row has nothing to show. For a session the user can steer, use
+    /// [`Self::with_level`], which is what the daemon does.
     #[must_use]
     pub fn new(
         session_id: SessionId,
@@ -498,14 +557,109 @@ impl PermissionGate {
         events: Arc<EventBus>,
         pending: Arc<PendingPermissions>,
     ) -> Self {
+        Self::from_source(session_id, PolicySource::Fixed(config), events, pending)
+    }
+
+    /// A gate for `session_id` at a named `level`, with the tiers
+    /// `[web] permission_allow` lists folded onto every table it produces
+    /// (REQ-560).
+    ///
+    /// The daemon's constructor. The level is what `/permissions` reads and
+    /// writes, and what the entry frame's status row renders.
+    #[must_use]
+    pub fn with_level(
+        session_id: SessionId,
+        level: PermissionLevel,
+        web_allow: Vec<WebTier>,
+        events: Arc<EventBus>,
+        pending: Arc<PendingPermissions>,
+    ) -> Self {
+        Self::from_source(
+            session_id,
+            PolicySource::Level { level, web_allow },
+            events,
+            pending,
+        )
+    }
+
+    fn from_source(
+        session_id: SessionId,
+        policy: PolicySource,
+        events: Arc<EventBus>,
+        pending: Arc<PendingPermissions>,
+    ) -> Self {
         Self {
             session_id,
-            config,
+            policy: Mutex::new(policy),
             grants: Mutex::new(HashMap::new()),
             events,
             pending,
             web_persistence: None,
         }
+    }
+
+    /// This session's permission level, or `None` on a gate pinned to an exact
+    /// table.
+    #[must_use]
+    pub fn level(&self) -> Option<PermissionLevel> {
+        self.policy
+            .lock()
+            .expect("permission policy mutex poisoned")
+            .level()
+    }
+
+    /// Set this session's level, answering whether it changed (REQ-560 BR-6).
+    ///
+    /// Session-scoped and **writes nothing**: there is deliberately no path from
+    /// here to the config file. A `full` that survived a restart would remove a
+    /// guardrail invisibly, in a session the user does not remember configuring.
+    ///
+    /// The `changed` answer exists for the same reason
+    /// [`WebTaintOverride::lift`](crate::runtime::WebTaintOverride)'s does — so a
+    /// confirmation stays honest and re-setting the level a session already holds
+    /// is not announced as a change.
+    ///
+    /// Setting a level on a gate that was pinned to an exact table converts it to
+    /// a leveled gate. The user named a posture; the posture governs from here.
+    pub fn set_level(&self, level: PermissionLevel) -> bool {
+        let mut policy = self.policy.lock().expect("permission policy mutex poisoned");
+        if policy.level() == Some(level) {
+            return false;
+        }
+        let web_allow = match &*policy {
+            PolicySource::Level { web_allow, .. } => web_allow.clone(),
+            PolicySource::Fixed(_) => Vec::new(),
+        };
+        *policy = PolicySource::Level { level, web_allow };
+        true
+    }
+
+    /// The table in force for the **next** decision.
+    fn effective_table(&self) -> PermissionConfig {
+        self.policy
+            .lock()
+            .expect("permission policy mutex poisoned")
+            .table()
+    }
+
+    /// The sentence a call refused **by the level** returns, or `None` when the
+    /// level would not refuse it (REQ-560 BR-15).
+    ///
+    /// `Some` means nobody was asked: the level settled the call. That is a
+    /// different fact from a user declining a prompt, and the two must not share
+    /// a sentence — a model told the wrong reason proposes the wrong remedy, and
+    /// a user told "you declined this" about something they were never asked is
+    /// being told something false.
+    ///
+    /// Derived from the same [`PermissionLevel`] the client renders, through the
+    /// same [`PermissionLevel::denial_sentence`], so the daemon's and the
+    /// client's account of one denial cannot drift (LESSON-456).
+    #[must_use]
+    pub fn denial_note(&self, tool: &str) -> Option<String> {
+        let policy = self.policy.lock().expect("permission policy mutex poisoned");
+        let level = policy.level()?;
+        (policy.table().policy_for(tool) == PermissionPolicy::Deny)
+            .then(|| level.denial_sentence(tool))
     }
 
     /// Wire the sink `enable_permanent` writes through (REQ-563 BR-4).
@@ -572,13 +726,51 @@ impl PermissionGate {
 
     /// The shared body of both entry points; `web` carries the tier when this is
     /// a web-lookup decision and is `None` for every other tool.
+    ///
+    /// ## The level is read once, here, and never again (REQ-560 BR-7)
+    ///
+    /// The table is snapshotted at the top and everything below decides against
+    /// that snapshot. Nothing after the `await` re-reads the level, and nothing
+    /// on the level-change path touches [`PendingPermissions`] — so a
+    /// `/permissions` arriving while this call is parked on its prompt cannot
+    /// resolve it in either direction. The user's own answer decides the call
+    /// they were asked about; the *next* call decides at the new level. That is
+    /// BR-7, and it holds because of the shape of this function rather than
+    /// because of a check someone remembered to add.
     async fn decide(
         &self,
         tool_name: &str,
         description: Option<String>,
         web: Option<WebTier>,
     ) -> PermissionDecision {
-        // A remembered session grant short-circuits everything (asked once).
+        // ## Level before grants (REQ-560 BR-5)
+        //
+        // A grant is an answer to a question the level decides whether to ask,
+        // so a grant can never outrank the level that would not have asked. This
+        // ordering is the inverse of the pre-REQ-560 one and it is the whole of
+        // BR-5: switching to `plan` denies a tool the user allow-always'd
+        // earlier in the session, and switching back restores it — the grant was
+        // never discarded, it simply stopped being consulted while the level had
+        // no question to answer.
+        //
+        // The consequence in the other direction is deliberate: an `allow` from
+        // the level supersedes a `reject_always` grant. `/permissions full` is a
+        // typed act by the same user, later in time than the grant, and a level
+        // change that silently did not do what it said is the guard-that-quietly-
+        // stops-guarding shape BR-4 exists to forbid. The web keys are unaffected
+        // — they sit at `ask` at every level, so REQ-563's capability refusals
+        // still reach the grant below.
+        //
+        // Nothing is published for a policy answer: `allow` and `deny` rows are
+        // configuration, and no one decided anything just now.
+        match self.effective_table().policy_for(tool_name) {
+            PermissionPolicy::Allow => return PermissionDecision::Allowed,
+            PermissionPolicy::Deny => return PermissionDecision::Denied,
+            PermissionPolicy::Ask => {}
+        }
+
+        // A remembered session grant answers the question the level just asked
+        // (asked once).
         //
         // No consent event here, deliberately: the decision this replays was
         // published when it was *made*, and re-announcing it per lookup would
@@ -588,14 +780,6 @@ impl PermissionGate {
                 RememberedGrant::AllowAlways => PermissionDecision::Allowed,
                 RememberedGrant::RejectAlways => PermissionDecision::Denied,
             };
-        }
-
-        // Likewise nothing is published for a policy answer: `allow` and `deny`
-        // rows are configuration, and no one decided anything just now.
-        match self.config.policy_for(tool_name) {
-            PermissionPolicy::Allow => return PermissionDecision::Allowed,
-            PermissionPolicy::Deny => return PermissionDecision::Denied,
-            PermissionPolicy::Ask => {}
         }
 
         // Register the waiter, publish the prompt, then await — no lock is held
@@ -998,6 +1182,247 @@ mod tests {
             Arc::clone(&pending),
         );
         (bus, pending, gate)
+    }
+
+    // ---- REQ-560: a session at a level -------------------------------------
+
+    /// A leveled gate — the daemon's shape — plus the bus and pending registry.
+    fn leveled_gate(
+        level: PermissionLevel,
+    ) -> (Arc<EventBus>, Arc<PendingPermissions>, PermissionGate) {
+        let bus = Arc::new(EventBus::new());
+        let pending = Arc::new(PendingPermissions::new());
+        let gate = PermissionGate::with_level(
+            SessionId::from("s1"),
+            level,
+            Vec::new(),
+            Arc::clone(&bus),
+            Arc::clone(&pending),
+        );
+        (bus, pending, gate)
+    }
+
+    /// Answer the next prompt the bus carries with `option_id`, returning the
+    /// request id that was answered.
+    async fn answer_next(
+        sub: &mut crate::broadcast::Subscription,
+        pending: &PendingPermissions,
+        option_id: &str,
+    ) -> RequestId {
+        let env = sub.recv().await.expect("a prompt was published");
+        let rid = match env.event {
+            Event::PermissionRequest(pr) => pr.request_id,
+            other => panic!("expected permission_request, got {other:?}"),
+        };
+        assert!(pending.resolve(
+            &rid,
+            PermissionOutcome::Selected {
+                option_id: option_id.to_owned()
+            }
+        ));
+        rid
+    }
+
+    /// REQ-560 AC-2, the three legs at the gate: `guarded` asks about an edit,
+    /// `edits` runs it and still asks about a shell, `plan` denies both.
+    #[tokio::test]
+    async fn each_level_decides_edit_and_shell_as_documented() {
+        // guarded: the edit asks.
+        let (bus, pending, gate) = leveled_gate(PermissionLevel::Guarded);
+        let mut sub = bus.subscribe(16);
+        let (decision, _rid) = tokio::join!(
+            gate.authorize("edit", None),
+            answer_next(&mut sub, &pending, "allow_once")
+        );
+        assert_eq!(decision, PermissionDecision::Allowed);
+
+        // edits: the edit runs unprompted; the shell still asks.
+        let (bus, pending, gate) = leveled_gate(PermissionLevel::Edits);
+        assert_eq!(gate.authorize("edit", None).await, PermissionDecision::Allowed);
+        assert_eq!(bus.subscriber_count(), 0, "an allowed edit published a prompt");
+        let mut sub = bus.subscribe(16);
+        let (decision, _rid) = tokio::join!(
+            gate.authorize("shell", None),
+            answer_next(&mut sub, &pending, "allow_once")
+        );
+        assert_eq!(decision, PermissionDecision::Allowed);
+
+        // plan: both are denied, and nothing was ever asked.
+        let (_bus, pending, gate) = leveled_gate(PermissionLevel::Plan);
+        for tool in ["edit", "shell"] {
+            assert_eq!(
+                gate.authorize(tool, None).await,
+                PermissionDecision::Denied,
+                "`{tool}` should be denied at plan"
+            );
+        }
+        assert_eq!(
+            pending.pending_count(),
+            0,
+            "plan denies without asking — a prompt was registered"
+        );
+    }
+
+    /// REQ-560 BR-5 / AC-3: a grant is an answer to a question the level decides
+    /// whether to ask, so a tightened level outranks it — and loosening back
+    /// restores it, because the grant was never discarded.
+    #[tokio::test]
+    async fn a_tightened_level_outranks_a_session_grant_and_loosening_restores_it() {
+        let (bus, pending, gate) = leveled_gate(PermissionLevel::Guarded);
+        let mut sub = bus.subscribe(16);
+
+        // Allow-always `shell` at guarded.
+        let (decision, _rid) = tokio::join!(
+            gate.authorize("shell", None),
+            answer_next(&mut sub, &pending, "allow_always")
+        );
+        assert_eq!(decision, PermissionDecision::Allowed);
+        // The grant answers the next call with no second prompt.
+        assert_eq!(
+            gate.authorize("shell", None).await,
+            PermissionDecision::Allowed
+        );
+        assert_eq!(pending.pending_count(), 0);
+
+        // Tighten: the grant does not survive a level that would not have asked.
+        assert!(gate.set_level(PermissionLevel::Plan));
+        assert_eq!(
+            gate.authorize("shell", None).await,
+            PermissionDecision::Denied,
+            "an allow_always grant outranked a tightened level"
+        );
+
+        // Loosen back: the grant applies again, and still without re-prompting.
+        assert!(gate.set_level(PermissionLevel::Guarded));
+        assert_eq!(
+            gate.authorize("shell", None).await,
+            PermissionDecision::Allowed
+        );
+        assert_eq!(
+            pending.pending_count(),
+            0,
+            "the restored grant re-prompted instead of being remembered"
+        );
+    }
+
+    /// REQ-560 BR-7 / AC-15: a level change never resolves a prompt already in
+    /// flight, in **either** direction.
+    ///
+    /// Asserted against `PendingPermissions` state rather than by timing: the
+    /// claim is that the waiter is still registered and still awaiting a human,
+    /// which is a fact about the registry, not about how long we waited.
+    #[tokio::test]
+    async fn a_level_change_leaves_an_in_flight_prompt_pending() {
+        for (arriving, label) in [
+            (PermissionLevel::Full, "loosening"),
+            (PermissionLevel::Plan, "tightening"),
+        ] {
+            let (bus, pending, gate) = leveled_gate(PermissionLevel::Guarded);
+            let gate = Arc::new(gate);
+            let mut sub = bus.subscribe(16);
+
+            let asking = {
+                let gate = Arc::clone(&gate);
+                tokio::spawn(async move { gate.authorize("shell", None).await })
+            };
+
+            // Wait for the prompt to actually be in flight.
+            let env = sub.recv().await.expect("a prompt was published");
+            let rid = match env.event {
+                Event::PermissionRequest(pr) => pr.request_id,
+                other => panic!("expected permission_request, got {other:?}"),
+            };
+            assert_eq!(pending.pending_count(), 1);
+
+            // The level changes under the open prompt.
+            assert!(gate.set_level(arriving));
+            tokio::task::yield_now().await;
+
+            // Still pending, still awaiting the user: the level answered nothing.
+            assert_eq!(
+                pending.pending_count(),
+                1,
+                "{label} to {arriving} resolved an in-flight prompt"
+            );
+            assert!(!asking.is_finished(), "{label} decided the parked call");
+
+            // The user's own answer decides the call they were asked about.
+            assert!(pending.resolve(
+                &rid,
+                PermissionOutcome::Selected {
+                    option_id: "allow_once".to_owned()
+                }
+            ));
+            assert_eq!(
+                asking.await.expect("the authorize task joins"),
+                PermissionDecision::Allowed,
+                "{label}: the user's answer did not decide the call"
+            );
+
+            // And the *next* call evaluates at the new level.
+            let next = gate.authorize("shell", None);
+            match arriving {
+                PermissionLevel::Full => {
+                    assert_eq!(next.await, PermissionDecision::Allowed);
+                }
+                PermissionLevel::Plan => {
+                    assert_eq!(next.await, PermissionDecision::Denied);
+                }
+                other => panic!("unexpected level in this table: {other}"),
+            }
+        }
+    }
+
+    /// REQ-563's capability refusals are untouched by REQ-560's ordering flip,
+    /// because the web keys sit at `ask` at every level — so a `reject_always`
+    /// on a web key still reaches the grant, even at `full`.
+    #[tokio::test]
+    async fn a_web_capability_refusal_still_holds_at_full() {
+        let (bus, pending, gate) = leveled_gate(PermissionLevel::Full);
+        let mut sub = bus.subscribe(16);
+
+        let (decision, _rid) = tokio::join!(
+            gate.authorize_web(PERMISSION_KEY_SEARCH, None, WebTier::Search),
+            answer_next(&mut sub, &pending, "reject_always")
+        );
+        assert_eq!(decision, PermissionDecision::Denied);
+        assert_eq!(
+            gate.authorize_web(PERMISSION_KEY_SEARCH, None, WebTier::Search)
+                .await,
+            PermissionDecision::Denied,
+            "a refused web capability was reopened by the full level"
+        );
+    }
+
+    /// REQ-560 BR-15: only a level denial gets the level's sentence, and it is
+    /// the level's own `denial_sentence` rather than a second string.
+    #[test]
+    fn the_denial_note_names_the_level_only_when_the_level_refused() {
+        let (_bus, _pending, planned) = leveled_gate(PermissionLevel::Plan);
+        let note = planned.denial_note("edit").expect("plan refuses edit");
+        assert_eq!(note, PermissionLevel::Plan.denial_sentence("edit"));
+        // A tool the level allows was not refused by the level.
+        assert_eq!(planned.denial_note("read"), None);
+
+        // At a level that asks, a denial came from the user, not the level.
+        let (_bus, _pending, guarded) = leveled_gate(PermissionLevel::Guarded);
+        assert_eq!(guarded.denial_note("shell"), None);
+
+        // A gate pinned to an exact table has no level to blame.
+        let (_bus, _pending, fixed) =
+            self::gate(PermissionConfig::with_default(PermissionPolicy::Deny));
+        assert_eq!(fixed.denial_note("shell"), None);
+    }
+
+    /// REQ-560 BR-6: `set_level` is idempotent and reports honestly, so a
+    /// confirmation cannot claim a change that did not happen.
+    #[test]
+    fn setting_the_level_a_session_already_holds_is_not_a_change() {
+        let (_bus, _pending, gate) = leveled_gate(PermissionLevel::Guarded);
+        assert_eq!(gate.level(), Some(PermissionLevel::Guarded));
+        assert!(!gate.set_level(PermissionLevel::Guarded));
+        assert!(gate.set_level(PermissionLevel::Edits));
+        assert_eq!(gate.level(), Some(PermissionLevel::Edits));
     }
 
     #[tokio::test]

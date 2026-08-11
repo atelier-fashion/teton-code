@@ -1,7 +1,7 @@
 ---
 id: TASK-003
 title: "PermissionGate holds a mutable session level; level is evaluated before grants"
-status: pending
+status: complete
 parent: REQ-560
 created: 2026-08-11
 updated: 2026-08-11

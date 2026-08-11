@@ -111,6 +111,7 @@ use teton_protocol::events::{
     SessionTitled, WebLookup, WebTaintOverridden,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
+use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
@@ -147,7 +148,7 @@ use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLoo
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
-    PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolDuties,
+    PendingPermissions, PermissionGate, SessionEvents, ToolContext, ToolDuties,
     ToolRegistry, WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY,
     TITLE_DUTY, TRIAGE_DUTY,
 };
@@ -1227,8 +1228,14 @@ pub struct DaemonRuntime {
     /// Daemon-wide registry of in-flight permission prompts (the
     /// `permission/respond` seam).
     pending: Arc<PendingPermissions>,
-    /// Per-tool permission policy for every session.
-    permission_config: PermissionConfig,
+    /// The permission level a **new** session starts at (REQ-560).
+    ///
+    /// The level itself is session-scoped and lives on each session's
+    /// [`PermissionGate`]; this is only the value a fresh gate is seeded with,
+    /// read from `[permissions] default_level`. Nothing writes back to it — a
+    /// `/permissions full` changes one session and is gone when that session is
+    /// (BR-6).
+    default_permission_level: PermissionLevel,
     /// Registered MCP servers (ADR-003), or `None` when none are configured.
     mcp_servers: Vec<McpServerConfig>,
     /// The startup hardware probe's *facts*, or `None` for a runtime with no
@@ -1343,7 +1350,7 @@ impl DaemonRuntime {
             scripted_engine: false,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
-            permission_config: PermissionConfig::coding_defaults(),
+            default_permission_level: PermissionLevel::default(),
             mcp_servers: Vec::new(),
             probe: None,
             turn_counter: AtomicU64::new(0),
@@ -1488,7 +1495,7 @@ impl DaemonRuntime {
             scripted_engine,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
-            permission_config: PermissionConfig::coding_defaults(),
+            default_permission_level: PermissionLevel::default(),
             mcp_servers,
             probe: Some(probe),
             turn_counter: AtomicU64::new(0),
@@ -2715,15 +2722,21 @@ impl DaemonRuntime {
             .lock()
             .expect("session gate mutex poisoned");
         Arc::clone(gates.entry(session_id.clone()).or_insert_with(|| {
-            let mut permissions = self.permission_config.clone();
-            // REQ-563 BR-4: `[web] permission_allow` is what an
-            // `enable_permanent` answer becomes on disk, and this is the one
-            // place it becomes a policy again — one listed tier, one key.
-            permissions.apply_web_permission(&config.web.permission_allow);
             Arc::new(
-                PermissionGate::new(
+                // REQ-560: the gate is created at a *level*, not at a built
+                // table, because the level is what the user can change
+                // mid-session — a table snapshotted here would go stale the
+                // instant they typed `/permissions`. The level starts at the
+                // configured default and is never written back (BR-6).
+                //
+                // REQ-563 BR-4: `[web] permission_allow` is what an
+                // `enable_permanent` answer becomes on disk, and the gate folds
+                // it onto every table the level produces — one listed tier, one
+                // key, and (since REQ-560) only ever relaxing an `ask`.
+                PermissionGate::with_level(
                     session_id.clone(),
-                    permissions,
+                    self.default_permission_level,
+                    config.web.permission_allow.clone(),
                     events.clone(),
                     self.pending.clone(),
                 )
@@ -12809,6 +12822,7 @@ provider_id = "on-device"
     mod web_lookup_seam {
         use super::*;
         use crate::classify::test_support::CountingEngine;
+        use crate::harness::PermissionConfig;
         use crate::egress::{
             Authorship, LookupContext, LookupDetail, LookupRecord, LookupRequest, TaintView,
         };
@@ -14257,7 +14271,7 @@ provider_id = "on-device"
                 let session = SessionId::from("s");
                 let gate = Arc::new(PermissionGate::new(
                     session.clone(),
-                    runtime.permission_config.clone(),
+                    crate::harness::table_for(runtime.default_permission_level),
                     Arc::clone(&events),
                     Arc::clone(&runtime.pending),
                 ));

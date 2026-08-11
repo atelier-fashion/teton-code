@@ -102,7 +102,7 @@ pub use context::{
 pub use digest::DIGEST_DUTY;
 pub use duty::{Duty, DutyKind, DutyRoute};
 pub use permissions::{
-    is_web_permission_key, PendingPermissions, PermissionConfig, PermissionDecision,
+    is_web_permission_key, table_for, PendingPermissions, PermissionConfig, PermissionDecision,
     PermissionGate, PermissionPolicy, WebTierPersistence,
 };
 pub use redact::REDACT_DUTY;
