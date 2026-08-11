@@ -1,7 +1,7 @@
 ---
 id: TASK-101
 title: "CLI: render only own-session envelopes (defense in depth)"
-status: draft
+status: complete
 parent: REQ-568
 created: 2026-08-11
 updated: 2026-08-11
@@ -23,10 +23,10 @@ daemon filter, never a substitute (BR-3). Daemon-scoped envelopes
 
 ## Acceptance Criteria
 
-- [ ] Other-session envelopes never reach `render_event`; own-session and daemon-scoped envelopes render exactly as before.
-- [ ] Pre-create (no session yet): daemon-scoped events (model download progress, lifecycle) still render — first-run consent UX unaffected.
-- [ ] `render_event` itself is unchanged (purity preserved).
-- [ ] `cargo test -p teton` passes.
+- [x] Other-session envelopes never reach `render_event`; own-session and daemon-scoped envelopes render exactly as before.
+- [x] Pre-create (no session yet): daemon-scoped events (model download progress, lifecycle) still render — first-run consent UX unaffected.
+- [x] `render_event` itself is unchanged (purity preserved).
+- [x] `cargo test -p teton` passes.
 
 ## Technical Notes
 
