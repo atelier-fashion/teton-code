@@ -120,17 +120,21 @@ router, cost, egress, permissions). No publish site needs re-scoping.
 
 ```
 Tier 1 (parallel, disjoint files):
-  TASK-097 protocol: monitor field + NOT_ATTACHED code   [teton-protocol]
+  TASK-097 protocol: monitor field + NOT_ATTACHED code   [teton-protocol + teton client.rs construction site]
   TASK-100 daemon: MAX_FRAME bounded reader              [tetond server.rs + tests/frame_cap.rs]
-  TASK-101 cli: own-session render filter                [teton]
-Tier 2:
+Tier 2 (parallel, disjoint files):
   TASK-098 daemon: ConnState + forwarder filter          [tetond server.rs + tests/multi_client.rs]  deps: 097
+  TASK-101 cli: own-session render filter                [teton]                                      deps: 097
 Tier 3:
   TASK-099 daemon: attachment gate on prompt/clear       [tetond server.rs]                          deps: 098
 Tier 4:
   TASK-102 integration: scoping e2e + fence variants     [tetond tests + e2e harness]                deps: 099, 100, 101
 ```
 
-Tier-parallel tasks touch disjoint files by construction (097: protocol crate;
-100: server.rs read loop + own test file; 101: teton crate) — 098 and 100 both
-touch server.rs but sit in different tiers, sequenced.
+Tier-parallel tasks touch disjoint files by construction: tier 1 pairs the
+protocol crate + `teton/src/client.rs` (097 owns the new field end-to-end
+compile-green, including the CLI's struct-literal construction — the only one
+outside the protocol crate, verified by grep) with tetond's read loop (100);
+tier 2 pairs tetond (098) with teton (101). 098 and 100 both touch server.rs
+but sit in different tiers, sequenced. TASK-101 depends on 097 solely because
+both edit `client.rs` — a file-collision edge, not a semantic one.

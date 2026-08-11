@@ -28,9 +28,9 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-568",
       "branch": "feat/REQ-568-session-scoped-event-delivery",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
-      "prCreatedAt": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/91",
+      "prNumber": 91,
+      "prCreatedAt": "2026-08-11T12:52:00Z",
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null

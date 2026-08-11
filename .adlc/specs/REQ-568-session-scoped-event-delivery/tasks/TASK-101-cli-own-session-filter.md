@@ -5,7 +5,7 @@ status: draft
 parent: REQ-568
 created: 2026-08-11
 updated: 2026-08-11
-dependencies: []
+dependencies: ["TASK-097"]
 ---
 
 ## Description

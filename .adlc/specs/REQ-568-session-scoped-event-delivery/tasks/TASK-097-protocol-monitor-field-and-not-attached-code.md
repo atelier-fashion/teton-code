@@ -19,13 +19,14 @@ per ADR-B.
 
 - `crates/teton-protocol/src/handshake.rs` — add `monitor: bool` to `HandshakeParams` with `#[serde(default)]` (and `skip_serializing_if` matching the file's optional-field idiom, cf. `SessionCreateParams.cwd` in methods.rs); doc-comment: "receive every session's events; explicit opt-in, logged by the daemon (REQ-568 BR-5)". Extend the existing round-trip tests: (a) params WITH `monitor: true` round-trip; (b) legacy JSON WITHOUT the field deserializes to `monitor == false` (backward compat — old client never fails handshake).
 - `crates/teton-protocol/src/jsonrpc.rs` — add `NOT_ATTACHED = -32009` to the `application_error_codes!` macro block with a comment ("session exists (or not) but the connection is not attached to it; REQ-568 BR-4"). The existing uniqueness-guard test picks it up automatically; verify it compiles into `ALL`.
+- `crates/teton/src/client.rs` — the ONLY struct-literal construction site outside the protocol crate (verified by grep; tetond tests send raw JSON and are covered by serde default): add `monitor: false` to the `HandshakeParams { ... }` literal. Mechanical, no behavior change — the CLI never monitors.
 
 ## Acceptance Criteria
 
 - [ ] `HandshakeParams` JSON lacking `monitor` deserializes with `monitor == false` (test asserts on a hand-written legacy JSON literal, not on re-serialized output — LESSON-490: fixtures through the real decode path).
 - [ ] `monitor: true` survives a serialize→deserialize round trip.
 - [ ] `error_code::NOT_ATTACHED == -32009`, present in the macro's `ALL` array, uniqueness guard green.
-- [ ] `cargo test -p teton-protocol` passes.
+- [ ] `cargo test -p teton-protocol` passes AND the workspace still compiles (`cargo check --workspace`) — the new field must not leave any construction site behind.
 
 ## Technical Notes
 
