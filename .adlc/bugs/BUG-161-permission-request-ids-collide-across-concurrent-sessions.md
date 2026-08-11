@@ -1,7 +1,7 @@
 ---
 id: BUG-161
 title: "Permission request_ids collide across concurrent sessions, cross-authorizing tool calls"
-status: open
+status: resolved
 severity: critical
 created: 2026-08-11
 updated: 2026-08-11
@@ -94,3 +94,10 @@ counter makes both ids `perm-0` and the test fails on exactly that assertion.
 ## Files Changed
 
 - `crates/tetond/src/harness/permissions.rs` — counter moved to `PendingPermissions` with `next_request_id()`; `register` refuses-not-overwrites (Entry API); per-gate `counter` field removed; regression test added.
+
+## Deployment
+
+Merged to `main` as PR #93 (squash `886d13e`), 2026-08-11. No runtime deploy:
+the daemon ships through the Homebrew tap on release tags (ADR-006), not on
+merge — this fix reaches users at the next tagged release. Lesson captured:
+[[LESSON-503]].
