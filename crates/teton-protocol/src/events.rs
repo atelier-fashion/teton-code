@@ -26,6 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::effort::ResolvedEffort;
 use crate::{Category, ClientKind, Phase, ProtocolVersion, ProviderId, RequestId, SessionId, Tier};
 
 /// JSON-RPC notification method every broadcast event is delivered under. Its
@@ -334,6 +335,23 @@ pub struct RouteDecided {
     pub model: Option<String>,
     /// The policy rule (or heuristic) that fired, as a user-facing sentence.
     pub reason: String,
+    /// What this call put in its reasoning field(s) — the **effective** effort
+    /// after the per-provider clamp, never the requested level (REQ-559 BR-5,
+    /// AC-4). Reporting the request would make the event lie about the call.
+    ///
+    /// `Option` is for **wire additivity only**: a daemon that has this field
+    /// always populates it. A frame from a daemon predating it carries no key
+    /// and reads `None`, and a client predating it ignores a key serde does not
+    /// require it to know — so this moves neither [`crate::PROTOCOL_VERSION`]
+    /// nor [`crate::PROTOCOL_VERSION_MIN`], exactly as `PrivacyBlock::cause` did
+    /// not (REQ-562 ADR-7).
+    ///
+    /// `None` therefore means "a daemon that predates effort", which is a
+    /// different claim from `Omit` — "effort does not apply here, and here is
+    /// why". Keeping them distinct is what lets the surface say which one it is
+    /// (BR-6).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub effort: Option<ResolvedEffort>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1767,6 +1785,7 @@ mod tests {
             provider_id: ProviderId::from("anthropic"),
             model: Some("opus".to_owned()),
             reason: "architecture phase routes to the frontier tier".to_owned(),
+            effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::Xhigh)),
         }));
         // Flattened: envelope metadata and the payload share one object.
         assert_eq!(wire["event"], "route_decided");
@@ -1775,6 +1794,9 @@ mod tests {
         assert_eq!(wire["provider_id"], "anthropic");
         assert_eq!(wire["category"], "design");
         assert_eq!(wire["tier"], "think");
+        // REQ-559 AC-4: the event names the effective effort.
+        assert_eq!(wire["effort"]["kind"], "effort");
+        assert_eq!(wire["effort"]["level"], "xhigh");
     }
 
     #[test]
@@ -1790,6 +1812,7 @@ mod tests {
                     provider_id: ProviderId::from("p"),
                     model: None,
                     reason: "r".to_owned(),
+                    effort: None,
                 }),
                 "route_decided",
             ),
@@ -2030,6 +2053,7 @@ mod tests {
             provider_id: ProviderId::from("deepseek"),
             model: Some("deepseek-coder".to_owned()),
             reason: "implement phase routes to the configured cheap tier".to_owned(),
+            effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
         });
     }
 
@@ -2046,6 +2070,10 @@ mod tests {
             model: Some("qwen2.5-coder-3b".to_owned()),
             reason: "Routing the 'digest' category to 'on-device' through its 'scan' tier binding."
                 .to_owned(),
+            // The local tier: a declared no-op, reported as one (BR-6).
+            effort: Some(ResolvedEffort::omit(
+                crate::effort::EffortOmission::ShapeNone,
+            )),
         };
         round_trip(&decided);
         let wire: serde_json::Value =

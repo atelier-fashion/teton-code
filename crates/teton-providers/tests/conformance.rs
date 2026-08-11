@@ -13,10 +13,12 @@
 use async_trait::async_trait;
 use futures::executor::block_on;
 use futures::StreamExt;
+use std::sync::{Arc, Mutex};
 use teton_providers::{
-    AnthropicAdapter, FailureAction, Message, OpenAiCompatAdapter, OpenAiCompatConfig, Provider,
-    ProviderError, Role, StopReason, ToolCall, ToolSpec, Transport, TransportError,
-    TransportRequest, TransportResponse, TurnEvent, TurnRequest,
+    AnthropicAdapter, EffortLevel, EffortOmission, FailureAction, Message, OpenAiCompatAdapter,
+    OpenAiCompatConfig, Provider, ProviderError, ResolvedEffort, Role, StopReason, ToolCall,
+    ToolSpec, Transport, TransportError, TransportRequest, TransportResponse, TurnEvent,
+    TurnRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -91,6 +93,12 @@ fn chunkify(fixture: &str, size: usize) -> Vec<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 fn sample_request() -> TurnRequest {
+    // The pre-REQ-559 baseline: no reasoning field on the wire, so every
+    // existing assertion in this suite keeps describing the same bytes.
+    request_with(ResolvedEffort::omit(EffortOmission::ShapeNone))
+}
+
+fn request_with(effort: ResolvedEffort) -> TurnRequest {
     TurnRequest {
         model: "test-model".to_string(),
         system: Some("be helpful".to_string()),
@@ -104,6 +112,206 @@ fn sample_request() -> TurnRequest {
             input_schema: serde_json::json!({"type": "object"}),
         }],
         max_tokens: 256,
+        effort,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-559: request-body capture
+// ---------------------------------------------------------------------------
+
+/// A `Transport` that records every request body it is handed before replaying
+/// a canned success. AC-1 and AC-2 are claims about what leaves the adapter, and
+/// only a capture can discharge them — reading the body-builder source is
+/// exactly the "code inspection is not acceptance" that conventions.md rules out
+/// for wire-level claims.
+#[derive(Default)]
+struct CapturingTransport {
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl CapturingTransport {
+    fn bodies(&self) -> Vec<serde_json::Value> {
+        self.seen.lock().expect("capture lock").clone()
+    }
+}
+
+#[async_trait]
+impl Transport for CapturingTransport {
+    async fn execute(
+        &self,
+        request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
+        self.seen
+            .lock()
+            .expect("capture lock")
+            .push(serde_json::from_slice(&request.body).expect("adapters emit JSON bodies"));
+        // Enough of a stream to reach `Completed` on either adapter; the tests
+        // below assert on the captured request, not on the response.
+        let body = futures::stream::iter(std::iter::empty::<Result<Vec<u8>, TransportError>>());
+        Ok(TransportResponse {
+            location: None,
+            status: 200,
+            body: Box::pin(body),
+        })
+    }
+}
+
+/// Drive both adapters once with `effort` and return the captured bodies,
+/// labelled by adapter. The response is ignored — these are request-shape tests.
+fn capture_both(effort: ResolvedEffort) -> Vec<(&'static str, serde_json::Value)> {
+    let mut out = Vec::new();
+    for (name, adapter) in [
+        (
+            "anthropic",
+            Box::new(AnthropicAdapter::new("a", "https://api.anthropic.test")) as Box<dyn Provider>,
+        ),
+        (
+            "openai-compatible",
+            Box::new(OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
+                "o",
+                "https://api.openai.test",
+            ))) as Box<dyn Provider>,
+        ),
+    ] {
+        let transport = CapturingTransport::default();
+        // The stream is allowed to fail (an empty body is a truncated stream);
+        // the request has already been built and captured by then.
+        let _ = block_on(adapter.stream_turn(request_with(effort), &transport));
+        for body in transport.bodies() {
+            out.push((name, body));
+        }
+    }
+    assert_eq!(out.len(), 2, "both adapters must have issued one request");
+    out
+}
+
+/// The two keys that must never appear together in one body (BR-4).
+fn reasoning_keys(body: &serde_json::Value) -> (bool, bool) {
+    let effort_field =
+        body.get("reasoning_effort").is_some() || body.pointer("/output_config/effort").is_some();
+    let thinking_field = body.get("thinking").is_some();
+    (effort_field, thinking_field)
+}
+
+/// AC-1 / BR-1. Every outbound request to a provider resolving to `Effort`
+/// carries an effort field. Driven across all five canonical levels and both
+/// adapters, so no call path can omit it.
+///
+/// The compiler already guarantees a *value* is supplied (`TurnRequest.effort`
+/// is required and `ResolvedEffort` has no `Default` — ADR-B). This asserts the
+/// value is honest: that it actually reaches the wire.
+#[test]
+fn every_effort_resolution_puts_the_field_on_the_wire() {
+    for level in [
+        EffortLevel::Low,
+        EffortLevel::Medium,
+        EffortLevel::High,
+        EffortLevel::Xhigh,
+        EffortLevel::Max,
+    ] {
+        for (adapter, body) in capture_both(ResolvedEffort::effort(level)) {
+            let (has_effort, _) = reasoning_keys(&body);
+            assert!(
+                has_effort,
+                "{adapter} dropped the effort field at {level}; omission inherits \
+                 the provider's default, and Kimi K3's is `max` (BR-1)",
+            );
+            let sent = body
+                .get("reasoning_effort")
+                .or_else(|| body.pointer("/output_config/effort"))
+                .and_then(serde_json::Value::as_str)
+                .expect("the effort field is a string");
+            assert_eq!(
+                sent,
+                level.as_str(),
+                "{adapter} must send the canonical spelling"
+            );
+        }
+    }
+}
+
+/// AC-2 / BR-4. No request ever carries both shapes. Kimi K2.5/K2.6 answer HTTP
+/// 400 when both are sent, so this is a correctness constraint.
+///
+/// ADR-A makes it unrepresentable — no `ResolvedEffort` variant names two fields
+/// — and this test drives every variant through both adapters to prove the
+/// property holds on the wire and not merely in the type.
+#[test]
+fn no_request_ever_carries_both_reasoning_shapes() {
+    let variants = [
+        ResolvedEffort::effort(EffortLevel::High),
+        ResolvedEffort::ThinkingFlag,
+        ResolvedEffort::omit(EffortOmission::ShapeNone),
+        ResolvedEffort::omit(EffortOmission::EmptyLadder),
+        ResolvedEffort::omit(EffortOmission::RefusedThisSession),
+    ];
+    for effort in variants {
+        for (adapter, body) in capture_both(effort) {
+            let (has_effort, has_thinking) = reasoning_keys(&body);
+            assert!(
+                !(has_effort && has_thinking),
+                "{adapter} sent both shapes for {effort:?} — a 400 on Kimi K2.5/K2.6",
+            );
+            match effort {
+                ResolvedEffort::Effort { .. } => assert!(has_effort && !has_thinking),
+                ResolvedEffort::ThinkingFlag => assert!(has_thinking && !has_effort),
+                ResolvedEffort::Omit { .. } => assert!(
+                    !has_effort && !has_thinking,
+                    "{adapter} sent a reasoning field for an omitted resolution",
+                ),
+            }
+        }
+    }
+}
+
+/// ADR-H, pinned so a future reader does not "fix" it. Anthropic accepts
+/// `output_config.effort` and `thinking` together; we deliberately send only the
+/// former, because BR-4 makes single-shape a testable invariant that holds for
+/// every provider, and Anthropic's thinking is already adaptive when effort is
+/// set. The omission is a decision, not an oversight.
+#[test]
+fn anthropic_sends_effort_alone_even_though_it_accepts_both() {
+    let transport = CapturingTransport::default();
+    let adapter = AnthropicAdapter::new("a", "https://api.anthropic.test");
+    let _ = block_on(adapter.stream_turn(
+        request_with(ResolvedEffort::effort(EffortLevel::Xhigh)),
+        &transport,
+    ));
+    let body = &transport.bodies()[0];
+    assert_eq!(
+        body.pointer("/output_config/effort")
+            .and_then(serde_json::Value::as_str),
+        Some("xhigh"),
+    );
+    assert!(
+        body.get("thinking").is_none(),
+        "ADR-H: no thinking block on the effort_only shape",
+    );
+}
+
+/// BR-6 compatibility: under `Omit` the bodies are byte-identical to the
+/// pre-REQ-559 bodies. The addition is inert when effort does not apply, which
+/// is what lets the local tier and every existing test keep their meaning.
+#[test]
+fn an_omitted_resolution_leaves_the_body_unchanged() {
+    for reason in [
+        EffortOmission::ShapeNone,
+        EffortOmission::EmptyLadder,
+        EffortOmission::RefusedThisSession,
+    ] {
+        let omitted = capture_both(ResolvedEffort::omit(reason));
+        let baseline = capture_both(ResolvedEffort::omit(EffortOmission::ShapeNone));
+        assert_eq!(omitted, baseline, "{reason:?} must not alter the wire");
+        for (adapter, body) in &omitted {
+            let obj = body.as_object().expect("a JSON object body");
+            assert!(
+                !obj.contains_key("reasoning_effort")
+                    && !obj.contains_key("output_config")
+                    && !obj.contains_key("thinking"),
+                "{adapter} added a reasoning key for an omitted resolution",
+            );
+        }
     }
 }
 

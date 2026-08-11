@@ -1212,6 +1212,7 @@ mod tests {
                 reason: "Routing the 'design' category to 'anthropic' through its 'think' tier \
                          binding."
                     .to_owned(),
+                effort: None,
             })),
             &mut surface,
             &mut state,
@@ -1256,6 +1257,7 @@ mod tests {
                     reason: "an earlier privacy decision in this session; this turn is \
                              pinned to the local tier (BR-1 backstop)"
                         .to_owned(),
+                    effort: None,
                 })),
                 &mut surface,
                 &mut state,
@@ -1287,6 +1289,7 @@ mod tests {
                 provider_id: ProviderId::from("anthropic"),
                 model: Some("claude-opus-4".to_owned()),
                 reason: "architecture routes to the frontier tier".to_owned(),
+                effort: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
@@ -1393,6 +1396,7 @@ mod tests {
                 provider_id: ProviderId::from("local"),
                 model: None,
                 reason: "coding turn goes to the default provider".to_owned(),
+                effort: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),

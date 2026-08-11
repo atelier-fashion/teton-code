@@ -44,10 +44,14 @@ use std::pin::Pin;
 
 pub use anthropic::AnthropicAdapter;
 pub use capability::{CapabilityProfile, HarnessProfile};
+// REQ-559: re-exported, never redefined. One ladder, one clamp, one resolver
+// (BR-3) — an adapter-local copy of this vocabulary would be a second place for
+// the wire spellings to drift from the router's.
 pub use failure::{
     classify, degradation_signal, FailureAction, FailureClass, FailureDecision, ProviderDegraded,
 };
 pub use openai_compat::{OpenAiCompatAdapter, OpenAiCompatConfig};
+pub use teton_core::{EffortLevel, EffortOmission, ReasoningShape, ResolvedEffort};
 pub use transport::{
     BlockDetail, ByteStream, HttpMethod, Transport, TransportError, TransportRequest,
     TransportResponse,
@@ -195,6 +199,20 @@ pub struct TurnRequest {
     pub tools: Vec<ToolSpec>,
     /// Maximum output tokens.
     pub max_tokens: u32,
+    /// What this call puts in its reasoning field(s) (REQ-559).
+    ///
+    /// **Required, with no `#[serde(default)]`, and [`ResolvedEffort`]
+    /// implements no [`Default`]** — that is the point (REQ-559 ADR-B). BR-1
+    /// says omitting effort is never a valid outcome, because omission inherits
+    /// the provider's default and at least one target provider defaults to
+    /// `max`. A test enumerating call paths is the guard LESSON-443 describes:
+    /// correct only until someone adds another path. Rust struct-literal syntax
+    /// requires every field, so a construction site that has not thought about
+    /// effort does not compile.
+    ///
+    /// The level here is **already clamped** — resolved once at route time
+    /// (ADR-G). Adapters `match` this and never re-clamp.
+    pub effort: ResolvedEffort,
 }
 
 /// A pinned, boxed stream of normalized turn events. `Send` so the daemon can

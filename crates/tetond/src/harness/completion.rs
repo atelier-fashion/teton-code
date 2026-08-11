@@ -27,6 +27,7 @@
 //! The loop switches on that and never sees a provider-specific shape.
 
 use std::sync::{Arc, Mutex};
+use teton_core::effort::ResolvedEffort;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -400,6 +401,13 @@ pub struct RemoteProviderSource<'a, T: Transport> {
     session_id: SessionId,
     phase: Option<Phase>,
     category: Option<Category>,
+    /// What this source's requests put in their reasoning field(s) (REQ-559).
+    ///
+    /// A **required** constructor argument, not a builder with a default: BR-1
+    /// says omitting effort is never a valid outcome, and a defaulting builder
+    /// would let a call site forget silently. The value is resolved once at
+    /// route time (ADR-G) and carried here unchanged — this source never clamps.
+    effort: ResolvedEffort,
 }
 
 impl<'a, T: Transport> RemoteProviderSource<'a, T> {
@@ -411,6 +419,7 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
         provider_id: impl Into<ProviderId>,
         model: impl Into<String>,
         session_id: impl Into<SessionId>,
+        effort: ResolvedEffort,
     ) -> Self {
         Self {
             provider,
@@ -420,6 +429,7 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
             session_id: session_id.into(),
             phase: None,
             category: None,
+            effort,
         }
     }
 
@@ -487,6 +497,10 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             messages,
             tools: exposed_tool_specs(tools, config.max_tools),
             max_tokens: config.gen_params.max_tokens,
+            // REQ-559 BR-1: resolved once at route time and carried here. This
+            // site does not clamp, does not default, and cannot omit — the
+            // field is required and `ResolvedEffort` has no `Default` (ADR-B).
+            effort: self.effort,
         };
 
         // BR-2 / REQ-558 BR-11: attribute the call to (session, phase, category,
@@ -788,8 +802,14 @@ mod tests {
         // double-execute) is caught.
         let provider = TwoToolProvider;
         let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
-        let mut source =
-            RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-under-test");
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "two-tool",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let prompt = flat_prompt("prompt");
@@ -1149,8 +1169,14 @@ mod tests {
         // it.
         let provider = TwoToolProvider;
         let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
-        let source =
-            RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-under-test");
+        let source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "two-tool",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
         assert_eq!(source.chat_format(), ChatFormat::Flat);
     }
 

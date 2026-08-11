@@ -31,6 +31,7 @@
 //! loop.
 
 use std::sync::{Arc, Mutex};
+use teton_core::effort::{EffortOmission, ResolvedEffort};
 
 use serde_json::Value;
 
@@ -244,6 +245,12 @@ pub struct TurnRoute {
     /// Harness configuration for this turn — the BR-6 profile the router derived
     /// from the selected provider's capabilities.
     pub config: HarnessConfig,
+    /// What this turn's request puts in its reasoning field(s) (REQ-559).
+    ///
+    /// Carried from `Route::effort`, resolved once at route time (ADR-G), so the
+    /// value here and the value in the `route_decided` event are the same value
+    /// rather than two computations of one fact.
+    pub effort: ResolvedEffort,
 }
 
 impl TurnRoute {
@@ -254,6 +261,13 @@ impl TurnRoute {
             provider_id: provider_id.into(),
             model: None,
             config,
+            // A hand-built route (tests, and the local tier's own path) sends no
+            // reasoning field until something states otherwise. This is the
+            // declared no-op, not a forgotten field: `with_effort` is how a
+            // caller states a level.
+            effort: ResolvedEffort::Omit {
+                reason: EffortOmission::ShapeNone,
+            },
         }
     }
 
@@ -1647,6 +1661,7 @@ mod tests {
             tool_call_tier: ToolCallTier::Degraded,
             parallel_calls: true,
             max_context: 32_000,
+            ..CapabilityProfile::default()
         }
         .harness_profile();
         let config = HarnessConfig::from_harness_profile(profile);

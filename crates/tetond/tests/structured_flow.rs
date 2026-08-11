@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use teton_core::entities::ProviderKind;
 
 use async_trait::async_trait;
 
@@ -143,6 +144,7 @@ fn native() -> CapabilityProfile {
         tool_call_tier: ToolCallTier::Native,
         parallel_calls: true,
         max_context: 200_000,
+        ..CapabilityProfile::default()
     }
 }
 
@@ -167,12 +169,14 @@ fn structured_router() -> Router {
     )
     .with_provider(
         "anthropic",
+        ProviderKind::Anthropic,
         "claude-opus-4",
         native(),
         ProviderHealth::Healthy,
     )
     .with_provider(
         "deepseek",
+        ProviderKind::OpenaiCompatible,
         "deepseek-chat",
         native(),
         ProviderHealth::Healthy,
@@ -336,6 +340,8 @@ async fn demo_requirement_flows_all_four_phases_with_per_phase_routing_and_real_
                 "deepseek",
                 route.model.clone().unwrap(),
                 session.clone(),
+                // REQ-559: read off the route, exactly as the daemon does.
+                route.effective_effort(),
             )
             .with_phase(Phase::Implement);
 

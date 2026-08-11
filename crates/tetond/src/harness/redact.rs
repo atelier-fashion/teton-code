@@ -2875,6 +2875,7 @@ mod tests {
         let mut sub = bus.subscribe(64);
         let announce = || {
             Some(RouteDecided {
+                effort: None,
                 category: Some(Category::Redact),
                 tier: Some(Tier::Scan),
                 phase: None,

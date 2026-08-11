@@ -2882,12 +2882,17 @@ impl DaemonRuntime {
             egress = egress.with_redaction_gate(gate);
         }
 
+        // REQ-559 ADR-G: the effort was resolved once, at route time, by
+        // `Router::effort_for`. It is READ off the route here, never recomputed
+        // — the `route_decided` event already announced this exact value, and a
+        // second computation is a second chance to disagree with it (AC-4).
         let mut source = RemoteProviderSource::new(
             &*provider,
             &egress,
             ProviderId::from(provider_cfg.id.as_str()),
             model,
             session_id.clone(),
+            route.effective_effort(),
         );
         if let Some(ph) = phase {
             source = source.with_phase(ph);
@@ -3829,6 +3834,11 @@ impl DaemonRuntime {
             egress,
             model,
             session_id.clone(),
+            // REQ-559: the duty's own route resolved its own effort, through the
+            // same `Router::effort_for` the turn path uses. A duty bound to a
+            // different provider than the turn therefore gets that provider's
+            // clamp, not the turn's — which is the point of resolving per route.
+            route.effective_effort(),
         )
     }
 }
@@ -5817,6 +5827,11 @@ fn build_router(
 
     let mut router = Router::new(table, default_provider)
         .with_judgment_default(config.judgment_default)
+        // REQ-559 BR-2/BR-8: one global level, read from the persisted config so
+        // it is configuration-visible rather than a constant compiled in here.
+        // The session override (ADR-I) is layered on by the caller that has a
+        // session; `build_router` sees only the persisted floor.
+        .with_effort(config.effort)
         .with_local_available(local_available);
     for p in &config.providers {
         // REQ-544 M-5: seed each provider's health from the persisted map (default
@@ -5863,6 +5878,9 @@ fn build_router(
         };
         router = router.with_provider(
             p.id.clone(),
+            // REQ-559: the kind drives the per-kind reasoning defaults (ADR-E)
+            // for a provider that declares no shape or ladder of its own.
+            p.kind,
             model,
             CapabilityProfile::from_core(p.capabilities),
             seed,
@@ -7891,6 +7909,7 @@ provider_id = "on-device"
             reason: resolution.reason.clone(),
             outcome: resolution.outcome,
             harness: Default::default(),
+            effort: None,
             resolution: Some(resolution),
         };
         assert!(selected.selected(), "the premise of this test");
@@ -7913,6 +7932,8 @@ provider_id = "on-device"
             reason: "No provider is bound to the 'build' tier.".to_owned(),
             outcome: RouteOutcome::NoPolicy,
             harness: Default::default(),
+            // No provider was selected, so there was nothing to resolve against.
+            effort: None,
             resolution: None,
         };
         let out = unserved_turn_sentence(&unresolved, classified.clone());
@@ -8711,6 +8732,7 @@ provider_id = "on-device"
     fn an_unconfigured_default_provider_is_none_not_a_synthesized_id() {
         let config = Config {
             pinned_local_model: None,
+            effort: teton_core::EffortLevel::default(),
             // The whole point: unset.
             default_provider: None,
             local_model: teton_core::LocalModelConfig::default(),
@@ -9026,6 +9048,7 @@ provider_id = "on-device"
     fn two_provider_spec_config() -> Config {
         Config {
             pinned_local_model: None,
+            effort: teton_core::EffortLevel::default(),
             default_provider: Some("anthropic".to_owned()),
             local_model: teton_core::LocalModelConfig::default(),
             privacy: teton_core::PrivacyConfig::default(),

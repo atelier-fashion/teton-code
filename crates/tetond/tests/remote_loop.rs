@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use teton_core::effort::{EffortLevel, ResolvedEffort};
 
 use async_trait::async_trait;
 
@@ -227,6 +228,9 @@ async fn remote_routed_session_streams_dispatches_tools_and_records_cost() {
         "deepseek",
         "deepseek-chat",
         session_id.clone(),
+        // REQ-559: an integration fixture states its effort like any other
+        // call path — the field is required, so it cannot be forgotten.
+        ResolvedEffort::effort(EffortLevel::High),
     )
     .with_phase(Phase::Implement);
 
@@ -363,6 +367,9 @@ async fn remote_turn_over_boundary_context_is_blocked_and_never_billed() {
         "deepseek",
         "deepseek-chat",
         session_id.clone(),
+        // REQ-559: an integration fixture states its effort like any other
+        // call path — the field is required, so it cannot be forgotten.
+        ResolvedEffort::effort(EffortLevel::High),
     )
     .with_phase(Phase::Implement);
 

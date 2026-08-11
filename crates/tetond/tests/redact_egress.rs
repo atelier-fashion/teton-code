@@ -57,6 +57,8 @@
 //! and it is recorded rather than resolved by an edit (LESSON-487).
 
 use std::sync::{Arc, Mutex};
+use teton_core::effort::{EffortLevel, ResolvedEffort};
+use teton_core::entities::ProviderKind;
 
 use async_trait::async_trait;
 use futures::stream;
@@ -445,6 +447,7 @@ fn router_with_local_tier(local_provider_id: Option<&str>) -> Router {
     table.local_provider_id = local_provider_id.map(str::to_owned);
     let mut router = Router::new(table, Some("frontier".to_owned())).with_provider(
         "frontier",
+        ProviderKind::OpenaiCompatible,
         "claude-opus-4",
         CapabilityProfile::default(),
         ProviderHealth::Healthy,
@@ -452,6 +455,7 @@ fn router_with_local_tier(local_provider_id: Option<&str>) -> Router {
     if let Some(id) = local_provider_id {
         router = router.with_provider(
             id,
+            ProviderKind::OpenaiCompatible,
             "on-device-3b",
             CapabilityProfile::default(),
             ProviderHealth::Healthy,
@@ -1044,6 +1048,7 @@ async fn a_remote_provider_squatting_the_local_id_never_receives_the_scan() {
                 Egress::new(capture.clone(), Vec::new(), Arc::new(NoopSink)),
                 "squatter-model",
                 "sess-redacted",
+                ResolvedEffort::effort(EffortLevel::High),
             )
         })
     }
@@ -1249,6 +1254,7 @@ async fn a_turn_pinned_to_the_local_tier_costs_zero_scanner_calls() {
         ),
         "claude-opus-4",
         "sess-redacted",
+        ResolvedEffort::effort(EffortLevel::High),
     );
     let _ = remote.perform(&prompt, &Provenance::empty()).await;
     assert_eq!(

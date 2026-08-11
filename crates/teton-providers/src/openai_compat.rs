@@ -23,7 +23,7 @@ use crate::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use teton_core::ToolCallTier;
+use teton_core::{ResolvedEffort, ToolCallTier};
 
 /// Configuration for an OpenAI-compatible provider instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +113,24 @@ impl OpenAiCompatAdapter {
                 })
                 .collect();
             body["tools"] = json!(tools);
+        }
+
+        // REQ-559 BR-4 / ADR-A: exactly one reasoning shape, or none. Kimi
+        // K2.5/K2.6 answer HTTP 400 when both `thinking` and `reasoning_effort`
+        // are sent, so this is a correctness constraint rather than a style
+        // preference — and it is discharged by the shape of the type, since no
+        // variant below names two fields. Exhaustive with no wildcard arm.
+        match req.effort {
+            // The canonical spellings ARE the wire spellings here: DeepSeek and
+            // Kimi both take `low`/`high`/`xhigh`/`max` verbatim, so there is no
+            // per-provider mapping table to keep in sync (BR-3).
+            ResolvedEffort::Effort { level } => {
+                body["reasoning_effort"] = json!(level.as_str());
+            }
+            ResolvedEffort::ThinkingFlag => {
+                body["thinking"] = json!(true);
+            }
+            ResolvedEffort::Omit { .. } => {}
         }
 
         let body = serde_json::to_vec(&body).map_err(|e| ProviderError::Build(e.to_string()))?;

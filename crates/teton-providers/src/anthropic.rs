@@ -19,7 +19,7 @@ use crate::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use teton_core::ToolCallTier;
+use teton_core::{ResolvedEffort, ToolCallTier};
 
 /// Default Anthropic context window used when none is configured.
 const DEFAULT_MAX_CONTEXT: u32 = 200_000;
@@ -109,6 +109,30 @@ impl AnthropicAdapter {
                 })
                 .collect();
             body["tools"] = json!(tools);
+        }
+
+        // REQ-559 BR-4 / ADR-A: exactly one reasoning shape, or none. The
+        // `match` is exhaustive with **no wildcard arm** on purpose — adding a
+        // fourth shape later must break this function until someone decides
+        // what it emits. No arm writes two keys, so "never both" (AC-2) is a
+        // property of the code rather than of the test that also asserts it.
+        match req.effort {
+            // ADR-H: `output_config.effort` alone, with **no** `thinking`
+            // block, even though Anthropic accepts both. BR-4 says
+            // `effort_only` sends the effort field alone and AC-2 pins it as a
+            // test; Anthropic's thinking is already adaptive by default when
+            // effort is set, so omitting it changes nothing observable. A
+            // single-shape invariant that holds for every provider is worth
+            // more than a per-provider exception that makes AC-2 conditional.
+            // This omission is deliberate — do not "fix" it.
+            ResolvedEffort::Effort { level } => {
+                body["output_config"] = json!({"effort": level.as_str()});
+            }
+            ResolvedEffort::ThinkingFlag => {
+                body["thinking"] = json!({"type": "adaptive"});
+            }
+            // The reason is for the event and the surface, never the wire.
+            ResolvedEffort::Omit { .. } => {}
         }
 
         let body = serde_json::to_vec(&body).map_err(|e| ProviderError::Build(e.to_string()))?;

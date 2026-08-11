@@ -45,6 +45,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use teton_core::effort::{EffortLevel, ResolvedEffort};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -422,6 +423,9 @@ async fn scripted_session(
         "deepseek",
         "deepseek-chat",
         session_id.clone(),
+        // REQ-559: an integration fixture states its effort like any other
+        // call path — the field is required, so it cannot be forgotten.
+        ResolvedEffort::effort(EffortLevel::High),
     );
 
     // --- the lookup side ---------------------------------------------------
