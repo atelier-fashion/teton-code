@@ -1,7 +1,7 @@
 ---
 id: TASK-114
 title: "Resolve effort once at route time; report the clamped level on route_decided and feed both TurnRequest sites"
-status: pending
+status: complete
 parent: REQ-559
 created: 2026-08-11
 updated: 2026-08-11
