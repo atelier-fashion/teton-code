@@ -65,7 +65,10 @@ use tokio::time::timeout;
 
 use teton_protocol::handshake::{VersionMismatch, VersionSkew};
 use teton_protocol::jsonrpc::{error_code, RpcError};
-use teton_protocol::{PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
+use teton_protocol::{RequestId, SessionId, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN};
+use tetond::harness::permissions::{
+    PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,
+};
 use tetond::{server, Daemon};
 
 /// A minimal in-test JSON-RPC client over the daemon socket.
@@ -1109,6 +1112,136 @@ async fn web_override_is_refused_until_the_connection_attaches() {
         Some(error_code::NOT_ATTACHED),
         "attached to its own session, web/override must reach the runtime: {served}"
     );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REQ-569 BR-9 / AC-9 at the raw RPC surface: an unattached connection cannot
+/// answer another session's permission prompt, and the refusal does not consume
+/// the prompt.
+///
+/// Answering a `permission_request` decides whether a session's tool call runs,
+/// so it is driving that session and is gated exactly like `session/prompt`,
+/// `session/clear` and `web/override`. What makes it worth its own test is the
+/// second half: a gate that *refused* by resolving the waiter unfavourably would
+/// pass an assertion on the error code alone while letting any same-UID peer
+/// deny every tool call on the machine — the user's prompt would vanish off
+/// their screen answered by someone else. So the prompt is asserted to be **still
+/// outstanding**, still owned by its session, and then answered by the client
+/// that legitimately holds it.
+///
+/// The prompt is raised through the daemon's own gate over its own bus and
+/// pending registry (the wiring `runtime.rs` builds per session), because a
+/// prompt that arrives from a real turn needs a provider that emits a tool call
+/// — which would pin the fixture, not the gate. Everything the gate reads is
+/// genuine: a real waiter, its real recorded owner, and the real registry the
+/// handler consults. The *answer* travels the whole way — client socket, reader
+/// loop, `dispatch`, handler — which is the surface AC-9 names (BUG-155).
+///
+/// **The monitor half of AC-9 is not here, and cannot be yet.** Declaring
+/// `monitor` at the handshake now requires a monitor-scope grant that nothing
+/// mints until TASK-108 (asserted in
+/// `a_monitor_declaration_is_refused_without_a_monitor_scope_grant`), so no
+/// monitor connection is constructible over a real socket on this branch. It is
+/// covered one layer down, at `dispatch`, by
+/// `server::tests::a_monitor_may_see_a_permission_prompt_and_may_not_answer_it`
+/// — which is where the gate actually lives, and which additionally asserts the
+/// thing this test cannot: that the refused connection *did* receive the prompt
+/// it was refused permission to answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unattached_connection_cannot_answer_another_sessions_permission_prompt() {
+    let path = temp_socket("gate-perm");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = Arc::new(Daemon::new());
+    // Kept alive beside the server so the test can raise a prompt in the
+    // daemon's own registry and read back whether it is still pending.
+    let held = Arc::clone(&daemon);
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut a = TestClient::connect(&path).await;
+    assert!(a.handshake(1).await.get("result").is_some());
+    a.send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let sid = a.read_response(2).await["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut b = TestClient::connect(&path).await;
+    assert!(b.handshake(1).await.get("result").is_some());
+    // B never attached, so no envelope of A's session may reach it — including
+    // the `permission_request` it is about to try to answer.
+    b.forbid_session(&sid);
+
+    // B learns the id the way any same-UID peer would: by asking.
+    b.send(2, "session/list", json!({})).await;
+    assert_eq!(session_ids(&b.read_response(2).await), vec![sid.clone()]);
+
+    // A real prompt in A's session, awaiting a real answer.
+    let gate = PermissionGate::new(
+        SessionId::from(sid.clone()),
+        PermissionConfig::with_default(PermissionPolicy::Ask),
+        Arc::clone(&held.events),
+        Arc::clone(held.runtime.pending()),
+    );
+    let blocked_tool_call = tokio::spawn(async move { gate.authorize("shell", None).await });
+
+    // A is attached by creation, so the prompt reaches it at the wire — and the
+    // `request_id` a client answers with is the one it read off that event.
+    let prompt = a.read_event("permission_request").await;
+    assert_eq!(prompt["params"]["session_id"].as_str(), Some(sid.as_str()));
+    let request_id = prompt["params"]["request_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the prompt carried no request_id: {prompt}"))
+        .to_owned();
+
+    let answer = json!({
+        "request_id": request_id.clone(),
+        "outcome": {"outcome": "selected", "option_id": "allow_once"},
+    });
+
+    // B answers a prompt that is not its to answer.
+    b.send(3, "permission/respond", answer.clone()).await;
+    let refused = b.read_response(3).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "an unattached connection must not answer another session's prompt: {refused}"
+    );
+
+    // The prompt survived the refusal, still owned by the session that raised
+    // it. Read off the daemon rather than inferred from a timeout, so "still
+    // pending" is a fact rather than the absence of an observation.
+    assert_eq!(
+        held.runtime.pending().pending_count(),
+        1,
+        "a refusal must leave the prompt standing for its rightful answerer"
+    );
+    assert_eq!(
+        held.runtime
+            .pending()
+            .owner_of(&RequestId::from(request_id)),
+        Some(SessionId::from(sid.clone())),
+        "and it must still belong to the session that raised it"
+    );
+
+    // The rightful answerer's own call is untouched, and releases the tool.
+    a.send(4, "permission/respond", answer).await;
+    let accepted = a.read_response(4).await;
+    assert!(
+        accepted.get("result").is_some(),
+        "the attached client's own answer must be served: {accepted}"
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), blocked_tool_call)
+            .await
+            .expect("the answered tool call must not still be waiting")
+            .unwrap(),
+        PermissionDecision::Allowed,
+        "the tool call must receive the answer the user actually gave"
+    );
+    assert_eq!(held.runtime.pending().pending_count(), 0);
 
     server_task.abort();
     let _ = std::fs::remove_file(&path);

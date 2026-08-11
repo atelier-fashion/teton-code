@@ -33,19 +33,22 @@
 //! wait forever on an event this connection was never going to receive.
 //!
 //! The same attachment set gates the *mutating* methods: `session/prompt`,
-//! `session/clear`, and `web/override` against a session this connection never
-//! attached are refused with `NOT_ATTACHED` (REQ-568 BR-4). The write gates sit
-//! at the seams every client crosses — [`forward_events`] for reads, and
-//! [`handle_session_clear`], [`spawn_prompt_turn`], [`handle_web_override`] for
-//! writes — never in a client, and never in the reader loop above them, so the
-//! direct-RPC tests exercise the real gate (LESSON-484).
+//! `session/clear`, `web/override` and `permission/respond` against a session
+//! this connection never attached are refused with `NOT_ATTACHED` (REQ-568 BR-4,
+//! REQ-569 BR-9). The write gates sit at the seams every client crosses —
+//! [`forward_events`] for reads, and [`handle_session_clear`],
+//! [`spawn_prompt_turn`], [`handle_web_override`],
+//! [`handle_permission_respond`] for writes — never in a client, and never in
+//! the reader loop above them, so the direct-RPC tests exercise the real gate
+//! (LESSON-484).
 //!
-//! Attachment is *not yet* the single grant. `permission/respond` is NOT gated:
-//! a monitor sees every session's `permission_request` and can answer it,
-//! driving another session's prompt. Closing that needs session-resolvable
-//! request ids (BUG-161) and is tracked in REQ-569 (BR-9); until then `monitor`
-//! buys sight of a session and the ability to answer its permission prompts,
-//! never the right to drive it with `prompt`/`clear`/`web/override`.
+//! `permission/respond` joined that list at REQ-569 (BR-9, ADR-F). It used to be
+//! ungated, which meant a monitor — which by design *sees* every session's
+//! `permission_request` — could answer one and so authorize another session's
+//! tool call. It is gated on [`ConnState::may_drive`] like its neighbours, and
+//! the refusal deliberately leaves the prompt pending for its rightful
+//! answerer. Delivery is unchanged: `monitor` still buys sight of every
+//! session's prompts, and now buys the right to answer none of them.
 //!
 //! ## Who may attach at all (REQ-569)
 //!
@@ -517,16 +520,19 @@ impl ConnState {
     }
 
     /// Whether this connection may *drive* `session_id` — the gate on
-    /// `session/prompt` and `session/clear` (REQ-568 BR-4).
+    /// `session/prompt`, `session/clear`, `web/override` and
+    /// `permission/respond` (REQ-568 BR-4, REQ-569 BR-9).
     ///
     /// Membership only, and deliberately not [`may_receive`](Self::may_receive):
     /// `monitor` grants receipt of every session's events, never the right to
     /// drive one *through this gate* (the spec's Permissions table lists it
-    /// against "receive", never against `prompt`/`clear`/`web/override`).
-    /// Reading the write gate off the delivery policy would make one declaration
-    /// mean two things and silently promote every observer into a driver of
-    /// every session it can see. (`permission/respond` is a separate, still
-    /// ungated path — BUG-161, REQ-569 BR-9 — not covered by this gate.)
+    /// against "receive", never against the driving methods). Reading the write
+    /// gate off the delivery policy would make one declaration mean two things
+    /// and silently promote every observer into a driver of every session it can
+    /// see. `permission/respond` is the sharpest case and the last to join:
+    /// a monitor receives the `permission_request` it would be answering, so
+    /// there the swap is not even a widening — it is handing the observer the
+    /// tool-approval authority of every session on the machine.
     fn may_drive(&self, session_id: &SessionId) -> bool {
         self.attached
             .read()
@@ -1252,7 +1258,9 @@ fn dispatch(
         }
         SessionAttachParams::METHOD => Some(handle_session_attach(daemon, conn, id, params)),
         SessionClearParams::METHOD => Some(handle_session_clear(daemon, conn, id, params)),
-        PermissionRespondParams::METHOD => Some(handle_permission_respond(daemon, id, params)),
+        PermissionRespondParams::METHOD => {
+            Some(handle_permission_respond(daemon, conn, id, params))
+        }
         ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, id, params)),
         ModelListParams::METHOD => Some(ok_string(id, &daemon.runtime.model_list())),
         ModelSetParams::METHOD => Some(handle_model_set(daemon, id, params)),
@@ -1315,18 +1323,49 @@ fn handle_web_refresh(daemon: &Daemon, id: Id, params: Value) -> String {
     }
 }
 
-/// Deliver a client's `permission/respond` to the waiting harness gate. Always
-/// acknowledges (idempotent): a late or duplicate reply for a prompt that already
-/// resolved simply finds no waiter.
-fn handle_permission_respond(daemon: &Daemon, id: Id, params: Value) -> String {
+/// Deliver a client's `permission/respond` to the waiting harness gate, if this
+/// connection is attached to the session that raised the prompt (REQ-569 BR-9,
+/// ADR-F).
+///
+/// Answering a permission prompt *is* driving the session — it decides whether
+/// that session's tool call runs — so it is gated exactly like `session/prompt`,
+/// `session/clear` and `web/override`, on [`ConnState::may_drive`]. Deliberately
+/// not [`ConnState::may_receive`]: a `monitor` **does** receive every session's
+/// `permission_request` (REQ-568 BR-2, unchanged here), and reading the write
+/// gate off the delivery policy would hand every observer the authority to
+/// approve every tool call it can see. Seeing a prompt and answering it are the
+/// two things this REQ separates.
+///
+/// A request id with no waiter keeps the pre-existing behaviour untouched:
+/// acknowledged, idempotent, nothing to gate. That is the same answer a late or
+/// duplicate reply always got, and it is deliberately *not* a refusal — the
+/// answering connection learns nothing from it about whether some other
+/// session's prompt is outstanding (ADR-B's posture: a refusal must not become
+/// an oracle).
+///
+/// **The refusal does not consume the waiter.** [`PendingPermissions::owner_of`]
+/// is a read; `resolve` is the only thing that takes the waiter, and it runs
+/// only past the gate. A refusal that had consumed the prompt would deny the
+/// tool call of a user who was never asked — a stranger could silence any
+/// session's prompt at will, which is a denial of service dressed as a security
+/// check.
+///
+/// The two-step read-then-resolve is not a TOCTOU hole: request ids are
+/// daemon-unique and never reused (BUG-161), so the only thing that can happen
+/// between them is the rightful answer arriving first, which leaves this call on
+/// the harmless "no waiter" path.
+fn handle_permission_respond(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     let params: PermissionRespondParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
-    daemon
-        .runtime
-        .pending()
-        .resolve(&params.request_id, params.outcome);
+    let pending = daemon.runtime.pending();
+    if let Some(owner) = pending.owner_of(&params.request_id) {
+        if !conn.may_drive(&owner) {
+            return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+        }
+    }
+    pending.resolve(&params.request_id, params.outcome);
     ok_string(id, &PermissionRespondResult {})
 }
 
@@ -1708,6 +1747,12 @@ fn error_from(id: Id, error: RpcError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use teton_protocol::RequestId;
+
+    use crate::harness::permissions::{
+        PermissionConfig, PermissionDecision, PermissionGate, PermissionPolicy,
+    };
 
     /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
     /// can return the same value for two calls within one clock tick.
@@ -2574,6 +2619,170 @@ mod tests {
             refused.contains(&error_code::NOT_ATTACHED.to_string()),
             "watching a session is not driving it: {refused}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-569 BR-9 / AC-9: `permission/respond` and its owning session
+    // ------------------------------------------------------------------
+
+    /// Raise a **real** permission prompt in `session` — through the daemon's own
+    /// event bus and its own pending registry, the two objects the handler under
+    /// test reads — and return the `request_id` it published plus the handle the
+    /// blocked tool call is waiting on.
+    ///
+    /// A gate constructed here rather than a turn driven end-to-end because a
+    /// turn needs a provider that emits a tool call, and none of that is what
+    /// these tests are about: what must be genuine is the *waiter*, its recorded
+    /// owner, and the registry the handler consults — and this is the production
+    /// wiring for all three (`runtime.rs` builds a session's gate over exactly
+    /// this `Arc<PendingPermissions>`).
+    async fn raise_a_prompt(
+        daemon: &Arc<Daemon>,
+        session: &SessionId,
+    ) -> (RequestId, JoinHandle<PermissionDecision>) {
+        let gate = PermissionGate::new(
+            session.clone(),
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            Arc::clone(&daemon.events),
+            Arc::clone(daemon.runtime.pending()),
+        );
+        // Subscribed before the prompt is published, or the event could be
+        // raised into an empty bus and the read below would hang.
+        let mut sub = daemon.events.subscribe(16);
+        let decision = tokio::spawn(async move { gate.authorize("shell", None).await });
+        loop {
+            let envelope = sub.recv().await.expect("the bus outlives this test");
+            if let Event::PermissionRequest(request) = envelope.event {
+                assert_eq!(
+                    envelope.session_id.as_ref(),
+                    Some(session),
+                    "the prompt must be scoped to the session that raised it"
+                );
+                return (request.request_id, decision);
+            }
+        }
+    }
+
+    /// A `permission/respond` frame answering `request_id` with `allow_once`.
+    fn answer_allowing(request_id: &RequestId) -> Value {
+        serde_json::json!({
+            "request_id": request_id.to_string(),
+            "outcome": {"outcome": "selected", "option_id": "allow_once"},
+        })
+    }
+
+    /// REQ-569 BR-9/AC-9, and the whole reason this gate exists (LESSON-502): a
+    /// `monitor` receives every session's `permission_request` and may answer
+    /// none of them.
+    ///
+    /// The three claims are asserted together on one prompt because they only
+    /// mean anything together:
+    ///
+    /// 1. the monitor **can see** the prompt (`may_receive` is `true`) — without
+    ///    this the refusal below could be trivially true of a connection that was
+    ///    never shown anything;
+    /// 2. its answer is refused `NOT_ATTACHED`;
+    /// 3. the waiter is **still pending** afterwards. A refusal that consumed the
+    ///    prompt would deny the tool call of a user who was never asked — a
+    ///    stranger could silence any session at will — so "refused" has to mean
+    ///    "left alone", not "resolved unfavourably".
+    ///
+    /// This is the test the mutation check aims at: reading the gate off
+    /// `may_receive` instead of `may_drive` makes claim (1) grant claim (2)'s
+    /// opposite, and only this test notices.
+    #[tokio::test]
+    async fn a_monitor_may_see_a_permission_prompt_and_may_not_answer_it() {
+        let daemon = Arc::new(Daemon::new());
+        let owner = unattached(&daemon);
+        let created = handle_session_create(
+            &daemon,
+            &owner,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        let session = created_session_id(&created);
+        let (request_id, decision) = raise_a_prompt(&daemon, &session).await;
+
+        let monitor = monitoring(&daemon);
+        assert!(
+            monitor.may_receive(Some(&session)),
+            "a monitor receives this very prompt — that is what makes answering \
+             it the bug this gate closes"
+        );
+
+        let refused = dispatch(
+            &daemon,
+            &monitor,
+            Id::Number(2),
+            PermissionRespondParams::METHOD,
+            answer_allowing(&request_id),
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "seeing a prompt is not answering it: {refused}"
+        );
+        assert_eq!(
+            daemon.runtime.pending().pending_count(),
+            1,
+            "the refused answer must leave the prompt standing for its rightful \
+             answerer, not consume it"
+        );
+        assert_eq!(
+            daemon.runtime.pending().owner_of(&request_id),
+            Some(session.clone()),
+            "and the prompt must still belong to the session that raised it"
+        );
+
+        // The rightful answerer — the session's creator, attached by creation —
+        // is untouched: the happy path still resolves the tool call.
+        let accepted = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            PermissionRespondParams::METHOD,
+            answer_allowing(&request_id),
+        )
+        .unwrap();
+        assert!(
+            !accepted.contains("error"),
+            "the attached connection's own answer must be accepted: {accepted}"
+        );
+        assert_eq!(
+            decision.await.unwrap(),
+            PermissionDecision::Allowed,
+            "the waiting tool call must receive the answer the user actually gave"
+        );
+        assert_eq!(daemon.runtime.pending().pending_count(), 0);
+    }
+
+    /// A request id with **no waiter** keeps its pre-existing behaviour for
+    /// every connection: acknowledged, never refused.
+    ///
+    /// The gate only has an opinion when a prompt is outstanding. If a
+    /// nonexistent id drew `NOT_ATTACHED` while a live one drew it too, the two
+    /// answers would be indistinguishable — but a *duplicate* or late reply from
+    /// the rightful client would start failing, and worse, the pair
+    /// (`ok` vs `NOT_ATTACHED`) would become an oracle telling a stranger which
+    /// request ids are currently pending somewhere on the machine.
+    #[tokio::test]
+    async fn an_unknown_request_id_is_acknowledged_rather_than_refused() {
+        let daemon = Arc::new(Daemon::new());
+        for conn in [unattached(&daemon), monitoring(&daemon)] {
+            let response = dispatch(
+                &daemon,
+                &conn,
+                Id::Number(1),
+                PermissionRespondParams::METHOD,
+                answer_allowing(&RequestId::from("perm-never-minted")),
+            )
+            .unwrap();
+            assert!(
+                !response.contains("error"),
+                "an answer to a prompt nobody is waiting on is a no-op, not a \
+                 refusal: {response}"
+            );
+        }
     }
 
     /// REQ-563 AC-10: `web/refresh` is a dispatchable method, and it answers
