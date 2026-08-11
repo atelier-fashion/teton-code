@@ -3,14 +3,16 @@
   "branch": "feat/REQ-570-human-attested-attach-consent",
   "startedAt": "2026-08-11T00:00:00Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -43,6 +45,16 @@
       "phase": 5,
       "name": "Verify",
       "completedAt": "2026-08-11T23:47:22.491502+00:00"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-11T23:48:08.058376+00:00"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup",
+      "completedAt": "2026-08-11T23:48:08.058578+00:00"
     }
   ],
   "repos": {
@@ -74,5 +86,13 @@
     ],
     "failedTasks": []
   },
-  "blockers": []
+  "blockers": [
+    {
+      "blockedBy": "human",
+      "conflictFiles": [],
+      "unblockCondition": "AC-3 is self-contradictory: it forbids test-harness auto-consent while requiring an automated end-to-end proof of a control that by design no machine can satisfy. Needs a product decision (architecture.md section 9) before REQ-570 can be called complete. TASK-006/007/008/009/010 also remain unimplemented.",
+      "holdState": "held",
+      "rebaseAttempts": 0
+    }
+  ]
 }
