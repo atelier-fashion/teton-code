@@ -1,7 +1,7 @@
 ---
 id: TASK-008
 title: "End-to-end proof: piped legs, egress-capture at full, a real terminal, and the mutation check"
-status: pending
+status: complete
 parent: REQ-560
 created: 2026-08-11
 updated: 2026-08-11

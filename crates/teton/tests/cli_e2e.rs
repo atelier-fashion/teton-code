@@ -2307,3 +2307,350 @@ fn a_web_lookup_is_consented_reported_and_counted_in_the_cost_report() {
          output:\n{quiet}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-560 — named permission levels, over a pipe
+//
+// Everything below is **added**; not one existing test above is touched. That
+// is AC-8's claim and it is meant to be checked by diffing this file: the status
+// row is TTY-gated (BR-9), so a piped session's bytes are what they always were,
+// and a test edited to accommodate status-line bytes would be a violation rather
+// than an accommodation.
+//
+// The prompt round-trip is what makes these tests possible on a pipe: a
+// permission question is asked through the `Prompter` seam, which on piped stdin
+// reads the next line. So a scripted stdin can answer one.
+// ---------------------------------------------------------------------------
+
+/// A scripted reply that asks to run a shell command that **succeeds**.
+///
+/// Success matters: a tool renders `[done]` when it ran and `[failed]` when it
+/// did not, so a command that cannot fail on its own makes the status line a
+/// clean read of the *permission* decision rather than of the tool's luck. An
+/// `edit` was the obvious choice and is the wrong one — a denied edit and an
+/// edit whose `old_string` was not in the file both render `[failed]`, so the
+/// evidence would not distinguish "the level refused" from "the fixture was
+/// wrong".
+const SHELL_CALL: &str = r#"{"tool": "shell", "arguments": {"command": "true"}}"#;
+
+/// The same shape under the `edit` name, for the legs that need the tool `edits`
+/// treats differently from `shell`.
+///
+/// Only ever used for **whether a prompt happened**, never for the tool's
+/// outcome. A tool jail is the *session's* cwd (BUG-147), which for a CLI
+/// spawned by this harness is the test runner's directory rather than the
+/// fixture root — so a file tool here always fails, and a `[failed]` beside an
+/// `edit` says nothing about permissions. `shell: true` carries every outcome
+/// claim instead, for the reason above it.
+const EDIT_CALL: &str = r#"{"tool": "edit", "arguments": {"path": "notes.txt", "old_string": "alpha", "new_string": "beta"}}"#;
+
+/// AC-2: the three legs, in one session — `guarded` asks about an edit;
+/// `edits` runs it unprompted and still asks about a shell; `plan` denies both.
+///
+/// Two independent signals, and both are needed. The **prompt count** says
+/// whether the level asked; the **`shell: true` outcome** says whether the call
+/// ran, and it is unambiguous because `true` cannot fail on its own — a
+/// `[failed]` beside it is a refusal and nothing else. The scripted closing line
+/// of each turn is the non-vacuity anchor: it proves the turn actually ran, so a
+/// count that stayed at one cannot be a session that quietly stopped.
+#[test]
+fn permission_levels_change_what_a_session_asks_about() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let replies = [
+        EDIT_CALL, "guarded edit turn done.",
+        EDIT_CALL, "edits edit turn done.",
+        SHELL_CALL, "edits shell turn done.",
+        SHELL_CALL, "plan shell turn done.",
+    ];
+    let daemon = TestDaemon::spawn_scripted(&daemon, &replies);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "edit something\ny\n\
+         /permissions edits\n\
+         edit something else\n\
+         run something\ny\n\
+         /permissions plan\n\
+         run again\n",
+    );
+
+    // Every turn ran — without this, the counts below could be satisfied by a
+    // session that died after the first one.
+    for marker in [
+        "guarded edit turn done.",
+        "edits edit turn done.",
+        "edits shell turn done.",
+        "plan shell turn done.",
+    ] {
+        assert!(
+            session.contains(marker),
+            "the turn ending `{marker}` never completed; output:\n{session}"
+        );
+    }
+
+    // Leg 1 — guarded: an edit is a question.
+    assert!(
+        session.contains("permission requested: edit"),
+        "at guarded an edit must ask; output:\n{session}"
+    );
+
+    // Leg 2 — edits: exactly one edit question in the whole session, so the
+    // second edit ran without asking. A count is the assertion because the mere
+    // presence of a prompt cannot distinguish "asked twice" from "asked once".
+    assert!(
+        session.contains("permission level: edits"),
+        "the level change must be confirmed; output:\n{session}"
+    );
+    assert_eq!(
+        session.matches("permission requested: edit").count(),
+        1,
+        "only the guarded edit should have asked; output:\n{session}"
+    );
+
+    // Leg 2b — a shell still asks at `edits`, which is the whole reason this
+    // level exists separately from `full`; allowed, it ran.
+    assert!(
+        session.contains("permission requested: shell"),
+        "at edits a shell must still ask; output:\n{session}"
+    );
+    assert!(
+        session.contains("shell: true [done]"),
+        "the allowed shell must have run; output:\n{session}"
+    );
+
+    // Leg 3 — plan: refused, and refused **without asking**. The shell count is
+    // unchanged from leg 2b and `true` failed, which together can only mean the
+    // level decided it rather than the user.
+    assert!(
+        session.contains("permission level: plan"),
+        "the level change must be confirmed; output:\n{session}"
+    );
+    assert_eq!(
+        session.matches("permission requested: shell").count(),
+        1,
+        "plan must deny without asking; output:\n{session}"
+    );
+    assert!(
+        session.contains("shell: true [failed]"),
+        "`true` cannot fail on its own, so plan must have refused it; \
+         output:\n{session}"
+    );
+}
+
+/// AC-3 / BR-5: a grant is an answer to a question the level decides whether to
+/// ask, so a tightened level outranks it — and loosening restores it, because
+/// the grant was never discarded.
+///
+/// Three `shell` calls, one prompt. The middle one is refused by `plan` and the
+/// third runs on the grant made before it, which is the whole claim: `[done]`,
+/// `[failed]`, `[done]` with a single question at the front.
+#[test]
+fn a_tightened_level_outranks_a_session_grant_over_a_pipe() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let replies = [
+        SHELL_CALL, "granted.",
+        SHELL_CALL, "denied by plan.",
+        SHELL_CALL, "grant applies again.",
+    ];
+    let daemon = TestDaemon::spawn_scripted(&daemon, &replies);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        // `a` is allow-always at the prompt.
+        "run once\na\n\
+         /permissions plan\n\
+         run again\n\
+         /permissions guarded\n\
+         run a third time\n",
+    );
+
+    // One question in the whole session: the first. The third call was answered
+    // by the remembered grant and the second by the level — two different
+    // reasons for silence, and neither is a prompt.
+    assert_eq!(
+        session.matches("permission requested: shell").count(),
+        1,
+        "the grant must be remembered and plan must not ask; output:\n{session}"
+    );
+    assert!(
+        session.contains("permission level: plan") && session.contains("permission level: guarded"),
+        "both level changes must be confirmed; output:\n{session}"
+    );
+
+    // The outcomes, in order: allowed, refused by the tightened level, allowed
+    // again on the restored grant. Sequence is the assertion — a count alone
+    // could not tell this from "denied, denied, denied".
+    // Scanned over the whole transcript rather than line by line: a tool's
+    // terminal status can share a line with the prompt that preceded it, so a
+    // line filter would silently miss the first outcome — and a missing outcome
+    // would make this assertion pass for the wrong reason.
+    let mut outcomes: Vec<(usize, &str)> = Vec::new();
+    for (at, _) in session.match_indices("shell: true [done]") {
+        outcomes.push((at, "done"));
+    }
+    for (at, _) in session.match_indices("shell: true [failed]") {
+        outcomes.push((at, "failed"));
+    }
+    outcomes.sort_unstable();
+    let outcomes: Vec<&str> = outcomes.into_iter().map(|(_, what)| what).collect();
+    assert_eq!(
+        outcomes,
+        vec!["done", "failed", "done"],
+        "a tightened level must refuse the granted tool and loosening must restore \
+         it; output:\n{session}"
+    );
+}
+
+/// AC-9 / BR-10: bare `/permissions` prints the current level **on a pipe**.
+///
+/// This is the criterion that keeps the feature usable for the users BR-9 hides
+/// the status row from. It is also AC-11's e2e half: `/help` lists the command
+/// from the same table that dispatches it.
+#[test]
+fn bare_permissions_reads_the_level_on_a_pipe_and_help_lists_it() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/permissions\n/help\n/permissions full\n/permissions\n");
+
+    // The read, with no argument, on a pipe.
+    assert!(
+        session.contains("permission level: guarded"),
+        "bare /permissions must print the level; output:\n{session}"
+    );
+    // AC-11: listed in /help, from the dispatch table.
+    assert!(
+        session
+            .lines()
+            .any(|line| line.contains("/permissions")
+                && line.contains("Show or set this session's permission level")),
+        "/help must list /permissions with its summary; output:\n{session}"
+    );
+    // A set, then a read that reflects it.
+    assert!(
+        session.contains("permission level: full"),
+        "the set must be confirmed; output:\n{session}"
+    );
+    assert!(
+        session.contains("permission level: full (unchanged)"),
+        "the second read must report the level without claiming a change; output:\n{session}"
+    );
+    // BR-14: this REQ ships no /effort command.
+    assert!(
+        !session.contains("/effort"),
+        "/effort is REQ-559's row and must not appear here; output:\n{session}"
+    );
+    assert_no_turn_ran(&session, "`/permissions` and `/help`");
+}
+
+/// AC-6 / BR-6: the level is session-scoped. A fresh session against the **same
+/// daemon** starts at the configured default, and nothing was written to disk.
+///
+/// The full-restart leg is the daemon spawn itself: this test's second CLI run
+/// is a new session, and the config file is asserted byte-identical, so a level
+/// that had persisted through either route would fail here.
+#[test]
+fn a_permission_level_does_not_survive_the_session() {
+    let Some(daemon) = daemon_or_skip() else {
+        return;
+    };
+    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let teton = teton_bin();
+    let config_path = daemon.root.join("config.toml");
+    let before = std::fs::read_to_string(&config_path).expect("the fixture config is readable");
+
+    let first = daemon.run_cli_with_stdin(&teton, &[], "/permissions full\n");
+    assert!(
+        first.contains("permission level: full"),
+        "the level must have been set in the first session; output:\n{first}"
+    );
+
+    let second = daemon.run_cli_with_stdin(&teton, &[], "/permissions\n");
+    assert!(
+        second.contains("permission level: guarded"),
+        "a new session must start at the configured default, not inherit the last \
+         one's level; output:\n{second}"
+    );
+
+    let after = std::fs::read_to_string(&config_path).expect("the fixture config is readable");
+    assert_eq!(
+        before, after,
+        "a session-scoped level was written to the config file"
+    );
+}
+
+/// AC-15 / BR-7, the piped half: a `/permissions` line typed while a permission
+/// prompt is open is consumed as the **prompt's answer**, never dispatched as a
+/// level change behind the user's back.
+///
+/// Scope, stated rather than implied. The CLI is a single reader of stdin by
+/// construction (REQ-556 ADR-556-1): while a prompt is open, the prompter is
+/// what reads the next line. So over a pipe a level change *cannot* be delivered
+/// mid-prompt at all, and what this test pins is that discipline — the line goes
+/// to the question that is waiting, and the session's posture is not quietly
+/// changed by text the user typed while being asked something else.
+///
+/// The concurrent case BR-7 is really about — a level change arriving from a
+/// **second attached client** while the first has a prompt open — cannot be
+/// staged through one piped CLI. It is pinned at the gate instead, by
+/// `a_level_change_leaves_an_in_flight_prompt_pending` in
+/// `harness::permissions`, which drives the two concurrently and asserts against
+/// `PendingPermissions` state. Naming that here so the split is a decision
+/// rather than a gap someone later mistakes for full coverage.
+#[test]
+fn a_level_line_typed_at_an_open_prompt_answers_the_prompt_and_changes_nothing() {
+    let Some(daemon_path) = daemon_or_skip() else {
+        return;
+    };
+
+    for arriving in ["full", "plan"] {
+        let replies = [SHELL_CALL, "first turn done.", SHELL_CALL, "second turn done."];
+        let daemon = TestDaemon::spawn_scripted(&daemon_path, &replies);
+        let teton = teton_bin();
+
+        let session = daemon.run_cli_with_stdin(
+            &teton,
+            &[],
+            &format!("run something\n/permissions {arriving}\nrun again\n"),
+        );
+
+        // The prompt was asked, and asked of the user.
+        assert!(
+            session.contains("permission requested: shell"),
+            "{arriving}: the shell call must have asked; output:\n{session}"
+        );
+        // The turn completed — without this the assertions below could be
+        // satisfied by a session that died at the prompt.
+        assert!(
+            session.contains("first turn done."),
+            "{arriving}: the first turn never finished; output:\n{session}"
+        );
+        // The load-bearing one: the line went to the prompt, so no level change
+        // was dispatched. A confirmation here would mean the command ran while a
+        // question was open — which is the shape BR-7 forbids.
+        assert!(
+            !session.contains("permission level: "),
+            "{arriving}: a line typed while a prompt was open was dispatched as a \
+             level change; it must be the prompt's answer instead; output:\n{session}"
+        );
+        // And the call was decided as a refusal, because `/permissions full` is
+        // not a valid answer — `true` cannot fail on its own, so this is the
+        // decline and not the command.
+        assert!(
+            session.contains("shell: true [failed]"),
+            "{arriving}: an unrecognised answer must decline the call; \
+             output:\n{session}"
+        );
+    }
+}

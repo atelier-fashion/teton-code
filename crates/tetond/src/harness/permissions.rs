@@ -1204,12 +1204,24 @@ mod tests {
 
     /// Answer the next prompt the bus carries with `option_id`, returning the
     /// request id that was answered.
+    ///
+    /// **Bounded**, and the bound is load-bearing rather than defensive. Every
+    /// caller here is asserting that a prompt *happens*; the failure mode of the
+    /// regressions they guard against — a level that decides a call without
+    /// asking — is that no prompt is ever published, and an unbounded `recv`
+    /// turns that into a hung test instead of a red one. A hang reads as
+    /// infrastructure trouble and gets retried; a failure gets read. (Found by
+    /// mutating `full` into a gate-skip, which is exactly the BR-4 shape AC-14
+    /// checks for: the suite went red, but only after hanging.)
     async fn answer_next(
         sub: &mut crate::broadcast::Subscription,
         pending: &PendingPermissions,
         option_id: &str,
     ) -> RequestId {
-        let env = sub.recv().await.expect("a prompt was published");
+        let env = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .expect("a prompt must be published — none arrived within the timeout")
+            .expect("a prompt was published");
         let rid = match env.event {
             Event::PermissionRequest(pr) => pr.request_id,
             other => panic!("expected permission_request, got {other:?}"),

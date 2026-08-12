@@ -14322,7 +14322,75 @@ provider_id = "on-device"
             }
         }
 
-        /// **REQ-560 regression: the gate `session/permissions` creates must publish
+        /// **REQ-560 AC-4, the taint half: `full` does not unpin a tainted session.**
+    ///
+    /// The permission level and the session-taint pin are orthogonal (BR-3). A
+    /// session whose context carries unknown-provenance results is pinned to the
+    /// local tier for every later turn, and that holds at every level — including
+    /// the one that stops asking about `shell`, which is also the one most likely
+    /// to be read as "turn the safety off".
+    ///
+    /// The egress half of AC-4 lives in `tests/egress_capture.rs`, where the
+    /// bytes are observable. This is the routing half: the pin decides *where a
+    /// turn runs*, which is a different mechanism in a different file, and a
+    /// source scan over `egress/` would never have looked at it.
+    #[tokio::test]
+    async fn a_tainted_session_stays_pinned_to_the_local_tier_at_full() {
+        let runtime = Arc::new(DaemonRuntime::minimal());
+        let events = Arc::new(EventBus::new());
+        let session = SessionId::from("sess-tainted-at-full");
+
+        // Really at `full`, through the shipped RPC rather than a stub.
+        let set = runtime.session_permissions(
+            &SessionPermissionsParams {
+                session_id: session.clone(),
+                level: Some(PermissionLevel::Full),
+            },
+            &events,
+        );
+        assert_eq!(set.level, PermissionLevel::Full);
+        assert!(set.changed);
+
+        // A `shell` result of unknown provenance taints the session.
+        runtime.session_taint.mark(&session);
+        assert!(runtime.session_taint.is_tainted(&session));
+
+        let config = runtime.config.lock().expect("config mutex").clone();
+        let router = build_router(&config, true, &BTreeMap::new());
+        let route = runtime
+            .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
+            .await;
+
+        assert_eq!(
+            route.reason,
+            taint_pin_reason("this turn"),
+            "a tainted session must still be pinned to the local tier at `full` — \
+             the permission level governs which tools may run, never what leaves \
+             the machine (REQ-560 BR-3)"
+        );
+
+        // Non-vacuity: an untainted session at the same level is NOT pinned, so
+        // the assertion above is about the taint and not about `full` pinning
+        // everything.
+        let clean = SessionId::from("sess-clean-at-full");
+        let _ = runtime.session_permissions(
+            &SessionPermissionsParams {
+                session_id: clean.clone(),
+                level: Some(PermissionLevel::Full),
+            },
+            &events,
+        );
+        let clean_route = runtime
+            .dispatch_route(&router, &clean, SessionMode::Freeform, None, "anything")
+            .await;
+        assert_ne!(
+            clean_route.reason,
+            taint_pin_reason("this turn"),
+            "an untainted session must not be pinned, or this test proves nothing"
+        );
+    }
+
+    /// **REQ-560 regression: the gate `session/permissions` creates must publish
     /// to the daemon's own bus.**
     ///
     /// [`DaemonRuntime::permission_gate_for`] creates the session's gate when
