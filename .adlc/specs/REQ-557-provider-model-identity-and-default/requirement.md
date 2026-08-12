@@ -4,7 +4,7 @@ title: "Provider model identity and an explicit default provider"
 status: complete
 deployable: true
 created: 2026-08-05
-updated: 2026-08-11
+updated: 2026-08-12
 component: "daemon/router"
 domain: "providers"
 stack: ["rust", "daemon", "cli", "llm-providers"]
@@ -175,10 +175,32 @@ No new events and no new RPCs. `config/get`'s `ProviderConfig` projection gains
 
 ## Acceptance Criteria
 
-- [x] AC-1: `teton provider add opus --kind anthropic --model claude-opus-5` and
+- [ ] AC-1 **[MANUAL GATE — not CI-enforceable; NOT RUN]**:
+      `teton provider add opus --kind anthropic --model claude-opus-5` and
       `teton provider add sonnet --kind anthropic --model claude-sonnet-5`
       both succeed; `teton provider list` shows two providers with distinct
       models and the same kind. Registering a third with `id: opus` fails.
+
+      **Unticked deliberately — do not tick without a sign-off block in
+      `docs/manual-verification.md`.** It was ticked in error during the
+      2026-08-11 wrapup by a sweep that flipped every box rather than checking
+      each against evidence; the runbook had already recorded this leg as
+      verified *"at the strength it was actually verified — which is not at
+      all."* Following REQ-547 AC-13's precedent, which stayed unticked until its
+      sign-off was filled and countersigned.
+
+      **The gap is narrow, and the unticked box should not be read as "none of
+      this works."** Automated and passing: the same two-provider registration
+      over the `config/set` RPC the CLI drives, including the `config/get`
+      round-trip (`tetond/tests/e2e/ac_matrix.rs`); the duplicate-id refusal,
+      this AC's third clause, through the real CLI binary
+      (`teton/tests/cli_e2e.rs`); and `provider list`'s rendering of the declared
+      model. **Not** automated: the keychain write and the CLI's own success
+      rendering for a *remote* kind via `provider add` — because
+      `run_provider_add` hardcodes `default_keychain()` rather than accepting an
+      injectable backend, so the subprocess e2e harness cannot substitute the
+      existing `MockKeychain`. That is plumbing, not a structural impossibility.
+      A ~2-minute manual procedure to close it is in the runbook.
 - [x] AC-2: `teton provider add x --kind anthropic` (no `--model`) exits
       non-zero with a message naming `--model`, and registers nothing.
 - [x] AC-3: A turn routed to a provider emits `route_decided` whose `model`
@@ -267,8 +289,9 @@ at wrapup (2026-08-11) rather than asserted from the tasks.
 
 ## Deferred
 
-Recorded at wrapup (2026-08-11). Neither was descoped mid-flight — both are
-consequences of OQ dispositions made during architecture.
+Recorded at wrapup (2026-08-11); the verification gap added 2026-08-12. The
+first two were not descoped mid-flight — both are consequences of OQ
+dispositions made during architecture.
 
 - **A `teton doctor` check for model-string validity** (OQ-1). `doctor` renders
   the provider table including `model`, so an *absent* model is visible, but
@@ -278,6 +301,16 @@ consequences of OQ dispositions made during architecture.
 - **`teton provider default <id>`** (OQ-2). Setting the default requires a
   config-file edit in v1. If REQ-560's permission/status work makes routing state
   more visible, a subcommand becomes the obvious companion.
+- **A verification gap, not deferred work: AC-1's CLI success path is NOT RUN.**
+  `teton provider add --model` for a *remote* kind writes to the keychain, and
+  `run_provider_add` hardcodes `default_keychain()` instead of taking an
+  injectable backend — so the subprocess e2e harness cannot substitute the
+  `MockKeychain` that already exists and is already used one frame down. An
+  automated success leg would write real entries into the developer's login
+  keychain and can prompt mid-suite. The closing move is an env-gated backend
+  override, which is a security-sensitive seam and deserves its own design. Until
+  then AC-1 stays unticked and the ~2-minute manual procedure lives in
+  `docs/manual-verification.md`.
 
 ## Out of Scope
 
