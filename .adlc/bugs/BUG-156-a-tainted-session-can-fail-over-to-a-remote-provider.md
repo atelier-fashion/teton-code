@@ -1,10 +1,10 @@
 ---
 id: BUG-156
 title: "A session pinned local by the privacy taint backstop can fail over to a remote provider"
-status: fixed-by-REQ-558
+status: resolved
 severity: medium
 created: 2026-08-06
-updated: 2026-08-06
+updated: 2026-08-12
 component: "daemon/router"
 domain: "privacy"
 stack: ["rust"]
