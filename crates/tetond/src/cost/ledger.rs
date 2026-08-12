@@ -678,6 +678,9 @@ impl CostMeter for CostLedger {
             provider_id,
             attribution,
             scan: UsageScan::default(),
+            // REQ-559: the status the provider answered with. `polled` alone is
+            // no longer sufficient — see `should_record`.
+            status: response.status,
             polled: false,
             recorded: false,
         };
@@ -714,17 +717,25 @@ impl CostMeter for CostLedger {
 /// early. Recording from [`Drop`] closes all of them at one site rather than at
 /// each caller, which is where a cancellation-safety rule belongs.
 ///
-/// ## `polled` is the line between "abandoned" and "never begun"
+/// ## Two conditions, and the second used to be implied by the first
 ///
-/// [`Drop`] records only a body the caller actually asked for a chunk. That
-/// distinction is not fastidiousness — it is what keeps this fix from inventing
-/// rows. A 4xx/5xx response is rejected on its **status**, before a byte of its
-/// body is read (see the provider adapters' `stream_turn`), and that body is
-/// then dropped unpolled. Recording it would append a 0-token, $0 row for a call
-/// the provider refused, inflating `CostReport::calls` with requests that bought
-/// nothing — a change to what the ledger *means*, made as a side effect of
-/// closing a leak. One `bool` draws the line where the ledger already draws it:
-/// a row means a response this daemon began to consume.
+/// [`Drop`] records only a body the caller actually asked for a chunk, and only
+/// a response the provider did **not** refuse. Both are what keep this from
+/// inventing rows: a 0-token, $0 row for a call the provider rejected would
+/// inflate `CostReport::calls` with requests that bought nothing — a change to
+/// what the ledger *means*, made as a side effect of closing a leak.
+///
+/// `polled` originally carried both, because a 4xx/5xx was rejected on its
+/// status before a byte of its body was read, so a refused body was always
+/// unpolled. **REQ-559 ended that**: BR-12's refusal classification reads a
+/// bounded prefix of a 400 body to decide whether the provider is rejecting the
+/// effort field, which polls it. The status check is therefore not redundant
+/// with `polled` — it is the condition `polled` was standing in for, now stated
+/// directly, and a guard keyed on a condition that stops holding once a feature
+/// lands is LESSON-443's shape exactly.
+///
+/// `polled` still earns its place: it separates "abandoned mid-stream" from
+/// "never begun" on a 2xx, which the status cannot.
 ///
 /// What [`Drop`] does **not** do is complete the token counts. A stream
 /// abandoned before its provider reported usage records what the scan saw, which
@@ -739,6 +750,9 @@ struct MeteredBody {
     sink: Arc<dyn CostEventSink>,
     session_id: SessionId,
     provider_id: ProviderId,
+    /// The response status, so a refusal is never billed however its body is
+    /// consumed (REQ-559).
+    status: u16,
     attribution: CostAttribution,
     scan: UsageScan,
     /// Whether the caller ever asked this body for a chunk. See the type doc:
@@ -758,8 +772,22 @@ impl MeteredBody {
         if self.recorded {
             return;
         }
+        // Latched even when the row is suppressed, so a suppressed body cannot
+        // be reconsidered by a later trigger.
         self.recorded = true;
+        if !self.should_record() {
+            return;
+        }
         self.finalize();
+    }
+
+    /// Whether this response is billable at all (REQ-559).
+    ///
+    /// A refusal buys nothing, so it is not a call — however its body was
+    /// consumed. Kept separate from `polled` because the two answer different
+    /// questions and only one of them is still implied by the other.
+    fn should_record(&self) -> bool {
+        self.status < 400
     }
 
     fn finalize(&self) {
@@ -1987,6 +2015,45 @@ CREATE TRIGGER cost_records_no_delete
             1,
             "and a subscriber watching cost sees it, not just the store"
         );
+    }
+
+    /// REQ-559 found the hole in `polled`'s reasoning. That flag was a **proxy**
+    /// for "the provider refused this on its status, so nobody read the body" —
+    /// true when it was written, and no longer true: BR-12's refusal
+    /// classification reads a bounded prefix of a 400 body to decide whether the
+    /// provider is rejecting the effort field. Polling it would flip `polled` and
+    /// bill a 0-token, $0 row for every refused request, inflating
+    /// `CostReport::calls` with calls that bought nothing.
+    ///
+    /// The guard now keys on the thing it always meant — the status — so reading
+    /// an error body to classify it cannot invent a row. LESSON-443's shape: a
+    /// guard keyed on a condition that stops holding once a feature lands.
+    #[tokio::test]
+    async fn reading_a_4xx_body_to_classify_it_still_bills_nothing() {
+        let (ledger, sink) = ledger();
+        let ledger = Arc::new(ledger);
+        let body = body_from(vec![
+            "{\"error\":{\"message\":\"Unrecognized request argument supplied: reasoning_effort\"}}",
+        ]);
+        let response = TransportResponse {
+            status: 400,
+            location: None,
+            body,
+        };
+        let metered = CostMeter::meter_response(
+            ledger.as_ref(),
+            response,
+            Some(SessionId::from("s")),
+            ProviderId::from("mystery"),
+            CostAttribution::new("mystery-1"),
+        );
+        // Exactly what REQ-559's `classify_client_error` does: read the body.
+        drain(metered.body).await;
+        assert!(
+            ledger.all_records().expect("read").is_empty(),
+            "a refused request must not be billed, even once its body is read",
+        );
+        assert!(sink.records.lock().unwrap().is_empty());
     }
 
     /// The other half of that line, and the reason `Drop` is gated on `polled`.
