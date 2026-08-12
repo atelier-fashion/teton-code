@@ -117,9 +117,31 @@ pub(crate) mod scan {
     }
 
     /// Every `.rs` file under `dir`, recursively.
+    ///
+    /// A directory that vanishes between being listed and being descended into
+    /// is skipped, not fatal — BUG-159's race one level up from the read side
+    /// (`is_dir` is a separate syscall from the `read_dir` that follows it), so
+    /// a `git checkout` removing a module directory panics a walk that has
+    /// nothing to do with the change under test. Every other error stays loud,
+    /// and [`production_sources`]' floor catches a walk that found nothing.
     fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("readable source dir") {
-            let path = entry.expect("readable dir entry").path();
+        let listing = match std::fs::read_dir(dir) {
+            Ok(listing) => listing,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "status::scan: {} vanished before it could be walked; skipped",
+                    dir.display()
+                );
+                return;
+            }
+            Err(err) => panic!("unreadable source dir {}: {err}", dir.display()),
+        };
+        for entry in listing {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => panic!("unreadable dir entry under {}: {err}", dir.display()),
+            };
             if path.is_dir() {
                 rust_files(&path, out);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
@@ -166,7 +188,7 @@ pub(crate) mod scan {
         let mut files = Vec::new();
         rust_files(&root, &mut files);
         files.sort();
-        files
+        let sources: Vec<(String, String)> = files
             .iter()
             .filter_map(|path| {
                 let text = match std::fs::read_to_string(path) {
@@ -199,7 +221,20 @@ pub(crate) mod scan {
                     .into_owned();
                 Some((rel, strip_test_modules(&text)))
             })
-            .collect()
+            .collect();
+        // The skips above can only shrink what the sweep sees, and its callers
+        // are set-based — each file missed makes an "every source has property
+        // P" assertion pass a little more easily, and a scan that saw nothing
+        // would pass all of them. The floor keeps that failure mode loud.
+        assert!(
+            sources.len() > 5,
+            "the client source scan found only {} file(s) under {}. Every sweep assertion built \
+             on this would pass vacuously, so this is a failure of the scan, not of the code it \
+             scans.",
+            sources.len(),
+            root.display()
+        );
+        sources
     }
 }
 

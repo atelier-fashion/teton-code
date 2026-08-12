@@ -108,9 +108,35 @@ pub(crate) mod scan {
     }
 
     /// Every `.rs` file under `dir`, recursively.
+    ///
+    /// A directory that vanishes between being listed and being descended into
+    /// is skipped rather than fatal — BUG-159's race one level up from the read
+    /// side. `path.is_dir()` is a separate syscall from the `read_dir` that
+    /// follows it, so a `git checkout`/`git stash` removing a module directory
+    /// in between panics a walk that has nothing to do with the change under
+    /// test. Every other error stays loud.
+    ///
+    /// This tolerance can only ever *shrink* what a scan sees, so it is paired
+    /// with [`production_sources`]'s floor assertion: a walk that silently found
+    /// nothing would otherwise let every sweep assertion pass vacuously.
     pub(crate) fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("readable source dir") {
-            let path = entry.expect("readable dir entry").path();
+        let listing = match std::fs::read_dir(dir) {
+            Ok(listing) => listing,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "call_sites::scan: {} vanished before it could be walked; skipped",
+                    dir.display()
+                );
+                return;
+            }
+            Err(err) => panic!("unreadable source dir {}: {err}", dir.display()),
+        };
+        for entry in listing {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => panic!("unreadable dir entry under {}: {err}", dir.display()),
+            };
             if path.is_dir() {
                 rust_files(&path, out);
             } else if path.extension().is_some_and(|e| e == "rs") {
@@ -125,8 +151,33 @@ pub(crate) mod scan {
     /// at the first one is exact today and *conservative* if that ever changes:
     /// it can only shrink what a scan sees, which makes an assertion fail loudly
     /// rather than pass wrongly.
+    /// # A named file is read loudly, but survives a rename window (BUG-159)
+    ///
+    /// This is the **loud half** of the tolerance split. [`production_sources`]
+    /// sweeps every file and *skips* one that is genuinely gone, because nobody
+    /// asked for it by name. A caller naming a specific module is the opposite
+    /// case: if that module was renamed or deleted, the test must fail naming
+    /// it, never pass against an empty string.
+    ///
+    /// So the only thing tolerated here is the microsecond window an atomic
+    /// rename opens — an editor saving, a `git checkout` rewriting the file —
+    /// which is a fact about *when* we looked, not about the source tree. One
+    /// retry closes that window; a file that is still missing is fatal, which
+    /// keeps a deleted module loud.
     pub(crate) fn production_source(path: &Path) -> String {
-        strip_test_modules(&std::fs::read_to_string(path).expect("readable source file"))
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => std::fs::read_to_string(path)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "source file {} is missing on a second read, so this is a deleted or \
+                         renamed module rather than a save in flight: {err}",
+                        path.display()
+                    )
+                }),
+            Err(err) => panic!("unreadable source file {}: {err}", path.display()),
+        };
+        strip_test_modules(&text)
     }
 
     /// `text` truncated at its first `#[cfg(test)]` item. See
@@ -169,12 +220,20 @@ pub(crate) mod scan {
     /// not see, silently. So the directory is re-listed: if the path is still
     /// there the read is retried and a second failure is fatal, and only a path
     /// that is genuinely absent from a fresh listing is skipped.
+    ///
+    /// ## The tolerance is floored, so it cannot become a vacuous pass
+    ///
+    /// Every skip above shrinks what the sweep sees, and the callers are
+    /// set-based: each file they miss makes an "every source has property P"
+    /// assertion pass a little more easily. A scan that saw *nothing* would pass
+    /// all of them. The floor below turns that failure mode back into a loud
+    /// one, so the race tolerance can never be mistaken for a green suite.
     pub(crate) fn production_sources() -> Vec<(String, String)> {
         let root = daemon_src();
         let mut files = Vec::new();
         rust_files(&root, &mut files);
         files.sort();
-        files
+        let sources: Vec<(String, String)> = files
             .iter()
             .filter_map(|path| {
                 let text = match std::fs::read_to_string(path) {
@@ -209,7 +268,16 @@ pub(crate) mod scan {
                     .into_owned();
                 (rel, strip_test_modules(&text)).into()
             })
-            .collect()
+            .collect();
+        assert!(
+            sources.len() > 10,
+            "the daemon source scan found only {} file(s) under {}. Every sweep assertion built \
+             on this would pass vacuously, so this is a failure of the scan, not of the code it \
+             scans.",
+            sources.len(),
+            root.display()
+        );
+        sources
     }
 
     /// `source` with whole-line comments removed.
@@ -242,7 +310,7 @@ mod tests {
     use teton_core::category::{category_for_phase, JudgmentCategory};
     use teton_core::Phase;
 
-    use super::scan::{daemon_src, production_source, rust_files};
+    use super::scan::{daemon_src, production_source, production_sources};
 
     /// The `Router` methods that answer "where does this category go".
     ///
@@ -354,16 +422,17 @@ mod tests {
     /// intended prompt.
     #[test]
     fn the_unreached_marker_matches_the_daemons_actual_call_sites() {
-        let mut files = Vec::new();
-        rust_files(&daemon_src(), &mut files);
-        files.sort();
-        assert!(files.len() > 10, "found no daemon sources to scan");
+        // `production_sources` rather than a second `rust_files` + per-file read:
+        // this is a *sweep*, so it wants the sweep API's BUG-159 tolerance — a
+        // file deleted between the listing and the read is not this test's
+        // subject. Its own floor assertion replaces the `files.len() > 10` this
+        // test used to make.
+        let sources = production_sources();
 
         let mut derived: BTreeSet<&'static str> = BTreeSet::new();
         let mut opaque: Vec<String> = Vec::new();
 
-        for path in &files {
-            let source = production_source(path);
+        for (rel, source) in &sources {
             for method in CATEGORY_BEARING {
                 let needle = format!("router.{method}(");
                 for (at, _) in source.match_indices(&needle) {
@@ -371,15 +440,14 @@ mod tests {
                     // through its shorter prefix: the `(` is part of the needle,
                     // so it cannot.
                     let open = at + needle.len() - 1;
-                    let arg = argument(&source, open);
+                    let arg = argument(source, open);
                     match reached_by(method, arg) {
                         Some(categories) => {
                             derived.extend(categories.into_iter().map(Category::as_str));
                         }
                         None => opaque.push(format!(
-                            "{}: router.{method}({arg}) — the scan cannot tell which category \
-                             this dispatches on",
-                            path.display()
+                            "{rel}: router.{method}({arg}) — the scan cannot tell which category \
+                             this dispatches on"
                         )),
                     }
                 }
