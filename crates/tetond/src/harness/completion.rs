@@ -27,7 +27,7 @@
 //! The loop switches on that and never sees a provider-specific shape.
 
 use std::sync::{Arc, Mutex};
-use teton_core::effort::ResolvedEffort;
+use teton_core::effort::{EffortOmission, ResolvedEffort};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -411,6 +411,15 @@ pub struct RemoteProviderSource<'a, T: Transport> {
     /// would let a call site forget silently. The value is resolved once at
     /// route time (ADR-G) and carried here unchanged — this source never clamps.
     effort: ResolvedEffort,
+    /// Set when this provider refused the effort field on this turn (REQ-559
+    /// BR-12 / ADR-F).
+    ///
+    /// Read by the daemon after the turn to populate the **session** refusal
+    /// memo, so the next call to this provider does not repeat a request already
+    /// known to fail. Never persisted, and it does not touch the declared
+    /// `reasoning_shape`: BR-4 forbids sniffing a shape from a response, so this
+    /// is a runtime degradation record and not a capability conclusion.
+    effort_refused: bool,
 }
 
 impl<'a, T: Transport> RemoteProviderSource<'a, T> {
@@ -433,7 +442,16 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
             phase: None,
             category: None,
             effort,
+            effort_refused: false,
         }
+    }
+
+    /// Whether this source's provider refused the effort field (REQ-559 BR-12).
+    ///
+    /// The daemon reads this after the turn to seed the session memo (ADR-F).
+    #[must_use]
+    pub fn effort_was_refused(&self) -> bool {
+        self.effort_refused
     }
 
     /// Pin the structured-mode `phase` this source's calls are attributed to
@@ -518,14 +536,52 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
         if let Some(category) = self.category {
             attribution = attribution.with_category(category);
         }
-        let egress_ctx = EgressContext::new(self.provider_id.clone())
-            .with_session(self.session_id.clone())
-            .with_cost(attribution);
-        let transport = self.egress.scoped(provenance.clone(), egress_ctx);
+        // Built as a closure rather than a value because the BR-12 fallback
+        // below needs a second one: an `EgressContext` is consumed by `scoped`,
+        // and the retry is a distinct call through the same choke point, so it
+        // must be boundary-checked and metered on its own terms — never handed a
+        // reused context that would fold two calls into one CostRecord.
+        let egress_ctx = || {
+            EgressContext::new(self.provider_id.clone())
+                .with_session(self.session_id.clone())
+                .with_cost(attribution.clone())
+        };
+        let transport = self.egress.scoped(provenance.clone(), egress_ctx());
 
         // Errors known at open time (including a privacy block, surfaced as a
         // transport refusal) come back here before any events flow.
-        let mut stream = self.provider.stream_turn(request, &transport).await?;
+        //
+        // REQ-559 BR-12: a provider that refuses the reasoning-effort field gets
+        // **exactly one** retry, with no reasoning field at all. Not a silent
+        // retry of the same request — that is what BR-12 forbids — and never
+        // both shapes "to see which works". The retry cannot loop by
+        // construction: it sends `Omit`, and `classify_client_error`
+        // short-circuits on a request that carried no reasoning field, so a
+        // second refusal is impossible rather than merely unlikely.
+        let mut stream = match self.provider.stream_turn(request.clone(), &transport).await {
+            Ok(stream) => stream,
+            Err(err) if err.is_effort_refused() => {
+                // Loud, not silent (LESSON-447): the typed error names the
+                // provider and both levels, and the session surface reports the
+                // provider as refusing rather than showing a level it is not
+                // receiving (BR-6).
+                eprintln!("teton: {err}; retrying this call with no reasoning field");
+                self.effort_refused = true;
+                let fallback = TurnRequest {
+                    effort: ResolvedEffort::Omit {
+                        reason: EffortOmission::RefusedThisSession,
+                    },
+                    ..request
+                };
+                // A fresh scoped transport: the first attempt's was consumed,
+                // and this is a second call through the same choke point, so it
+                // is boundary-checked and metered on its own terms (BR-13 —
+                // effort changes nothing about egress).
+                let transport = self.egress.scoped(provenance.clone(), egress_ctx());
+                self.provider.stream_turn(fallback, &transport).await?
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         let mut text = String::new();
         let mut tool_call: Option<TurnDecision> = None;

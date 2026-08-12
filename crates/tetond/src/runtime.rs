@@ -520,6 +520,65 @@ pub struct SessionTaint {
     tainted: Mutex<HashSet<SessionId>>,
 }
 
+/// Providers that refused the reasoning-effort field, per session (REQ-559
+/// BR-12 / ADR-F).
+///
+/// **Session-scoped and never persisted.** BR-12 forbids *silent retries* —
+/// making a failing request again and hoping — and this does the opposite: it
+/// declines a request already known to fail. Remembering is not retrying.
+///
+/// It deliberately does **not** touch the provider's declared
+/// `reasoning_shape`. BR-4 says the shape is declared per provider and never
+/// sniffed from a response, and persisting a capability conclusion drawn from
+/// one HTTP status is exactly that sniff — it would survive a provider adding
+/// effort support, or a transient 400 from a proxy, with no way for the user to
+/// know why their setting stopped applying. Because the memo is session-scoped,
+/// the next session tries again and a provider that gained support self-heals
+/// with no config edit.
+///
+/// Keyed by `(session, provider_id)` — the id the user configured — so two
+/// providers pointing at one endpoint are remembered separately, per the
+/// codebase's "a remembered grant is scoped by its key" principle.
+#[derive(Debug, Default)]
+pub struct EffortRefusals {
+    refused: Mutex<HashSet<(SessionId, String)>>,
+}
+
+impl EffortRefusals {
+    /// An empty memo.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remember that `provider_id` refused the effort field in `session`.
+    ///
+    /// Returns whether this was the first refusal for that pair, so the caller
+    /// can announce it once rather than on every subsequent call — the same
+    /// announce-once discipline [`SessionTaint::mark`] uses, and for the same
+    /// reason: a degradation nothing says out loud is one the user discovers as
+    /// "why did my setting stop working".
+    pub fn mark(&self, session: &SessionId, provider_id: &str) -> bool {
+        self.refused
+            .lock()
+            .expect("effort refusal mutex poisoned")
+            .insert((session.clone(), provider_id.to_owned()))
+    }
+
+    /// Every provider that has refused the effort field in `session`, as the
+    /// set `Router::with_effort_refusals` consumes.
+    #[must_use]
+    pub fn for_session(&self, session: &SessionId) -> std::collections::BTreeSet<String> {
+        self.refused
+            .lock()
+            .expect("effort refusal mutex poisoned")
+            .iter()
+            .filter(|(s, _)| s == session)
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+}
+
 impl SessionTaint {
     /// An empty taint set.
     #[must_use]
@@ -1193,6 +1252,10 @@ pub struct DaemonRuntime {
     /// path's own `is_privacy_blocked` arm cannot cover it (see
     /// [`TaintingPrivacySink`]).
     session_taint: Arc<SessionTaint>,
+    /// Providers that refused the reasoning-effort field, per session
+    /// (REQ-559 BR-12 / ADR-F). Beside `session_taint` because both are
+    /// session-scoped runtime degradation records rather than configuration.
+    effort_refusals: Arc<EffortRefusals>,
     /// Per-session lifts of the BR-13 web restriction (REQ-563). Behind an `Arc`
     /// because the lookup seam reads it through a [`TaintView`] on whatever task
     /// the turn is running on, while the `web/override` RPC writes it from the
@@ -1285,6 +1348,7 @@ impl DaemonRuntime {
             probe: None,
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
+            effort_refusals: Arc::new(EffortRefusals::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
@@ -1429,6 +1493,7 @@ impl DaemonRuntime {
             probe: Some(probe),
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
+            effort_refusals: Arc::new(EffortRefusals::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
@@ -2147,7 +2212,13 @@ impl DaemonRuntime {
             // answer.
             self.local_tier_available(),
             &health_snapshot,
-        );
+        )
+        // REQ-559 BR-12 / ADR-F: a provider that refused the effort field
+        // earlier in THIS session resolves to `Omit(RefusedThisSession)` rather
+        // than being asked again. Seeded per turn from the session-scoped memo,
+        // so it is honoured by the route, the `route_decided` event, the request
+        // and the `teton effort` surface alike — one resolution, every reader.
+        .with_effort_refusals(self.effort_refusals.for_session(&session_id));
 
         // REQ-561 TASK-062: name the session, at most once for its whole life.
         // Ahead of the turn rather than after it, for two reasons: the name is
@@ -2908,7 +2979,7 @@ impl DaemonRuntime {
             source = source.with_category(to_protocol_category(category));
         }
 
-        run_session_turn_with_source(
+        let outcome = run_session_turn_with_source(
             &mut source,
             tools,
             tool_ctx,
@@ -2921,7 +2992,30 @@ impl DaemonRuntime {
             &compact,
             &duties,
         )
-        .await
+        .await;
+
+        // REQ-559 BR-12 / ADR-F: if this provider refused the effort field, the
+        // source already retried once with no reasoning field — that is the
+        // whole of BR-12's per-call handling. Remember it for the session so the
+        // *next* call does not repeat a request known to fail.
+        //
+        // Read AFTER the turn and unconditionally, including on the error path:
+        // a refusal happened whether or not the retried turn then succeeded for
+        // some other reason, and a memo that only recorded successes would ask
+        // again on the very next call.
+        if source.effort_was_refused() && self.effort_refusals.mark(session_id, &provider_cfg.id) {
+            // Announced once per (session, provider), like the taint pin: a
+            // degradation nothing says out loud is one the user discovers as
+            // "why did my effort setting stop working". The `teton effort` /
+            // `/effort` surfaces carry the standing state; this is the moment it
+            // changed.
+            eprintln!(
+                "teton: '{}' refused the reasoning-effort field; this session will \
+                 send none to it (the next session tries again).",
+                provider_cfg.id,
+            );
+        }
+        outcome
     }
 
     /// Resolve the `digest` category for this turn (REQ-558 BR-1, BR-2, BR-7).

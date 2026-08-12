@@ -124,7 +124,7 @@ impl OpenAiCompatAdapter {
             // The canonical spellings ARE the wire spellings here: DeepSeek and
             // Kimi both take `low`/`high`/`xhigh`/`max` verbatim, so there is no
             // per-provider mapping table to keep in sync (BR-3).
-            ResolvedEffort::Effort { level } => {
+            ResolvedEffort::Effort { level, .. } => {
                 body["reasoning_effort"] = json!(level.as_str());
             }
             ResolvedEffort::ThinkingFlag => {
@@ -173,9 +173,19 @@ impl Provider for OpenAiCompatAdapter {
             });
         }
         if resp.status >= 400 {
-            return Err(ProviderError::ClientError {
-                status: resp.status,
-            });
+            // REQ-559 BR-12: a 400 naming the reasoning field is a refusal of
+            // that field, not a failure of the provider. Classified here — with
+            // the request's own `effort` in hand — because only this scope knows
+            // what was actually sent, and a refusal claim made without that is a
+            // guess (crate::classify_client_error short-circuits when the
+            // request carried no reasoning field at all).
+            return Err(crate::classify_client_error(
+                resp.status,
+                resp.body,
+                &self.config.id,
+                request.effort,
+            )
+            .await);
         }
         Ok(event_stream(resp.body))
     }

@@ -1457,8 +1457,21 @@ mod tests {
         let decided = route.route_decided().expect("a provider was selected");
         assert_eq!(
             decided.effort,
-            Some(ResolvedEffort::effort(EffortLevel::High)),
+            Some(ResolvedEffort::clamped(
+                EffortLevel::Xhigh,
+                EffortLevel::High
+            )),
             "the event must name the clamped level (AC-4)",
+        );
+        assert_eq!(
+            decided.effort.unwrap().level(),
+            Some(EffortLevel::High),
+            "what goes on the wire is `high`, not the requested `xhigh`",
+        );
+        assert!(
+            decided.effort.unwrap().was_clamped(),
+            "and the event carries the fact that it WAS clamped, so a reader \
+             does not have to infer it by comparing against the setting",
         );
     }
 

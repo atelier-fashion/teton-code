@@ -125,7 +125,7 @@ impl AnthropicAdapter {
             // single-shape invariant that holds for every provider is worth
             // more than a per-provider exception that makes AC-2 conditional.
             // This omission is deliberate — do not "fix" it.
-            ResolvedEffort::Effort { level } => {
+            ResolvedEffort::Effort { level, .. } => {
                 body["output_config"] = json!({"effort": level.as_str()});
             }
             ResolvedEffort::ThinkingFlag => {
@@ -179,9 +179,19 @@ impl Provider for AnthropicAdapter {
             });
         }
         if resp.status >= 400 {
-            return Err(ProviderError::ClientError {
-                status: resp.status,
-            });
+            // REQ-559 BR-12: a 400 naming the reasoning field is a refusal of
+            // that field, not a failure of the provider. Classified here — with
+            // the request's own `effort` in hand — because only this scope knows
+            // what was actually sent, and a refusal claim made without that is a
+            // guess (crate::classify_client_error short-circuits when the
+            // request carried no reasoning field at all).
+            return Err(crate::classify_client_error(
+                resp.status,
+                resp.body,
+                &self.id,
+                request.effort,
+            )
+            .await);
         }
         Ok(event_stream(resp.body))
     }

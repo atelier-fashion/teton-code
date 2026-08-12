@@ -318,8 +318,17 @@ pub enum ResolvedEffort {
     /// route time (ADR-G). An adapter that re-clamped would be a second
     /// implementation of BR-5, which is the drift AC-8 exists to prevent.
     Effort {
-        /// The clamped level to send.
+        /// The clamped level to send — what actually goes on the wire.
         level: EffortLevel,
+        /// The level the user asked for, before the per-provider clamp.
+        ///
+        /// Carried alongside rather than compared against a global elsewhere,
+        /// so "was this clamped?" is answerable from the value itself. Two
+        /// consumers need it and neither should have to reach for the setting:
+        /// the surface, which says "clamped from X" (BR-9), and BR-12's typed
+        /// error, which must name the requested level at a layer that never
+        /// saw it. Equal to `level` whenever no clamping happened.
+        requested: EffortLevel,
     },
     /// Send the thinking flag alone.
     ///
@@ -335,10 +344,43 @@ pub enum ResolvedEffort {
 }
 
 impl ResolvedEffort {
-    /// Shorthand for [`ResolvedEffort::Effort`].
+    /// An unclamped resolution: the level asked for is the level sent.
     #[must_use]
     pub const fn effort(level: EffortLevel) -> Self {
-        Self::Effort { level }
+        Self::Effort {
+            level,
+            requested: level,
+        }
+    }
+
+    /// A clamped resolution: `requested` was asked for, `level` is being sent.
+    #[must_use]
+    pub const fn clamped(requested: EffortLevel, level: EffortLevel) -> Self {
+        Self::Effort { level, requested }
+    }
+
+    /// Whether the per-provider ladder moved the level the user asked for
+    /// (REQ-559 BR-5). The surface says so; a silent clamp would leave a user
+    /// who set `xhigh` with no explanation of why nothing changed.
+    #[must_use]
+    pub const fn was_clamped(self) -> bool {
+        matches!(self, Self::Effort { level, requested } if !matches!(
+            (level, requested),
+            (EffortLevel::Low, EffortLevel::Low)
+                | (EffortLevel::Medium, EffortLevel::Medium)
+                | (EffortLevel::High, EffortLevel::High)
+                | (EffortLevel::Xhigh, EffortLevel::Xhigh)
+                | (EffortLevel::Max, EffortLevel::Max)
+        ))
+    }
+
+    /// The level the user asked for, when this resolution sends one.
+    #[must_use]
+    pub const fn requested(self) -> Option<EffortLevel> {
+        match self {
+            Self::Effort { requested, .. } => Some(requested),
+            Self::ThinkingFlag | Self::Omit { .. } => None,
+        }
     }
 
     /// Shorthand for [`ResolvedEffort::Omit`].
@@ -355,7 +397,7 @@ impl ResolvedEffort {
     #[must_use]
     pub const fn level(self) -> Option<EffortLevel> {
         match self {
-            Self::Effort { level } => Some(level),
+            Self::Effort { level, .. } => Some(level),
             Self::ThinkingFlag | Self::Omit { .. } => None,
         }
     }

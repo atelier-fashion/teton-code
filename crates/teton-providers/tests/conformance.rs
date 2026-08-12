@@ -690,3 +690,172 @@ fn openai_parses_the_reasoning_split_without_moving_the_total() {
     assert_eq!(with_split.output_tokens, 42);
     assert!(with_split.reasoning_tokens.unwrap() <= with_split.output_tokens);
 }
+
+// ---------------------------------------------------------------------------
+// REQ-559 BR-12: the effort refusal (AC-2b, AC-10)
+// ---------------------------------------------------------------------------
+
+/// A transport that answers one status with one body — enough to drive the 400
+/// classification path, which reads a bounded prefix of the error document.
+struct ErrorBodyTransport {
+    status: u16,
+    body: &'static str,
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl ErrorBodyTransport {
+    fn new(status: u16, body: &'static str) -> Self {
+        Self {
+            status,
+            body,
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl Transport for ErrorBodyTransport {
+    async fn execute(
+        &self,
+        request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
+        self.seen
+            .lock()
+            .expect("capture lock")
+            .push(serde_json::from_slice(&request.body).expect("a JSON body"));
+        let chunks = vec![Ok::<Vec<u8>, TransportError>(self.body.as_bytes().to_vec())];
+        Ok(TransportResponse {
+            location: None,
+            status: self.status,
+            body: Box::pin(futures::stream::iter(chunks)),
+        })
+    }
+}
+
+/// AC-2b / AC-10 / BR-12. A 400 naming the effort field produces the **typed**
+/// error, and it names all three values BR-12 requires: the provider, the level
+/// the user asked for, and the level the clamp actually sent.
+///
+/// The distinction from a generic `ClientError` is load-bearing: this error is
+/// what populates the session refusal memo (ADR-F), and a memo poisoned by an
+/// unrelated 400 would silently stop sending effort to a provider that accepts
+/// it — the misattribution family BR-6 exists to prevent.
+#[test]
+fn a_400_naming_the_effort_field_is_the_typed_refusal() {
+    let transport = ErrorBodyTransport::new(
+        400,
+        r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#,
+    );
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig::new("mystery", "https://byom.test"));
+    let err = match block_on(adapter.stream_turn(
+        // Clamped: `xhigh` asked for, `high` sent — the pair the error must name.
+        request_with(ResolvedEffort::clamped(
+            EffortLevel::Xhigh,
+            EffortLevel::High,
+        )),
+        &transport,
+    )) {
+        Ok(_) => panic!("a 400 must not open a stream"),
+        Err(err) => err,
+    };
+
+    match &err {
+        ProviderError::EffortRefused {
+            provider_id,
+            requested,
+            clamped,
+        } => {
+            assert_eq!(provider_id, "mystery");
+            assert_eq!(*requested, EffortLevel::Xhigh);
+            assert_eq!(*clamped, EffortLevel::High);
+        }
+        other => panic!("expected the typed refusal, got {other:?}"),
+    }
+    // The message names all three, and carries no response body or prompt text.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("mystery") && msg.contains("xhigh") && msg.contains("high"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("Unrecognized"),
+        "no provider body in the error: {msg}"
+    );
+
+    // It is NOT handed to the retry/fallback/degrade machinery: the one correct
+    // response is a single retry with no reasoning field, which the daemon does.
+    assert!(err.is_effort_refused());
+    assert_eq!(err.failure_class(), None);
+}
+
+/// The narrowness is the point. A 400 for an unrelated reason stays a generic
+/// `ClientError`, so it cannot poison the session memo and silently disable
+/// effort for a provider that accepts it.
+#[test]
+fn an_unrelated_400_is_not_read_as_an_effort_refusal() {
+    let transport = ErrorBodyTransport::new(
+        400,
+        r#"{"error":{"message":"invalid model: no such model `test-model`"}}"#,
+    );
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig::new("mystery", "https://byom.test"));
+    let err = match block_on(adapter.stream_turn(
+        request_with(ResolvedEffort::effort(EffortLevel::High)),
+        &transport,
+    )) {
+        Ok(_) => panic!("a 400 must not open a stream"),
+        Err(err) => err,
+    };
+    assert!(!err.is_effort_refused(), "got {err:?}");
+    assert!(matches!(err, ProviderError::ClientError { status: 400 }));
+}
+
+/// A request that carried **no** reasoning field cannot be refusing one, so the
+/// classification short-circuits. This is what makes the daemon's single retry
+/// non-looping by construction rather than by a counter: the retry sends
+/// `Omit`, and an `Omit` request can never come back as a refusal.
+#[test]
+fn a_request_with_no_reasoning_field_can_never_be_an_effort_refusal() {
+    for reason in [
+        EffortOmission::ShapeNone,
+        EffortOmission::EmptyLadder,
+        EffortOmission::RefusedThisSession,
+    ] {
+        let transport = ErrorBodyTransport::new(
+            400,
+            r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#,
+        );
+        let adapter =
+            OpenAiCompatAdapter::new(OpenAiCompatConfig::new("mystery", "https://byom.test"));
+        let err = match block_on(
+            adapter.stream_turn(request_with(ResolvedEffort::omit(reason)), &transport),
+        ) {
+            Ok(_) => panic!("a 400 must not open a stream"),
+            Err(err) => err,
+        };
+        assert!(
+            !err.is_effort_refused(),
+            "{reason:?}: a request that sent no reasoning field cannot be refusing one",
+        );
+    }
+}
+
+/// AC-2b's first leg: an `openai-compatible` provider with **no declared
+/// reasoning_shape** sends the effort field on its first call — the ADR-E
+/// `effort_only` default. Asserted on the captured body, because this is the
+/// BYOM leg of AC-1's regression and the whole point is what leaves the daemon.
+#[test]
+fn an_undeclared_byom_endpoint_sends_the_effort_field_on_its_first_call() {
+    let transport = ErrorBodyTransport::new(400, r#"{"error":"nope"}"#);
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig::new("mystery", "https://byom.test"));
+    let _ = block_on(adapter.stream_turn(
+        request_with(ResolvedEffort::effort(EffortLevel::High)),
+        &transport,
+    ));
+    let bodies = transport.seen.lock().expect("capture lock").clone();
+    assert_eq!(bodies.len(), 1, "exactly one request, no silent retry here");
+    assert_eq!(bodies[0]["reasoning_effort"], "high");
+    assert!(
+        bodies[0].get("thinking").is_none(),
+        "and never both shapes (AC-2b)",
+    );
+}

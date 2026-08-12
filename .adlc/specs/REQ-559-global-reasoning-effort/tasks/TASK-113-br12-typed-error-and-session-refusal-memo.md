@@ -1,7 +1,7 @@
 ---
 id: TASK-113
 title: "BR-12: a typed effort-refused error, a single per-call fallback, and the session refusal memo"
-status: pending
+status: complete
 parent: REQ-559
 created: 2026-08-11
 updated: 2026-08-11

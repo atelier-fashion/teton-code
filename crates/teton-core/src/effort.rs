@@ -138,7 +138,10 @@ pub fn resolve_effort(
             // (LESSON-443), and would make the AC-12 identity-clamp mutation
             // undetectable on the common path.
             match ladder.clamp(requested) {
-                Some(level) => ResolvedEffort::effort(level),
+                // Both levels travel: the surface needs the pair to say
+                // "clamped from X", and BR-12's typed error names both at a
+                // layer that never saw the setting.
+                Some(level) => ResolvedEffort::clamped(requested, level),
                 None => ResolvedEffort::omit(EffortOmission::EmptyLadder),
             }
         }
@@ -340,8 +343,8 @@ mod tests {
                 &caps(None, None),
                 false,
             ),
-            ResolvedEffort::effort(EffortLevel::High),
-            "the conservative default still clamps",
+            ResolvedEffort::clamped(EffortLevel::Xhigh, EffortLevel::High),
+            "the conservative default still clamps, and the resolution says so",
         );
     }
 

@@ -21,7 +21,7 @@
 //! refused the field — would be the misattribution family of BUG-146 and
 //! BUG-153: the user set something and something else happened.
 
-use teton_protocol::effort::{EffortLevel, EffortOmission, ResolvedEffort};
+use teton_protocol::effort::{EffortOmission, ResolvedEffort};
 use teton_protocol::methods::EffortView;
 
 use crate::render::{LineKind, Surface};
@@ -35,25 +35,23 @@ const NO_VIEW: &str =
 
 /// What one provider's row says (REQ-559 BR-6, BR-9).
 ///
-/// `requested` is the pre-clamp global level, passed so a clamped row can say so
-/// — a row that silently showed the lower number would leave a user wondering
-/// why `xhigh` did nothing.
+/// The resolution carries both the level being sent and the level the user
+/// asked for, so a clamped row can say so without the renderer being handed the
+/// setting separately — a row that silently showed the lower number would leave
+/// a user wondering why `xhigh` did nothing.
 #[must_use]
-pub fn provider_line(
-    provider_id: &str,
-    resolved: ResolvedEffort,
-    requested: EffortLevel,
-) -> String {
+pub fn provider_line(provider_id: &str, resolved: ResolvedEffort) -> String {
     match resolved {
-        ResolvedEffort::Effort { level } if level == requested => {
-            format!("{provider_id}: {level}")
-        }
         // Clamped. Naming both numbers is the point: the user asked for one
         // thing and is getting another, and BR-5 says the effective level is
-        // what counts.
-        ResolvedEffort::Effort { level } => {
+        // what counts. The pair travels on the value, so this reads the clamp
+        // off the resolution rather than comparing against a setting the
+        // renderer would otherwise have to be handed — a comparison the caller
+        // could get wrong, and one more thing two surfaces could disagree on.
+        ResolvedEffort::Effort { level, requested } if level != requested => {
             format!("{provider_id}: {level} (clamped from {requested} — this provider's ladder stops there)")
         }
+        ResolvedEffort::Effort { level, .. } => format!("{provider_id}: {level}"),
         // No level on the wire, so no level in the row (BR-6).
         ResolvedEffort::ThinkingFlag => {
             format!("{provider_id}: thinking on (this provider takes a flag, not a level)")
@@ -101,7 +99,7 @@ pub fn render(surface: &mut dyn Surface, view: Option<&EffortView>) {
     for row in &view.providers {
         surface.line(
             LineKind::Notice,
-            &provider_line(&row.provider_id.0, row.resolved, view.level),
+            &provider_line(&row.provider_id.0, row.resolved),
         );
     }
 }
@@ -110,6 +108,7 @@ pub fn render(surface: &mut dyn Surface, view: Option<&EffortView>) {
 mod tests {
     use super::*;
     use crate::render::RecordingSurface;
+    use teton_protocol::effort::EffortLevel;
     use teton_protocol::methods::ProviderEffortView;
     use teton_protocol::ProviderId;
 
@@ -137,7 +136,7 @@ mod tests {
             ResolvedEffort::omit(EffortOmission::EmptyLadder),
             ResolvedEffort::omit(EffortOmission::RefusedThisSession),
         ] {
-            let line = provider_line("p", resolved, EffortLevel::Max);
+            let line = provider_line("p", resolved);
             assert!(
                 !line.contains("max"),
                 "a provider not receiving a level must not display one: {line}",
@@ -149,11 +148,7 @@ mod tests {
     /// not a level.
     #[test]
     fn the_local_tier_reads_not_applicable() {
-        let line = provider_line(
-            "local",
-            ResolvedEffort::omit(EffortOmission::ShapeNone),
-            EffortLevel::Max,
-        );
+        let line = provider_line("local", ResolvedEffort::omit(EffortOmission::ShapeNone));
         assert!(line.contains("not applicable"), "{line}");
     }
 
@@ -163,17 +158,12 @@ mod tests {
     fn a_clamped_row_names_both_the_effective_and_the_requested_level() {
         let line = provider_line(
             "kimi",
-            ResolvedEffort::effort(EffortLevel::High),
-            EffortLevel::Xhigh,
+            ResolvedEffort::clamped(EffortLevel::Xhigh, EffortLevel::High),
         );
         assert!(line.contains("high") && line.contains("xhigh"), "{line}");
         assert!(line.contains("clamped"), "{line}");
         // An unclamped row does not cry wolf.
-        let plain = provider_line(
-            "kimi",
-            ResolvedEffort::effort(EffortLevel::High),
-            EffortLevel::High,
-        );
+        let plain = provider_line("kimi", ResolvedEffort::effort(EffortLevel::High));
         assert!(!plain.contains("clamped"), "{plain}");
     }
 
@@ -184,7 +174,6 @@ mod tests {
         let line = provider_line(
             "mystery",
             ResolvedEffort::omit(EffortOmission::RefusedThisSession),
-            EffortLevel::High,
         );
         assert!(line.contains("this session"), "{line}");
         assert!(line.contains("next session"), "{line}");
@@ -199,7 +188,10 @@ mod tests {
                 EffortLevel::Xhigh,
                 &[
                     ("anthropic", ResolvedEffort::effort(EffortLevel::Xhigh)),
-                    ("kimi", ResolvedEffort::effort(EffortLevel::High)),
+                    (
+                        "kimi",
+                        ResolvedEffort::clamped(EffortLevel::Xhigh, EffortLevel::High),
+                    ),
                     ("local", ResolvedEffort::omit(EffortOmission::ShapeNone)),
                 ],
             )),
