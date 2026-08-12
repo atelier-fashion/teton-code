@@ -4,6 +4,7 @@ title: "Source-scanning tests panic when src/ changes mid-run — which is exact
 status: open
 severity: medium
 created: 2026-08-07
+updated: 2026-08-12
 component: "daemon/tests"
 domain: "verification"
 found_by: REQ-561 Phase-5 confirmation pass
@@ -69,8 +70,79 @@ concurrent-modification case should be tolerated, and it should say so.
 Worth adding: a test that removes a file mid-walk and asserts the scan reports
 the race rather than panicking on an unrelated line.
 
+## Root Cause
+
+A **listing and the reads that follow it are separate syscalls**, and the scan
+treated the listing as still-true. `rust_files` walks `src/`, then each path is
+opened a moment later; anything that rewrites `src/` in between — an editor
+saving by atomic rename, a `git checkout`, or a mutation pass — makes an opened
+path `NotFound` and the `expect` turns that into a panic attributed to whatever
+test happened to be sweeping.
+
+The race has **three** windows, not the one the report names:
+
+1. `production_source`'s read (`call_sites.rs`, the reported line).
+2. `rust_files`' own recursion — `path.is_dir()` is a separate syscall from the
+   `read_dir` that follows it, so a *directory* removed mid-walk panics too.
+3. Both again in the client twin, `crates/teton/src/status.rs`.
+
+**Partly fixed already, which the report predates.** `production_sources`
+(plural) was hardened during REQ-562/REQ-570 with a re-list-and-retry — so the
+four `harness::duty` tests listed above were no longer affected by the time this
+was picked up. Only `call_sites`' own sweep still used the racy singular read.
+
+## Resolution
+
+The fix follows the report's instruction to keep the loud posture everywhere it
+means something, and splits on **who asked for the file**:
+
+- **A sweep** (`production_sources`) skips a file that is genuinely gone — nobody
+  asked for it by name, and its absence is a fact about timing, not about the
+  source tree.
+- **A by-name read** (`production_source`, e.g. `router.rs`) retries once to
+  close the atomic-rename window, then **still panics**. A renamed or deleted
+  module must fail naming itself, never pass against an empty string.
+- **The walk** (`rust_files`, both crates) skips a directory that vanishes before
+  it can be descended into. Every other error stays fatal.
+
+`the_unreached_marker_matches_the_daemons_actual_call_sites` now calls
+`production_sources()` instead of re-walking with `rust_files` + per-file
+`production_source` — a sweep should use the sweep API, which also drops a
+duplicated walk.
+
+**The tolerance is floored.** Every skip above can only shrink what a sweep sees,
+and the callers are set-based: each missed file makes an "every source has
+property P" assertion pass a little more easily, and a scan seeing *nothing*
+would pass all of them. Both `production_sources` implementations now assert a
+minimum file count, so the race tolerance cannot quietly become a vacuous green.
+
+### Verification
+
+- **Reproduced first**: 4 failures in 24 runs against a concurrent
+  create/remove loop on a `.rs` file under `src/`, panicking at
+  `call_sites.rs:129` with `readable source file: NotFound` — the report's
+  signature at its current line.
+- **After the fix**: 0 failures in 40 runs of the same harness; 0 in 12 runs each
+  for all five tests the report names.
+- **Mutation check** (LESSON-441): making `rust_files` return nothing turns both
+  the `call_sites` sweep **and** a `harness::duty` test red on the new floor
+  message, rather than passing vacuously — so the floor is load-bearing.
+- Full workspace: 2215 passing across 45 targets, `fmt --check` and
+  `clippy -- -D warnings` clean.
+
+## Files Changed
+
+- `crates/tetond/src/call_sites.rs` — `rust_files` tolerates a vanished
+  directory; `production_source` retries the rename window but stays fatal on a
+  genuinely missing named file; `production_sources` gains the floor assertion;
+  the marker sweep uses `production_sources()`
+- `crates/teton/src/status.rs` — the same walk tolerance and floor in the client
+  twin
+
 ## Related
 
 - LESSON-441 (a deletion is verified only by proving restoration breaks
   something — the workflow this bug interferes with)
+- LESSON-489 (a test that reads `src/` races the mutation that tests it — the
+  lesson this bug produced, and the basis of the earlier partial fix)
 - REQ-561 Phase-5 confirmation pass, where it was found and reproduced
