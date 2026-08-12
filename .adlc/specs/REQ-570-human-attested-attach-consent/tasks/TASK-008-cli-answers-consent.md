@@ -1,7 +1,7 @@
 ---
 id: TASK-008
 title: "The shipped CLI renders a consent request, takes a decision, and answers"
-status: pending
+status: complete
 parent: REQ-570
 created: 2026-08-11
 updated: 2026-08-11
@@ -24,9 +24,9 @@ shipped flow diverge until this lands.
 
 ## Acceptance Criteria
 
-- [ ] AC-4: the CLI renders an incoming consent request, takes a decision, and
+- [x] AC-4: the CLI renders an incoming consent request, takes a decision, and
       sends `attach/consent`.
-- [ ] AC-4: it **never** auto-answers — asserted, including that a
+- [x] AC-4: it **never** auto-answers — asserted, including that a
       **non-interactive** invocation does not auto-approve. It declines and says why.
 - [ ] AC-3: a user resuming their own session in a fresh CLI succeeds with
       exactly **one** visible consent step, end to end through the shipped

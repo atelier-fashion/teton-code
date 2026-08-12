@@ -34,7 +34,9 @@ use teton_protocol::events::{
     WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome, WebTier,
     OPTION_ID_ENABLE_PERMANENT,
 };
-use teton_protocol::methods::{PermissionOutcome, PermissionRespondParams};
+use teton_protocol::methods::{
+    AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
+};
 use teton_protocol::{Phase, RequestId, SessionId};
 
 use crate::cost_ui::CostMeter;
@@ -248,6 +250,17 @@ pub enum EventOutcome {
     /// and resolves it with [`crate::model_ui::resolve_proposal`] and sends the
     /// resulting `model/confirm` — or sends nothing, leaving the proposal open.
     ModelProposal(Box<ModelSelectionProposed>),
+    /// Somebody is asking to attach to a session, or to watch every session on
+    /// this daemon (REQ-570 BR-4, AC-4). The caller resolves it with
+    /// [`resolve_attach_consent`] and sends the resulting `attach/consent`.
+    ///
+    /// Before REQ-570 this event was rendered as a notice the client could not
+    /// act on, so **every** consent path ended in the daemon's 30-second
+    /// timeout: nothing in this crate sent `attach/consent`, and REQ-569's own
+    /// acceptance evidence for the grant flow leaned on a test-harness
+    /// auto-consent no shipped client had. The tested flow and the shipped flow
+    /// diverged until this existed.
+    AttachConsent(Box<AttachConsentRequested>),
 }
 
 /// Render one event, updating `state`, and report whether follow-up is needed.
@@ -452,17 +465,15 @@ pub fn render_event(
             EventOutcome::Rendered
         }
         Event::AttachConsentRequested(request) => {
-            // REQ-569 BR-6. This client can *see* the question and cannot yet
-            // answer it — `attach/consent` has no CLI surface on this branch.
+            // REQ-570 BR-4: this client can now answer. Handing it back to the
+            // caller rather than rendering a notice here is what closes Gap 2 —
+            // until this existed, nothing in this crate sent `attach/consent`
+            // and every consent path ended in the daemon's 30-second timeout.
             //
-            // Rendered as a notice rather than swallowed, and that is the whole
-            // decision here: a silent security prompt is worse than an
-            // unanswerable one. The user would otherwise learn nothing about a
-            // peer asking for their session, and would see only that peer
-            // quietly fail. Never verbose-gated, for `context_cleared`'s
-            // reason — this is news, not chrome.
-            surface.line(LineKind::Notice, &format_attach_consent(request));
-            EventOutcome::Rendered
+            // The rendering moved into `resolve_attach_consent` so the question
+            // and the answer live together: a prompt drawn here and a decision
+            // taken elsewhere is how the two drift apart.
+            EventOutcome::AttachConsent(Box::new(request.clone()))
         }
         Event::AttachRefused(_) => {
             // Nothing to draw. The connection that was refused is told by its
@@ -483,6 +494,85 @@ pub fn render_event(
     }
 }
 
+/// Put an attach/monitor consent question to the user and build the answer
+/// (REQ-570 BR-4, AC-4).
+///
+/// Returns the [`AttachConsentParams`] to send, or `None` when there is nobody
+/// to ask — see the auto-answer rule below.
+///
+/// # It never auto-answers, and that is the point
+///
+/// Every other decision surface in this client has some form of "yes to
+/// everything": `--yes` accepts a model proposal, a session grant auto-allows a
+/// tool. **None of them may reach this one.** They are all consent to *the
+/// user's own* pending action; this is consent to admit a **different
+/// connection** into the user's session, and a flag the user set once to skip
+/// download prompts must never become standing authority to hand their session
+/// to whatever asks for it next.
+///
+/// So there is deliberately no `auto_accept` parameter here to wire one into.
+/// A non-interactive invocation — piped stdin, no TTY, EOF — **declines**, and
+/// says so on screen. Silence is not consent, and the fail-closed direction is
+/// the one that refuses.
+///
+/// The daemon does not rely on this: it runs its own OS presence check before
+/// minting anything (REQ-570 BR-1), so a client that lied here would still be
+/// refused. This is the surface being honest, not the control.
+pub fn resolve_attach_consent(
+    request: &AttachConsentRequested,
+    surface: &mut dyn Surface,
+    prompter: &mut dyn Prompter,
+) -> Option<AttachConsentParams> {
+    // The question first, as a notice: it is news whether or not the user is in
+    // a position to answer, and it must be legible before the prompt line.
+    surface.line(LineKind::Notice, &format_attach_consent_notice(request));
+
+    let question = match request.scope {
+        ConsentScope::Attach => "Allow this client to attach to your session? [y/N] ",
+        // Deliberately a different sentence, not the same one with a noun
+        // swapped: a monitor grant is sight of *every* session on the machine,
+        // and a user skimming a familiar prompt would answer the smaller
+        // question they have answered before.
+        ConsentScope::Monitor => "Allow this client to watch EVERY session on this daemon? [y/N] ",
+    };
+
+    let Some(answer) = prompter.ask(question) else {
+        // EOF — a pipe, a redirect, no TTY. Nobody is there to consent.
+        surface.line(
+            LineKind::Notice,
+            "no interactive input available, so the request was declined. \
+             Answer it from an interactive `teton` session.",
+        );
+        return Some(AttachConsentParams {
+            request_id: request.request_id.clone(),
+            outcome: AttachConsentOutcome::Denied,
+        });
+    };
+
+    // Default-deny on anything that is not an explicit yes, which is the
+    // opposite of `confirm_model`'s empty-is-yes. The asymmetry is deliberate:
+    // there the default action is the one the user asked for, here it is
+    // admitting somebody else.
+    let granted = matches!(answer.trim().to_lowercase().as_str(), "y" | "yes");
+    surface.line(
+        LineKind::Prompt,
+        if granted {
+            "granted — the daemon will ask you to confirm you are present."
+        } else {
+            "denied."
+        },
+    );
+
+    Some(AttachConsentParams {
+        request_id: request.request_id.clone(),
+        outcome: if granted {
+            AttachConsentOutcome::Granted
+        } else {
+            AttachConsentOutcome::Denied
+        },
+    })
+}
+
 /// The one-line notice an `attach_consent_requested` event draws (REQ-569 BR-6).
 ///
 /// It says what would be granted rather than repeating the wire scope name,
@@ -493,16 +583,12 @@ pub fn render_event(
 /// its control characters before publishing, which is where that has to happen —
 /// this is one renderer of several, and a guard that lived here would protect
 /// only this one.
-fn format_attach_consent(request: &AttachConsentRequested) -> String {
+pub fn format_attach_consent_notice(request: &AttachConsentRequested) -> String {
     let what = match request.scope {
         ConsentScope::Attach => "attach to this session",
         ConsentScope::Monitor => "watch every session on this daemon",
     };
-    format!(
-        "{} asked to {what}. This client cannot answer it; another attached \
-         client may.",
-        request.requester
-    )
+    format!("{} asked to {what}.", request.requester)
 }
 
 /// The one-line notice a `session_grant_minted` event draws (REQ-569 verify,
@@ -1195,6 +1281,122 @@ mod tests {
         PlanEntry, PlanEntryStatus, SelectionSource, SessionUpdate, WebTaintOverridden,
     };
     use teton_protocol::{ProviderId, RequestId, SessionId};
+
+    /// A consent request as the daemon would publish it.
+    fn consent_request(scope: ConsentScope) -> AttachConsentRequested {
+        AttachConsentRequested {
+            request_id: teton_protocol::RequestId::from("consent-0"),
+            scope,
+            requester: "cli client \"teton\"".to_owned(),
+        }
+    }
+
+    /// **REQ-570 AC-4.** The CLI renders the request, takes a decision, and
+    /// answers — the capability whose absence made every consent path time out.
+    #[test]
+    fn the_cli_renders_a_consent_request_and_sends_the_users_decision() {
+        for (case, typed, expected) in [
+            ("an explicit yes grants", "y", AttachConsentOutcome::Granted),
+            (
+                "the long form works too",
+                "yes",
+                AttachConsentOutcome::Granted,
+            ),
+            ("an explicit no denies", "n", AttachConsentOutcome::Denied),
+        ] {
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&[typed]);
+            let reply = resolve_attach_consent(
+                &consent_request(ConsentScope::Attach),
+                &mut surface,
+                &mut prompter,
+            )
+            .expect("an answered prompt produces a reply");
+
+            assert_eq!(reply.outcome, expected, "{case}");
+            assert_eq!(reply.request_id.to_string(), "consent-0", "{case}");
+            assert!(
+                surface
+                    .lines_of(LineKind::Notice)
+                    .iter()
+                    .any(|l| l.contains("asked to")),
+                "{case}: the user must see who asked and for what"
+            );
+        }
+    }
+
+    /// **AC-4, the half that matters.** It never auto-answers.
+    ///
+    /// A non-interactive invocation — piped stdin, no TTY, EOF — **declines**.
+    /// Silence is not consent, and this is the path nobody exercises by hand, so
+    /// it is the one most likely to rot into an accidental approval.
+    #[test]
+    fn a_non_interactive_cli_declines_rather_than_auto_approving() {
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&[]); // EOF immediately
+        let reply = resolve_attach_consent(
+            &consent_request(ConsentScope::Attach),
+            &mut surface,
+            &mut prompter,
+        )
+        .expect("even with nobody there, the request is answered rather than left hanging");
+
+        assert_eq!(
+            reply.outcome,
+            AttachConsentOutcome::Denied,
+            "no input must never mean yes"
+        );
+        assert!(
+            surface
+                .lines_of(LineKind::Notice)
+                .iter()
+                .any(|l| l.contains("no interactive input")),
+            "and it says why, so a scripted user is not left guessing"
+        );
+    }
+
+    /// Anything that is not an explicit yes is a no.
+    ///
+    /// Deliberately the opposite of `confirm_model`'s empty-is-yes: there the
+    /// default action is the one the user asked for, here it is admitting
+    /// somebody else.
+    #[test]
+    fn only_an_explicit_yes_grants_consent() {
+        for typed in ["", " ", "sure", "ok", "yep", "Y E S", "1", "true", "d"] {
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&[typed]);
+            let reply = resolve_attach_consent(
+                &consent_request(ConsentScope::Attach),
+                &mut surface,
+                &mut prompter,
+            )
+            .expect("answered");
+            assert_eq!(
+                reply.outcome,
+                AttachConsentOutcome::Denied,
+                "{typed:?} is not an explicit yes and must not grant"
+            );
+        }
+    }
+
+    /// A monitor ask is a different sentence, not the same one with a noun
+    /// swapped — a user skimming a familiar prompt would otherwise answer the
+    /// smaller question they have answered before.
+    #[test]
+    fn a_monitor_request_asks_a_visibly_bigger_question() {
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["n"]);
+        let _ = resolve_attach_consent(
+            &consent_request(ConsentScope::Monitor),
+            &mut surface,
+            &mut prompter,
+        );
+        let asked = prompter.questions.join(" ");
+        assert!(
+            asked.contains("EVERY"),
+            "the monitor prompt must not read like the attach one: {asked}"
+        );
+    }
 
     fn envelope(event: Event) -> EventEnvelope {
         EventEnvelope::new(1, Some(SessionId::from("s1")), event)
@@ -2270,6 +2472,7 @@ mod tests {
                     approver: approver.to_owned(),
                     self_approved,
                     suppressed,
+                    attestation: "os_biometric".to_owned(),
                 })),
                 &mut surface,
                 &mut state,

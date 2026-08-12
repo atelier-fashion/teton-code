@@ -893,12 +893,34 @@ async fn refuse_unattested_commitment(
     conn: &ConnState,
     id: &Id,
 ) -> Option<String> {
+    // **Where no mechanism exists this degrades to layer (a) — it does not
+    // refuse.** The asymmetry with the consent path is the spec's, not a
+    // convenience:
+    //
+    // BR-8 and BR-11 both scope the fail-closed refusal to *cross-session
+    // attach* — "cross-session attach is refused", "cross-session attach does
+    // not work there". Neither extends it to a daemon-wide commitment. AC-10
+    // says a commitment "refuses when no valid attestation is **presented**",
+    // which is about an absent or invalid proof on a platform that can produce
+    // one, not about a platform that cannot.
+    //
+    // Refusing here would also be catastrophic rather than merely strict: the
+    // `presence` feature is non-default, so a shipped build has no mechanism, so
+    // `model/confirm` would refuse — and first-run model selection, the flow
+    // REQ-547 exists for, would be impossible for every user. That is exactly
+    // what AC-8's regression bar forbids ("zero new prompts or attestation
+    // steps" for the ordinary flows).
+    //
+    // The reduced posture is **stated rather than silent**, which is the part of
+    // BR-8 that does apply here.
     if let MechanismAvailability::Unavailable(reason) = daemon.verifier.availability() {
-        return Some(error_string(
-            id.clone(),
-            error_code::ATTESTATION_UNAVAILABLE,
-            reason.describe(),
-        ));
+        eprintln!(
+            "teton-code: daemon-wide commitment allowed on connection standing alone — \
+             this build has no presence mechanism ({}). BR-10(a) still applies; \
+             BR-10(b) is unavailable here.",
+            reason.describe()
+        );
+        return None;
     }
     // A synthetic binding id: these methods carry no consent request, and the
     // verifier binds to whatever it is handed. Keying it to the connection stops
@@ -3705,19 +3727,26 @@ mod tests {
     /// the spec's, so it is asserted rather than left to a reviewer to notice.
     #[tokio::test]
     async fn only_a_daemon_wide_commitment_demands_presence() {
-        // Ancestry is satisfied throughout; presence is not. So the only thing
-        // that can vary between these methods is layer (b).
+        // Ancestry is satisfied throughout, and a mechanism **is** available, so
+        // the only thing that can vary between these methods is layer (b).
+        //
+        // A refusing verifier is the fixture rather than an accepting one:
+        // "presence was demanded" is only observable when it can fail.
         let commitments = [ModelConfirmParams::METHOD, ModelSetParams::METHOD];
 
         for (method, params) in daemon_wide_methods() {
-            let daemon = daemon_with_short_consent_unattested();
+            let daemon = Arc::new(Daemon::new().with_presence_verifier(Box::new(
+                crate::attest::AlwaysFailsVerifier::new(
+                    crate::attest::AttestationMethod::OsBiometric,
+                ),
+            )));
             let ordinary = unattached(&daemon);
             assert!(ordinary.may_hold_session_access());
 
             let response =
                 route_for_test(&daemon, &ordinary, Id::Number(1), method, params.clone()).await;
             let refused_for_presence =
-                response.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string());
+                response.contains(&error_code::ATTESTATION_FAILED.to_string());
 
             if commitments.contains(&method) {
                 assert!(
@@ -3732,6 +3761,43 @@ mod tests {
                      train users to click through the prompt that matters: {response}"
                 );
             }
+        }
+    }
+
+    /// **AC-8, the regression this nearly broke.** With no mechanism at all, a
+    /// daemon-wide commitment degrades to layer (a) rather than refusing.
+    ///
+    /// The `presence` feature is non-default, so **the shipped build has no
+    /// mechanism**. An implementation that refused here would make
+    /// `model/confirm` impossible to answer and first-run model selection — the
+    /// whole of REQ-547 — unreachable for every user. BR-8 and BR-11 scope their
+    /// fail-closed refusal to *cross-session attach* and say nothing about
+    /// commitments, and AC-10 refuses on an attestation not **presented**, not
+    /// on a platform that cannot produce one.
+    ///
+    /// So this asserts the product still works on the build CI runs, and that
+    /// the reduced posture is not silently confused with a satisfied one.
+    #[tokio::test]
+    async fn a_commitment_degrades_to_layer_a_where_no_mechanism_exists() {
+        for method in [ModelConfirmParams::METHOD, ModelSetParams::METHOD] {
+            let params = daemon_wide_methods()
+                .into_iter()
+                .find(|(m, _)| *m == method)
+                .expect("the method is in the table")
+                .1;
+            let daemon = daemon_with_short_consent_unattested();
+            let ordinary = unattached(&daemon);
+
+            let response = route_for_test(&daemon, &ordinary, Id::Number(1), method, params).await;
+            assert!(
+                !response.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string()),
+                "`{method}` must not be refused for want of a mechanism the shipped \
+                 build does not have — that would brick first-run: {response}"
+            );
+            assert!(
+                !response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                "`{method}`: and layer (a) still admits an ordinary connection: {response}"
+            );
         }
     }
 

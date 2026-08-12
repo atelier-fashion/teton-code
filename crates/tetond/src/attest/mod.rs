@@ -280,6 +280,42 @@ impl PresenceVerifier for AcceptingVerifier {
     }
 }
 
+/// A verifier that is **present but never satisfied** — fixtures only.
+///
+/// Distinct from [`UnavailableVerifier`], and the distinction is exactly the one
+/// BR-8 turns on: that one says *no human can be asked here*, this one says *a
+/// human was asked and it did not pass*. They take different code paths and mean
+/// different things to a user, so a test that wants to observe "presence was
+/// demanded and failed" cannot use the unavailable one — on a commitment path
+/// unavailability deliberately degrades rather than refuses.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct AlwaysFailsVerifier {
+    method: AttestationMethod,
+}
+
+impl AlwaysFailsVerifier {
+    /// A double that reports `method` available and then refuses every check.
+    #[must_use]
+    pub fn new(method: AttestationMethod) -> Self {
+        Self { method }
+    }
+}
+
+impl PresenceVerifier for AlwaysFailsVerifier {
+    fn availability(&self) -> MechanismAvailability {
+        MechanismAvailability::Available(self.method)
+    }
+
+    fn verify(
+        &self,
+        _subject: ConnectionId,
+        _request: &RequestId,
+    ) -> Result<PresenceAttestation, AttestationRefusal> {
+        Err(AttestationRefusal::Failed)
+    }
+}
+
 /// The seam that lets the acceptance suite drive the *granted* path
 /// (`TETON_PRESENCE_ACCEPT`, DECISION 3).
 ///
