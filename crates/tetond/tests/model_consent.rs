@@ -2323,7 +2323,12 @@ async fn the_reader_loop_serves_sessions_while_a_proposal_is_outstanding() {
     // its own coverage in `multi_client.rs`.
     let daemon = Arc::new(
         Daemon::with_runtime(Arc::clone(&h.bus), Arc::clone(&runtime))
-            .with_daemon_process(server::DaemonProcess::Embedded),
+            .with_daemon_process(server::DaemonProcess::Embedded)
+            // REQ-570 BR-10(b): model/confirm is a daemon-wide commitment and
+            // now asks for presence. This test is about the reader loop staying
+            // responsive (D-3), not about attestation, so it gets a satisfiable
+            // mechanism rather than asserting the refusal.
+            .with_presence_verifier(Box::new(tetond::attest::AcceptingVerifier::default())),
     );
     let server_task = tokio::spawn(server::serve(listener, daemon));
 

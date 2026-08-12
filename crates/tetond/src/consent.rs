@@ -107,6 +107,16 @@ pub enum ConsentOutcome {
         /// The answering connection's bounded, control-stripped descriptor.
         /// Untrusted, peer-chosen text — a hint, never an identity.
         approver: String,
+        /// What verified a human behind this approval (REQ-570 BR-9, AC-9).
+        ///
+        /// Travels **with the decision** for [`Self::approver`]'s reason, one
+        /// layer sharper: the presence check happens in the *answering*
+        /// connection's handler, and the grant is minted in the *requesting*
+        /// connection's parked task. The requester never sees the verification,
+        /// so a method re-derived at the mint site would be a guess. Recording
+        /// the fact where it was known rather than re-deriving it downstream is
+        /// LESSON-501's rule, and this is exactly the seam it is about.
+        attestation: crate::attest::AttestationMethod,
     },
     /// A user was asked and said no.
     Denied,
@@ -640,6 +650,7 @@ mod tests {
     fn granted(approver: &str) -> ConsentOutcome {
         ConsentOutcome::Granted {
             approver: approver.to_owned(),
+            attestation: crate::attest::AttestationMethod::OsBiometric,
         }
     }
 

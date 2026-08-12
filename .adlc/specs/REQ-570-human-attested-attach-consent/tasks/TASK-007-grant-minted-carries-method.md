@@ -1,7 +1,7 @@
 ---
 id: TASK-007
 title: "grant_minted carries the attestation method"
-status: pending
+status: complete
 parent: REQ-570
 created: 2026-08-11
 updated: 2026-08-11
@@ -21,10 +21,10 @@ tell an attested grant from a creator-path attach.
 
 ## Acceptance Criteria
 
-- [ ] AC-9: `grant_minted` carries the attestation method and is delivered to
+- [x] AC-9: `grant_minted` carries the attestation method and is delivered to
       **every handshaked connection**.
-- [ ] `AttestationMethod::None` is reported honestly for the creator path rather
+- [x] `AttestationMethod::None` is reported honestly for the creator path rather
       than omitted — a missing field and "no attestation" must not be the same
       wire shape.
-- [ ] REQ-569's announcement budget (`GrantAnnouncementBudget`, R3) still bounds
+- [x] REQ-569's announcement budget (`GrantAnnouncementBudget`, R3) still bounds
       the notices; this task must not regress it.

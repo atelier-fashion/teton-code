@@ -1,7 +1,7 @@
 ---
 id: TASK-009
 title: "BR-10(b): a daemon-wide commitment additionally requires attestation"
-status: pending
+status: complete
 parent: REQ-570
 created: 2026-08-11
 updated: 2026-08-11
@@ -21,12 +21,12 @@ session.
 
 ## Acceptance Criteria
 
-- [ ] AC-10 layer (b): a daemon-wide commitment refuses when no valid attestation
+- [x] AC-10 layer (b): a daemon-wide commitment refuses when no valid attestation
       is presented.
-- [ ] Layer (a) of AC-10 still passes **independently** of the attestation
+- [x] Layer (a) of AC-10 still passes **independently** of the attestation
       mechanism — verified by running the TASK-002 tests with the `presence`
       feature off.
-- [ ] The read-only siblings (`config/get`, `cost/query`, `web/refresh`) do
+- [x] The read-only siblings (`config/get`, `cost/query`, `web/refresh`) do
       **not** require attestation — they are layer (a) only, per §1's table.
-- [ ] AC-8: first-run model consent for an ordinary interactive user does not
+- [x] AC-8: first-run model consent for an ordinary interactive user does not
       gain a second prompt beyond the one it already shows.

@@ -1728,6 +1728,23 @@ pub struct SessionGrantMinted {
     /// suppressed: a burst is one notice that says how much it stands for
     /// instead of a thousand notices that scroll the real one away.
     pub suppressed: u32,
+    /// What verified a human's presence behind this grant (REQ-570 BR-9, AC-9).
+    ///
+    /// `"os_biometric"`, `"os_credential"`, or `"none"`. This is the field that
+    /// makes [`Self::self_approved`]'s blindness recoverable: R1 records that a
+    /// `false` there is not a clean bill of health, because an attacker holding
+    /// two connections is announced as an ordinary peer approval. A human had to
+    /// be at the machine for anything other than `"none"` to appear here, so an
+    /// operator can tell an **attested** grant from one that merely had two
+    /// connection ids involved.
+    ///
+    /// `"none"` is carried explicitly rather than omitted, and the distinction
+    /// matters: a missing field and "no attestation" must not be the same wire
+    /// shape, or a client reading an older daemon's event would silently read
+    /// unattested grants as attested ones. Since REQ-570 the only grants that
+    /// reach `"none"` are ones minted on a path that requires no attestation at
+    /// all.
+    pub attestation: String,
 }
 
 #[cfg(test)]
@@ -3210,6 +3227,7 @@ mod tests {
             approver: "cli client \"teton\"".to_owned(),
             self_approved: true,
             suppressed: 0,
+            attestation: "os_biometric".to_owned(),
         });
         assert_eq!(minted.name(), "session_grant_minted");
 
@@ -3236,6 +3254,7 @@ mod tests {
             approver: "cli client \"attacker\"".to_owned(),
             self_approved: false,
             suppressed: 12,
+            attestation: "none".to_owned(),
         }));
         assert_eq!(peer["self_approved"], false);
         assert_eq!(
@@ -3244,6 +3263,14 @@ mod tests {
              and it has to survive the wire: {peer}"
         );
         assert_eq!(peer["suppressed"], 12);
+
+        // REQ-570 AC-9: the attestation method rides along, and it is what
+        // rescues the pair above. Same requester and approver, `self_approved`
+        // false — indistinguishable from an honest peer approval on the R1
+        // evidence alone. `attestation: "none"` is what tells a reader no human
+        // was ever verified.
+        assert_eq!(wire["attestation"], "os_biometric");
+        assert_eq!(peer["attestation"], "none");
     }
 
     /// BR-5: each refusal reason has its own spelling, and a monitor request

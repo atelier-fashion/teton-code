@@ -869,6 +869,69 @@ fn refuse_daemon_wide(conn: &ConnState, id: &Id) -> Option<String> {
     ))
 }
 
+/// **BR-10(b).** A daemon-wide *commitment* additionally needs a verified human.
+///
+/// [`refuse_daemon_wide`] is a standing check and stops at the daemon's own
+/// children; REQ-569 ADR-A records that breaking the ancestry chain costs one
+/// model-supplied shell word, so a non-descendant same-UID process still passes
+/// it. That residual is tolerable for a config read. It is **not** tolerable for
+/// a commitment whose blast radius is the whole machine — a model change, a
+/// multi-gigabyte download — which is why those two methods, and only those two,
+/// ask for presence on top.
+///
+/// The split is the spec's rather than a convenience: `config/get`, `cost/query`
+/// and `web/refresh` stay layer (a) only. Prompting a human to evict a cached
+/// document would train them to click through the prompt that matters.
+///
+/// Unlike the consent path this does **not** record into the attestation
+/// registry. There is no consent `request_id` here to bind to — these methods
+/// are not answers to a request — so the check is live, used once immediately,
+/// and never stored; BR-6's single-use property holds by construction rather
+/// than by bookkeeping.
+async fn refuse_unattested_commitment(
+    daemon: &Daemon,
+    conn: &ConnState,
+    id: &Id,
+) -> Option<String> {
+    if let MechanismAvailability::Unavailable(reason) = daemon.verifier.availability() {
+        return Some(error_string(
+            id.clone(),
+            error_code::ATTESTATION_UNAVAILABLE,
+            reason.describe(),
+        ));
+    }
+    // A synthetic binding id: these methods carry no consent request, and the
+    // verifier binds to whatever it is handed. Keying it to the connection stops
+    // two concurrent commitments from sharing one human's answer.
+    let request = RequestId::from(format!("commit-{:?}", conn.id));
+    let verifier = &daemon.verifier;
+    let subject = conn.id;
+    let verified = if tokio::runtime::Handle::try_current()
+        .map(|h| {
+            matches!(
+                h.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        })
+        .unwrap_or(false)
+    {
+        tokio::task::block_in_place(|| verifier.verify(subject, &request))
+    } else {
+        verifier.verify(subject, &request)
+    };
+    match verified {
+        Ok(_) => None,
+        Err(refusal) => {
+            eprintln!("{}", attestation_refusal_line(&conn.requester, &refusal));
+            Some(error_string(
+                id.clone(),
+                attestation_error_code(&refusal),
+                refusal_message(&refusal),
+            ))
+        }
+    }
+}
+
 /// The refusal a connection gets when it already has
 /// [`MAX_PENDING_CONSENTS_PER_CONNECTION`] prompts outstanding (REQ-569 verify,
 /// F4).
@@ -1317,18 +1380,32 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         // for as long as they take. Left on the reader loop it would stall every
         // other RPC on this connection — including, on a single-client resume,
         // the very `session/attach` whose consent is being answered.
-        if method == SessionAttachParams::METHOD || method == AttachConsentParams::METHOD {
+        // `model/confirm` and `model/set` join for BR-10(b): a daemon-wide
+        // commitment now asks for presence too, and that prompt parks on a human
+        // exactly as the consent one does.
+        let blocks_on_a_human = matches!(
+            method,
+            m if m == SessionAttachParams::METHOD
+                || m == AttachConsentParams::METHOD
+                || m == ModelConfirmParams::METHOD
+                || m == ModelSetParams::METHOD
+        );
+        if blocks_on_a_human {
             let daemon = Arc::clone(&daemon);
             let conn = conn.clone();
             let out_tx = out_tx.clone();
             let fence = fence.clone();
-            let is_attach = method == SessionAttachParams::METHOD;
+            let method = method.to_owned();
             attach_tasks.retain(|h| !h.is_finished());
             attach_tasks.push(tokio::spawn(async move {
-                let response = if is_attach {
+                let response = if method == SessionAttachParams::METHOD {
                     handle_session_attach(&daemon, &conn, id, params).await
-                } else {
+                } else if method == AttachConsentParams::METHOD {
                     handle_attach_consent(&daemon, &conn, id, params).await
+                } else if method == ModelConfirmParams::METHOD {
+                    handle_model_confirm(&daemon, &conn, id, params).await
+                } else {
+                    handle_model_set(&daemon, &conn, id, params).await
                 };
                 // The fence for the same reason `dispatch`'s responses take it:
                 // any event already delivered to this client's subscription
@@ -1844,9 +1921,11 @@ fn dispatch(
         PermissionRespondParams::METHOD => {
             Some(handle_permission_respond(daemon, conn, id, params))
         }
-        ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, conn, id, params)),
+        // `model/confirm` and `model/set` are deliberately absent alongside
+        // `session/attach`: since REQ-570 BR-10(b) both may run an OS presence
+        // prompt that parks on a human, so they run on their own task (see
+        // `handle_client`).
         ModelListParams::METHOD => Some(ok_string(id, &daemon.runtime.model_list())),
-        ModelSetParams::METHOD => Some(handle_model_set(daemon, conn, id, params)),
         ModelStatusParams::METHOD => Some(ok_string(id, &daemon.runtime.model_status())),
         ConfigGetParams::METHOD => Some(handle_config_get(daemon, conn, id)),
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, conn, id, params)),
@@ -2005,12 +2084,18 @@ fn handle_permission_respond(daemon: &Daemon, conn: &ConnState, id: Id, params: 
 /// can fix (an unknown catalog name, an above-RAM-floor pick with no second
 /// confirmation, BR-3). Those come back as `INVALID_PARAMS` with the proposal
 /// still open, rather than silently consuming the user's one chance to answer.
-fn handle_model_confirm(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+async fn handle_model_confirm(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     // BR-10(a) / BUG-162, the bug's headline case: this method commits a
     // multi-gigabyte download and a daemon-wide model change, and took no
     // connection context at all. See `refuse_daemon_wide` for why the check is a
     // standing rule rather than a raiser-identity one.
     if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
+    // BR-10(b): and because the blast radius is the whole machine, a human too.
+    // Ordered after (a) deliberately — a connection that may not act here at all
+    // should be refused without a prompt appearing on somebody's screen.
+    if let Some(refusal) = refuse_unattested_commitment(daemon, conn, &id).await {
         return refusal;
     }
     let params: ModelConfirmParams = match serde_json::from_value(params) {
@@ -2030,10 +2115,13 @@ fn handle_model_confirm(daemon: &Daemon, conn: &ConnState, id: Id, params: Value
 /// Records and announces the decision synchronously so the client gets an
 /// immediate answer, then installs the newly chosen weights on its own task —
 /// a multi-gigabyte download must not hold the reader loop.
-fn handle_model_set(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+async fn handle_model_set(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     // BR-10(a) / BUG-162: the same daemon-wide commitment as `model/confirm`,
-    // reached by a different door.
+    // reached by a different door — so it takes the same two layers.
     if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
+    if let Some(refusal) = refuse_unattested_commitment(daemon, conn, &id).await {
         return refusal;
     }
     let params: ModelSetParams = match serde_json::from_value(params) {
@@ -2330,12 +2418,20 @@ fn publish_attach_refusal(
 /// hands back the arrears, which ride out on the next announcement that gets
 /// through: the bound costs a reader the notices, never the knowledge that there
 /// were notices.
+/// # What made it attestable (REQ-570 BR-9, AC-9)
+///
+/// `attestation` is what makes `self_approved`'s blindness recoverable. That
+/// flag is a fact about connection ids, so an attacker holding two connections
+/// is announced as an ordinary peer approval; the attestation method cannot be
+/// produced without a human at the machine, so anything other than `"none"` is
+/// a claim about a *person* rather than about a pair of ids.
 fn publish_grant_minted(
     daemon: &Daemon,
     conn: &ConnState,
     scope: ConsentScope,
     approver: &str,
     self_approved: bool,
+    attestation: crate::attest::AttestationMethod,
 ) {
     let Some(suppressed) = conn.may_announce_grant(daemon.grant_announcement_window) else {
         return;
@@ -2348,6 +2444,7 @@ fn publish_grant_minted(
             approver: approver.to_owned(),
             self_approved,
             suppressed,
+            attestation: attestation.as_str().to_owned(),
         }),
     );
 }
@@ -2596,7 +2693,10 @@ async fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params
         // The one place an attach-scope grant is minted, and it mints exactly
         // one, at exactly the scope that was asked for and for exactly the
         // session that was named (LESSON-495).
-        ConsentOutcome::Granted { approver } => {
+        ConsentOutcome::Granted {
+            approver,
+            attestation,
+        } => {
             let minted = Grant::attach(conn.id, params.session_id.clone());
             daemon.grants.grant(minted.clone());
             // REQ-569 verify, F6: announce it in-perimeter, at the moment it is
@@ -2606,12 +2706,16 @@ async fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params
             // question is "one connection or two", not "one actor or two". The
             // approver descriptor, which comes back on the outcome from
             // whichever connection actually answered, is what carries the rest.
+            // REQ-570 AC-9: and the attestation method, which is the field that
+            // makes `self_approved`'s blindness recoverable — a human had to be
+            // at the machine for it to read anything but `none`.
             publish_grant_minted(
                 daemon,
                 conn,
                 ConsentScope::Attach,
                 &approver,
                 route.self_approved_by(conn.id),
+                attestation,
             );
             let attempt = attach_to(daemon, conn, id, &params.session_id);
             if !attempt.landed {
@@ -2763,20 +2867,29 @@ async fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params
     // BR-1 / BR-3: an approval mints a credential, so it needs a human. A
     // denial does not — see this function's docs on why that asymmetry is the
     // fail-closed direction.
-    if granted {
-        if let Err(refusal) = attest_presence(daemon, conn, &params.request_id).await {
-            // Nothing is resolved and nothing minted: the prompt is deliberately
-            // left standing for whoever may rightfully answer it, exactly as the
-            // routing refusal above leaves it. A failed presence check must not
-            // become a way for anyone to cancel a pending consent.
-            eprintln!("{}", attestation_refusal_line(&conn.requester, &refusal));
-            return error_string(
-                id,
-                attestation_error_code(&refusal),
-                refusal_message(&refusal),
-            );
+    //
+    // `None` on the denial path is not "unattested" leaking through: a denial
+    // mints nothing, so there is no grant for a method to describe.
+    let attested = if granted {
+        match attest_presence(daemon, conn, &params.request_id).await {
+            Ok(method) => method,
+            Err(refusal) => {
+                // Nothing is resolved and nothing minted: the prompt is
+                // deliberately left standing for whoever may rightfully answer
+                // it, exactly as the routing refusal above leaves it. A failed
+                // presence check must not become a way for anyone to cancel a
+                // pending consent.
+                eprintln!("{}", attestation_refusal_line(&conn.requester, &refusal));
+                return error_string(
+                    id,
+                    attestation_error_code(&refusal),
+                    refusal_message(&refusal),
+                );
+            }
         }
-    }
+    } else {
+        crate::attest::AttestationMethod::None
+    };
 
     let outcome = match params.outcome {
         // The approver's descriptor travels with the decision (R1). This is the
@@ -2787,6 +2900,7 @@ async fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params
         // connection just as it does for a real second user.
         AttachConsentOutcome::Granted => ConsentOutcome::Granted {
             approver: conn.requester.clone(),
+            attestation: attested,
         },
         AttachConsentOutcome::Denied => ConsentOutcome::Denied,
     };
@@ -3494,6 +3608,33 @@ mod tests {
         ]
     }
 
+    /// Route a request the way [`handle_client`] does.
+    ///
+    /// Four methods run on their own task because they may park on a human, so
+    /// they are absent from [`dispatch`]. A test that reached only for
+    /// `dispatch` would get `METHOD_NOT_FOUND` for those and could report a
+    /// security gate as "passing" while never invoking it — so the routing is
+    /// mirrored here rather than duplicated per test.
+    async fn route_for_test(
+        daemon: &Daemon,
+        conn: &ConnState,
+        id: Id,
+        method: &str,
+        params: Value,
+    ) -> String {
+        if method == SessionAttachParams::METHOD {
+            handle_session_attach(daemon, conn, id, params).await
+        } else if method == AttachConsentParams::METHOD {
+            handle_attach_consent(daemon, conn, id, params).await
+        } else if method == ModelConfirmParams::METHOD {
+            handle_model_confirm(daemon, conn, id, params).await
+        } else if method == ModelSetParams::METHOD {
+            handle_model_set(daemon, conn, id, params).await
+        } else {
+            dispatch(daemon, conn, id, method, params).expect("a routed method answers")
+        }
+    }
+
     /// **REQ-570 AC-10, layer (a) — BUG-162.** Every daemon-wide method refuses a
     /// connection that fails the ancestry gate.
     ///
@@ -3507,14 +3648,14 @@ mod tests {
     /// `may_hold_session_access` treats `Indeterminate` as `Descendant` — "I
     /// could not tell" must cost the same as "it did", or the guard's failure
     /// mode is open.
-    #[test]
-    fn every_daemon_wide_method_refuses_a_connection_that_fails_the_ancestry_gate() {
+    #[tokio::test]
+    async fn every_daemon_wide_method_refuses_a_connection_that_fails_the_ancestry_gate() {
         for ancestry in [Ancestry::Descendant, Ancestry::Indeterminate] {
             for (method, params) in daemon_wide_methods() {
                 let daemon = Daemon::new();
                 let child = conn_with_ancestry(&daemon, ancestry);
                 let response =
-                    dispatch(&daemon, &child, Id::Number(1), method, params.clone()).unwrap();
+                    route_for_test(&daemon, &child, Id::Number(1), method, params.clone()).await;
                 assert!(
                     response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
                     "{ancestry:?} calling `{method}` must be refused by the ancestry gate: \
@@ -3532,20 +3673,91 @@ mod tests {
     /// succeeds (several of these legitimately fail on an empty test daemon —
     /// an unknown catalog entry, no such pending proposal), only that whatever
     /// comes back is not the *ancestry* refusal.
-    #[test]
-    fn an_ordinary_connection_is_not_refused_the_daemon_wide_methods_by_ancestry() {
+    #[tokio::test]
+    async fn an_ordinary_connection_is_not_refused_the_daemon_wide_methods_by_ancestry() {
         for (method, params) in daemon_wide_methods() {
-            let daemon = Daemon::new();
+            // A satisfiable mechanism, so the two BR-10(b) commitment methods
+            // are not refused for a *different* reason and quietly stop
+            // testing the ancestry question this asserts.
+            let daemon = Daemon::new()
+                .with_presence_verifier(Box::new(crate::attest::AcceptingVerifier::default()));
             let ordinary = unattached(&daemon);
             assert!(
                 ordinary.may_hold_session_access(),
                 "the fixture is only meaningful if this connection passes the gate"
             );
             let response =
-                dispatch(&daemon, &ordinary, Id::Number(1), method, params.clone()).unwrap();
+                route_for_test(&daemon, &ordinary, Id::Number(1), method, params.clone()).await;
             assert!(
                 !response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
                 "`{method}` must not refuse an ordinary connection on ancestry: {response}"
+            );
+        }
+    }
+
+    /// **REQ-570 AC-10, layer (b) — BR-10.** A daemon-wide *commitment* refuses
+    /// when no valid attestation is presented; the read-only siblings do not.
+    ///
+    /// The negative half is as load-bearing as the positive one. If
+    /// `config/get`, `cost/query` and `web/refresh` also demanded presence, a
+    /// user would be prompted to evict a cached document — and a user prompted
+    /// for trivia learns to click through the prompt that matters. The split is
+    /// the spec's, so it is asserted rather than left to a reviewer to notice.
+    #[tokio::test]
+    async fn only_a_daemon_wide_commitment_demands_presence() {
+        // Ancestry is satisfied throughout; presence is not. So the only thing
+        // that can vary between these methods is layer (b).
+        let commitments = [ModelConfirmParams::METHOD, ModelSetParams::METHOD];
+
+        for (method, params) in daemon_wide_methods() {
+            let daemon = daemon_with_short_consent_unattested();
+            let ordinary = unattached(&daemon);
+            assert!(ordinary.may_hold_session_access());
+
+            let response =
+                route_for_test(&daemon, &ordinary, Id::Number(1), method, params.clone()).await;
+            let refused_for_presence =
+                response.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string());
+
+            if commitments.contains(&method) {
+                assert!(
+                    refused_for_presence,
+                    "`{method}` commits a machine-wide change and must refuse without \
+                     a verified human: {response}"
+                );
+            } else {
+                assert!(
+                    !refused_for_presence,
+                    "`{method}` is layer (a) only — demanding presence for it would \
+                     train users to click through the prompt that matters: {response}"
+                );
+            }
+        }
+    }
+
+    /// **AC-10's independence clause.** Layer (a) passes with no mechanism at all.
+    ///
+    /// BR-10 requires layer (a) to be shippable without (b), because BUG-162 is
+    /// high severity and open and must not wait on OQ-1's mechanism. That is a
+    /// claim about the *ancestry* refusal surviving when presence is
+    /// unavailable, so it is asserted against the fail-closed verifier — the
+    /// build CI actually runs.
+    #[tokio::test]
+    async fn layer_a_refuses_independently_of_any_attestation_mechanism() {
+        for (method, params) in daemon_wide_methods() {
+            let daemon = daemon_with_short_consent_unattested();
+            let child = conn_with_ancestry(&daemon, Ancestry::Descendant);
+            let response =
+                route_for_test(&daemon, &child, Id::Number(1), method, params.clone()).await;
+            assert!(
+                response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                "`{method}`: the ancestry refusal must answer first and must not \
+                 depend on a mechanism being present: {response}"
+            );
+            assert!(
+                !response.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string()),
+                "`{method}`: a connection that may not act here at all must be refused \
+                 without a presence prompt appearing on somebody's screen: {response}"
             );
         }
     }
@@ -4482,6 +4694,15 @@ mod tests {
              connection is both parties (R1)"
         );
         assert_eq!(minted.suppressed, 0, "nothing was rate-limited away");
+        // REQ-570 AC-9. This arm is exactly the one the field exists for: the
+        // requester answered its own prompt, so `self_approved` is the only
+        // other signal — and under REQ-570 this grant exists at all only because
+        // a human was verified. A `"none"` here would mean the self-approval
+        // residual had reopened.
+        assert_eq!(
+            minted.attestation, "os_biometric",
+            "the announcement must name what verified the human behind the grant"
+        );
         assert!(
             announced[0].session_id.is_none(),
             "a grant announcement is daemon-scoped, so every handshaked \
