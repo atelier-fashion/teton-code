@@ -3,16 +3,12 @@
   "branch": "feat/REQ-570-human-attested-attach-consent",
   "startedAt": "2026-08-11T00:00:00Z",
   "completed": false,
-  "currentPhase": 8,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
     2,
-    3,
-    4,
-    5,
-    6,
-    7
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -76,7 +72,7 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": null,
+    "currentTask": "TASK-006",
     "completedTasks": [
       "TASK-001",
       "TASK-002",
@@ -86,14 +82,6 @@
     ],
     "failedTasks": []
   },
-  "blockers": [
-    {
-      "blockedBy": "human",
-      "conflictFiles": [],
-      "unblockCondition": "AC-3 is self-contradictory: it forbids test-harness auto-consent while requiring an automated end-to-end proof of a control that by design no machine can satisfy. Needs a product decision (architecture.md section 9) before REQ-570 can be called complete. TASK-006/007/008/009/010 also remain unimplemented.",
-      "holdState": "held",
-      "rebaseAttempts": 0
-    }
-  ],
-  "notes": "Halted at Phase 8 with terminal state BLOCKED. PR #101 is OPEN, MERGEABLE, all 6 CI checks green. NOT merged: a blocker requiring human input is recorded, and the /proceed contract forbids merging while blocked. 5 of 10 tasks landed (TASK-001..005); TASK-006/007/008/009/010 remain. ACs satisfied: AC-1, AC-5, AC-6, AC-7, AC-7b, AC-8, AC-10(a), plus AC-11 for every rule built. Outstanding: AC-2, AC-2b, AC-3, AC-4, AC-9, AC-10(b)."
+  "blockers": [],
+  "notes": "Blockers cleared by coordinator 2026-08-11: AC-3 amended (Option 1+2), ADR-A ancestry accepted with residual recorded. Resumed from Phase 4 for TASK-006..010."
 }

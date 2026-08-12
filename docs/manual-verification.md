@@ -1071,3 +1071,83 @@ using any tools, list what we have discussed", the post-clear model
 paraphrased its **system prompt** (tools, providers, configuration) rather
 than saying "nothing yet" — correct on the load-bearing claim (no cleared
 content resurfaced), just a weak model filling silence with what it can see.
+
+---
+
+# Manual verification runbook — REQ-570 AC-3b
+
+**Status: OUTSTANDING. Nobody has run this yet.**
+
+AC-3b is the second claim in this repo that CI structurally cannot make, and the
+reason is sharper than REQ-547 AC-13's. That one needed real hardware and a real
+network. This one needs **a human being**, by construction: REQ-570 BR-2 requires
+a presence mechanism "a headless same-UID process cannot satisfy without a human
+acting at the machine", and CI *is* a headless same-UID process. A CI job that
+could tick this box would be a CI job that disproves the feature.
+
+This is why AC-3 was amended on 2026-08-11. Its original clause — "no
+test-harness auto-consent anywhere in the path" — asked a machine to demonstrate
+that a machine cannot do something, by doing it. The amended AC-3 says "no
+auto-consent in any **shipped build**", which is mechanically checkable and is
+what the `TETON_TEST_SEAMS` contract already guarantees (a release build refuses
+to start when it is set, so `TETON_PRESENCE_ACCEPT` cannot exist in a shipped
+artifact). AC-3b carries the part that remains, and a human carries it.
+
+> **Do not tick AC-3b in
+> `.adlc/specs/REQ-570-human-attested-attach-consent/requirement.md` until a
+> sign-off block below is filled in by a person who ran it.** An unticked AC-3b
+> beside a green CI run is the honest state of the world (LESSON-433).
+
+## What this proves that CI does not
+
+| Claim | Proven by CI? | Why not |
+|---|---|---|
+| An unattested approval mints nothing | **yes** | fail-closed verifier, grant registry asserted empty |
+| Each refusal ending is distinct and mints nothing | **yes** | table-driven over the refusal taxonomy |
+| The no-mechanism posture refuses rather than self-approves | **yes** | injected `UnavailableVerifier` |
+| Every daemon-wide method refuses a failing connection | **yes** | per-method, mutation-checked |
+| **A real Touch ID prompt appears during a real resume** | **no** | needs a human finger |
+| **Exactly ONE consent step is visible to the user** | **no** | "visible" is a property of a person's screen |
+| **The prompt's wording is comprehensible at the moment of trust** | **no** | no machine can judge this |
+| **A non-interactive CLI invocation does not auto-approve** | partly | asserted in-process; the shipped-binary path wants eyes |
+
+## Procedure
+
+1. Build with the mechanism compiled in — the default build has none:
+   `cargo build --features presence` (macOS only; `presence` is macOS-gated).
+2. Ensure `TETON_TEST_SEAMS` and `TETON_PRESENCE_ACCEPT` are **unset**. If
+   either is set you are testing the seam, not the feature. Confirm with `env`.
+3. Start the daemon from that build. Create a session with `teton` and send at
+   least one prompt so the session has state worth resuming.
+4. Exit the CLI **without** stopping the daemon (the session outlives its
+   client — REQ-565/567).
+5. Start a **fresh** `teton` and resume that session.
+6. Record: how many consent steps were visible (AC-3 says exactly one), whether
+   a real OS presence prompt appeared, what it said, and whether the resume
+   completed after authenticating.
+7. Cancel the prompt on a second attempt and confirm the attach is **refused**
+   and no grant is minted (`grant_minted` should not fire).
+8. Run a non-interactive invocation (piped stdin / no TTY) and confirm it does
+   **not** auto-approve (AC-4).
+
+## Sign-off
+
+```
+AC-3b sign-off
+--------------
+Verified by      :
+Date             :
+Platform / OS    :               (e.g. macOS 26.6, Apple M-series)
+Build            :               (cargo build --features presence)
+TETON_TEST_SEAMS / TETON_PRESENCE_ACCEPT confirmed unset : yes / no
+Resume succeeded after authenticating : yes / no
+Visible consent steps : ___      (AC-3 requires exactly 1)
+OS prompt appeared    : yes / no
+Prompt wording as shown :
+Biometry or password used : Touch ID / login credential
+Cancelled attempt refused, no grant minted : yes / no
+Non-interactive invocation did NOT auto-approve (AC-4) : yes / no
+Notes / findings :
+```
+
+<!-- Add further sign-off blocks below, one per platform and per release. -->

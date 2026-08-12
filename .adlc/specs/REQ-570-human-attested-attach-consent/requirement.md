@@ -117,7 +117,8 @@ this hard and is why an OS-mediated presence check, not a terminal prompt, is
 - [ ] AC-1: A headless same-UID process that requests attach to an unattended session and answers its own prompt is refused, and no grant is minted — the REQ-569 residual, closed. Asserted at the raw RPC surface.
 - [ ] AC-2: The REQ-569 two-connection monitor attack (conn A creates a throwaway session, conn B requests monitor, A approves) is refused as a named regression test.
 - [ ] AC-2b: `monitor` is **mintable again** — a connection presenting a valid attestation, answering a monitor-scope request it did not raise, receives the grant and can then monitor. Asserted positively: AC-2 proves the attack is refused, and a capability that is only ever observed being refused is indistinguishable from the dead code Gap 3 describes. (BR-5)
-- [ ] AC-3: A user resuming their own session in a fresh CLI succeeds with exactly one visible consent step, end to end through the shipped client — no test-harness auto-consent anywhere in the path.
+- [ ] AC-3: A user resuming their own session in a fresh CLI succeeds with exactly one visible consent step, end to end through the shipped client — **no auto-consent in any shipped build**. *(Amended 2026-08-11. The original clause read "no test-harness auto-consent anywhere in the path", which is unsatisfiable: BR-2 requires a mechanism a headless same-UID process cannot satisfy, and CI is a headless process, so any automated proof of the granted path needs exactly the seam the clause forbade — it asked a machine to demonstrate that a machine cannot do something, by doing it. The amended wording is mechanically checkable and is what the `TETON_TEST_SEAMS` release-refuses-to-start contract already guarantees. See architecture.md §9.)*
+- [ ] AC-3b: The AC-3 flow is confirmed by **one recorded human pass** — a person runs the resume flow on a macOS build with `--features presence`, and the result is written to `docs/manual-verification.md` at the strength it was actually verified (REQ-556 precedent). This criterion is **not satisfied by reasoning, by a test, or by the seam**; if nobody has run it, it is recorded as outstanding rather than ticked.
 - [ ] AC-4: The CLI renders an incoming consent request, takes a decision, and sends `attach/consent`; it never answers without user input (asserted, including that a non-interactive CLI invocation does not auto-approve).
 - [ ] AC-5: An attestation is single-use and expires: replaying it, or using it for a different request id or connection, is refused.
 - [ ] AC-6: Attestation failure/cancel/timeout each produce a distinct code, mint nothing, and leave the grant and attestation registries empty (asserted by inspecting the registries, not inferred from the error).
@@ -136,6 +137,26 @@ this hard and is why an OS-mediated presence check, not a terminal prompt, is
 
 ## Assumptions
 
+- **BR-10(a) inherits the ancestry gate's known escape, and does so knowingly.**
+  BUG-162's proposed fix — "restrict answering to the connection that raised the
+  flow" — turned out to be unimplementable for its own headline method:
+  `model_selection_proposed` is raised by the daemon's first-run flow, which is
+  spawned beside `serve` and may publish before the daemon accepts its first
+  connection, and it is `None`-scoped because model selection is machine-wide.
+  There is no raiser to bind to. BR-10(a) is therefore implemented as a
+  **standing** rule — REQ-569's ancestry gate at all seven seams — which is the
+  bar BUG-162's own *Expected Behavior* names ("minimally, not by the daemon's
+  own spawned children"). See architecture.md ADR-A.
+  
+  The residual this leaves must not be inherited silently: REQ-569 ADR-A records
+  that breaking the ancestry chain costs **one model-supplied shell word**
+  (`setsid helper`, `helper &`), so a non-descendant same-UID process still
+  passes the gate. Stated plainly: BR-10(a) closes the **ambient** access hole —
+  any handshaked connection, including the daemon's own tool and MCP children,
+  could commit a machine-wide model change — and it does **not** close the
+  determined-adversary case. BR-10(b)'s attestation is what covers the latter
+  for daemon-wide commitments, which is precisely why the two layers are
+  separable rather than one.
 - The uid perimeter (auth.rs) stays unchanged; this adds authorization within it.
 - A ptrace-capable same-UID adversary remains out of model. Note REQ-569's Phase-5 review found the *previous* framing of this assumption misleading — the residual it excused needed no ptrace at all — so this REQ must not lean on it to excuse anything.
 - The VS Code extension (phase 2) uses the same flow; nothing here may assume a TTY, which is precisely why a terminal-typed code is likely insufficient on its own.
