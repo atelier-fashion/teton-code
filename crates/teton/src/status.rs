@@ -50,11 +50,7 @@ const FIELD_SEPARATOR: &str = "  ·  ";
 /// `width` is the terminal's column count, passed in rather than queried so this
 /// function stays pure — the whole point of the module.
 #[must_use]
-pub fn status_line(
-    level: PermissionLevel,
-    effort: Option<&str>,
-    width: usize,
-) -> Option<String> {
+pub fn status_line(level: PermissionLevel, effort: Option<&str>, width: usize) -> Option<String> {
     let mut row = format!("{PERMISSIONS_LABEL}: {}", level.name());
     if let Some(effort) = effort {
         row.push_str(FIELD_SEPARATOR);

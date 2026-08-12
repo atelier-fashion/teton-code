@@ -111,8 +111,8 @@ use teton_protocol::methods::{
     ModelListParams, ModelSetParams, ModelStatusParams, PermissionRespondParams,
     PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod, SessionAttachParams,
     SessionAttachResult, SessionClearParams, SessionCreateParams, SessionCreateResult,
-    SessionListParams, SessionListResult, SessionSummary, WebOverrideParams, WebRefreshParams,
-    SessionPermissionsParams,
+    SessionListParams, SessionListResult, SessionPermissionsParams, SessionSummary,
+    WebOverrideParams, WebRefreshParams,
 };
 use teton_protocol::{RequestId, SessionId};
 

@@ -10,11 +10,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::effort::{EffortLevel, ResolvedEffort};
-use crate::permissions::PermissionLevel;
 use crate::events::{
     CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource, WebTier,
 };
 use crate::jsonrpc::{Id, Request};
+use crate::permissions::PermissionLevel;
 use crate::{
     BindingSource, Category, ConfigurableCategory, Phase, PrivacyMode, ProviderId, ProviderKind,
     RequestId, SessionId, SessionMode, Tier, TierBindingSource, TurnId,

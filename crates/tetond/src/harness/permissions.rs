@@ -49,12 +49,12 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 use teton_core::config::WebTier;
-use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::events::{
     Event, PermissionOption, PermissionOptionKind, PermissionRequest, WebConsentDecided,
     WebConsentScope, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::PermissionOutcome;
+use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{RequestId, SessionId};
 
 use crate::broadcast::EventBus;
@@ -622,7 +622,10 @@ impl PermissionGate {
     /// Setting a level on a gate that was pinned to an exact table converts it to
     /// a leveled gate. The user named a posture; the posture governs from here.
     pub fn set_level(&self, level: PermissionLevel) -> bool {
-        let mut policy = self.policy.lock().expect("permission policy mutex poisoned");
+        let mut policy = self
+            .policy
+            .lock()
+            .expect("permission policy mutex poisoned");
         if policy.level() == Some(level) {
             return false;
         }
@@ -656,7 +659,10 @@ impl PermissionGate {
     /// client's account of one denial cannot drift (LESSON-456).
     #[must_use]
     pub fn denial_note(&self, tool: &str) -> Option<String> {
-        let policy = self.policy.lock().expect("permission policy mutex poisoned");
+        let policy = self
+            .policy
+            .lock()
+            .expect("permission policy mutex poisoned");
         let level = policy.level()?;
         (policy.table().policy_for(tool) == PermissionPolicy::Deny)
             .then(|| level.denial_sentence(tool))
@@ -1018,7 +1024,9 @@ mod tests {
     ///
     /// `None` in the second slot means "this tool is not listed and must resolve
     /// to the level's default".
-    fn expected_rows(level: PermissionLevel) -> (PermissionPolicy, Vec<(&'static str, PermissionPolicy)>) {
+    fn expected_rows(
+        level: PermissionLevel,
+    ) -> (PermissionPolicy, Vec<(&'static str, PermissionPolicy)>) {
         use PermissionPolicy::{Allow, Ask, Deny};
         match level {
             PermissionLevel::Guarded => (
@@ -1250,8 +1258,15 @@ mod tests {
 
         // edits: the edit runs unprompted; the shell still asks.
         let (bus, pending, gate) = leveled_gate(PermissionLevel::Edits);
-        assert_eq!(gate.authorize("edit", None).await, PermissionDecision::Allowed);
-        assert_eq!(bus.subscriber_count(), 0, "an allowed edit published a prompt");
+        assert_eq!(
+            gate.authorize("edit", None).await,
+            PermissionDecision::Allowed
+        );
+        assert_eq!(
+            bus.subscriber_count(),
+            0,
+            "an allowed edit published a prompt"
+        );
         let mut sub = bus.subscribe(16);
         let (decision, _rid) = tokio::join!(
             gate.authorize("shell", None),

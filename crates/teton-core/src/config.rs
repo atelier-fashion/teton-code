@@ -33,8 +33,8 @@ use crate::entities::{ModelProvider, PrivacyBoundary};
 use crate::mcp::{McpServerConfig, McpTransport};
 use crate::phase::Phase;
 use serde::{Deserialize, Serialize};
-use teton_protocol::permissions::PermissionLevel;
 use std::collections::HashSet;
+use teton_protocol::permissions::PermissionLevel;
 
 /// User-authored inputs for the local model tier (the `[local_model]` table).
 ///

@@ -111,15 +111,15 @@ use teton_protocol::events::{
     SessionTitled, WebLookup, WebTaintOverridden,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
-use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
-    SessionClearParams, SessionClearResult, TierRouteView, WebOverrideParams, WebOverrideResult,
-    WebRefreshOutcome, WebRefreshParams, WebRefreshResult, WebTotalsView,
-    SessionPermissionsParams, SessionPermissionsResult,
+    SessionClearParams, SessionClearResult, SessionPermissionsParams, SessionPermissionsResult,
+    TierRouteView, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
+    WebRefreshResult, WebTotalsView,
 };
+use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
     BindingSource, ConfigurableCategory as ProtoConfigurableCategory, Phase as ProtoPhase,
     PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId, SessionMode,
@@ -149,9 +149,9 @@ use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLoo
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
-    PendingPermissions, PermissionGate, SessionEvents, ToolContext, ToolDuties,
-    ToolRegistry, WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY,
-    TITLE_DUTY, TRIAGE_DUTY,
+    PendingPermissions, PermissionGate, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
+    WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY, TITLE_DUTY,
+    TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -12889,10 +12889,10 @@ provider_id = "on-device"
     mod web_lookup_seam {
         use super::*;
         use crate::classify::test_support::CountingEngine;
-        use crate::harness::PermissionConfig;
         use crate::egress::{
             Authorship, LookupContext, LookupDetail, LookupRecord, LookupRequest, TaintView,
         };
+        use crate::harness::PermissionConfig;
         use crate::harness::{PermissionDecision, PermissionPolicy};
         use teton_core::config::WebTier;
         use teton_protocol::events::{WebLookupKind, WebLookupOutcome, WebTier as WireWebTier};
@@ -14323,134 +14323,134 @@ provider_id = "on-device"
         }
 
         /// **REQ-560 AC-4, the taint half: `full` does not unpin a tainted session.**
-    ///
-    /// The permission level and the session-taint pin are orthogonal (BR-3). A
-    /// session whose context carries unknown-provenance results is pinned to the
-    /// local tier for every later turn, and that holds at every level — including
-    /// the one that stops asking about `shell`, which is also the one most likely
-    /// to be read as "turn the safety off".
-    ///
-    /// The egress half of AC-4 lives in `tests/egress_capture.rs`, where the
-    /// bytes are observable. This is the routing half: the pin decides *where a
-    /// turn runs*, which is a different mechanism in a different file, and a
-    /// source scan over `egress/` would never have looked at it.
-    #[tokio::test]
-    async fn a_tainted_session_stays_pinned_to_the_local_tier_at_full() {
-        let runtime = Arc::new(DaemonRuntime::minimal());
-        let events = Arc::new(EventBus::new());
-        let session = SessionId::from("sess-tainted-at-full");
+        ///
+        /// The permission level and the session-taint pin are orthogonal (BR-3). A
+        /// session whose context carries unknown-provenance results is pinned to the
+        /// local tier for every later turn, and that holds at every level — including
+        /// the one that stops asking about `shell`, which is also the one most likely
+        /// to be read as "turn the safety off".
+        ///
+        /// The egress half of AC-4 lives in `tests/egress_capture.rs`, where the
+        /// bytes are observable. This is the routing half: the pin decides *where a
+        /// turn runs*, which is a different mechanism in a different file, and a
+        /// source scan over `egress/` would never have looked at it.
+        #[tokio::test]
+        async fn a_tainted_session_stays_pinned_to_the_local_tier_at_full() {
+            let runtime = Arc::new(DaemonRuntime::minimal());
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("sess-tainted-at-full");
 
-        // Really at `full`, through the shipped RPC rather than a stub.
-        let set = runtime.session_permissions(
-            &SessionPermissionsParams {
-                session_id: session.clone(),
-                level: Some(PermissionLevel::Full),
-            },
-            &events,
-        );
-        assert_eq!(set.level, PermissionLevel::Full);
-        assert!(set.changed);
+            // Really at `full`, through the shipped RPC rather than a stub.
+            let set = runtime.session_permissions(
+                &SessionPermissionsParams {
+                    session_id: session.clone(),
+                    level: Some(PermissionLevel::Full),
+                },
+                &events,
+            );
+            assert_eq!(set.level, PermissionLevel::Full);
+            assert!(set.changed);
 
-        // A `shell` result of unknown provenance taints the session.
-        runtime.session_taint.mark(&session);
-        assert!(runtime.session_taint.is_tainted(&session));
+            // A `shell` result of unknown provenance taints the session.
+            runtime.session_taint.mark(&session);
+            assert!(runtime.session_taint.is_tainted(&session));
 
-        let config = runtime.config.lock().expect("config mutex").clone();
-        let router = build_router(&config, true, &BTreeMap::new());
-        let route = runtime
-            .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
-            .await;
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let router = build_router(&config, true, &BTreeMap::new());
+            let route = runtime
+                .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
+                .await;
 
-        assert_eq!(
-            route.reason,
-            taint_pin_reason("this turn"),
-            "a tainted session must still be pinned to the local tier at `full` — \
+            assert_eq!(
+                route.reason,
+                taint_pin_reason("this turn"),
+                "a tainted session must still be pinned to the local tier at `full` — \
              the permission level governs which tools may run, never what leaves \
              the machine (REQ-560 BR-3)"
-        );
+            );
 
-        // Non-vacuity: an untainted session at the same level is NOT pinned, so
-        // the assertion above is about the taint and not about `full` pinning
-        // everything.
-        let clean = SessionId::from("sess-clean-at-full");
-        let _ = runtime.session_permissions(
-            &SessionPermissionsParams {
-                session_id: clean.clone(),
-                level: Some(PermissionLevel::Full),
-            },
-            &events,
-        );
-        let clean_route = runtime
-            .dispatch_route(&router, &clean, SessionMode::Freeform, None, "anything")
-            .await;
-        assert_ne!(
-            clean_route.reason,
-            taint_pin_reason("this turn"),
-            "an untainted session must not be pinned, or this test proves nothing"
-        );
-    }
+            // Non-vacuity: an untainted session at the same level is NOT pinned, so
+            // the assertion above is about the taint and not about `full` pinning
+            // everything.
+            let clean = SessionId::from("sess-clean-at-full");
+            let _ = runtime.session_permissions(
+                &SessionPermissionsParams {
+                    session_id: clean.clone(),
+                    level: Some(PermissionLevel::Full),
+                },
+                &events,
+            );
+            let clean_route = runtime
+                .dispatch_route(&router, &clean, SessionMode::Freeform, None, "anything")
+                .await;
+            assert_ne!(
+                clean_route.reason,
+                taint_pin_reason("this turn"),
+                "an untainted session must not be pinned, or this test proves nothing"
+            );
+        }
 
-    /// **REQ-560 regression: the gate `session/permissions` creates must publish
-    /// to the daemon's own bus.**
-    ///
-    /// [`DaemonRuntime::permission_gate_for`] creates the session's gate when
-    /// none exists and then **caches** it, so whichever `EventBus` the first
-    /// caller hands it is the bus that session's prompts go to for the rest of
-    /// its life. `session/permissions` can easily be that first caller — the
-    /// CLI reads the level at session start, before any turn has run — and an
-    /// early implementation of it passed a freshly-constructed bus for
-    /// convenience. Every later permission prompt in that session was then
-    /// published to a bus with no subscribers: the tool sat `[running]`, the
-    /// user was never asked, and nothing errored.
-    ///
-    /// Caught by `pty_e2e`, which is the only place the whole chain is real.
-    /// This test is the cheap twin that fails in milliseconds instead of at a
-    /// twenty-second timeout.
-    #[tokio::test]
-    async fn a_gate_created_by_reading_the_level_still_reaches_the_daemons_subscribers() {
-        let runtime = Arc::new(DaemonRuntime::minimal());
-        let events = Arc::new(EventBus::new());
-        let session = SessionId::from("sess-under-test");
+        /// **REQ-560 regression: the gate `session/permissions` creates must publish
+        /// to the daemon's own bus.**
+        ///
+        /// [`DaemonRuntime::permission_gate_for`] creates the session's gate when
+        /// none exists and then **caches** it, so whichever `EventBus` the first
+        /// caller hands it is the bus that session's prompts go to for the rest of
+        /// its life. `session/permissions` can easily be that first caller — the
+        /// CLI reads the level at session start, before any turn has run — and an
+        /// early implementation of it passed a freshly-constructed bus for
+        /// convenience. Every later permission prompt in that session was then
+        /// published to a bus with no subscribers: the tool sat `[running]`, the
+        /// user was never asked, and nothing errored.
+        ///
+        /// Caught by `pty_e2e`, which is the only place the whole chain is real.
+        /// This test is the cheap twin that fails in milliseconds instead of at a
+        /// twenty-second timeout.
+        #[tokio::test]
+        async fn a_gate_created_by_reading_the_level_still_reaches_the_daemons_subscribers() {
+            let runtime = Arc::new(DaemonRuntime::minimal());
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("sess-under-test");
 
-        // The read creates the gate — this is the ordering the bug needed.
-        let read = runtime.session_permissions(
-            &SessionPermissionsParams {
-                session_id: session.clone(),
-                level: None,
-            },
-            &events,
-        );
-        assert_eq!(read.level, PermissionLevel::Guarded);
-        assert!(!read.changed);
+            // The read creates the gate — this is the ordering the bug needed.
+            let read = runtime.session_permissions(
+                &SessionPermissionsParams {
+                    session_id: session.clone(),
+                    level: None,
+                },
+                &events,
+            );
+            assert_eq!(read.level, PermissionLevel::Guarded);
+            assert!(!read.changed);
 
-        // A later turn resolves the *same* cached gate…
-        let config = runtime.config.lock().expect("config mutex").clone();
-        let gate = runtime.permission_gate_for(&session, &events, &config);
+            // A later turn resolves the *same* cached gate…
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let gate = runtime.permission_gate_for(&session, &events, &config);
 
-        // …and its prompt must reach a subscriber of the bus we passed in.
-        let mut sub = events.subscribe(16);
-        let asking = tokio::spawn(async move { gate.authorize("shell", None).await });
-        let env = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
-            .await
-            .expect("the prompt must reach the daemon's own bus, not a throwaway one")
-            .expect("a prompt was published");
-        let request_id = match env.event {
-            Event::PermissionRequest(pr) => pr.request_id,
-            other => panic!("expected permission_request, got {other:?}"),
-        };
-        assert!(runtime.pending.resolve(
-            &request_id,
-            teton_protocol::methods::PermissionOutcome::Selected {
-                option_id: "allow_once".to_owned()
-            }
-        ));
-        assert_eq!(
-            asking.await.expect("the authorize task joins"),
-            crate::harness::PermissionDecision::Allowed
-        );
-    }
+            // …and its prompt must reach a subscriber of the bus we passed in.
+            let mut sub = events.subscribe(16);
+            let asking = tokio::spawn(async move { gate.authorize("shell", None).await });
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+                .await
+                .expect("the prompt must reach the daemon's own bus, not a throwaway one")
+                .expect("a prompt was published");
+            let request_id = match env.event {
+                Event::PermissionRequest(pr) => pr.request_id,
+                other => panic!("expected permission_request, got {other:?}"),
+            };
+            assert!(runtime.pending.resolve(
+                &request_id,
+                teton_protocol::methods::PermissionOutcome::Selected {
+                    option_id: "allow_once".to_owned()
+                }
+            ));
+            assert_eq!(
+                asking.await.expect("the authorize task joins"),
+                crate::harness::PermissionDecision::Allowed
+            );
+        }
 
-    /// **BR-1 / AC-1's structural half, through the real registry builder.**
+        /// **BR-1 / AC-1's structural half, through the real registry builder.**
         ///
         /// `off` is not a tool behind a flag: the registry does not hold one, so
         /// there is nothing for a later change to accidentally expose.

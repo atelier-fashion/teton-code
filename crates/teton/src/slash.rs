@@ -856,8 +856,7 @@ fn handle_permissions(
             None => {
                 // Rendered before any RPC: an unknown level is a typo, and the
                 // session's posture must not be touched to find that out.
-                ctx.surface
-                    .line(LineKind::Error, &unknown_level_line(args));
+                ctx.surface.line(LineKind::Error, &unknown_level_line(args));
                 for level in PermissionLevel::ALL {
                     ctx.surface
                         .line(LineKind::Info, &render_level_option(*level));
@@ -2056,7 +2055,10 @@ mod tests {
             changed: true,
         });
         assert!(changed.contains("full"), "{changed}");
-        assert!(changed.contains(PermissionLevel::Full.summary()), "{changed}");
+        assert!(
+            changed.contains(PermissionLevel::Full.summary()),
+            "{changed}"
+        );
         assert!(!changed.contains("unchanged"), "{changed}");
 
         // A read, and a set that changed nothing, must not confirm a change
@@ -2163,7 +2165,10 @@ mod tests {
     fn a_daemon_without_session_permissions_is_a_notice_not_an_error() {
         let mut surface = RecordingSurface::new();
         assert!(permissions_or_report(
-            Err(RpcError::new(error_code::METHOD_NOT_FOUND, "no such method")),
+            Err(RpcError::new(
+                error_code::METHOD_NOT_FOUND,
+                "no such method"
+            )),
             &mut surface
         )
         .is_none());

@@ -2359,10 +2359,14 @@ fn permission_levels_change_what_a_session_asks_about() {
         return;
     };
     let replies = [
-        EDIT_CALL, "guarded edit turn done.",
-        EDIT_CALL, "edits edit turn done.",
-        SHELL_CALL, "edits shell turn done.",
-        SHELL_CALL, "plan shell turn done.",
+        EDIT_CALL,
+        "guarded edit turn done.",
+        EDIT_CALL,
+        "edits edit turn done.",
+        SHELL_CALL,
+        "edits shell turn done.",
+        SHELL_CALL,
+        "plan shell turn done.",
     ];
     let daemon = TestDaemon::spawn_scripted(&daemon, &replies);
     let teton = teton_bin();
@@ -2454,9 +2458,12 @@ fn a_tightened_level_outranks_a_session_grant_over_a_pipe() {
         return;
     };
     let replies = [
-        SHELL_CALL, "granted.",
-        SHELL_CALL, "denied by plan.",
-        SHELL_CALL, "grant applies again.",
+        SHELL_CALL,
+        "granted.",
+        SHELL_CALL,
+        "denied by plan.",
+        SHELL_CALL,
+        "grant applies again.",
     ];
     let daemon = TestDaemon::spawn_scripted(&daemon, &replies);
     let teton = teton_bin();
@@ -2522,7 +2529,11 @@ fn bare_permissions_reads_the_level_on_a_pipe_and_help_lists_it() {
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
-    let session = daemon.run_cli_with_stdin(&teton, &[], "/permissions\n/help\n/permissions full\n/permissions\n");
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "/permissions\n/help\n/permissions full\n/permissions\n",
+    );
 
     // The read, with no argument, on a pipe.
     assert!(
@@ -2531,10 +2542,8 @@ fn bare_permissions_reads_the_level_on_a_pipe_and_help_lists_it() {
     );
     // AC-11: listed in /help, from the dispatch table.
     assert!(
-        session
-            .lines()
-            .any(|line| line.contains("/permissions")
-                && line.contains("Show or set this session's permission level")),
+        session.lines().any(|line| line.contains("/permissions")
+            && line.contains("Show or set this session's permission level")),
         "/help must list /permissions with its summary; output:\n{session}"
     );
     // A set, then a read that reflects it.
@@ -2615,7 +2624,12 @@ fn a_level_line_typed_at_an_open_prompt_answers_the_prompt_and_changes_nothing()
     };
 
     for arriving in ["full", "plan"] {
-        let replies = [SHELL_CALL, "first turn done.", SHELL_CALL, "second turn done."];
+        let replies = [
+            SHELL_CALL,
+            "first turn done.",
+            SHELL_CALL,
+            "second turn done.",
+        ];
         let daemon = TestDaemon::spawn_scripted(&daemon_path, &replies);
         let teton = teton_bin();
 

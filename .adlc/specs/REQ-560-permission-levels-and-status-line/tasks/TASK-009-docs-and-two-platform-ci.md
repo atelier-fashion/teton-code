@@ -1,7 +1,7 @@
 ---
 id: TASK-009
 title: "Documentation and two-platform CI confirmation"
-status: pending
+status: complete
 parent: REQ-560
 created: 2026-08-11
 updated: 2026-08-11

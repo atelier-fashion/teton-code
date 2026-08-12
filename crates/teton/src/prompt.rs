@@ -197,7 +197,11 @@ impl FramedStdinPrompter {
         let mut line = String::new();
         let read = io::stdin().read_line(&mut line);
         if self.framed {
-            let _ = write!(out, "{}", self.advance_bytes(matches!(read, Ok(0) | Err(_))));
+            let _ = write!(
+                out,
+                "{}",
+                self.advance_bytes(matches!(read, Ok(0) | Err(_)))
+            );
             let _ = out.flush();
         }
         match read {

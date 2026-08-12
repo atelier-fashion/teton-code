@@ -16,7 +16,6 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use teton_protocol::effort::EffortLevel;
-use teton_protocol::SessionId;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSnapshot, ConfigUpdate,
@@ -24,6 +23,7 @@ use teton_protocol::methods::{
     ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig,
     ProviderConfig, SessionCreateParams, SessionPermissionsParams, TierBindingConfig,
 };
+use teton_protocol::SessionId;
 use teton_protocol::{
     BindingSource, Category, ConfigurableCategory, PrivacyMode, ProviderId, ProviderKind,
     SessionMode, Tier, TierBindingSource,
