@@ -993,6 +993,55 @@ fn ancestry_refusal_line(ancestry: Ancestry, what: &str) -> String {
     format!("tetond: refused {what} for a connection because {because}")
 }
 
+/// What the daemon records when it classifies a connection's ancestry as
+/// anything other than [`Ancestry::NotDescendant`] (BUG-163).
+///
+/// [`ancestry_refusal_line`] already tells the two verdicts apart — but only on
+/// the paths that **refuse**. A connection classified `Indeterminate` that
+/// declares no monitor is not refused at handshake at all: it is admitted,
+/// silently registered with `may_answer: false`, and then never offered a
+/// consent frame. The user sees a request that waits out its window; the daemon
+/// keeps no record that it decided anything.
+///
+/// That silence is what made BUG-163 cost two rounds of guessing — with the
+/// classification unrecorded, there was no way to ask whether this seam was even
+/// involved, so the investigation had to reason about mechanisms instead of
+/// reading one line. This records the decision the daemon is already making.
+///
+/// Deliberately **not** logged for `NotDescendant`: that is every ordinary
+/// connection, and a line per handshake would bury the two cases worth seeing.
+///
+/// Carries the peer pid, because "which process was this" is the first question
+/// anyone reading it will ask, and it is the one fact that lets a walk be
+/// reconstructed by hand. It carries no session id, no path, and no
+/// client-supplied string (conventions: privacy in logs).
+fn ancestry_classification_line(ancestry: Ancestry, peer_pid: Option<i32>) -> String {
+    let (verdict, consequence) = match ancestry {
+        Ancestry::Descendant => (
+            "descends from this daemon's own process tree",
+            "it is excluded from session access — this is the gate working",
+        ),
+        Ancestry::Indeterminate => (
+            "has an ancestry this daemon could not determine",
+            "it fails closed: no session access, and no consent prompt will be \
+             delivered to it. If this connection is a legitimate client, that is \
+             a peer-pid or process-walk problem, not a policy decision",
+        ),
+        // Not reached — the caller logs only the two above. Spelled out rather
+        // than left to a catch-all so a future arm cannot land here silently
+        // wearing one of the sentences above.
+        Ancestry::NotDescendant => (
+            "is outside this daemon's process tree",
+            "it is eligible for session access",
+        ),
+    };
+    let pid = match peer_pid {
+        Some(pid) => pid.to_string(),
+        None => "unknown".to_owned(),
+    };
+    format!("tetond: connection from pid {pid} {verdict} — {consequence}")
+}
+
 /// The refusal a connection gets when a user was asked and said no
 /// (REQ-569 BR-5/BR-7).
 const CONSENT_DENIED_MESSAGE: &str = "the request was declined";
@@ -1701,6 +1750,19 @@ async fn do_handshake(
     };
 
     let ancestry = daemon.process.ancestry_of(peer.pid);
+
+    // BUG-163: record the verdict here, once, for every connection it applies
+    // to — not only for the ones a later gate happens to refuse out loud.
+    //
+    // `Indeterminate` on a client that declares no monitor is admitted and then
+    // silently denied every consent frame, so its only observable is a request
+    // that waits out its window. Logging at the point of classification is what
+    // makes the *next* occurrence answerable in one line instead of by
+    // hypothesis.
+    if !matches!(ancestry, Ancestry::NotDescendant) {
+        eprintln!("{}", ancestry_classification_line(ancestry, peer.pid));
+    }
+
     let connection = daemon.grants.next_connection_id();
 
     // REQ-569 BR-2/BR-4: the monitor declaration is gated here, and the
@@ -5409,6 +5471,51 @@ mod tests {
         assert!(!conn_with_ancestry(&daemon, Ancestry::Descendant).may_hold_session_access());
         assert!(!conn_with_ancestry(&daemon, Ancestry::Indeterminate).may_hold_session_access());
         assert!(conn_with_ancestry(&daemon, Ancestry::NotDescendant).may_hold_session_access());
+    }
+
+    /// BUG-163: an `Indeterminate` classification is recorded at the moment it
+    /// is made, and says what it costs the connection.
+    ///
+    /// The bug this pins is an **absence**: a client whose ancestry could not be
+    /// determined and which declares no monitor is admitted, marked
+    /// `may_answer: false`, and then never offered a consent frame — with
+    /// nothing written down anywhere. Its only symptom is a request that waits
+    /// out its window, which is indistinguishable from a dozen other causes.
+    /// BUG-163 spent two refuted root causes on exactly that ambiguity.
+    ///
+    /// So this asserts the line exists, names the pid, tells the two verdicts
+    /// apart, and — the part that makes it worth reading — says which one is the
+    /// gate working and which one is a lookup that has stopped working.
+    #[test]
+    fn an_ancestry_verdict_is_recorded_where_it_is_decided_not_only_where_it_refuses() {
+        let unknown = ancestry_classification_line(Ancestry::Indeterminate, Some(4321));
+        let descendant = ancestry_classification_line(Ancestry::Descendant, Some(4321));
+
+        assert_ne!(
+            unknown, descendant,
+            "the two verdicts must stay distinguishable here as well as at the refusals"
+        );
+        // The pid is the one fact that lets a walk be reconstructed by hand.
+        assert!(unknown.contains("4321"), "{unknown}");
+        // An operator must be able to tell "your tool child was correctly
+        // excluded" from "this daemon's peer-pid lookup is broken" — opposite
+        // remedies, and the whole reason this line exists.
+        assert!(
+            unknown.contains("could not determine") && unknown.contains("fails closed"),
+            "{unknown}"
+        );
+        assert!(
+            descendant.contains("this is the gate working"),
+            "{descendant}"
+        );
+        // A missing peer pid is itself the interesting case; it must not render
+        // as a plausible pid.
+        let no_pid = ancestry_classification_line(Ancestry::Indeterminate, None);
+        assert!(no_pid.contains("unknown"), "{no_pid}");
+        // Content-free, like every other line on this seam.
+        for line in [&unknown, &descendant, &no_pid] {
+            assert!(!line.contains("sess-"), "{line}");
+        }
     }
 
     /// REQ-569 ADR-A: which process tree a daemon excludes is a property it
