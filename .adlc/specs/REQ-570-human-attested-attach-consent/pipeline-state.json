@@ -2,7 +2,7 @@
   "req": "REQ-570",
   "branch": "feat/REQ-570-human-attested-attach-consent",
   "startedAt": "2026-08-11T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -75,6 +76,11 @@
       "phase": 7,
       "name": "PR Cleanup",
       "completedAt": "2026-08-12T00:37:15.722213+00:00"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup and Merge",
+      "completedAt": "2026-08-12T00:49:52.251075+00:00"
     }
   ],
   "repos": {
@@ -87,7 +93,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/101",
       "prNumber": 101,
       "prCreatedAt": "2026-08-11T00:00:00Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
@@ -112,5 +118,5 @@
     "failedTasks": []
   },
   "blockers": [],
-  "notes": "All 10 tasks complete. AC-3b (one recorded human pass) is deliberately OUTSTANDING per its runbook \u2014 REQ-547 AC-13 precedent."
+  "notes": "MERGED as c8bdffd (PR #101). All 10 tasks complete. AC-3b (one recorded human pass) deliberately OUTSTANDING per docs/manual-verification.md \u2014 REQ-547 AC-13 precedent."
 }
