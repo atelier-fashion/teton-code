@@ -270,7 +270,22 @@ impl PresenceVerifier for LocalAuthenticationVerifier {
             };
             // No session id, no path, no prompt text — conventions forbid
             // content in anything a user or a log may see.
-            let reason = nsstring("approve a request to attach to one of your Teton sessions");
+            //
+            // Deliberately generic about *what* is being approved, and that is a
+            // known limitation rather than an oversight: this seam is handed a
+            // connection and a request id, not a scope, so it cannot say whether
+            // the user is admitting one client to one session or handing out
+            // sight of every session on the machine. The scope-specific sentence
+            // is the CLI's (`resolve_attach_consent`), which the user answers
+            // first — the OS prompt confirms *a person is here*, it does not
+            // re-ask the question.
+            //
+            // Recorded as a residual: a user who habitually approves this dialog
+            // is confirming presence, not consenting to a scope. Threading the
+            // scope through to this string would make the OS prompt
+            // self-describing and is worth doing if this seam ever grows a
+            // second caller whose question differs.
+            let reason = nsstring("confirm you are present to approve a Teton access request");
 
             let evaluate: unsafe extern "C" fn(Id, Sel, isize, Id, *mut ReplyBlock) =
                 std::mem::transmute(objc_msgSend as *const ());

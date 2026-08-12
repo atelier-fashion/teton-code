@@ -170,6 +170,32 @@ enum RenderedBy {
     /// reaches this module, so "ask the requester" can never mean "ask the
     /// daemon's own spawned code".
     TheRequesterItself,
+    /// **Monitor.** Any connection holding a session, and **never** the
+    /// requester (REQ-570 BR-5).
+    ///
+    /// The arm REQ-569's verify pass deleted, restored under a condition it did
+    /// not have. What made the old one unsound was not its routing: connection A
+    /// created a throwaway session, which made A an attached surface, which made
+    /// A the eligible approver for connection B's monitor request — two distinct
+    /// `ConnectionId`s, so it did not even read as self-approval, and one
+    /// attacker holding two connections owned the whole exchange.
+    ///
+    /// Two things changed, and **both** are load-bearing:
+    ///
+    /// 1. A granting answer now requires a presence attestation the daemon
+    ///    itself verified, so the attacker's second connection has to produce a
+    ///    human at the machine. That is what actually breaks the attack.
+    /// 2. `session/create` is no longer ungated (REQ-570 BR-10(a)), so the
+    ///    daemon's own children can no longer manufacture the attached-surface
+    ///    standing the attack opened with.
+    ///
+    /// Excluding the requester is kept as a **third**, structural guard rather
+    /// than dropped as redundant. It is cheap, it is the invariant BR-5 states
+    /// in so many words, and LESSON-502 is explicit that an invariant enforced
+    /// at several seams needs a test at each seam — a property that holds only
+    /// because two other mechanisms happen to hold is one nobody notices
+    /// breaking.
+    AnyAttachedPeer,
 }
 
 impl ConsentRoute {
@@ -192,6 +218,27 @@ impl ConsentRoute {
         }
     }
 
+    /// The monitor arm (REQ-570 BR-5): any connection holding a session, never
+    /// the requester.
+    #[must_use]
+    pub fn any_attached_peer(requester: ConnectionId) -> Self {
+        Self {
+            requester,
+            rendered_by: RenderedBy::AnyAttachedPeer,
+        }
+    }
+
+    /// Whether this route is for a monitor-scope request.
+    ///
+    /// Read by the answering handler so a monitor approval can be held to BR-5's
+    /// extra condition. Asking the *route* rather than trusting the caller to
+    /// remember the scope keeps one definition of which requests are monitor
+    /// requests (LESSON-484).
+    #[must_use]
+    pub fn is_monitor(&self) -> bool {
+        matches!(self.rendered_by, RenderedBy::AnyAttachedPeer)
+    }
+
     /// The connection that asked.
     #[must_use]
     pub fn requester(&self) -> ConnectionId {
@@ -211,6 +258,10 @@ impl ConsentRoute {
         match &self.rendered_by {
             RenderedBy::ConnectionsAttachedTo(session) => attached.contains(session),
             RenderedBy::TheRequesterItself => connection == self.requester,
+            // The requester exclusion is *first* and unconditional: a monitor
+            // grant is sight of every session on the machine, and BR-5 says the
+            // approver is never the requester under any arm.
+            RenderedBy::AnyAttachedPeer => connection != self.requester && !attached.is_empty(),
         }
     }
 
@@ -565,6 +616,33 @@ impl ConsentSurfaces {
                     .read()
                     .expect("connection attachment lock poisoned")
                     .contains(session)
+            })
+    }
+
+    /// Is any live connection **other than** `requester` holding a session?
+    ///
+    /// The question that decides whether a monitor request has anyone to ask
+    /// (REQ-570 BR-5). Excludes the requester for the same reason
+    /// `RenderedBy::AnyAttachedPeer` does: a connection holding a session of its
+    /// own must not become the peer that approves its *own* daemon-wide read.
+    ///
+    /// Counts surfaces that may not answer, exactly as
+    /// [`Self::anyone_attached_to`] does (F2). A connection the ancestry gate
+    /// excludes still *holds* what it holds; leaving it out here would make a
+    /// held daemon look empty and turn a refusal into a different answer.
+    #[must_use]
+    pub fn anyone_attached_to_anything(&self, requester: ConnectionId) -> bool {
+        self.live
+            .read()
+            .expect("consent surfaces lock poisoned")
+            .iter()
+            .any(|(connection, surface)| {
+                *connection != requester
+                    && !surface
+                        .attached
+                        .read()
+                        .expect("connection attachment lock poisoned")
+                        .is_empty()
             })
     }
 

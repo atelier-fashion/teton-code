@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 title: "monitor becomes mintable again, and only under attestation"
-status: pending
+status: complete
 parent: REQ-570
 created: 2026-08-11
 updated: 2026-08-11
@@ -23,17 +23,17 @@ nothing weaker should mint it.
 
 ## Acceptance Criteria
 
-- [ ] AC-2: the REQ-569 two-connection attack (conn A creates a throwaway
+- [x] AC-2: the REQ-569 two-connection attack (conn A creates a throwaway
       session, conn B requests monitor, A approves) is refused, as a **named
       regression test**.
-- [ ] AC-2b: `monitor` is mintable — a connection presenting a valid attestation,
+- [x] AC-2b: `monitor` is mintable — a connection presenting a valid attestation,
       answering a monitor-scope request it did **not** raise, receives the grant
       and can then monitor. Asserted **positively**: a capability only ever
       observed being refused is indistinguishable from the dead code Gap 3
       describes.
-- [ ] BR-5: the approver is never the requester **under any arm** — checked
+- [x] BR-5: the approver is never the requester **under any arm** — checked
       structurally, not merely avoided by construction (LESSON-502).
-- [ ] `NOT_GRANTED_MESSAGE` is updated: it currently says the daemon "has no way
+- [x] `NOT_GRANTED_MESSAGE` is updated: it currently says the daemon "has no way
       to mint one over the socket", which stops being true.
 
 ## Technical Notes

@@ -126,7 +126,7 @@ use crate::broadcast::{EventBus, Subscription, DEFAULT_CAPACITY};
 use crate::consent::{
     ConsentOutcome, ConsentRoute, ConsentSurfaces, PendingConsents, CONSENT_TIMEOUT,
 };
-use crate::grants::{ConnectionId, Grant, GrantRegistry};
+use crate::grants::{monitor_witness, ConnectionId, Grant, GrantRegistry};
 use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
 use crate::runtime::DaemonRuntime;
@@ -815,7 +815,7 @@ const ATTACH_FORBIDDEN_MESSAGE: &str =
 /// there is no remedy to name. See the F1 comment in `do_handshake` for why the
 /// one that existed was removed rather than re-predicated.
 const NOT_GRANTED_MESSAGE: &str =
-    "no monitor-scope grant, and this daemon has no way to mint one over the socket";
+    "no monitor-scope grant, and no attached client is available to approve one";
 
 /// The BR-10(a) standing check for a **daemon-wide** method (REQ-570 ADR-A,
 /// closes BUG-162).
@@ -1735,40 +1735,89 @@ async fn do_handshake(
             return None;
         }
         if !daemon.grants.may_monitor(connection) {
-            // **There is no consent path here, and that is the fix, not an
-            // omission** (REQ-569 verify, F1).
+            // **REQ-570 BR-5 / AC-2b: the consent path is back, under
+            // attestation.** REQ-569 verify (F1) deleted it, and the note below
+            // records why. What it could not do at the time was tell an
+            // attacker's second connection from the user's real client — so the
+            // capability kept its grant gate and had no minter at all, leaving a
+            // REQ-568 feature dead.
             //
-            // TASK-108 added one: a monitor request was routed to "any attached
-            // peer other than the requester", on the theory that an attached
-            // connection is a surface whose user demonstrably owns something.
-            // It was mintable over the socket by one attacker holding two
-            // connections. `session/create` is ungated by design, so connection
-            // A created a throwaway session — which made A attached, and made A
-            // a registered surface — and connection B then declared `monitor`.
-            // The routing picked A as the approver, A answered, and B became a
-            // daemon-wide observer of every session on the machine. No human was
-            // involved, and it did not even read as a self-approval: two
-            // different `ConnectionId`s, so the `self_approved_by` log line
-            // stayed silent.
+            // Three things now stand between a request and a monitor grant, and
+            // the first is the one that actually breaks F1's attack:
             //
-            // No sound approver predicate exists over the primitives this
-            // daemon has. It cannot distinguish an attacker's second connection
-            // from the user's real client — that is the same ADR-A residual the
-            // spec records for attach's self-render arm — and a peer-pid check
-            // only forces the attacker to fork. So the capability keeps its
-            // grant gate (BR-2/AC-4: `GrantScope::Monitor` and `may_monitor` are
-            // untouched) and simply has no minter reachable from a socket.
+            // 1. A granting answer requires a presence attestation the daemon
+            //    itself verified (`handle_attach_consent`). The attacker's
+            //    second connection has to produce a human at the machine.
+            // 2. The approver is never the requester, structurally
+            //    (`ConsentRoute::any_attached_peer`), under any arm — BR-5.
+            // 3. `session/create` is no longer ungated (BR-10(a)), so the
+            //    attached-surface standing F1's attack opened with can no longer
+            //    be manufactured by a daemon child.
             //
-            // No `attach_refused` is published either. The route it would be
-            // published on reaches nobody: this connection is not a registered
-            // surface until its handshake succeeds, and there is no peer the
-            // request was ever offered to.
-            let _ = out_tx.try_send(error_string(
-                id,
-                error_code::NOT_GRANTED,
-                NOT_GRANTED_MESSAGE,
-            ));
-            return None;
+            // Refusal stays the default: if nobody holds a session there is no
+            // peer to ask, and the request is refused rather than routed back to
+            // the requester. A monitor is a whole-daemon read, and the
+            // self-render arm that keeps *attach* usable would hand it to
+            // whoever asked.
+            let granted_now = if daemon.surfaces.anyone_attached_to_anything(connection) {
+                let route = ConsentRoute::any_attached_peer(connection);
+                let requester = requester_descriptor(&params);
+                match seek_consent(daemon, &requester, ConsentScope::Monitor, None, &route).await {
+                    Some(ConsentOutcome::Granted { attestation, .. }) => {
+                        daemon
+                            .grants
+                            .grant(Grant::monitor(connection, monitor_witness()));
+                        // Announced like any other mint (BR-9/AC-9), carrying
+                        // what verified the human — the field that separates
+                        // this from the path F1 removed.
+                        eprintln!(
+                            "teton-code: monitor grant minted for {requester} (attested: {})",
+                            attestation.as_str()
+                        );
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+
+            if granted_now {
+                // Fall through into the ordinary admission path below.
+            } else {
+                // The history this replaces (REQ-569 verify, F1): a monitor
+                // request was routed to "any attached peer other than the
+                // requester", on the theory that an attached connection is a
+                // surface whose user demonstrably owns something. One attacker
+                // holding two connections owned the whole exchange — A created a
+                // throwaway session through the then-ungated `session/create`,
+                // which made A an attached surface and so the eligible approver
+                // for B's monitor request; A answered, and B became a daemon-wide
+                // observer. No human was involved, and with two distinct
+                // `ConnectionId`s it did not even read as a self-approval.
+                //
+                // The path is back because the missing piece arrived, not
+                // because the reasoning changed: the daemon still cannot tell an
+                // attacker's second connection from the user's real client, and
+                // now it does not have to — it asks the *machine's* human
+                // directly. See the three conditions above.
+                //
+                // This arm is what is left: no peer holds a session, so there is
+                // nobody to ask. Refused rather than routed back to the
+                // requester — a monitor is a whole-daemon read, and the
+                // self-render arm that keeps attach usable would hand it to
+                // whoever asked.
+                //
+                // No `attach_refused` is published: this connection is not a
+                // registered surface until its handshake succeeds, so the route
+                // it would go out on reaches nobody.
+                let _ = out_tx.try_send(error_string(
+                    id,
+                    error_code::NOT_GRANTED,
+                    NOT_GRANTED_MESSAGE,
+                ));
+                return None;
+            }
         }
     }
 
