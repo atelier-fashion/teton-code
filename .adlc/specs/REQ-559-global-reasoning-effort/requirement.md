@@ -1,7 +1,7 @@
 ---
 id: REQ-559
 title: "Global reasoning effort with per-provider clamping and thinking-token attribution"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-05
 updated: 2026-08-11
