@@ -1,7 +1,7 @@
 ---
 id: TASK-117
 title: "AC-12 mutation checks, the full-suite sweep, and the architecture/context record"
-status: pending
+status: complete
 parent: REQ-559
 created: 2026-08-11
 updated: 2026-08-11
