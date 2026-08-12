@@ -1,7 +1,7 @@
 ---
 id: TASK-010
 title: "AC-11 mutation check and the AC-8 regression bar"
-status: pending
+status: complete
 parent: REQ-570
 created: 2026-08-11
 updated: 2026-08-11
@@ -20,17 +20,17 @@ one test red.
 
 ## Acceptance Criteria
 
-- [ ] Mutation 1: making the attestation verifier return success unconditionally
+- [x] Mutation 1: making the attestation verifier return success unconditionally
       makes at least one test red.
-- [ ] Mutation 2: dropping the single-use/expiry binding (BR-6) makes at least
+- [x] Mutation 2: dropping the single-use/expiry binding (BR-6) makes at least
       one test red.
-- [ ] Mutation 3: restoring the unattested self-approval routing arm (BR-3) makes
+- [x] Mutation 3: restoring the unattested self-approval routing arm (BR-3) makes
       at least one test red.
-- [ ] Mutation 4: removing a method's connection check (BR-10a) makes at least
+- [x] Mutation 4: removing a method's connection check (BR-10a) makes at least
       one test red — for **each** of the seven, not one representative.
-- [ ] AC-8 regression bar re-asserted end to end: single-client create → prompt →
+- [x] AC-8 regression bar re-asserted end to end: single-client create → prompt →
       stream and the creator's own attach run with zero new prompts.
-- [ ] Each mutation is actually **run** and seen red, then restored. A mutation
+- [x] Each mutation is actually **run** and seen red, then restored. A mutation
       check asserted from reasoning is not a mutation check.
 
 ## Technical Notes

@@ -804,6 +804,56 @@ mod tests {
         }
     }
 
+    /// **REQ-570 BR-5 / AC-2.** The monitor arm never offers the prompt to the
+    /// requester — under any attachment it happens to hold.
+    ///
+    /// Tested here, at the predicate, rather than only through the socket, and
+    /// the reason is worth recording: over the socket this invariant is
+    /// currently **unreachable**. A connection declaring `monitor` is parked
+    /// inside its own handshake while the consent runs, so it has no reader loop
+    /// with which to answer itself, and an end-to-end test cannot distinguish a
+    /// daemon that enforces this rule from one that merely never gets the chance
+    /// to break it.
+    ///
+    /// That is exactly the shape LESSON-502 names — an invariant enforced at
+    /// several seams needs a test at *each* seam — and it was caught by AC-11's
+    /// mutation check: deleting `connection != self.requester` left the whole
+    /// suite green until this test existed. A guard nothing can kill is a guard
+    /// nobody notices losing, and the handshake shape it depends on is not
+    /// something this module gets to assume forever.
+    #[test]
+    fn a_monitor_prompt_is_never_offered_to_the_connection_that_asked() {
+        let registry = GrantRegistry::new();
+        let requester = registry.next_connection_id();
+        let peer = registry.next_connection_id();
+        let route = ConsentRoute::any_attached_peer(requester);
+
+        // The cell the mutation check found unguarded: the requester holding a
+        // session of its own is precisely the F1 attack's opening move, and it
+        // must not make the requester an eligible approver.
+        assert!(
+            !route.renders_request(requester, &attached_to(&["sess-its-own"])),
+            "a monitor request must never be answerable by the connection that \
+             raised it, however much it happens to hold (BR-5)"
+        );
+        assert!(
+            !route.renders_request(requester, &HashSet::new()),
+            "and holding nothing does not help it either"
+        );
+
+        // Non-vacuity: a genuine peer holding a session *is* asked, so the
+        // refusals above are the rule and not an arm that asks nobody.
+        assert!(route.renders_request(peer, &attached_to(&["sess-theirs"])));
+        assert!(
+            !route.renders_request(peer, &HashSet::new()),
+            "a peer holding no session is not a surface whose user owns anything"
+        );
+
+        // And the requester is still told how its own request ended.
+        assert!(route.renders_outcome(requester, &HashSet::new()));
+        assert!(route.is_monitor());
+    }
+
     /// The requester always learns how its own request ended, even in the arms
     /// that never offered it the prompt — otherwise the one connection that has
     /// to retire its pending state is the one connection never told.

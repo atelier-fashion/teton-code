@@ -469,3 +469,49 @@ Three ways out, none of which should be chosen unilaterally:
 Option 1 plus a recorded manual pass (option 2) is the combination this
 architecture would recommend, but AC-3 is a product statement about what the
 project is willing to claim it has verified, so it is left open here.
+
+
+---
+
+## 10. AC-11 mutation evidence (TASK-010)
+
+Every mutation below was **actually applied, compiled, and run**, and seen red —
+not reasoned about. This REQ ships mostly refusals, and a refusal is verified
+only by proving it is load-bearing (LESSON-441). Sources were restored from a
+pristine copy between every run, and the runs were strictly sequential because
+BUG-159 panics `call_sites.rs` / `harness/duty.rs` when `src/` changes mid-run.
+
+| # | Mutation | Result |
+|---|---|---|
+| M1a | `UnavailableVerifier::verify` returns a valid attestation | RED |
+| M1b | `availability()` always claims `Available` | RED |
+| M2a | BR-6 single-use dropped (`consume` stops consuming) | RED |
+| M2b | BR-6 expiry dropped (`is_live_at` always true) | RED |
+| M2c | BR-6 binding dropped (request removed from the key) | RED |
+| M3 | BR-3 unattested self-approval arm restored | RED |
+| M4 ×7 | BR-10(a) connection check removed, **one method at a time** | RED ×7 |
+| M5 | BR-10(b) commitment presence check removed | RED |
+| M6 | BR-5 monitor requester-exclusion removed | **SURVIVED**, then RED |
+
+### M6 is the one worth reading
+
+Deleting `connection != self.requester` from the monitor routing arm left the
+**entire suite green**. The guard was real, correct, and completely untested.
+
+Why it survived: over the socket the invariant is currently *unreachable*. A
+connection declaring `monitor` is parked inside its own handshake while the
+consent runs, so it has no reader loop with which to answer itself. Every
+end-to-end test therefore passes whether or not the rule exists — they cannot
+distinguish a daemon that enforces it from one that never gets the chance to
+break it.
+
+This is exactly the shape LESSON-502 names: an invariant enforced at several
+seams needs a test at *each* seam. The fix is a direct predicate test
+(`a_monitor_prompt_is_never_offered_to_the_connection_that_asked`), which makes
+the mutation red. The handshake shape the socket-level unreachability depends on
+is not something `consent.rs` gets to assume forever — and a guard nothing can
+kill is a guard nobody notices losing.
+
+Recorded because it is a general lesson about defense-in-depth guards, not a
+detail of this REQ: **a redundant check needs its own test precisely because it
+is redundant.**
