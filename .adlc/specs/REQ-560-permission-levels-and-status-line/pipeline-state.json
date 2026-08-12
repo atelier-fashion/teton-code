@@ -3,7 +3,7 @@
   "branch": "feat/REQ-560-permission-levels-and-status-line",
   "startedAt": "2026-08-11T00:00:00Z",
   "completed": false,
-  "currentPhase": 7,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,8 @@
     3,
     4,
     5,
-    6
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -55,6 +56,12 @@
       "name": "Create PR",
       "completedAt": "2026-08-11T00:00:00Z",
       "result": "PR #102 flipped draft -> ready"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "6/6 checks green incl. both platform legs (AC-13 observed); mergeStateStatus CLEAN"
     }
   ],
   "repos": {
@@ -95,6 +102,8 @@
     "Subagent mode (/sprint pipeline-runner). ORCHESTRATOR MERGE OVERRIDE: stop after Phase 7 and report pr-ready. Do NOT self-merge \u2014 overlapping footprint with REQ-559 (COMMANDS table, CLI status/session surface). Orchestrator sequences REQ-559 first, then REQ-560, each behind a fresh trial-merge gate.",
     "Expect to rebase onto a main that already carries REQ-559. Overlap points: crates/teton/src/slash.rs COMMANDS table (this REQ adds the `permissions` row and an Args::Optional variant; REQ-559 adds `effort`), and crates/teton/src/status.rs status_line's `effort` parameter, which is the seam REQ-559 fills.",
     "AC-14 mutation check performed and recorded in the PR body; all three legs confirmed red then reverted.",
-    "AC-13: CI matrix [ubuntu-latest, macos-latest] both run cargo test --workspace (includes cli_e2e + pty_e2e). Linux pty leg first observed on this PR's CI."
+    "AC-13: CI matrix [ubuntu-latest, macos-latest] both run cargo test --workspace (includes cli_e2e + pty_e2e). Linux pty leg first observed on this PR's CI.",
+    "Phase 8 NOT run by this pipeline-runner, per orchestrator merge override. Terminal claim: pr-ready. Orchestrator owns the merge after REQ-559.",
+    "Likely rebase conflicts after REQ-559 lands, all mechanical: (1) crates/teton/src/slash.rs `enum Args` \u2014 REQ-559 BR-9's bare `/effort` read needs an optional-argument variant too, and this REQ added `Args::Optional`; keep one. (2) the COMMANDS array (two new rows). (3) the `promised` list in `the_table_carries_every_command_this_req_promises`. (4) the `Args::Optional` match arm in `every_table_row_is_reachable_from_a_typed_command_line`. (5) SessionState in session_ui.rs (two new fields). (6) crates/teton/src/status.rs `status_line`'s `effort: Option<&str>` parameter is REQ-559's seam \u2014 it fills it, nothing here changes."
   ]
 }
