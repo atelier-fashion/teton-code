@@ -259,10 +259,13 @@ category/tier equivalent (see OQ-2 for the command shape).
       documented category table, reports the `implement` → {`edit`,`shell`} and
       `io` → {`digest`,`triage`,`title`,`compact`} expansions by name, drops the
       `freeform` entry with a note, and does not re-run on second start.
-- [ ] AC-8: `route_decided` for every turn carries a category, a tier, a
+- [ ] AC-8 **[MANUAL GATE — not CI-enforceable]**: `route_decided` for every turn carries a category, a tier, a
       provider, and a non-empty reason — asserted across a scripted session
       covering at least one harness-known and one intent-classified category.
       (REQ-544 BR-5)
+
+      **Unticked deliberately, not overlooked.** carries a **recorded exception** in `docs/manual-verification.md`: a taint-pinned `route_decided` legitimately carries no category, so the 'every turn' wording is true only outside that case. Ticking it would overstate the claim. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
 - [x] AC-9: `Phase` appears in no routing signature (`resolve_*`, the policy
       table, `route_decided`'s dispatch input) while still appearing in
       `CostRecord`; `Phase::Freeform` no longer exists. Compile-level assertion

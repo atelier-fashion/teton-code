@@ -121,10 +121,13 @@ n/a — no user-facing permission changes; removed per template guidance.
       refused with the existing typed engine error — pinned by a test sized
       to cross the window only when template overhead is counted (informed
       by LESSON-446).
-- [ ] AC-6: The feature-gated real-model smoke (`--features llama`,
+- [ ] AC-6 **[MANUAL GATE — not CI-enforceable]**: The feature-gated real-model smoke (`--features llama`,
       `#[ignore]`d) drives one turn through the native template and observes
       a single well-formed tool call — single-platform mock-only green is
       not acceptance for this REQ (informed by LESSON-433, LESSON-448).
+
+      **Unticked deliberately, not overlooked.** the real-engine smoke exists (`crates/teton-inference/tests/llama_smoke.rs`) but is `--ignored` and needs `--features llama` plus ~17 GB of weights. CI builds without the feature by design. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
 - [x] AC-7: Default/CI builds (no `llama` feature) compile and pass: mock and
       scripted engines run under the flat fallback with no template
       machinery required at runtime.

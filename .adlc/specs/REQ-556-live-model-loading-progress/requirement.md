@@ -175,15 +175,21 @@ PTY-driven e2e — see External Dependencies), and **piped** (the existing
 cross-cutting claims about the suite as a whole — which platforms it ran on,
 and whether it actually fails when the feature is disabled.
 
-- [ ] AC-1 *(unit + pty)*: With the daemon mid-load, opening `teton` shows a
+- [ ] AC-1 **[MANUAL GATE — not CI-enforceable]** *(unit + pty)*: With the daemon mid-load, opening `teton` shows a
       live indicator naming the model and its current phase, advancing at a
       steady interval, **with no input typed**.
-- [ ] AC-2 *(pty)*: When the tier opens, the indicator clears and the existing
+
+      **Unticked deliberately, not overlooked.** a `(pty)` behaviour — already recorded as an unticked checklist item in `docs/manual-verification.md` under the REQ-547 runbook. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
+- [ ] AC-2 **[MANUAL GATE — not CI-enforceable]** *(pty)*: When the tier opens, the indicator clears and the existing
       `>> local model <id> ready` line renders **on its own**, with no prompt
       typed and no RPC issued. This is the direct regression test for the
       queued-event defect and fails against today's binary. It is the one
       criterion that cannot be reached any other way — it is *about* timing —
       which is what justifies the PTY harness.
+
+      **Unticked deliberately, not overlooked.** as AC-1: `(pty)`, recorded in the REQ-547 runbook. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
 - [x] AC-3 *(unit + existing tests)*: The per-stage lines are unchanged.
       `render_lifecycle`'s and `progress_bar`'s existing unit tests pass
       **unmodified** (BR-10). New output appears only in the window that
@@ -193,9 +199,12 @@ and whether it actually fails when the feature is disabled.
       to the pre-REQ binary. `slash_quit_ends_the_session_exactly_as_ctrl_d_does`
       and the `/exit` equivalence leg pass **unmodified** — a test edited to
       accommodate indicator bytes is a BR-2 violation, not an accommodation.
-- [ ] AC-5 *(pty)*: A prompt typed while the indicator is running is accepted
+- [ ] AC-5 **[MANUAL GATE — not CI-enforceable]** *(pty)*: A prompt typed while the indicator is running is accepted
       intact, the entry frame is not corrupted, and the turn proceeds — or
       returns `TIER_WARMING` and renders as BUG-152 defined.
+
+      **Unticked deliberately, not overlooked.** as AC-1: `(pty)`, recorded in the REQ-547 runbook. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
 - [x] AC-6 *(unit)*: Driven with a lifecycle sequence that never reaches
       `Ready`, the indicator terminates on its bounded condition rather than
       advancing indefinitely, and the line it leaves behind names the last state
