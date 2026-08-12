@@ -680,6 +680,38 @@ impl Drop for Daemon {
         // itself is the expected state, not an error.
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        // On a failing test, put the daemon's own account of events where the
+        // person reading CI will see it (BUG-163).
+        //
+        // The daemon's stderr goes to a file inside a temporary workspace, so
+        // by default it is written, never read, and then deleted with the
+        // workspace. Every assertion that wants it passes it explicitly — but
+        // the failures that need it most are the ones that *panic somewhere
+        // else*: a read that times out waiting for a frame reports only its own
+        // deadline, and the log explaining why no frame came is discarded
+        // moments later.
+        //
+        // BUG-163 is exactly that shape. It cost two refuted root causes, and
+        // the handshake now records each connection's ancestry verdict — a line
+        // that would have answered it — into precisely this unread file.
+        //
+        // Read *after* `kill`/`wait` so the child has flushed and exited: a
+        // wedged daemon dies quickly here, and a log read before that can miss
+        // its last lines, which are the interesting ones.
+        //
+        // Gated on `panicking()` so a green run stays silent.
+        if std::thread::panicking() {
+            let log = self.log();
+            if log.is_empty() {
+                eprintln!("--- tetond stderr: empty ({}) ---", self.log_path.display());
+            } else {
+                eprintln!(
+                    "--- tetond stderr ({}) ---\n{log}--- end tetond stderr ---",
+                    self.log_path.display()
+                );
+            }
+        }
     }
 }
 
