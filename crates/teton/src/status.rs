@@ -27,6 +27,7 @@
 //! `/permissions` prints it and works on a pipe (BR-10), which is what makes
 //! dropping the row an acceptable degradation rather than a loss.
 
+use teton_protocol::methods::EffortView;
 use teton_protocol::permissions::PermissionLevel;
 
 /// The label the permission field carries.
@@ -38,14 +39,52 @@ const EFFORT_LABEL: &str = "effort";
 /// What separates the fields.
 const FIELD_SEPARATOR: &str = "  ·  ";
 
+/// What the effort field shows when the setting reaches no model (REQ-559 BR-6).
+///
+/// Short because the row has to stay readable at 80 columns, and *present*
+/// rather than omitted because the two facts differ: an absent field means this
+/// daemon has no effort setting at all, while this means the setting exists and
+/// is not being applied. Showing the level instead would be the misattribution
+/// BR-6 forbids — the user set something and something else happened.
+const EFFORT_NOT_APPLICABLE: &str = "n/a";
+
+/// The effort value the status row should show, from the daemon's own view.
+///
+/// Derived rather than re-computed: [`EffortView`] is produced by
+/// `teton_core::effort::resolve_effort`, the same function the router calls per
+/// model call, so this reads the daemon's answer instead of forming a second
+/// opinion about clamping (REQ-559's one-resolver chain, LESSON-456).
+///
+/// Three outcomes, and they are three different facts:
+///
+/// - `None` — the daemon sent no view. It predates the setting, so the row shows
+///   the permission field alone rather than inventing a level.
+/// - `Some("n/a")` — a view exists, but **nothing is receiving it**: either no
+///   provider is registered, or every registered provider's resolution omits the
+///   field (a local-only session is the case AC-7 names). BR-6 requires this be
+///   reported as ignored rather than displayed as a level.
+/// - `Some(level)` — the level being requested.
+#[must_use]
+pub fn effort_field(view: Option<&EffortView>) -> Option<String> {
+    let view = view?;
+    let reaches_a_model = view
+        .providers
+        .iter()
+        .any(|row| row.resolved.level().is_some());
+    Some(if reaches_a_model {
+        view.level.to_string()
+    } else {
+        EFFORT_NOT_APPLICABLE.to_owned()
+    })
+}
+
 /// The status row's content, or `None` when it does not fit `width`.
 ///
-/// `effort` is the reasoning-effort value REQ-559 renders. It is `Option` rather
-/// than a required field because **the permission half of this REQ is
-/// independently shippable**: until REQ-559 lands there is no effort level to
-/// show, and the row is the permission field alone. REQ-559 fills the parameter
-/// in; nothing here needs to change when it does, and this REQ deliberately adds
-/// no `/effort` command to go with it (BR-14).
+/// `effort` is the reasoning-effort value, normally produced by
+/// [`effort_field`]. It stays an `Option<&str>` rather than taking an
+/// [`EffortView`] directly so this function keeps no opinion about effort at
+/// all: it lays out whatever string it is handed, which is what lets the layout
+/// be tested exhaustively without constructing a provider table.
 ///
 /// `width` is the terminal's column count, passed in rather than queried so this
 /// function stays pure — the whole point of the module.
@@ -198,6 +237,115 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- REQ-560 AC-7, the effort half (now that REQ-559 has landed) --------
+
+    use teton_protocol::effort::{EffortLevel, EffortOmission, ResolvedEffort};
+    use teton_protocol::methods::ProviderEffortView;
+    use teton_protocol::ProviderId;
+
+    fn view(level: EffortLevel, rows: &[(&str, ResolvedEffort)]) -> EffortView {
+        EffortView {
+            level,
+            providers: rows
+                .iter()
+                .map(|(id, resolved)| ProviderEffortView {
+                    provider_id: ProviderId::from(*id),
+                    resolved: *resolved,
+                })
+                .collect(),
+        }
+    }
+
+    /// A daemon that predates the setting sends no view, and the row then shows
+    /// the permission field alone rather than inventing a level.
+    #[test]
+    fn no_effort_view_means_no_effort_field() {
+        assert_eq!(effort_field(None), None);
+        assert_eq!(
+            status_line(PermissionLevel::Guarded, None, 80).as_deref(),
+            Some("permissions: guarded")
+        );
+    }
+
+    /// The ordinary case: something is receiving the setting, so the row names
+    /// the level the user asked for.
+    #[test]
+    fn a_level_that_reaches_a_model_is_shown() {
+        let v = view(
+            EffortLevel::High,
+            &[("anthropic", ResolvedEffort::effort(EffortLevel::High))],
+        );
+        assert_eq!(effort_field(Some(&v)).as_deref(), Some("high"));
+        assert_eq!(
+            status_line(
+                PermissionLevel::Edits,
+                effort_field(Some(&v)).as_deref(),
+                80
+            )
+            .as_deref(),
+            Some("permissions: edits  ·  effort: high")
+        );
+    }
+
+    /// **AC-7's named case**: a local-only session. `ShapeNone` is the omission
+    /// REQ-559 BR-6 attaches to the local tier by name, so this is that case
+    /// rather than a stand-in for it. Every provider's resolution omits the
+    /// field, so the setting reaches no model — and REQ-559 BR-6
+    /// requires that be reported as ignored rather than displayed as a level the
+    /// model is not receiving. Showing `high` here would be the misattribution
+    /// family of BUG-146: the user set something and something else happened.
+    #[test]
+    fn a_setting_that_reaches_no_model_renders_as_not_applicable() {
+        let local_only = view(
+            EffortLevel::High,
+            &[("local", ResolvedEffort::omit(EffortOmission::ShapeNone))],
+        );
+        assert_eq!(effort_field(Some(&local_only)).as_deref(), Some("n/a"));
+        assert_eq!(
+            status_line(
+                PermissionLevel::Guarded,
+                effort_field(Some(&local_only)).as_deref(),
+                80
+            )
+            .as_deref(),
+            Some("permissions: guarded  ·  effort: n/a")
+        );
+
+        // No providers registered at all is the same fact: nothing receives it.
+        let nobody = view(EffortLevel::Max, &[]);
+        assert_eq!(effort_field(Some(&nobody)).as_deref(), Some("n/a"));
+    }
+
+    /// A mixed machine still shows the level: *some* model is receiving it, and
+    /// the per-provider detail is `/effort`'s job, not a status row's — the row
+    /// has to stay readable at 80 columns (OQ-4).
+    #[test]
+    fn one_provider_receiving_the_setting_is_enough_to_show_it() {
+        let mixed = view(
+            EffortLevel::Medium,
+            &[
+                ("local", ResolvedEffort::omit(EffortOmission::ShapeNone)),
+                ("anthropic", ResolvedEffort::effort(EffortLevel::Medium)),
+            ],
+        );
+        assert_eq!(effort_field(Some(&mixed)).as_deref(), Some("medium"));
+    }
+
+    /// A clamped resolution still reaches a model, so the row shows the level
+    /// rather than `n/a` — clamping is a narrowing, not an omission, and
+    /// `/effort` is where the per-provider clamp is spelled out.
+    #[test]
+    fn a_clamped_provider_still_counts_as_reached() {
+        let clamped = view(
+            EffortLevel::Max,
+            &[(
+                "openai",
+                ResolvedEffort::clamped(EffortLevel::Max, EffortLevel::High),
+            )],
+        );
+        assert_eq!(effort_field(Some(&clamped)).as_deref(), Some("max"));
     }
 
     #[test]

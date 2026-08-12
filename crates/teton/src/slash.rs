@@ -701,7 +701,16 @@ fn handle_effort(
         }
     }
     match conn.call(ConfigGetParams::default(), ctx)? {
-        Ok(cfg) => crate::effort_ui::render(ctx.surface, cfg.snapshot.effort.as_ref()),
+        Ok(cfg) => {
+            // REQ-560: the status row renders from session state, so it has to
+            // learn what the daemon just reported — otherwise a `/effort high`
+            // would leave the row showing the previous level for the rest of the
+            // session. Cached from the daemon's answer rather than from the
+            // request, so what the row shows is what actually took effect
+            // (a clamped or refused set is reported, not assumed).
+            ctx.state.effort = cfg.snapshot.effort.clone();
+            crate::effort_ui::render(ctx.surface, cfg.snapshot.effort.as_ref());
+        }
         Err(err) => ctx.surface.line(
             LineKind::Error,
             &format!("could not read the effort setting: {}", err.message),
@@ -2140,21 +2149,40 @@ mod tests {
         }
     }
 
-    /// REQ-560 BR-14, the fence: this REQ owns `/permissions` and must not add,
-    /// alias, or duplicate `/effort`, which is REQ-559 BR-9's row.
+    /// REQ-560 BR-14, the fence: `/effort` and `/permissions` are **one row
+    /// each**, owned by REQ-559 and REQ-560 respectively.
     ///
-    /// Asserted rather than assumed because the two REQs were built
-    /// concurrently, and a duplicated row is exactly the BUG-153 shape the one
-    /// -table rule exists to prevent.
+    /// Written as a uniqueness claim rather than an absence one, and that
+    /// framing is the point. While REQ-559 was unlanded this could assert
+    /// "`/effort` does not appear" — but that phrasing expires the moment the
+    /// other REQ merges, and an expired fence either fails for the wrong reason
+    /// or gets deleted. What BR-14 actually forbids is a *second* row: "a second
+    /// name for it is an alias on the same row, never a second row." So count.
+    ///
+    /// This also covers the direction the concurrent development made likely —
+    /// a rebase resolving two `COMMANDS` edits by keeping both copies of one
+    /// row, which is the BUG-153 shape (`/help` listing a command twice, two
+    /// handlers to drift apart) and which no compiler would catch.
     #[test]
-    fn this_req_adds_no_effort_command() {
-        for spec in COMMANDS {
-            for spelling in spec.spellings() {
-                assert_ne!(
-                    spelling, "effort",
-                    "/effort belongs to REQ-559 and must not be added here"
-                );
-            }
+    fn effort_and_permissions_are_one_row_each() {
+        for owned in ["effort", "permissions"] {
+            let rows = COMMANDS.iter().filter(|s| s.name == owned).count();
+            assert_eq!(
+                rows, 1,
+                "`/{owned}` must be exactly one row in COMMANDS, found {rows}"
+            );
+            // …and no *other* row may reach it by alias, which would be a second
+            // spelling with a second handler behind it.
+            let spellings = COMMANDS
+                .iter()
+                .flat_map(CommandSpec::spellings)
+                .filter(|sp| *sp == owned)
+                .count();
+            assert_eq!(
+                spellings, 1,
+                "`/{owned}` is reachable by {spellings} spellings; BR-14 allows one row \
+                 and aliases only on that same row"
+            );
         }
     }
 

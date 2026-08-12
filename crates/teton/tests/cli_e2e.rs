@@ -2532,7 +2532,7 @@ fn bare_permissions_reads_the_level_on_a_pipe_and_help_lists_it() {
     let session = daemon.run_cli_with_stdin(
         &teton,
         &[],
-        "/permissions\n/help\n/permissions full\n/permissions\n",
+        "/permissions\n/effort\n/help\n/permissions full\n/permissions\n",
     );
 
     // The read, with no argument, on a pipe.
@@ -2540,11 +2540,26 @@ fn bare_permissions_reads_the_level_on_a_pipe_and_help_lists_it() {
         session.contains("permission level: guarded"),
         "bare /permissions must print the level; output:\n{session}"
     );
-    // AC-11: listed in /help, from the dispatch table.
+    // AC-9's second half, now that REQ-559 has landed: the spec deferred this
+    // leg with "when REQ-559 has landed, the same test covers bare `/effort`".
+    // It has, so it does — bare `/effort` reads on a pipe too, which is the
+    // point of BR-10: every value the TTY-only status row shows has a
+    // non-visual read path.
+    assert!(
+        session.contains("Reasoning effort:"),
+        "bare /effort must print the setting on a pipe (REQ-559 BR-9); output:\n{session}"
+    );
+    // AC-11: both rows listed in `/help`, from the dispatch table `/help` is
+    // generated from — so neither can exist without appearing there.
     assert!(
         session.lines().any(|line| line.contains("/permissions")
             && line.contains("Show or set this session's permission level")),
         "/help must list /permissions with its summary; output:\n{session}"
+    );
+    assert!(
+        session.lines().any(|line| line.contains("/effort")
+            && line.contains("Show or set the global reasoning effort")),
+        "/help must list /effort with its summary; output:\n{session}"
     );
     // A set, then a read that reflects it.
     assert!(
@@ -2555,12 +2570,18 @@ fn bare_permissions_reads_the_level_on_a_pipe_and_help_lists_it() {
         session.contains("permission level: full (unchanged)"),
         "the second read must report the level without claiming a change; output:\n{session}"
     );
-    // BR-14: this REQ ships no /effort command.
-    assert!(
-        !session.contains("/effort"),
-        "/effort is REQ-559's row and must not appear here; output:\n{session}"
+    // BR-14: `/effort` appears **once** — one row, REQ-559's. Counted rather
+    // than asserted absent, because absence stopped being the invariant the
+    // moment that REQ landed; what BR-14 forbids is a second row.
+    assert_eq!(
+        session
+            .lines()
+            .filter(|line| line.contains("/effort") && line.contains("reasoning effort"))
+            .count(),
+        1,
+        "/help must list /effort exactly once (BR-14); output:\n{session}"
     );
-    assert_no_turn_ran(&session, "`/permissions` and `/help`");
+    assert_no_turn_ran(&session, "`/permissions`, `/effort` and `/help`");
 }
 
 /// AC-6 / BR-6: the level is session-scoped. A fresh session against the **same

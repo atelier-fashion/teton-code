@@ -484,7 +484,8 @@ fn next_interactive_line(
 /// permission level alone and adds no `/effort` command (BR-14).
 fn entry_status(ctx: &UiContext<'_>) -> Option<String> {
     let level = ctx.state.permission_level?;
-    status::status_line(level, None, prompt::terminal_width())
+    let effort = status::effort_field(ctx.state.effort.as_ref());
+    status::status_line(level, effort.as_deref(), prompt::terminal_width())
 }
 
 /// Read the session's permission level into the render cache (REQ-560).
@@ -502,6 +503,23 @@ fn read_permission_level(conn: &mut Connection, ctx: &mut UiContext<'_>, session
     };
     if let Ok(Ok(result)) = conn.call(params, ctx) {
         ctx.state.permission_level = Some(result.level);
+    }
+}
+
+/// Read the daemon's reasoning-effort view into the render cache (REQ-559 /
+/// REQ-560).
+///
+/// Best-effort for the same reason [`read_permission_level`] is: a daemon that
+/// predates the setting leaves it `None`, and the status row then shows the
+/// permission field alone. Silent, because an error line at every startup
+/// against an older daemon would be noise about a feature the user has not asked
+/// for.
+///
+/// Kept fresh by `/effort`'s own handler, which caches what the daemon reports
+/// after a set — so the row cannot go on showing a level the user has changed.
+fn read_effort_view(conn: &mut Connection, ctx: &mut UiContext<'_>) {
+    if let Ok(Ok(cfg)) = conn.call(ConfigGetParams::default(), ctx) {
+        ctx.state.effort = cfg.snapshot.effort;
     }
 }
 
@@ -703,6 +721,7 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
         // rather than showing a guess.
         if interactive {
             read_permission_level(&mut conn, &mut ctx, &session_id);
+            read_effort_view(&mut conn, &mut ctx);
         }
         // The indicator's animation clock, persisted across turns so the dots do
         // not restart every time a turn ends (REQ-556).

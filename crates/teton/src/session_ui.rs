@@ -112,6 +112,18 @@ pub struct SessionState {
     /// start and by `/permissions` itself. Session-scoped like everything else
     /// here — nothing is persisted (BR-6).
     pub permission_level: Option<teton_protocol::permissions::PermissionLevel>,
+    /// The daemon's reasoning-effort view, for the status row (REQ-559 / REQ-560).
+    ///
+    /// A render cache like [`Self::permission_level`], and `None` for the same
+    /// two reasons: nobody has asked yet, or the daemon predates the setting. In
+    /// either case the status row shows the permission field alone rather than
+    /// inventing an effort value.
+    ///
+    /// The view itself is the daemon's, computed with the same `resolve_effort`
+    /// the router calls — this holds it rather than a derived string so
+    /// [`crate::status::effort_field`] can apply REQ-559 BR-6's
+    /// reaches-no-model rule to real data.
+    pub effort: Option<teton_protocol::methods::EffortView>,
     /// This session's web-lookup capability, as the event stream reports it
     /// (REQ-563 BR-7/BR-13).
     ///

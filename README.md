@@ -63,6 +63,7 @@ prompts:
 | `/model set <name>` | Change the local model (typed input only; asks before an above-RAM-floor pick) |
 | `/clear` | Drop this session's retained conversation; the next prompt starts fresh |
 | `/verbose` | Toggle routing and turn-end notices for this session |
+| `/effort [level]` | Show, or change, the global reasoning effort |
 | `/permissions [level]` | Show, or change, what this session may run without asking |
 | `/web allow` | Lift this session's web taint restriction (grants no new tier) |
 | `/web refresh <url>` | Drop a URL's cached copy so the next lookup re-fetches |
@@ -73,9 +74,11 @@ double it: `//usr/local/bin/x — why?` asks the model about `/usr/local/bin/x`.
 
 ### Permission levels
 
-How much the agent asks before it acts is one named setting. At a terminal the
-current level shows in a row under the entry frame; `/permissions` prints it
-anywhere, including over a pipe.
+How much the agent asks before it acts is one named setting. At a terminal it
+shows in a status row under the entry frame, beside the reasoning effort — the
+two session-wide settings that silently change what every later turn does and
+costs. Both also print on demand (`/permissions`, `/effort`), which is what
+makes them readable over a pipe, where the row is not drawn.
 
 | Level | What runs without asking |
 |---|---|

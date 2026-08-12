@@ -470,6 +470,22 @@ fn the_status_row_renders_below_the_frame_and_survives_a_redraw() {
         "the status row never rendered at a tty (AC-10); transcript:\n{}",
         snapshot(&transcript)
     );
+    // …and it carries **both** values it is specified to carry, now that
+    // REQ-559 has landed. The permission half alone would satisfy the assertion
+    // above while the effort seam sat unwired, so the second field is asserted
+    // separately. The *value* deliberately is not: what it resolves to depends
+    // on which providers the fixture registers, and the claim here is that the
+    // field reaches the terminal, not what the resolver decided.
+    let framed_once = snapshot(&transcript);
+    let row = framed_once
+        .lines()
+        .find(|line| line.contains("permissions: guarded"))
+        .expect("just asserted present");
+    assert!(
+        row.contains("effort: "),
+        "the status row must carry the effort field beside the permission one \
+         (REQ-560 status line + REQ-559 value); row: {row:?}"
+    );
 
     let framed = snapshot(&transcript);
     // …and it is BELOW the bottom rule, which is the placement BR-11 specifies.
