@@ -293,3 +293,135 @@ async fn adapter_seam_is_enforced() {
     assert!(capture.captured().is_empty(), "nothing may reach the wire");
     assert_eq!(sink.events().len(), 1, "the block still emitted its event");
 }
+
+// ---------------------------------------------------------------------------
+// REQ-560 AC-4 — permission levels are orthogonal to the privacy boundary
+// ---------------------------------------------------------------------------
+
+/// **`full` grants tool execution; it does not touch egress** (REQ-560 BR-3).
+///
+/// This is the criterion that keeps the two mechanisms orthogonal, and the spec
+/// is explicit that it is **not satisfiable by code inspection** — LESSON-432 is
+/// the precedent, where a guarantee's hole was invisible because the tests that
+/// would have caught it were the ones nobody wrote. So the check is the same
+/// shape as the AC-5 harness above: drive the real choke point and look at the
+/// bytes.
+///
+/// The construction is deliberately blunt. A session is put at
+/// [`PermissionLevel::Full`] — the level that stops asking about `shell`, the
+/// most permissive thing a user can type — and then the exact traffic the AC-5
+/// harness blocks is sent through the exact same `Egress`. If a level had leaked
+/// into an egress predicate, `full` is the value that would have opened it.
+///
+/// Note what is **not** mocked away: this is the production `Egress`, with
+/// production boundaries, and the level is genuinely set on a gate. The only
+/// stand-in is the transport, which is the point of the harness.
+#[tokio::test]
+async fn a_full_permission_level_still_blocks_boundary_content_and_still_reports_it() {
+    use teton_protocol::permissions::PermissionLevel;
+
+    // A session really at `full`, through the daemon's own gate rather than a
+    // stub — so this test is about the shipped classifier, not a paraphrase.
+    let gate = tetond::harness::PermissionGate::with_level(
+        SessionId::from("sess-at-full"),
+        PermissionLevel::Full,
+        Vec::new(),
+        Arc::new(tetond::broadcast::EventBus::new()),
+        Arc::new(tetond::harness::PendingPermissions::new()),
+    );
+    assert_eq!(
+        gate.level(),
+        Some(PermissionLevel::Full),
+        "this test is only meaningful with the session actually at full"
+    );
+    // The level really is permissive about tools — the non-vacuity control. If
+    // `full` did not allow `shell`, the assertions below would pass for the
+    // wrong reason.
+    assert_eq!(
+        gate.authorize("shell", None).await,
+        tetond::harness::PermissionDecision::Allowed,
+        "full must allow a shell without asking, or this test proves nothing"
+    );
+
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let egress = Egress::new(capture.clone(), local_only_boundaries(), sink.clone());
+    let ctx = EgressContext::new("anthropic").with_session("sess-at-full");
+
+    // A public turn still goes out — the positive control, so "zero leaks"
+    // cannot be satisfied by an egress that refuses everything.
+    let (req, prov) = assemble(
+        "https://api.anthropic.com/v1/messages",
+        &[ContextBlock::from_file("src/main.rs", "fn main() {}")],
+    );
+    assert!(
+        egress.send(req, &prov, &ctx).await.is_ok(),
+        "a public turn must still be allowed at full"
+    );
+
+    // A boundary read is still blocked, at the most permissive level there is.
+    let (req, prov) = assemble(
+        "https://api.anthropic.com/v1/messages",
+        &[ContextBlock::from_file("secrets/prod.env", SECRET_ENV)],
+    );
+    let blocked = egress.send(req, &prov, &ctx).await;
+    assert!(
+        matches!(
+            blocked,
+            Err(EgressError::PrivacyBlocked { ref path, .. }) if path == "secrets/prod.env"
+        ),
+        "full must not open the local-only boundary; got {blocked:?}"
+    );
+
+    // A derived summary is still blocked, so the level did not weaken
+    // provenance either.
+    let derived = ContextBlock::from_file("secrets/config.yaml", SECRET_YAML)
+        .derive("Summary: this file holds the production DB credentials.");
+    let (req, prov) = assemble(
+        "https://api.anthropic.com/v1/messages",
+        &[ContextBlock::synthetic("You are Teton Code."), derived],
+    );
+    assert!(
+        matches!(
+            egress.send(req, &prov, &ctx).await,
+            Err(EgressError::PrivacyBlocked { ref path, .. }) if path == "secrets/config.yaml"
+        ),
+        "full must not weaken provenance on a derived block"
+    );
+
+    // Zero boundary bytes in any captured payload, at `full`.
+    let captured = capture.captured();
+    assert_eq!(
+        captured.len(),
+        1,
+        "only the public turn may be forwarded, whatever the permission level"
+    );
+    for req in &captured {
+        for secret in [SECRET_ENV, SECRET_YAML, "hunter2"] {
+            assert!(
+                !contains_bytes(&req.body, secret),
+                "boundary content reached the wire at permission level `full`"
+            );
+        }
+    }
+    assert!(
+        contains_bytes(&captured[0].body, "fn main()"),
+        "the positive control never went out, so the zero-leak claim is vacuous"
+    );
+
+    // …and `privacy_block` is still emitted, once per blocked turn. A level that
+    // silenced the reporting would be as bad as one that opened the boundary.
+    let events = sink.events();
+    assert_eq!(
+        events.len(),
+        2,
+        "privacy_block must still fire at full; got {events:?}"
+    );
+    let paths: Vec<&str> = events.iter().map(|(_, b)| b.path.as_str()).collect();
+    assert!(paths.contains(&"secrets/prod.env"), "{paths:?}");
+    assert!(paths.contains(&"secrets/config.yaml"), "{paths:?}");
+    for (session_id, block) in &events {
+        assert_eq!(session_id.as_ref(), Some(&SessionId::from("sess-at-full")));
+        assert_eq!(block.action, PrivacyAction::ReroutedToLocal);
+    }
+}

@@ -16,6 +16,9 @@
 //! - [`methods`] — typed client→daemon requests and their result types.
 //! - [`events`] — the daemon→client event envelope and its payloads.
 //! - [`handshake`] — protocol-version negotiation.
+//! - [`permissions`] — the named permission levels a session can be in
+//!   (REQ-560). The level's *identity* only; the policy table it expands to is
+//!   daemon enforcement state and stays in `tetond`.
 //! - [`socket_path`] — the shared socket/lock path resolution both the daemon and
 //!   every client must agree on.
 //! - [`weights`] — the shared on-disk weights directory/filename convention (a
@@ -26,6 +29,7 @@ pub mod events;
 pub mod handshake;
 pub mod jsonrpc;
 pub mod methods;
+pub mod permissions;
 pub mod socket_path;
 pub mod weights;
 

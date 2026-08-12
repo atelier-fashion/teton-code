@@ -99,6 +99,31 @@ pub struct SessionState {
     /// indicator fed only from the idle path would keep animating "model
     /// starting" after a `Ready` that landed mid-turn.
     pub loading: crate::loading::LoadingIndicator,
+    /// This session's permission level, once the daemon has been asked
+    /// (REQ-560).
+    ///
+    /// `None` means "not known" — before the first read, or against a daemon too
+    /// old to serve `session/permissions` — and a level nobody knows renders no
+    /// status row rather than a guess. Guessing `guarded` here would be the
+    /// worst available answer: it would show a stricter posture than the session
+    /// might actually be in.
+    ///
+    /// The daemon is authoritative; this is a render cache, refreshed at session
+    /// start and by `/permissions` itself. Session-scoped like everything else
+    /// here — nothing is persisted (BR-6).
+    pub permission_level: Option<teton_protocol::permissions::PermissionLevel>,
+    /// The daemon's reasoning-effort view, for the status row (REQ-559 / REQ-560).
+    ///
+    /// A render cache like [`Self::permission_level`], and `None` for the same
+    /// two reasons: nobody has asked yet, or the daemon predates the setting. In
+    /// either case the status row shows the permission field alone rather than
+    /// inventing an effort value.
+    ///
+    /// The view itself is the daemon's, computed with the same `resolve_effort`
+    /// the router calls — this holds it rather than a derived string so
+    /// [`crate::status::effort_field`] can apply REQ-559 BR-6's
+    /// reaches-no-model rule to real data.
+    pub effort: Option<teton_protocol::methods::EffortView>,
     /// This session's web-lookup capability, as the event stream reports it
     /// (REQ-563 BR-7/BR-13).
     ///

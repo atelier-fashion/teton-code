@@ -34,6 +34,7 @@ use crate::mcp::{McpServerConfig, McpTransport};
 use crate::phase::Phase;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use teton_protocol::permissions::PermissionLevel;
 
 /// User-authored inputs for the local model tier (the `[local_model]` table).
 ///
@@ -442,6 +443,55 @@ impl WebConfig {
     }
 }
 
+/// Tool permissions (the `[permissions]` table, REQ-560).
+///
+/// One knob, and deliberately only one: levels are *presets*, and a user who
+/// wants finer control edits the per-tool table directly rather than growing a
+/// second vocabulary here.
+///
+/// ## This is a starting value, not a setting
+///
+/// The permission level is **session-scoped**. This field is the value a new
+/// session is seeded with; `/permissions <level>` changes the running session
+/// and writes nothing back (BR-6). The asymmetry with REQ-559's persisted
+/// reasoning effort is the point: an effort level that survives a restart costs
+/// money predictably, while a `full` that survives a restart removes a guardrail
+/// invisibly, in a session the user does not remember configuring.
+///
+/// ## It grants no egress
+///
+/// No level, including `full`, affects the `local-only` boundary or the
+/// session-taint pin (BR-3). A level governs which tools may run; the boundary
+/// governs what leaves the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PermissionsConfig {
+    /// The level a new session starts at. Defaults to `guarded`.
+    ///
+    /// Serialized unconditionally within the table (like
+    /// [`LifetimeConfig::shutdown`]): a config that names `[permissions]` at all
+    /// states its posture rather than leaving a reader to infer it from an
+    /// absent key.
+    ///
+    /// An unrecognised spelling is a **deserialization** failure, not a silent
+    /// fallback to `guarded` — the daemon refuses to start and the error names
+    /// the four valid levels. A posture nobody chose is the shape of a guard
+    /// that has quietly stopped guarding, and it would be worst in exactly the
+    /// case that matters: a typo in `full` leaving a user who asked for one
+    /// thing running as another.
+    #[serde(default)]
+    pub default_level: PermissionLevel,
+}
+
+impl PermissionsConfig {
+    /// Whether every field still holds its default, used to keep the
+    /// `[permissions]` table out of a config that never set one — the same
+    /// treatment [`LifetimeConfig::is_unset`] gives `[lifetime]`.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Top-level configuration document.
 ///
 /// Field order matters for TOML serialization: the scalar `pinned_local_model`
@@ -503,6 +553,12 @@ pub struct Config {
     /// array-of-table fields, for the TOML-ordering reason above.
     #[serde(default, skip_serializing_if = "LifetimeConfig::is_unset")]
     pub lifetime: LifetimeConfig,
+    /// Tool permissions (`[permissions]`): the level a **new** session starts at
+    /// (REQ-560). Absent means `guarded` — reads run freely, edits and shell
+    /// commands ask. Declared here among the tables, before the array-of-table
+    /// fields, for the TOML-ordering reason above.
+    #[serde(default, skip_serializing_if = "PermissionsConfig::is_unset")]
+    pub permissions: PermissionsConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -2337,6 +2393,9 @@ effort_ladder = []
             // REQ-565: the shipped default (exit with the last client); the
             // policy modes have their own tests.
             lifetime: LifetimeConfig::default(),
+            // REQ-560: likewise the shipped default (guarded); the levels have
+            // their own tests.
+            permissions: PermissionsConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),
@@ -4794,6 +4853,74 @@ cache_ttl_secs = 60
             0,
             "an explicit zero came back as the default: {written}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // [permissions] — REQ-560
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_absent_permissions_table_means_a_new_session_starts_guarded() {
+        let cfg = Config::load("").expect("an empty config must load");
+        assert_eq!(cfg.permissions.default_level, PermissionLevel::Guarded);
+        assert!(cfg.permissions.is_unset());
+    }
+
+    #[test]
+    fn every_level_is_nameable_from_config() {
+        // Driven off `ALL` so a fifth level cannot ship unreachable from config
+        // (REQ-560 AC-17).
+        for level in PermissionLevel::ALL {
+            let toml = format!("[permissions]\ndefault_level = \"{}\"\n", level.name());
+            let cfg = Config::load(&toml)
+                .unwrap_or_else(|err| panic!("`{}` must load: {err}", level.name()));
+            assert_eq!(cfg.permissions.default_level, *level);
+            cfg.validate()
+                .unwrap_or_else(|err| panic!("`{}` must validate: {err}", level.name()));
+        }
+    }
+
+    /// REQ-560: an unrecognised level is refused at load, not silently defaulted.
+    ///
+    /// The refusal is a **deserialization** failure rather than a
+    /// [`Config::validate`] error, which is the same treatment every other
+    /// enum-valued key gets (`[web] tier`, `[lifetime] shutdown`) — it fails one
+    /// step earlier, and serde's message already enumerates the valid spellings.
+    /// What matters for the requirement is that the daemon refuses to start:
+    /// quietly falling back to `guarded` would leave a user who typed `full`
+    /// running as something else, and quietly falling back to `full` would be
+    /// worse.
+    #[test]
+    fn an_unrecognised_level_is_refused_rather_than_defaulted() {
+        let err = Config::load("[permissions]\ndefault_level = \"unrestricted\"\n")
+            .expect_err("an unknown level must not load");
+        let rendered = err.to_string();
+        for level in PermissionLevel::ALL {
+            assert!(
+                rendered.contains(level.name()),
+                "the refusal should name `{}`: {rendered}",
+                level.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_permissions_table_holding_only_the_default_is_not_serialised() {
+        let cfg = Config::load("[permissions]\ndefault_level = \"guarded\"\n")
+            .expect("guarded must load");
+        let rendered = toml::to_string(&cfg).expect("config serialises");
+        assert!(
+            !rendered.contains("[permissions]"),
+            "an unset table should stay out of the document: {rendered}"
+        );
+
+        // A non-default level round-trips through the document.
+        let cfg =
+            Config::load("[permissions]\ndefault_level = \"plan\"\n").expect("plan must load");
+        let rendered = toml::to_string(&cfg).expect("config serialises");
+        assert!(rendered.contains("[permissions]"), "{rendered}");
+        let back = Config::load(&rendered).expect("the rendered document reloads");
+        assert_eq!(back.permissions.default_level, PermissionLevel::Plan);
     }
 
     // -----------------------------------------------------------------------

@@ -49,8 +49,8 @@ pub use category::{
 };
 pub use config::{
     Config, ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig,
-    MigratedPhase, PrivacyConfig, RoutingMigration, ShutdownPolicyKind, SkippedRule, WebConfig,
-    WebTier,
+    MigratedPhase, PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind,
+    SkippedRule, WebConfig, WebTier,
 };
 // REQ-559: the effort vocabulary is re-exported at the crate root so
 // `teton_core::EffortLevel` is the stable path for the daemon, the adapters and

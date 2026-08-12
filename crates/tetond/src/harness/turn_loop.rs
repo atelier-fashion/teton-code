@@ -683,14 +683,21 @@ pub async fn run_session_turn_with_source(
                 match decision {
                     PermissionDecision::Denied => {
                         events.tool_finished(&call.id, false);
-                        ctx.push_tool_result(
-                            name.clone(),
-                            None,
+                        // Who refused this matters to what the model does next.
+                        // A level refusal was never a question — nobody was
+                        // asked — so telling the model "the user declined" would
+                        // be telling it something false about a decision it is
+                        // meant to route around. `denial_note` answers `Some`
+                        // only when the level settled it, and derives the
+                        // sentence from the same `PermissionLevel` the client
+                        // renders (REQ-560 BR-15).
+                        let reason = gate.denial_note(&name).unwrap_or_else(|| {
                             format!(
                                 "Permission denied: the user declined `{name}`. Do not \
                                  retry this tool; take a different approach or finish."
-                            ),
-                        );
+                            )
+                        });
+                        ctx.push_tool_result(name.clone(), None, reason);
                         continue;
                     }
                     PermissionDecision::Allowed => {

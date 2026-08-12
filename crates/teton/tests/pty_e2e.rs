@@ -404,3 +404,152 @@ fn closed_port() -> u16 {
     drop(listener);
     port
 }
+
+/// **REQ-560 AC-10 / BR-11: the status row renders below the bottom rule, and a
+/// redraw strands no row in either direction.**
+///
+/// This is the criterion BR-11 exists for and it cannot be reached on a pipe:
+/// the frame renders only at a TTY (BR-9), so the arithmetic that places the row
+/// — and the arithmetic that takes it back — is unobservable everywhere else.
+/// The unit tests in `prompt.rs` pin the *bytes* `draw` and `read_line` would
+/// write; this pins what a real terminal does with them.
+///
+/// Three claims, in the order they can be established:
+///
+/// 1. the row is drawn, and drawn **below** the bottom rule;
+/// 2. a typed line is accepted intact with the frame uncorrupted — i.e. the
+///    cursor really did land in the input row and not on the status row;
+/// 3. after a redraw (an event arriving while the frame is open, which is what
+///    REQ-556's indicator does) neither the row above nor the row below is left
+///    stranded — the transcript ends with exactly one of each.
+#[test]
+fn the_status_row_renders_below_the_frame_and_survives_a_redraw() {
+    let Some(daemon_path) = daemon_or_skip() else {
+        return;
+    };
+    // A scripted tier so a typed prompt actually produces a turn — which is what
+    // forces the frame down and redraws it, the redraw this test is about. Every
+    // tier is bound to the local (scripted) provider, the same binding the web
+    // test above makes for the same REQ-558 reason: otherwise the turn resolves
+    // to the unreachable remote provider and fails before it can redraw
+    // anything.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon = TestDaemon::spawn_with(&daemon_path, &config, &["a scripted reply."]);
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    // (1) The row is there, at a real terminal, naming the session's level.
+    assert!(
+        wait_for(&transcript, "permissions: guarded"),
+        "the status row never rendered at a tty (AC-10); transcript:\n{}",
+        snapshot(&transcript)
+    );
+    // …and it carries **both** values it is specified to carry, now that
+    // REQ-559 has landed. The permission half alone would satisfy the assertion
+    // above while the effort seam sat unwired, so the second field is asserted
+    // separately. The *value* deliberately is not: what it resolves to depends
+    // on which providers the fixture registers, and the claim here is that the
+    // field reaches the terminal, not what the resolver decided.
+    let framed_once = snapshot(&transcript);
+    let row = framed_once
+        .lines()
+        .find(|line| line.contains("permissions: guarded"))
+        .expect("just asserted present");
+    assert!(
+        row.contains("effort: "),
+        "the status row must carry the effort field beside the permission one \
+         (REQ-560 status line + REQ-559 value); row: {row:?}"
+    );
+
+    let framed = snapshot(&transcript);
+    // …and it is BELOW the bottom rule, which is the placement BR-11 specifies.
+    // The rule is a run of box-drawing characters; the last one before the
+    // status row is the bottom rule, so the row must come after it.
+    let row_at = framed
+        .find("permissions: guarded")
+        .expect("just asserted present");
+    let rule_before = framed[..row_at]
+        .rfind('\u{2500}')
+        .expect("the frame draws a rule above the status row");
+    assert!(
+        rule_before < row_at,
+        "the status row must sit below the bottom rule; transcript:\n{framed}"
+    );
+    // The cursor-up escape that puts the caret back in the input row must be the
+    // four-row form. `\x1b[2A` would mean the row was never counted, and the
+    // caret would land on the bottom rule.
+    assert!(
+        framed.contains("\x1b[3A"),
+        "with a status row the caret must rise three rows, not two; \
+         transcript:\n{framed}"
+    );
+
+    // (2) A typed line is accepted intact with the frame uncorrupted.
+    writer
+        .write_all(b"hello from the entry row\r")
+        .expect("type the prompt");
+    writer.flush().ok();
+    assert!(
+        wait_for(&transcript, "a scripted reply."),
+        "the typed line never produced a turn, so the caret was not in the input \
+         row; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    // (3) The frame was torn down and redrawn around that turn. Neither
+    // direction may be left stranded: the transcript's tail must hold exactly
+    // one status row, below exactly one intact frame.
+    assert!(
+        wait_for(&transcript, "permissions: guarded"),
+        "the status row did not come back after the redraw; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    let after = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    // A stranded row shows up as a status row with no frame above it in the
+    // tail — the shape a redraw that erased three rows but drew four would
+    // leave. Counting the whole transcript would be meaningless (every redraw
+    // legitimately writes another), so the assertion is about the tail: the last
+    // status row must still have a rule above it.
+    let last_row = after
+        .rfind("permissions: guarded")
+        .expect("just asserted present");
+    assert!(
+        after[..last_row].contains('\u{2500}'),
+        "after a redraw the status row must still sit under a frame, not alone; \
+         transcript:\n{after}"
+    );
+    // And the redraw really did happen — otherwise (3) is asserting nothing.
+    assert!(
+        after.matches("permissions: guarded").count() > 1,
+        "the frame was never redrawn, so this leg proves nothing; transcript:\n{after}"
+    );
+}

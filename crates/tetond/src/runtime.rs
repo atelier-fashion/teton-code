@@ -115,9 +115,11 @@ use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult, ModelListResult,
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
-    SessionClearParams, SessionClearResult, TierRouteView, WebOverrideParams, WebOverrideResult,
-    WebRefreshOutcome, WebRefreshParams, WebRefreshResult, WebTotalsView,
+    SessionClearParams, SessionClearResult, SessionPermissionsParams, SessionPermissionsResult,
+    TierRouteView, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
+    WebRefreshResult, WebTotalsView,
 };
+use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
     BindingSource, ConfigurableCategory as ProtoConfigurableCategory, Phase as ProtoPhase,
     PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId, SessionMode,
@@ -147,9 +149,9 @@ use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLoo
 use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
-    PendingPermissions, PermissionConfig, PermissionGate, SessionEvents, ToolContext, ToolDuties,
-    ToolRegistry, WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY,
-    TITLE_DUTY, TRIAGE_DUTY,
+    PendingPermissions, PermissionGate, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
+    WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY, TITLE_DUTY,
+    TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -1227,8 +1229,14 @@ pub struct DaemonRuntime {
     /// Daemon-wide registry of in-flight permission prompts (the
     /// `permission/respond` seam).
     pending: Arc<PendingPermissions>,
-    /// Per-tool permission policy for every session.
-    permission_config: PermissionConfig,
+    /// The permission level a **new** session starts at (REQ-560).
+    ///
+    /// The level itself is session-scoped and lives on each session's
+    /// [`PermissionGate`]; this is only the value a fresh gate is seeded with,
+    /// read from `[permissions] default_level`. Nothing writes back to it — a
+    /// `/permissions full` changes one session and is gone when that session is
+    /// (BR-6).
+    default_permission_level: PermissionLevel,
     /// Registered MCP servers (ADR-003), or `None` when none are configured.
     mcp_servers: Vec<McpServerConfig>,
     /// The startup hardware probe's *facts*, or `None` for a runtime with no
@@ -1343,7 +1351,7 @@ impl DaemonRuntime {
             scripted_engine: false,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
-            permission_config: PermissionConfig::coding_defaults(),
+            default_permission_level: PermissionLevel::default(),
             mcp_servers: Vec::new(),
             probe: None,
             turn_counter: AtomicU64::new(0),
@@ -1475,6 +1483,11 @@ impl DaemonRuntime {
         // --- MCP servers (ADR-003 / AC-9): the main TOML config is the source of
         // truth; TETON_MCP_CONFIG is a test-only override (see `load_mcp_servers`).
         let mcp_servers = load_mcp_servers(&config);
+        // REQ-560: read before `config` is moved into the mutex. The level is
+        // session-scoped from here on — nothing writes back — so a config edit
+        // changes what the *next* daemon start seeds sessions with, never a
+        // running one.
+        let default_permission_level = config.permissions.default_level;
 
         Ok(Self {
             config: Mutex::new(config),
@@ -1488,7 +1501,7 @@ impl DaemonRuntime {
             scripted_engine,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
-            permission_config: PermissionConfig::coding_defaults(),
+            default_permission_level,
             mcp_servers,
             probe: Some(probe),
             turn_counter: AtomicU64::new(0),
@@ -2715,15 +2728,21 @@ impl DaemonRuntime {
             .lock()
             .expect("session gate mutex poisoned");
         Arc::clone(gates.entry(session_id.clone()).or_insert_with(|| {
-            let mut permissions = self.permission_config.clone();
-            // REQ-563 BR-4: `[web] permission_allow` is what an
-            // `enable_permanent` answer becomes on disk, and this is the one
-            // place it becomes a policy again — one listed tier, one key.
-            permissions.apply_web_permission(&config.web.permission_allow);
             Arc::new(
-                PermissionGate::new(
+                // REQ-560: the gate is created at a *level*, not at a built
+                // table, because the level is what the user can change
+                // mid-session — a table snapshotted here would go stale the
+                // instant they typed `/permissions`. The level starts at the
+                // configured default and is never written back (BR-6).
+                //
+                // REQ-563 BR-4: `[web] permission_allow` is what an
+                // `enable_permanent` answer becomes on disk, and the gate folds
+                // it onto every table the level produces — one listed tier, one
+                // key, and (since REQ-560) only ever relaxing an `ask`.
+                PermissionGate::with_level(
                     session_id.clone(),
-                    permissions,
+                    self.default_permission_level,
+                    config.web.permission_allow.clone(),
                     events.clone(),
                     self.pending.clone(),
                 )
@@ -3473,6 +3492,65 @@ impl DaemonRuntime {
     /// `web_overrides` row beside the `web_lookups` rows it re-enables. Written
     /// only on the transition, for the same reason the event is: a re-override
     /// removed nothing.
+    /// Read or set a session's permission level (REQ-560 ADR-D).
+    ///
+    /// `params.level` is `None` for a read and `Some(l)` for a set; either way
+    /// the answer is the level now in force, so a client's rendered status row
+    /// cannot drift from the daemon's actual posture.
+    ///
+    /// ## It writes nothing (BR-6)
+    ///
+    /// The level lives on the session's [`PermissionGate`] and nowhere else.
+    /// There is deliberately no path from here to `self.config` or to the config
+    /// file: a `full` that survived a restart would remove a guardrail invisibly,
+    /// in a session the user does not remember configuring. Every new session is
+    /// seeded from `[permissions] default_level` again.
+    ///
+    /// ## A session that has not run a turn yet
+    ///
+    /// The gate is created lazily by [`Self::permission_gate_for`], on the first
+    /// thing that needs one. Setting a level before then has to create it, or the
+    /// set would be silently discarded and the *next* turn would build a gate at
+    /// the configured default — the user's typed instruction quietly undone. So
+    /// this resolves the gate the same way a turn does.
+    /// The level a **new** session is seeded with — `[permissions] default_level`
+    /// as it stood when the daemon started (REQ-560).
+    ///
+    /// Read-only on purpose: nothing in the daemon writes it back, which is what
+    /// makes BR-6's "the level persists nothing" checkable rather than merely
+    /// stated.
+    #[must_use]
+    pub fn default_permission_level(&self) -> PermissionLevel {
+        self.default_permission_level
+    }
+
+    /// ## `events` is the daemon's real bus, and that is load-bearing
+    ///
+    /// [`Self::permission_gate_for`] *creates* the gate when none exists, and
+    /// the gate it creates publishes its prompts to whichever bus it was handed
+    /// — for the life of the session, because the gate is cached. Handing this a
+    /// convenient throwaway bus would bind the session's gate to something
+    /// nobody subscribes to, and every later permission prompt in that session
+    /// would be published into a void: the tool would sit `[running]` forever
+    /// and the user would never be asked. Take the daemon's own bus, exactly as
+    /// [`Self::web_override`] does.
+    pub fn session_permissions(
+        self: &Arc<Self>,
+        params: &SessionPermissionsParams,
+        events: &Arc<EventBus>,
+    ) -> SessionPermissionsResult {
+        let config = self.config.lock().expect("config mutex poisoned").clone();
+        let gate = self.permission_gate_for(&params.session_id, events, &config);
+        let changed = params.level.is_some_and(|level| gate.set_level(level));
+        SessionPermissionsResult {
+            // Read back from the gate rather than echoing the request: the gate
+            // is the authority, and echoing would report a success the gate
+            // might not have performed.
+            level: gate.level().unwrap_or_default(),
+            changed,
+        }
+    }
+
     pub fn web_override(
         &self,
         params: &WebOverrideParams,
@@ -8864,6 +8942,7 @@ provider_id = "on-device"
             privacy: teton_core::PrivacyConfig::default(),
             web: teton_core::WebConfig::default(),
             lifetime: teton_core::LifetimeConfig::default(),
+            permissions: teton_core::PermissionsConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -9179,6 +9258,7 @@ provider_id = "on-device"
             privacy: teton_core::PrivacyConfig::default(),
             web: teton_core::WebConfig::default(),
             lifetime: teton_core::LifetimeConfig::default(),
+            permissions: teton_core::PermissionsConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),
@@ -12812,6 +12892,7 @@ provider_id = "on-device"
         use crate::egress::{
             Authorship, LookupContext, LookupDetail, LookupRecord, LookupRequest, TaintView,
         };
+        use crate::harness::PermissionConfig;
         use crate::harness::{PermissionDecision, PermissionPolicy};
         use teton_core::config::WebTier;
         use teton_protocol::events::{WebLookupKind, WebLookupOutcome, WebTier as WireWebTier};
@@ -14241,6 +14322,134 @@ provider_id = "on-device"
             }
         }
 
+        /// **REQ-560 AC-4, the taint half: `full` does not unpin a tainted session.**
+        ///
+        /// The permission level and the session-taint pin are orthogonal (BR-3). A
+        /// session whose context carries unknown-provenance results is pinned to the
+        /// local tier for every later turn, and that holds at every level — including
+        /// the one that stops asking about `shell`, which is also the one most likely
+        /// to be read as "turn the safety off".
+        ///
+        /// The egress half of AC-4 lives in `tests/egress_capture.rs`, where the
+        /// bytes are observable. This is the routing half: the pin decides *where a
+        /// turn runs*, which is a different mechanism in a different file, and a
+        /// source scan over `egress/` would never have looked at it.
+        #[tokio::test]
+        async fn a_tainted_session_stays_pinned_to_the_local_tier_at_full() {
+            let runtime = Arc::new(DaemonRuntime::minimal());
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("sess-tainted-at-full");
+
+            // Really at `full`, through the shipped RPC rather than a stub.
+            let set = runtime.session_permissions(
+                &SessionPermissionsParams {
+                    session_id: session.clone(),
+                    level: Some(PermissionLevel::Full),
+                },
+                &events,
+            );
+            assert_eq!(set.level, PermissionLevel::Full);
+            assert!(set.changed);
+
+            // A `shell` result of unknown provenance taints the session.
+            runtime.session_taint.mark(&session);
+            assert!(runtime.session_taint.is_tainted(&session));
+
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let router = build_router(&config, true, &BTreeMap::new());
+            let route = runtime
+                .dispatch_route(&router, &session, SessionMode::Freeform, None, "anything")
+                .await;
+
+            assert_eq!(
+                route.reason,
+                taint_pin_reason("this turn"),
+                "a tainted session must still be pinned to the local tier at `full` — \
+             the permission level governs which tools may run, never what leaves \
+             the machine (REQ-560 BR-3)"
+            );
+
+            // Non-vacuity: an untainted session at the same level is NOT pinned, so
+            // the assertion above is about the taint and not about `full` pinning
+            // everything.
+            let clean = SessionId::from("sess-clean-at-full");
+            let _ = runtime.session_permissions(
+                &SessionPermissionsParams {
+                    session_id: clean.clone(),
+                    level: Some(PermissionLevel::Full),
+                },
+                &events,
+            );
+            let clean_route = runtime
+                .dispatch_route(&router, &clean, SessionMode::Freeform, None, "anything")
+                .await;
+            assert_ne!(
+                clean_route.reason,
+                taint_pin_reason("this turn"),
+                "an untainted session must not be pinned, or this test proves nothing"
+            );
+        }
+
+        /// **REQ-560 regression: the gate `session/permissions` creates must publish
+        /// to the daemon's own bus.**
+        ///
+        /// [`DaemonRuntime::permission_gate_for`] creates the session's gate when
+        /// none exists and then **caches** it, so whichever `EventBus` the first
+        /// caller hands it is the bus that session's prompts go to for the rest of
+        /// its life. `session/permissions` can easily be that first caller — the
+        /// CLI reads the level at session start, before any turn has run — and an
+        /// early implementation of it passed a freshly-constructed bus for
+        /// convenience. Every later permission prompt in that session was then
+        /// published to a bus with no subscribers: the tool sat `[running]`, the
+        /// user was never asked, and nothing errored.
+        ///
+        /// Caught by `pty_e2e`, which is the only place the whole chain is real.
+        /// This test is the cheap twin that fails in milliseconds instead of at a
+        /// twenty-second timeout.
+        #[tokio::test]
+        async fn a_gate_created_by_reading_the_level_still_reaches_the_daemons_subscribers() {
+            let runtime = Arc::new(DaemonRuntime::minimal());
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("sess-under-test");
+
+            // The read creates the gate — this is the ordering the bug needed.
+            let read = runtime.session_permissions(
+                &SessionPermissionsParams {
+                    session_id: session.clone(),
+                    level: None,
+                },
+                &events,
+            );
+            assert_eq!(read.level, PermissionLevel::Guarded);
+            assert!(!read.changed);
+
+            // A later turn resolves the *same* cached gate…
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let gate = runtime.permission_gate_for(&session, &events, &config);
+
+            // …and its prompt must reach a subscriber of the bus we passed in.
+            let mut sub = events.subscribe(16);
+            let asking = tokio::spawn(async move { gate.authorize("shell", None).await });
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+                .await
+                .expect("the prompt must reach the daemon's own bus, not a throwaway one")
+                .expect("a prompt was published");
+            let request_id = match env.event {
+                Event::PermissionRequest(pr) => pr.request_id,
+                other => panic!("expected permission_request, got {other:?}"),
+            };
+            assert!(runtime.pending.resolve(
+                &request_id,
+                teton_protocol::methods::PermissionOutcome::Selected {
+                    option_id: "allow_once".to_owned()
+                }
+            ));
+            assert_eq!(
+                asking.await.expect("the authorize task joins"),
+                crate::harness::PermissionDecision::Allowed
+            );
+        }
+
         /// **BR-1 / AC-1's structural half, through the real registry builder.**
         ///
         /// `off` is not a tool behind a flag: the registry does not hold one, so
@@ -14257,7 +14466,7 @@ provider_id = "on-device"
                 let session = SessionId::from("s");
                 let gate = Arc::new(PermissionGate::new(
                     session.clone(),
-                    runtime.permission_config.clone(),
+                    crate::harness::table_for(runtime.default_permission_level),
                     Arc::clone(&events),
                     Arc::clone(&runtime.pending),
                 ));

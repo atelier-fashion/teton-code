@@ -1,0 +1,117 @@
+{
+  "req": "REQ-560",
+  "branch": "feat/REQ-560-permission-levels-and-status-line",
+  "startedAt": "2026-08-11T00:00:00Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-08-11T00:00:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "APPROVED"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "7 ADRs, 9 tasks"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "APPROVED \u2014 all 17 ACs covered, DAG linear/acyclic"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "9/9 tasks complete"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (inline reflect + review)",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "1 Major fixed (LESSON-489 scanner tolerance); 2121 tests green"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "PR #102 flipped draft -> ready"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "6/6 checks green incl. both platform legs (AC-13 observed); mergeStateStatus CLEAN"
+    },
+    {
+      "phase": 7,
+      "name": "Rebase onto REQ-559 + integration",
+      "completedAt": "2026-08-11T00:00:00Z",
+      "result": "rebased onto 92d56e2; 5 conflicts resolved (3 unpredicted: methods.rs, main.rs imports, and a fmt-pass re-conflict); effort seam wired to EffortView; AC-7/AC-9/AC-11 deferred legs now real"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-560",
+      "branch": "feat/REQ-560-permission-levels-and-status-line",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/102",
+      "prNumber": 102,
+      "prCreatedAt": "2026-08-11T00:00:00Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-001",
+      "TASK-002",
+      "TASK-003",
+      "TASK-004",
+      "TASK-005",
+      "TASK-006",
+      "TASK-007",
+      "TASK-008",
+      "TASK-009"
+    ],
+    "failedTasks": []
+  },
+  "blockers": [],
+  "notes": [
+    "Subagent mode (/sprint pipeline-runner). ORCHESTRATOR MERGE OVERRIDE: stop after Phase 7 and report pr-ready. Do NOT self-merge \u2014 overlapping footprint with REQ-559 (COMMANDS table, CLI status/session surface). Orchestrator sequences REQ-559 first, then REQ-560, each behind a fresh trial-merge gate.",
+    "Expect to rebase onto a main that already carries REQ-559. Overlap points: crates/teton/src/slash.rs COMMANDS table (this REQ adds the `permissions` row and an Args::Optional variant; REQ-559 adds `effort`), and crates/teton/src/status.rs status_line's `effort` parameter, which is the seam REQ-559 fills.",
+    "AC-14 mutation check performed and recorded in the PR body; all three legs confirmed red then reverted.",
+    "AC-13: CI matrix [ubuntu-latest, macos-latest] both run cargo test --workspace (includes cli_e2e + pty_e2e). Linux pty leg first observed on this PR's CI.",
+    "Phase 8 NOT run by this pipeline-runner, per orchestrator merge override. Terminal claim: pr-ready. Orchestrator owns the merge after REQ-559.",
+    "Likely rebase conflicts after REQ-559 lands, all mechanical: (1) crates/teton/src/slash.rs `enum Args` \u2014 REQ-559 BR-9's bare `/effort` read needs an optional-argument variant too, and this REQ added `Args::Optional`; keep one. (2) the COMMANDS array (two new rows). (3) the `promised` list in `the_table_carries_every_command_this_req_promises`. (4) the `Args::Optional` match arm in `every_table_row_is_reachable_from_a_typed_command_line`. (5) SessionState in session_ui.rs (two new fields). (6) crates/teton/src/status.rs `status_line`'s `effort: Option<&str>` parameter is REQ-559's seam \u2014 it fills it, nothing here changes.",
+    "Rebased onto origin/main 92d56e2 (REQ-559 landed). Conflicts resolved: slash.rs (kept REQ-559's Args::Optional, dropped the duplicate; both COMMANDS rows declared; my inline both-ways block removed as REQ-559's dedicated test already covers every Optional row, and /permissions asserted in it), architecture.md (both REQs' pattern entries kept), plus three the gate did not predict \u2014 teton-protocol/methods.rs and teton/main.rs import unions, and a second round of the same three files because the docs commit carried a cargo fmt pass.",
+    "Integration: status::effort_field derives the row's effort value from ConfigSnapshot.effort (EffortView, in teton_protocol::methods \u2014 NOT ::effort, which holds EffortLevel). BR-6 not-applicable rendering keys on every provider's ResolvedEffort omitting (ShapeNone is the local-tier variant)."
+  ]
+}

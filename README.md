@@ -63,12 +63,60 @@ prompts:
 | `/model set <name>` | Change the local model (typed input only; asks before an above-RAM-floor pick) |
 | `/clear` | Drop this session's retained conversation; the next prompt starts fresh |
 | `/verbose` | Toggle routing and turn-end notices for this session |
+| `/effort [level]` | Show, or change, the global reasoning effort |
+| `/permissions [level]` | Show, or change, what this session may run without asking |
 | `/web allow` | Lift this session's web taint restriction (grants no new tier) |
 | `/web refresh <url>` | Drop a URL's cached copy so the next lookup re-fetches |
 | `/quit` (or `/exit`) | End the session (same as Ctrl-D) |
 
 To send a prompt that genuinely starts with a slash — a pasted path, say —
 double it: `//usr/local/bin/x — why?` asks the model about `/usr/local/bin/x`.
+
+### Permission levels
+
+How much the agent asks before it acts is one named setting. At a terminal it
+shows in a status row under the entry frame, beside the reasoning effort — the
+two session-wide settings that silently change what every later turn does and
+costs. Both also print on demand (`/permissions`, `/effort`), which is what
+makes them readable over a pipe, where the row is not drawn.
+
+| Level | What runs without asking |
+|---|---|
+| `guarded` | Reads. Edits and shell commands ask first. **The default.** |
+| `edits` | Reads and edits. Shell commands still ask. |
+| `plan` | Nothing that changes anything — every mutating tool is refused, so you get a plan rather than a prompt for each step. |
+| `full` | Everything. |
+
+```sh
+/permissions          # what am I in?
+/permissions edits    # stop asking about edits; keep asking about shell
+```
+
+A level lasts for **one session**. It is never written to disk, so a `full` you
+set today cannot outlive the window you set it in — every new session starts at
+`default_permission_level`, which is `guarded` unless your config says
+otherwise:
+
+```toml
+[permissions]
+default_level = "edits"
+```
+
+Two things worth being precise about, because both are easy to assume wrongly:
+
+- **No level affects privacy.** `full` grants tool *execution*. It does not
+  touch the `local-only` boundary, and it does not unpin a session that has read
+  unknown-provenance content — such a session stays on the local tier at every
+  level. Which tools may run and what may leave the machine are separate
+  questions with separate answers.
+- **A level outranks a remembered answer.** "Allow for this session" is an
+  answer to a question the level decides whether to ask, so switching to `plan`
+  refuses a tool you allowed earlier — and switching back restores it, because
+  the answer was never discarded.
+
+Tools a level has never heard of — anything an MCP server supplies — follow the
+level's default rather than a name list: they ask at `guarded` and `edits`, are
+refused at `plan`, and run at `full`.
 
 ### Upgrading
 

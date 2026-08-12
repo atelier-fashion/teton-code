@@ -135,6 +135,27 @@
   status is sniffing, and it outlives the condition that produced it. The
   condition that makes it a degradation rather than a hidden downgrade is that
   the surface reports it (REQ-559 ADR-F).
+- **A named preset classifies the open set by its default, never by a list** —
+  when a setting names a posture over an existing per-item table, the items it
+  enumerates are only the *closed, first-party* ones; everything else — every
+  MCP tool, every tool added tomorrow — falls to the preset's default policy,
+  which is the preset's answer to "something I do not recognise". Enumerating
+  the mutating side is impossible (those names are server-supplied) and
+  enumerating it badly fails open. One function turns the name into the table,
+  and the legacy constructors delegate to it rather than holding a second copy
+  (REQ-560 ADR-A/ADR-B, LESSON-456).
+- **A remembered answer never outranks the rule that decides whether to ask** —
+  a session grant answers a question; if the current policy would not have asked
+  it, the grant is not consulted. Evaluating the policy first is what makes a
+  tightened setting take effect immediately and a loosened one restore the
+  earlier answer, and it keeps a stale grant from surviving a posture the user
+  has since changed (REQ-560 BR-5).
+- **A gated surface splits into pure content and gated bytes** — when a feature
+  renders only behind a TTY (or any other gate CI does not cross), its *content*
+  is a pure function of state, unit-tested with the gate out of the way, and only
+  the bytes that reach the terminal stay gated. Otherwise the gate that hides the
+  feature from users hides it from the test suite too, and the feature ships
+  unverified (REQ-556, REQ-560 BR-8, LESSON-481).
 - **Adapter degradation** — providers with weak tool-calling get a reduced
   harness profile (smaller tool set, shorter loops, mandatory verification)
   rather than the full loop (BR-6).

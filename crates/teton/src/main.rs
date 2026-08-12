@@ -21,8 +21,9 @@ use teton_protocol::methods::{
     CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSnapshot, ConfigUpdate,
     ContentClass, CostQueryParams, CostQueryResult, CostReportView, ModelListParams,
     ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig,
-    ProviderConfig, SessionCreateParams, TierBindingConfig,
+    ProviderConfig, SessionCreateParams, SessionPermissionsParams, TierBindingConfig,
 };
+use teton_protocol::SessionId;
 use teton_protocol::{
     BindingSource, Category, ConfigurableCategory, PrivacyMode, ProviderId, ProviderKind,
     SessionMode, Tier, TierBindingSource,
@@ -41,6 +42,7 @@ mod render;
 mod service;
 mod session_ui;
 mod slash;
+mod status;
 mod uninstall;
 
 use client::{Connection, UiContext};
@@ -416,6 +418,7 @@ fn next_interactive_line(
     // immediately above the frame's top rule (ADR-556-4). `status_rows` is how
     // many rows that added, which is what `erase` needs to take back.
     let mut status_rows = paint_status(ctx, *tick);
+    entry.set_status(entry_status(ctx));
     entry.draw(entry_prompt);
     loop {
         if prompt::stdin_ready(FRAME_INTERVAL) {
@@ -430,6 +433,10 @@ fn next_interactive_line(
         let drained = conn.drain_events(ctx, || entry.erase(rows))?;
         if drained.rendered > 0 {
             status_rows = paint_status(ctx, *tick);
+            // Recomposed on every redraw rather than cached: the level can have
+            // changed since the last draw, and a stale row about permissions is
+            // worse than none.
+            entry.set_status(entry_status(ctx));
             entry.draw(entry_prompt);
             continue;
         }
@@ -457,6 +464,62 @@ fn next_interactive_line(
                 status_rows = usize::from(ctx.state.web.is_engaged()) + 1;
             }
         }
+    }
+}
+
+/// The status row's content for the next frame draw, or `None` for no row
+/// (REQ-560).
+///
+/// Thin on purpose: what the row *says* is [`status::status_line`]'s decision,
+/// unit-tested with no terminal in the way (BR-8), and the only thing added here
+/// is the two runtime facts it cannot be pure about — the session's level and
+/// the terminal's width.
+///
+/// `None` propagates from two places and means the same thing in both: a level
+/// nobody has read yet, and a terminal too narrow for the row. Neither is an
+/// error — the values stay readable through bare `/permissions`, which works on
+/// a pipe (BR-10).
+///
+/// The effort field is `None` until REQ-559 lands; this REQ renders the
+/// permission level alone and adds no `/effort` command (BR-14).
+fn entry_status(ctx: &UiContext<'_>) -> Option<String> {
+    let level = ctx.state.permission_level?;
+    let effort = status::effort_field(ctx.state.effort.as_ref());
+    status::status_line(level, effort.as_deref(), prompt::terminal_width())
+}
+
+/// Read the session's permission level into the render cache (REQ-560).
+///
+/// Best-effort by design. A daemon that does not serve `session/permissions`
+/// leaves the level `None`, which draws no status row — the session is fully
+/// usable and the level is still reachable with `/permissions`, so a failure
+/// here costs a row and nothing else (BR-13). The failure is deliberately
+/// **silent**: an error line at every startup against an older daemon would be
+/// noise about a feature the user has not asked for yet.
+fn read_permission_level(conn: &mut Connection, ctx: &mut UiContext<'_>, session_id: &SessionId) {
+    let params = SessionPermissionsParams {
+        session_id: session_id.clone(),
+        level: None,
+    };
+    if let Ok(Ok(result)) = conn.call(params, ctx) {
+        ctx.state.permission_level = Some(result.level);
+    }
+}
+
+/// Read the daemon's reasoning-effort view into the render cache (REQ-559 /
+/// REQ-560).
+///
+/// Best-effort for the same reason [`read_permission_level`] is: a daemon that
+/// predates the setting leaves it `None`, and the status row then shows the
+/// permission field alone. Silent, because an error line at every startup
+/// against an older daemon would be noise about a feature the user has not asked
+/// for.
+///
+/// Kept fresh by `/effort`'s own handler, which caches what the daemon reports
+/// after a set — so the row cannot go on showing a level the user has changed.
+fn read_effort_view(conn: &mut Connection, ctx: &mut UiContext<'_>) {
+    if let Ok(Ok(cfg)) = conn.call(ConfigGetParams::default(), ctx) {
+        ctx.state.effort = cfg.snapshot.effort;
     }
 }
 
@@ -651,6 +714,15 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             "› "
         };
         let mut entry = FramedStdinPrompter::new(interactive, color);
+        // REQ-560: seed the status row's permission field once, from the daemon.
+        // Only when interactive — BR-9 draws no row on a pipe, so a piped
+        // session must not pay an RPC for something it will never render, and a
+        // daemon too old to answer leaves the level `None` and the row absent
+        // rather than showing a guess.
+        if interactive {
+            read_permission_level(&mut conn, &mut ctx, &session_id);
+            read_effort_view(&mut conn, &mut ctx);
+        }
         // The indicator's animation clock, persisted across turns so the dots do
         // not restart every time a turn ends (REQ-556).
         let mut frame_tick: u64 = 0;
