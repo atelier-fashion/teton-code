@@ -507,6 +507,15 @@ pub async fn run_session_turn_with_source(
 
     loop {
         if turns >= config.max_turns {
+            // BUG-157, second exit: this check sits *above* the gate, so the
+            // previous iteration's pushes — a model turn plus its tool result —
+            // leave by this door ungated too.
+            //
+            // Found while fixing the `EndTurn` arm; the report named only that
+            // one. Fixing a postcondition at one of its two exits would leave it
+            // false at the other, and the next reader would reasonably believe
+            // it held.
+            ctx.truncate_to_budget();
             return Ok(TurnOutcome {
                 stop_reason: StopReason::MaxTurnRequests,
                 turns,
@@ -617,6 +626,27 @@ pub async fn run_session_turn_with_source(
                     continue;
                 }
                 ctx.push_model(final_text.clone());
+                // BUG-157: gate again, because this block was appended *after*
+                // the one at the top of the iteration ran.
+                //
+                // Without it the loop's postcondition — "the context is under
+                // budget when the turn ends" — is false by exactly one model
+                // answer. The overshoot never compounds, since the next turn's
+                // gate corrects it before anything is sent, which is why this
+                // was low severity. It is worth fixing because an
+                // almost-true invariant is the kind a later change builds on:
+                // `a_turn_whose_compact_duty_cannot_serve_still_ends_under_budget`
+                // already had to pin `max_turns: 1` to work around it, and a
+                // test bending around an invariant is a signal the invariant is
+                // wrong.
+                //
+                // Safe for the answer itself: `truncate_to_budget` drops
+                // oldest-first and never removes the last block, so the worst it
+                // can do to a very long answer is middle-truncate the *context's*
+                // copy. `final_text` is returned whole below and has already been
+                // streamed, so what the user receives is untouched — only what
+                // the next turn carries is bounded, which is the point.
+                ctx.truncate_to_budget();
                 return Ok(TurnOutcome {
                     stop_reason: StopReason::EndTurn,
                     turns,
@@ -1283,6 +1313,158 @@ mod tests {
             "the turn ended {} bytes over its budget with a `compact` duty that never served",
             ctx.estimated_bytes() - BUDGET_BYTES
         );
+    }
+
+    /// `ToolThenEndSource` with `pad` bytes of filler on its first turn.
+    ///
+    /// The padding exists because the loop's two exits need **opposite**
+    /// fixtures to be non-vacuous, and each one hides the other's bug:
+    ///
+    /// - **`EndTurn`** needs the gate to leave the context near the budget edge,
+    ///   so appending a short final answer tips it over. `pad: 0` does that —
+    ///   the overshoot is the 5 bytes BUG-157 measured.
+    /// - **`MaxTurnRequests`** needs the blocks pushed after the gate to breach
+    ///   the budget by themselves, since that exit returns from above the gate
+    ///   carrying the previous iteration's pushes. `pad: 3_000` does that.
+    ///
+    /// Using either alone gives a green test with one dead leg: a big first turn
+    /// makes the last gate truncate hard enough that the final answer never tips
+    /// the budget, and a small one never breaches it at the turn cap. Both
+    /// mutations must bite, so both shapes are exercised.
+    struct PaddedToolThenEndSource {
+        calls: usize,
+        pad: usize,
+    }
+
+    #[async_trait]
+    impl CompletionSource for PaddedToolThenEndSource {
+        fn chat_format(&self) -> ChatFormat {
+            ChatFormat::Flat
+        }
+
+        async fn produce_turn(
+            &mut self,
+            _prompt: &PreparedPrompt,
+            _provenance: &EgressProvenance,
+            _config: &HarnessConfig,
+            _tools: &ToolRegistry,
+            _exposed: &[&str],
+            _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            self.calls += 1;
+            let (text, decision) = if self.calls == 1 {
+                (
+                    format!(
+                        "{}{{\"tool\":\"read\",\"arguments\":{{\"path\":\"nope.txt\"}}}}",
+                        "y".repeat(self.pad)
+                    ),
+                    TurnDecision::ToolCall {
+                        name: "read".to_owned(),
+                        arguments: serde_json::json!({ "path": "nope.txt" }),
+                    },
+                )
+            } else {
+                (
+                    "Done.".to_owned(),
+                    TurnDecision::EndTurn {
+                        final_text: "Done.".to_owned(),
+                    },
+                )
+            };
+            let call_in_text = matches!(decision, TurnDecision::ToolCall { .. });
+            Ok(SourceTurn {
+                text,
+                decision,
+                usage: TokenUsage::default(),
+                dropped_calls: 0,
+                cache: None,
+                call_in_text,
+            })
+        }
+    }
+
+    /// BUG-157: the context is under budget when the turn **ends**, not merely
+    /// when the gate last ran.
+    ///
+    /// Deliberately does **not** pin `max_turns: 1`. That pin is the workaround
+    /// this bug is about: with it, the loop stops before the model's final
+    /// answer is appended, so the assertion only ever measured what the gate
+    /// guarantees rather than what the turn leaves behind. This lets the loop
+    /// take its second turn and end through the `EndTurn` arm — the path that
+    /// pushes after the gate — and asserts the postcondition there.
+    ///
+    /// Both stop reasons are covered, because the loop has two exits and the
+    /// original report named one. `MaxTurnRequests` returns from *above* the
+    /// gate, carrying whatever the previous iteration pushed.
+    #[tokio::test]
+    async fn a_turn_ends_under_budget_however_it_ends() {
+        const BUDGET_BYTES: usize = 4_000;
+
+        // `pad` is per-leg on purpose — see `PaddedToolThenEndSource`. Each exit
+        // needs the opposite fixture to be able to fail at all.
+        for (label, max_turns, pad, expected) in [
+            ("ends by answering", 12u32, 0usize, StopReason::EndTurn),
+            (
+                "ends by exhausting its turns",
+                1u32,
+                3_000usize,
+                StopReason::MaxTurnRequests,
+            ),
+        ] {
+            let session_id = SessionId::from("budget-at-turn-end");
+            let bus = Arc::new(EventBus::new());
+            let gate = PermissionGate::new(
+                session_id.clone(),
+                PermissionConfig::permissive(),
+                Arc::clone(&bus),
+                Arc::new(PendingPermissions::new()),
+            );
+            let events = SessionEvents::new(Arc::clone(&bus), session_id);
+            let config = HarnessConfig {
+                max_turns,
+                ..HarnessConfig::default()
+            };
+            let tools = ToolRegistry::with_builtins();
+            let tool_ctx = ToolContext::new(std::env::temp_dir());
+            let mut hook = NoopProvenanceHook;
+
+            let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(BUDGET_BYTES);
+            ctx.push_user("do the thing");
+            for i in 0..5 {
+                ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+            }
+            assert!(
+                ctx.estimated_bytes() > BUDGET_BYTES,
+                "{label}: non-vacuity — the turn must start over budget"
+            );
+
+            let mut source = PaddedToolThenEndSource { calls: 0, pad };
+            let outcome = run_session_turn_with_source(
+                &mut source,
+                &tools,
+                &tool_ctx,
+                &gate,
+                &events,
+                &mut ctx,
+                &config,
+                &mut hook,
+                &DutyRoute::unresolved("no digest route in this test"),
+                &DutyRoute::unresolved("no compact route in this test"),
+                &ToolDuties {
+                    triage: &DutyRoute::unresolved("no triage route in this test"),
+                    shell: &DutyRoute::unresolved("no shell route in this test"),
+                },
+            )
+            .await
+            .expect("the turn completes");
+
+            assert_eq!(outcome.stop_reason, expected, "{label}: fixture drifted");
+            assert!(
+                ctx.estimated_bytes() <= BUDGET_BYTES,
+                "{label}: the turn ended {} bytes over its budget",
+                ctx.estimated_bytes().saturating_sub(BUDGET_BYTES)
+            );
+        }
     }
 
     /// A source that calls a tool once, whose reply text is the same prose
