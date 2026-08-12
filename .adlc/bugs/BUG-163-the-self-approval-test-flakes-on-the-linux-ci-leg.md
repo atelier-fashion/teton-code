@@ -22,12 +22,16 @@ introduced_by: REQ-570
 > Severity is back to **medium** and the root cause is back to **unknown**. The
 > filename carries the original slug so links from PRs #108/#109 keep resolving.
 >
-> What is established: **the withholding chain is real**. What is not: **anything
-> that triggers it.**
+> **Fourth revision, 2026-08-12: first instrumented capture.** The instrument
+> built in #111/#112/#113 fired on its first opportunity and **positively
+> excluded** both the ancestry seam and the zero-delivery path. See
+> "First instrumented capture" below — the cause is still unnamed, but the
+> search space is now much smaller and narrowed by measurement rather than
+> reasoning.
 
-**Status in one line.** A real, reproducible-in-CI flake whose *mechanism of
-failure* is understood link by link, and whose *cause* — what actually sets that
-mechanism off — has survived two attempts to name it.
+**Status in one line.** A real, intermittent CI failure, captured once with
+instrumentation: consent **succeeded**, and the read that times out is the one
+waiting for the `session/attach` **response** afterwards. Cause still unnamed.
 
 **The symptom.**
 `tetond/tests/attach_authorization.rs::a_consent_the_requester_granted_itself_is_named_as_such_in_the_daemon_log`
@@ -75,7 +79,9 @@ passed, in well under a second each.
 
 - Platform: ubuntu-latest (GitHub Actions). Not observed on macos-latest.
 - Version: `main` @ `cd5b358`; the test arrived with REQ-570 (`c8bdffd`).
-- Failing run: <https://github.com/atelier-fashion/teton-code/actions/runs/31598675582/job/94120352305>
+- Failing run 1: <https://github.com/atelier-fashion/teton-code/actions/runs/31598675582/job/94120352305>
+- Failing run 2 (**instrumented**, PR #116, docs-only): job 94257585202 — the
+  capture recorded below
 
 ## Root Cause
 
@@ -223,6 +229,73 @@ user or operator can act on, and the daemon keeps no record of the decision. Tha
 is a real gap in a security-relevant path independent of whether it is what makes
 this test flake — and it is what the "observe, do not hypothesise" step above
 addresses.
+
+
+## FIRST INSTRUMENTED CAPTURE — 2026-08-12
+
+The instrument fired on its first opportunity, on CI for PR #116 (a **docs-only**
+`.adlc` change), ubuntu leg. This is the first evidence anyone has had about this
+bug, and it **excludes two of the three candidate mechanisms outright.**
+
+Captured daemon log, surfaced by #112's panic dump:
+
+```
+teton-code: client_connected    (live_connection_count=1)   <- watcher
+teton-code: client_connected    (live_connection_count=2)   <- owner
+teton-code: client_connected    (live_connection_count=3)   <- peer
+teton-code: client_disconnected (live_connection_count=2)
+teton-code: client_disconnected (live_connection_count=1)
+teton-code: client_connected    (live_connection_count=2)   <- resumer
+tetond: Cli client "resume-client" approved its own attach consent — no other
+        client was attached to that session, so the prompt was rendered at the
+        connection that asked for it (REQ-569 BR-6 second arm)
+```
+
+### What this rules out
+
+- **The ancestry seam is CLEARED.** #111 logs a line for every classification
+  that is not `NotDescendant`. There is none. So no connection in this run was
+  `Descendant` or `Indeterminate`, and the mechanism #109 published as "the
+  actual root cause" is now positively **excluded**, not merely unproven.
+- **"The prompt reached nobody" is CLEARED.** #113 logs whenever a consent frame
+  is delivered to zero surfaces. There is none. Every prompt reached a surface.
+
+### What this localises
+
+**Leg 2 succeeded.** The self-approval line is the daemon's record of the
+*resume* consent being granted — the thing the test asserts last, and the whole
+point of the arm under test. So consent was sought, delivered, answered, and the
+grant minted.
+
+The read that times out therefore comes **after** that: the test's
+`read_response(resume_attach)` loop, waiting for the `session/attach` RPC
+response to arrive on the resumer's socket. `read_response` loops on
+`read_frame` until it sees a frame whose `id` matches; the deadline fires inside
+that loop.
+
+So the shape is: **the daemon completed the attach and the response frame never
+reached the client** — or reached it in a form the id match did not recognise.
+That is a delivery/ordering question one layer downstream of consent, and it is
+territory none of the three refuted hypotheses touched.
+
+### Not a fourth hypothesis
+
+One sample. The above is what the log *shows*, plus the narrowing that follows
+from two absent lines — no mechanism is being proposed here. This report has
+already published two confident wrong causes, and the discipline that produced
+this evidence was refusing to guess a third time.
+
+What would settle it: the resumer's frame stream at the moment of the timeout.
+`read_frame` records event notifications as it passes them, so dumping the
+frames a client *did* receive when its deadline fires is the natural companion
+to #112 — the daemon's side is now visible and the client's still is not.
+
+Worth noting for whoever picks this up: REQ-570 added a daemon-wide
+`grant_minted` broadcast to every handshaked connection (AC-9), so this arm now
+produces event traffic on connections that are not party to the attach, and
+`ConsentSurfaces::deliver` uses a non-blocking `try_send` whose failure is
+silent. That is an observation about what changed near this seam, not a claim
+that it is the cause.
 
 ## Next step: observe, do not hypothesise
 
