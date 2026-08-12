@@ -1,7 +1,7 @@
 ---
 id: BUG-162
 title: "model/confirm can be answered by any connection, and six sibling methods take no connection at all"
-status: open
+status: resolved
 severity: high
 created: 2026-08-11
 updated: 2026-08-11
