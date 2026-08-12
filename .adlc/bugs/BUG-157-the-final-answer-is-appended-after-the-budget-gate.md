@@ -1,7 +1,7 @@
 ---
 id: BUG-157
 title: "A turn's final answer is appended after the budget gate, so a turn can end over budget"
-status: open
+status: resolved
 severity: low
 created: 2026-08-07
 updated: 2026-08-12
@@ -87,6 +87,12 @@ complaint this bug makes about `max_turns: 1`.
 | Remove the `MaxTurnRequests` gate | red — "ends by exhausting its turns: 2936 bytes over" |
 
 Workspace: 2218 passing across 45 targets, fmt and clippy clean.
+
+### Deployment
+
+n/a — plain PR-gated OSS flow, no Cloud Run and no `gcp:` config
+(conventions.md). Merged in PR #114 (`b18d639`), 2026-08-12; reaches users at the
+next tagged Homebrew release.
 
 ## Files Changed
 

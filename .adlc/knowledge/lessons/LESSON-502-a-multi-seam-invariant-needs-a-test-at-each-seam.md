@@ -8,7 +8,7 @@ concerns: ["security"]
 tags: ["mutation-testing", "verification-gaps", "authorization", "cross-call-site", "monitor", "req-568"]
 req: REQ-568
 created: 2026-08-11
-updated: 2026-08-11
+updated: 2026-08-12
 ---
 
 ## What Happened
@@ -57,6 +57,39 @@ checks + a near-2000-test green suite). The same audit pass found a Critical
 `permission/respond`/`session/list` surfaces now tracked in REQ-569 — all
 "edges the fix drew" that a passing suite hid. A green suite is evidence about
 the tests you wrote, never about the invariant you meant.
+
+## Amendment (2026-08-12, BUG-157): a test at each seam can still be vacuous at one of them
+
+This lesson's remedy — *enumerate the enforcement sites and confirm each has a
+test that goes red when that site's check is inverted* — is right, and it is not
+sufficient on its own. BUG-157 fixed a budget postcondition at the turn loop's
+**two** exits and wrote one table-driven test covering both. Mutating each gate
+separately showed why that is not enough:
+
+- Remove the `EndTurn` gate → **red**. Remove the `MaxTurnRequests` gate →
+  **green**. The second leg asserted something the fixture made true anyway.
+- Fixing that (padding the fixture so the second exit really breached the
+  budget) made the **first** leg vacuous: a large first turn causes the last gate
+  to truncate hard enough that a short final answer no longer tips the budget.
+
+**The two seams needed opposite fixtures.** One needs the context left at the
+budget edge so a small append tips it; the other needs the post-gate pushes to
+breach the budget by themselves. Any single fixture satisfies one and masks the
+other, and the masked leg is a green assertion that cannot fail.
+
+So the check has two parts, not one:
+
+1. **Mutate each site separately.** Disabling both at once, or reading the test
+   and satisfying yourself it covers both, hides exactly this. The vacuity is
+   invisible from the test's source — it looks like a normal parameterised case.
+2. **Expect the fixture to be per-site.** If one fixture makes every seam's test
+   go red, that is worth a second look: it may mean the seams are not actually
+   independent, or that one leg is riding the other's failure.
+
+The tell to remember: a parameterised test where every row shares a fixture, over
+an invariant enforced at sites with different preconditions. That shape reads as
+thorough and can be half-dead. Related: [[LESSON-508]], the same problem for a
+guard nobody tested at all.
 
 ## Applies When
 
