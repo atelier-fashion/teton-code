@@ -4,7 +4,7 @@ title: "In-session slash commands for the teton interactive CLI"
 status: complete
 deployable: true
 created: 2026-08-04
-updated: 2026-08-04
+updated: 2026-08-12
 component: "cli"
 domain: "clients"
 stack: ["rust", "cli", "json-rpc"]
@@ -148,43 +148,43 @@ does. `/help`, `/verbose`, and `/quit` are fully client-local.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Typing `/help` in an interactive session prints all six commands
+- [x] AC-1: Typing `/help` in an interactive session prints all six commands
       with their summaries, and the test asserts no `prompt/turn` RPC was
       issued for it.
-- [ ] AC-2: Mid-session `/cost` renders the live cost meter from `cost/query`,
+- [x] AC-2: Mid-session `/cost` renders the live cost meter from `cost/query`,
       producing the same rendering `teton cost` produces for the same daemon
       state (asserted by a shared-renderer test, not by string coincidence).
-- [ ] AC-3: Mid-session `/model` prints one line naming the currently selected
+- [x] AC-3: Mid-session `/model` prints one line naming the currently selected
       model (and its ready/installing/declined state) derived from
       `model/status` — e.g. `model: qwen3-coder-30b-a3b (user_override) —
       ready`; with the local tier declined it says so rather than printing
       nothing.
-- [ ] AC-3b: `/model set <name>` with a valid catalog name changes the
+- [x] AC-3b: `/model set <name>` with a valid catalog name changes the
       selection (the daemon installs missing weights, exactly as the
       subcommand path reports); an unknown name lists the available catalog
       names; an above-RAM-floor name shows the BR-3 warning and only proceeds
       after the second confirmation — declining leaves the selection
       unchanged. All three legs in scripted-session tests.
-- [ ] AC-4: With default (quiet) startup, a turn produces no `route [...]`
+- [x] AC-4: With default (quiet) startup, a turn produces no `route [...]`
       line; after `/verbose`, the next turn's routing notice and turn-end line
       render; after a second `/verbose`, they are hidden again — all in one
       scripted session test.
-- [ ] AC-5: `/quit` ends the session with the standard session-end cost
+- [x] AC-5: `/quit` ends the session with the standard session-end cost
       summary and exit code 0; the test drives both paths in piped mode —
       where EOF and `/quit` are byte-comparable — and asserts identical
       session-end output for the same session history. (On a TTY the framed
       prompter's EOF-vs-Enter cursor chrome legitimately differs; that is
       prompter behavior, not session behavior, and is out of this AC's scope.)
-- [ ] AC-6: `/frobnicate` prints the unknown-command hint naming `/help`,
+- [x] AC-6: `/frobnicate` prints the unknown-command hint naming `/help`,
       issues no RPC, and the entry loop continues accepting input.
-- [ ] AC-7: Non-slash input is untouched: both existing e2e suites pass
+- [x] AC-7: Non-slash input is untouched: both existing e2e suites pass
       unmodified, and a regression test pins that a prompt not starting with
       `/` produces a byte-identical `prompt/turn` request to today's.
-- [ ] AC-7b: `//usr/local/bin/deploy.sh fails with exit 3 — why?` issues a
+- [x] AC-7b: `//usr/local/bin/deploy.sh fails with exit 3 — why?` issues a
       `prompt/turn` whose text is `/usr/local/bin/deploy.sh fails with exit 3
       — why?` (leading pair collapsed, everything else verbatim, no command
       dispatched); the `/help` output includes the escape-hatch footer line.
-- [ ] AC-8: The BR-8 bidirectional classification tests exist and have been
+- [x] AC-8: The BR-8 bidirectional classification tests exist and have been
       seen to fail (mutation-checked: removing a dispatch entry or the
       interception branch makes the corresponding test go red). (informed by
       LESSON-441, LESSON-479)

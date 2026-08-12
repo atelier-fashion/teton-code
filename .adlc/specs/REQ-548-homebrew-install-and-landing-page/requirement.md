@@ -4,7 +4,7 @@ title: "One-command Homebrew install and the tetoncode.ai landing page"
 status: complete
 deployable: true
 created: 2026-07-24
-updated: 2026-08-01
+updated: 2026-08-12
 component: "distribution/release"
 domain: "distribution"
 stack: ["rust", "github-actions", "homebrew", "ci", "static-site"]
@@ -149,7 +149,7 @@ Rust+cmake burden this REQ exists to remove.
       CI smoke per platform is mandatory; human sign-off per platform is
       recorded when hardware is available, and unrun legs are recorded as
       unrun, not assumed.
-- [ ] AC-3: Pushing tag `vX.Y.Z` runs one workflow that: refuses on
+- [x] AC-3: Pushing tag `vX.Y.Z` runs one workflow that: refuses on
       tag/Cargo-version mismatch before building; builds all three targets
       with `tetond/llama`; smoke-tests each on its own platform (BR-7);
       asserts the seam refusal (BR-9); publishes the GitHub Release with
@@ -166,10 +166,10 @@ Rust+cmake burden this REQ exists to remove.
 - [ ] AC-6: `brew services start|stop|restart teton` manage the daemon;
       after `start`, `teton doctor` reports a healthy socket without any
       manual `tetond` invocation.
-- [ ] AC-7: `https://tetoncode.ai` serves the landing page over HTTPS with
+- [x] AC-7: `https://tetoncode.ai` serves the landing page over HTTPS with
       the overview and the install command; the displayed version matches the
       latest release at deploy time (BR-8).
-- [ ] AC-8: README quick-start is replaced with the brew one-liner (source
+- [x] AC-8: README quick-start is replaced with the brew one-liner (source
       build remains documented for contributors), and the stale
       "pre-alpha — product spec stage" status line is corrected.
 

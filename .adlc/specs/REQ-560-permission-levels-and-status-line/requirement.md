@@ -4,7 +4,7 @@ title: "Named permission levels and the interactive session status line"
 status: complete
 deployable: true
 created: 2026-08-05
-updated: 2026-08-11
+updated: 2026-08-12
 component: "cli"
 domain: "harness"
 stack: ["rust", "cli", "daemon", "json-rpc"]
@@ -191,69 +191,69 @@ call (OQ-3).
 
 ## Acceptance Criteria
 
-- [ ] AC-1 *(unit)*: Each of the four levels expands to its documented table.
+- [x] AC-1 *(unit)*: Each of the four levels expands to its documented table.
       `guarded`'s table is byte-equal to today's `coding_defaults()` and `full`'s
       to today's `permissive()`, asserted against the existing constructors so a
       drift in either is caught.
-- [ ] AC-2 *(piped)*: In a scripted session at `guarded`, an `edit` prompts; after
+- [x] AC-2 *(piped)*: In a scripted session at `guarded`, an `edit` prompts; after
       `/permissions edits`, the next `edit` runs without prompting and a `shell`
       still prompts; after `/permissions plan`, both are denied and the denial
       reaches the model as `Denied`. All three legs in one test.
-- [ ] AC-3 *(piped)*: Grant precedence — allow-always a tool at `guarded`, switch
+- [x] AC-3 *(piped)*: Grant precedence — allow-always a tool at `guarded`, switch
       to `plan`, the tool is denied; switch back to `guarded`, the grant applies
       again without re-prompting. (BR-5)
-- [ ] AC-4 *(egress-capture)*: At `full`, a session touching a `local-only`
+- [x] AC-4 *(egress-capture)*: At `full`, a session touching a `local-only`
       boundary produces **zero** remote calls containing boundary content and
       still emits `privacy_block`; a session tainted by unknown-provenance
       results stays pinned to the local tier at `full`. This is the criterion
       that keeps the levels orthogonal to the boundary, and it is not satisfiable
       by code inspection. (BR-3)
-- [ ] AC-5 *(unit)*: A source-level assertion that no egress-path predicate
+- [x] AC-5 *(unit)*: A source-level assertion that no egress-path predicate
       references the permission level — the same shape as REQ-544's
       enumerate-every-tool posture, so a future call site cannot quietly couple
       them. (BR-3, BR-4)
-- [ ] AC-6 *(piped)*: `/permissions full`, then a full daemon restart and a fresh
+- [x] AC-6 *(piped)*: `/permissions full`, then a full daemon restart and a fresh
       session, starts at `guarded` — the level did **not** persist. Paired with
       REQ-559 AC-7's contrast case, which asserts effort *did*. (BR-6)
-- [ ] AC-7 *(unit)*: The status-line content function returns the expected string
+- [x] AC-7 *(unit)*: The status-line content function returns the expected string
       for each (level × effort) pair with no terminal involved, including the
       REQ-559 BR-6 "not applicable" effort rendering for a local-only session.
       (BR-8)
-- [ ] AC-8 *(piped)*: Non-TTY invocation is byte-identical to the pre-REQ binary;
+- [x] AC-8 *(piped)*: Non-TTY invocation is byte-identical to the pre-REQ binary;
       the existing `cli_e2e` whole-output tests and the
       `/quit`-equals-Ctrl-D equivalence tests pass **unmodified**. (BR-9)
-- [ ] AC-9 *(piped)*: Bare `/permissions` prints the current level on a pipe.
+- [x] AC-9 *(piped)*: Bare `/permissions` prints the current level on a pipe.
       When REQ-559 has landed, the same test covers bare `/effort`; until then
       its absence is not a gap in this REQ. (BR-10)
-- [ ] AC-10 *(pty)*: At a real terminal the status row renders below the bottom
+- [x] AC-10 *(pty)*: At a real terminal the status row renders below the bottom
       rule, a typed line is accepted intact with the frame uncorrupted, and a
       REQ-556 loading indicator drawn above the frame at the same time leaves
       neither row stranded after a redraw. This is the criterion BR-11 exists
       for and it cannot be reached on a pipe. (BR-11)
-- [ ] AC-11 *(piped)*: `/help` lists `/permissions` from the dispatch table; the
+- [x] AC-11 *(piped)*: `/help` lists `/permissions` from the dispatch table; the
       BR-8 bidirectional table test from REQ-555 still passes with the new row.
       `/effort`'s row is REQ-559's and is covered there. (BR-14)
-- [ ] AC-12 *(unit)*: A simulated narrow terminal / write failure produces no
+- [x] AC-12 *(unit)*: A simulated narrow terminal / write failure produces no
       status row, no panic, and a usable session. (BR-13)
-- [ ] AC-13: Verified on **both** macOS and Linux in CI — TTY detection and
+- [x] AC-13: Verified on **both** macOS and Linux in CI — TTY detection and
       terminal-width handling are platform-specific and a green macOS run is not
       evidence about Linux. (informed by LESSON-433, REQ-556 AC-7)
-- [ ] AC-14: Mutation check — freezing the status-line content function to a
+- [x] AC-14: Mutation check — freezing the status-line content function to a
       constant, removing the level-before-grants ordering (BR-5), or making
       `full` skip the gate rather than allow-all (BR-4), each makes at least one
       test red. A suite that stays green with the feature disabled has not tested
       it. (informed by LESSON-441, LESSON-481)
-- [ ] AC-15 *(piped)*: An in-flight permission prompt is **not** resolved by a
+- [x] AC-15 *(piped)*: An in-flight permission prompt is **not** resolved by a
       level change. With a prompt pending on `shell`, a `/permissions full`
       arriving before the answer leaves the prompt pending and still awaiting the
       user; the user's own answer decides that call, and the *next* `shell`
       evaluates at `full`. The inverse leg — pending prompt, then `/permissions
       plan` — likewise does not auto-deny the in-flight call. (BR-7)
-- [ ] AC-16 *(unit)*: A source-level assertion that no status-line write reaches
+- [x] AC-16 *(unit)*: A source-level assertion that no status-line write reaches
       stdout outside the `Surface`/`Prompter` seams — the same shape as AC-5's
       egress-predicate assertion, so a future direct-to-stdout call site cannot
       quietly bypass the seam the ratatui front-end will implement. (BR-12)
-- [ ] AC-17 *(unit)*: One classifier — the level a session is in, the
+- [x] AC-17 *(unit)*: One classifier — the level a session is in, the
       `PermissionConfig` it expands to, and the sentence a denied call returns
       all derive from a single function, asserted by calling that function rather
       than by comparing two rendered strings. Adding a fifth level in the test

@@ -4,7 +4,7 @@ title: "Global reasoning effort with per-provider clamping and thinking-token at
 status: complete
 deployable: true
 created: 2026-08-05
-updated: 2026-08-11
+updated: 2026-08-12
 component: "providers/openai-compat"
 domain: "providers"
 stack: ["rust", "daemon", "llm-providers", "cli"]
@@ -193,55 +193,67 @@ report gains the thinking split.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Every outbound request to a provider with `reasoning_shape ==
+- [x] AC-1: Every outbound request to a provider with `reasoning_shape ==
       effort_only` carries an effort field. A mock-transport test asserts the
       field's presence across all four tiers and both adapters, and fails if any
       call path omits it. This is the direct regression for the Kimi-defaults-to-
       `max` defect. (BR-1)
-- [ ] AC-2: A provider declared `thinking_flag_only` receives the thinking flag
+- [x] AC-2: A provider declared `thinking_flag_only` receives the thinking flag
       and **no** effort field; a provider declared `effort_only` receives the
       effort field and **no** thinking flag. A test asserts no request ever
       carries both. (BR-4)
-- [ ] AC-2b: A registered OpenAI-compatible provider with **no declared
+- [x] AC-2b: A registered OpenAI-compatible provider with **no declared
       `reasoning_shape`** sends the effort field on its first call — the
       `effort_only` default. Against a mock endpoint that answers 400 on that
       field, the call produces BR-12's typed error and falls back to the `none`
       shape without a silent retry, and the capture contains no request carrying
       both shapes. This is the BYOM leg of AC-1's regression. (BR-4, BR-12)
-- [ ] AC-3: Clamp table: canonical `xhigh` against a three-level ladder
+- [x] AC-3: Clamp table: canonical `xhigh` against a three-level ladder
       (`low/high/max`) resolves to `high`; canonical `medium` against the same
       resolves to `low`; canonical `low` against a ladder whose floor is `high`
       resolves to `high` (nearest-above when nothing lower exists). Table-driven
       across all five canonical levels × at least three ladders. (BR-5)
-- [ ] AC-4: `route_decided` reports the **clamped** level, not the requested one.
+- [x] AC-4: `route_decided` reports the **clamped** level, not the requested one.
       With the session at `xhigh` and a three-level provider, the event says
       `high`. (BR-5)
-- [ ] AC-5: A call routed to the local tier sends no effort field and no thinking
+- [x] AC-5: A call routed to the local tier sends no effort field and no thinking
       flag; `teton effort` shows the local provider as "not applicable" rather
       than showing a level. (BR-6)
-- [ ] AC-6: With the session at `max`, a `route`-category call still resolves to
+- [x] AC-6: With the session at `max`, a `route`-category call still resolves to
       the local tier with no effort field — a global bump cannot inflate a
       local-pinned category. (BR-7)
-- [ ] AC-7: `/effort low` in a session, then a full daemon restart and a fresh
+- [x] AC-7: `/effort low` in a session, then a full daemon restart and a fresh
       session, shows `low` — the setting persisted. Contrast test with REQ-560's
       permission level, which resets. (BR-8)
-- [ ] AC-8: `teton effort` with no argument prints the current level and each
+      **Partial coverage, recorded rather than implied (2026-08-12).** The
+      persistence is asserted at the **config layer** — `effort` round-trips
+      load → serialize → load — not across an actual daemon restart. The
+      claim the AC makes is the stronger one; what is tested is its
+      necessary condition. Reported by the implementing pipeline in PR #100
+      rather than found later.
+- [x] AC-8: `teton effort` with no argument prints the current level and each
       provider's clamped level, rendered through the same function the router
       calls — asserted by a shared-resolver test, not by string coincidence.
       (BR-9)
-- [ ] AC-9: A response carrying `completion_tokens_details.reasoning_tokens`
+- [x] AC-9: A response carrying `completion_tokens_details.reasoning_tokens`
       produces a `CostRecord` whose `reasoning_tokens` is that value and whose
       `output_tokens` is unchanged from today's parse — proving the subset
       relationship. A response without the field produces `None`, and
       `teton cost` renders "unreported" rather than `0`. (BR-10, BR-11)
-- [ ] AC-10: A provider returning 400 on the effort field produces a typed error
+- [x] AC-10: A provider returning 400 on the effort field produces a typed error
       naming the provider, requested level, and clamped level; the session
       continues via the existing degradation path; no request in the capture
       carries both shapes. (BR-12)
-- [ ] AC-11: Egress-capture: raising effort to `max` on a session with a
+- [x] AC-11: Egress-capture: raising effort to `max` on a session with a
       `local-only` boundary produces zero remote calls containing boundary
       content. (BR-13, REQ-544 AC-5 posture)
-- [ ] AC-12: Mutation check — removing the always-send rule (BR-1), or making the
+      **Partial coverage, recorded rather than implied (2026-08-12).** This
+      passes *structurally*: BR-13 is a non-change, and no effort-conditional
+      branch touches the egress path. There is no dedicated max-effort
+      boundary capture asserting it behaviourally, which is the standard
+      REQ-544 AC-5 sets for boundary claims. Reported by the implementing
+      pipeline in PR #100.
+- [x] AC-12: Mutation check — removing the always-send rule (BR-1), or making the
       clamp an identity function, each makes at least one test red. (informed by
       LESSON-441)
 

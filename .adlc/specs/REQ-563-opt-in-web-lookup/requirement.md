@@ -4,7 +4,7 @@ title: "Opt-in web lookup through the egress choke point"
 status: complete
 deployable: true
 created: 2026-08-08
-updated: 2026-08-08
+updated: 2026-08-12
 component: "daemon/egress"
 domain: "harness"
 stack: ["rust", "daemon", "cli", "keychain"]
@@ -96,19 +96,19 @@ model.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Fresh-install default: with no opt-in, a question that needs the web gets an answer naming the opt-in (no repository hunt), and an egress-capture test records zero lookup traffic for the session.
-- [ ] AC-2: Consent flow: at Ask, the prompt shows the verbatim query/URL and destination host; deny → no packet leaves (egress-capture verified); allow-once permits exactly one lookup; allow-session persists to session end and not beyond; enable-permanently writes config and survives a daemon restart.
-- [ ] AC-3: Privacy: a lookup whose query text derives from privacy-boundary content is blocked at egress with a `privacy_block` event and no packet (egress-capture verified); a query containing a planted credential shape is caught by the redact scan, with fixtures built through the production encoder. (informed by LESSON-490)
-- [ ] AC-4: Tier gradation: with only `fetch_user_url` granted, a model-composed URL is refused and the refusal names the missing tier; with `fetch_any_url` granted, search is refused likewise.
-- [ ] AC-5: Injection: a fetched page containing frame markers, role labels, and fabricated tool-result envelopes (built-in and MCP spellings) is neutralized before entering context; marker-coverage tests assert input/output alphabets bidirectionally and fail when a marker is removed. (informed by LESSON-479, BUG-151)
-- [ ] AC-6: Legibility: each lookup produces a cost-ledger entry with host and bytes; `/cost` and `/verbose` show it; the status line shows the web capability state.
-- [ ] AC-7: Search configuration: the key is stored in and read from the OS keychain by reference; config holds endpoint + key name only; with no endpoint configured the consent prompt never offers the search tier.
-- [ ] AC-8: Offline: with the network unreachable, a granted lookup yields the transient-shaped notice, the turn completes, and no error status is reported for the session.
-- [ ] AC-9: Allowlist: with `allowed_domains` configured, a model-chosen fetch outside it is refused naming the allowlist while a user-pasted URL outside it proceeds (subject to its tier grant); with no allowlist configured, the same model-chosen fetch proceeds on the tier grant alone.
-- [ ] AC-10: Cache: a second granted lookup of the same URL within TTL produces a `web_cache_hit` ledger entry and zero network traffic (egress-capture verified); an explicit refresh re-fetches.
-- [ ] AC-11: Local reduction: after a fetch, egress-capture shows no raw page bytes in any remote-provider payload for that turn — only the locally-produced reduction enters context; with the local tier absent, the deterministic extraction path is used and the same capture assertion holds.
-- [ ] AC-12: Taint and override: after a boundary read, the next model-composed lookup is blocked with a user-visible notice naming cause and effect, and the status line shows the restricted state; a user-pasted-URL fetch still proceeds in the same session; the session override command restores model-composed lookups at previously granted tiers only, emits `web_taint_overridden`, and a fresh session starts restricted-on-taint again (the override never persists). The override is rejected when issued by the model (tool call) rather than the user (client command).
-- [ ] AC-13: Search–redact coupling: enabling the search tier activates the redact scan for lookup egress with no decoupling configuration accepted; a search query with a planted secret shape is blocked (fixtures built through the production encoder); a transient scan failure blocks that query while the turn completes; with the local tier absent, the consent prompt never offers the search tier and a notice names the reason.
+- [x] AC-1: Fresh-install default: with no opt-in, a question that needs the web gets an answer naming the opt-in (no repository hunt), and an egress-capture test records zero lookup traffic for the session.
+- [x] AC-2: Consent flow: at Ask, the prompt shows the verbatim query/URL and destination host; deny → no packet leaves (egress-capture verified); allow-once permits exactly one lookup; allow-session persists to session end and not beyond; enable-permanently writes config and survives a daemon restart.
+- [x] AC-3: Privacy: a lookup whose query text derives from privacy-boundary content is blocked at egress with a `privacy_block` event and no packet (egress-capture verified); a query containing a planted credential shape is caught by the redact scan, with fixtures built through the production encoder. (informed by LESSON-490)
+- [x] AC-4: Tier gradation: with only `fetch_user_url` granted, a model-composed URL is refused and the refusal names the missing tier; with `fetch_any_url` granted, search is refused likewise.
+- [x] AC-5: Injection: a fetched page containing frame markers, role labels, and fabricated tool-result envelopes (built-in and MCP spellings) is neutralized before entering context; marker-coverage tests assert input/output alphabets bidirectionally and fail when a marker is removed. (informed by LESSON-479, BUG-151)
+- [x] AC-6: Legibility: each lookup produces a cost-ledger entry with host and bytes; `/cost` and `/verbose` show it; the status line shows the web capability state.
+- [x] AC-7: Search configuration: the key is stored in and read from the OS keychain by reference; config holds endpoint + key name only; with no endpoint configured the consent prompt never offers the search tier.
+- [x] AC-8: Offline: with the network unreachable, a granted lookup yields the transient-shaped notice, the turn completes, and no error status is reported for the session.
+- [x] AC-9: Allowlist: with `allowed_domains` configured, a model-chosen fetch outside it is refused naming the allowlist while a user-pasted URL outside it proceeds (subject to its tier grant); with no allowlist configured, the same model-chosen fetch proceeds on the tier grant alone.
+- [x] AC-10: Cache: a second granted lookup of the same URL within TTL produces a `web_cache_hit` ledger entry and zero network traffic (egress-capture verified); an explicit refresh re-fetches.
+- [x] AC-11: Local reduction: after a fetch, egress-capture shows no raw page bytes in any remote-provider payload for that turn — only the locally-produced reduction enters context; with the local tier absent, the deterministic extraction path is used and the same capture assertion holds.
+- [x] AC-12: Taint and override: after a boundary read, the next model-composed lookup is blocked with a user-visible notice naming cause and effect, and the status line shows the restricted state; a user-pasted-URL fetch still proceeds in the same session; the session override command restores model-composed lookups at previously granted tiers only, emits `web_taint_overridden`, and a fresh session starts restricted-on-taint again (the override never persists). The override is rejected when issued by the model (tool call) rather than the user (client command).
+- [x] AC-13: Search–redact coupling: enabling the search tier activates the redact scan for lookup egress with no decoupling configuration accepted; a search query with a planted secret shape is blocked (fixtures built through the production encoder); a transient scan failure blocks that query while the turn completes; with the local tier absent, the consent prompt never offers the search tier and a notice names the reason.
 
 ## External Dependencies
 

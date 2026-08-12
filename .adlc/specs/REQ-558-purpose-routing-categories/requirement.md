@@ -4,7 +4,7 @@ title: "Purpose-oriented routing categories as the runtime dispatch key"
 status: complete
 deployable: true
 created: 2026-08-05
-updated: 2026-08-07
+updated: 2026-08-12
 component: "daemon/router"
 domain: "routing"
 stack: ["rust", "daemon", "cli"]
@@ -227,35 +227,35 @@ category/tier equivalent (see OQ-2 for the command shape).
 
 ## Acceptance Criteria
 
-- [ ] AC-1: In a **freeform** session with `think` bound to a frontier provider,
+- [x] AC-1: In a **freeform** session with `think` bound to a frontier provider,
       the prompt *"explain the tradeoffs between these two architectures"*
       routes to the `design`/`think` binding — not to the local tier. This is the
       direct regression for the `AUXILIARY_SIGNALS` defect and fails against
       today's binary.
-- [ ] AC-2: A table-driven test iterates all eleven categories and asserts each
+- [x] AC-2: A table-driven test iterates all eleven categories and asserts each
       resolves through override → tier → declared error, with no path producing a
       synthesized provider id. Removing a tier binding makes the corresponding
       category name itself in the failure. (BR-8)
-- [ ] AC-3: No `harness_known` category is reachable from any prompt-text path,
+- [x] AC-3: No `harness_known` category is reachable from any prompt-text path,
       enforced **by the type system**: the classifier's return type admits only
       the four judgment categories, so assigning `digest` from prompt text does
       not compile. A type-level guarantee subsumes the grep-style assertion this
       AC originally also asked for (validation I1) — if the type holds, the grep
       is redundant; if the grep is needed, the type is not doing its job. Build
       the type. (BR-2)
-- [ ] AC-4: `redact` has no configuration path — a config file setting
+- [x] AC-4: `redact` has no configuration path — a config file setting
       `categories.redact` is rejected at load naming the pin, and a test asserts
       the resolution function returns the local provider for `redact` even when
       every tier is bound to a remote provider. (BR-4)
-- [ ] AC-5: With the local tier unavailable, a freeform coding prompt resolves
+- [x] AC-5: With the local tier unavailable, a freeform coding prompt resolves
       through the BR-9 default with `route_decided` naming the bypass, and **no
       remote classification call is issued** — asserted by call count, not by
       output text. (BR-5)
-- [ ] AC-6: Egress-capture test: a session tainted by boundary content stays on
+- [x] AC-6: Egress-capture test: a session tainted by boundary content stays on
       the local tier for every subsequent turn with `think` bound to a remote
       provider and a `design`-classified prompt. Zero remote calls contain
       boundary content. (BR-7, REQ-544 AC-5 posture)
-- [ ] AC-7: Migration: a pre-REQ config with all six phase entries produces the
+- [x] AC-7: Migration: a pre-REQ config with all six phase entries produces the
       documented category table, reports the `implement` → {`edit`,`shell`} and
       `io` → {`digest`,`triage`,`title`,`compact`} expansions by name, drops the
       `freeform` entry with a note, and does not re-run on second start.
@@ -263,14 +263,14 @@ category/tier equivalent (see OQ-2 for the command shape).
       provider, and a non-empty reason — asserted across a scripted session
       covering at least one harness-known and one intent-classified category.
       (REQ-544 BR-5)
-- [ ] AC-9: `Phase` appears in no routing signature (`resolve_*`, the policy
+- [x] AC-9: `Phase` appears in no routing signature (`resolve_*`, the policy
       table, `route_decided`'s dispatch input) while still appearing in
       `CostRecord`; `Phase::Freeform` no longer exists. Compile-level assertion
       plus a cost-attribution test.
-- [ ] AC-10: Mutation check — reintroducing a keyword match for any
+- [x] AC-10: Mutation check — reintroducing a keyword match for any
       harness-known category, or removing the taint override in BR-7, makes at
       least one test red. (informed by LESSON-441, LESSON-479)
-- [ ] AC-11: **One resolver, asserted by construction** (BR-6). Every surface
+- [x] AC-11: **One resolver, asserted by construction** (BR-6). Every surface
       that describes a routing state — `route_decided`'s payload,
       `teton policy show` (or its successor), and the turn-failure sentence for
       an unresolvable category — is built from the return value of the single
@@ -284,7 +284,7 @@ category/tier equivalent (see OQ-2 for the command shape).
       defect in this subsystem one REQ earlier — a rule enforced where it was
       convenient rather than where the decision is made (LESSON-484). BR-6 was
       the only business rule in this spec with no acceptance criterion.
-- [ ] AC-12: The BR-9 declared default is **configuration-visible**: it appears
+- [x] AC-12: The BR-9 declared default is **configuration-visible**: it appears
       in the effective-configuration projection any attached client can read,
       and a test asserts it is reported rather than compiled in silently.
       Changing it in config changes the category a bypassed classification

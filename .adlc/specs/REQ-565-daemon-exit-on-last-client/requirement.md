@@ -4,7 +4,7 @@ title: "On-demand daemon lifetime: exit with the last client"
 status: complete
 deployable: true
 created: 2026-08-09
-updated: 2026-08-10
+updated: 2026-08-12
 component: "daemon/lifecycle"
 domain: "distribution"
 stack: ["rust", "daemon", "cli", "homebrew"]
@@ -114,16 +114,16 @@ lifecycle claim (AC-5 here).
 
 ## Acceptance Criteria
 
-- [ ] AC-1: e2e: start `teton` with no daemon running (autostart), exit the
+- [x] AC-1: e2e: start `teton` with no daemon running (autostart), exit the
   CLI → the daemon process exits cleanly within the idle grace window; no
   `teton-code` process remains; `daemon_shutdown` logged with reason
   `last_client`.
-- [ ] AC-2: e2e: two concurrent CLI sessions; exiting one leaves the daemon
+- [x] AC-2: e2e: two concurrent CLI sessions; exiting one leaves the daemon
   running (`client_disconnected` shows count 1); exiting the second stops it.
-- [ ] AC-3: e2e: exit the last CLI while a scripted turn is in flight → the
+- [x] AC-3: e2e: exit the last CLI while a scripted turn is in flight → the
   daemon defers (`daemon_shutdown_deferred`, blocking_activity `turn`),
   completes the turn, then exits; the ledger row for that turn is intact.
-- [ ] AC-4: race test: a new client connects while shutdown is armed →
+- [x] AC-4: race test: a new client connects while shutdown is armed →
   either the shutdown is cancelled and the handshake succeeds, or the
   handshake is refused and the client's autostart path connects to a fresh
   daemon; the prompt turn succeeds either way; never two daemons (flock
@@ -137,14 +137,14 @@ lifecycle claim (AC-5 here).
 - [ ] AC-6: upgrade path: formula caveats (and release notes) instruct
   existing users to run `brew services stop teton` once; a doc section
   explains the old vs new lifecycle.
-- [ ] AC-7: handshake version-skew warning appears when CLI and daemon
+- [x] AC-7: handshake version-skew warning appears when CLI and daemon
   versions differ (unit-testable via injected versions) and does not appear
   when they match.
 - [ ] AC-8: config: `never` mode + `brew services` keeps today's always-on
   behavior (daemon survives last disconnect); `linger` mode with
   `linger_seconds=N` exits N seconds after the last disconnect unless a
   client returns.
-- [ ] AC-9: unit: the lifetime state machine is covered without any socket,
+- [x] AC-9: unit: the lifetime state machine is covered without any socket,
   launchd, or TTY — arm, disarm, defer, exit ordering (BR-9).
 
 ## External Dependencies
