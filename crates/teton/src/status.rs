@@ -108,6 +108,20 @@ pub(crate) mod scan {
     }
 
     /// Every production source in the client, as `(relative path, text)`.
+    ///
+    /// **A file that vanishes between the walk and the read is skipped, loudly**
+    /// (LESSON-489). This repo's primary verification technique is the mutation
+    /// pass — apply a change to `src/`, run the suite, observe red, revert — and
+    /// that rewrites source files between `cargo test` invocations *by
+    /// construction*. A scanner that `expect`ed every listed file to still be
+    /// readable therefore fails at exactly the moment someone is relying on it,
+    /// and the failure looks like a real finding: it was mistaken for one twice
+    /// in REQ-561 before anyone recognised it (BUG-159).
+    ///
+    /// The tolerance is narrow on purpose. It covers a file that is *gone* from
+    /// a fresh listing, not one this process merely could not read — that stays
+    /// a loud failure, because a scanner silently skipping its target is worse
+    /// than no scanner.
     pub(crate) fn production_sources() -> Vec<(String, String)> {
         let root = client_src();
         let mut files = Vec::new();
@@ -115,15 +129,36 @@ pub(crate) mod scan {
         files.sort();
         files
             .iter()
-            .map(|path| {
-                let text = std::fs::read_to_string(path)
-                    .unwrap_or_else(|err| panic!("unreadable source {}: {err}", path.display()));
+            .filter_map(|path| {
+                let text = match std::fs::read_to_string(path) {
+                    Ok(text) => text,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        let mut current = Vec::new();
+                        rust_files(&root, &mut current);
+                        if !current.contains(path) {
+                            eprintln!(
+                                "status::scan: {} vanished between the directory listing \
+                                 and the read, and is gone from a fresh listing; skipped",
+                                path.display()
+                            );
+                            return None;
+                        }
+                        // Still listed — the window was a rename, not a deletion.
+                        std::fs::read_to_string(path).unwrap_or_else(|err| {
+                            panic!(
+                                "source file {} is listed but unreadable: {err}",
+                                path.display()
+                            )
+                        })
+                    }
+                    Err(err) => panic!("unreadable source {}: {err}", path.display()),
+                };
                 let rel = path
                     .strip_prefix(&root)
                     .expect("a file under src/")
                     .to_string_lossy()
                     .into_owned();
-                (rel, strip_test_modules(&text))
+                Some((rel, strip_test_modules(&text)))
             })
             .collect()
     }
