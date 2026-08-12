@@ -3,14 +3,16 @@
   "branch": "feat/REQ-559-global-reasoning-effort",
   "startedAt": "2026-08-11T00:00:00Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -43,6 +45,16 @@
       "phase": 5,
       "name": "Verify",
       "completedAt": "2026-08-11T02:30:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-11T02:45:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-11T02:55:00Z"
     }
   ],
   "repos": {
@@ -77,5 +89,9 @@
     "failedTasks": []
   },
   "blockers": [],
-  "notes": []
+  "notes": [
+    "Orchestrator merge override honored: REQ-559 and REQ-560 have overlapping footprints (COMMANDS table, CLI status/session surface). Stopped after Phase 7; did NOT self-merge.",
+    "OQ-1 closed at architecture time (ADR-E), OQ-5 (ADR-I), OQ-6 (ADR-F). OQ-4 and OQ-1's flag-ergonomics residual remain open by design.",
+    "Coverage gaps recorded honestly in the PR body: AC-7's full daemon-restart cycle is covered at the config layer only; AC-11 passes structurally (BR-13 is a non-change) without a dedicated max-effort egress test."
+  ]
 }
