@@ -218,6 +218,21 @@ impl ConsentRoute {
         }
     }
 
+    /// A stable, log-safe name for which routing rule this request took.
+    ///
+    /// Exists so the daemon can say *which* arm sent a prompt nowhere without
+    /// [`RenderedBy`] leaving this module — the variants carry a `SessionId`,
+    /// and a session id has no business in a log line (conventions: privacy in
+    /// logs). Names the rule, never its subject.
+    #[must_use]
+    pub fn arm(&self) -> &'static str {
+        match &self.rendered_by {
+            RenderedBy::ConnectionsAttachedTo(_) => "connections attached to the session",
+            RenderedBy::TheRequesterItself => "the requester itself",
+            RenderedBy::AnyAttachedPeer => "any attached peer other than the requester",
+        }
+    }
+
     /// The monitor arm (REQ-570 BR-5): any connection holding a session, never
     /// the requester.
     #[must_use]
