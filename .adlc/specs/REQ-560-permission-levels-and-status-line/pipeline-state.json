@@ -92,6 +92,9 @@
   },
   "blockers": [],
   "notes": [
-    "Subagent mode (/sprint pipeline-runner). Orchestrator merge override: STOP after Phase 7, report pr-ready. Do NOT self-merge \u2014 overlapping footprint with REQ-559 (COMMANDS table, CLI status/session surface)."
+    "Subagent mode (/sprint pipeline-runner). ORCHESTRATOR MERGE OVERRIDE: stop after Phase 7 and report pr-ready. Do NOT self-merge \u2014 overlapping footprint with REQ-559 (COMMANDS table, CLI status/session surface). Orchestrator sequences REQ-559 first, then REQ-560, each behind a fresh trial-merge gate.",
+    "Expect to rebase onto a main that already carries REQ-559. Overlap points: crates/teton/src/slash.rs COMMANDS table (this REQ adds the `permissions` row and an Args::Optional variant; REQ-559 adds `effort`), and crates/teton/src/status.rs status_line's `effort` parameter, which is the seam REQ-559 fills.",
+    "AC-14 mutation check performed and recorded in the PR body; all three legs confirmed red then reverted.",
+    "AC-13: CI matrix [ubuntu-latest, macos-latest] both run cargo test --workspace (includes cli_e2e + pty_e2e). Linux pty leg first observed on this PR's CI."
   ]
 }
