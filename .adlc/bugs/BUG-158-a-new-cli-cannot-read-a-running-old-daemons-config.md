@@ -1,9 +1,10 @@
 ---
 id: BUG-158
 title: "A new CLI cannot read a running v0.1.10 daemon's config — policy show and config get fail with a raw serde error"
-status: fixed
+status: resolved
 severity: medium
 created: 2026-08-07
+updated: 2026-08-12
 component: "protocol"
 domain: "upgrade-path"
 found_by: REQ-561 Phase-5 verify panel
