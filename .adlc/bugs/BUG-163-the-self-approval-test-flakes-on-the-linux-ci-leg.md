@@ -1,35 +1,33 @@
 ---
 id: BUG-163
-title: "A transient /proc read is treated as a vanished process, so a legitimate client is silently denied consent (surfaced as a flaky attach test on Linux)"
+title: "The self-approval attach test flakes on the Linux CI leg — the withholding mechanism is understood, the trigger is not"
 status: open
-severity: high
+severity: medium
 created: 2026-08-12
 updated: 2026-08-12
-component: "daemon/peer"
+component: "daemon/session"
 domain: "session-authorization"
 stack: ["rust", "daemon", "json-rpc", "linux"]
 concerns: ["security", "availability", "test-determinism"]
 tags: ["ancestry-gate", "procfs", "attach-consent", "may-answer", "flaky-test", "linux", "REQ-570", "REQ-569"]
 found_by: "CI on PR #107 (a docs-only change), 2026-08-12"
-introduced_by: REQ-569
+introduced_by: REQ-570
 ---
 
 ## Description
 
-> **The title and severity changed after analysis (2026-08-12).** This was filed
-> as a flaky test at medium. It is a **daemon defect** at high: on Linux, a
-> transient `/proc/<pid>/status` read failure is indistinguishable from a
-> vanished process, and the daemon silently denies the affected connection the
-> right to answer an attach-consent prompt. The flaky test is the symptom that
-> made it visible. The filename still carries the original slug so links from
-> PR #108 keep resolving.
+> **Corrected 2026-08-12 (third revision).** This report has now carried two
+> root causes and **both were refuted**. PR #109 raised it to high and asserted a
+> transient `/proc` read as "the actual mechanism"; Linux probing disproved that.
+> Severity is back to **medium** and the root cause is back to **unknown**. The
+> filename carries the original slug so links from PRs #108/#109 keep resolving.
+>
+> What is established: **the withholding chain is real**. What is not: **anything
+> that triggers it.**
 
-**The defect.** `linux::parent_of` treats any `/proc` read error as "process
-gone", which becomes `Ancestry::Indeterminate`, which sets `may_answer: false` on
-that connection's consent surface, which makes `deliver()` skip it. The consent
-frame is then sent to nobody and the request waits out its window. In production
-that is a legitimate user's resume flow failing at 30 seconds with no
-explanation; in CI it is a 20-second read deadline and a red suite.
+**Status in one line.** A real, reproducible-in-CI flake whose *mechanism of
+failure* is understood link by link, and whose *cause* — what actually sets that
+mechanism off — has survived two attempts to name it.
 
 **The symptom.**
 `tetond/tests/attach_authorization.rs::a_consent_the_requester_granted_itself_is_named_as_such_in_the_daemon_log`
@@ -104,7 +102,12 @@ creator's attachment (set synchronously inside `record_created`).
 
 Recorded rather than deleted, so nobody re-treads it.
 
-### The actual mechanism
+### The second hypothesis — the withholding chain (real) and its trigger (refuted below)
+
+> Kept because the **chain** is verified and load-bearing for any future
+> investigation. Its **trigger** — the `/proc` read failure — is disproved in the
+> next section. PR #109 published this section as "the actual mechanism"; that
+> framing was wrong and is retracted.
 
 **`crates/tetond/src/peer.rs`, the Linux arm:**
 
@@ -137,77 +140,105 @@ failure treated as a fact about the world rather than a fact about the read.**
 BUG-159 conflated "the file vanished" with "the read failed"; this conflates
 "the process vanished" with "the `/proc` read failed."
 
-### Why this explains what was observed, where the first hypothesis did not
+### REFUTED — the trigger, disproved on Linux (2026-08-12)
 
-- **Linux-only** — macOS uses `sysctl(KERN_PROC_PID)`, which has no file read to
-  fail. The first hypothesis was platform-neutral and could not account for the
-  asymmetry.
-- **Load-sensitive** — `/proc` reads get less reliable exactly when the runner is
-  contended, which is when it fired.
-- **~1 in 9** — a transient error rate, not a logic error.
-- **Twenty seconds of total silence** — the frame is *withheld*, not delayed.
+The chain above is real. The claim that a **transient `/proc` read failure**
+sets it off is not. Two probes in a Linux container (colima, 4 CPU), both
+negative:
 
-### Not reproduced
+| Probe | Conditions | Result |
+|---|---|---|
+| `/proc/<pid>/status` read for a process that is **alive throughout** | 3× CPU oversubscription, continuous `fork`/`exec` churn of the process table | **300,000 reads — 0 errors, 0 partial reads** |
+| Full ancestor walk where an **intermediate ancestor exits mid-walk** | same contention, 4,000 tree-churn iterations | **0 `Indeterminate`** — every walk ended `NotDescendant` |
 
-Still a hypothesis, however clean the chain. macOS gave **0 failures in 30 quiet
-runs** of the test and **12 runs of the full binary under full CPU saturation** —
-consistent with a Linux-only mechanism, but not evidence for it. A Linux
-reproduction is the next step and should land before the authorization path is
-touched.
+The second result explains why the first refinement fails too: when a middle
+process dies, the kernel **reparents its child to init immediately**, so the walk
+finds `ppid <= 1` and terminates cleanly. There is no window in which the chain
+"breaks under us" for a live leaf.
 
-## Why this is a product defect, not only a flaky test
+**So `linux::parent_of`'s conflation of "gone" with "unreadable" is real in the
+code and, on this evidence, unreachable in practice.** It remains worth tidying
+on its own merits — see Suggested fix — but it is **not** what makes this test
+flake, and nothing here should be cited as if it were.
 
-The severity was raised from medium to **high** here. The same transient failure
-in production silently downgrades a **legitimate** client to "may not answer
-consent", so a real user's resume flow dies at the 30-second window with no
-explanation and nothing in the error naming the cause.
+### Severity returned to medium
 
-The direction is fail-**closed**, so this is not a hole in REQ-569's perimeter —
-it is a spurious denial of a core flow. The rate on an ordinary developer machine
-is unmeasured and probably well below CI's 1-in-9; if it turns out negligible in
-practice this could come back down. It is rated on impact-when-it-fires, and on
-the fact that the failure is silent and undiagnosable from the user's side.
+PR #109 raised this to high on the strength of a production story — a legitimate
+client silently denied its resume — that depended entirely on the trigger just
+refuted. With no established trigger there is no evidence of production impact,
+so the rating goes back to **medium**, carried by the original argument: this is
+the suite that stands as evidence for REQ-569's ancestry gate and REQ-570's
+attestation split, and a suite that reddens intermittently teaches people to
+re-run it.
 
-The flaky test is the messenger.
+### What is established, and what is not
+
+**Established** — the withholding chain, verified link by link in source:
+`None` → `Indeterminate` → `may_hold_session_access()` false →
+`may_answer: false` → `deliver()` skips the surface → the frame reaches nobody.
+If anything ever yields `Indeterminate` for a legitimate client, a silent
+20s/30s denial follows with no diagnosis available to the user. That property is
+worth fixing regardless of this bug.
+
+**Not established** — anything that produces `Indeterminate` here. Ruled out so
+far: the test's barrier ordering (refuted by the disconnect sequence), both
+routing arms, the creator's attachment, `MAX_ANCESTRY_DEPTH` exhaustion (64, and
+real chains are a handful deep), `SO_PEERCRED` failure on a connected socket,
+transient `/proc` read failure, and ancestor-exits-mid-walk.
+
+**Not reproduced anywhere outside CI.** macOS: 0 failures in 30 quiet runs of the
+test and 12 runs of the full binary under full CPU saturation.
+
+### A note on how this report went wrong twice
+
+Both refuted root causes were arrived at the same way: read the code, find a path
+that *could* produce the symptom, and mistake its tidiness for evidence. The
+second was more persuasive than the first precisely because it explained the
+platform asymmetry — and it was equally wrong. A mechanism that could produce a
+symptom is not evidence that it did. The next step is deliberately an
+*observation*, not a third hypothesis.
 
 ## Suggested fix
 
-**Do not raise `READ_DEADLINE`**, and do not touch the test's barrier — the
-barrier is correct and the deadline is doing its job by making a withheld frame
-loud.
+There is no fix to make yet — the cause is unknown. What follows is what should
+**not** be done, and what is worth doing anyway.
 
-Narrow the Linux arm so it distinguishes *gone* from *unreadable*: `ENOENT` (and
-`ESRCH`) is a vanished process and stays `None`; any other error is a failed read
-and should be retried before the walk gives up.
+**Do not raise `READ_DEADLINE`**, and do not touch the test's barrier. The
+barrier is correct (proved above) and the deadline is doing its job by making a
+withheld frame loud rather than slow. Raising it converts an occasional loud
+failure into a slower occasional loud failure.
 
-**The failure semantics are the security-sensitive part and must be chosen
-deliberately.** `Indeterminate` must remain the terminal answer when the read
-cannot be completed — retry then `Indeterminate`, never retry then *assume*.
-Treating a still-alive but unreadable process as eligible would punch a hole
-straight through REQ-569's ancestry gate, converting a spurious denial into a
-spurious admission. Fail-closed is the correct direction; the bug is only that we
-arrive there on evidence we do not actually have.
+**Do not "fix" `linux::parent_of` as though it were the cause.** Distinguishing
+`ENOENT` from a transient read error is defensible tidying — the current `.ok()?`
+does conflate two different facts — but the probes say that conflation is
+unreachable in practice, so doing it would close this bug in appearance only.
+If it is done, it must be on its own merits and with `Indeterminate` still
+terminal: **retry then `Indeterminate`, never retry then assume.** Treating a
+still-alive but unreadable process as eligible would convert a spurious denial
+into a spurious admission, straight through REQ-569's ancestry gate.
 
-Worth doing at the same time: make an `Indeterminate` classification **observable**.
-Today a legitimate client that trips this is refused with no signal a user or an
-operator could act on, which is why this surfaced as a test timeout rather than
-as a report.
+**Worth doing regardless of this bug:** an `Indeterminate` classification is
+currently invisible. A legitimate client that trips it is refused with nothing a
+user or operator can act on, and the daemon keeps no record of the decision. That
+is a real gap in a security-relevant path independent of whether it is what makes
+this test flake — and it is what the "observe, do not hypothesise" step above
+addresses.
 
-## Next step (agreed 2026-08-12)
+## Next step: observe, do not hypothesise
 
-**Reproduce on Linux before touching the authorization path.** The chain above is
-read off the code and explains every observed property, but it has not been
-executed. A change to REQ-569's ancestry gate should rest on a reproduction, not
-on reasoning however clean — that gate is the perimeter, and the fix's whole
-subtlety is in its failure semantics.
+Two hypotheses have now been refuted, and a third would be worth less than one
+measurement. **Make the next occurrence diagnosable**, then wait for it.
 
-Shape of the reproduction: build the workspace in a Linux container, run the
-`attach_authorization` binary in a loop under CPU contention, and confirm both
-that the failure appears and that it is preceded by an `Indeterminate`
-classification. Injecting a fault at the `ParentOf` seam is the cheaper
-confirmation — `is_descendant_of` already takes a `&dyn ParentOf`, so a lookup
-that fails transiently can be simulated on any platform, and the daemon-level
-consequence observed without procfs at all.
+The daemon computes each connection's `Ancestry` exactly once, at handshake, and
+then discards the inputs. When CI next goes red there is no way to tell whether
+`Indeterminate` was involved at all — which is why this has cost two rounds of
+guessing. Recording the classification and the peer pid at handshake turns the
+next failure into a single log line that either implicates this mechanism or
+clears it for good.
+
+That is a small, additive change to a security-critical path: it records a
+decision already being made and changes no predicate. It is the cheapest thing
+that can end this.
 
 ## Related
 
