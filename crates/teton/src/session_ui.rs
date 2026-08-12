@@ -497,8 +497,10 @@ pub fn render_event(
 /// Put an attach/monitor consent question to the user and build the answer
 /// (REQ-570 BR-4, AC-4).
 ///
-/// Returns the [`AttachConsentParams`] to send, or `None` when there is nobody
-/// to ask — see the auto-answer rule below.
+/// Always returns an answer. There is deliberately no "no reply" arm: an
+/// unanswered consent costs the requester the daemon's full 30-second window,
+/// and a client that has decided to decline should say so immediately rather
+/// than make a user wait out a timeout for a decision already taken.
 ///
 /// # It never auto-answers, and that is the point
 ///
@@ -522,7 +524,7 @@ pub fn resolve_attach_consent(
     request: &AttachConsentRequested,
     surface: &mut dyn Surface,
     prompter: &mut dyn Prompter,
-) -> Option<AttachConsentParams> {
+) -> AttachConsentParams {
     // The question first, as a notice: it is news whether or not the user is in
     // a position to answer, and it must be legible before the prompt line.
     surface.line(LineKind::Notice, &format_attach_consent_notice(request));
@@ -543,10 +545,10 @@ pub fn resolve_attach_consent(
             "no interactive input available, so the request was declined. \
              Answer it from an interactive `teton` session.",
         );
-        return Some(AttachConsentParams {
+        return AttachConsentParams {
             request_id: request.request_id.clone(),
             outcome: AttachConsentOutcome::Denied,
-        });
+        };
     };
 
     // Default-deny on anything that is not an explicit yes, which is the
@@ -563,14 +565,14 @@ pub fn resolve_attach_consent(
         },
     );
 
-    Some(AttachConsentParams {
+    AttachConsentParams {
         request_id: request.request_id.clone(),
         outcome: if granted {
             AttachConsentOutcome::Granted
         } else {
             AttachConsentOutcome::Denied
         },
-    })
+    }
 }
 
 /// The one-line notice an `attach_consent_requested` event draws (REQ-569 BR-6).
@@ -1310,8 +1312,7 @@ mod tests {
                 &consent_request(ConsentScope::Attach),
                 &mut surface,
                 &mut prompter,
-            )
-            .expect("an answered prompt produces a reply");
+            );
 
             assert_eq!(reply.outcome, expected, "{case}");
             assert_eq!(reply.request_id.to_string(), "consent-0", "{case}");
@@ -1338,8 +1339,7 @@ mod tests {
             &consent_request(ConsentScope::Attach),
             &mut surface,
             &mut prompter,
-        )
-        .expect("even with nobody there, the request is answered rather than left hanging");
+        );
 
         assert_eq!(
             reply.outcome,
@@ -1369,8 +1369,7 @@ mod tests {
                 &consent_request(ConsentScope::Attach),
                 &mut surface,
                 &mut prompter,
-            )
-            .expect("answered");
+            );
             assert_eq!(
                 reply.outcome,
                 AttachConsentOutcome::Denied,

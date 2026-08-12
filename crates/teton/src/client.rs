@@ -412,13 +412,12 @@ impl Connection {
                 // Fire-and-forget like a permission answer: the ack comes back
                 // later as a stray response and is ignored. Awaiting it here
                 // would re-enter the event pump from inside an event dispatch.
-                if let Some(reply) = session_ui::resolve_attach_consent(
+                let reply = session_ui::resolve_attach_consent(
                     &request,
                     &mut *ctx.surface,
                     &mut *ctx.prompter,
-                ) {
-                    self.send(reply)?;
-                }
+                );
+                self.send(reply)?;
             }
             EventOutcome::AttachConsent(request) => {
                 // Not our prompt to answer. Rendered rather than swallowed for
