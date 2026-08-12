@@ -138,34 +138,58 @@ Rust+cmake burden this REQ exists to remove.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: On a clean macOS Apple Silicon machine with only Homebrew
+- [ ] AC-1 **[MANUAL GATE — not CI-enforceable]**: On a clean macOS Apple Silicon machine with only Homebrew
       installed: `brew install atelier-fashion/tap/teton`, then
       `brew services start teton`, then `teton` reaches the first-run model
       proposal (names the pick, download size, RAM floor). Human-verified and
       signed off, mirroring the AC-13 runbook posture.
-- [ ] AC-2: The same sequence works on macOS x86_64 and Linux x86_64
+
+      **Unticked deliberately, not overlooked.** needs a **clean machine**: a fresh macOS Apple Silicon box with only Homebrew. CI runners carry state and cannot prove a first install. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
+- [ ] AC-2 **[MANUAL GATE — not CI-enforceable]**: The same sequence works on macOS x86_64 and Linux x86_64
       (Homebrew on Linux), each verified on its own platform — a green
       arm64 run is not evidence for the others (informed by LESSON-433).
       CI smoke per platform is mandatory; human sign-off per platform is
       recorded when hardware is available, and unrun legs are recorded as
       unrun, not assumed.
+
+      **Unticked deliberately, not overlooked.** needs **macOS x86_64 and Linux x86_64 hardware**, neither of which this project's CI matrix provides. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
 - [x] AC-3: Pushing tag `vX.Y.Z` runs one workflow that: refuses on
       tag/Cargo-version mismatch before building; builds all three targets
       with `tetond/llama`; smoke-tests each on its own platform (BR-7);
       asserts the seam refusal (BR-9); publishes the GitHub Release with
       tarballs + checksums; and bumps the tap formula — all green in one run
       with no manual step.
-- [ ] AC-4: `brew upgrade teton` from release N-1 to N works and the running
+- [ ] AC-4 **[MANUAL GATE — not CI-enforceable]**: `brew upgrade teton` from release N-1 to N works and the running
       daemon story is documented (upgrade does not silently leave an old
       `tetond` running — `brew services restart` guidance or automation).
       Mechanically satisfiable only from the second release onward; for
       v0.1.0 this criterion is staged (the upgrade path exists and is
       documented) and first exercised by the v0.1.x follow-up release.
-- [ ] AC-5: The formula's `test do` block passes in CI for the tap
+
+      **Unticked deliberately, not overlooked.** needs two **real installed releases** to upgrade between; the tag→release path is covered by AC-3, the upgrade itself is not. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
+- [ ] AC-5 **[MANUAL GATE — not CI-enforceable]**: The formula's `test do` block passes in CI for the tap
       (`teton --version` matches the formula version).
-- [ ] AC-6: `brew services start|stop|restart teton` manage the daemon;
+
+      **Unticked deliberately, not overlooked.** the formula's `test do` block runs in the **tap repository**, not here — this repo cannot assert another repo's CI. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
+- [ ] AC-6 **[MANUAL GATE — not CI-enforceable]**: `brew services start|stop|restart teton` manage the daemon;
       after `start`, `teton doctor` reports a healthy socket without any
       manual `tetond` invocation.
+
+      **Unticked deliberately, not overlooked — and still accurate.** REQ-565
+      made `brew services` **opt-in rather than the default**; it did not remove
+      it. `packaging/homebrew/teton.rb.tmpl` still carries a `service do` block,
+      and says so in as many words: *"`brew services start teton` is the explicit
+      always-on choice, and it is the only path that reaches this block."* What
+      changed is that a plain `brew install` no longer registers the service and
+      the block carries no `keep_alive` (REQ-565 AC-5) — so this AC and REQ-565
+      AC-5 are consistent, not contradictory.
+
+      It stays unticked only because verifying it needs a real Homebrew install.
+      Do not tick without a recorded sign-off (REQ-547 AC-13 precedent).
 - [x] AC-7: `https://tetoncode.ai` serves the landing page over HTTPS with
       the overview and the install command; the displayed version matches the
       latest release at deploy time (BR-8).

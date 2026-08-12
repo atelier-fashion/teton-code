@@ -128,22 +128,31 @@ lifecycle claim (AC-5 here).
   handshake is refused and the client's autostart path connects to a fresh
   daemon; the prompt turn succeeds either way; never two daemons (flock
   assertion).
-- [ ] AC-5: packaging: the rendered formula's service block carries no
+- [ ] AC-5 **[MANUAL GATE — not CI-enforceable]**: packaging: the rendered formula's service block carries no
   `keep_alive` and the default install performs no boot-time start; the
   release smoke that previously asserted `brew services` health is updated to
   prove the new lifecycle claim (install → CLI round-trip → process gone)
   rather than silently weakened. (informed by LESSON-459 — a gate proves only
   what it exercises)
-- [ ] AC-6: upgrade path: formula caveats (and release notes) instruct
+
+      **Unticked deliberately, not overlooked.** packaging: asserts the **rendered formula's** service block, which is produced in the tap repo at release time. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
+- [ ] AC-6 **[MANUAL GATE — not CI-enforceable]**: upgrade path: formula caveats (and release notes) instruct
   existing users to run `brew services stop teton` once; a doc section
   explains the old vs new lifecycle.
+
+      **Unticked deliberately, not overlooked.** an **upgrade-path instruction** to existing users (formula caveats + release notes), not a property of this tree. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
 - [x] AC-7: handshake version-skew warning appears when CLI and daemon
   versions differ (unit-testable via injected versions) and does not appear
   when they match.
-- [ ] AC-8: config: `never` mode + `brew services` keeps today's always-on
+- [ ] AC-8 **[MANUAL GATE — not CI-enforceable]**: config: `never` mode + `brew services` keeps today's always-on
   behavior (daemon survives last disconnect); `linger` mode with
   `linger_seconds=N` exits N seconds after the last disconnect unless a
   client returns.
+
+      **Unticked deliberately, not overlooked.** needs `brew services` on a real install to compare `never` mode against today's always-on behaviour. Do not tick without a
+      recorded sign-off (REQ-547 AC-13 precedent).
 - [x] AC-9: unit: the lifetime state machine is covered without any socket,
   launchd, or TTY — arm, disarm, defer, exit ordering (BR-9).
 
