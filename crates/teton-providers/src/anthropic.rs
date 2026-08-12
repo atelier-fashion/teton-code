@@ -19,7 +19,7 @@ use crate::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use teton_core::ToolCallTier;
+use teton_core::{ResolvedEffort, ToolCallTier};
 
 /// Default Anthropic context window used when none is configured.
 const DEFAULT_MAX_CONTEXT: u32 = 200_000;
@@ -48,6 +48,10 @@ impl AnthropicAdapter {
                 tool_call_tier: ToolCallTier::Native,
                 parallel_calls: true,
                 max_context: DEFAULT_MAX_CONTEXT,
+                // REQ-559: undeclared, so `resolve_effort` applies the
+                // per-kind default (ADR-E) rather than a value duplicated here.
+                // Two sources for one default is the LESSON-456 drift.
+                ..CapabilityProfile::default()
             },
         }
     }
@@ -107,6 +111,30 @@ impl AnthropicAdapter {
             body["tools"] = json!(tools);
         }
 
+        // REQ-559 BR-4 / ADR-A: exactly one reasoning shape, or none. The
+        // `match` is exhaustive with **no wildcard arm** on purpose — adding a
+        // fourth shape later must break this function until someone decides
+        // what it emits. No arm writes two keys, so "never both" (AC-2) is a
+        // property of the code rather than of the test that also asserts it.
+        match req.effort {
+            // ADR-H: `output_config.effort` alone, with **no** `thinking`
+            // block, even though Anthropic accepts both. BR-4 says
+            // `effort_only` sends the effort field alone and AC-2 pins it as a
+            // test; Anthropic's thinking is already adaptive by default when
+            // effort is set, so omitting it changes nothing observable. A
+            // single-shape invariant that holds for every provider is worth
+            // more than a per-provider exception that makes AC-2 conditional.
+            // This omission is deliberate — do not "fix" it.
+            ResolvedEffort::Effort { level, .. } => {
+                body["output_config"] = json!({"effort": level.as_str()});
+            }
+            ResolvedEffort::ThinkingFlag => {
+                body["thinking"] = json!({"type": "adaptive"});
+            }
+            // The reason is for the event and the surface, never the wire.
+            ResolvedEffort::Omit { .. } => {}
+        }
+
         let body = serde_json::to_vec(&body).map_err(|e| ProviderError::Build(e.to_string()))?;
         Ok(TransportRequest {
             method: HttpMethod::Post,
@@ -151,9 +179,19 @@ impl Provider for AnthropicAdapter {
             });
         }
         if resp.status >= 400 {
-            return Err(ProviderError::ClientError {
-                status: resp.status,
-            });
+            // REQ-559 BR-12: a 400 naming the reasoning field is a refusal of
+            // that field, not a failure of the provider. Classified here — with
+            // the request's own `effort` in hand — because only this scope knows
+            // what was actually sent, and a refusal claim made without that is a
+            // guess (crate::classify_client_error short-circuits when the
+            // request carried no reasoning field at all).
+            return Err(crate::classify_client_error(
+                resp.status,
+                resp.body,
+                &self.id,
+                request.effort,
+            )
+            .await);
         }
         Ok(event_stream(resp.body))
     }
@@ -323,6 +361,11 @@ impl State {
             usage: TokenUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                // REQ-559 BR-10: Anthropic reports no reasoning-token count, so
+                // this stays `None` — unreported, which is the truth about it.
+                // Deliberate, not an oversight: `anthropic_reports_no_reasoning_split`
+                // pins it so a future reader does not read the absence as a gap.
+                reasoning_tokens: None,
             },
             stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
         })

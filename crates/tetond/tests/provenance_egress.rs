@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use teton_core::effort::{EffortLevel, ResolvedEffort};
 
 use async_trait::async_trait;
 
@@ -178,6 +179,9 @@ async fn run_touching_tool(
         "deepseek",
         "deepseek-chat",
         session_id.clone(),
+        // REQ-559: an integration fixture states its effort like any other
+        // call path — the field is required, so it cannot be forgotten.
+        ResolvedEffort::effort(EffortLevel::High),
     );
 
     // Full profile so the loop does not force a verification nudge before the

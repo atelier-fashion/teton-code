@@ -21,6 +21,7 @@
 //! - [`weights`] — the shared on-disk weights directory/filename convention (a
 //!   path is never sent over the wire, but both sides derive the same one).
 
+pub mod effort;
 pub mod events;
 pub mod handshake;
 pub mod jsonrpc;

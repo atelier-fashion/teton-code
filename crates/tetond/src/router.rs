@@ -52,12 +52,14 @@
 //! `teton_protocol::Phase` that travels on `route_decided` / `cost_recorded`
 //! out.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use teton_core::category::{
     resolve as resolve_category, Category as CoreCategory, CategoryResolution, CategoryTable,
     JudgmentCategory, Tier as CoreTier, TierBinding,
 };
+use teton_core::effort::{resolve_effort, EffortLevel, EffortOmission, ResolvedEffort};
+use teton_core::entities::{ProviderCapabilities, ProviderKind};
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::{ProviderHealth, RouteOutcome};
 
@@ -171,6 +173,11 @@ pub struct TierReport {
 struct ProviderRuntime {
     /// Concrete model name billed for this provider (drives cost attribution).
     model: String,
+    /// Transport/vendor family. Needed because the REQ-559 per-kind reasoning
+    /// defaults (ADR-E) key on it, and `CapabilityProfile` deliberately does not
+    /// carry a kind of its own — duplicating `ModelProvider::kind` there would be
+    /// the two-sources-of-one-fact drift LESSON-456 is about.
+    kind: ProviderKind,
     /// Capability profile (tool-call tier → harness degradation, BR-6).
     capabilities: CapabilityProfile,
     /// Current health as the router sees it (BR-5 policy fallback input).
@@ -226,6 +233,17 @@ pub struct Route {
     /// router produces carries one, which
     /// `every_route_but_the_taint_pin_carries_its_resolution` asserts.
     pub resolution: Option<CategoryResolution>,
+    /// What this turn's request will put in its reasoning field(s) (REQ-559).
+    ///
+    /// Resolved **once**, here, by [`Router::effort_for`] (ADR-G).
+    /// [`Route::route_decided`] and [`Route::turn_route`] both *read* it off
+    /// this field and neither recomputes it — the same ADR-D discipline the
+    /// `category`/`tier` projection follows, and for the same reason: the event
+    /// must report the level the request actually carries (AC-4), which it
+    /// cannot do if the two are computed separately.
+    ///
+    /// `None` only when no provider was selected.
+    pub effort: Option<ResolvedEffort>,
 }
 
 impl Route {
@@ -254,6 +272,27 @@ impl Route {
             provider_id: provider_id.clone(),
             model: self.model.clone(),
             reason: self.reason.clone(),
+            // Read off the route, never recomputed (ADR-D/ADR-G). This is the
+            // **clamped** level — reporting the requested one would make the
+            // event lie about the call (BR-5, AC-4).
+            effort: self.effort,
+        })
+    }
+
+    /// The effort this route's requests carry, with the honest floor for a
+    /// route that resolved no provider (REQ-559).
+    ///
+    /// `Route::effort` is `None` only when no provider was selected — there was
+    /// nothing to resolve against. Every caller that reaches a request has
+    /// already established a provider, so this is unreachable in practice; it
+    /// resolves to `Omit(ShapeNone)` rather than panicking or inventing a level,
+    /// because "send no reasoning field" is the one answer that is always safe
+    /// and always honest. Shared by [`Route::turn_route`] and the daemon's
+    /// remote-source construction so the floor is stated once.
+    #[must_use]
+    pub fn effective_effort(&self) -> ResolvedEffort {
+        self.effort.unwrap_or(ResolvedEffort::Omit {
+            reason: EffortOmission::ShapeNone,
         })
     }
 
@@ -266,6 +305,12 @@ impl Route {
             provider_id,
             model: self.model.clone(),
             config: self.harness.clone(),
+            // The same value the event carries — one resolution, two readers.
+            // `Omit(ShapeNone)` is unreachable here in practice (a selected
+            // provider always resolves), but it is the honest floor: a route
+            // with a provider the router does not know sends no reasoning field
+            // rather than inventing a level.
+            effort: self.effective_effort(),
         })
     }
 }
@@ -303,6 +348,20 @@ pub struct Router {
     judgment_default: JudgmentCategory,
     /// Whether the local tier can serve its BR-8 latency duty right now.
     local_available: bool,
+    /// The effort level in force for this turn (REQ-559 BR-2): one global
+    /// setting, resolved by the caller as
+    /// `session_override.or(config.effort)` and defaulted to `high` — never
+    /// absent (BR-1).
+    effort: EffortLevel,
+    /// Providers that answered 400 on the effort field earlier in this session
+    /// (REQ-559 BR-12 / ADR-F).
+    ///
+    /// **Session-scoped and never persisted.** The declared `reasoning_shape`
+    /// is untouched, so the next session tries again and a provider that gains
+    /// support self-heals with no config edit. Keyed by provider id — the key
+    /// the user configured — so two providers pointing at one endpoint are
+    /// remembered separately.
+    effort_refused: BTreeSet<String>,
 }
 
 impl Router {
@@ -320,7 +379,81 @@ impl Router {
             default_provider,
             judgment_default: JudgmentCategory::default(),
             local_available: true,
+            effort: EffortLevel::default(),
+            effort_refused: BTreeSet::new(),
         }
+    }
+
+    /// Set the effort level this router resolves against (REQ-559 BR-2/BR-8).
+    ///
+    /// Read from `Config::effort` (or the session override), which is why it is
+    /// configuration-visible rather than a constant compiled in here.
+    #[must_use]
+    pub fn with_effort(mut self, effort: EffortLevel) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// Seed the set of providers that refused the effort field this session
+    /// (REQ-559 BR-12 / ADR-F). Session-scoped; never read from or written to
+    /// config.
+    #[must_use]
+    pub fn with_effort_refusals(mut self, refused: BTreeSet<String>) -> Self {
+        self.effort_refused = refused;
+        self
+    }
+
+    /// The effort level in force (the pre-clamp request). Exposed so the
+    /// `teton effort` / `/effort` surfaces report the same number the router is
+    /// working from (BR-9).
+    #[must_use]
+    pub fn effort(&self) -> EffortLevel {
+        self.effort
+    }
+
+    /// **The** per-provider effort resolution (REQ-559 ADR-G, BR-9).
+    ///
+    /// Every `Route` this router builds calls this, and so does the
+    /// `teton effort` / `/effort` view — one function, so the event, the request
+    /// and the surface cannot disagree about what a provider is being sent
+    /// (LESSON-456). The clamp itself lives in `teton_core::effort`, is pure,
+    /// and is table-tested there.
+    ///
+    /// `None` when no provider was selected: there is nothing to resolve
+    /// against, and minting a value would be reporting a decision that was never
+    /// made.
+    #[must_use]
+    pub fn effort_for(&self, provider_id: Option<&str>) -> Option<ResolvedEffort> {
+        let id = provider_id?;
+        let refused = self.effort_refused.contains(id);
+        let Some(runtime) = self.providers.get(id) else {
+            // The local tier is legitimately absent from `providers`: it comes
+            // from the engine rather than from a `[[providers]]` entry
+            // (REQ-557 ADR-D), so a config that declares no local provider still
+            // routes here. It must still report a **declared** no-op (BR-6):
+            // `None` would mean "a daemon that predates effort", which is a
+            // different claim from "effort does not apply to this tier, and here
+            // is why" — and a silently ignored setting is the BUG-146/BUG-153
+            // misattribution family.
+            if self.table.local_provider_id.as_deref() == Some(id) {
+                return Some(resolve_effort(
+                    self.effort,
+                    ProviderKind::Local,
+                    &ProviderCapabilities::default(),
+                    refused,
+                ));
+            }
+            // Any other unknown id is the no-tier-available case the caller
+            // turns into an error. It carries no capability declaration and no
+            // engine, so it has no honest resolution.
+            return None;
+        };
+        Some(resolve_effort(
+            self.effort,
+            runtime.kind,
+            &runtime.capabilities.to_core(),
+            refused,
+        ))
     }
 
     /// Set the category a freeform judgment turn falls back to (BR-9). Read from
@@ -337,6 +470,7 @@ impl Router {
     pub fn with_provider(
         mut self,
         id: impl Into<String>,
+        kind: ProviderKind,
         model: impl Into<String>,
         capabilities: CapabilityProfile,
         health: ProviderHealth,
@@ -345,6 +479,7 @@ impl Router {
             id.into(),
             ProviderRuntime {
                 model: model.into(),
+                kind,
                 capabilities,
                 health,
             },
@@ -520,8 +655,14 @@ impl Router {
                     .to_owned(),
                 outcome: RouteOutcome::NoPolicy,
                 resolution: None,
+                effort: None,
             };
         };
+        // REQ-559 BR-7: the taint pin lands on the local tier, whose declared
+        // shape is `none`, so a global bump to `max` cannot put a reasoning
+        // field on a locally-served turn. The cap comes from the clamp table,
+        // not from per-category configuration (which BR-2 forbids).
+        let effort = self.effort_for(Some(&provider));
         Route {
             model: self.model_of(&provider),
             harness: self.harness_config_for(&provider),
@@ -529,6 +670,7 @@ impl Router {
             phase: None,
             reason: reason.into(),
             outcome: RouteOutcome::Fallback,
+            effort,
             // BR-7: the taint pin overrides every category binding, so this route
             // is deliberately *not* a category resolution — it is the privacy
             // backstop refusing to consult one.
@@ -859,6 +1001,7 @@ impl Router {
             reason: resolution.reason.clone(),
             outcome: resolution.outcome,
             harness,
+            effort: self.effort_for(resolution.provider_id.as_deref()),
             resolution: Some(resolution),
         }
     }
@@ -999,6 +1142,7 @@ impl Router {
             reason,
             outcome,
             harness,
+            effort: self.effort_for(Some(provider)),
             resolution: failed.resolution.clone(),
         }
     }
@@ -1053,6 +1197,7 @@ mod tests {
     use super::*;
     use crate::classify::ClassificationSignal;
     use teton_core::category::category_for_phase;
+    use teton_core::effort::EffortLadder;
     use teton_core::ToolCallTier;
 
     /// A `Route` carrying `resolution`, with everything else fixed. The point of
@@ -1065,6 +1210,7 @@ mod tests {
             reason: resolution.reason.clone(),
             outcome: resolution.outcome,
             harness: HarnessConfig::default(),
+            effort: None,
             resolution: Some(resolution),
         }
     }
@@ -1194,6 +1340,7 @@ mod tests {
         // map is exactly what that looks like from here.
         .with_provider(
             "primary",
+            ProviderKind::OpenaiCompatible,
             "deepseek-chat",
             native(),
             ProviderHealth::Healthy,
@@ -1224,6 +1371,7 @@ mod tests {
             tool_call_tier: ToolCallTier::Native,
             parallel_calls: true,
             max_context: 200_000,
+            ..CapabilityProfile::default()
         }
     }
 
@@ -1232,6 +1380,7 @@ mod tests {
             tool_call_tier: ToolCallTier::Degraded,
             parallel_calls: false,
             max_context: 32_000,
+            ..CapabilityProfile::default()
         }
     }
 
@@ -1256,16 +1405,199 @@ mod tests {
         )
         .with_provider(
             "anthropic",
+            ProviderKind::Anthropic,
             "claude-opus-4",
             native(),
             ProviderHealth::Healthy,
         )
         .with_provider(
             "deepseek",
+            ProviderKind::OpenaiCompatible,
             "deepseek-chat",
             native(),
             ProviderHealth::Healthy,
         )
+    }
+
+    // ---- REQ-559: effort resolution at route time ------------------------
+
+    /// AC-4 / BR-5. `route_decided` reports the **clamped** level, not the
+    /// requested one. With the session at `xhigh` and a provider whose ladder is
+    /// `{low, high, max}`, the event says `high`.
+    ///
+    /// Reporting the request would make the event lie about the call — the
+    /// number a user reads in `route_decided` is the number that went on the
+    /// wire, or it is worthless.
+    #[test]
+    fn route_decided_reports_the_clamped_level_not_the_requested_one() {
+        let three_rungs = CapabilityProfile {
+            effort_ladder: Some(EffortLadder::from_levels(&[
+                EffortLevel::Low,
+                EffortLevel::High,
+                EffortLevel::Max,
+            ])),
+            ..native()
+        };
+        let router = Router::new(
+            CategoryTable::new()
+                .with_local_provider("local")
+                .with_tier(tier(CoreTier::Think, "kimi", None)),
+            Some("kimi".to_owned()),
+        )
+        .with_effort(EffortLevel::Xhigh)
+        .with_provider(
+            "kimi",
+            ProviderKind::OpenaiCompatible,
+            "kimi-k3",
+            three_rungs,
+            ProviderHealth::Healthy,
+        );
+
+        let route = router.resolve(CoreCategory::Design);
+        let decided = route.route_decided().expect("a provider was selected");
+        assert_eq!(
+            decided.effort,
+            Some(ResolvedEffort::clamped(
+                EffortLevel::Xhigh,
+                EffortLevel::High
+            )),
+            "the event must name the clamped level (AC-4)",
+        );
+        assert_eq!(
+            decided.effort.unwrap().level(),
+            Some(EffortLevel::High),
+            "what goes on the wire is `high`, not the requested `xhigh`",
+        );
+        assert!(
+            decided.effort.unwrap().was_clamped(),
+            "and the event carries the fact that it WAS clamped, so a reader \
+             does not have to infer it by comparing against the setting",
+        );
+    }
+
+    /// ADR-G: one resolution, two readers. The value the event announces and the
+    /// value the request carries are the **same** value, not two computations of
+    /// one fact — which is the drift LESSON-456 is about.
+    #[test]
+    fn the_event_and_the_request_carry_the_same_resolution() {
+        let router = router().with_effort(EffortLevel::Max);
+        for category in [
+            CoreCategory::Design,
+            CoreCategory::Edit,
+            CoreCategory::Digest,
+        ] {
+            let route = router.resolve(category);
+            let Some(decided) = route.route_decided() else {
+                continue;
+            };
+            let turn = route.turn_route().expect("a provider was selected");
+            assert_eq!(
+                decided.effort,
+                Some(turn.effort),
+                "{category}: the event and the request must not be able to disagree",
+            );
+        }
+    }
+
+    /// AC-5 / BR-6. A call routed to the local tier resolves to a **declared**
+    /// no-op, not to an absent value: `Omit(ShapeNone)` is "effort does not apply
+    /// here, and here is why", while `None` would mean "a daemon that predates
+    /// effort". The surface renders the first as "not applicable"; it has
+    /// nothing to say about the second.
+    ///
+    /// The local tier is deliberately absent from `providers` here — it comes
+    /// from the engine, not from a `[[providers]]` entry (REQ-557 ADR-D) — which
+    /// is exactly the path that would otherwise report `None`.
+    #[test]
+    fn a_local_route_reports_a_declared_no_op_never_an_absent_one() {
+        let router = router().with_effort(EffortLevel::Max);
+        let route = router.resolve_local_pin("pinned for privacy");
+        assert_eq!(
+            route.effort,
+            Some(ResolvedEffort::omit(EffortOmission::ShapeNone)),
+            "BR-6: the local tier's no-op is declared, not merely true by omission",
+        );
+        assert_eq!(route.turn_route().unwrap().effort.level(), None);
+    }
+
+    /// AC-6 / BR-7. With the session at `max`, a local-pinned category still
+    /// carries no effort field. The cap comes from the clamp table — the local
+    /// kind's empty ladder and `none` shape — and **not** from any per-category
+    /// effort configuration, which BR-2 forbids outright.
+    #[test]
+    fn a_global_bump_to_max_cannot_inflate_a_local_pinned_category() {
+        for requested in teton_core::ALL_LEVELS {
+            let router = router().with_effort(requested);
+            let route = router.resolve_local_pin("reflex work stays local");
+            assert_eq!(
+                route.effective_effort(),
+                ResolvedEffort::omit(EffortOmission::ShapeNone),
+                "at {requested}, a local-pinned route must still send nothing",
+            );
+        }
+    }
+
+    /// BR-1: the absence of a user setting resolves to the declared default
+    /// (`high`), never to an absent field. A router built without
+    /// `with_effort` still states an effort.
+    #[test]
+    fn an_unconfigured_router_still_states_an_effort() {
+        let route = router().resolve(CoreCategory::Design);
+        assert_eq!(
+            route.effective_effort(),
+            ResolvedEffort::effort(EffortLevel::High),
+            "omission inherits the provider's default, and one of them is `max`",
+        );
+    }
+
+    /// ADR-F: a session refusal is honoured by the same resolver, so the event,
+    /// the request and the surface all report it together — a runtime no-op is
+    /// as visible as a declared one.
+    #[test]
+    fn a_session_refusal_reaches_the_event_and_the_request() {
+        let mut refused = BTreeSet::new();
+        refused.insert("anthropic".to_owned());
+        let router = router().with_effort_refusals(refused);
+        let route = router.resolve(CoreCategory::Design);
+        assert_eq!(route.provider_id.as_ref().unwrap().0, "anthropic");
+        assert_eq!(
+            route.effective_effort(),
+            ResolvedEffort::omit(EffortOmission::RefusedThisSession),
+        );
+        // And a provider that did NOT refuse is unaffected — the memo is keyed
+        // by provider id, not applied session-wide.
+        let other = router.resolve(CoreCategory::Edit);
+        assert_eq!(other.provider_id.as_ref().unwrap().0, "deepseek");
+        assert!(matches!(
+            other.effective_effort(),
+            ResolvedEffort::Effort { .. }
+        ));
+    }
+
+    /// AC-8's premise, at the router: the surface's per-provider view and the
+    /// router's per-call decision come from **one** function, so they cannot
+    /// disagree for any provider at any level. Asserted on `ResolvedEffort`
+    /// values, not on rendered strings — a golden-string test would pass while
+    /// the two diverged, because the surface would be self-consistently wrong.
+    #[test]
+    fn the_surface_view_and_the_route_agree_for_every_provider_and_level() {
+        for requested in teton_core::ALL_LEVELS {
+            let router = router().with_effort(requested);
+            for (category, provider) in [
+                (CoreCategory::Design, "anthropic"),
+                (CoreCategory::Edit, "deepseek"),
+            ] {
+                let from_route = router.resolve(category).effective_effort();
+                let from_view = router
+                    .effort_for(Some(provider))
+                    .expect("a registered provider resolves");
+                assert_eq!(
+                    from_route, from_view,
+                    "{provider} at {requested}: the surface and the router must \
+                     read one resolution, not two",
+                );
+            }
+        }
     }
 
     /// **AC-1, the headline regression.** `"explain the tradeoffs between these
@@ -1499,6 +1831,7 @@ mod tests {
         )
         .with_provider(
             "frontier-remote",
+            ProviderKind::OpenaiCompatible,
             "claude-opus-4",
             native(),
             ProviderHealth::Healthy,
@@ -1555,7 +1888,13 @@ mod tests {
             CategoryTable::new().with_tier(tier(CoreTier::Think, "ghost", None)),
             None,
         )
-        .with_provider("real", "a-model", native(), ProviderHealth::Healthy);
+        .with_provider(
+            "real",
+            ProviderKind::OpenaiCompatible,
+            "a-model",
+            native(),
+            ProviderHealth::Healthy,
+        );
 
         let route = router.resolve(CoreCategory::Design);
         assert_eq!(route.provider_id, None, "{route:?}");
@@ -1598,12 +1937,14 @@ mod tests {
         )
         .with_provider(
             "anthropic",
+            ProviderKind::Anthropic,
             "claude-opus-4",
             native(),
             ProviderHealth::Healthy,
         )
         .with_provider(
             "deepseek",
+            ProviderKind::OpenaiCompatible,
             "deepseek-chat",
             native(),
             ProviderHealth::Healthy,
@@ -1650,7 +1991,13 @@ mod tests {
             // Named by config, registered nowhere — REQ-557 ADR-E's shape.
             Some("deleted-vendor".to_owned()),
         )
-        .with_provider("on-device", "qwen", native(), ProviderHealth::Healthy);
+        .with_provider(
+            "on-device",
+            ProviderKind::Local,
+            "qwen",
+            native(),
+            ProviderHealth::Healthy,
+        );
 
         // Non-vacuity: a *usable* default is still inherited, so this test is
         // measuring the screen rather than the absence of inheritance.
@@ -1658,9 +2005,16 @@ mod tests {
             CategoryTable::new().with_local_provider("on-device"),
             Some("frontier".to_owned()),
         )
-        .with_provider("on-device", "qwen", native(), ProviderHealth::Healthy)
+        .with_provider(
+            "on-device",
+            ProviderKind::Local,
+            "qwen",
+            native(),
+            ProviderHealth::Healthy,
+        )
         .with_provider(
             "frontier",
+            ProviderKind::OpenaiCompatible,
             "claude-opus-4",
             native(),
             ProviderHealth::Healthy,
@@ -1712,11 +2066,18 @@ mod tests {
         )
         .with_provider(
             "frontier-remote",
+            ProviderKind::OpenaiCompatible,
             "claude-opus-4",
             native(),
             ProviderHealth::Healthy,
         )
-        .with_provider("on-device", "qwen", native(), ProviderHealth::Healthy);
+        .with_provider(
+            "on-device",
+            ProviderKind::Local,
+            "qwen",
+            native(),
+            ProviderHealth::Healthy,
+        );
         // `title` is the reflex category that is neither pinned nor classified,
         // so it is the one the fill can actually reach. `digest` is `scan`'s.
         for (category, why) in [
@@ -1769,8 +2130,13 @@ mod tests {
 
     #[test]
     fn degraded_provider_yields_the_reduced_harness_profile() {
-        let router =
-            router().with_provider("kimi", "kimi-k2", degraded(), ProviderHealth::Degraded);
+        let router = router().with_provider(
+            "kimi",
+            ProviderKind::OpenaiCompatible,
+            "kimi-k2",
+            degraded(),
+            ProviderHealth::Degraded,
+        );
         let cfg = router.harness_config_for("kimi");
         assert!(cfg.require_verification);
         assert_eq!(cfg.max_tools, Some(5));
@@ -1842,6 +2208,7 @@ mod tests {
         )
         .with_provider(
             "anthropic",
+            ProviderKind::Anthropic,
             "claude-opus-4",
             native(),
             ProviderHealth::Healthy,

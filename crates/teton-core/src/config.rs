@@ -460,6 +460,27 @@ pub struct Config {
     /// *detected* and reported, not so it can take effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_local_model: Option<String>,
+    /// The global reasoning-effort setting applied to every model call
+    /// (REQ-559 BR-2), persisted across sessions (BR-8).
+    ///
+    /// **One** global setting: there is deliberately no per-category,
+    /// per-tier or per-provider effort configuration. The category bindings
+    /// (REQ-558) already carry the per-workload cost distinction; effort is the
+    /// orthogonal "how hard am I thinking right now" dial. The single exception
+    /// is the per-provider clamp, which is a capability constraint rather than a
+    /// user setting — see [`crate::effort::EffortLadder::clamp`].
+    ///
+    /// Serialized **unconditionally** (no `skip_serializing_if`), for the same
+    /// reason as [`Config::judgment_default`] and
+    /// [`LocalModelConfig::auto_accept`]: a declared default that vanishes from
+    /// a written-out config whenever it holds its default value is precisely the
+    /// hidden constant that configuration-visibility rules out. A user must be
+    /// able to see what they are spending on.
+    ///
+    /// Declared here among the scalars, **before** the array-of-table fields,
+    /// for the TOML-ordering reason above.
+    #[serde(default)]
+    pub effort: crate::effort::EffortLevel,
     /// Local-model tier inputs (`[local_model]`): the pin, the auto-accept
     /// opt-in, and the catalog base-URL override.
     #[serde(default, skip_serializing_if = "LocalModelConfig::is_unset")]
@@ -2178,9 +2199,129 @@ auth_ref = "keychain:anthropic"
         assert_eq!(cfg.default_provider.as_deref(), Some("opus"));
     }
 
+    // ---- REQ-559: effort key + per-provider reasoning declaration ----------
+
+    /// The pre-REQ-559 config shape: no top-level `effort` key, and a
+    /// `[providers.capabilities]` table carrying only the three fields that
+    /// existed before. Written as raw TOML on purpose — the claim is that bytes
+    /// authored before this REQ still parse and mean what they meant.
+    const PRE_REQ_559_TOML: &str = r#"
+[[providers]]
+id = "anthropic"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-opus-5"
+auth_ref = "keychain:anthropic"
+
+[providers.capabilities]
+tool_call_tier = "native"
+parallel_calls = true
+max_context = 200000
+"#;
+
+    #[test]
+    fn a_pre_req_559_config_still_loads_and_defaults_to_high() {
+        let cfg = Config::load(PRE_REQ_559_TOML).expect("pre-REQ-559 config must load");
+        // BR-1: the absence of a user setting resolves to the declared default,
+        // never to an absent field.
+        assert_eq!(cfg.effort, crate::effort::EffortLevel::High);
+        let p = &cfg.providers[0];
+        assert_eq!(p.capabilities.max_context, 200_000);
+        // Undeclared, so `resolve_effort` applies the per-kind default rather
+        // than a value materialized at load time.
+        assert!(p.capabilities.reasoning_shape.is_none());
+        assert!(p.capabilities.effort_ladder.is_none());
+    }
+
+    #[test]
+    fn a_declared_shape_and_ladder_round_trip_through_toml() {
+        let src = r#"
+effort = "xhigh"
+
+[[providers]]
+id = "kimi"
+kind = "openai-compatible"
+endpoint = "https://api.moonshot.example"
+model = "kimi-k2.6"
+auth_ref = "keychain:kimi"
+
+[providers.capabilities]
+reasoning_shape = "thinking_flag_only"
+effort_ladder = ["low", "high", "xhigh", "max"]
+"#;
+        let cfg = Config::load(src).expect("must load");
+        assert_eq!(cfg.effort, crate::effort::EffortLevel::Xhigh);
+        let caps = cfg.providers[0].capabilities;
+        assert_eq!(
+            caps.reasoning_shape,
+            Some(crate::effort::ReasoningShape::ThinkingFlagOnly),
+        );
+        assert_eq!(
+            caps.effort_ladder,
+            Some(crate::effort::EffortLadder::from_levels(&[
+                crate::effort::EffortLevel::Low,
+                crate::effort::EffortLevel::High,
+                crate::effort::EffortLevel::Xhigh,
+                crate::effort::EffortLevel::Max,
+            ])),
+        );
+
+        // load -> serialize -> load is lossless. The ladder has a hand-written
+        // serde pair, so this is the path a silent drift would take.
+        let round = Config::load(&toml::to_string(&cfg).expect("serialize")).expect("reload");
+        assert_eq!(round, cfg);
+    }
+
+    /// A declared default that vanishes from a written-out config whenever it
+    /// holds its default value is the hidden constant configuration-visibility
+    /// rules out — the same reason `judgment_default` is unconditional.
+    #[test]
+    fn the_effort_key_is_always_written_out_even_at_its_default() {
+        let cfg = Config::load("").expect("empty config loads");
+        assert_eq!(cfg.effort, crate::effort::EffortLevel::High);
+        let text = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            text.contains("effort = \"high\""),
+            "the default must be visible in the written config, got:\n{text}",
+        );
+    }
+
+    /// ADR-E: `validate` is fail-closed and gates daemon startup, so it carries
+    /// structural errors only. An effort misconfiguration must not refuse to
+    /// start the daemon, and must not mark the provider unusable either — an
+    /// empty ladder resolves to `Omit(EmptyLadder)` and is reported on the
+    /// surface instead.
+    #[test]
+    fn an_explicitly_empty_ladder_loads_validates_and_leaves_the_provider_usable() {
+        let src = r#"
+[[providers]]
+id = "weird"
+kind = "openai-compatible"
+endpoint = "https://api.weird.example"
+model = "weird-1"
+auth_ref = "keychain:weird"
+
+[providers.capabilities]
+effort_ladder = []
+"#;
+        let cfg = Config::load(src).expect("an empty ladder must not refuse startup");
+        assert_eq!(
+            cfg.providers[0].capabilities.effort_ladder,
+            Some(crate::effort::EffortLadder::EMPTY),
+        );
+        assert!(
+            cfg.unusable_providers().is_empty(),
+            "an effort misconfiguration is not a reason to stop serving turns",
+        );
+    }
+
     fn sample_config() -> Config {
         Config {
             pinned_local_model: None,
+            // REQ-559: the sample carries a non-default level on purpose, so a
+            // serialization round-trip that silently dropped the key would fail
+            // rather than coincide with the default.
+            effort: crate::effort::EffortLevel::Xhigh,
             default_provider: Some("anthropic-prod".to_owned()),
             local_model: LocalModelConfig {
                 pinned: Some("qwen2.5-coder-3b".to_owned()),
@@ -2208,6 +2349,7 @@ auth_ref = "keychain:anthropic"
                         tool_call_tier: ToolCallTier::Degraded,
                         parallel_calls: false,
                         max_context: 8192,
+                        ..ProviderCapabilities::default()
                     },
                 },
                 ModelProvider {
@@ -2220,6 +2362,7 @@ auth_ref = "keychain:anthropic"
                         tool_call_tier: ToolCallTier::Native,
                         parallel_calls: true,
                         max_context: 200_000,
+                        ..ProviderCapabilities::default()
                     },
                 },
                 ModelProvider {

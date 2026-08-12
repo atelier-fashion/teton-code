@@ -1,0 +1,97 @@
+{
+  "req": "REQ-559",
+  "branch": "feat/REQ-559-global-reasoning-effort",
+  "startedAt": "2026-08-11T00:00:00Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Preflight",
+      "completedAt": "2026-08-11T00:00:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-11T00:10:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Tasks",
+      "completedAt": "2026-08-11T00:30:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-11T00:40:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-11T02:00:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-08-11T02:30:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-11T02:45:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-11T02:55:00Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-559",
+      "branch": "feat/REQ-559-global-reasoning-effort",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/100",
+      "prNumber": 100,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-110",
+      "TASK-111",
+      "TASK-112",
+      "TASK-113",
+      "TASK-114",
+      "TASK-115",
+      "TASK-116",
+      "TASK-117"
+    ],
+    "failedTasks": []
+  },
+  "blockers": [],
+  "notes": [
+    "Orchestrator merge override honored: REQ-559 and REQ-560 have overlapping footprints (COMMANDS table, CLI status/session surface). Stopped after Phase 7; did NOT self-merge.",
+    "OQ-1 closed at architecture time (ADR-E), OQ-5 (ADR-I), OQ-6 (ADR-F). OQ-4 and OQ-1's flag-ergonomics residual remain open by design.",
+    "Coverage gaps recorded honestly in the PR body: AC-7's full daemon-restart cycle is covered at the config layer only; AC-11 passes structurally (BR-13 is a non-change) without a dedicated max-effort egress test."
+  ]
+}

@@ -23,7 +23,7 @@ use crate::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use teton_core::ToolCallTier;
+use teton_core::{ResolvedEffort, ToolCallTier};
 
 /// Configuration for an OpenAI-compatible provider instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,10 @@ impl OpenAiCompatConfig {
                 tool_call_tier: ToolCallTier::Degraded,
                 parallel_calls: false,
                 max_context: 0,
+                // REQ-559: undeclared, so `resolve_effort` applies the
+                // per-kind default (ADR-E) rather than a value duplicated here.
+                // Two sources for one default is the LESSON-456 drift.
+                ..CapabilityProfile::default()
             },
         }
     }
@@ -111,6 +115,24 @@ impl OpenAiCompatAdapter {
             body["tools"] = json!(tools);
         }
 
+        // REQ-559 BR-4 / ADR-A: exactly one reasoning shape, or none. Kimi
+        // K2.5/K2.6 answer HTTP 400 when both `thinking` and `reasoning_effort`
+        // are sent, so this is a correctness constraint rather than a style
+        // preference — and it is discharged by the shape of the type, since no
+        // variant below names two fields. Exhaustive with no wildcard arm.
+        match req.effort {
+            // The canonical spellings ARE the wire spellings here: DeepSeek and
+            // Kimi both take `low`/`high`/`xhigh`/`max` verbatim, so there is no
+            // per-provider mapping table to keep in sync (BR-3).
+            ResolvedEffort::Effort { level, .. } => {
+                body["reasoning_effort"] = json!(level.as_str());
+            }
+            ResolvedEffort::ThinkingFlag => {
+                body["thinking"] = json!(true);
+            }
+            ResolvedEffort::Omit { .. } => {}
+        }
+
         let body = serde_json::to_vec(&body).map_err(|e| ProviderError::Build(e.to_string()))?;
         Ok(TransportRequest {
             method: HttpMethod::Post,
@@ -151,9 +173,19 @@ impl Provider for OpenAiCompatAdapter {
             });
         }
         if resp.status >= 400 {
-            return Err(ProviderError::ClientError {
-                status: resp.status,
-            });
+            // REQ-559 BR-12: a 400 naming the reasoning field is a refusal of
+            // that field, not a failure of the provider. Classified here — with
+            // the request's own `effort` in hand — because only this scope knows
+            // what was actually sent, and a refusal claim made without that is a
+            // guess (crate::classify_client_error short-circuits when the
+            // request carried no reasoning field at all).
+            return Err(crate::classify_client_error(
+                resp.status,
+                resp.body,
+                &self.config.id,
+                request.effort,
+            )
+            .await);
         }
         Ok(event_stream(resp.body))
     }
@@ -217,6 +249,9 @@ fn event_stream(body: ByteStream) -> TurnStream {
 struct State {
     input_tokens: u64,
     output_tokens: u64,
+    /// REQ-559 BR-10: the reasoning subset of `output_tokens`, when the endpoint
+    /// reports it. `None` until a usage chunk carries the field.
+    reasoning_tokens: Option<u64>,
     stop_reason: Option<StopReason>,
     tools: Vec<PartialTool>,
     flushed: bool,
@@ -248,6 +283,15 @@ impl State {
             }
             if let Some(o) = usage.get("completion_tokens").and_then(Value::as_u64) {
                 self.output_tokens = o;
+            }
+            // REQ-559 BR-10. Absent, null, or non-integer all stay `None` —
+            // "the provider didn't tell us" is not zero, and `and_then` keeps
+            // them distinct without a branch that could collapse them.
+            if let Some(r) = usage
+                .pointer("/completion_tokens_details/reasoning_tokens")
+                .and_then(Value::as_u64)
+            {
+                self.reasoning_tokens = Some(r);
             }
         }
 
@@ -324,6 +368,7 @@ impl State {
             usage: TokenUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                reasoning_tokens: self.reasoning_tokens,
             },
             stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
         })

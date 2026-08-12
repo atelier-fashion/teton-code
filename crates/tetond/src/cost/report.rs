@@ -104,6 +104,16 @@ pub struct Totals {
     pub priced_calls: u64,
     /// Calls that were unpriced.
     pub unpriced_calls: u64,
+    /// Reasoning tokens summed over the calls that reported a split, or `None`
+    /// when **no** call did (REQ-559 BR-11).
+    ///
+    /// `None` renders as "unreported"; a `0` would claim every provider did no
+    /// thinking, which is displaying an estimate as an actual (REQ-544 BR-2).
+    /// A **subset** of `output_tokens`, never added to it.
+    pub reasoning_tokens: Option<u64>,
+    /// How many calls reported a reasoning split, so a partial figure can say
+    /// it is partial rather than reading as a whole-ledger total.
+    pub calls_reporting_reasoning: u64,
 }
 
 /// The savings-vs-frontier estimate (AC-4 / OQ-6).
@@ -162,6 +172,13 @@ struct Accum {
     output_tokens: u64,
     usd_micros: i64,
     unpriced_calls: u64,
+    /// REQ-559 BR-11: reasoning tokens summed over the rows that **reported**
+    /// one, and the count of those rows. Both are needed: a bare sum over a
+    /// mixed ledger reads as a whole-ledger figure when it is a partial one,
+    /// and presenting a partial as a total is the estimate-as-actual REQ-544
+    /// BR-2 forbids.
+    reasoning_tokens: u64,
+    calls_reporting_reasoning: u64,
 }
 
 impl Accum {
@@ -172,6 +189,11 @@ impl Accum {
         match row.usd_micros {
             Some(cost) => self.usd_micros = self.usd_micros.saturating_add(cost),
             None => self.unpriced_calls = self.unpriced_calls.saturating_add(1),
+        }
+        // Never summed into `output_tokens` — a subset, not an addition (BR-10).
+        if let Some(reasoning) = row.reasoning_tokens {
+            self.reasoning_tokens = self.reasoning_tokens.saturating_add(reasoning);
+            self.calls_reporting_reasoning = self.calls_reporting_reasoning.saturating_add(1);
         }
     }
 
@@ -300,6 +322,9 @@ pub fn aggregate(rows: &[LedgerRow], web_rows: &[WebLookupRow], prices: &PriceTa
             usd_micros: total.usd_micros,
             priced_calls,
             unpriced_calls: total.unpriced_calls,
+            reasoning_tokens: (total.calls_reporting_reasoning > 0)
+                .then_some(total.reasoning_tokens),
+            calls_reporting_reasoning: total.calls_reporting_reasoning,
         },
         savings,
         unpriced,
@@ -364,6 +389,7 @@ mod tests {
             output_tokens: output,
             usd_micros,
             cached_tokens: None,
+            reasoning_tokens: None,
         }
     }
 

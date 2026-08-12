@@ -520,6 +520,65 @@ pub struct SessionTaint {
     tainted: Mutex<HashSet<SessionId>>,
 }
 
+/// Providers that refused the reasoning-effort field, per session (REQ-559
+/// BR-12 / ADR-F).
+///
+/// **Session-scoped and never persisted.** BR-12 forbids *silent retries* —
+/// making a failing request again and hoping — and this does the opposite: it
+/// declines a request already known to fail. Remembering is not retrying.
+///
+/// It deliberately does **not** touch the provider's declared
+/// `reasoning_shape`. BR-4 says the shape is declared per provider and never
+/// sniffed from a response, and persisting a capability conclusion drawn from
+/// one HTTP status is exactly that sniff — it would survive a provider adding
+/// effort support, or a transient 400 from a proxy, with no way for the user to
+/// know why their setting stopped applying. Because the memo is session-scoped,
+/// the next session tries again and a provider that gained support self-heals
+/// with no config edit.
+///
+/// Keyed by `(session, provider_id)` — the id the user configured — so two
+/// providers pointing at one endpoint are remembered separately, per the
+/// codebase's "a remembered grant is scoped by its key" principle.
+#[derive(Debug, Default)]
+pub struct EffortRefusals {
+    refused: Mutex<HashSet<(SessionId, String)>>,
+}
+
+impl EffortRefusals {
+    /// An empty memo.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remember that `provider_id` refused the effort field in `session`.
+    ///
+    /// Returns whether this was the first refusal for that pair, so the caller
+    /// can announce it once rather than on every subsequent call — the same
+    /// announce-once discipline [`SessionTaint::mark`] uses, and for the same
+    /// reason: a degradation nothing says out loud is one the user discovers as
+    /// "why did my setting stop working".
+    pub fn mark(&self, session: &SessionId, provider_id: &str) -> bool {
+        self.refused
+            .lock()
+            .expect("effort refusal mutex poisoned")
+            .insert((session.clone(), provider_id.to_owned()))
+    }
+
+    /// Every provider that has refused the effort field in `session`, as the
+    /// set `Router::with_effort_refusals` consumes.
+    #[must_use]
+    pub fn for_session(&self, session: &SessionId) -> std::collections::BTreeSet<String> {
+        self.refused
+            .lock()
+            .expect("effort refusal mutex poisoned")
+            .iter()
+            .filter(|(s, _)| s == session)
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+}
+
 impl SessionTaint {
     /// An empty taint set.
     #[must_use]
@@ -1193,6 +1252,10 @@ pub struct DaemonRuntime {
     /// path's own `is_privacy_blocked` arm cannot cover it (see
     /// [`TaintingPrivacySink`]).
     session_taint: Arc<SessionTaint>,
+    /// Providers that refused the reasoning-effort field, per session
+    /// (REQ-559 BR-12 / ADR-F). Beside `session_taint` because both are
+    /// session-scoped runtime degradation records rather than configuration.
+    effort_refusals: Arc<EffortRefusals>,
     /// Per-session lifts of the BR-13 web restriction (REQ-563). Behind an `Arc`
     /// because the lookup seam reads it through a [`TaintView`] on whatever task
     /// the turn is running on, while the `web/override` RPC writes it from the
@@ -1285,6 +1348,7 @@ impl DaemonRuntime {
             probe: None,
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
+            effort_refusals: Arc::new(EffortRefusals::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
@@ -1429,6 +1493,7 @@ impl DaemonRuntime {
             probe: Some(probe),
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
+            effort_refusals: Arc::new(EffortRefusals::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
@@ -2147,7 +2212,13 @@ impl DaemonRuntime {
             // answer.
             self.local_tier_available(),
             &health_snapshot,
-        );
+        )
+        // REQ-559 BR-12 / ADR-F: a provider that refused the effort field
+        // earlier in THIS session resolves to `Omit(RefusedThisSession)` rather
+        // than being asked again. Seeded per turn from the session-scoped memo,
+        // so it is honoured by the route, the `route_decided` event, the request
+        // and the `teton effort` surface alike — one resolution, every reader.
+        .with_effort_refusals(self.effort_refusals.for_session(&session_id));
 
         // REQ-561 TASK-062: name the session, at most once for its whole life.
         // Ahead of the turn rather than after it, for two reasons: the name is
@@ -2882,12 +2953,17 @@ impl DaemonRuntime {
             egress = egress.with_redaction_gate(gate);
         }
 
+        // REQ-559 ADR-G: the effort was resolved once, at route time, by
+        // `Router::effort_for`. It is READ off the route here, never recomputed
+        // — the `route_decided` event already announced this exact value, and a
+        // second computation is a second chance to disagree with it (AC-4).
         let mut source = RemoteProviderSource::new(
             &*provider,
             &egress,
             ProviderId::from(provider_cfg.id.as_str()),
             model,
             session_id.clone(),
+            route.effective_effort(),
         );
         if let Some(ph) = phase {
             source = source.with_phase(ph);
@@ -2903,7 +2979,7 @@ impl DaemonRuntime {
             source = source.with_category(to_protocol_category(category));
         }
 
-        run_session_turn_with_source(
+        let outcome = run_session_turn_with_source(
             &mut source,
             tools,
             tool_ctx,
@@ -2916,7 +2992,30 @@ impl DaemonRuntime {
             &compact,
             &duties,
         )
-        .await
+        .await;
+
+        // REQ-559 BR-12 / ADR-F: if this provider refused the effort field, the
+        // source already retried once with no reasoning field — that is the
+        // whole of BR-12's per-call handling. Remember it for the session so the
+        // *next* call does not repeat a request known to fail.
+        //
+        // Read AFTER the turn and unconditionally, including on the error path:
+        // a refusal happened whether or not the retried turn then succeeded for
+        // some other reason, and a memo that only recorded successes would ask
+        // again on the very next call.
+        if source.effort_was_refused() && self.effort_refusals.mark(session_id, &provider_cfg.id) {
+            // Announced once per (session, provider), like the taint pin: a
+            // degradation nothing says out loud is one the user discovers as
+            // "why did my effort setting stop working". The `teton effort` /
+            // `/effort` surfaces carry the standing state; this is the moment it
+            // changed.
+            eprintln!(
+                "teton: '{}' refused the reasoning-effort field; this session will \
+                 send none to it (the next session tries again).",
+                provider_cfg.id,
+            );
+        }
+        outcome
     }
 
     /// Resolve the `digest` category for this turn (REQ-558 BR-1, BR-2, BR-7).
@@ -3829,6 +3928,11 @@ impl DaemonRuntime {
             egress,
             model,
             session_id.clone(),
+            // REQ-559: the duty's own route resolved its own effort, through the
+            // same `Router::effort_for` the turn path uses. A duty bound to a
+            // different provider than the turn therefore gets that provider's
+            // clamp, not the turn's — which is the point of resolving per route.
+            route.effective_effort(),
         )
     }
 }
@@ -5817,6 +5921,11 @@ fn build_router(
 
     let mut router = Router::new(table, default_provider)
         .with_judgment_default(config.judgment_default)
+        // REQ-559 BR-2/BR-8: one global level, read from the persisted config so
+        // it is configuration-visible rather than a constant compiled in here.
+        // The session override (ADR-I) is layered on by the caller that has a
+        // session; `build_router` sees only the persisted floor.
+        .with_effort(config.effort)
         .with_local_available(local_available);
     for p in &config.providers {
         // REQ-544 M-5: seed each provider's health from the persisted map (default
@@ -5863,6 +5972,9 @@ fn build_router(
         };
         router = router.with_provider(
             p.id.clone(),
+            // REQ-559: the kind drives the per-kind reasoning defaults (ADR-E)
+            // for a provider that declares no shape or ladder of its own.
+            p.kind,
             model,
             CapabilityProfile::from_core(p.capabilities),
             seed,
@@ -5946,7 +6058,27 @@ pub(crate) fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBo
 /// `router` so that `teton policy show` and `route_decided` are two renderings of
 /// one value rather than two computations of one question (ADR-D, BR-6, AC-11).
 fn snapshot_from_config(config: &Config, router: &Router) -> ConfigSnapshot {
+    // REQ-559 BR-9 / AC-8: every row comes from `Router::effort_for`, the SAME
+    // function the router calls per model call. The surfaces therefore cannot
+    // describe a provider differently from the request that goes to it — which
+    // a second, surface-local computation could, and would do silently.
+    let effort = Some(teton_protocol::methods::EffortView {
+        level: router.effort(),
+        providers: config
+            .providers
+            .iter()
+            .filter_map(|p| {
+                router.effort_for(Some(&p.id)).map(|resolved| {
+                    teton_protocol::methods::ProviderEffortView {
+                        provider_id: ProviderId::from(p.id.as_str()),
+                        resolved,
+                    }
+                })
+            })
+            .collect(),
+    });
     ConfigSnapshot {
+        effort,
         providers: config
             .providers
             .iter()
@@ -6055,7 +6187,12 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
                 .chain(cb.fallback_id.iter().map(|f| f.0.as_str()))
                 .collect(),
         ),
-        ConfigUpdate::RegisterProvider(_) | ConfigUpdate::SetPrivacyBoundary(_) => {
+        // REQ-559: `SetEffort` names no provider, so there is no binding to
+        // reject. An effort level is valid against every provider by
+        // construction — the per-provider clamp is what makes it so.
+        ConfigUpdate::RegisterProvider(_)
+        | ConfigUpdate::SetPrivacyBoundary(_)
+        | ConfigUpdate::SetEffort(_) => {
             return Ok(());
         }
     };
@@ -6082,6 +6219,10 @@ fn reject_unusable_binding(config: &Config, update: &ConfigUpdate) -> Result<(),
 /// Apply a single [`ConfigUpdate`] to `config` in place (replace-or-insert).
 fn apply_update(config: &mut Config, update: ConfigUpdate) {
     match update {
+        // REQ-559 BR-8: written to the persisted config, so the next session
+        // starts here. The session override (ADR-I) is applied by the caller
+        // that owns a session; this is the durable floor.
+        ConfigUpdate::SetEffort(level) => config.effort = level,
         ConfigUpdate::RegisterProvider(pc) => {
             let id = pc.id.0;
             // BUG-155: re-registering an existing id keeps the capability
@@ -6175,6 +6316,8 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
         total_calls: report.total.calls,
         priced_calls: report.total.priced_calls,
         unpriced_calls: report.total.unpriced_calls,
+        reasoning_tokens: report.total.reasoning_tokens,
+        calls_reporting_reasoning: report.total.calls_reporting_reasoning,
         // REQ-557 AC-7b: the models the meter could not price travel to the
         // client by name, so `teton cost` can say what to add a price for.
         unpriced_models: report.unpriced.models.iter().cloned().collect(),
@@ -7891,6 +8034,7 @@ provider_id = "on-device"
             reason: resolution.reason.clone(),
             outcome: resolution.outcome,
             harness: Default::default(),
+            effort: None,
             resolution: Some(resolution),
         };
         assert!(selected.selected(), "the premise of this test");
@@ -7913,6 +8057,8 @@ provider_id = "on-device"
             reason: "No provider is bound to the 'build' tier.".to_owned(),
             outcome: RouteOutcome::NoPolicy,
             harness: Default::default(),
+            // No provider was selected, so there was nothing to resolve against.
+            effort: None,
             resolution: None,
         };
         let out = unserved_turn_sentence(&unresolved, classified.clone());
@@ -8711,6 +8857,7 @@ provider_id = "on-device"
     fn an_unconfigured_default_provider_is_none_not_a_synthesized_id() {
         let config = Config {
             pinned_local_model: None,
+            effort: teton_core::EffortLevel::default(),
             // The whole point: unset.
             default_provider: None,
             local_model: teton_core::LocalModelConfig::default(),
@@ -9026,6 +9173,7 @@ provider_id = "on-device"
     fn two_provider_spec_config() -> Config {
         Config {
             pinned_local_model: None,
+            effort: teton_core::EffortLevel::default(),
             default_provider: Some("anthropic".to_owned()),
             local_model: teton_core::LocalModelConfig::default(),
             privacy: teton_core::PrivacyConfig::default(),

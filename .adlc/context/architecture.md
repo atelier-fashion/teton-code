@@ -106,6 +106,35 @@
   Give the parent and child one owned thread and a channel; the borrow becomes
   an ordinary stack borrow, `Send` stops being a question, and drop order is
   compiler-checked rather than commented (REQ-564, LESSON-498).
+- **A mutually-exclusive wire shape is a return type, not a pair of flags** —
+  when two request fields cannot both be sent because a provider answers 400 on
+  both, encode the exclusion as an enum whose variants *are* the outcomes, and
+  match on it with no wildcard arm. The illegal state stops being representable
+  instead of being defended by a test that has to keep passing, and adding a
+  third shape becomes a compile error at every adapter rather than a silent
+  omission at one. The same posture as ADR-009's frame containment, applied
+  outbound (REQ-559 ADR-A).
+- **A required field with no `Default` is how "every call states X" is enforced**
+  — a rule of the form "no call path may omit X" is a guard that holds only until
+  someone adds the next call path (LESSON-443). Making X a required struct field
+  whose type has no `Default` turns "the path forgot" into a compile error, and
+  leaves the test to check that the value is *honest* rather than that it exists
+  (REQ-559 ADR-B).
+- **An unknown endpoint's default capability is the intersection, not the
+  superset** — for a provider you cannot identify, the permissive default sends
+  values it will reject, and the rejection path lands back on the vendor default
+  the feature existed to override. Default to the narrowest set every known
+  target accepts, and let the user widen it by declaring one. The failure the
+  generous default reintroduces is usually the one the feature was written to fix
+  (REQ-559 ADR-E).
+- **Remembering a refusal is not retrying it** — a rule against silent retries
+  forbids making a failing request again and hoping; it does not forbid declining
+  to make it. A refusal observed at runtime is remembered *session-scoped*, keyed
+  by what the user configured, never persisted, and never allowed to mutate the
+  *declared* capability — persisting a capability conclusion drawn from one HTTP
+  status is sniffing, and it outlives the condition that produced it. The
+  condition that makes it a degradation rather than a hidden downgrade is that
+  the surface reports it (REQ-559 ADR-F).
 - **Adapter degradation** — providers with weak tool-calling get a reduced
   harness profile (smaller tool set, shorter loops, mandatory verification)
   rather than the full loop (BR-6).

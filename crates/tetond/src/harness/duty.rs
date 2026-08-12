@@ -331,6 +331,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use teton_core::effort::ResolvedEffort;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -606,6 +607,7 @@ impl DutyRoute {
         egress: Egress<T>,
         model: impl Into<String>,
         session_id: impl Into<SessionId>,
+        effort: ResolvedEffort,
     ) -> Self {
         let provider_id = provider_id.into();
         DutyRoute::Serves {
@@ -616,6 +618,7 @@ impl DutyRoute {
                 provider_id: ProviderId::from(provider_id.clone()),
                 model: model.into(),
                 session_id: session_id.into(),
+                effort,
             }),
             provider_id,
             announce: None,
@@ -816,6 +819,9 @@ struct RemoteDuty<T: Transport> {
     provider_id: ProviderId,
     model: String,
     session_id: SessionId,
+    /// REQ-559: a duty is a model call like any other, so it states its effort
+    /// too. Resolved at route time and carried here (ADR-G).
+    effort: ResolvedEffort,
 }
 
 #[async_trait]
@@ -844,6 +850,11 @@ impl<T: Transport> Duty for RemoteDuty<T> {
             // This duty's own budget, sized from its own ceiling — the same
             // number the local leg asks its engine for, from the same place.
             max_tokens: self.kind.max_tokens(),
+            // REQ-559 BR-1 / AC-1: a harness duty is a model call, so it states
+            // its effort exactly as an ordinary turn does. AC-1 asks for the
+            // field across all four tiers, and the duty path is how the reflex
+            // and scan tiers are reached.
+            effort: self.effort,
         };
         // BR-2: a duty has no lifecycle position, so it attributes no phase — but
         // it does attribute its category, which is the whole point of routing it.
@@ -919,6 +930,7 @@ impl<T: Transport> Duty for RemoteDuty<T> {
 #[cfg(test)]
 pub(crate) mod testing {
     use std::sync::{Arc, Mutex};
+    use teton_core::{EffortLevel, ResolvedEffort};
 
     use async_trait::async_trait;
     use futures::stream;
@@ -1060,6 +1072,9 @@ pub(crate) mod testing {
             egress,
             "claude-opus-4",
             "sess-under-test",
+            // REQ-559: a test fixture states its effort like every other call
+            // path. The field is required, so it cannot be forgotten here.
+            ResolvedEffort::effort(EffortLevel::High),
         );
         (route, sent)
     }
@@ -1081,12 +1096,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use super::{
-        Duty, DutyKind, DutyRoute, Provenance, DUTY_DEADLINE, DUTY_MAX_TOKENS_REQUEST,
-        DUTY_REQUEST_BYTES_PER_TOKEN,
+        Duty, DutyKind, DutyRoute, Provenance, ResolvedEffort, DUTY_DEADLINE,
+        DUTY_MAX_TOKENS_REQUEST, DUTY_REQUEST_BYTES_PER_TOKEN,
     };
     use crate::call_sites::scan::{code_only, count, production_sources};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+    use teton_core::EffortLevel;
     use teton_inference::{Completion, Engine, EngineError, GenParams};
     use teton_protocol::Category;
 
@@ -1514,6 +1530,7 @@ mod tests {
             egress,
             "claude-opus-4",
             "sess-stalled",
+            ResolvedEffort::effort(EffortLevel::High),
         );
 
         let err = route

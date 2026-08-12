@@ -38,6 +38,7 @@
 //!   claim is in the test suite and not only in prose.
 
 use std::sync::{Arc, Mutex};
+use teton_core::effort::{EffortLevel, ResolvedEffort};
 
 use async_trait::async_trait;
 use futures::stream;
@@ -158,6 +159,7 @@ fn remote(
         Egress::new(transport, boundaries, Arc::new(NoopSink)),
         "claude-opus-4",
         "sess-scope",
+        ResolvedEffort::effort(EffortLevel::High),
     );
     (route, sent)
 }

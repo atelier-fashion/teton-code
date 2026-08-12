@@ -24,6 +24,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use teton_core::entities::ProviderKind;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -61,6 +62,7 @@ fn native() -> CapabilityProfile {
         tool_call_tier: ToolCallTier::Native,
         parallel_calls: true,
         max_context: 200_000,
+        ..CapabilityProfile::default()
     }
 }
 
@@ -69,6 +71,7 @@ fn degraded() -> CapabilityProfile {
         tool_call_tier: ToolCallTier::Degraded,
         parallel_calls: false,
         max_context: 32_000,
+        ..CapabilityProfile::default()
     }
 }
 
@@ -109,18 +112,21 @@ fn structured_router() -> Router {
     )
     .with_provider(
         "anthropic",
+        ProviderKind::Anthropic,
         "claude-opus-4",
         native(),
         ProviderHealth::Healthy,
     )
     .with_provider(
         "deepseek",
+        ProviderKind::OpenaiCompatible,
         "deepseek-chat",
         native(),
         ProviderHealth::Healthy,
     )
     .with_provider(
         "local",
+        ProviderKind::Local,
         "qwen2.5-coder-3b",
         native(),
         ProviderHealth::Healthy,
@@ -443,9 +449,16 @@ async fn simulated_provider_failure_falls_back_and_completes_emitting_provider_d
             .with_tier(tier(Tier::Build, "flaky", Some("anthropic"))),
         Some("anthropic".to_owned()),
     )
-    .with_provider("flaky", "flaky-model", native(), ProviderHealth::Healthy)
+    .with_provider(
+        "flaky",
+        ProviderKind::OpenaiCompatible,
+        "flaky-model",
+        native(),
+        ProviderHealth::Healthy,
+    )
     .with_provider(
         "anthropic",
+        ProviderKind::Anthropic,
         "claude-opus-4",
         native(),
         ProviderHealth::Healthy,
@@ -583,7 +596,13 @@ async fn weak_capability_provider_gets_degraded_harness_profile() {
             .with_tier(tier(Tier::Build, "kimi", None)),
         Some("kimi".to_owned()),
     )
-    .with_provider("kimi", "kimi-k2", degraded(), ProviderHealth::Degraded);
+    .with_provider(
+        "kimi",
+        ProviderKind::OpenaiCompatible,
+        "kimi-k2",
+        degraded(),
+        ProviderHealth::Degraded,
+    );
 
     let route = structured_route(&router, CorePhase::Implement);
     assert_eq!(route.provider_id.as_ref().unwrap().0, "kimi");

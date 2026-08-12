@@ -30,6 +30,7 @@
 pub mod boundary;
 pub mod category;
 pub mod config;
+pub mod effort;
 pub mod entities;
 pub mod lifetime;
 pub mod mcp;
@@ -50,6 +51,13 @@ pub use config::{
     Config, ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig,
     MigratedPhase, PrivacyConfig, RoutingMigration, ShutdownPolicyKind, SkippedRule, WebConfig,
     WebTier,
+};
+// REQ-559: the effort vocabulary is re-exported at the crate root so
+// `teton_core::EffortLevel` is the stable path for the daemon, the adapters and
+// the CLI alike — one ladder, one clamp, one resolver (BR-3, BR-9).
+pub use effort::{
+    default_ladder_for, default_shape_for, level_list, resolve_effort, EffortLadder, EffortLevel,
+    EffortOmission, ParseEffortLevelError, ReasoningShape, ResolvedEffort, ALL_LEVELS,
 };
 pub use entities::{
     BoundaryMode, ModelProvider, ModelSelection, PrivacyBoundary, ProviderCapabilities,

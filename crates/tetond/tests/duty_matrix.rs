@@ -46,6 +46,7 @@
 //! hard as the failures are.
 
 use std::sync::{Arc, Mutex};
+use teton_core::effort::{EffortLevel, ResolvedEffort};
 
 use async_trait::async_trait;
 use futures::stream;
@@ -295,6 +296,7 @@ fn route_for(duty: Duty, condition: Condition) -> (DutyRoute, Arc<Mutex<Vec<Vec<
             Egress::new(transport, Vec::new(), Arc::new(NoopSink)),
             "claude-opus-4",
             "sess-matrix",
+            ResolvedEffort::effort(EffortLevel::High),
         ),
         // Boundaries configured and the content is boundary-derived: the choke
         // point refuses. Everything else about this route is the working remote
@@ -309,6 +311,7 @@ fn route_for(duty: Duty, condition: Condition) -> (DutyRoute, Arc<Mutex<Vec<Vec<
             Egress::new(transport, boundaries(), Arc::new(NoopSink)),
             "claude-opus-4",
             "sess-matrix",
+            ResolvedEffort::effort(EffortLevel::High),
         ),
     };
     (route, sent)

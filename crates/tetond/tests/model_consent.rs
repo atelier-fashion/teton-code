@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use teton_core::entities::ProviderKind;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -454,6 +455,7 @@ fn native() -> CapabilityProfile {
         tool_call_tier: ToolCallTier::Native,
         parallel_calls: true,
         max_context: 200_000,
+        ..CapabilityProfile::default()
     }
 }
 
@@ -573,7 +575,13 @@ async fn an_undecided_tier_is_withheld_while_the_session_still_routes_remote_onl
         teton_core::category::CategoryTable::new().with_local_provider("local"),
         Some("remote".to_owned()),
     )
-    .with_provider("remote", "remote-model", native(), ProviderHealth::Healthy)
+    .with_provider(
+        "remote",
+        ProviderKind::OpenaiCompatible,
+        "remote-model",
+        native(),
+        ProviderHealth::Healthy,
+    )
     .with_local_available(runtime.local_tier_available());
     let route = router.resolve(router.freeform_category());
     assert!(

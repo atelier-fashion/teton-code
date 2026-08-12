@@ -13,10 +13,12 @@
 use async_trait::async_trait;
 use futures::executor::block_on;
 use futures::StreamExt;
+use std::sync::{Arc, Mutex};
 use teton_providers::{
-    AnthropicAdapter, FailureAction, Message, OpenAiCompatAdapter, OpenAiCompatConfig, Provider,
-    ProviderError, Role, StopReason, ToolCall, ToolSpec, Transport, TransportError,
-    TransportRequest, TransportResponse, TurnEvent, TurnRequest,
+    AnthropicAdapter, EffortLevel, EffortOmission, FailureAction, Message, OpenAiCompatAdapter,
+    OpenAiCompatConfig, Provider, ProviderError, ResolvedEffort, Role, StopReason, ToolCall,
+    ToolSpec, Transport, TransportError, TransportRequest, TransportResponse, TurnEvent,
+    TurnRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -91,6 +93,12 @@ fn chunkify(fixture: &str, size: usize) -> Vec<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 fn sample_request() -> TurnRequest {
+    // The pre-REQ-559 baseline: no reasoning field on the wire, so every
+    // existing assertion in this suite keeps describing the same bytes.
+    request_with(ResolvedEffort::omit(EffortOmission::ShapeNone))
+}
+
+fn request_with(effort: ResolvedEffort) -> TurnRequest {
     TurnRequest {
         model: "test-model".to_string(),
         system: Some("be helpful".to_string()),
@@ -104,6 +112,206 @@ fn sample_request() -> TurnRequest {
             input_schema: serde_json::json!({"type": "object"}),
         }],
         max_tokens: 256,
+        effort,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-559: request-body capture
+// ---------------------------------------------------------------------------
+
+/// A `Transport` that records every request body it is handed before replaying
+/// a canned success. AC-1 and AC-2 are claims about what leaves the adapter, and
+/// only a capture can discharge them — reading the body-builder source is
+/// exactly the "code inspection is not acceptance" that conventions.md rules out
+/// for wire-level claims.
+#[derive(Default)]
+struct CapturingTransport {
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl CapturingTransport {
+    fn bodies(&self) -> Vec<serde_json::Value> {
+        self.seen.lock().expect("capture lock").clone()
+    }
+}
+
+#[async_trait]
+impl Transport for CapturingTransport {
+    async fn execute(
+        &self,
+        request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
+        self.seen
+            .lock()
+            .expect("capture lock")
+            .push(serde_json::from_slice(&request.body).expect("adapters emit JSON bodies"));
+        // Enough of a stream to reach `Completed` on either adapter; the tests
+        // below assert on the captured request, not on the response.
+        let body = futures::stream::iter(std::iter::empty::<Result<Vec<u8>, TransportError>>());
+        Ok(TransportResponse {
+            location: None,
+            status: 200,
+            body: Box::pin(body),
+        })
+    }
+}
+
+/// Drive both adapters once with `effort` and return the captured bodies,
+/// labelled by adapter. The response is ignored — these are request-shape tests.
+fn capture_both(effort: ResolvedEffort) -> Vec<(&'static str, serde_json::Value)> {
+    let mut out = Vec::new();
+    for (name, adapter) in [
+        (
+            "anthropic",
+            Box::new(AnthropicAdapter::new("a", "https://api.anthropic.test")) as Box<dyn Provider>,
+        ),
+        (
+            "openai-compatible",
+            Box::new(OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
+                "o",
+                "https://api.openai.test",
+            ))) as Box<dyn Provider>,
+        ),
+    ] {
+        let transport = CapturingTransport::default();
+        // The stream is allowed to fail (an empty body is a truncated stream);
+        // the request has already been built and captured by then.
+        let _ = block_on(adapter.stream_turn(request_with(effort), &transport));
+        for body in transport.bodies() {
+            out.push((name, body));
+        }
+    }
+    assert_eq!(out.len(), 2, "both adapters must have issued one request");
+    out
+}
+
+/// The two keys that must never appear together in one body (BR-4).
+fn reasoning_keys(body: &serde_json::Value) -> (bool, bool) {
+    let effort_field =
+        body.get("reasoning_effort").is_some() || body.pointer("/output_config/effort").is_some();
+    let thinking_field = body.get("thinking").is_some();
+    (effort_field, thinking_field)
+}
+
+/// AC-1 / BR-1. Every outbound request to a provider resolving to `Effort`
+/// carries an effort field. Driven across all five canonical levels and both
+/// adapters, so no call path can omit it.
+///
+/// The compiler already guarantees a *value* is supplied (`TurnRequest.effort`
+/// is required and `ResolvedEffort` has no `Default` — ADR-B). This asserts the
+/// value is honest: that it actually reaches the wire.
+#[test]
+fn every_effort_resolution_puts_the_field_on_the_wire() {
+    for level in [
+        EffortLevel::Low,
+        EffortLevel::Medium,
+        EffortLevel::High,
+        EffortLevel::Xhigh,
+        EffortLevel::Max,
+    ] {
+        for (adapter, body) in capture_both(ResolvedEffort::effort(level)) {
+            let (has_effort, _) = reasoning_keys(&body);
+            assert!(
+                has_effort,
+                "{adapter} dropped the effort field at {level}; omission inherits \
+                 the provider's default, and Kimi K3's is `max` (BR-1)",
+            );
+            let sent = body
+                .get("reasoning_effort")
+                .or_else(|| body.pointer("/output_config/effort"))
+                .and_then(serde_json::Value::as_str)
+                .expect("the effort field is a string");
+            assert_eq!(
+                sent,
+                level.as_str(),
+                "{adapter} must send the canonical spelling"
+            );
+        }
+    }
+}
+
+/// AC-2 / BR-4. No request ever carries both shapes. Kimi K2.5/K2.6 answer HTTP
+/// 400 when both are sent, so this is a correctness constraint.
+///
+/// ADR-A makes it unrepresentable — no `ResolvedEffort` variant names two fields
+/// — and this test drives every variant through both adapters to prove the
+/// property holds on the wire and not merely in the type.
+#[test]
+fn no_request_ever_carries_both_reasoning_shapes() {
+    let variants = [
+        ResolvedEffort::effort(EffortLevel::High),
+        ResolvedEffort::ThinkingFlag,
+        ResolvedEffort::omit(EffortOmission::ShapeNone),
+        ResolvedEffort::omit(EffortOmission::EmptyLadder),
+        ResolvedEffort::omit(EffortOmission::RefusedThisSession),
+    ];
+    for effort in variants {
+        for (adapter, body) in capture_both(effort) {
+            let (has_effort, has_thinking) = reasoning_keys(&body);
+            assert!(
+                !(has_effort && has_thinking),
+                "{adapter} sent both shapes for {effort:?} — a 400 on Kimi K2.5/K2.6",
+            );
+            match effort {
+                ResolvedEffort::Effort { .. } => assert!(has_effort && !has_thinking),
+                ResolvedEffort::ThinkingFlag => assert!(has_thinking && !has_effort),
+                ResolvedEffort::Omit { .. } => assert!(
+                    !has_effort && !has_thinking,
+                    "{adapter} sent a reasoning field for an omitted resolution",
+                ),
+            }
+        }
+    }
+}
+
+/// ADR-H, pinned so a future reader does not "fix" it. Anthropic accepts
+/// `output_config.effort` and `thinking` together; we deliberately send only the
+/// former, because BR-4 makes single-shape a testable invariant that holds for
+/// every provider, and Anthropic's thinking is already adaptive when effort is
+/// set. The omission is a decision, not an oversight.
+#[test]
+fn anthropic_sends_effort_alone_even_though_it_accepts_both() {
+    let transport = CapturingTransport::default();
+    let adapter = AnthropicAdapter::new("a", "https://api.anthropic.test");
+    let _ = block_on(adapter.stream_turn(
+        request_with(ResolvedEffort::effort(EffortLevel::Xhigh)),
+        &transport,
+    ));
+    let body = &transport.bodies()[0];
+    assert_eq!(
+        body.pointer("/output_config/effort")
+            .and_then(serde_json::Value::as_str),
+        Some("xhigh"),
+    );
+    assert!(
+        body.get("thinking").is_none(),
+        "ADR-H: no thinking block on the effort_only shape",
+    );
+}
+
+/// BR-6 compatibility: under `Omit` the bodies are byte-identical to the
+/// pre-REQ-559 bodies. The addition is inert when effort does not apply, which
+/// is what lets the local tier and every existing test keep their meaning.
+#[test]
+fn an_omitted_resolution_leaves_the_body_unchanged() {
+    for reason in [
+        EffortOmission::ShapeNone,
+        EffortOmission::EmptyLadder,
+        EffortOmission::RefusedThisSession,
+    ] {
+        let omitted = capture_both(ResolvedEffort::omit(reason));
+        let baseline = capture_both(ResolvedEffort::omit(EffortOmission::ShapeNone));
+        assert_eq!(omitted, baseline, "{reason:?} must not alter the wire");
+        for (adapter, body) in &omitted {
+            let obj = body.as_object().expect("a JSON object body");
+            assert!(
+                !obj.contains_key("reasoning_effort")
+                    && !obj.contains_key("output_config")
+                    && !obj.contains_key("thinking"),
+                "{adapter} added a reasoning key for an omitted resolution",
+            );
+        }
     }
 }
 
@@ -416,4 +624,238 @@ fn empty_body_still_finalizes_with_usage_zeroed() {
     let events = run(&anthropic(), &MockTransport::ok(vec![])).expect("finalizes");
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0], TurnEvent::Completed(_)));
+}
+
+/// REQ-559 BR-10: the Anthropic API reports no reasoning-token count, so its
+/// `TokenUsage.reasoning_tokens` is `None` — unreported, which is the truth
+/// about it. Pinned so a future reader does not read the absence as a gap in
+/// this REQ's parsing and "fix" it by writing a zero.
+#[test]
+fn anthropic_reports_no_reasoning_split() {
+    let fixture = concat!(
+        "event: message_start\n",
+        "data: {\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"usage\":{\"output_tokens\":7}}\n\n",
+        "event: message_stop\ndata: {}\n\n",
+    );
+    let transport = MockTransport::ok(chunkify(fixture, 7));
+    let adapter = AnthropicAdapter::new("a", "https://api.anthropic.test");
+    let events = run(&adapter, &transport).expect("stream");
+    let TurnEvent::Completed(done) = events.last().expect("a terminal event") else {
+        panic!("the last event must be Completed");
+    };
+    assert_eq!(done.usage.output_tokens, 7);
+    assert_eq!(
+        done.usage.reasoning_tokens, None,
+        "Anthropic reports no split; None is unreported, not zero",
+    );
+}
+
+/// AC-9 at the adapter seam: an OpenAI-compatible usage chunk carrying
+/// `completion_tokens_details.reasoning_tokens` yields that value, and
+/// `output_tokens` is the same number the parser produced before this field
+/// existed — the subset relationship, proven rather than asserted in prose.
+#[test]
+fn openai_parses_the_reasoning_split_without_moving_the_total() {
+    fn usage_of(fixture: &str) -> teton_providers::TokenUsage {
+        let transport = MockTransport::ok(chunkify(fixture, 9));
+        let adapter =
+            OpenAiCompatAdapter::new(OpenAiCompatConfig::new("o", "https://api.openai.test"));
+        let events = run(&adapter, &transport).expect("stream");
+        match events.last().expect("a terminal event") {
+            TurnEvent::Completed(done) => done.usage,
+            other => panic!("the last event must be Completed, got {other:?}"),
+        }
+    }
+
+    let with_split = usage_of(concat!(
+        "data: {\"choices\":[]}\n\n",
+        "data: {\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":42,",
+        "\"completion_tokens_details\":{\"reasoning_tokens\":30}}}\n\n",
+        "data: [DONE]\n\n",
+    ));
+    let without = usage_of(concat!(
+        "data: {\"choices\":[]}\n\n",
+        "data: {\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":42}}\n\n",
+        "data: [DONE]\n\n",
+    ));
+
+    assert_eq!(with_split.reasoning_tokens, Some(30));
+    assert_eq!(without.reasoning_tokens, None, "unreported, never 0");
+    assert_eq!(
+        with_split.output_tokens, without.output_tokens,
+        "BR-10: parsing the split must not move the total",
+    );
+    assert_eq!(with_split.output_tokens, 42);
+    assert!(with_split.reasoning_tokens.unwrap() <= with_split.output_tokens);
+}
+
+// ---------------------------------------------------------------------------
+// REQ-559 BR-12: the effort refusal (AC-2b, AC-10)
+// ---------------------------------------------------------------------------
+
+/// A transport that answers one status with one body — enough to drive the 400
+/// classification path, which reads a bounded prefix of the error document.
+struct ErrorBodyTransport {
+    status: u16,
+    body: &'static str,
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl ErrorBodyTransport {
+    fn new(status: u16, body: &'static str) -> Self {
+        Self {
+            status,
+            body,
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl Transport for ErrorBodyTransport {
+    async fn execute(
+        &self,
+        request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
+        self.seen
+            .lock()
+            .expect("capture lock")
+            .push(serde_json::from_slice(&request.body).expect("a JSON body"));
+        let chunks = vec![Ok::<Vec<u8>, TransportError>(self.body.as_bytes().to_vec())];
+        Ok(TransportResponse {
+            location: None,
+            status: self.status,
+            body: Box::pin(futures::stream::iter(chunks)),
+        })
+    }
+}
+
+/// AC-2b / AC-10 / BR-12. A 400 naming the effort field produces the **typed**
+/// error, and it names all three values BR-12 requires: the provider, the level
+/// the user asked for, and the level the clamp actually sent.
+///
+/// The distinction from a generic `ClientError` is load-bearing: this error is
+/// what populates the session refusal memo (ADR-F), and a memo poisoned by an
+/// unrelated 400 would silently stop sending effort to a provider that accepts
+/// it — the misattribution family BR-6 exists to prevent.
+#[test]
+fn a_400_naming_the_effort_field_is_the_typed_refusal() {
+    let transport = ErrorBodyTransport::new(
+        400,
+        r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#,
+    );
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig::new("mystery", "https://byom.test"));
+    let err = match block_on(adapter.stream_turn(
+        // Clamped: `xhigh` asked for, `high` sent — the pair the error must name.
+        request_with(ResolvedEffort::clamped(
+            EffortLevel::Xhigh,
+            EffortLevel::High,
+        )),
+        &transport,
+    )) {
+        Ok(_) => panic!("a 400 must not open a stream"),
+        Err(err) => err,
+    };
+
+    match &err {
+        ProviderError::EffortRefused {
+            provider_id,
+            requested,
+            clamped,
+        } => {
+            assert_eq!(provider_id, "mystery");
+            assert_eq!(*requested, EffortLevel::Xhigh);
+            assert_eq!(*clamped, EffortLevel::High);
+        }
+        other => panic!("expected the typed refusal, got {other:?}"),
+    }
+    // The message names all three, and carries no response body or prompt text.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("mystery") && msg.contains("xhigh") && msg.contains("high"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("Unrecognized"),
+        "no provider body in the error: {msg}"
+    );
+
+    // It is NOT handed to the retry/fallback/degrade machinery: the one correct
+    // response is a single retry with no reasoning field, which the daemon does.
+    assert!(err.is_effort_refused());
+    assert_eq!(err.failure_class(), None);
+}
+
+/// The narrowness is the point. A 400 for an unrelated reason stays a generic
+/// `ClientError`, so it cannot poison the session memo and silently disable
+/// effort for a provider that accepts it.
+#[test]
+fn an_unrelated_400_is_not_read_as_an_effort_refusal() {
+    let transport = ErrorBodyTransport::new(
+        400,
+        r#"{"error":{"message":"invalid model: no such model `test-model`"}}"#,
+    );
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig::new("mystery", "https://byom.test"));
+    let err = match block_on(adapter.stream_turn(
+        request_with(ResolvedEffort::effort(EffortLevel::High)),
+        &transport,
+    )) {
+        Ok(_) => panic!("a 400 must not open a stream"),
+        Err(err) => err,
+    };
+    assert!(!err.is_effort_refused(), "got {err:?}");
+    assert!(matches!(err, ProviderError::ClientError { status: 400 }));
+}
+
+/// A request that carried **no** reasoning field cannot be refusing one, so the
+/// classification short-circuits. This is what makes the daemon's single retry
+/// non-looping by construction rather than by a counter: the retry sends
+/// `Omit`, and an `Omit` request can never come back as a refusal.
+#[test]
+fn a_request_with_no_reasoning_field_can_never_be_an_effort_refusal() {
+    for reason in [
+        EffortOmission::ShapeNone,
+        EffortOmission::EmptyLadder,
+        EffortOmission::RefusedThisSession,
+    ] {
+        let transport = ErrorBodyTransport::new(
+            400,
+            r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#,
+        );
+        let adapter =
+            OpenAiCompatAdapter::new(OpenAiCompatConfig::new("mystery", "https://byom.test"));
+        let err = match block_on(
+            adapter.stream_turn(request_with(ResolvedEffort::omit(reason)), &transport),
+        ) {
+            Ok(_) => panic!("a 400 must not open a stream"),
+            Err(err) => err,
+        };
+        assert!(
+            !err.is_effort_refused(),
+            "{reason:?}: a request that sent no reasoning field cannot be refusing one",
+        );
+    }
+}
+
+/// AC-2b's first leg: an `openai-compatible` provider with **no declared
+/// reasoning_shape** sends the effort field on its first call — the ADR-E
+/// `effort_only` default. Asserted on the captured body, because this is the
+/// BYOM leg of AC-1's regression and the whole point is what leaves the daemon.
+#[test]
+fn an_undeclared_byom_endpoint_sends_the_effort_field_on_its_first_call() {
+    let transport = ErrorBodyTransport::new(400, r#"{"error":"nope"}"#);
+    let adapter = OpenAiCompatAdapter::new(OpenAiCompatConfig::new("mystery", "https://byom.test"));
+    let _ = block_on(adapter.stream_turn(
+        request_with(ResolvedEffort::effort(EffortLevel::High)),
+        &transport,
+    ));
+    let bodies = transport.seen.lock().expect("capture lock").clone();
+    assert_eq!(bodies.len(), 1, "exactly one request, no silent retry here");
+    assert_eq!(bodies[0]["reasoning_effort"], "high");
+    assert!(
+        bodies[0].get("thinking").is_none(),
+        "and never both shapes (AC-2b)",
+    );
 }

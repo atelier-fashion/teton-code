@@ -83,6 +83,14 @@ pub fn render_report_view(report: &CostReportView, surface: &mut dyn Surface) {
             report.total_calls
         ),
     );
+    // REQ-559 BR-11: effort is a dial, and this is its gauge. Rendered next to
+    // the totals it is a subset of, so it is never read as an addition to them.
+    render_reasoning_split(
+        surface,
+        report.reasoning_tokens,
+        report.calls_reporting_reasoning,
+        report.total_calls,
+    );
     if report.unpriced_calls > 0 {
         surface.line(
             LineKind::Cost,
@@ -155,6 +163,39 @@ fn render_group(
     }
 }
 
+/// Render the reasoning-token split (REQ-559 BR-11 / AC-9).
+///
+/// Says "unreported" where the providers reported nothing, and says how much of
+/// the ledger the figure covers where they reported some. It never prints `0`
+/// for an unreported split, and never scales a partial figure up to look like a
+/// whole-ledger total — both would be displaying an estimate as an actual, which
+/// REQ-544 BR-2 forbids for exactly this reason.
+pub(crate) fn render_reasoning_split(
+    surface: &mut dyn Surface,
+    reasoning_tokens: Option<u64>,
+    calls_reporting: u64,
+    total_calls: u64,
+) {
+    let Some(reasoning) = reasoning_tokens else {
+        surface.line(
+            LineKind::Cost,
+            "  thinking:    unreported (no provider reported a reasoning split)",
+        );
+        return;
+    };
+    let scope = if calls_reporting >= total_calls {
+        String::new()
+    } else {
+        // The rest are unreported, NOT zero — say which, or the number reads as
+        // a total.
+        format!(" (across {calls_reporting} of {total_calls} calls; the rest unreported)")
+    };
+    surface.line(
+        LineKind::Cost,
+        &format!("  thinking:    {reasoning} output token(s){scope}"),
+    );
+}
+
 /// Render the per-session web-lookup roll-up (REQ-563 BR-7 / AC-6).
 ///
 /// Its own section rather than a column on the call tables, mirroring the
@@ -204,6 +245,7 @@ mod tests {
             output_tokens: 50,
             usd_micros,
             cached_tokens: None,
+            reasoning_tokens: None,
         }
     }
 
@@ -254,6 +296,8 @@ mod tests {
                 usd_micros: 3_000,
             }],
             web_per_session: Vec::new(),
+            reasoning_tokens: None,
+            calls_reporting_reasoning: 0,
         };
 
         let mut surface = RecordingSurface::new();
@@ -289,6 +333,8 @@ mod tests {
             per_phase: Vec::new(),
             per_provider: Vec::new(),
             web_per_session: Vec::new(),
+            reasoning_tokens: None,
+            calls_reporting_reasoning: 0,
         };
 
         let mut surface = RecordingSurface::new();
@@ -326,6 +372,8 @@ mod tests {
             per_phase: Vec::new(),
             per_provider: Vec::new(),
             web_per_session: Vec::new(),
+            reasoning_tokens: None,
+            calls_reporting_reasoning: 0,
         };
 
         let mut surface = RecordingSurface::new();
@@ -407,6 +455,48 @@ mod tests {
             }],
             per_provider: Vec::new(),
             web_per_session: Vec::new(),
+            reasoning_tokens: None,
+            calls_reporting_reasoning: 0,
         }
+    }
+
+    // ---- REQ-559: the thinking split (BR-11, AC-9) ------------------------
+
+    /// BR-11: a `0` standing in for "the provider didn't tell us" is displaying
+    /// an estimate as an actual (REQ-544 BR-2). The word is what distinguishes
+    /// them, so the word is what is asserted.
+    #[test]
+    fn an_unreported_split_renders_the_word_never_a_zero() {
+        let mut surface = RecordingSurface::new();
+        render_reasoning_split(&mut surface, None, 0, 7);
+        let line = surface.lines_of(LineKind::Cost).join("\n");
+        assert!(line.contains("unreported"), "{line}");
+        assert!(
+            !line.contains(" 0 "),
+            "an unreported split must not be rendered as zero: {line}",
+        );
+    }
+
+    /// A split that covers only part of the ledger says so. Without the scope
+    /// clause the number reads as a whole-ledger total, which is the same
+    /// estimate-as-actual failure one step subtler.
+    #[test]
+    fn a_partial_split_says_how_much_of_the_ledger_it_covers() {
+        let mut surface = RecordingSurface::new();
+        render_reasoning_split(&mut surface, Some(1_200), 2, 7);
+        let line = surface.lines_of(LineKind::Cost).join("\n");
+        assert!(line.contains("1200"), "{line}");
+        assert!(line.contains("2 of 7"), "{line}");
+        assert!(line.contains("unreported"), "{line}");
+    }
+
+    /// When every call reported, the figure is a total and says nothing extra.
+    #[test]
+    fn a_complete_split_renders_without_a_scope_caveat() {
+        let mut surface = RecordingSurface::new();
+        render_reasoning_split(&mut surface, Some(900), 3, 3);
+        let line = surface.lines_of(LineKind::Cost).join("\n");
+        assert!(line.contains("900"), "{line}");
+        assert!(!line.contains("unreported"), "{line}");
     }
 }

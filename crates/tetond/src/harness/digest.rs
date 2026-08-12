@@ -341,6 +341,7 @@ mod tests {
             &bus,
             Some(SessionId::from("sess")),
             Some(RouteDecided {
+                effort: None,
                 category: Some(Category::Digest),
                 tier: Some(Tier::Scan),
                 phase: None,

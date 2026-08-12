@@ -1,7 +1,7 @@
 ---
 id: REQ-559
 title: "Global reasoning effort with per-provider clamping and thinking-token attribution"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-05
 updated: 2026-08-11
@@ -277,12 +277,20 @@ report gains the thinking split.
 
 ## Open Questions
 
-- [ ] OQ-1: How does a provider's `effort_ladder` get populated — hardcoded per
-      `kind` in the adapter, declared in the provider config by the user, or
-      probed once at registration? Hardcoding is wrong for arbitrary
-      OpenAI-compatible endpoints (REQ-544 BR-6 promises any endpoint with no
-      code change); user-declared is honest but is a knob nobody wants to fill in.
-      Leaning: a per-kind default table the user may override.
+- [x] OQ-1 — **closed 2026-08-11 at architecture time (ADR-E): a per-kind
+      default table the user may override**, as the leaning proposed. The
+      non-obvious part is the *value* of the default for an unknown
+      OpenAI-compatible endpoint: **`{low, high}`**, the intersection of every
+      published target ladder — not the full canonical set. A permissive default
+      sends `xhigh` to a Kimi K3 registered as `openai-compatible` (the expected
+      registration, since Teton has no Kimi kind), which K3 rejects → 400 →
+      BR-12 fallback to no effort → back to Kimi's `max` default. The
+      superset default reaches this REQ's originating defect the long way round.
+      Overridable per provider via `[provider.capabilities] effort_ladder`.
+
+      Residual, deliberately deferred: whether a ladder should also be settable
+      via `teton provider add` flags rather than only a config-file edit. The
+      config path satisfies OQ-1; a flag is additive.
 - [x] OQ-2 — **closed 2026-08-11: `effort_only`.** An unknown
       OpenAI-compatible endpoint states its effort. Recorded in BR-4 with the
       reasoning and pinned by AC-2b. The 400 risk is real but bounded and
@@ -296,18 +304,33 @@ report gains the thinking split.
       behavior it asserts two sections earlier. The cost-conservative reading
       stands — a user who wants the higher rung names it, rather than having a
       clamp round up on their behalf and bill for it.
-- [ ] OQ-6: Does a BR-12 fallback **persist for the session**? BR-12 specifies
-      per-call fallback and forbids silent retries, so an endpoint that 400s on
-      the effort field 400s once per call for the life of the session — correct
-      but wasteful. Options: remember the refusal per provider for the session,
-      or downgrade that provider's declared shape to `none` and say so on the
-      surface. Raised by OQ-2's resolution; not created by it.
+- [x] OQ-6 — **closed 2026-08-11 at architecture time (ADR-F): remember the
+      refusal per provider for the session; never persist it.** The refusal is
+      session-scoped runtime state keyed by `provider_id`; it never writes to
+      config and never mutates the declared `reasoning_shape`, because BR-4
+      forbids sniffing a shape from a response and persisting a capability
+      conclusion drawn from one HTTP status is exactly that. Remembering is not
+      what BR-12 forbids: BR-12 forbids *silent retries* — making the failing
+      request again and hoping — and the memo does the opposite, declining a
+      request already known to fail. The declared shape is untouched, so the
+      next session tries again and a provider that gained support self-heals
+      with no config edit. The condition that makes this a degradation rather
+      than a hidden downgrade is visibility: the surface renders that provider
+      as "effort refused this session — sending none" rather than showing a
+      level it is not receiving (BR-6 discipline, BUG-146/BUG-153 family).
 - [ ] OQ-4: Does `teton cost` break out reasoning tokens per category (REQ-558)
       as well as in total? Per-category is the view that makes the dial tunable;
       it also widens this REQ's coupling to REQ-558's landing.
-- [ ] OQ-5: Should raising effort mid-session apply to the current in-flight turn
-      or only the next one? Applying mid-turn splits one turn across two effort
-      levels, which makes the CostRecord ambiguous.
+- [x] OQ-5 — **closed 2026-08-11 at architecture time (ADR-I): only the next
+      turn.** The effective effort is snapshotted at turn start, so one
+      `CostRecord` always describes one setting. The question named its own
+      answer — a turn split across two effort levels has an ambiguous cost record
+      — and the snapshot costs nothing. This also gives the System Model's
+      `Config.effort` / `SessionState.effort_override` pair a coherent reading:
+      `/effort <level>` writes the persisted config (BR-8) *and* sets the session
+      override, and resolution is
+      `session.override.or(config.effort).unwrap_or(high)` — never an absent
+      field (BR-1).
 
 ## Out of Scope
 

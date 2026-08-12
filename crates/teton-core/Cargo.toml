@@ -24,5 +24,12 @@ toml = "0.8"
 thiserror = "2"
 globset = "0.4"
 
+[dev-dependencies]
+# Test-only. The REQ-559 effort ladder has a hand-written Serialize/Deserialize
+# pair (a bitset that must present as a level list), and that is exactly where
+# silent drift lives — so both directions are pinned against JSON literals.
+# A dev-dependency, so the no-I/O rule above is untouched for the shipped crate.
+serde_json = "1"
+
 [lints]
 workspace = true

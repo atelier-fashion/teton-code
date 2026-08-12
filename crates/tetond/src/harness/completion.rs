@@ -27,6 +27,7 @@
 //! The loop switches on that and never sees a provider-specific shape.
 
 use std::sync::{Arc, Mutex};
+use teton_core::effort::{EffortOmission, ResolvedEffort};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -374,6 +375,9 @@ impl CompletionSource for LocalEngineSource {
             usage: TokenUsage {
                 input_tokens: u64::from(completion.prompt_tokens),
                 output_tokens: u64::from(completion.completion_tokens),
+                // The local engine reports no reasoning split — thinking there
+                // is a chat-template property, not a counted category (BR-6).
+                reasoning_tokens: None,
             },
             dropped_calls: parsed.dropped_calls,
             cache: Some(cache),
@@ -400,6 +404,22 @@ pub struct RemoteProviderSource<'a, T: Transport> {
     session_id: SessionId,
     phase: Option<Phase>,
     category: Option<Category>,
+    /// What this source's requests put in their reasoning field(s) (REQ-559).
+    ///
+    /// A **required** constructor argument, not a builder with a default: BR-1
+    /// says omitting effort is never a valid outcome, and a defaulting builder
+    /// would let a call site forget silently. The value is resolved once at
+    /// route time (ADR-G) and carried here unchanged — this source never clamps.
+    effort: ResolvedEffort,
+    /// Set when this provider refused the effort field on this turn (REQ-559
+    /// BR-12 / ADR-F).
+    ///
+    /// Read by the daemon after the turn to populate the **session** refusal
+    /// memo, so the next call to this provider does not repeat a request already
+    /// known to fail. Never persisted, and it does not touch the declared
+    /// `reasoning_shape`: BR-4 forbids sniffing a shape from a response, so this
+    /// is a runtime degradation record and not a capability conclusion.
+    effort_refused: bool,
 }
 
 impl<'a, T: Transport> RemoteProviderSource<'a, T> {
@@ -411,6 +431,7 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
         provider_id: impl Into<ProviderId>,
         model: impl Into<String>,
         session_id: impl Into<SessionId>,
+        effort: ResolvedEffort,
     ) -> Self {
         Self {
             provider,
@@ -420,7 +441,17 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
             session_id: session_id.into(),
             phase: None,
             category: None,
+            effort,
+            effort_refused: false,
         }
+    }
+
+    /// Whether this source's provider refused the effort field (REQ-559 BR-12).
+    ///
+    /// The daemon reads this after the turn to seed the session memo (ADR-F).
+    #[must_use]
+    pub fn effort_was_refused(&self) -> bool {
+        self.effort_refused
     }
 
     /// Pin the structured-mode `phase` this source's calls are attributed to
@@ -487,6 +518,10 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             messages,
             tools: exposed_tool_specs(tools, config.max_tools),
             max_tokens: config.gen_params.max_tokens,
+            // REQ-559 BR-1: resolved once at route time and carried here. This
+            // site does not clamp, does not default, and cannot omit — the
+            // field is required and `ResolvedEffort` has no `Default` (ADR-B).
+            effort: self.effort,
         };
 
         // BR-2 / REQ-558 BR-11: attribute the call to (session, phase, category,
@@ -501,14 +536,63 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
         if let Some(category) = self.category {
             attribution = attribution.with_category(category);
         }
-        let egress_ctx = EgressContext::new(self.provider_id.clone())
-            .with_session(self.session_id.clone())
-            .with_cost(attribution);
-        let transport = self.egress.scoped(provenance.clone(), egress_ctx);
+        // Built as a closure rather than a value because the BR-12 fallback
+        // below needs a second one: an `EgressContext` is consumed by `scoped`,
+        // and the retry is a distinct call through the same choke point, so it
+        // must be boundary-checked and metered on its own terms — never handed a
+        // reused context that would fold two calls into one CostRecord.
+        let egress_ctx = || {
+            EgressContext::new(self.provider_id.clone())
+                .with_session(self.session_id.clone())
+                .with_cost(attribution.clone())
+        };
+        let transport = self.egress.scoped(provenance.clone(), egress_ctx());
 
         // Errors known at open time (including a privacy block, surfaced as a
         // transport refusal) come back here before any events flow.
-        let mut stream = self.provider.stream_turn(request, &transport).await?;
+        //
+        // REQ-559 BR-12: a provider that refuses the reasoning-effort field gets
+        // **exactly one** retry, with no reasoning field at all. Not a silent
+        // retry of the same request — that is what BR-12 forbids — and never
+        // both shapes "to see which works". The retry cannot loop by
+        // construction: it sends `Omit`, and `classify_client_error`
+        // short-circuits on a request that carried no reasoning field, so a
+        // second refusal is impossible rather than merely unlikely.
+        // Cloned only when a refusal is *possible* — i.e. when this request
+        // actually carries an effort field. A turn whose resolution is `Omit` or
+        // `ThinkingFlag` can never come back as an effort refusal
+        // (`classify_client_error` short-circuits), so it must not pay to copy a
+        // whole conversation on the hot path for a fallback it cannot take.
+        let retry_seed =
+            matches!(request.effort, ResolvedEffort::Effort { .. }).then(|| request.clone());
+        let mut stream = match self.provider.stream_turn(request, &transport).await {
+            Ok(stream) => stream,
+            Err(err) if err.is_effort_refused() => {
+                // Loud, not silent (LESSON-447): the typed error names the
+                // provider and both levels, and the session surface reports the
+                // provider as refusing rather than showing a level it is not
+                // receiving (BR-6).
+                eprintln!("teton: {err}; retrying this call with no reasoning field");
+                self.effort_refused = true;
+                let seed = retry_seed.expect(
+                    "a refusal is only classified for a request that carried an \
+                     effort field, which is exactly when the seed was taken",
+                );
+                let fallback = TurnRequest {
+                    effort: ResolvedEffort::Omit {
+                        reason: EffortOmission::RefusedThisSession,
+                    },
+                    ..seed
+                };
+                // A fresh scoped transport: the first attempt's was consumed,
+                // and this is a second call through the same choke point, so it
+                // is boundary-checked and metered on its own terms (BR-13 —
+                // effort changes nothing about egress).
+                let transport = self.egress.scoped(provenance.clone(), egress_ctx());
+                self.provider.stream_turn(fallback, &transport).await?
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         let mut text = String::new();
         let mut tool_call: Option<TurnDecision> = None;
@@ -753,6 +837,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 11,
                         output_tokens: 4,
+                        reasoning_tokens: None,
                     },
                     stop_reason: StopReason::ToolUse,
                 })),
@@ -788,8 +873,14 @@ mod tests {
         // double-execute) is caught.
         let provider = TwoToolProvider;
         let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
-        let mut source =
-            RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-under-test");
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "two-tool",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
         let prompt = flat_prompt("prompt");
@@ -824,7 +915,8 @@ mod tests {
             turn.usage,
             TokenUsage {
                 input_tokens: 11,
-                output_tokens: 4
+                output_tokens: 4,
+                reasoning_tokens: None,
             }
         );
     }
@@ -1149,8 +1241,14 @@ mod tests {
         // it.
         let provider = TwoToolProvider;
         let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
-        let source =
-            RemoteProviderSource::new(&provider, &egress, "two-tool", "model-x", "sess-under-test");
+        let source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "two-tool",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
         assert_eq!(source.chat_format(), ChatFormat::Flat);
     }
 

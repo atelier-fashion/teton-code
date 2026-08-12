@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS cost_records (
     input_tokens   INTEGER NOT NULL,
     output_tokens  INTEGER NOT NULL,
     usd_micros     INTEGER,
-    cached_tokens  INTEGER
+    cached_tokens  INTEGER,
+    reasoning_tokens INTEGER
 );
 CREATE TRIGGER IF NOT EXISTS cost_records_no_update
     BEFORE UPDATE ON cost_records
@@ -128,7 +129,7 @@ CREATE TRIGGER IF NOT EXISTS web_overrides_no_delete
 /// does reach an existing file, which is how REQ-563's `web_lookups` arrives on
 /// a `cost.db` written before it existed. Only a new column on a table that is
 /// already there is invisible to the schema batch.
-const ADDITIVE_COLUMNS: [(&str, &str); 2] = [
+const ADDITIVE_COLUMNS: [(&str, &str); 3] = [
     (
         // REQ-558: the routing category the call was made for.
         "category",
@@ -141,6 +142,14 @@ const ADDITIVE_COLUMNS: [(&str, &str); 2] = [
         // the truth about it, not a zero.
         "cached_tokens",
         "ALTER TABLE cost_records ADD COLUMN cached_tokens INTEGER",
+    ),
+    (
+        // REQ-559: the reasoning subset of `output_tokens`. Nullable and never
+        // backfilled: a provider that reported no split told us nothing, and a
+        // row written before this column existed predates the concept — `None`
+        // is the truth about both, and a `0` would be an invented attribution.
+        "reasoning_tokens",
+        "ALTER TABLE cost_records ADD COLUMN reasoning_tokens INTEGER",
     ),
 ];
 
@@ -226,6 +235,14 @@ pub struct LedgerRow {
     /// `input_tokens`, never a substitute: the prompt is still that many tokens
     /// whether or not their KV had to be recomputed.
     pub cached_tokens: Option<u64>,
+    /// Of `output_tokens`, how many the provider attributed to reasoning
+    /// (REQ-559 BR-10), or `None` where it reported none.
+    ///
+    /// `None` on every Anthropic row (that API reports no split), every local
+    /// row, and every row written before this column existed. A **component
+    /// of** `output_tokens`, never an addition: the completion is that many
+    /// tokens whether or not the provider broke out the thinking share.
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl LedgerRow {
@@ -247,6 +264,7 @@ impl LedgerRow {
             output_tokens: self.output_tokens,
             usd_micros: self.usd_micros.unwrap_or(0),
             cached_tokens: self.cached_tokens,
+            reasoning_tokens: self.reasoning_tokens,
         }
     }
 }
@@ -414,6 +432,10 @@ impl CostLedger {
             input_tokens,
             output_tokens,
             usd_micros,
+            // This convenience is used where the caller holds only aggregate
+            // counts; the metered stream path (`MeteredBody::finalize`) is what
+            // carries a real reasoning split.
+            reasoning_tokens: None,
             // A remote provider has no local KV: "no cache" rather than
             // "nothing reused".
             cached_tokens: None,
@@ -458,6 +480,8 @@ impl CostLedger {
             output_tokens,
             usd_micros,
             cached_tokens: Some(cached_tokens),
+            // The local engine reports no reasoning split (BR-6).
+            reasoning_tokens: None,
         })
     }
 
@@ -469,7 +493,8 @@ impl CostLedger {
         let guard = self.conn.lock().map_err(|_| LedgerError::Poisoned)?;
         let mut stmt = guard.prepare(
             "SELECT session_id, phase, category, provider_id, model,
-                    input_tokens, output_tokens, usd_micros, cached_tokens
+                    input_tokens, output_tokens, usd_micros, cached_tokens,
+                    reasoning_tokens
              FROM cost_records ORDER BY id",
         )?;
         let rows = stmt
@@ -486,6 +511,7 @@ impl CostLedger {
                     output_tokens: to_u64(r.get::<_, i64>(6)?),
                     usd_micros: r.get(7)?,
                     cached_tokens: r.get::<_, Option<i64>>(8)?.map(to_u64),
+                    reasoning_tokens: r.get::<_, Option<i64>>(9)?.map(to_u64),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -652,6 +678,9 @@ impl CostMeter for CostLedger {
             provider_id,
             attribution,
             scan: UsageScan::default(),
+            // REQ-559: the status the provider answered with. `polled` alone is
+            // no longer sufficient — see `should_record`.
+            status: response.status,
             polled: false,
             recorded: false,
         };
@@ -688,17 +717,25 @@ impl CostMeter for CostLedger {
 /// early. Recording from [`Drop`] closes all of them at one site rather than at
 /// each caller, which is where a cancellation-safety rule belongs.
 ///
-/// ## `polled` is the line between "abandoned" and "never begun"
+/// ## Two conditions, and the second used to be implied by the first
 ///
-/// [`Drop`] records only a body the caller actually asked for a chunk. That
-/// distinction is not fastidiousness — it is what keeps this fix from inventing
-/// rows. A 4xx/5xx response is rejected on its **status**, before a byte of its
-/// body is read (see the provider adapters' `stream_turn`), and that body is
-/// then dropped unpolled. Recording it would append a 0-token, $0 row for a call
-/// the provider refused, inflating `CostReport::calls` with requests that bought
-/// nothing — a change to what the ledger *means*, made as a side effect of
-/// closing a leak. One `bool` draws the line where the ledger already draws it:
-/// a row means a response this daemon began to consume.
+/// [`Drop`] records only a body the caller actually asked for a chunk, and only
+/// a response the provider did **not** refuse. Both are what keep this from
+/// inventing rows: a 0-token, $0 row for a call the provider rejected would
+/// inflate `CostReport::calls` with requests that bought nothing — a change to
+/// what the ledger *means*, made as a side effect of closing a leak.
+///
+/// `polled` originally carried both, because a 4xx/5xx was rejected on its
+/// status before a byte of its body was read, so a refused body was always
+/// unpolled. **REQ-559 ended that**: BR-12's refusal classification reads a
+/// bounded prefix of a 400 body to decide whether the provider is rejecting the
+/// effort field, which polls it. The status check is therefore not redundant
+/// with `polled` — it is the condition `polled` was standing in for, now stated
+/// directly, and a guard keyed on a condition that stops holding once a feature
+/// lands is LESSON-443's shape exactly.
+///
+/// `polled` still earns its place: it separates "abandoned mid-stream" from
+/// "never begun" on a 2xx, which the status cannot.
 ///
 /// What [`Drop`] does **not** do is complete the token counts. A stream
 /// abandoned before its provider reported usage records what the scan saw, which
@@ -713,6 +750,9 @@ struct MeteredBody {
     sink: Arc<dyn CostEventSink>,
     session_id: SessionId,
     provider_id: ProviderId,
+    /// The response status, so a refusal is never billed however its body is
+    /// consumed (REQ-559).
+    status: u16,
     attribution: CostAttribution,
     scan: UsageScan,
     /// Whether the caller ever asked this body for a chunk. See the type doc:
@@ -732,8 +772,22 @@ impl MeteredBody {
         if self.recorded {
             return;
         }
+        // Latched even when the row is suppressed, so a suppressed body cannot
+        // be reconsidered by a later trigger.
         self.recorded = true;
+        if !self.should_record() {
+            return;
+        }
         self.finalize();
+    }
+
+    /// Whether this response is billable at all (REQ-559).
+    ///
+    /// A refusal buys nothing, so it is not a call — however its body was
+    /// consumed. Kept separate from `polled` because the two answer different
+    /// questions and only one of them is still implied by the other.
+    fn should_record(&self) -> bool {
+        self.status < 400
     }
 
     fn finalize(&self) {
@@ -753,6 +807,10 @@ impl MeteredBody {
             usd_micros,
             // The metered stream is the remote choke point; no local KV here.
             cached_tokens: None,
+            // A subset of `output_tokens`, never added to it: the price above is
+            // computed from `usage.output` alone, exactly as before this field
+            // existed, so totals are byte-identical (BR-10).
+            reasoning_tokens: usage.reasoning,
         };
         // Best-effort: never let a ledger hiccup break the response stream.
         let _ = insert_and_emit(&self.conn, self.sink.as_ref(), &row);
@@ -808,6 +866,11 @@ impl Drop for MeteredBody {
 struct Usage {
     input: u64,
     output: u64,
+    /// REQ-559 BR-10: the reasoning subset of `output`, or `None` where the
+    /// stream reported none. Deliberately `Option` while the other two are
+    /// plain `u64`: a missing total is meaningfully zero, a missing split is
+    /// not.
+    reasoning: Option<u64>,
 }
 
 /// An incremental, provider-agnostic usage extractor.
@@ -828,12 +891,28 @@ struct UsageScan {
     carry: Vec<u8>,
     input: Option<u64>,
     output: Option<u64>,
+    /// REQ-559 BR-10: the reasoning subset of `output`, when the stream reports
+    /// one. Stays `None` for a stream that does not — unreported, not zero.
+    reasoning: Option<u64>,
 }
 
 /// Quoted usage keys that denote input (prompt) tokens.
 const INPUT_KEYS: [&[u8]; 2] = [b"\"input_tokens\"", b"\"prompt_tokens\""];
 /// Quoted usage keys that denote output (completion) tokens.
+///
+/// The trailing quote is load-bearing: without it `"completion_tokens"` would
+/// also match inside `"completion_tokens_details"`, the very object
+/// [`REASONING_KEYS`] reads, and the output total would be overwritten by
+/// whatever integer happened to follow that key.
 const OUTPUT_KEYS: [&[u8]; 2] = [b"\"output_tokens\"", b"\"completion_tokens\""];
+/// Quoted usage key denoting the reasoning subset of the output tokens
+/// (REQ-559 BR-10). Reported by OpenAI-compatible endpoints inside
+/// `completion_tokens_details`; Anthropic reports no equivalent, so an
+/// Anthropic stream simply never matches and the value stays `None`.
+///
+/// The key plus its integer is far shorter than [`CARRY_BYTES`] (64), so a
+/// split across a chunk boundary is still matched.
+const REASONING_KEYS: [&[u8]; 1] = [b"\"reasoning_tokens\""];
 
 impl UsageScan {
     fn feed(&mut self, chunk: &[u8]) {
@@ -849,6 +928,11 @@ impl UsageScan {
                 self.output = Some(v);
             }
         }
+        for key in REASONING_KEYS {
+            if let Some(v) = last_int_after(&buf, key) {
+                self.reasoning = Some(v);
+            }
+        }
         let keep = buf.len().min(CARRY_BYTES);
         self.carry = buf.split_off(buf.len() - keep);
     }
@@ -857,6 +941,10 @@ impl UsageScan {
         Usage {
             input: self.input.unwrap_or(0),
             output: self.output.unwrap_or(0),
+            // NOT `unwrap_or(0)`: a stream that reported no split told us
+            // nothing, and a `0` here would claim the provider did no thinking
+            // (BR-10, BR-11).
+            reasoning: self.reasoning,
         }
     }
 }
@@ -915,8 +1003,9 @@ fn insert_and_emit(
         guard.execute(
             "INSERT INTO cost_records
                (recorded_at_ms, session_id, phase, category, provider_id, model,
-                input_tokens, output_tokens, usd_micros, cached_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                input_tokens, output_tokens, usd_micros, cached_tokens,
+                reasoning_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 now_ms(),
                 row.session_id,
@@ -928,6 +1017,7 @@ fn insert_and_emit(
                 to_i64(row.output_tokens),
                 row.usd_micros,
                 row.cached_tokens.map(to_i64),
+                row.reasoning_tokens.map(to_i64),
             ],
         )?;
     }
@@ -1304,6 +1394,12 @@ CREATE TRIGGER cost_records_no_delete
         assert_eq!(
             rows[0].cached_tokens, None,
             "a pre-REQ row predates the prefix cache — None is the truth about              it, not zero"
+        );
+        assert_eq!(
+            rows[0].reasoning_tokens, None,
+            "REQ-559: and it predates the reasoning split too. Never backfilled — \
+             a row written before the column has no thinking share to report, and \
+             a 0 would invent one",
         );
         assert_eq!(rows[0].input_tokens, 900);
         assert_eq!(rows[0].usd_micros, Some(42));
@@ -1921,6 +2017,45 @@ CREATE TRIGGER cost_records_no_delete
         );
     }
 
+    /// REQ-559 found the hole in `polled`'s reasoning. That flag was a **proxy**
+    /// for "the provider refused this on its status, so nobody read the body" —
+    /// true when it was written, and no longer true: BR-12's refusal
+    /// classification reads a bounded prefix of a 400 body to decide whether the
+    /// provider is rejecting the effort field. Polling it would flip `polled` and
+    /// bill a 0-token, $0 row for every refused request, inflating
+    /// `CostReport::calls` with calls that bought nothing.
+    ///
+    /// The guard now keys on the thing it always meant — the status — so reading
+    /// an error body to classify it cannot invent a row. LESSON-443's shape: a
+    /// guard keyed on a condition that stops holding once a feature lands.
+    #[tokio::test]
+    async fn reading_a_4xx_body_to_classify_it_still_bills_nothing() {
+        let (ledger, sink) = ledger();
+        let ledger = Arc::new(ledger);
+        let body = body_from(vec![
+            "{\"error\":{\"message\":\"Unrecognized request argument supplied: reasoning_effort\"}}",
+        ]);
+        let response = TransportResponse {
+            status: 400,
+            location: None,
+            body,
+        };
+        let metered = CostMeter::meter_response(
+            ledger.as_ref(),
+            response,
+            Some(SessionId::from("s")),
+            ProviderId::from("mystery"),
+            CostAttribution::new("mystery-1"),
+        );
+        // Exactly what REQ-559's `classify_client_error` does: read the body.
+        drain(metered.body).await;
+        assert!(
+            ledger.all_records().expect("read").is_empty(),
+            "a refused request must not be billed, even once its body is read",
+        );
+        assert!(sink.records.lock().unwrap().is_empty());
+    }
+
     /// The other half of that line, and the reason `Drop` is gated on `polled`.
     ///
     /// A 4xx/5xx response is refused on its **status** by every provider
@@ -2005,8 +2140,128 @@ CREATE TRIGGER cost_records_no_delete
             scan.usage(),
             Usage {
                 input: 0,
-                output: 0
+                output: 0,
+                reasoning: None,
             }
         );
+    }
+
+    // ---- REQ-559: reasoning-token attribution (BR-10, AC-9) ----------------
+
+    /// The load-bearing half of BR-10: parsing the split must not move the
+    /// totals. Reasoning tokens are **already inside** `completion_tokens`, so
+    /// this is an attribution change and not a totals change — the same bytes
+    /// must produce the same `output_tokens` they produced before the field
+    /// existed.
+    #[test]
+    fn reading_the_reasoning_split_does_not_move_the_totals() {
+        let with_details = b"\"prompt_tokens\": 80, \"completion_tokens\": 42, \
+            \"completion_tokens_details\": {\"reasoning_tokens\": 30}";
+        let without = b"\"prompt_tokens\": 80, \"completion_tokens\": 42";
+
+        let mut a = UsageScan::default();
+        a.feed(with_details);
+        let mut b = UsageScan::default();
+        b.feed(without);
+
+        assert_eq!(a.usage().input, b.usage().input);
+        assert_eq!(
+            a.usage().output,
+            b.usage().output,
+            "the reasoning split must not change the output total (BR-10)",
+        );
+        assert_eq!(a.usage().output, 42);
+        assert_eq!(a.usage().reasoning, Some(30));
+        // Unreported is `None`, never `0` — a provider that told us nothing is
+        // not a provider that reported zero thinking (BR-10, BR-11).
+        assert_eq!(b.usage().reasoning, None);
+        assert!(
+            a.usage().reasoning.unwrap() <= a.usage().output,
+            "reasoning is a subset of output, never an addition",
+        );
+    }
+
+    /// `"completion_tokens_details"` contains `completion_tokens` as a prefix.
+    /// The trailing quote in `OUTPUT_KEYS` is what stops the scanner reading the
+    /// nested object's first integer as the output total — a one-character
+    /// invariant worth its own test.
+    #[test]
+    fn the_details_object_does_not_capture_the_output_total() {
+        let mut scan = UsageScan::default();
+        // The details object comes LAST and holds a smaller number, so a scanner
+        // that matched the prefix would report 30 instead of 42.
+        scan.feed(
+            b"\"completion_tokens\": 42, \"completion_tokens_details\": {\"reasoning_tokens\": 30}",
+        );
+        assert_eq!(scan.usage().output, 42);
+        assert_eq!(scan.usage().reasoning, Some(30));
+    }
+
+    /// The key plus its integer is well under `CARRY_BYTES`, so a split across a
+    /// chunk boundary is still matched — the same guarantee the totals have.
+    #[test]
+    fn the_reasoning_split_survives_a_chunk_boundary() {
+        let mut scan = UsageScan::default();
+        scan.feed(b"data: {\"usage\":{\"completion_tokens\":42,\"completion_tokens_deta");
+        scan.feed(b"ils\":{\"reasoning_toke");
+        scan.feed(b"ns\":30}}}\n\n");
+        assert_eq!(scan.usage().reasoning, Some(30));
+        assert_eq!(scan.usage().output, 42);
+    }
+
+    /// AC-9 end to end through the metering seam: a response carrying the field
+    /// produces a row whose `reasoning_tokens` is that value and whose
+    /// `output_tokens` is unchanged.
+    #[tokio::test]
+    async fn a_metered_stream_records_the_reasoning_split() {
+        let (ledger, _sink) = ledger();
+        let ledger = Arc::new(ledger);
+        let body = body_from(vec![
+            "data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":42,",
+            "\"completion_tokens_details\":{\"reasoning_tokens\":30}}}\n\ndata: [DONE]\n\n",
+        ]);
+        let response = TransportResponse {
+            status: 200,
+            location: None,
+            body,
+        };
+        let metered = CostMeter::meter_response(
+            ledger.as_ref(),
+            response,
+            Some(SessionId::from("s")),
+            ProviderId::from("deepseek"),
+            CostAttribution::new("deepseek-chat"),
+        );
+        drain(metered.body).await;
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].output_tokens, 42, "totals unchanged (BR-10)");
+        assert_eq!(rows[0].reasoning_tokens, Some(30));
+    }
+
+    /// And a response without the field records `None`, which is what
+    /// `teton cost` renders as "unreported" rather than as `0`.
+    #[tokio::test]
+    async fn an_unreported_split_is_recorded_as_none_not_zero() {
+        let (ledger, _sink) = ledger();
+        let ledger = Arc::new(ledger);
+        let body = body_from(vec![
+            "data: {\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":42}}\n\ndata: [DONE]\n\n",
+        ]);
+        let response = TransportResponse {
+            status: 200,
+            location: None,
+            body,
+        };
+        let metered = CostMeter::meter_response(
+            ledger.as_ref(),
+            response,
+            Some(SessionId::from("s")),
+            ProviderId::from("anthropic"),
+            CostAttribution::new("claude-opus-5"),
+        );
+        drain(metered.body).await;
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows[0].reasoning_tokens, None);
     }
 }

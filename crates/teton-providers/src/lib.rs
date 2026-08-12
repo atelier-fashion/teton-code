@@ -37,17 +37,21 @@ pub mod transport;
 mod sse;
 
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
 
 pub use anthropic::AnthropicAdapter;
 pub use capability::{CapabilityProfile, HarnessProfile};
+// REQ-559: re-exported, never redefined. One ladder, one clamp, one resolver
+// (BR-3) — an adapter-local copy of this vocabulary would be a second place for
+// the wire spellings to drift from the router's.
 pub use failure::{
     classify, degradation_signal, FailureAction, FailureClass, FailureDecision, ProviderDegraded,
 };
 pub use openai_compat::{OpenAiCompatAdapter, OpenAiCompatConfig};
+pub use teton_core::{EffortLevel, EffortOmission, ReasoningShape, ResolvedEffort};
 pub use transport::{
     BlockDetail, ByteStream, HttpMethod, Transport, TransportError, TransportRequest,
     TransportResponse,
@@ -99,6 +103,20 @@ pub struct TokenUsage {
     pub input_tokens: u64,
     /// Completion / output tokens.
     pub output_tokens: u64,
+    /// Of [`Self::output_tokens`], how many the provider attributes to
+    /// reasoning (REQ-559 BR-10).
+    ///
+    /// A **component of** `output_tokens`, never an addition to it: both
+    /// providers' aggregate counts already include reasoning tokens, so this is
+    /// an attribution change and not a totals change. Summing the two would
+    /// double-count and inflate every reported figure — for a product whose
+    /// headline promise is cost control, worse than not reporting the split.
+    ///
+    /// `None` means **unreported**, never `0`. A provider that does not tell us
+    /// is a different fact from one that reports zero reasoning, and collapsing
+    /// them would put an estimate where an actual belongs (REQ-544 BR-2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Normalized stop reason across providers.
@@ -195,6 +213,98 @@ pub struct TurnRequest {
     pub tools: Vec<ToolSpec>,
     /// Maximum output tokens.
     pub max_tokens: u32,
+    /// What this call puts in its reasoning field(s) (REQ-559).
+    ///
+    /// **Required, with no `#[serde(default)]`, and [`ResolvedEffort`]
+    /// implements no [`Default`]** — that is the point (REQ-559 ADR-B). BR-1
+    /// says omitting effort is never a valid outcome, because omission inherits
+    /// the provider's default and at least one target provider defaults to
+    /// `max`. A test enumerating call paths is the guard LESSON-443 describes:
+    /// correct only until someone adds another path. Rust struct-literal syntax
+    /// requires every field, so a construction site that has not thought about
+    /// effort does not compile.
+    ///
+    /// The level here is **already clamped** — resolved once at route time
+    /// (ADR-G). Adapters `match` this and never re-clamp.
+    pub effort: ResolvedEffort,
+}
+
+/// How many bytes of a 400 response body are read to decide whether it is a
+/// REQ-559 BR-12 effort refusal.
+///
+/// Bounded because the body is provider-controlled and this is an error path:
+/// a provider that answered 400 with a megabyte of prose must not cost the
+/// daemon a megabyte of allocation to classify. Every observed vendor error body
+/// names the offending parameter in its first few hundred bytes.
+const EFFORT_REFUSAL_SNIFF_BYTES: usize = 4096;
+
+/// Whether a 400 body names the reasoning field this request sent (REQ-559
+/// BR-12).
+///
+/// Deliberately narrow. The memo this feeds (ADR-F) stops sending effort to a
+/// provider for the rest of the session, so a false positive is a silent
+/// downgrade — exactly the failure mode BR-6 exists to prevent. It therefore
+/// matches the **field names this crate actually emits** rather than anything
+/// resembling an effort complaint, and an unrelated 400 stays a `ClientError`.
+#[must_use]
+pub fn body_names_the_effort_field(body: &[u8]) -> bool {
+    let head = &body[..body.len().min(EFFORT_REFUSAL_SNIFF_BYTES)];
+    let Ok(text) = std::str::from_utf8(head) else {
+        // A non-UTF-8 error body tells us nothing. Not an effort refusal —
+        // "unclassifiable" must fall to the general 4xx path, not to the memo.
+        return false;
+    };
+    // The two spellings the adapters in this crate emit, and nothing else.
+    text.contains("reasoning_effort") || text.contains("output_config")
+}
+
+/// Read a bounded prefix of an error body so a 400 can be classified (REQ-559
+/// BR-12), then discard the rest.
+///
+/// Only ever called on a 4xx, where the body is an error document rather than a
+/// turn. The cap is [`EFFORT_REFUSAL_SNIFF_BYTES`]; a stream error while reading
+/// yields whatever arrived, because a partial error body still classifies and a
+/// read failure on an already-failed request is not worth a second error.
+async fn read_error_head(mut body: ByteStream) -> Vec<u8> {
+    let mut out = Vec::new();
+    while out.len() < EFFORT_REFUSAL_SNIFF_BYTES {
+        match body.next().await {
+            Some(Ok(chunk)) => out.extend_from_slice(&chunk),
+            Some(Err(_)) | None => break,
+        }
+    }
+    out.truncate(EFFORT_REFUSAL_SNIFF_BYTES);
+    out
+}
+
+/// The BR-12 classification for a 4xx: an effort refusal, or the general client
+/// error. Shared by both adapters so the rule has one implementation.
+///
+/// `sent` is what the request actually carried, and it names **both** levels —
+/// which is what lets this layer satisfy BR-12's "names the provider, the
+/// requested level, and the clamped level" without ever seeing the setting.
+///
+/// A provider that was sent **no** reasoning field cannot be refusing one, so
+/// the check short-circuits. That is also what makes the daemon's retry
+/// non-looping by construction: the retry sends `Omit`, and an `Omit` request
+/// can never be classified as a refusal.
+pub(crate) async fn classify_client_error(
+    status: u16,
+    body: ByteStream,
+    provider_id: &str,
+    sent: ResolvedEffort,
+) -> ProviderError {
+    if let ResolvedEffort::Effort { level, requested } = sent {
+        let head = read_error_head(body).await;
+        if body_names_the_effort_field(&head) {
+            return ProviderError::EffortRefused {
+                provider_id: provider_id.to_owned(),
+                requested,
+                clamped: level,
+            };
+        }
+    }
+    ProviderError::ClientError { status }
 }
 
 /// A pinned, boxed stream of normalized turn events. `Send` so the daemon can
@@ -259,6 +369,35 @@ pub enum ProviderError {
         /// The offending tool's name.
         tool: String,
     },
+    /// The provider refused the reasoning-effort field (REQ-559 BR-12).
+    ///
+    /// A 400 whose body names the effort field, and **only** that. An unrelated
+    /// 400 stays a [`ProviderError::ClientError`] — narrow on purpose, because
+    /// this error is what populates the session refusal memo (ADR-F), and a
+    /// memo poisoned by an unrelated failure would stop sending effort to a
+    /// provider that accepts it, silently, for the rest of the session.
+    ///
+    /// Names all three values BR-12 requires: the provider, the level the user
+    /// asked for, and the level the clamp actually sent. It carries **no
+    /// response body and no prompt text** — conventions.md forbids content in
+    /// error messages.
+    ///
+    /// It has no [`FailureClass`]: it is not a failure the retry / fallback /
+    /// degrade machinery should act on. The one correct response is a single
+    /// retry with no reasoning field, which the daemon performs — and then
+    /// remembers, so the failing request is not made again this session.
+    #[error(
+        "provider `{provider_id}` refused the reasoning-effort field \
+         (requested `{requested}`, sent `{clamped}`)"
+    )]
+    EffortRefused {
+        /// The provider that refused.
+        provider_id: String,
+        /// The level the user set, before clamping.
+        requested: EffortLevel,
+        /// The level actually sent, after the per-provider clamp.
+        clamped: EffortLevel,
+    },
     /// The request could not be built (serialization / configuration problem).
     /// This is a local programmer/config error, not a provider failure, so it
     /// has no [`FailureClass`].
@@ -293,8 +432,25 @@ impl ProviderError {
             // A privacy block is not a provider failure and must never be
             // retried/fallen-back-on: the daemon handles it out-of-band by
             // rerouting to the local tier (REQ-544 M-1).
-            ProviderError::Build(_) | ProviderError::PrivacyBlocked(_) => return None,
+            // Neither is a failure the retry / fallback / degrade machinery
+            // should act on. A privacy block is handled out-of-band by
+            // rerouting to the local tier (REQ-544 M-1); an effort refusal by a
+            // single retry with no reasoning field, remembered for the session
+            // (REQ-559 BR-12 / ADR-F). Handing either to `classify` would
+            // degrade a provider that is working fine.
+            ProviderError::Build(_)
+            | ProviderError::PrivacyBlocked(_)
+            | ProviderError::EffortRefused { .. } => return None,
         })
+    }
+
+    /// Whether this is the REQ-559 BR-12 effort refusal, which the daemon
+    /// answers with exactly one retry carrying no reasoning field — never a
+    /// silent retry of the same request, and never both shapes to see which
+    /// works.
+    #[must_use]
+    pub const fn is_effort_refused(&self) -> bool {
+        matches!(self, ProviderError::EffortRefused { .. })
     }
 
     /// Whether this error is an egress privacy block (BR-1) — a distinct,

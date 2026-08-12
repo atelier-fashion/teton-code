@@ -875,6 +875,7 @@ mod tests {
             &bus,
             Some(teton_protocol::SessionId::from("sess")),
             Some(RouteDecided {
+                effort: None,
                 category: Some(Category::Triage),
                 tier: Some(Tier::Scan),
                 phase: None,

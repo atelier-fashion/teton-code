@@ -15,6 +15,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSnapshot, ConfigUpdate,
@@ -30,6 +31,7 @@ use teton_protocol::{
 mod banner;
 mod client;
 mod cost_ui;
+mod effort_ui;
 mod firstrun;
 mod keychain;
 mod loading;
@@ -107,6 +109,16 @@ enum Command {
     },
     /// Show the cost meter: total, per-phase attribution, and savings estimate.
     Cost,
+    /// Show or set the global reasoning-effort level (REQ-559).
+    ///
+    /// With no argument, prints the current level and what it resolves to for
+    /// each registered provider. With one, sets it — and the setting persists
+    /// across sessions (BR-8).
+    Effort {
+        /// One of: low, medium, high, xhigh, max. Omit to read the current
+        /// setting.
+        level: Option<String>,
+    },
     /// Diagnose the daemon, socket, model state, and providers.
     Doctor,
     /// Remove Teton Code from this machine: stop the daemon, delete its data
@@ -315,6 +327,7 @@ fn main() -> ExitCode {
         None => run_session(&paths, cli.yes, cli.verbose),
         Some(Command::Doctor) => run_doctor(&paths),
         Some(Command::Cost) => run_cost(&paths),
+        Some(Command::Effort { level }) => run_effort(&paths, level.as_deref()),
         Some(Command::Model { action }) => match action {
             ModelAction::List => run_model_list(&paths),
             ModelAction::Set { name } => run_model_set(&paths, &name, cli.yes),
@@ -1152,6 +1165,55 @@ fn run_cost(paths: &DaemonPaths) -> anyhow::Result<()> {
         query_and_render_cost(&mut conn, &mut ctx)?;
     }
     let _ = surface.flush();
+    Ok(())
+}
+
+/// `teton effort [level]` (REQ-559 BR-9).
+///
+/// The bare form reads; the one-argument form sets and then reads back, so the
+/// user sees the clamp their new level lands on rather than only the number they
+/// typed. Both render through [`crate::effort_ui::render`] — the same function
+/// `/effort` calls — because two surfaces describing one setting must not be
+/// able to drift (LESSON-456, REQ-555 BR-4).
+fn run_effort(paths: &DaemonPaths, level: Option<&str>) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    if let Some(raw) = level {
+        // Parsed client-side so a typo costs one line rather than a round trip,
+        // and the error names every accepted spelling from the one list that
+        // also defines the enum (`teton_core::effort::level_list`).
+        let parsed: EffortLevel = match raw.parse() {
+            Ok(l) => l,
+            Err(err) => {
+                ctx.surface.line(LineKind::Error, &format!("{err}"));
+                return Ok(());
+            }
+        };
+        if let Err(err) = conn.call(
+            ConfigSetParams {
+                update: ConfigUpdate::SetEffort(parsed),
+            },
+            &mut ctx,
+        )? {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!("could not set the effort level: {}", err.message),
+            );
+            return Ok(());
+        }
+    }
+    // Read back even after a set, so the user sees the clamp their new level
+    // lands on for each provider rather than only the number they typed.
+    match conn.call(ConfigGetParams::default(), &mut ctx)? {
+        Ok(cfg) => effort_ui::render(ctx.surface, cfg.snapshot.effort.as_ref()),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("could not read the effort setting: {}", err.message),
+        ),
+    }
     Ok(())
 }
 
@@ -2004,6 +2066,7 @@ mod tests {
         use BindingSource::{PinnedLocal, TierInheritance as Inherit};
         use TierBindingSource::{DefaultProvider, LocalTier};
         ConfigSnapshot {
+            effort: None,
             providers: Vec::new(),
             tiers: vec![
                 tier(Tier::Reflex, "on-device", LocalTier),
