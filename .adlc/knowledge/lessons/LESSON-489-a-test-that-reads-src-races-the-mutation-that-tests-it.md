@@ -8,7 +8,7 @@ concerns: ["verification", "test-determinism"]
 tags: ["mutation-testing", "source-scanning", "flaky-tests", "false-positive"]
 req: REQ-561
 created: 2026-08-07
-updated: 2026-08-07
+updated: 2026-08-12
 ---
 
 ## What happened
@@ -60,6 +60,40 @@ diagnosing anything.
 
 Filed as BUG-159 — not fixed in REQ-561, because hardening a seam-scanner's
 deliberate loud-failure posture is its own decision.
+
+## Amendment (2026-08-12, when BUG-159 was actually fixed)
+
+Three things this lesson got slightly wrong, learned by applying it:
+
+**A partly-applied lesson leaves the sharpest edge intact, and looks done.**
+Between the filing and the fix, `production_sources` (plural) *was* hardened —
+during REQ-562/REQ-570, citing this lesson — which silently fixed four of the
+five tests named above. The fifth, `call_sites`' own sweep, still used a
+different singular read and still raced. Anyone reading the two hardened call
+sites would reasonably conclude the lesson had landed. **When a lesson names a
+pattern, fix every instance in one pass or record which were left**, because a
+half-applied fix is indistinguishable from a whole one at a glance.
+
+**The race has more windows than the read.** This lesson (and BUG-159) framed it
+as walk-then-*read*. The walk itself has the same shape: `path.is_dir()` is a
+separate syscall from the `read_dir` that follows it, so a *directory* removed
+mid-walk panics too. Whenever a "listing is stale by the time we use it" bug is
+found, ask what else was derived from that listing.
+
+**"Skip a file that vanished" is not right everywhere, and the split is
+*who asked*.** A sweep may skip — nobody named that file, so its absence is a
+fact about timing. A caller reading a *specific* module by name must still fail
+loudly, or a renamed module passes against an empty string. BUG-159's own
+suggested fix said to make the shared singular read skip; doing that literally
+would have broken the by-name caller.
+
+**Tolerating a skip needs a floor.** Every skip shrinks what a set-based sweep
+sees, and those callers assert "every source has property P" — so each missed
+file passes a little more easily, and a scan seeing *nothing* passes completely.
+The fix pairs each tolerance with a minimum-file-count assertion, verified by
+mutation: neutering the walk turns the sweeps red on the floor rather than green.
+A tolerance without a floor converts a loud failure into a silent pass, which is
+a worse bug than the one being fixed.
 
 Related: [[LESSON-441]], [[LESSON-485]].
 

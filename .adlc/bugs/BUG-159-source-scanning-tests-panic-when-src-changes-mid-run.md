@@ -1,7 +1,7 @@
 ---
 id: BUG-159
 title: "Source-scanning tests panic when src/ changes mid-run — which is exactly what a mutation pass does"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-07
 updated: 2026-08-12
@@ -129,6 +129,15 @@ minimum file count, so the race tolerance cannot quietly become a vacuous green.
   message, rather than passing vacuously — so the floor is load-bearing.
 - Full workspace: 2215 passing across 45 targets, `fmt --check` and
   `clippy -- -D warnings` clean.
+
+### Deployment
+
+n/a — this repo is a plain PR-gated OSS flow with no Cloud Run services and no
+`gcp:` config (conventions.md, Git Conventions). The fix rides `main` and reaches
+users at the next tagged Homebrew release; it is test-harness code, so it changes
+nothing in the shipped daemon's runtime behaviour.
+
+Merged in PR #104 (`37bf7c8`), 2026-08-12.
 
 ## Files Changed
 
