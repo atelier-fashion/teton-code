@@ -107,6 +107,16 @@ pub enum ConsentOutcome {
         /// The answering connection's bounded, control-stripped descriptor.
         /// Untrusted, peer-chosen text — a hint, never an identity.
         approver: String,
+        /// What verified a human behind this approval (REQ-570 BR-9, AC-9).
+        ///
+        /// Travels **with the decision** for [`Self::approver`]'s reason, one
+        /// layer sharper: the presence check happens in the *answering*
+        /// connection's handler, and the grant is minted in the *requesting*
+        /// connection's parked task. The requester never sees the verification,
+        /// so a method re-derived at the mint site would be a guess. Recording
+        /// the fact where it was known rather than re-deriving it downstream is
+        /// LESSON-501's rule, and this is exactly the seam it is about.
+        attestation: crate::attest::AttestationMethod,
     },
     /// A user was asked and said no.
     Denied,
@@ -160,6 +170,32 @@ enum RenderedBy {
     /// reaches this module, so "ask the requester" can never mean "ask the
     /// daemon's own spawned code".
     TheRequesterItself,
+    /// **Monitor.** Any connection holding a session, and **never** the
+    /// requester (REQ-570 BR-5).
+    ///
+    /// The arm REQ-569's verify pass deleted, restored under a condition it did
+    /// not have. What made the old one unsound was not its routing: connection A
+    /// created a throwaway session, which made A an attached surface, which made
+    /// A the eligible approver for connection B's monitor request — two distinct
+    /// `ConnectionId`s, so it did not even read as self-approval, and one
+    /// attacker holding two connections owned the whole exchange.
+    ///
+    /// Two things changed, and **both** are load-bearing:
+    ///
+    /// 1. A granting answer now requires a presence attestation the daemon
+    ///    itself verified, so the attacker's second connection has to produce a
+    ///    human at the machine. That is what actually breaks the attack.
+    /// 2. `session/create` is no longer ungated (REQ-570 BR-10(a)), so the
+    ///    daemon's own children can no longer manufacture the attached-surface
+    ///    standing the attack opened with.
+    ///
+    /// Excluding the requester is kept as a **third**, structural guard rather
+    /// than dropped as redundant. It is cheap, it is the invariant BR-5 states
+    /// in so many words, and LESSON-502 is explicit that an invariant enforced
+    /// at several seams needs a test at each seam — a property that holds only
+    /// because two other mechanisms happen to hold is one nobody notices
+    /// breaking.
+    AnyAttachedPeer,
 }
 
 impl ConsentRoute {
@@ -182,6 +218,27 @@ impl ConsentRoute {
         }
     }
 
+    /// The monitor arm (REQ-570 BR-5): any connection holding a session, never
+    /// the requester.
+    #[must_use]
+    pub fn any_attached_peer(requester: ConnectionId) -> Self {
+        Self {
+            requester,
+            rendered_by: RenderedBy::AnyAttachedPeer,
+        }
+    }
+
+    /// Whether this route is for a monitor-scope request.
+    ///
+    /// Read by the answering handler so a monitor approval can be held to BR-5's
+    /// extra condition. Asking the *route* rather than trusting the caller to
+    /// remember the scope keeps one definition of which requests are monitor
+    /// requests (LESSON-484).
+    #[must_use]
+    pub fn is_monitor(&self) -> bool {
+        matches!(self.rendered_by, RenderedBy::AnyAttachedPeer)
+    }
+
     /// The connection that asked.
     #[must_use]
     pub fn requester(&self) -> ConnectionId {
@@ -201,6 +258,10 @@ impl ConsentRoute {
         match &self.rendered_by {
             RenderedBy::ConnectionsAttachedTo(session) => attached.contains(session),
             RenderedBy::TheRequesterItself => connection == self.requester,
+            // The requester exclusion is *first* and unconditional: a monitor
+            // grant is sight of every session on the machine, and BR-5 says the
+            // approver is never the requester under any arm.
+            RenderedBy::AnyAttachedPeer => connection != self.requester && !attached.is_empty(),
         }
     }
 
@@ -558,6 +619,33 @@ impl ConsentSurfaces {
             })
     }
 
+    /// Is any live connection **other than** `requester` holding a session?
+    ///
+    /// The question that decides whether a monitor request has anyone to ask
+    /// (REQ-570 BR-5). Excludes the requester for the same reason
+    /// `RenderedBy::AnyAttachedPeer` does: a connection holding a session of its
+    /// own must not become the peer that approves its *own* daemon-wide read.
+    ///
+    /// Counts surfaces that may not answer, exactly as
+    /// [`Self::anyone_attached_to`] does (F2). A connection the ancestry gate
+    /// excludes still *holds* what it holds; leaving it out here would make a
+    /// held daemon look empty and turn a refusal into a different answer.
+    #[must_use]
+    pub fn anyone_attached_to_anything(&self, requester: ConnectionId) -> bool {
+        self.live
+            .read()
+            .expect("consent surfaces lock poisoned")
+            .iter()
+            .any(|(connection, surface)| {
+                *connection != requester
+                    && !surface
+                        .attached
+                        .read()
+                        .expect("connection attachment lock poisoned")
+                        .is_empty()
+            })
+    }
+
     /// Send `frame` to every surface this route offers the prompt to. Returns
     /// how many took it.
     pub fn deliver_request(&self, route: &ConsentRoute, frame: &str) -> usize {
@@ -640,6 +728,7 @@ mod tests {
     fn granted(approver: &str) -> ConsentOutcome {
         ConsentOutcome::Granted {
             approver: approver.to_owned(),
+            attestation: crate::attest::AttestationMethod::OsBiometric,
         }
     }
 
@@ -713,6 +802,56 @@ mod tests {
                 "{case}: renders_request"
             );
         }
+    }
+
+    /// **REQ-570 BR-5 / AC-2.** The monitor arm never offers the prompt to the
+    /// requester — under any attachment it happens to hold.
+    ///
+    /// Tested here, at the predicate, rather than only through the socket, and
+    /// the reason is worth recording: over the socket this invariant is
+    /// currently **unreachable**. A connection declaring `monitor` is parked
+    /// inside its own handshake while the consent runs, so it has no reader loop
+    /// with which to answer itself, and an end-to-end test cannot distinguish a
+    /// daemon that enforces this rule from one that merely never gets the chance
+    /// to break it.
+    ///
+    /// That is exactly the shape LESSON-502 names — an invariant enforced at
+    /// several seams needs a test at *each* seam — and it was caught by AC-11's
+    /// mutation check: deleting `connection != self.requester` left the whole
+    /// suite green until this test existed. A guard nothing can kill is a guard
+    /// nobody notices losing, and the handshake shape it depends on is not
+    /// something this module gets to assume forever.
+    #[test]
+    fn a_monitor_prompt_is_never_offered_to_the_connection_that_asked() {
+        let registry = GrantRegistry::new();
+        let requester = registry.next_connection_id();
+        let peer = registry.next_connection_id();
+        let route = ConsentRoute::any_attached_peer(requester);
+
+        // The cell the mutation check found unguarded: the requester holding a
+        // session of its own is precisely the F1 attack's opening move, and it
+        // must not make the requester an eligible approver.
+        assert!(
+            !route.renders_request(requester, &attached_to(&["sess-its-own"])),
+            "a monitor request must never be answerable by the connection that \
+             raised it, however much it happens to hold (BR-5)"
+        );
+        assert!(
+            !route.renders_request(requester, &HashSet::new()),
+            "and holding nothing does not help it either"
+        );
+
+        // Non-vacuity: a genuine peer holding a session *is* asked, so the
+        // refusals above are the rule and not an arm that asks nobody.
+        assert!(route.renders_request(peer, &attached_to(&["sess-theirs"])));
+        assert!(
+            !route.renders_request(peer, &HashSet::new()),
+            "a peer holding no session is not a surface whose user owns anything"
+        );
+
+        // And the requester is still told how its own request ended.
+        assert!(route.renders_outcome(requester, &HashSet::new()));
+        assert!(route.is_monitor());
     }
 
     /// The requester always learns how its own request ended, even in the arms

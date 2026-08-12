@@ -2305,10 +2305,31 @@ async fn the_reader_loop_serves_sessions_while_a_proposal_is_outstanding() {
     let runtime = Arc::new(DaemonRuntime::with_consent(Arc::clone(&h.gate)));
     let path = temp_socket("consent");
     let listener = server::bind_listener(&path).unwrap();
-    let daemon = Arc::new(Daemon::with_runtime(
-        Arc::clone(&h.bus),
-        Arc::clone(&runtime),
-    ));
+    // `Embedded` is the honest answer for an in-process harness, and REQ-570
+    // BR-10(a) is what makes it load-bearing here.
+    //
+    // `with_runtime` takes the production path, which sets
+    // `DaemonProcess::Own(std::process::id())`. In an in-process test the client
+    // *is* the host process, so every connection then classifies as a daemon
+    // descendant — which never mattered while `session/create` and
+    // `model/confirm` were ungated, and now does. `Embedded` states what is
+    // actually true of this fixture: the daemon has spawned no children, so no
+    // connection is a descendant of it (see `DaemonProcess::Embedded`'s own
+    // docs, which call `Own(shared pid)` the dishonest option for exactly this
+    // case).
+    //
+    // This test is about the reader loop staying responsive while a proposal is
+    // outstanding (D-3). It is not an ancestry test, and the ancestry gate has
+    // its own coverage in `multi_client.rs`.
+    let daemon = Arc::new(
+        Daemon::with_runtime(Arc::clone(&h.bus), Arc::clone(&runtime))
+            .with_daemon_process(server::DaemonProcess::Embedded)
+            // REQ-570 BR-10(b): model/confirm is a daemon-wide commitment and
+            // now asks for presence. This test is about the reader loop staying
+            // responsive (D-3), not about attestation, so it gets a satisfiable
+            // mechanism rather than asserting the refusal.
+            .with_presence_verifier(Box::new(tetond::attest::AcceptingVerifier::default())),
+    );
     let server_task = tokio::spawn(server::serve(listener, daemon));
 
     let mut client = TestClient::connect(&path).await;

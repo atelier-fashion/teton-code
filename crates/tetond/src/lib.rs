@@ -62,6 +62,7 @@
 //! [`teton_protocol::socket_path`] module so the daemon and every client resolve
 //! the same path (REQ-544 — was a byte-identical copy in each binary).
 
+pub mod attest;
 pub mod auth;
 pub mod broadcast;
 pub mod call_sites;

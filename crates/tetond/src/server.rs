@@ -118,12 +118,15 @@ use teton_protocol::{RequestId, SessionId};
 
 use teton_core::lifetime::{BlockingActivity, PolicySource, ShutdownPolicy};
 
+use crate::attest::{
+    AttestationRefusal, AttestationRegistry, MechanismAvailability, PresenceVerifier,
+};
 use crate::auth::{self, PeerIdentity};
 use crate::broadcast::{EventBus, Subscription, DEFAULT_CAPACITY};
 use crate::consent::{
     ConsentOutcome, ConsentRoute, ConsentSurfaces, PendingConsents, CONSENT_TIMEOUT,
 };
-use crate::grants::{ConnectionId, Grant, GrantRegistry};
+use crate::grants::{monitor_witness, ConnectionId, Grant, GrantRegistry};
 use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
 use crate::runtime::DaemonRuntime;
@@ -277,6 +280,25 @@ pub struct Daemon {
     /// Every live connection a consent prompt can be rendered at (BR-6's
     /// routing question, which no single connection can answer for itself).
     pub surfaces: ConsentSurfaces,
+    /// Verified human presence, bound to one connection and one request
+    /// (REQ-570 BR-6).
+    ///
+    /// Beside [`Self::grants`] rather than inside it because the two answer
+    /// different questions and must not imply each other: a grant is standing
+    /// that persists for the connection's life, an attestation is a single-use
+    /// proof that a human was at the machine one moment ago.
+    pub attestations: AttestationRegistry,
+    /// What asks a human to prove presence (REQ-570 ADR-B).
+    ///
+    /// Boxed behind the trait so AC-7's "no mechanism available" posture can be
+    /// injected on any platform — the fail-closed path is then testable on a
+    /// developer's Mac and a headless Linux CI runner alike, rather than only
+    /// being observable on hardware nobody runs the suite on.
+    ///
+    /// Default and CI builds get [`UnavailableVerifier`], which refuses: on a
+    /// build with no mechanism, cross-session attach is **refused** rather than
+    /// silently self-approved (BR-8, BR-11).
+    pub verifier: Box<dyn PresenceVerifier>,
     /// The process whose descendants may never attach or monitor (BR-4, ADR-A).
     pub process: DaemonProcess,
     /// How long a consent request waits before it defaults closed (BR-7).
@@ -321,6 +343,8 @@ impl Daemon {
             grants: GrantRegistry::new(),
             consents: PendingConsents::new(),
             surfaces: ConsentSurfaces::new(),
+            attestations: AttestationRegistry::new(),
+            verifier: crate::attest::default_verifier(),
             consent_timeout: CONSENT_TIMEOUT,
             grant_announcement_window: GRANT_ANNOUNCEMENT_WINDOW,
             // `Embedded`, for the same reason `ShutdownPolicy::Never` is above:
@@ -356,6 +380,23 @@ impl Daemon {
     #[must_use]
     pub fn with_consent_timeout(mut self, window: std::time::Duration) -> Self {
         self.consent_timeout = window;
+        self
+    }
+
+    /// Replaces what asks a human to prove presence (REQ-570 AC-7).
+    ///
+    /// **The injection seam the acceptance criteria are written against.** AC-7
+    /// requires the no-mechanism posture to be assertable on any platform, and
+    /// AC-1 requires the opposite — a *working* verifier — to be exercised
+    /// without a human touching a sensor in CI. Neither is reachable through the
+    /// real mechanism, which by design cannot be satisfied without a person.
+    ///
+    /// A fixture has to name this out loud, exactly as it does
+    /// [`Self::with_consent_timeout`]: production never sets it, so an
+    /// always-succeeding verifier can never be reached by a build that ships.
+    #[must_use]
+    pub fn with_presence_verifier(mut self, verifier: Box<dyn PresenceVerifier>) -> Self {
+        self.verifier = verifier;
         self
     }
 
@@ -403,6 +444,8 @@ impl Daemon {
             grants: GrantRegistry::new(),
             consents: PendingConsents::new(),
             surfaces: ConsentSurfaces::new(),
+            attestations: AttestationRegistry::new(),
+            verifier: crate::attest::default_verifier(),
             // The production answer, and taken here rather than passed in so
             // `main` cannot ship a daemon that forgot to state it: this daemon
             // is its own process, and the children it spawns are what BR-4
@@ -772,7 +815,144 @@ const ATTACH_FORBIDDEN_MESSAGE: &str =
 /// there is no remedy to name. See the F1 comment in `do_handshake` for why the
 /// one that existed was removed rather than re-predicated.
 const NOT_GRANTED_MESSAGE: &str =
-    "no monitor-scope grant, and this daemon has no way to mint one over the socket";
+    "no monitor-scope grant, and no attached client is available to approve one";
+
+/// The BR-10(a) standing check for a **daemon-wide** method (REQ-570 ADR-A,
+/// closes BUG-162).
+///
+/// Seven methods took no connection context at all, so any handshaked same-UID
+/// connection — including a daemon-spawned tool/MCP child that REQ-569 BR-4
+/// otherwise excludes from session access — could commit a multi-gigabyte
+/// download and a daemon-wide model change on the user's behalf.
+///
+/// **Why a standing rule and not "the connection that raised the request".**
+/// BUG-162 proposes binding the answer to the raiser, and REQ-570's Permissions
+/// table inherits that wording. For `model/confirm` there is no such connection:
+/// `model_consent` raises the proposal from the first-run flow spawned beside
+/// `serve`, which its own comment notes "may publish before the daemon accepts
+/// its first connection", and publishes it `None`-scoped because local model
+/// selection is a machine-wide fact. The raiser is the *daemon*. Inventing a
+/// raiser (first-claim-wins) would hand the proposal to whichever connection
+/// races fastest, which an attacker wins as easily as a user.
+///
+/// So the rule is the standing that already exists and is exactly right —
+/// REQ-569's ancestry gate — which is what BUG-162's own *Expected Behavior*
+/// names as the minimum bar: "answerable only by a connection entitled to answer
+/// it — minimally, not by the daemon's own spawned children".
+///
+/// It inherits [`ConnState::may_hold_session_access`]'s fail-closed treatment of
+/// [`Ancestry::Indeterminate`], so a vanished pid or an unreadable chain costs
+/// the same as a confirmed descendant.
+///
+/// **What it does not claim.** It cannot distinguish a user's real CLI from a
+/// non-descendant headless same-UID process; that distinction is unavailable to
+/// this layer by construction and is what BR-10(b)'s attestation supplies. This
+/// is a real reduction in blast radius — the daemon's own children lose the
+/// capability outright — recorded at that strength rather than oversold.
+///
+/// Returns the refusal to hand back, or `None` to proceed. Called as a **single
+/// line at the top of each of the seven handlers** rather than once in
+/// [`dispatch`], deliberately: AC-11's mutation check requires removing *a
+/// method's* check to make a test red, per method rather than for one
+/// representative (LESSON-502), and a single shared gate has only one thing to
+/// remove.
+/// Borrows `id` and clones only on the refusal path, so the overwhelmingly
+/// common "allowed" case leaves the caller's `id` untouched to pass on.
+fn refuse_daemon_wide(conn: &ConnState, id: &Id) -> Option<String> {
+    if conn.may_hold_session_access() {
+        return None;
+    }
+    Some(error_string(
+        id.clone(),
+        error_code::ATTACH_FORBIDDEN,
+        ATTACH_FORBIDDEN_MESSAGE,
+    ))
+}
+
+/// **BR-10(b).** A daemon-wide *commitment* additionally needs a verified human.
+///
+/// [`refuse_daemon_wide`] is a standing check and stops at the daemon's own
+/// children; REQ-569 ADR-A records that breaking the ancestry chain costs one
+/// model-supplied shell word, so a non-descendant same-UID process still passes
+/// it. That residual is tolerable for a config read. It is **not** tolerable for
+/// a commitment whose blast radius is the whole machine — a model change, a
+/// multi-gigabyte download — which is why those two methods, and only those two,
+/// ask for presence on top.
+///
+/// The split is the spec's rather than a convenience: `config/get`, `cost/query`
+/// and `web/refresh` stay layer (a) only. Prompting a human to evict a cached
+/// document would train them to click through the prompt that matters.
+///
+/// Unlike the consent path this does **not** record into the attestation
+/// registry. There is no consent `request_id` here to bind to — these methods
+/// are not answers to a request — so the check is live, used once immediately,
+/// and never stored; BR-6's single-use property holds by construction rather
+/// than by bookkeeping.
+async fn refuse_unattested_commitment(
+    daemon: &Daemon,
+    conn: &ConnState,
+    id: &Id,
+) -> Option<String> {
+    // **Where no mechanism exists this degrades to layer (a) — it does not
+    // refuse.** The asymmetry with the consent path is the spec's, not a
+    // convenience:
+    //
+    // BR-8 and BR-11 both scope the fail-closed refusal to *cross-session
+    // attach* — "cross-session attach is refused", "cross-session attach does
+    // not work there". Neither extends it to a daemon-wide commitment. AC-10
+    // says a commitment "refuses when no valid attestation is **presented**",
+    // which is about an absent or invalid proof on a platform that can produce
+    // one, not about a platform that cannot.
+    //
+    // Refusing here would also be catastrophic rather than merely strict: the
+    // `presence` feature is non-default, so a shipped build has no mechanism, so
+    // `model/confirm` would refuse — and first-run model selection, the flow
+    // REQ-547 exists for, would be impossible for every user. That is exactly
+    // what AC-8's regression bar forbids ("zero new prompts or attestation
+    // steps" for the ordinary flows).
+    //
+    // The reduced posture is **stated rather than silent**, which is the part of
+    // BR-8 that does apply here.
+    if let MechanismAvailability::Unavailable(reason) = daemon.verifier.availability() {
+        eprintln!(
+            "teton-code: daemon-wide commitment allowed on connection standing alone — \
+             this build has no presence mechanism ({}). BR-10(a) still applies; \
+             BR-10(b) is unavailable here.",
+            reason.describe()
+        );
+        return None;
+    }
+    // A synthetic binding id: these methods carry no consent request, and the
+    // verifier binds to whatever it is handed. Keying it to the connection stops
+    // two concurrent commitments from sharing one human's answer.
+    let request = RequestId::from(format!("commit-{:?}", conn.id));
+    let verifier = &daemon.verifier;
+    let subject = conn.id;
+    let verified = if tokio::runtime::Handle::try_current()
+        .map(|h| {
+            matches!(
+                h.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        })
+        .unwrap_or(false)
+    {
+        tokio::task::block_in_place(|| verifier.verify(subject, &request))
+    } else {
+        verifier.verify(subject, &request)
+    };
+    match verified {
+        Ok(_) => None,
+        Err(refusal) => {
+            eprintln!("{}", attestation_refusal_line(&conn.requester, &refusal));
+            Some(error_string(
+                id.clone(),
+                attestation_error_code(&refusal),
+                refusal_message(&refusal),
+            ))
+        }
+    }
+}
 
 /// The refusal a connection gets when it already has
 /// [`MAX_PENDING_CONSENTS_PER_CONNECTION`] prompts outstanding (REQ-569 verify,
@@ -1217,14 +1397,38 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         // `session/attach` runs on its own task for `session/prompt`'s reason
         // (REQ-569 BR-6): it may await a consent decision that arrives on this
         // same connection, and the reader loop has to stay free to read it.
-        if method == SessionAttachParams::METHOD {
+        // `attach/consent` joins them for a third reason (REQ-570 BR-1): a
+        // granting answer now runs an OS presence prompt, which parks on a human
+        // for as long as they take. Left on the reader loop it would stall every
+        // other RPC on this connection — including, on a single-client resume,
+        // the very `session/attach` whose consent is being answered.
+        // `model/confirm` and `model/set` join for BR-10(b): a daemon-wide
+        // commitment now asks for presence too, and that prompt parks on a human
+        // exactly as the consent one does.
+        let blocks_on_a_human = matches!(
+            method,
+            m if m == SessionAttachParams::METHOD
+                || m == AttachConsentParams::METHOD
+                || m == ModelConfirmParams::METHOD
+                || m == ModelSetParams::METHOD
+        );
+        if blocks_on_a_human {
             let daemon = Arc::clone(&daemon);
             let conn = conn.clone();
             let out_tx = out_tx.clone();
             let fence = fence.clone();
+            let method = method.to_owned();
             attach_tasks.retain(|h| !h.is_finished());
             attach_tasks.push(tokio::spawn(async move {
-                let response = handle_session_attach(&daemon, &conn, id, params).await;
+                let response = if method == SessionAttachParams::METHOD {
+                    handle_session_attach(&daemon, &conn, id, params).await
+                } else if method == AttachConsentParams::METHOD {
+                    handle_attach_consent(&daemon, &conn, id, params).await
+                } else if method == ModelConfirmParams::METHOD {
+                    handle_model_confirm(&daemon, &conn, id, params).await
+                } else {
+                    handle_model_set(&daemon, &conn, id, params).await
+                };
                 // The fence for the same reason `dispatch`'s responses take it:
                 // any event already delivered to this client's subscription
                 // must reach the wire ahead of the response ordering it.
@@ -1531,40 +1735,89 @@ async fn do_handshake(
             return None;
         }
         if !daemon.grants.may_monitor(connection) {
-            // **There is no consent path here, and that is the fix, not an
-            // omission** (REQ-569 verify, F1).
+            // **REQ-570 BR-5 / AC-2b: the consent path is back, under
+            // attestation.** REQ-569 verify (F1) deleted it, and the note below
+            // records why. What it could not do at the time was tell an
+            // attacker's second connection from the user's real client — so the
+            // capability kept its grant gate and had no minter at all, leaving a
+            // REQ-568 feature dead.
             //
-            // TASK-108 added one: a monitor request was routed to "any attached
-            // peer other than the requester", on the theory that an attached
-            // connection is a surface whose user demonstrably owns something.
-            // It was mintable over the socket by one attacker holding two
-            // connections. `session/create` is ungated by design, so connection
-            // A created a throwaway session — which made A attached, and made A
-            // a registered surface — and connection B then declared `monitor`.
-            // The routing picked A as the approver, A answered, and B became a
-            // daemon-wide observer of every session on the machine. No human was
-            // involved, and it did not even read as a self-approval: two
-            // different `ConnectionId`s, so the `self_approved_by` log line
-            // stayed silent.
+            // Three things now stand between a request and a monitor grant, and
+            // the first is the one that actually breaks F1's attack:
             //
-            // No sound approver predicate exists over the primitives this
-            // daemon has. It cannot distinguish an attacker's second connection
-            // from the user's real client — that is the same ADR-A residual the
-            // spec records for attach's self-render arm — and a peer-pid check
-            // only forces the attacker to fork. So the capability keeps its
-            // grant gate (BR-2/AC-4: `GrantScope::Monitor` and `may_monitor` are
-            // untouched) and simply has no minter reachable from a socket.
+            // 1. A granting answer requires a presence attestation the daemon
+            //    itself verified (`handle_attach_consent`). The attacker's
+            //    second connection has to produce a human at the machine.
+            // 2. The approver is never the requester, structurally
+            //    (`ConsentRoute::any_attached_peer`), under any arm — BR-5.
+            // 3. `session/create` is no longer ungated (BR-10(a)), so the
+            //    attached-surface standing F1's attack opened with can no longer
+            //    be manufactured by a daemon child.
             //
-            // No `attach_refused` is published either. The route it would be
-            // published on reaches nobody: this connection is not a registered
-            // surface until its handshake succeeds, and there is no peer the
-            // request was ever offered to.
-            let _ = out_tx.try_send(error_string(
-                id,
-                error_code::NOT_GRANTED,
-                NOT_GRANTED_MESSAGE,
-            ));
-            return None;
+            // Refusal stays the default: if nobody holds a session there is no
+            // peer to ask, and the request is refused rather than routed back to
+            // the requester. A monitor is a whole-daemon read, and the
+            // self-render arm that keeps *attach* usable would hand it to
+            // whoever asked.
+            let granted_now = if daemon.surfaces.anyone_attached_to_anything(connection) {
+                let route = ConsentRoute::any_attached_peer(connection);
+                let requester = requester_descriptor(&params);
+                match seek_consent(daemon, &requester, ConsentScope::Monitor, None, &route).await {
+                    Some(ConsentOutcome::Granted { attestation, .. }) => {
+                        daemon
+                            .grants
+                            .grant(Grant::monitor(connection, monitor_witness()));
+                        // Announced like any other mint (BR-9/AC-9), carrying
+                        // what verified the human — the field that separates
+                        // this from the path F1 removed.
+                        eprintln!(
+                            "teton-code: monitor grant minted for {requester} (attested: {})",
+                            attestation.as_str()
+                        );
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+
+            if granted_now {
+                // Fall through into the ordinary admission path below.
+            } else {
+                // The history this replaces (REQ-569 verify, F1): a monitor
+                // request was routed to "any attached peer other than the
+                // requester", on the theory that an attached connection is a
+                // surface whose user demonstrably owns something. One attacker
+                // holding two connections owned the whole exchange — A created a
+                // throwaway session through the then-ungated `session/create`,
+                // which made A an attached surface and so the eligible approver
+                // for B's monitor request; A answered, and B became a daemon-wide
+                // observer. No human was involved, and with two distinct
+                // `ConnectionId`s it did not even read as a self-approval.
+                //
+                // The path is back because the missing piece arrived, not
+                // because the reasoning changed: the daemon still cannot tell an
+                // attacker's second connection from the user's real client, and
+                // now it does not have to — it asks the *machine's* human
+                // directly. See the three conditions above.
+                //
+                // This arm is what is left: no peer holds a session, so there is
+                // nobody to ask. Refused rather than routed back to the
+                // requester — a monitor is a whole-daemon read, and the
+                // self-render arm that keeps attach usable would hand it to
+                // whoever asked.
+                //
+                // No `attach_refused` is published: this connection is not a
+                // registered surface until its handshake succeeds, so the route
+                // it would go out on reaches nobody.
+                let _ = out_tx.try_send(error_string(
+                    id,
+                    error_code::NOT_GRANTED,
+                    NOT_GRANTED_MESSAGE,
+                ));
+                return None;
+            }
         }
     }
 
@@ -1733,22 +1986,26 @@ fn dispatch(
         // is: both run on their own task (see `handle_client`), because both
         // await something this reader loop has to stay free to read.
         SessionClearParams::METHOD => Some(handle_session_clear(daemon, conn, id, params)),
-        AttachConsentParams::METHOD => Some(handle_attach_consent(daemon, conn, id, params)),
+        // `attach/consent` is deliberately absent alongside `session/attach`:
+        // since REQ-570 it may run an OS presence prompt that parks on a human,
+        // so it runs on its own task (see `handle_client`).
         PermissionRespondParams::METHOD => {
             Some(handle_permission_respond(daemon, conn, id, params))
         }
-        ModelConfirmParams::METHOD => Some(handle_model_confirm(daemon, id, params)),
+        // `model/confirm` and `model/set` are deliberately absent alongside
+        // `session/attach`: since REQ-570 BR-10(b) both may run an OS presence
+        // prompt that parks on a human, so they run on their own task (see
+        // `handle_client`).
         ModelListParams::METHOD => Some(ok_string(id, &daemon.runtime.model_list())),
-        ModelSetParams::METHOD => Some(handle_model_set(daemon, id, params)),
         ModelStatusParams::METHOD => Some(ok_string(id, &daemon.runtime.model_status())),
-        ConfigGetParams::METHOD => Some(handle_config_get(daemon, id)),
-        ConfigSetParams::METHOD => Some(handle_config_set(daemon, id, params)),
-        CostQueryParams::METHOD => Some(handle_cost_query(daemon, id)),
+        ConfigGetParams::METHOD => Some(handle_config_get(daemon, conn, id)),
+        ConfigSetParams::METHOD => Some(handle_config_set(daemon, conn, id, params)),
+        CostQueryParams::METHOD => Some(handle_cost_query(daemon, conn, id)),
         WebOverrideParams::METHOD => Some(handle_web_override(daemon, conn, id, params)),
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
-        WebRefreshParams::METHOD => Some(handle_web_refresh(daemon, id, params)),
+        WebRefreshParams::METHOD => Some(handle_web_refresh(daemon, conn, id, params)),
         _ => Some(error_string(
             id,
             error_code::METHOD_NOT_FOUND,
@@ -1825,7 +2082,11 @@ fn handle_session_permissions(daemon: &Daemon, conn: &ConnState, id: Id, params:
 /// fallible — a cached file that will not unlink is the one outcome that would
 /// otherwise leave the user's next lookup silently reading the copy they asked
 /// to drop, so it comes back as an error rather than as `absent`.
-fn handle_web_refresh(daemon: &Daemon, id: Id, params: Value) -> String {
+fn handle_web_refresh(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162: see `refuse_daemon_wide`.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     let params: WebRefreshParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -1894,7 +2155,20 @@ fn handle_permission_respond(daemon: &Daemon, conn: &ConnState, id: Id, params: 
 /// can fix (an unknown catalog name, an above-RAM-floor pick with no second
 /// confirmation, BR-3). Those come back as `INVALID_PARAMS` with the proposal
 /// still open, rather than silently consuming the user's one chance to answer.
-fn handle_model_confirm(daemon: &Daemon, id: Id, params: Value) -> String {
+async fn handle_model_confirm(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162, the bug's headline case: this method commits a
+    // multi-gigabyte download and a daemon-wide model change, and took no
+    // connection context at all. See `refuse_daemon_wide` for why the check is a
+    // standing rule rather than a raiser-identity one.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
+    // BR-10(b): and because the blast radius is the whole machine, a human too.
+    // Ordered after (a) deliberately — a connection that may not act here at all
+    // should be refused without a prompt appearing on somebody's screen.
+    if let Some(refusal) = refuse_unattested_commitment(daemon, conn, &id).await {
+        return refusal;
+    }
     let params: ModelConfirmParams = match serde_json::from_value(params) {
         Ok(params) => params,
         // A closed enum by design (TASK-001): an `outcome` this build does not
@@ -1912,7 +2186,15 @@ fn handle_model_confirm(daemon: &Daemon, id: Id, params: Value) -> String {
 /// Records and announces the decision synchronously so the client gets an
 /// immediate answer, then installs the newly chosen weights on its own task —
 /// a multi-gigabyte download must not hold the reader loop.
-fn handle_model_set(daemon: &Daemon, id: Id, params: Value) -> String {
+async fn handle_model_set(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162: the same daemon-wide commitment as `model/confirm`,
+    // reached by a different door — so it takes the same two layers.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
+    if let Some(refusal) = refuse_unattested_commitment(daemon, conn, &id).await {
+        return refusal;
+    }
     let params: ModelSetParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -1957,7 +2239,14 @@ fn handle_model_set(daemon: &Daemon, id: Id, params: Value) -> String {
 }
 
 /// Serve the current configuration snapshot (`config/get`).
-fn handle_config_get(daemon: &Daemon, id: Id) -> String {
+fn handle_config_get(daemon: &Daemon, conn: &ConnState, id: Id) -> String {
+    // BR-10(a) / BUG-162: exposes provider endpoints and `auth_ref` names (not
+    // secret material) to any connection. Low severity — the same-UID
+    // file-access refutation in the bug applies — but gated for the same reason
+    // as its neighbours: one rule at seven seams, not six and an exception.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     ok_string(
         id,
         &ConfigGetResult {
@@ -1968,7 +2257,15 @@ fn handle_config_get(daemon: &Daemon, id: Id) -> String {
 
 /// Apply a configuration mutation (`config/set`), rejecting it on validation
 /// failure (e.g. a raw key in `auth_ref`, BR-7).
-fn handle_config_set(daemon: &Daemon, id: Id, params: Value) -> String {
+fn handle_config_set(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162, deliberately downgraded there and gated here anyway:
+    // config lives at `base_dir/config.toml`, which any same-UID process can
+    // already write directly, so this removes *immediacy* (no daemon restart
+    // needed) rather than a capability. Defense in depth, not the emergency the
+    // raw audit finding suggested.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     let params: ConfigSetParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -1980,7 +2277,14 @@ fn handle_config_set(daemon: &Daemon, id: Id, params: Value) -> String {
 }
 
 /// Serve the authoritative cost report from the ledger (`cost/query`, BR-2).
-fn handle_cost_query(daemon: &Daemon, id: Id) -> String {
+fn handle_cost_query(daemon: &Daemon, conn: &ConnState, id: Id) -> String {
+    // BR-10(a) / BUG-162: returns a daemon-wide roll-up spanning *every* session
+    // (phase names, provider ids, token counts) — a genuine cross-session
+    // metadata read, directly adjacent to the payload reduction REQ-569 landed
+    // for `session/list`.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     match daemon.runtime.cost_report() {
         Ok(result) => ok_string(id, &result),
         Err(err) => error_from(id, err),
@@ -1990,6 +2294,14 @@ fn handle_cost_query(daemon: &Daemon, id: Id) -> String {
 /// Create a session (`session/create`), attaching the creating connection to it
 /// (REQ-568 BR-1).
 fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162: the odd one of the seven. This handler already
+    // *receives* the connection and simply never consulted the gate, so a daemon
+    // descendant that BR-4 forbids from attaching could still create and drive
+    // its **own** session, spending the user's provider credits — outside BR-4's
+    // literal wording, inside REQ-569 ADR-A's rationale.
+    if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
     let params: SessionCreateParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -2177,12 +2489,20 @@ fn publish_attach_refusal(
 /// hands back the arrears, which ride out on the next announcement that gets
 /// through: the bound costs a reader the notices, never the knowledge that there
 /// were notices.
+/// # What made it attestable (REQ-570 BR-9, AC-9)
+///
+/// `attestation` is what makes `self_approved`'s blindness recoverable. That
+/// flag is a fact about connection ids, so an attacker holding two connections
+/// is announced as an ordinary peer approval; the attestation method cannot be
+/// produced without a human at the machine, so anything other than `"none"` is
+/// a claim about a *person* rather than about a pair of ids.
 fn publish_grant_minted(
     daemon: &Daemon,
     conn: &ConnState,
     scope: ConsentScope,
     approver: &str,
     self_approved: bool,
+    attestation: crate::attest::AttestationMethod,
 ) {
     let Some(suppressed) = conn.may_announce_grant(daemon.grant_announcement_window) else {
         return;
@@ -2195,6 +2515,7 @@ fn publish_grant_minted(
             approver: approver.to_owned(),
             self_approved,
             suppressed,
+            attestation: attestation.as_str().to_owned(),
         }),
     );
 }
@@ -2443,7 +2764,10 @@ async fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params
         // The one place an attach-scope grant is minted, and it mints exactly
         // one, at exactly the scope that was asked for and for exactly the
         // session that was named (LESSON-495).
-        ConsentOutcome::Granted { approver } => {
+        ConsentOutcome::Granted {
+            approver,
+            attestation,
+        } => {
             let minted = Grant::attach(conn.id, params.session_id.clone());
             daemon.grants.grant(minted.clone());
             // REQ-569 verify, F6: announce it in-perimeter, at the moment it is
@@ -2453,12 +2777,16 @@ async fn handle_session_attach(daemon: &Daemon, conn: &ConnState, id: Id, params
             // question is "one connection or two", not "one actor or two". The
             // approver descriptor, which comes back on the outcome from
             // whichever connection actually answered, is what carries the rest.
+            // REQ-570 AC-9: and the attestation method, which is the field that
+            // makes `self_approved`'s blindness recoverable — a human had to be
+            // at the machine for it to read anything but `none`.
             publish_grant_minted(
                 daemon,
                 conn,
                 ConsentScope::Attach,
                 &approver,
                 route.self_approved_by(conn.id),
+                attestation,
             );
             let attempt = attach_to(daemon, conn, id, &params.session_id);
             if !attempt.landed {
@@ -2552,16 +2880,38 @@ fn attach_to(daemon: &Daemon, conn: &ConnState, id: Id, session_id: &SessionId) 
 ///
 /// # A daemon descendant may not answer either (BR-4)
 ///
-/// The ancestry gate runs here too, and it is not belt-and-braces. A tool child
-/// **can** hold a session — it creates its own, and `session/create` is not
-/// gated — so it is a connection with a non-empty attachment set, which is
-/// precisely what the monitor rule asks for in an approver. Without this check a
-/// daemon-spawned child could approve a *peer's* monitor request and hand a
-/// same-UID process sight of every session on the machine: BR-4 would hold on
-/// the door and fail on the door handle. "May not hold session access" has to
-/// mean "may not confer it" (LESSON-484 — the rule belongs where the decision
-/// is made, and this is a decision).
-fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+/// The ancestry gate runs here too, and it is not belt-and-braces. It used to be
+/// justified by a tool child being able to hold a session of its own, because
+/// `session/create` was ungated; REQ-570 BR-10(a) closed that, so a descendant
+/// can no longer acquire an attachment set over the socket at all. The check
+/// stays, and the reason is now the general one rather than that specific path:
+/// "may not hold session access" has to mean "may not confer it", or BR-4 would
+/// hold on the door and fail on the door handle (LESSON-484 — the rule belongs
+/// where the decision is made, and this is a decision).
+///
+/// # An approval needs a human behind it (REQ-570 BR-1, BR-3)
+///
+/// This is where REQ-569's residual closes. That REQ routed the prompt back to
+/// the *requesting* connection when nothing was attached to the target session
+/// — right for a user reopening their own CLI, and for a headless same-UID
+/// process it meant the consent was self-issued with nobody involved.
+///
+/// The routing arm survives, because refusing it would break resume, which is
+/// what REQ-565/567 exist to provide. What changed is that a **granting** answer
+/// now mints nothing unless the daemon has itself verified a human is present.
+///
+/// **The daemon runs the presence check, not the client.** A client that
+/// authenticated locally and reported "a human said yes" would be trivially
+/// forgeable by the very process this is defending against — the claim would be
+/// worth exactly as much as the self-approval it replaces. So the prompt is the
+/// daemon's own, in the daemon's process, and the connection never handles the
+/// proof.
+///
+/// A **denial** needs no attestation, and that asymmetry is deliberate. Refusing
+/// access requires no proof of presence, and requiring one would mean an absent
+/// or broken mechanism could keep a request pending rather than let it be
+/// refused — fail-open in the one direction that matters.
+async fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     if !conn.may_hold_session_access() {
         eprintln!("{}", ancestry_refusal_line(conn.ancestry, "attach/consent"));
         return error_string(id, error_code::ATTACH_FORBIDDEN, ATTACH_FORBIDDEN_MESSAGE);
@@ -2584,6 +2934,34 @@ fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
     }
 
     let granted = matches!(params.outcome, AttachConsentOutcome::Granted);
+
+    // BR-1 / BR-3: an approval mints a credential, so it needs a human. A
+    // denial does not — see this function's docs on why that asymmetry is the
+    // fail-closed direction.
+    //
+    // `None` on the denial path is not "unattested" leaking through: a denial
+    // mints nothing, so there is no grant for a method to describe.
+    let attested = if granted {
+        match attest_presence(daemon, conn, &params.request_id).await {
+            Ok(method) => method,
+            Err(refusal) => {
+                // Nothing is resolved and nothing minted: the prompt is
+                // deliberately left standing for whoever may rightfully answer
+                // it, exactly as the routing refusal above leaves it. A failed
+                // presence check must not become a way for anyone to cancel a
+                // pending consent.
+                eprintln!("{}", attestation_refusal_line(&conn.requester, &refusal));
+                return error_string(
+                    id,
+                    attestation_error_code(&refusal),
+                    refusal_message(&refusal),
+                );
+            }
+        }
+    } else {
+        crate::attest::AttestationMethod::None
+    };
+
     let outcome = match params.outcome {
         // The approver's descriptor travels with the decision (R1). This is the
         // only place it can be picked up: the requesting task is parked on a
@@ -2593,6 +2971,7 @@ fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
         // connection just as it does for a real second user.
         AttachConsentOutcome::Granted => ConsentOutcome::Granted {
             approver: conn.requester.clone(),
+            attestation: attested,
         },
         AttachConsentOutcome::Denied => ConsentOutcome::Denied,
     };
@@ -2612,6 +2991,119 @@ fn handle_attach_consent(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
         eprintln!("{}", self_approval_line(&conn.requester));
     }
     ok_string(id, &AttachConsentResult { resolved })
+}
+
+/// Ask a human to prove presence, and consume the resulting attestation
+/// (REQ-570 BR-1, BR-6, BR-7).
+///
+/// The full round trip, in the one place it happens:
+///
+/// 1. **Availability first.** An unusable mechanism produces BR-8's posture
+///    refusal rather than a prompt that cannot appear — and never a fall-through
+///    to the unattested path, which is the whole of BR-11.
+/// 2. **The prompt runs on the blocking pool.** It parks on a human for up to
+///    thirty seconds, and the daemon's standing rule (ADR-006 E-3, LESSON-448,
+///    pinned by `tests/nonblocking_inference.rs`) is that nothing which waits on
+///    human or model time may sit on a tokio worker.
+/// 3. **Record, then consume.** The registry round-trip is not ceremony: it is
+///    what makes single-use, expiry and `(subject, request)` binding one
+///    testable rule (BR-6) instead of an argument about call order, and it is
+///    what AC-6 inspects to prove a refusal left nothing behind.
+///
+/// Returns `Ok(())` only when a human was verified for *this* connection and
+/// *this* request. Every error arm mints nothing and leaves both registries as
+/// it found them.
+async fn attest_presence(
+    daemon: &Daemon,
+    conn: &ConnState,
+    request_id: &RequestId,
+) -> Result<crate::attest::AttestationMethod, AttestationRefusal> {
+    if let MechanismAvailability::Unavailable(reason) = daemon.verifier.availability() {
+        return Err(AttestationRefusal::Unavailable(reason));
+    }
+
+    let attestation = {
+        let verifier = &daemon.verifier;
+        let subject = conn.id;
+        let request = request_id.clone();
+        // `block_in_place` rather than `spawn_blocking`: the verifier is
+        // borrowed from the daemon and is not `'static`, and this call is
+        // already on its own per-request task (see `handle_client`), so moving
+        // the *thread* off the worker pool is exactly the right granularity.
+        // Falls back to a direct call on a single-threaded runtime, where
+        // `block_in_place` panics and where no other task shares this worker
+        // anyway.
+        if tokio::runtime::Handle::try_current()
+            .map(|h| {
+                matches!(
+                    h.runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                )
+            })
+            .unwrap_or(false)
+        {
+            tokio::task::block_in_place(|| verifier.verify(subject, &request))
+        } else {
+            verifier.verify(subject, &request)
+        }
+    }?;
+
+    let method = attestation.method();
+    daemon.attestations.record(attestation);
+    // Consumed immediately, by the same key it was minted under. The registry
+    // is what enforces the binding rather than this call site trusting itself.
+    daemon
+        .attestations
+        .consume(conn.id, request_id, std::time::Instant::now())?;
+    Ok(method)
+}
+
+/// The wire code for an attestation refusal (BR-7 — the endings stay apart).
+fn attestation_error_code(refusal: &AttestationRefusal) -> i64 {
+    match refusal {
+        AttestationRefusal::Required | AttestationRefusal::NotBound => {
+            error_code::ATTESTATION_REQUIRED
+        }
+        AttestationRefusal::Failed => error_code::ATTESTATION_FAILED,
+        AttestationRefusal::Cancelled => error_code::ATTESTATION_CANCELLED,
+        AttestationRefusal::TimedOut | AttestationRefusal::Expired => {
+            error_code::ATTESTATION_TIMEOUT
+        }
+        AttestationRefusal::Unavailable(_) => error_code::ATTESTATION_UNAVAILABLE,
+    }
+}
+
+/// The client-facing message for an attestation refusal.
+///
+/// Content-free like its neighbours — no session id, no path, no prompt text
+/// (conventions). The unavailable arm names its *cause* rather than failing
+/// generically, which is AC-7b: a user on a headless Linux box is told polkit
+/// has no agent, so the limitation is documented rather than discovered.
+fn refusal_message(refusal: &AttestationRefusal) -> &'static str {
+    match refusal {
+        AttestationRefusal::Required | AttestationRefusal::NotBound => {
+            "this approval needs a confirmed human present at the machine"
+        }
+        AttestationRefusal::Failed => "the presence check did not pass; nothing was granted",
+        AttestationRefusal::Cancelled => "the presence check was dismissed; nothing was granted",
+        AttestationRefusal::TimedOut | AttestationRefusal::Expired => {
+            "the presence check was not answered in time; nothing was granted"
+        }
+        AttestationRefusal::Unavailable(reason) => reason.describe(),
+    }
+}
+
+/// Operator-facing line for a refused attestation.
+///
+/// Carries the requester's bounded, control-stripped descriptor and the reason —
+/// never a session id or any content. The counterpart to
+/// [`self_approval_line`]: that one records the residual REQ-569 had to accept,
+/// this one records it being refused.
+fn attestation_refusal_line(requester: &str, refusal: &AttestationRefusal) -> String {
+    format!(
+        "teton-code: attach consent refused for {requester} — no verified presence ({})",
+        refusal.code()
+    )
 }
 
 /// Empty a session's retained conversation (`session/clear`, REQ-567 BR-8).
@@ -2856,6 +3348,33 @@ mod tests {
         )
     }
 
+    /// Give `conn` a session it created, **without** going through the
+    /// `session/create` RPC (REQ-570 TASK-002).
+    ///
+    /// Needed because BR-10(a) now gates that RPC on the ancestry check, so a
+    /// `Descendant` / `Indeterminate` connection can no longer acquire
+    /// session-holding standing over the socket at all — which is the point of
+    /// the gate.
+    ///
+    /// The REQ-569 fixtures that hand a daemon child a session of its own are
+    /// asking a *different* question: "even a descendant that **is** attached
+    /// may not approve a consent request". That question is still live and still
+    /// worth asserting, and it needs the child genuinely attached to be
+    /// non-vacuous — so those fixtures establish the standing directly here
+    /// rather than through the gate that now, correctly, refuses them.
+    ///
+    /// Deliberately not a bypass anything in production can reach: it pokes the
+    /// session registry and the connection's own bookkeeping, which is exactly
+    /// what `handle_session_create` does after its checks pass.
+    fn seed_created_session(daemon: &Daemon, conn: &ConnState) -> SessionId {
+        let summary = daemon
+            .sessions
+            .create(teton_protocol::SessionMode::Freeform, None, None)
+            .expect("the test session registry accepts a freeform session");
+        conn.record_created(summary.session_id.clone());
+        summary.session_id
+    }
+
     /// An ordinary connection that calls itself `requester` at the handshake.
     ///
     /// The descriptor has to be settable for the R1 tests: what a grant
@@ -2880,6 +3399,31 @@ mod tests {
 
     /// A daemon whose consent window a test can outlast.
     fn daemon_with_short_consent() -> Arc<Daemon> {
+        // A satisfiable presence mechanism, because these fixtures are about
+        // REQ-569's *routing* — who is offered a prompt, who may answer it, what
+        // a grant announcement says — and they predate attestation. Leaving them
+        // on the fail-closed default would make every one of them assert
+        // "attestation was unavailable", which is a different property with its
+        // own tests below and would silently stop exercising the routing rules
+        // these were written for.
+        //
+        // Tests that assert the *attestation* requirement construct their own
+        // daemon and keep the shipped fail-closed verifier — see
+        // `an_unattested_self_approval_mints_nothing`.
+        Arc::new(
+            Daemon::new()
+                .with_consent_timeout(TEST_CONSENT_WINDOW)
+                .with_presence_verifier(Box::new(crate::attest::AcceptingVerifier::default())),
+        )
+    }
+
+    /// A short-window daemon that keeps the **shipped** fail-closed verifier.
+    ///
+    /// The counterpart to [`daemon_with_short_consent`]: that one installs a
+    /// satisfiable mechanism so the REQ-569 routing fixtures keep testing
+    /// routing, this one leaves presence genuinely unavailable so the REQ-570
+    /// fixtures can test what happens when it is.
+    fn daemon_with_short_consent_unattested() -> Arc<Daemon> {
         Arc::new(Daemon::new().with_consent_timeout(TEST_CONSENT_WINDOW))
     }
 
@@ -2941,6 +3485,422 @@ mod tests {
         )
         .unwrap();
         assert!(response.contains("-32601")); // METHOD_NOT_FOUND
+    }
+
+    /// **REQ-570 AC-1 — the REQ-569 residual, closed.**
+    ///
+    /// A headless same-UID process requests attach to a session nothing is
+    /// attached to, is handed its own prompt by BR-6's second routing arm, and
+    /// answers itself `granted`. Under REQ-569 that minted a real grant with no
+    /// human anywhere in the loop. It must now mint nothing.
+    ///
+    /// Uses the **shipped** fail-closed verifier — no `with_presence_verifier`,
+    /// no seam — because the property is precisely what happens when presence
+    /// cannot be established.
+    ///
+    /// The load-bearing assertion is the registry inspection, not the error
+    /// code. AC-1 says "no grant is minted", and a test that only read the
+    /// response would pass just as happily against a daemon that refused loudly
+    /// and granted anyway.
+    #[tokio::test]
+    async fn an_unattested_self_approval_mints_nothing() {
+        let daemon = daemon_with_short_consent_unattested();
+        let requester = unattached(&daemon);
+        let _prompts = as_surface(&daemon, &requester);
+
+        // BR-6 arm 2: nothing is attached to the target, so the requester is
+        // handed its own prompt. The fixture is only meaningful if that is the
+        // arm taken.
+        let route = ConsentRoute::requester_itself(requester.id);
+        assert!(
+            route.self_approved_by(requester.id),
+            "this fixture must be exercising the self-render arm"
+        );
+        let request_id = daemon.consents.next_request_id();
+        let _rx = daemon
+            .consents
+            .register(request_id.clone(), route)
+            .expect("under the per-connection cap");
+
+        let refused = handle_attach_consent(
+            &daemon,
+            &requester,
+            Id::Number(1),
+            serde_json::json!({
+                "request_id": request_id.to_string(),
+                "outcome": { "outcome": "granted" },
+            }),
+        )
+        .await;
+
+        assert!(
+            refused.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string()),
+            "an unattested approval must be refused for want of presence: {refused}"
+        );
+        assert!(
+            daemon.grants.is_empty(),
+            "AC-1: no grant may exist — the registry is the assertion, not the error code"
+        );
+        assert!(
+            daemon.attestations.is_empty(),
+            "AC-6: and no attestation may be left behind either"
+        );
+        assert_eq!(
+            daemon.consents.pending_count(),
+            1,
+            "and the prompt is left standing for whoever may rightfully answer it"
+        );
+    }
+
+    /// **AC-6.** Each ending mints nothing and leaves both registries empty.
+    ///
+    /// Asserted per ending rather than once, because "no partial state" is a
+    /// claim about the ending nobody thought about.
+    #[tokio::test]
+    async fn every_attestation_ending_leaves_both_registries_empty() {
+        use crate::attest::{UnavailableReason, UnavailableVerifier};
+
+        for (case, verifier, expected) in [
+            (
+                "no mechanism at all",
+                UnavailableVerifier::new(UnavailableReason::PlatformUnsupported),
+                error_code::ATTESTATION_UNAVAILABLE,
+            ),
+            (
+                "linux with no polkit agent",
+                UnavailableVerifier::new(UnavailableReason::NoPolkitAgent),
+                error_code::ATTESTATION_UNAVAILABLE,
+            ),
+        ] {
+            let daemon = Arc::new(
+                Daemon::new()
+                    .with_consent_timeout(TEST_CONSENT_WINDOW)
+                    .with_presence_verifier(Box::new(verifier)),
+            );
+            let requester = unattached(&daemon);
+            let _prompts = as_surface(&daemon, &requester);
+            let request_id = daemon.consents.next_request_id();
+            let _rx = daemon
+                .consents
+                .register(
+                    request_id.clone(),
+                    ConsentRoute::requester_itself(requester.id),
+                )
+                .expect("under the cap");
+
+            let refused = handle_attach_consent(
+                &daemon,
+                &requester,
+                Id::Number(1),
+                serde_json::json!({
+                    "request_id": request_id.to_string(),
+                    "outcome": { "outcome": "granted" },
+                }),
+            )
+            .await;
+
+            assert!(refused.contains(&expected.to_string()), "{case}: {refused}");
+            assert!(daemon.grants.is_empty(), "{case}: no grant");
+            assert!(daemon.attestations.is_empty(), "{case}: no attestation");
+            assert_eq!(
+                daemon.consents.pending_count(),
+                1,
+                "{case}: a refused answer must leave the prompt standing for whoever \
+                 may rightfully answer it — consuming it would be a denial of service"
+            );
+        }
+    }
+
+    /// A **denial** needs no attestation (BR-1's deliberate asymmetry).
+    ///
+    /// Refusing access requires no proof of presence. Requiring one would let an
+    /// absent mechanism keep a request pending rather than let it be refused,
+    /// which is fail-open in the one direction that matters — so this runs
+    /// against the fail-closed verifier and must still succeed.
+    #[tokio::test]
+    async fn a_denial_needs_no_presence_check() {
+        let daemon = daemon_with_short_consent_unattested();
+        let requester = unattached(&daemon);
+        let _prompts = as_surface(&daemon, &requester);
+        let request_id = daemon.consents.next_request_id();
+        let _rx = daemon
+            .consents
+            .register(
+                request_id.clone(),
+                ConsentRoute::requester_itself(requester.id),
+            )
+            .expect("under the cap");
+
+        let answered = handle_attach_consent(
+            &daemon,
+            &requester,
+            Id::Number(1),
+            serde_json::json!({
+                "request_id": request_id.to_string(),
+                "outcome": { "outcome": "denied" },
+            }),
+        )
+        .await;
+
+        assert!(
+            answered.contains("\"resolved\":true"),
+            "a denial must decide the request even with no mechanism available: {answered}"
+        );
+        assert!(daemon.grants.is_empty(), "and mint nothing");
+    }
+
+    /// The seven daemon-wide methods BUG-162 enumerates, with the params each
+    /// needs to get *past* parsing — so a refusal below is the ancestry gate
+    /// answering and never a malformed-params rejection wearing the same shape.
+    fn daemon_wide_methods() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                ModelConfirmParams::METHOD,
+                serde_json::json!({"request_id": "model-0", "outcome": {"outcome": "accept"}}),
+            ),
+            (
+                ModelSetParams::METHOD,
+                serde_json::json!({"name": "small-fit", "confirmed_above_ram_floor": false}),
+            ),
+            (ConfigGetParams::METHOD, serde_json::json!({})),
+            (
+                ConfigSetParams::METHOD,
+                serde_json::json!({"update": {"local_model": {"auto_accept": true}}}),
+            ),
+            (CostQueryParams::METHOD, serde_json::json!({})),
+            (
+                WebRefreshParams::METHOD,
+                serde_json::json!({"url": "https://example.invalid/a"}),
+            ),
+            (
+                SessionCreateParams::METHOD,
+                serde_json::json!({"mode": "freeform"}),
+            ),
+        ]
+    }
+
+    /// Route a request the way [`handle_client`] does.
+    ///
+    /// Four methods run on their own task because they may park on a human, so
+    /// they are absent from [`dispatch`]. A test that reached only for
+    /// `dispatch` would get `METHOD_NOT_FOUND` for those and could report a
+    /// security gate as "passing" while never invoking it — so the routing is
+    /// mirrored here rather than duplicated per test.
+    async fn route_for_test(
+        daemon: &Daemon,
+        conn: &ConnState,
+        id: Id,
+        method: &str,
+        params: Value,
+    ) -> String {
+        if method == SessionAttachParams::METHOD {
+            handle_session_attach(daemon, conn, id, params).await
+        } else if method == AttachConsentParams::METHOD {
+            handle_attach_consent(daemon, conn, id, params).await
+        } else if method == ModelConfirmParams::METHOD {
+            handle_model_confirm(daemon, conn, id, params).await
+        } else if method == ModelSetParams::METHOD {
+            handle_model_set(daemon, conn, id, params).await
+        } else {
+            dispatch(daemon, conn, id, method, params).expect("a routed method answers")
+        }
+    }
+
+    /// **REQ-570 AC-10, layer (a) — BUG-162.** Every daemon-wide method refuses a
+    /// connection that fails the ancestry gate.
+    ///
+    /// Asserted **per method**, not for one representative, and that is the whole
+    /// point: LESSON-502 says an invariant enforced at several seams needs a test
+    /// at each seam, and these seven are seven separate one-line checks that a
+    /// future edit can drop one at a time. A single representative test would go
+    /// green with six of the seven gates deleted.
+    ///
+    /// Both refused ancestries are covered, because
+    /// `may_hold_session_access` treats `Indeterminate` as `Descendant` — "I
+    /// could not tell" must cost the same as "it did", or the guard's failure
+    /// mode is open.
+    #[tokio::test]
+    async fn every_daemon_wide_method_refuses_a_connection_that_fails_the_ancestry_gate() {
+        for ancestry in [Ancestry::Descendant, Ancestry::Indeterminate] {
+            for (method, params) in daemon_wide_methods() {
+                let daemon = Daemon::new();
+                let child = conn_with_ancestry(&daemon, ancestry);
+                let response =
+                    route_for_test(&daemon, &child, Id::Number(1), method, params.clone()).await;
+                assert!(
+                    response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                    "{ancestry:?} calling `{method}` must be refused by the ancestry gate: \
+                     {response}"
+                );
+            }
+        }
+    }
+
+    /// The non-vacuity half: an ordinary connection reaches all seven.
+    ///
+    /// Without this, the test above would still pass if a typo made every method
+    /// name unroutable — it would be asserting that seven strings are not
+    /// methods. What is asserted here is narrow on purpose: **not** that the call
+    /// succeeds (several of these legitimately fail on an empty test daemon —
+    /// an unknown catalog entry, no such pending proposal), only that whatever
+    /// comes back is not the *ancestry* refusal.
+    #[tokio::test]
+    async fn an_ordinary_connection_is_not_refused_the_daemon_wide_methods_by_ancestry() {
+        for (method, params) in daemon_wide_methods() {
+            // A satisfiable mechanism, so the two BR-10(b) commitment methods
+            // are not refused for a *different* reason and quietly stop
+            // testing the ancestry question this asserts.
+            let daemon = Daemon::new()
+                .with_presence_verifier(Box::new(crate::attest::AcceptingVerifier::default()));
+            let ordinary = unattached(&daemon);
+            assert!(
+                ordinary.may_hold_session_access(),
+                "the fixture is only meaningful if this connection passes the gate"
+            );
+            let response =
+                route_for_test(&daemon, &ordinary, Id::Number(1), method, params.clone()).await;
+            assert!(
+                !response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                "`{method}` must not refuse an ordinary connection on ancestry: {response}"
+            );
+        }
+    }
+
+    /// **REQ-570 AC-10, layer (b) — BR-10.** A daemon-wide *commitment* refuses
+    /// when no valid attestation is presented; the read-only siblings do not.
+    ///
+    /// The negative half is as load-bearing as the positive one. If
+    /// `config/get`, `cost/query` and `web/refresh` also demanded presence, a
+    /// user would be prompted to evict a cached document — and a user prompted
+    /// for trivia learns to click through the prompt that matters. The split is
+    /// the spec's, so it is asserted rather than left to a reviewer to notice.
+    #[tokio::test]
+    async fn only_a_daemon_wide_commitment_demands_presence() {
+        // Ancestry is satisfied throughout, and a mechanism **is** available, so
+        // the only thing that can vary between these methods is layer (b).
+        //
+        // A refusing verifier is the fixture rather than an accepting one:
+        // "presence was demanded" is only observable when it can fail.
+        let commitments = [ModelConfirmParams::METHOD, ModelSetParams::METHOD];
+
+        for (method, params) in daemon_wide_methods() {
+            let daemon = Arc::new(Daemon::new().with_presence_verifier(Box::new(
+                crate::attest::AlwaysFailsVerifier::new(
+                    crate::attest::AttestationMethod::OsBiometric,
+                ),
+            )));
+            let ordinary = unattached(&daemon);
+            assert!(ordinary.may_hold_session_access());
+
+            let response =
+                route_for_test(&daemon, &ordinary, Id::Number(1), method, params.clone()).await;
+            let refused_for_presence =
+                response.contains(&error_code::ATTESTATION_FAILED.to_string());
+
+            if commitments.contains(&method) {
+                assert!(
+                    refused_for_presence,
+                    "`{method}` commits a machine-wide change and must refuse without \
+                     a verified human: {response}"
+                );
+            } else {
+                assert!(
+                    !refused_for_presence,
+                    "`{method}` is layer (a) only — demanding presence for it would \
+                     train users to click through the prompt that matters: {response}"
+                );
+            }
+        }
+    }
+
+    /// **AC-8, the regression this nearly broke.** With no mechanism at all, a
+    /// daemon-wide commitment degrades to layer (a) rather than refusing.
+    ///
+    /// The `presence` feature is non-default, so **the shipped build has no
+    /// mechanism**. An implementation that refused here would make
+    /// `model/confirm` impossible to answer and first-run model selection — the
+    /// whole of REQ-547 — unreachable for every user. BR-8 and BR-11 scope their
+    /// fail-closed refusal to *cross-session attach* and say nothing about
+    /// commitments, and AC-10 refuses on an attestation not **presented**, not
+    /// on a platform that cannot produce one.
+    ///
+    /// So this asserts the product still works on the build CI runs, and that
+    /// the reduced posture is not silently confused with a satisfied one.
+    #[tokio::test]
+    async fn a_commitment_degrades_to_layer_a_where_no_mechanism_exists() {
+        for method in [ModelConfirmParams::METHOD, ModelSetParams::METHOD] {
+            let params = daemon_wide_methods()
+                .into_iter()
+                .find(|(m, _)| *m == method)
+                .expect("the method is in the table")
+                .1;
+            let daemon = daemon_with_short_consent_unattested();
+            let ordinary = unattached(&daemon);
+
+            let response = route_for_test(&daemon, &ordinary, Id::Number(1), method, params).await;
+            assert!(
+                !response.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string()),
+                "`{method}` must not be refused for want of a mechanism the shipped \
+                 build does not have — that would brick first-run: {response}"
+            );
+            assert!(
+                !response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                "`{method}`: and layer (a) still admits an ordinary connection: {response}"
+            );
+        }
+    }
+
+    /// **AC-10's independence clause.** Layer (a) passes with no mechanism at all.
+    ///
+    /// BR-10 requires layer (a) to be shippable without (b), because BUG-162 is
+    /// high severity and open and must not wait on OQ-1's mechanism. That is a
+    /// claim about the *ancestry* refusal surviving when presence is
+    /// unavailable, so it is asserted against the fail-closed verifier — the
+    /// build CI actually runs.
+    #[tokio::test]
+    async fn layer_a_refuses_independently_of_any_attestation_mechanism() {
+        for (method, params) in daemon_wide_methods() {
+            let daemon = daemon_with_short_consent_unattested();
+            let child = conn_with_ancestry(&daemon, Ancestry::Descendant);
+            let response =
+                route_for_test(&daemon, &child, Id::Number(1), method, params.clone()).await;
+            assert!(
+                response.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
+                "`{method}`: the ancestry refusal must answer first and must not \
+                 depend on a mechanism being present: {response}"
+            );
+            assert!(
+                !response.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string()),
+                "`{method}`: a connection that may not act here at all must be refused \
+                 without a presence prompt appearing on somebody's screen: {response}"
+            );
+        }
+    }
+
+    /// **AC-8 regression bar, at this layer.** The creator path gains nothing.
+    ///
+    /// `session/create` is the one of the seven an ordinary client calls as its
+    /// very first act, so a gate placed slightly wrong there would break every
+    /// session in the product rather than fail a security test.
+    #[test]
+    fn the_ordinary_create_path_is_untouched_by_the_daemon_wide_gate() {
+        let daemon = Daemon::new();
+        let creator = unattached(&daemon);
+        let created = handle_session_create(
+            &daemon,
+            &creator,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        let session = created_session_id(&created);
+        assert!(
+            creator.may_receive(Some(&session)),
+            "the creator is attached to what it just made, exactly as before"
+        );
+        assert!(
+            daemon.grants.is_empty(),
+            "and the creator path still mints no grant at all"
+        );
     }
 
     #[test]
@@ -3110,7 +4070,8 @@ mod tests {
                     "request_id": prompt["request_id"],
                     "outcome": { "outcome": outcome },
                 }),
-            );
+            )
+            .await;
             assert!(
                 answered.contains("\"resolved\":true"),
                 "the answer must have decided something: {answered}"
@@ -3153,7 +4114,8 @@ mod tests {
                         "request_id": prompt["request_id"],
                         "outcome": { "outcome": outcome },
                     }),
-                );
+                )
+                .await;
                 assert!(
                     answered.contains("\"resolved\":true"),
                     "the answer must have decided something: {answered}"
@@ -3461,7 +4423,8 @@ mod tests {
                     "request_id": request_id.to_string(),
                     "outcome": { "outcome": "granted" },
                 }),
-            );
+            )
+            .await;
             assert!(
                 refused.contains(&error_code::NOT_ATTACHED.to_string()),
                 "{case} must not be able to answer this prompt: {refused}"
@@ -3487,7 +4450,8 @@ mod tests {
                 "request_id": request_id.to_string(),
                 "outcome": { "outcome": "denied" },
             }),
-        );
+        )
+        .await;
         assert!(answered.contains("\"resolved\":true"), "{answered}");
         assert_eq!(daemon.consents.pending_count(), 0);
     }
@@ -3516,13 +4480,14 @@ mod tests {
             let child = conn_with_ancestry(&daemon, ancestry);
             // The child holds a session of its own — the standing that would
             // otherwise make it an eligible approver.
-            let created = handle_session_create(
-                &daemon,
-                &child,
-                Id::Number(1),
-                serde_json::json!({"mode": "freeform"}),
-            );
-            let own = created_session_id(&created);
+            //
+            // Seeded directly rather than through `session/create`: REQ-570
+            // BR-10(a) now gates that RPC on the same ancestry check, so a child
+            // cannot acquire this standing over the socket at all. The question
+            // *this* test asks is the other one — whether a descendant that
+            // genuinely holds a session may approve — and it needs the standing
+            // to be real to be worth asking.
+            let own = seed_created_session(&daemon, &child);
             assert!(
                 child.may_receive(Some(&own)),
                 "{ancestry:?}: the fixture is only meaningful if the child is attached"
@@ -3548,7 +4513,8 @@ mod tests {
                     "request_id": request_id.to_string(),
                     "outcome": { "outcome": "granted" },
                 }),
-            );
+            )
+            .await;
             assert!(
                 refused.contains(&error_code::ATTACH_FORBIDDEN.to_string()),
                 "{ancestry:?}: a daemon child must not confer what it may not hold: {refused}"
@@ -3595,15 +4561,18 @@ mod tests {
             let daemon = daemon_with_short_consent();
 
             // The holder: excluded from *answering*, but a genuine holder of a
-            // session it created (`session/create` is ungated by design).
+            // session it created.
+            //
+            // REQ-570 BR-10(a) closed the "`session/create` is ungated by
+            // design" premise this fixture was originally written against — a
+            // daemon child can no longer create one over the socket. The F2
+            // property under test is unchanged and still matters: a session held
+            // by a connection that may not answer is **still held**, so a
+            // stranger's attach fails closed on a timeout instead of falling
+            // through to a self-render. Seeded directly so the holder is a real
+            // holder.
             let holder = conn_with_ancestry(&daemon, ancestry);
-            let created = handle_session_create(
-                &daemon,
-                &holder,
-                Id::Number(1),
-                serde_json::json!({"mode": "freeform"}),
-            );
-            let session = created_session_id(&created);
+            let session = seed_created_session(&daemon, &holder);
             let mut holder_prompts = as_surface(&daemon, &holder);
 
             // The attacker: an ordinary connection the ancestry gate lets
@@ -3840,6 +4809,15 @@ mod tests {
              connection is both parties (R1)"
         );
         assert_eq!(minted.suppressed, 0, "nothing was rate-limited away");
+        // REQ-570 AC-9. This arm is exactly the one the field exists for: the
+        // requester answered its own prompt, so `self_approved` is the only
+        // other signal — and under REQ-570 this grant exists at all only because
+        // a human was verified. A `"none"` here would mean the self-approval
+        // residual had reopened.
+        assert_eq!(
+            minted.attestation, "os_biometric",
+            "the announcement must name what verified the human behind the grant"
+        );
         assert!(
             announced[0].session_id.is_none(),
             "a grant announcement is daemon-scoped, so every handshaked \
@@ -4081,7 +5059,10 @@ mod tests {
         let daemon = Arc::new(
             Daemon::new()
                 .with_consent_timeout(TEST_CONSENT_WINDOW)
-                .with_grant_announcement_window(std::time::Duration::from_secs(3600)),
+                .with_grant_announcement_window(std::time::Duration::from_secs(3600))
+                // Grants have to actually be minted for there to be
+                // announcements to bound — see `daemon_with_short_consent`.
+                .with_presence_verifier(Box::new(crate::attest::AcceptingVerifier::default())),
         );
         let flooder = unattached(&daemon);
         let prompts = as_surface(&daemon, &flooder);
@@ -4160,8 +5141,8 @@ mod tests {
     /// connected peer, which is an oracle this seam does not hand out. The
     /// `resolved: false` is what stops a client reporting success for an answer
     /// that arrived after the window closed.
-    #[test]
-    fn an_answer_to_an_unknown_consent_request_decides_nothing_and_says_so() {
+    #[tokio::test]
+    async fn an_answer_to_an_unknown_consent_request_decides_nothing_and_says_so() {
         let daemon = Daemon::new();
         let stranger = unattached(&daemon);
         let response = handle_attach_consent(
@@ -4172,7 +5153,8 @@ mod tests {
                 "request_id": "consent-404",
                 "outcome": { "outcome": "granted" },
             }),
-        );
+        )
+        .await;
         assert!(response.contains("\"resolved\":false"), "{response}");
         assert!(daemon.grants.is_empty());
     }

@@ -183,6 +183,23 @@ pub fn may_monitor(connection: ConnectionId, grants: &HashSet<Grant>) -> bool {
         .any(|grant| grant.connection == connection && grant.scope == GrantScope::Monitor)
 }
 
+/// The session recorded on a **monitor**-scope grant.
+///
+/// A monitor grant is not about a session, and [`may_monitor`] proves it: the
+/// predicate matches on connection and scope and never looks at this field. So
+/// per LESSON-495 the whole key for the monitor question is `(connection,
+/// scope)`, and the `session_id` slot is a witness rather than part of the
+/// question.
+///
+/// Given that, a sentinel is the honest value — better than the approver's
+/// session, which would read as though the grant were somehow scoped to it.
+/// REQ-569 BR-8 made real session ids 128 random bits, so this cannot collide
+/// with one.
+#[must_use]
+pub fn monitor_witness() -> SessionId {
+    SessionId::from("daemon-wide")
+}
+
 /// The daemon's live grants, and the connection-id namespace they are keyed by.
 ///
 /// In-memory and daemon-lifetime (ADR-C). Held in the [`crate::server::Daemon`]

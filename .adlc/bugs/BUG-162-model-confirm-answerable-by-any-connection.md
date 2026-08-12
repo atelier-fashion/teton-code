@@ -1,7 +1,7 @@
 ---
 id: BUG-162
 title: "model/confirm can be answered by any connection, and six sibling methods take no connection at all"
-status: open
+status: resolved
 severity: high
 created: 2026-08-11
 updated: 2026-08-11
@@ -68,11 +68,37 @@ is answered once, there, rather than twice. REQ-570 BR-10 carries it in two
 separable layers:
 
 - **(a) Connection binding** — every one of these methods takes and checks
-  connection context, so only the connection that raised a request may answer
-  it. This is REQ-569 TASK-107's pattern one scope up, needs no new mechanism,
-  and **ships independently of REQ-570's attestation work** — deliberately, so
-  this high-severity defect is not gated on REQ-570 OQ-1's unresolved mechanism
-  choice.
+  connection context. Needs no new mechanism, and **ships independently of
+  REQ-570's attestation work** — deliberately, so this high-severity defect is
+  not gated on REQ-570 OQ-1's unresolved mechanism choice.
+
+  **Correction (2026-08-11, as built).** This section previously said layer (a)
+  would "restrict answering to the connection that raised the flow". **That is
+  not implementable for this bug's own headline method, and was not built.**
+  `model_selection_proposed` is raised by the daemon's first-run flow — spawned
+  beside `serve`, and by its own comment able to publish *before the daemon
+  accepts its first connection* — and it is published `None`-scoped because
+  local model selection is a machine-wide fact. There is no connection that
+  raised it. Inventing one (first-claim-wins) would hand the proposal to
+  whichever connection races fastest, which an attacker wins as easily as a
+  user.
+
+  What was built is a **standing** rule: every one of the seven methods checks
+  `ConnState::may_hold_session_access()` — REQ-569's ancestry gate — which is
+  exactly the bar this bug's own *Expected Behavior* section names ("minimally,
+  not by the daemon's own spawned children"). Seven separate one-line gates
+  rather than one shared check, so REQ-570 AC-11's mutation check can remove a
+  *single* method's gate and see a test go red (LESSON-502). See REQ-570
+  architecture.md ADR-A.
+
+  **Residual, recorded rather than inherited silently.** REQ-569 ADR-A documents
+  that breaking the ancestry chain costs one model-supplied shell word
+  (`setsid helper`, `helper &`), so a **non-descendant** same-UID process still
+  passes this gate. Layer (a) closes the *ambient* hole this bug reports — any
+  handshaked connection, including the daemon's own tool and MCP children, could
+  commit a machine-wide model change — and does **not** close the
+  determined-adversary case. Layer (b) is what covers that for daemon-wide
+  commitments.
 - **(b) Attestation for daemon-wide commitments** — a model change or a
   multi-GB download additionally requires a verified presence attestation,
   because its blast radius is the whole machine.
@@ -81,10 +107,15 @@ Verified per method by REQ-570 AC-10 (each seam tested, not one representative �
 LESSON-502) and guarded by AC-11's mutation check.
 
 Of the options originally listed here, "restrict answering to the connection
-that raised the flow" is the one BR-10(a) adopts. The `Ancestry` reuse is
-rejected on REQ-569 ADR-A's own evidence — the ancestry chain breaks on one
-shell word — and first-answer-wins is rejected because recording the answerer
-documents the hijack rather than preventing it.
+that raised the flow" was the intended pick and proved unimplementable for
+`model/confirm` (see the correction above). `Ancestry` reuse — originally
+rejected on REQ-569 ADR-A's evidence that the chain breaks on one shell word —
+is what BR-10(a) actually adopts, with that weakness now recorded explicitly as
+the residual rather than treated as a reason to do nothing: a gate that stops
+every daemon child is strictly better than no gate, and the shell-word escape is
+answered by layer (b)'s attestation for the commitments that matter.
+First-answer-wins stays rejected, because recording the answerer documents the
+hijack rather than preventing it.
 
 ## Related surface — the rest of the dispatch audit
 

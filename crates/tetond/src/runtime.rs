@@ -4729,7 +4729,7 @@ fn seam_policy(debug_build: bool, switch: Option<&str>) -> SeamPolicy {
 ///
 /// # Panics
 /// Panics when `TETON_TEST_SEAMS=1` is set in a release build.
-fn test_seams_enabled() -> bool {
+pub fn test_seams_enabled() -> bool {
     match seam_policy(
         cfg!(debug_assertions),
         std::env::var("TETON_TEST_SEAMS").ok().as_deref(),

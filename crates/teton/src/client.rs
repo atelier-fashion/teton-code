@@ -402,6 +402,33 @@ impl Connection {
                     "answer this prompt from an interactive `teton` session.",
                 );
             }
+            EventOutcome::AttachConsent(request) if ctx.answer_permissions => {
+                // REQ-570 BR-4 / AC-4. Gated on `answer_permissions` — the same
+                // flag that decides whether this client owns the interactive
+                // surface — and deliberately **not** on `auto_accept_model`:
+                // `--yes` is consent to this user's own download, never standing
+                // authority to admit a different connection into their session.
+                //
+                // Fire-and-forget like a permission answer: the ack comes back
+                // later as a stray response and is ignored. Awaiting it here
+                // would re-enter the event pump from inside an event dispatch.
+                let reply = session_ui::resolve_attach_consent(
+                    &request,
+                    &mut *ctx.surface,
+                    &mut *ctx.prompter,
+                );
+                self.send(reply)?;
+            }
+            EventOutcome::AttachConsent(request) => {
+                // Not our prompt to answer. Rendered rather than swallowed for
+                // `attach_consent_requested`'s original reason: a silent
+                // security prompt is worse than an unanswerable one — the user
+                // would otherwise see only that a peer quietly failed.
+                ctx.surface.line(
+                    LineKind::Notice,
+                    &session_ui::format_attach_consent_notice(&request),
+                );
+            }
         }
         Ok(true)
     }
