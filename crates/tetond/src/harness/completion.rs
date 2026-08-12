@@ -558,7 +558,14 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
         // construction: it sends `Omit`, and `classify_client_error`
         // short-circuits on a request that carried no reasoning field, so a
         // second refusal is impossible rather than merely unlikely.
-        let mut stream = match self.provider.stream_turn(request.clone(), &transport).await {
+        // Cloned only when a refusal is *possible* — i.e. when this request
+        // actually carries an effort field. A turn whose resolution is `Omit` or
+        // `ThinkingFlag` can never come back as an effort refusal
+        // (`classify_client_error` short-circuits), so it must not pay to copy a
+        // whole conversation on the hot path for a fallback it cannot take.
+        let retry_seed =
+            matches!(request.effort, ResolvedEffort::Effort { .. }).then(|| request.clone());
+        let mut stream = match self.provider.stream_turn(request, &transport).await {
             Ok(stream) => stream,
             Err(err) if err.is_effort_refused() => {
                 // Loud, not silent (LESSON-447): the typed error names the
@@ -567,11 +574,15 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
                 // receiving (BR-6).
                 eprintln!("teton: {err}; retrying this call with no reasoning field");
                 self.effort_refused = true;
+                let seed = retry_seed.expect(
+                    "a refusal is only classified for a request that carried an \
+                     effort field, which is exactly when the seed was taken",
+                );
                 let fallback = TurnRequest {
                     effort: ResolvedEffort::Omit {
                         reason: EffortOmission::RefusedThisSession,
                     },
-                    ..request
+                    ..seed
                 };
                 // A fresh scoped transport: the first attempt's was consumed,
                 // and this is a second call through the same choke point, so it
