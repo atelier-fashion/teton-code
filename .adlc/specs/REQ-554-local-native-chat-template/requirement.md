@@ -4,7 +4,7 @@ title: "Local tier renders prompts through the model's native chat template"
 status: complete
 deployable: true
 created: 2026-08-03
-updated: 2026-08-03
+updated: 2026-08-12
 component: "inference/local"
 domain: "harness"
 stack: ["rust", "llama.cpp", "gguf"]
@@ -103,21 +103,21 @@ n/a — no user-facing permission changes; removed per template guidance.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: With a template-bearing GGUF (Qwen catalog family), the prompt
+- [x] AC-1: With a template-bearing GGUF (Qwen catalog family), the prompt
       handed to the engine contains the template's role delimiters and does
       NOT contain the flat frame (`User:`, `Assistant:`, `Tool (`) as
       structural markers.
-- [ ] AC-2: Tool results appear as user-role turns under the template, with
+- [x] AC-2: Tool results appear as user-role turns under the template, with
       consecutive same-role messages merged so alternation holds (same
       contract the remote mapping already pins).
-- [ ] AC-3: Loading a model with no recognized template produces exactly one
+- [x] AC-3: Loading a model with no recognized template produces exactly one
       visible fallback report (model id + reason) and the session runs on
       the flat rendering with behavior identical to today's.
-- [ ] AC-4: All BUG-147 containment tests pass unchanged in both modes, and a
+- [x] AC-4: All BUG-147 containment tests pass unchanged in both modes, and a
       new test pins template-mode fabrication: a reply that emits the
       template's own role header (e.g. `<|im_start|>user`) is cut before
       context and never displayed.
-- [ ] AC-5: An over-window *rendered* prompt (template overhead included) is
+- [x] AC-5: An over-window *rendered* prompt (template overhead included) is
       refused with the existing typed engine error — pinned by a test sized
       to cross the window only when template overhead is counted (informed
       by LESSON-446).
@@ -125,10 +125,10 @@ n/a — no user-facing permission changes; removed per template guidance.
       `#[ignore]`d) drives one turn through the native template and observes
       a single well-formed tool call — single-platform mock-only green is
       not acceptance for this REQ (informed by LESSON-433, LESSON-448).
-- [ ] AC-7: Default/CI builds (no `llama` feature) compile and pass: mock and
+- [x] AC-7: Default/CI builds (no `llama` feature) compile and pass: mock and
       scripted engines run under the flat fallback with no template
       machinery required at runtime.
-- [ ] AC-8: Template-mode rendering is verifiable in default/CI builds: a
+- [x] AC-8: Template-mode rendering is verifiable in default/CI builds: a
       rendered prompt for a known template family can be produced and
       inspected without the `llama` feature, so AC-1/AC-2/AC-5 are pinned by
       the always-on suite, not only by the `#[ignore]`d real-model smoke

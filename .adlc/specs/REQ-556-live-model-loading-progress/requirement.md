@@ -4,7 +4,7 @@ title: "Live model-loading progress in the interactive session"
 status: complete
 deployable: true
 created: 2026-08-04
-updated: 2026-08-04
+updated: 2026-08-12
 component: "cli"
 domain: "clients"
 stack: ["rust", "cli", "json-rpc"]
@@ -184,26 +184,26 @@ and whether it actually fails when the feature is disabled.
       queued-event defect and fails against today's binary. It is the one
       criterion that cannot be reached any other way — it is *about* timing —
       which is what justifies the PTY harness.
-- [ ] AC-3 *(unit + existing tests)*: The per-stage lines are unchanged.
+- [x] AC-3 *(unit + existing tests)*: The per-stage lines are unchanged.
       `render_lifecycle`'s and `progress_bar`'s existing unit tests pass
       **unmodified** (BR-10). New output appears only in the window that
       publishes nothing — indeterminate motion, and no ETA, countdown, or
       estimated remaining time anywhere in the session (BR-5).
-- [ ] AC-4 *(piped)*: Piped (non-TTY) invocation produces output byte-identical
+- [x] AC-4 *(piped)*: Piped (non-TTY) invocation produces output byte-identical
       to the pre-REQ binary. `slash_quit_ends_the_session_exactly_as_ctrl_d_does`
       and the `/exit` equivalence leg pass **unmodified** — a test edited to
       accommodate indicator bytes is a BR-2 violation, not an accommodation.
 - [ ] AC-5 *(pty)*: A prompt typed while the indicator is running is accepted
       intact, the entry frame is not corrupted, and the turn proceeds — or
       returns `TIER_WARMING` and renders as BUG-152 defined.
-- [ ] AC-6 *(unit)*: Driven with a lifecycle sequence that never reaches
+- [x] AC-6 *(unit)*: Driven with a lifecycle sequence that never reaches
       `Ready`, the indicator terminates on its bounded condition rather than
       advancing indefinitely, and the line it leaves behind names the last state
       it actually observed (BR-7).
-- [ ] AC-7: Verified on **both** macOS and Linux in CI. TTY detection and
+- [x] AC-7: Verified on **both** macOS and Linux in CI. TTY detection and
       terminal-width handling are platform-specific and a green macOS run is not
       evidence about Linux. (informed by LESSON-433)
-- [ ] AC-8: Mutation check — freezing the animation counter, or removing the
+- [x] AC-8: Mutation check — freezing the animation counter, or removing the
       idle-render path, fails at least one test. A suite that stays green with
       the feature disabled has not tested it. (informed by LESSON-441)
 
