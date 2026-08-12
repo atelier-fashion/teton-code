@@ -993,6 +993,35 @@ fn ancestry_refusal_line(ancestry: Ancestry, what: &str) -> String {
     format!("tetond: refused {what} for a connection because {because}")
 }
 
+/// What the daemon records when a consent prompt is delivered to **no
+/// surface at all** (BUG-163).
+///
+/// This is the failure that has no other symptom. The request is registered, the
+/// window opens, and nothing is on the other end — so the only thing anyone
+/// observes is a call that takes the full consent timeout and then reports a
+/// timeout, which reads identically to a user who walked away from a prompt they
+/// really were shown.
+///
+/// Those two need telling apart, because their remedies are opposite: one is a
+/// person who declined to answer, the other is a daemon that asked nobody.
+///
+/// Names the **scope** and the **routing rule**, which together say what was
+/// being asked and which rule produced an empty audience. Carries no session id,
+/// no connection id and no client-supplied string (conventions: privacy in
+/// logs) — [`ConsentRoute::arm`] exists to give the rule's name without its
+/// subject.
+fn undelivered_consent_line(scope: ConsentScope, arm: &str) -> String {
+    let what = match scope {
+        ConsentScope::Attach => "an attach",
+        ConsentScope::Monitor => "a monitor",
+    };
+    format!(
+        "tetond: {what} consent prompt reached no surface — the rule that chose the audience was \
+         '{arm}', and it selected nobody. Nothing can answer this request, so it will wait out its \
+         full consent window and then report a timeout"
+    )
+}
+
 /// What the daemon records when it classifies a connection's ancestry as
 /// anything other than [`Ancestry::NotDescendant`] (BUG-163).
 ///
@@ -2633,7 +2662,29 @@ async fn seek_consent(
             requester: requester.to_owned(),
         }),
     );
-    daemon.surfaces.deliver_request(route, &frame);
+    // BUG-163: a prompt that reached **nobody** is the one outcome worth saying
+    // out loud, and until now it was the one the daemon could not distinguish.
+    //
+    // `deliver_request` returns how many surfaces the frame reached, and this
+    // call discarded it — so "asked three clients" and "asked no one" produced
+    // byte-identical logs. The second is not a slow success: nothing will
+    // answer, and the request is already committed to waiting out its full
+    // consent window before anyone learns otherwise.
+    //
+    // Logged at delivery rather than at the timeout deliberately. The timeout is
+    // 30s and BUG-163's test deadline is 20s, so a line hung off the timeout
+    // path would never appear in the failing run that needs it — and more
+    // generally, "nobody was asked" is knowable *now* and the 30-second wait
+    // adds nothing to it.
+    //
+    // Downstream of every cause rather than one: whatever made the surface set
+    // empty — an ancestry verdict, a routing arm that matched nothing, a
+    // departure — this line fires. That is what makes it a better signal than
+    // the ancestry line it complements.
+    let delivered = daemon.surfaces.deliver_request(route, &frame);
+    if delivered == 0 {
+        eprintln!("{}", undelivered_consent_line(scope, route.arm()));
+    }
 
     let outcome = daemon
         .consents
@@ -5471,6 +5522,53 @@ mod tests {
         assert!(!conn_with_ancestry(&daemon, Ancestry::Descendant).may_hold_session_access());
         assert!(!conn_with_ancestry(&daemon, Ancestry::Indeterminate).may_hold_session_access());
         assert!(conn_with_ancestry(&daemon, Ancestry::NotDescendant).may_hold_session_access());
+    }
+
+    /// BUG-163: a consent prompt that reached nobody says so, and says which
+    /// rule chose the empty audience.
+    ///
+    /// The failure this pins has no other symptom. A request delivered to zero
+    /// surfaces is registered, waits out the full consent window, and reports a
+    /// timeout — which is indistinguishable in every log the daemon keeps from a
+    /// user who was shown a prompt and ignored it. Opposite remedies, identical
+    /// evidence, and `deliver_request`'s count was being discarded at the one
+    /// call site that could tell them apart.
+    ///
+    /// Names the routing rule rather than its subject, so the line can say
+    /// *which* arm selected nobody without putting a session id in a log.
+    #[test]
+    fn a_consent_prompt_that_reached_nobody_says_so_and_names_the_rule() {
+        let attach = undelivered_consent_line(ConsentScope::Attach, "the requester itself");
+        let monitor = undelivered_consent_line(ConsentScope::Monitor, "any attached peer");
+
+        // The two scopes are different questions and must not read alike.
+        assert_ne!(attach, monitor, "scope must be legible in the line");
+        assert!(attach.contains("attach"), "{attach}");
+        assert!(monitor.contains("monitor"), "{monitor}");
+        // The rule that produced an empty audience is the diagnostic payload.
+        assert!(attach.contains("the requester itself"), "{attach}");
+        // And it must say the request is doomed, not merely slow — that is the
+        // distinction from a prompt a user simply has not answered yet.
+        assert!(
+            attach.contains("reached no surface") && attach.contains("Nothing can answer"),
+            "{attach}"
+        );
+        // Content-free, like every other line on this seam.
+        for line in [&attach, &monitor] {
+            assert!(!line.contains("sess-"), "{line}");
+        }
+
+        // The rule names themselves come from the route, never spelled twice.
+        let daemon = Daemon::new();
+        let conn = daemon.grants.next_connection_id();
+        let requester = ConsentRoute::requester_itself(conn);
+        assert_eq!(requester.arm(), "the requester itself");
+        let attached = ConsentRoute::attached_to(conn, SessionId::from("sess-secret"));
+        assert!(
+            !attached.arm().contains("sess-"),
+            "the arm names the rule, never its subject: {}",
+            attached.arm()
+        );
     }
 
     /// BUG-163: an `Indeterminate` classification is recorded at the moment it
