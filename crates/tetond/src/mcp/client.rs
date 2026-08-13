@@ -35,12 +35,15 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
 use teton_core::ProvenanceId;
+use teton_protocol::events::ProvenanceRejection;
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
     BlockDetail, ByteStream, HttpMethod, TransportRequest, TransportResponse,
 };
 
-use crate::egress::{Egress, EgressContext, EgressError, Provenance};
+use crate::egress::{
+    rejection_reason, sanitize_reported_source, Egress, EgressContext, EgressError, Provenance,
+};
 use teton_providers::transport::Transport;
 
 /// The MCP protocol revision Teton Code advertises in `initialize`.
@@ -399,9 +402,51 @@ pub fn parse_namespaced_tool_name(name: &str) -> Option<(&str, &str)> {
 /// either direction.
 #[must_use]
 pub fn call_provenance(arguments: &Value) -> Provenance {
-    let mut prov = Provenance::empty();
-    collect_paths(None, arguments, &mut prov);
-    prov
+    call_provenance_detailed(arguments).provenance
+}
+
+/// An argument value that looked like a path but could not be minted into a
+/// [`ProvenanceId`] (REQ-571 ADR-D).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedSource {
+    /// The offending argument value, already sanitized for reporting.
+    pub source: String,
+    /// Which canonical-form rule it broke.
+    pub reason: ProvenanceRejection,
+}
+
+/// An MCP call's [`Provenance`] together with the assertions that were
+/// **refused** while computing it.
+///
+/// The two halves answer different questions and only one of them can be
+/// recovered later. The provenance says what the call may touch; the rejections
+/// say what it *claimed* to touch in a form the daemon could not verify — and
+/// once a rejection has tainted the provenance `Unknown`, that taint is
+/// indistinguishable from a `shell` result's. Keeping the rejections beside the
+/// provenance is what lets the caller report which assertion caused it, on the
+/// event a user actually sees (LESSON-505).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallProvenance {
+    /// The provenance the call carries.
+    pub provenance: Provenance,
+    /// Path-shaped argument values that could not be minted, in traversal
+    /// order.
+    pub rejected: Vec<RejectedSource>,
+}
+
+/// [`call_provenance`], keeping the refused assertions rather than only their
+/// effect.
+///
+/// One traversal backs both entry points, so the set of values treated as paths
+/// and the set reported as refused cannot drift into disagreeing.
+#[must_use]
+pub fn call_provenance_detailed(arguments: &Value) -> CallProvenance {
+    let mut out = CallProvenance {
+        provenance: Provenance::empty(),
+        rejected: Vec::new(),
+    };
+    collect_paths(None, arguments, &mut out);
+    out
 }
 
 /// Argument keys whose string values are treated as paths regardless of shape.
@@ -438,26 +483,42 @@ const PATH_KEYS: &[&str] = &[
 /// This bites only when a boundary is configured — the inspector runs nowhere
 /// else — and the cost of the conservative answer is a session pinned local, the
 /// same posture REQ-544 C-1 already takes.
-fn collect_paths(key: Option<&str>, value: &Value, prov: &mut Provenance) {
+///
+/// ## And the taint is reported, not only taken (REQ-571 TASK-122)
+///
+/// The refusal is recorded in [`CallProvenance::rejected`] as well as folded
+/// into the unknown bit, because the two are not the same information: once the
+/// provenance is `Unknown` it says only "something here was unattributable",
+/// which is what a `shell` result says too. Whoever is holding the tool name —
+/// [`McpRegistry::call_tool`](crate::mcp::McpRegistry::call_tool) — turns the
+/// record into the `provenance_rejected` event, so a session that goes local
+/// says *which* assertion did it rather than leaving the user to guess.
+fn collect_paths(key: Option<&str>, value: &Value, out: &mut CallProvenance) {
     match value {
         Value::String(s) => {
             let key_is_path =
                 key.is_some_and(|k| PATH_KEYS.contains(&k.to_ascii_lowercase().as_str()));
             if key_is_path || looks_like_path(s) {
                 match ProvenanceId::claimed(s) {
-                    Ok(id) => prov.merge(&Provenance::tainted_by(id)),
-                    Err(_) => prov.mark_unknown(),
+                    Ok(id) => out.provenance.merge(&Provenance::tainted_by(id)),
+                    Err(e) => {
+                        out.provenance.mark_unknown();
+                        out.rejected.push(RejectedSource {
+                            source: sanitize_reported_source(s),
+                            reason: rejection_reason(&e),
+                        });
+                    }
                 }
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_paths(key, item, prov);
+                collect_paths(key, item, out);
             }
         }
         Value::Object(map) => {
             for (k, v) in map {
-                collect_paths(Some(k), v, prov);
+                collect_paths(Some(k), v, out);
             }
         }
         _ => {}
@@ -1053,6 +1114,82 @@ mod tests {
     fn arguments_with_no_paths_have_empty_provenance() {
         let prov = call_provenance(&json!({ "n": 3, "flag": true, "q": "hello" }));
         assert!(prov.is_empty());
+    }
+
+    // ---- refused assertions (REQ-571 ADR-D) ----
+
+    /// The two halves of the fail-closed answer, asserted together because
+    /// either alone is a bug: the call is tainted (so it cannot leak), *and*
+    /// the refused assertion is kept (so the taint can be explained).
+    #[test]
+    fn an_un_mintable_argument_taints_the_call_and_is_recorded() {
+        let out = call_provenance_detailed(&json!({ "path": "/repo/secrets/prod.env" }));
+        assert!(
+            out.provenance.is_unknown(),
+            "an un-mintable claim must fail toward taint"
+        );
+        assert_eq!(
+            out.rejected,
+            vec![RejectedSource {
+                source: "/repo/secrets/prod.env".to_owned(),
+                reason: ProvenanceRejection::Absolute,
+            }]
+        );
+    }
+
+    /// Each refusal shape keeps its own reason, and a `..` claim is recorded
+    /// rather than collapsed — the two are different problems for whoever reads
+    /// the event.
+    #[test]
+    fn every_un_mintable_shape_is_recorded_with_its_reason() {
+        let out = call_provenance_detailed(&json!({
+            "path": "/etc/passwd",
+            "resource": "../outside/x.env",
+            "clean": "src/main.rs",
+        }));
+        let mut seen: Vec<(&str, ProvenanceRejection)> = out
+            .rejected
+            .iter()
+            .map(|r| (r.source.as_str(), r.reason))
+            .collect();
+        seen.sort_unstable_by_key(|(s, _)| *s);
+        assert_eq!(
+            seen,
+            [
+                ("../outside/x.env", ProvenanceRejection::ParentTraversal),
+                ("/etc/passwd", ProvenanceRejection::Absolute),
+            ]
+        );
+        // The well-formed sibling is still tagged: one bad assertion does not
+        // discard the provenance of the others.
+        assert!(out.provenance.contains("src/main.rs"));
+    }
+
+    /// The recorded source is sanitized where it is recorded, not where it is
+    /// rendered — a server chose this string, and every consumer downstream
+    /// (event, log line, terminal) inherits the bound rather than repeating it.
+    #[test]
+    fn a_recorded_source_is_sanitized_and_bounded() {
+        let hostile = format!("/{}\u{1b}[31m\n{}", "a".repeat(400), "b".repeat(400));
+        let out = call_provenance_detailed(&json!({ "path": hostile }));
+        let recorded = &out.rejected[0].source;
+        assert!(recorded.len() <= 260, "unbounded: {} bytes", recorded.len());
+        assert!(!recorded.contains('\u{1b}'));
+        assert!(!recorded.contains('\n'));
+        assert!(recorded.ends_with('…'), "truncation is visible: {recorded}");
+    }
+
+    /// Non-vacuity: a call whose every path-shaped argument mints cleanly
+    /// records nothing, so the recording is a signal rather than noise every
+    /// call carries.
+    #[test]
+    fn a_clean_call_records_no_rejection() {
+        let out = call_provenance_detailed(&json!({
+            "files": ["src/a.rs", "./docs/b.md"],
+            "q": "words",
+        }));
+        assert!(out.rejected.is_empty());
+        assert!(!out.provenance.is_unknown());
     }
 
     // ---- protocol parsing ----

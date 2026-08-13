@@ -91,6 +91,7 @@ use teton_core::boundary::BoundaryMatcher;
 use teton_core::entities::PrivacyBoundary;
 use teton_protocol::events::{
     BlockCause, ByteSpan, Event, FindingKind as WireFindingKind, PrivacyAction, PrivacyBlock,
+    ProvenanceRejected,
 };
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
@@ -101,12 +102,15 @@ use teton_providers::transport::{
 use crate::broadcast::EventBus;
 use crate::cost::{CostAttribution, CostMeter};
 
-pub use inspector::{inspect, Inspection, Violation};
+pub use inspector::{first_malformed_source, inspect, Inspection, MalformedSource, Violation};
 pub use lookup::{
     to_protocol_web_tier, AddressClass, Authorship, LookupContext, LookupDetail, LookupKind,
     LookupOutcome, LookupRecord, LookupRecorder, LookupRequest, NoopLookupRecorder, TaintView,
 };
-pub use provenance::{assembled_provenance, ContextBlock, Provenance};
+pub use provenance::{
+    assembled_provenance, rejection_reason, sanitize_reported_source, ContextBlock, Provenance,
+    MALFORMED_PROVENANCE_PATH,
+};
 pub use redact::{RedactionGate, RedactionVerdict};
 
 /// A failure at the egress choke point.
@@ -332,20 +336,48 @@ fn wire_kind(kind: redact::FindingKind) -> WireFindingKind {
     }
 }
 
-/// A sink for `privacy_block` events emitted by the choke point.
+/// A sink for the privacy events emitted by the choke point — and, for
+/// `provenance_rejected`, by the MCP call funnel that refuses a source before
+/// one is ever assembled ([`crate::mcp::McpRegistry`]).
 ///
-/// Abstracted so the choke point does not depend on the concrete daemon event
-/// bus (and so tests can capture emitted events). The daemon wires its
-/// [`EventBus`]; a [`NoopSink`] is available where events are irrelevant.
+/// Abstracted so neither depends on the concrete daemon event bus (and so tests
+/// can capture emitted events). The daemon wires its [`EventBus`]; a
+/// [`NoopSink`] is available where events are irrelevant.
 pub trait PrivacyEventSink: Send + Sync {
     /// Publish a `privacy_block` event, scoped to `session_id` when known.
     fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock);
+
+    /// Publish a `provenance_rejected` event (REQ-571 ADR-D), scoped to
+    /// `session_id` when known.
+    ///
+    /// ## Why this one has a default body and `privacy_block` does not
+    ///
+    /// The default drops the event, and that is a real cost, so it is worth
+    /// being precise about what it buys. Every sink in the daemon that can
+    /// reach a client — [`EventBus`], and the runtime's tainting wrapper around
+    /// it — overrides it; the implementations that would inherit the default
+    /// are [`NoopSink`] and the capture fixtures in the egress suites, which
+    /// have no subscriber to inform either way. Making it required would have
+    /// bought nothing there and forced an edit to six suites whose job is to
+    /// stay still while this REQ moves the code under them.
+    ///
+    /// A sink added *later* is the case the default is genuinely weaker for. If
+    /// that sink is another delivery path to a user, it must override this —
+    /// LESSON-505 is that a refusal only the daemon log carries is a weak
+    /// control, and inheriting silence here is exactly that failure.
+    fn provenance_rejected(&self, session_id: Option<SessionId>, rejected: ProvenanceRejected) {
+        let _ = (session_id, rejected);
+    }
 }
 
 /// The production sink: broadcast to attached clients over the daemon event bus.
 impl PrivacyEventSink for EventBus {
     fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock) {
         self.publish(session_id, Event::PrivacyBlock(block));
+    }
+
+    fn provenance_rejected(&self, session_id: Option<SessionId>, rejected: ProvenanceRejected) {
+        self.publish(session_id, Event::ProvenanceRejected(rejected));
     }
 }
 
@@ -630,6 +662,54 @@ impl<T: Transport> Egress<T> {
         provenance: &Provenance,
         ctx: &EgressContext,
     ) -> Result<TransportResponse, EgressError> {
+        // REQ-571 ADR-D, ahead of everything and outside the fast path below.
+        //
+        // The guard is *not* a boundary check, so it does not wait for a
+        // boundary to be configured: a source that is not in canonical form
+        // matches no glob at all, which means the failure mode of ignoring it is
+        // silently allowing it. Refusing costs nothing here because — by ADR-A
+        // — no typed path in this daemon can produce such a source; see
+        // `inspector::first_malformed_source` for why the unreachable code is
+        // kept and how it is tested (LESSON-508).
+        //
+        // `inspect` runs the same check. That is deliberate rather than
+        // duplication to tidy away: this call is what makes the refusal
+        // unconditional, and that one is what stops a caller obtaining a verdict
+        // that skipped the guard. Removing either leaves a hole the other does
+        // not cover.
+        if let Some(malformed) = first_malformed_source(provenance) {
+            self.sink.provenance_rejected(
+                ctx.session_id.clone(),
+                ProvenanceRejected {
+                    source: malformed.source,
+                    // The choke point sees an assembled provenance, long after
+                    // it left whatever produced it. Naming a tool here would be
+                    // a guess; the mint-time report names one because it is
+                    // standing at the call.
+                    tool: None,
+                    reason: malformed.reason,
+                },
+            );
+            let block = PrivacyBlock {
+                path: MALFORMED_PROVENANCE_PATH.to_owned(),
+                provider_id: ctx.provider_id.clone(),
+                action: ctx.block_action,
+                // The same reading the unknown-provenance refusal already takes:
+                // `BlockCause` distinguishes *which inspection* refused the
+                // payload, and this is the provenance one. The detail of what
+                // was wrong with the provenance rides on the paired
+                // `provenance_rejected` event rather than on a fourth cause.
+                cause: BlockCause::Boundary,
+            };
+            self.sink.privacy_block(ctx.session_id.clone(), block);
+            return Err(EgressError::PrivacyBlocked {
+                path: MALFORMED_PROVENANCE_PATH.to_owned(),
+                provider_id: ctx.provider_id.clone(),
+                action: ctx.block_action,
+                cause: BlockCause::Boundary,
+            });
+        }
+
         // Fast path: content from no file, or no boundaries configured, can never
         // intersect a boundary — skip building a matcher entirely.
         if !provenance.is_empty() && !self.boundaries.is_empty() {
@@ -1058,6 +1138,7 @@ mod tests {
     use super::*;
     use crate::fixture_id;
     use std::sync::Mutex;
+    use teton_protocol::events::ProvenanceRejection;
 
     /// A `Transport` that records what it was asked to send and returns an empty
     /// 200 — the unit-level stand-in for the network. (The integration harness in
@@ -1087,11 +1168,20 @@ mod tests {
     #[derive(Default)]
     struct CapturingSink {
         events: Mutex<Vec<PrivacyBlock>>,
+        rejections: Mutex<Vec<ProvenanceRejected>>,
     }
 
     impl PrivacyEventSink for CapturingSink {
         fn privacy_block(&self, _session_id: Option<SessionId>, block: PrivacyBlock) {
             self.events.lock().unwrap().push(block);
+        }
+
+        fn provenance_rejected(
+            &self,
+            _session_id: Option<SessionId>,
+            rejected: ProvenanceRejected,
+        ) {
+            self.rejections.lock().unwrap().push(rejected);
         }
     }
 
@@ -1171,6 +1261,83 @@ mod tests {
         assert_eq!(events[0].path, "secrets/prod.env");
         assert_eq!(events[0].provider_id, ProviderId::from("deepseek"));
         assert_eq!(events[0].action, PrivacyAction::ReroutedToLocal);
+    }
+
+    /// AC-5 at the choke point, and the part `inspect`'s own tests cannot show:
+    /// the refusal does not wait for a boundary to be configured. This egress
+    /// has **no boundaries at all**, which is the configuration where every
+    /// other provenance — including an unknown one — is forwarded.
+    ///
+    /// The value under test is one the type system says cannot exist; see
+    /// `inspector::first_malformed_source` for why the guard is kept anyway
+    /// (LESSON-508) and `ProvenanceId::unvalidated_for_test` for the seam.
+    #[tokio::test]
+    async fn a_malformed_source_is_refused_and_reported_with_no_boundaries_configured() {
+        for (source, reason) in [
+            ("/repo/secrets/prod.env", ProvenanceRejection::Absolute),
+            (
+                "sub/../secrets/prod.env",
+                ProvenanceRejection::ParentTraversal,
+            ),
+        ] {
+            let inner = CaptureTransport::default();
+            let sent = inner.sent.clone();
+            let sink = Arc::new(CapturingSink::default());
+            let egress = Egress::new(inner, Vec::new(), sink.clone());
+            let prov =
+                Provenance::tainted_by(teton_core::ProvenanceId::unvalidated_for_test(source));
+            let ctx = EgressContext::new("anthropic").with_session("sess-malformed");
+
+            let err = egress
+                .send(a_request("derived from a boundary file"), &prov, &ctx)
+                .await
+                .expect_err("a malformed source must fail closed");
+            assert!(
+                matches!(err, EgressError::PrivacyBlocked { ref path, .. }
+                    if path == MALFORMED_PROVENANCE_PATH),
+                "{source:?}: {err:?}"
+            );
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "{source:?} reached the wire"
+            );
+
+            // Reported, not merely refused (LESSON-505) — with the offending
+            // source and the reason, and naming no tool, because the choke point
+            // has no honest answer for that.
+            let rejections = sink.rejections.lock().unwrap();
+            assert_eq!(rejections.len(), 1, "{source:?}");
+            assert_eq!(rejections[0].source, source);
+            assert_eq!(rejections[0].reason, reason);
+            assert_eq!(rejections[0].tool, None);
+
+            // And it is a block like any other, on the content-free sentinel:
+            // `path` stays a value a consumer can read as a locus.
+            let blocks = sink.events.lock().unwrap();
+            assert_eq!(blocks.len(), 1, "{source:?}");
+            assert_eq!(blocks[0].path, MALFORMED_PROVENANCE_PATH);
+        }
+    }
+
+    /// Non-vacuity for the test above: with the same empty boundary set, a
+    /// canonical source is forwarded and nothing is reported. Without this, the
+    /// assertions above would pass just as well against an egress that blocked
+    /// everything.
+    #[tokio::test]
+    async fn with_no_boundaries_a_canonical_source_still_reaches_the_wire() {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let sink = Arc::new(CapturingSink::default());
+        let egress = Egress::new(inner, Vec::new(), sink.clone());
+        let prov = Provenance::tainted_by(fixture_id("secrets/prod.env"));
+        let ctx = EgressContext::new("anthropic");
+        egress
+            .send(a_request("public code"), &prov, &ctx)
+            .await
+            .expect("no boundaries configured: nothing to block");
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(sink.rejections.lock().unwrap().is_empty());
+        assert!(sink.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

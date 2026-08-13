@@ -242,6 +242,15 @@ fn tool_error_sentence(tool: &str, err: &McpError) -> String {
 /// [`ToolProvenance::Unknown`] rather than quietly contributing nothing (see
 /// `collect_paths`). Failing toward taint is the only direction a provenance may
 /// be rounded.
+///
+/// ## The refusal is *reported* one layer down, not here (REQ-571 TASK-122)
+///
+/// This function runs on the same arguments
+/// [`McpRegistry::call_tool`](crate::mcp::McpRegistry::call_tool) already walked
+/// on the way out, and that is where the `provenance_rejected` event is
+/// published. Emitting again here would double-report every refusal — one for
+/// the call, one for the result it produced — for a user whose session went
+/// local exactly once.
 #[must_use]
 fn mcp_result_provenance(args: &Value) -> ToolProvenance {
     let provenance = call_provenance(args);

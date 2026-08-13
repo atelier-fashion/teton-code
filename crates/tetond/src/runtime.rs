@@ -931,6 +931,22 @@ impl crate::egress::PrivacyEventSink for TaintingPrivacySink {
         }
         self.events.privacy_block(session_id, block);
     }
+
+    /// Forwarded verbatim to the bus.
+    ///
+    /// No taint decision to make: the fail-closed consequence of a refused
+    /// provenance assertion is already taken where it happens (the call's
+    /// provenance is marked unknown), and this sink's job — deciding whether a
+    /// *block* pins the whole session — has no bearing on it. What would be
+    /// wrong is inheriting the trait's default and dropping the event, because
+    /// this wrapper is a delivery path to a client (LESSON-505).
+    fn provenance_rejected(
+        &self,
+        session_id: Option<SessionId>,
+        rejected: teton_protocol::events::ProvenanceRejected,
+    ) {
+        self.events.provenance_rejected(session_id, rejected);
+    }
 }
 
 /// Whether a block at the choke point establishes that content crossed a
@@ -2659,11 +2675,21 @@ impl DaemonRuntime {
             if let Ok(transport) = HttpTransport::new() {
                 let egress =
                     Arc::new(self.mcp_egress(transport, router, &config, events, session_id));
-                let registry = Arc::new(McpRegistry::with_egress(
-                    egress as Arc<dyn crate::mcp::EgressGate>,
-                    Some(session_id.clone()),
-                    self.mcp_servers.clone(),
-                ));
+                let registry =
+                    Arc::new(
+                        McpRegistry::with_egress(
+                            egress as Arc<dyn crate::mcp::EgressGate>,
+                            Some(session_id.clone()),
+                            self.mcp_servers.clone(),
+                        )
+                        // REQ-571 ADR-D: an MCP argument asserting a path the daemon
+                        // cannot mint taints the call unknown, and the user is told
+                        // which argument did it rather than left with a session that
+                        // silently went local.
+                        .with_event_sink(
+                            Arc::clone(events) as Arc<dyn crate::egress::PrivacyEventSink>
+                        ),
+                    );
                 crate::harness::tools::mcp::register_mcp_tools(
                     &mut tools,
                     registry,

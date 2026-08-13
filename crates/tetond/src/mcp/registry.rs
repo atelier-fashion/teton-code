@@ -21,7 +21,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use teton_protocol::events::ProvenanceRejected;
 use teton_protocol::SessionId;
+
+use crate::egress::PrivacyEventSink;
 
 // The MCP server declaration types live in `teton-core` (the pure-data config
 // layer) because they are part of the main config document (the `[[mcp_server]]`
@@ -30,8 +33,8 @@ use teton_protocol::SessionId;
 pub use teton_core::mcp::{McpServerConfig, McpTransport};
 
 use super::client::{
-    namespaced_tool_name, parse_namespaced_tool_name, EgressGate, HttpConnection, McpClient,
-    McpConnection, McpError, McpTool, McpToolResult, StdioConnection,
+    call_provenance_detailed, namespaced_tool_name, parse_namespaced_tool_name, EgressGate,
+    HttpConnection, McpClient, McpConnection, McpError, McpTool, McpToolResult, StdioConnection,
 };
 
 /// The health of a registered server.
@@ -120,6 +123,12 @@ pub struct McpRegistry {
     connector: Arc<dyn McpConnector>,
     servers: Mutex<HashMap<String, ServerState>>,
     order: Vec<String>,
+    /// Where a refused provenance assertion is reported (REQ-571 ADR-D).
+    /// `None` in contexts with no subscribers — a unit fixture, a probe.
+    events: Option<Arc<dyn PrivacyEventSink>>,
+    /// The session a reported refusal is scoped to, when the registry belongs
+    /// to one. Set alongside the egress gate, which already carries it.
+    session_id: Option<SessionId>,
 }
 
 impl McpRegistry {
@@ -143,6 +152,8 @@ impl McpRegistry {
             connector,
             servers: Mutex::new(servers),
             order,
+            events: None,
+            session_id: None,
         }
     }
 
@@ -154,7 +165,24 @@ impl McpRegistry {
         session_id: Option<SessionId>,
         configs: Vec<McpServerConfig>,
     ) -> Self {
-        Self::new(Arc::new(DefaultConnector::new(egress, session_id)), configs)
+        let connector = Arc::new(DefaultConnector::new(egress, session_id.clone()));
+        Self {
+            session_id,
+            ..Self::new(connector, configs)
+        }
+    }
+
+    /// Report refused provenance assertions to `sink` (REQ-571 ADR-D).
+    ///
+    /// Opt-in rather than a constructor parameter so the fixtures that build a
+    /// registry to test the *lifecycle* keep compiling unchanged; the daemon
+    /// wires its event bus in `runtime::build_tools`. A registry with no sink
+    /// still fails closed — the taint is what refuses the call — it simply
+    /// cannot say why, which is the gap this exists to close.
+    #[must_use]
+    pub fn with_event_sink(mut self, sink: Arc<dyn PrivacyEventSink>) -> Self {
+        self.events = Some(sink);
+        self
     }
 
     /// The configured server ids, in declaration order.
@@ -257,6 +285,44 @@ impl McpRegistry {
         discovered
     }
 
+    /// Broadcast a `provenance_rejected` event for every path-shaped argument of
+    /// this call that could not be minted into an identity (REQ-571 ADR-D).
+    ///
+    /// ## Why here, and not where the refusal happens
+    ///
+    /// The refusal itself is in `collect_paths`, three layers down, which has no
+    /// event bus and — more to the point — no idea which tool it is computing
+    /// for. This is the narrowest place that has both: it is the single funnel
+    /// every MCP tool call passes through, local and remote alike, and it is
+    /// holding the namespaced name the user would recognize.
+    ///
+    /// That the funnel is shared matters for the **local** case especially. A
+    /// local stdio server never reaches the egress choke point, so a refusal on
+    /// its arguments would otherwise surface only much later and much vaguer, as
+    /// an unknown-provenance block on whatever remote turn happened to assemble
+    /// its result. Reporting here names the call that caused it.
+    ///
+    /// This recomputes the argument traversal that
+    /// [`McpClient::call_tool`] will do again. It is a pure walk over one
+    /// arguments object, next to a subprocess or HTTP round trip — and sharing
+    /// one function is what stops the reported set and the tagged set from
+    /// drifting apart, which is the failure that would actually cost something.
+    fn report_rejected_sources(&self, namespaced_name: &str, arguments: &serde_json::Value) {
+        let Some(sink) = self.events.as_ref() else {
+            return;
+        };
+        for rejected in call_provenance_detailed(arguments).rejected {
+            sink.provenance_rejected(
+                self.session_id.clone(),
+                ProvenanceRejected {
+                    source: rejected.source,
+                    tool: Some(namespaced_name.to_owned()),
+                    reason: rejected.reason,
+                },
+            );
+        }
+    }
+
     /// Call a namespaced MCP tool.
     ///
     /// A connection-lost error degrades that server (and schedules a restart on
@@ -264,6 +330,12 @@ impl McpRegistry {
     /// bridge folds it into a tool result the model sees, and the session
     /// continues. A per-call server error is returned without degrading the
     /// connection.
+    ///
+    /// An argument that *claimed* a path the daemon cannot mint taints the call
+    /// [`Unknown`](crate::egress::Provenance::is_unknown) — fail-closed, since
+    /// an absolute argument may well name a boundary file — and is reported on
+    /// the protocol here ([`Self::report_rejected_sources`]). The report goes
+    /// out before the call, so it is not lost when the call then fails.
     ///
     /// # Errors
     /// [`McpError::NotNamespaced`] for a non-MCP name, or the underlying call
@@ -276,6 +348,8 @@ impl McpRegistry {
         let (server_id, tool) = parse_namespaced_tool_name(namespaced_name)
             .ok_or_else(|| McpError::NotNamespaced(namespaced_name.to_owned()))?;
         let (server_id, tool) = (server_id.to_owned(), tool.to_owned());
+
+        self.report_rejected_sources(namespaced_name, &arguments);
 
         let client = self.get_or_connect(&server_id).await?;
         match client.call_tool(&tool, arguments).await {

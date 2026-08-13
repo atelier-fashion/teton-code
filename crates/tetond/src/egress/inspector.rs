@@ -26,9 +26,11 @@
 //! mode still has no implementation and this arm still fails closed.
 
 use teton_core::boundary::BoundaryMatcher;
-use teton_protocol::events::PrivacyAction;
+use teton_protocol::events::{PrivacyAction, ProvenanceRejection};
 
-use crate::egress::provenance::{Provenance, UNKNOWN_PROVENANCE_PATH};
+use crate::egress::provenance::{
+    sanitize_reported_source, Provenance, MALFORMED_PROVENANCE_PATH, UNKNOWN_PROVENANCE_PATH,
+};
 
 /// The outcome of inspecting a request's provenance against the boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +72,80 @@ pub struct Violation {
     pub action: PrivacyAction,
 }
 
+/// A provenance source whose string form is not the canonical identity boundary
+/// matching is defined against (REQ-571 ADR-D).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MalformedSource {
+    /// The offending source, already sanitized for reporting.
+    pub source: String,
+    /// Which canonical-form rule it broke.
+    pub reason: ProvenanceRejection,
+}
+
+/// The first (lowest, deterministic) source in `provenance` that is not in
+/// canonical form, if any — ADR-D's fail-closed guard.
+///
+/// Canonical form is: repo-root-relative, `/`-separated, no `.`, `..`, or empty
+/// segment. A source that breaks it would not *fail* boundary matching, it would
+/// silently **pass** it — `secrets/prod.env` is covered by `secrets/**` and
+/// `/repo/secrets/prod.env` is covered by nothing — so a malformed source is the
+/// one shape where matching-and-allowing is the wrong answer. Hence: refused,
+/// ahead of matching, whether or not any boundary is configured.
+///
+/// # This is unreachable, and that is why it is here (LESSON-508)
+///
+/// After ADR-A a [`Provenance`] holds
+/// [`ProvenanceId`](teton_core::ProvenanceId)s, and both of that type's
+/// constructors run one validator that refuses every spelling this function
+/// looks for. So no typed path in the daemon can hand this guard a value it
+/// rejects, and the honest description of the code below is *dead*.
+///
+/// It stays because "unreachable" is a property of today's call graph, not of
+/// the type: `ProvenanceId::claimed` exists precisely to accept a **third
+/// party's** assertion, and the next constructor — or the next crate to hold a
+/// provenance — inherits none of today's guarantees. LESSON-508 is the rule that
+/// a redundant guard without its own test is one refactor from being deleted as
+/// noise, so this one is tested through
+/// [`ProvenanceId::unvalidated_for_test`](teton_core::ProvenanceId::unvalidated_for_test),
+/// a seam that exists only in test builds. Deleting the guard turns those tests
+/// red rather than turning nothing red.
+#[must_use]
+pub fn first_malformed_source(provenance: &Provenance) -> Option<MalformedSource> {
+    provenance.sources().find_map(|source| {
+        malformed_reason(source).map(|reason| MalformedSource {
+            source: sanitize_reported_source(source),
+            reason,
+        })
+    })
+}
+
+/// Why `source` is not in canonical form, or `None` if it is.
+///
+/// The checks run in the order a reader would ask them, and each is the same
+/// rule `teton_core`'s mint applies — stated here in terms of the *already
+/// minted* string rather than the raw input, because that is what this guard
+/// receives. Separator normalization is deliberately not repeated: an id that
+/// still carries a `\` never went through the mint, and `\`-spelled absolute and
+/// traversal forms are caught by the tests below.
+fn malformed_reason(source: &str) -> Option<ProvenanceRejection> {
+    let normalized = source.replace('\\', "/");
+    if normalized.is_empty() {
+        return Some(ProvenanceRejection::Empty);
+    }
+    if normalized.starts_with('/') || std::path::Path::new(source).is_absolute() {
+        return Some(ProvenanceRejection::Absolute);
+    }
+    let mut segments = 0_usize;
+    for segment in normalized.split('/') {
+        match segment {
+            ".." => return Some(ProvenanceRejection::ParentTraversal),
+            "." | "" => return Some(ProvenanceRejection::NotCanonical),
+            _ => segments += 1,
+        }
+    }
+    (segments == 0).then_some(ProvenanceRejection::Empty)
+}
+
 /// Inspect `provenance` against `matcher`, taking `action` when a boundary is
 /// hit.
 ///
@@ -87,12 +163,29 @@ pub struct Violation {
 /// prove the content is boundary-free, so it refuses to send it remotely rather
 /// than gamble. The reported offender is the content-free
 /// [`UNKNOWN_PROVENANCE_PATH`] sentinel (no real path, no file content).
+///
+/// ## Fail-closed on a malformed source (REQ-571 ADR-D)
+///
+/// [`first_malformed_source`] runs **before** boundary matching, so a source not
+/// in canonical form is refused rather than matched — a distinction that matters
+/// because a malformed source matches *no* glob and would therefore be allowed
+/// through, which is the failure direction that leaks. The choke point runs the
+/// same check itself, unconditionally and independent of whether any boundary is
+/// configured (see [`crate::egress::Egress::send`]); this arm is what makes the
+/// pure decision function fail closed on its own, so a caller cannot obtain a
+/// verdict that skipped the guard.
 #[must_use]
 pub fn inspect(
     provenance: &Provenance,
     matcher: &BoundaryMatcher<'_>,
     action: PrivacyAction,
 ) -> Inspection {
+    if first_malformed_source(provenance).is_some() {
+        return Inspection::Blocked(Violation {
+            path: MALFORMED_PROVENANCE_PATH.to_owned(),
+            action,
+        });
+    }
     if provenance.is_unknown() {
         return Inspection::Blocked(Violation {
             path: UNKNOWN_PROVENANCE_PATH.to_owned(),
@@ -118,6 +211,7 @@ mod tests {
     use super::*;
     use crate::fixture_id;
     use teton_core::entities::{BoundaryMode, PrivacyBoundary};
+    use teton_core::ProvenanceId;
 
     fn boundary(glob: &str, mode: BoundaryMode) -> PrivacyBoundary {
         PrivacyBoundary {
@@ -238,6 +332,138 @@ mod tests {
             .expect("unknown provenance must fail closed");
         assert_eq!(v.path, UNKNOWN_PROVENANCE_PATH);
         assert_eq!(v.action, PrivacyAction::ReroutedToLocal);
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-571 ADR-D — the malformed-source guard
+    //
+    // Every test below drives a value the type system says cannot exist, via
+    // `ProvenanceId::unvalidated_for_test`. That is the point rather than a
+    // workaround: ADR-A makes this guard unreachable from any typed path in the
+    // daemon, and LESSON-508 is that a redundant guard *without* its own test
+    // reads as dead code and gets deleted in the next cleanup — taking with it
+    // the only thing standing between a future third-party-asserted source and
+    // a boundary match that silently passes. These tests are the reason the
+    // guard survives a refactor that "notices" it can never fire.
+    // -----------------------------------------------------------------------
+
+    /// A malformed source that names a boundary file must not be *allowed* just
+    /// because no glob matches its spelling. This is the leak the guard exists
+    /// to stop, so it is asserted against a matcher that would have passed it.
+    #[test]
+    fn a_malformed_source_naming_a_boundary_file_is_refused_not_matched() {
+        let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
+        let m = matcher(&bs);
+        // The absolute spelling of a file the boundary covers. `secrets/**`
+        // matches none of it — which is exactly why allowing it would leak.
+        let prov =
+            Provenance::tainted_by(ProvenanceId::unvalidated_for_test("/repo/secrets/prod.env"));
+        let out = inspect(&prov, &m, PrivacyAction::ReroutedToLocal);
+        let v = out
+            .violation()
+            .expect("a malformed source must fail closed");
+        assert_eq!(v.path, MALFORMED_PROVENANCE_PATH);
+        assert_eq!(v.action, PrivacyAction::ReroutedToLocal);
+    }
+
+    /// AC-5. The two shapes ADR-D names, **with no boundary configured** — the
+    /// guard is not a boundary check and does not wait for one.
+    #[test]
+    fn an_absolute_and_a_traversing_source_are_refused_with_no_boundary_configured() {
+        let bs: Vec<PrivacyBoundary> = Vec::new();
+        let m = matcher(&bs);
+        // Control: a well-formed source is allowed by this same empty matcher,
+        // so the assertions below cannot pass because *everything* is blocked.
+        assert_eq!(
+            inspect(
+                &Provenance::tainted_by(fixture_id("src/main.rs")),
+                &m,
+                PrivacyAction::ReroutedToLocal
+            ),
+            Inspection::Allowed
+        );
+
+        for source in ["/etc/passwd", "sub/../../etc/passwd"] {
+            let prov = Provenance::tainted_by(ProvenanceId::unvalidated_for_test(source));
+            let out = inspect(&prov, &m, PrivacyAction::ReroutedToLocal);
+            assert_eq!(
+                out.violation().map(|v| v.path.as_str()),
+                Some(MALFORMED_PROVENANCE_PATH),
+                "{source:?} must be refused with no boundary configured"
+            );
+        }
+    }
+
+    /// Each way of breaking canonical form reports its own reason: they are
+    /// different problems with different fixes, and a collapsed reason would
+    /// make the event unable to say which one happened.
+    #[test]
+    fn every_canonical_form_rule_reports_its_own_reason() {
+        let cases = [
+            ("/etc/passwd", ProvenanceRejection::Absolute),
+            ("\\etc\\passwd", ProvenanceRejection::Absolute),
+            ("../outside", ProvenanceRejection::ParentTraversal),
+            ("sub\\..\\outside", ProvenanceRejection::ParentTraversal),
+            ("./secrets/prod.env", ProvenanceRejection::NotCanonical),
+            ("secrets//prod.env", ProvenanceRejection::NotCanonical),
+            ("secrets/prod.env/", ProvenanceRejection::NotCanonical),
+            ("", ProvenanceRejection::Empty),
+        ];
+        for (source, expected) in cases {
+            let prov = Provenance::tainted_by(ProvenanceId::unvalidated_for_test(source));
+            let found = first_malformed_source(&prov)
+                .unwrap_or_else(|| panic!("{source:?} must be refused"));
+            assert_eq!(found.reason, expected, "wrong reason for {source:?}");
+        }
+    }
+
+    /// Non-vacuity for the guard itself: the canonical spellings a real mint
+    /// produces pass it untouched, so it is refusing a shape rather than
+    /// refusing everything.
+    #[test]
+    fn a_canonical_source_is_not_malformed() {
+        for source in ["a", "secrets/prod.env", "a/b/c/d.rs", "x.y"] {
+            let prov = Provenance::tainted_by(fixture_id(source));
+            assert_eq!(
+                first_malformed_source(&prov),
+                None,
+                "{source:?} is canonical and must pass the guard"
+            );
+        }
+    }
+
+    /// The reported source is sanitized before it leaves: a hostile spelling
+    /// cannot smuggle a newline or an escape sequence into whatever renders the
+    /// `provenance_rejected` event.
+    #[test]
+    fn the_reported_source_carries_no_control_characters() {
+        let prov = Provenance::tainted_by(ProvenanceId::unvalidated_for_test(
+            "/etc/\u{1b}[31mpasswd\nprivacy: all clear",
+        ));
+        let found = first_malformed_source(&prov).expect("refused");
+        assert!(!found.source.contains('\n'), "{:?}", found.source);
+        assert!(!found.source.contains('\u{1b}'), "{:?}", found.source);
+        assert!(found.source.starts_with("/etc/"), "{:?}", found.source);
+    }
+
+    /// One malformed source among well-formed ones still refuses the whole
+    /// provenance — the guard is a property of the set, not of a lucky
+    /// iteration order.
+    #[test]
+    fn one_malformed_source_among_canonical_ones_still_refuses() {
+        let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
+        let m = matcher(&bs);
+        let prov = Provenance::tainted_by(fixture_id("src/a.rs"))
+            .union(&Provenance::tainted_by(ProvenanceId::unvalidated_for_test(
+                "/etc/passwd",
+            )))
+            .union(&Provenance::tainted_by(fixture_id("src/b.rs")));
+        assert_eq!(
+            inspect(&prov, &m, PrivacyAction::ReroutedToLocal)
+                .violation()
+                .map(|v| v.path.as_str()),
+            Some(MALFORMED_PROVENANCE_PATH)
+        );
     }
 
     #[test]

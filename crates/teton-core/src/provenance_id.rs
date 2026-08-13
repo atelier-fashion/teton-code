@@ -211,6 +211,36 @@ impl ProvenanceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// **Test seam** (REQ-571 TASK-122). Wrap `raw` verbatim, minting nothing
+    /// and validating nothing.
+    ///
+    /// ## Why a deliberately unsound constructor exists
+    ///
+    /// ADR-D puts a well-formedness guard at the egress inspection point, ahead
+    /// of boundary matching: a source that is absolute, or retains a `.`/`..`
+    /// segment, fails closed whether or not a boundary is configured. ADR-A is
+    /// what makes that guard **unreachable** — [`mint`] is the only way to get a
+    /// [`ProvenanceId`], and it refuses every one of those spellings — and that
+    /// is exactly the problem LESSON-508 names: a redundant guard with no test
+    /// is one refactor away from being deleted as dead weight. The guard cannot
+    /// be tested without a value the type system says cannot exist, so the seam
+    /// that produces one is here, named for what it is.
+    ///
+    /// ## Why the feature gate rather than `#[doc(hidden)]`
+    ///
+    /// `test-seam` is off in every shipped build and is switched on only by
+    /// `tetond`'s **dev**-dependency, so production code that reached for this
+    /// does not compile — the same posture as `tetond`'s `fixture_id` and
+    /// `RetainedContext::from_blocks`, and the reason ADR-A's "only a minted
+    /// identity enters the channel" is a property of the binary rather than a
+    /// convention. A `#[doc(hidden)] pub` escape hatch would compile fine in
+    /// production and rely on nobody noticing it.
+    #[cfg(any(test, feature = "test-seam"))]
+    #[must_use]
+    pub fn unvalidated_for_test(raw: &str) -> Self {
+        ProvenanceId(raw.to_owned())
+    }
 }
 
 /// Normalize and validate a candidate id into canonical form.

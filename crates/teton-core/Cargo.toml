@@ -12,6 +12,15 @@ authors.workspace = true
 # reqwest, no async runtime). Only pure-logic crates are allowed here so the
 # routing and privacy-boundary logic stays trivially testable and cannot itself
 # perform egress.
+# REQ-571 TASK-122. `test-seam` exposes `ProvenanceId::unvalidated_for_test`,
+# the only way to build the malformed id ADR-D's redundant egress guard exists
+# to catch — the guard is unreachable by construction, which is precisely why it
+# needs its own test (LESSON-508). Off in every shipped build: `tetond` turns it
+# on through a dev-dependency, so production code reaching for the seam fails to
+# compile rather than relying on a review catch.
+[features]
+test-seam = []
+
 [dependencies]
 # The wire vocabulary this crate's lifetime decision is expressed in
 # (REQ-565). teton-protocol is a pure leaf — serde/serde_json/thiserror only —

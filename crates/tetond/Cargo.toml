@@ -129,6 +129,13 @@ futures = { version = "0.3", features = ["std", "async-await"] }
 # implementing the trait) and asserts on protocol stop-reason / session ids.
 teton-inference = { path = "../teton-inference" }
 teton-protocol = { path = "../teton-protocol" }
+# REQ-571 TASK-122: `test-seam` exposes `ProvenanceId::unvalidated_for_test`, the
+# only way to construct the malformed identity ADR-D's redundant egress guard
+# exists to refuse. Listed here and NOT in `[dependencies]` on purpose — with
+# resolver 2 a dev-dependency feature is not unified into `cargo build`, so the
+# seam is absent from every shipped binary and daemon code calling it fails to
+# compile.
+teton-core = { path = "../teton-core", features = ["test-seam"] }
 
 [lints]
 workspace = true

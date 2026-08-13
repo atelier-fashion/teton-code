@@ -17,7 +17,8 @@
 
 use std::collections::BTreeSet;
 
-use teton_core::ProvenanceId;
+use teton_core::{ProvenanceError, ProvenanceId};
+use teton_protocol::events::ProvenanceRejection;
 
 /// The sentinel "path" reported when a request is blocked because some content
 /// carried **unknown** provenance rather than a specific boundary source.
@@ -28,6 +29,71 @@ use teton_core::ProvenanceId;
 /// for its `privacy_block` event and typed error — this is it. It is not a real
 /// repo path, and by construction leaks no file content.
 pub const UNKNOWN_PROVENANCE_PATH: &str = "<unknown-provenance>";
+
+/// The sentinel "path" reported when a request is refused because a provenance
+/// source was **malformed** rather than because it crossed a boundary.
+///
+/// The twin of [`UNKNOWN_PROVENANCE_PATH`], and a sentinel for the same reason:
+/// `PrivacyBlock::path` is documented as a repo-relative path, and a source that
+/// failed the canonical form is by definition not one. Naming it here keeps that
+/// field honest, and keeps attacker-influenced text out of a field consumers
+/// read as a path — the offending source travels on the paired
+/// [`ProvenanceRejected`](teton_protocol::events::ProvenanceRejected) event
+/// instead, sanitized, where it is labelled as the untrusted claim it is.
+pub const MALFORMED_PROVENANCE_PATH: &str = "<malformed-provenance>";
+
+/// Byte cap on the source text carried by a `provenance_rejected` event.
+///
+/// A source is chosen by whoever asserted it — a remote MCP server can send
+/// megabytes under a path-shaped key — so the report is bounded before it is
+/// cloned to every subscriber.
+const MAX_REPORTED_SOURCE_BYTES: usize = 256;
+
+/// Prepare an attacker-influenced provenance source for reporting: strip
+/// control characters, then truncate.
+///
+/// Both halves are load-bearing. **Control characters** are how a hostile source
+/// forges structure in whatever renders it — a newline splits one notice into
+/// two, an ANSI escape colours or moves a terminal cursor, a `\r` erases the
+/// line that named the tool. They are replaced (not dropped) with `?` so the
+/// report still shows that something was there. **Truncation** bounds a value
+/// the daemon did not choose the length of, at a cost of a marker the reader can
+/// see; the value is a diagnostic, never something to act on as a path, so a cut
+/// tail loses nothing that could be trusted anyway.
+#[must_use]
+pub fn sanitize_reported_source(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_REPORTED_SOURCE_BYTES));
+    for ch in raw.chars() {
+        // `len_utf8` before pushing: truncating on a char boundary is what keeps
+        // the result a valid `String` rather than a slice index panic waiting on
+        // a multi-byte source.
+        if out.len() + ch.len_utf8() > MAX_REPORTED_SOURCE_BYTES {
+            out.push('…');
+            return out;
+        }
+        out.push(if ch.is_control() { '?' } else { ch });
+    }
+    out
+}
+
+/// The wire reason for a mint failure.
+///
+/// One map, at the single seam where a `teton-core` refusal becomes a protocol
+/// event, so the two vocabularies cannot drift into disagreeing about the same
+/// refusal. [`ProvenanceError::NotUnderRoot`] has no wire twin of its own: it is
+/// reachable only from `from_resolved`, i.e. a file the daemon *opened* outside
+/// the root, which the tool refuses outright rather than reporting — so it maps
+/// to the closest true statement, that the source has no repo-relative form.
+#[must_use]
+pub fn rejection_reason(err: &ProvenanceError) -> ProvenanceRejection {
+    match err {
+        ProvenanceError::Absolute { .. } | ProvenanceError::NotUnderRoot { .. } => {
+            ProvenanceRejection::Absolute
+        }
+        ProvenanceError::ParentTraversal { .. } => ProvenanceRejection::ParentTraversal,
+        ProvenanceError::Empty => ProvenanceRejection::Empty,
+    }
+}
 
 /// The set of repo-relative source identities a piece of content was derived
 /// from.
