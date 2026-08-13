@@ -172,6 +172,28 @@ mod tests {
         );
     }
 
+    /// **REQ-571 BR-8 — retained, and paired.**
+    ///
+    /// What this test says is true of the matcher and only of the matcher: an
+    /// out-of-repo *string* matches no repo-relative glob. It is deliberately
+    /// **not** a claim that a boundary file is safe when named that way — the
+    /// opposite, in fact. `secrets/**` returning `None` for
+    /// `/abs/root/secrets/prod.env` is what made a non-canonical spelling
+    /// invisible to enforcement before REQ-571 (BR-9).
+    ///
+    /// The reason that is no longer reachable lives one layer up, in the tools:
+    /// `ToolContext::resolve` canonicalizes a path to its repo-relative form
+    /// before any identity is minted, so a spelling like the ones below never
+    /// becomes a `ProvenanceId` and never arrives here. Each assertion is
+    /// therefore paired with the tool-layer test that proves it, named inline
+    /// below.
+    ///
+    /// **Do not delete either half alone.** Without the assertion, nothing
+    /// states what the matcher does with such a string; without the twin,
+    /// nothing states that the tool layer keeps it hypothetical.
+    /// `crates/tetond/tests/boundary_coverage.rs`
+    /// (`each_out_of_repo_matcher_assertion_is_paired_with_a_tool_layer_test`)
+    /// fails if this test, either assertion, or the names below go missing.
     #[test]
     fn out_of_repo_paths_never_match_and_never_panic() {
         let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
@@ -191,7 +213,22 @@ mod tests {
         ] {
             let _ = m.match_path(p); // must not panic
         }
+        // Absolute. Tool-layer twins — an absolute in-root path is canonicalized
+        // before it is minted, so this spelling never reaches the matcher:
+        //   tetond/tests/egress_capture.rs
+        //     read_blocks_every_boundary_spelling_under_one_identity
+        //     edit_blocks_every_boundary_spelling_under_one_identity
+        //   tetond/tests/provenance_egress.rs
+        //     a_session_tainted_by_an_absolute_spelling_reaches_the_pin_and_closes_the_web
         assert!(m.match_path("/etc/secrets/x").is_none());
+        // `..`-bearing. Tool-layer twins — a `..` component is either resolved
+        // away inside the root or refused by the jail, so no `..`-bearing string
+        // survives to become an identity:
+        //   tetond/tests/egress_capture.rs
+        //     read_blocks_every_boundary_spelling_under_one_identity
+        //     edit_blocks_every_boundary_spelling_under_one_identity
+        //   tetond/tests/provenance_egress.rs
+        //     a_session_tainted_by_a_traversing_spelling_reaches_the_pin_and_closes_the_web
         assert!(m.match_path("../secrets/x").is_none());
     }
 
