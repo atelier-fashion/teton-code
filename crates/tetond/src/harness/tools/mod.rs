@@ -81,8 +81,10 @@ impl ToolContext {
     /// escapes the repo root.
     ///
     /// Relative paths join onto the root; absolute paths are taken as-is and then
-    /// checked. `.`/`..` are collapsed lexically, and existing paths are
-    /// canonicalized so a symlink pointing outside the root is caught too.
+    /// checked. `.`/`..` are collapsed lexically, and the result is resolved
+    /// against the filesystem — through the deepest ancestor that exists, so a
+    /// symlink pointing outside the root is caught whether or not the leaf has
+    /// been created yet (`canonical_through_existing_ancestor`, below).
     ///
     /// # A link is answered by its target (REQ-571 ADR-C)
     ///
@@ -105,8 +107,9 @@ impl ToolContext {
     ///
     /// # Errors
     /// Returns [`ToolError::Jail`] when the resolved path is not inside the root
-    /// (or the root itself cannot be resolved), and — the same refusal, one step
-    /// later — when the resolved path has no repo-relative identity to mint.
+    /// (or the root itself cannot be resolved), when the path cannot be resolved
+    /// at all because it passes through a broken link, and — the same refusal, one
+    /// step later — when the resolved path has no repo-relative identity to mint.
     ///
     /// **There is no fallback to `raw`, ever** (ADR-B). A mint failure means the
     /// resolved path is not a file under the root, which is precisely the case
@@ -126,9 +129,13 @@ impl ToolContext {
         };
         let normalized = lexical_normalize(&joined);
 
-        // Canonicalize when the target exists so a symlink cannot tunnel out of
-        // the jail; fall back to the lexical form for not-yet-created paths.
-        let checked = normalized.canonicalize().unwrap_or(normalized);
+        // Containment is decided on a *resolved* path — never on one that still
+        // holds untraversed components (REQ-571 BR-6).
+        let checked = canonical_through_existing_ancestor(&normalized).ok_or_else(|| {
+            ToolError::jail(format!(
+                "path `{raw}` cannot be resolved: it passes through a broken symlink"
+            ))
+        })?;
 
         if !checked.starts_with(&root) {
             return Err(ToolError::jail(format!(
@@ -194,6 +201,51 @@ pub struct Resolved {
 /// path. Inferring "not a link" from `!is_dir()` reproduces the bug exactly.
 pub(crate) fn skip_symlink_entry(file_type: std::fs::FileType) -> bool {
     file_type.is_symlink()
+}
+
+/// Resolve `path` as far as the filesystem actually goes: canonicalize the
+/// deepest ancestor that exists, then re-join the components that do not exist
+/// yet. `None` means the path has no answer at all — see below.
+///
+/// # Containment is decided on a resolved path, never a lexical one (REQ-571 BR-6)
+///
+/// The obvious spelling — `path.canonicalize().unwrap_or(path)` — is a jail
+/// escape waiting for a `write`/`create` tool. `canonicalize` fails for a target
+/// that does not exist *yet*, and the fallback then hands the containment check a
+/// string whose components were never traversed: `link/new`, where `link` points
+/// outside the repo, is lexically inside the root and passes, and the **OS**
+/// resolves the link on open. Resolving the ancestor closes it, because `link`
+/// itself does exist — canonicalizing it yields the outside directory, and the
+/// re-joined `link/new` fails `starts_with(root)` like any other escape.
+///
+/// A not-yet-existing path under a genuine in-root directory still resolves and
+/// is still accepted: creating new files in the repo is the case this must not
+/// break, and it is what distinguishes "resolve the ancestor" from "require the
+/// path to exist".
+///
+/// # A dangling link is refused, not resolved lexically
+///
+/// If a component exists ([`Path::symlink_metadata`] succeeds) yet does not
+/// canonicalize, it is a broken symlink — or, rarely, a component that just
+/// became unreadable. Either way the daemon cannot say where an open would land,
+/// and the discarded fallback would have minted an identity under the *link's*
+/// own in-jail name for a file that may live anywhere. ADR-B's no-fallback rule
+/// applies exactly here, so the walk stops and the caller refuses.
+fn canonical_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            let mut resolved = canonical;
+            resolved.extend(tail.iter().rev().copied());
+            return Some(resolved);
+        }
+        if cursor.symlink_metadata().is_ok() {
+            return None;
+        }
+        tail.push(cursor.file_name()?);
+        cursor = cursor.parent()?;
+    }
 }
 
 /// Collapse `.` and `..` components lexically, without touching the filesystem.
@@ -822,6 +874,80 @@ mod tests {
         let err = ctx.resolve("/etc/hosts").unwrap_err();
         assert!(matches!(err, ToolError::Jail(_)));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-571 BR-6, the case the ancestor walk exists for.** The leaf does not
+    /// exist, so canonicalizing the whole path fails — but `link` does exist and
+    /// resolves outside the repo, so the re-joined path is outside and refused.
+    /// The discarded lexical fallback accepted this.
+    #[test]
+    fn resolve_refuses_a_new_leaf_reached_through_an_escaping_link() {
+        let root = temp_root("newleaf-esc");
+        let outside = temp_root("newleaf-out");
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        // Fixture control: the link is live and really does leave the root.
+        assert_eq!(
+            root.join("link").canonicalize().unwrap(),
+            outside.canonicalize().unwrap()
+        );
+        let ctx = ToolContext::new(&root);
+
+        let err = ctx.resolve("link/new.txt").unwrap_err();
+        assert!(matches!(err, ToolError::Jail(_)), "{err:?}");
+        assert!(err.to_string().contains("escapes the repo root"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// **The over-refusal guard.** Resolving the ancestor is not "the path must
+    /// exist": a file that has not been created yet, under a real in-root
+    /// directory, still resolves and still mints its own identity — including
+    /// through an in-root link, which is answered by its target like any other
+    /// spelling (ADR-C).
+    #[test]
+    fn resolve_still_accepts_a_not_yet_existing_path_under_the_root() {
+        let root = temp_root("newleaf-ok");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::os::unix::fs::symlink("src", root.join("link")).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let ctx = ToolContext::new(&root);
+
+        let resolved = ctx.resolve("src/new.rs").unwrap();
+        assert_eq!(resolved.provenance.as_str(), "src/new.rs");
+        assert_eq!(resolved.path, canonical_root.join("src/new.rs"));
+
+        // A missing intermediate directory is a new path too, not an escape.
+        let resolved = ctx.resolve("src/deep/new.rs").unwrap();
+        assert_eq!(resolved.provenance.as_str(), "src/deep/new.rs");
+
+        // Through an in-root link: the target names the file, so the id is the
+        // target's — the same rule an existing file gets.
+        let resolved = ctx.resolve("link/new.rs").unwrap();
+        assert_eq!(resolved.provenance.as_str(), "src/new.rs");
+        assert_eq!(resolved.path, canonical_root.join("src/new.rs"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The dangling link (TASK-120 flagged it, this closes it).** The link
+    /// exists but resolves nowhere, so the daemon cannot say where an open would
+    /// land — and the discarded fallback would have minted an id under the link's
+    /// own in-jail name for a file that lives outside. Refused instead (ADR-B).
+    #[test]
+    fn resolve_refuses_a_dangling_link_rather_than_minting_its_own_name() {
+        let root = temp_root("dangling");
+        let outside = temp_root("dangling-out");
+        std::os::unix::fs::symlink(outside.join("never-created.txt"), root.join("notes.txt"))
+            .unwrap();
+        // Fixture control: the entry exists, and it is the *resolution* that fails.
+        assert!(root.join("notes.txt").symlink_metadata().is_ok());
+        assert!(root.join("notes.txt").canonicalize().is_err());
+        let ctx = ToolContext::new(&root);
+
+        let err = ctx.resolve("notes.txt").unwrap_err();
+        assert!(matches!(err, ToolError::Jail(_)), "{err:?}");
+        assert!(err.to_string().contains("broken symlink"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

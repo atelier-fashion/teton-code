@@ -1,5 +1,6 @@
-//! REQ-571 AC-3/AC-4 — symlink posture splits by tool class (BR-5, ADR-C) — and
-//! AC-15, the model-facing half of that posture (BR-11).
+//! REQ-571 AC-3/AC-4 — symlink posture splits by tool class (BR-5, ADR-C) —
+//! AC-6, containment decided on a resolved path (BR-6), and AC-15, the
+//! model-facing half of the posture (BR-11).
 //!
 //! A symlink is a second name for a file, and the two tool classes must answer
 //! it differently:
@@ -24,6 +25,13 @@
 //! file it is holding. The AC-15 cases at the foot of this file assert that it
 //! is told — and that being told changes nothing about the verdict, since the
 //! displayed text and the enforced identity are separate values.
+//!
+//! AC-6 (BR-6) belongs here too, at the foot of the file: it is a claim about
+//! the same resolution step, made about the leaf that does *not* exist yet.
+//! Resolving only what exists left a hole — a link out of the root plus an
+//! uncreated leaf under it — and closing it must not cost the repo the ability to
+//! name a file before creating it, so each of those cases is asserted against the
+//! other.
 //!
 //! Every fixture that asserts an absence pairs it with a positive control — a
 //! live link proving the refusal is not merely a broken link, and a public turn
@@ -121,6 +129,37 @@ impl LinkFixture {
             std::fs::read_to_string(&link).unwrap(),
             SECRET_ENV,
             "fixture: the in-root link must actually resolve to the boundary file"
+        );
+    }
+
+    /// Link `name` inside the root to the outside **directory**, and assert it is
+    /// live. The AC-6 shape: the link resolves, so a leaf named under it can be
+    /// one that does not exist yet.
+    fn link_out_dir(&self, name: &str) {
+        let link = self.root.join(name);
+        symlink(&self.outside, &link).unwrap();
+        assert_eq!(
+            link.canonicalize().unwrap(),
+            self.outside.canonicalize().unwrap(),
+            "fixture: the directory link must actually leave the root, or every \
+             assertion below is about a path that was never dangerous"
+        );
+    }
+
+    /// Link `name` inside the root to a file outside the root that does **not**
+    /// exist — the dangling case, where the link entry is real but resolves
+    /// nowhere.
+    fn dangling_link_out(&self, name: &str) {
+        let link = self.root.join(name);
+        symlink(self.outside.join("never-created.txt"), &link).unwrap();
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "fixture: the link entry itself must exist"
+        );
+        assert!(
+            link.canonicalize().is_err(),
+            "fixture: the link must dangle, or this is the already-covered \
+             resolved-link case"
         );
     }
 
@@ -759,5 +798,177 @@ async fn divergent_display_cannot_move_the_boundary_verdict() {
     for (_, block) in &events {
         assert_eq!(block.path, CANONICAL_ID);
     }
+    fx.cleanup();
+}
+
+/// **AC-6 (BR-6), `read`.** A leaf that does not exist *yet*, named under a link
+/// that leaves the root, is refused — and the same tool, in the same repo, still
+/// accepts a leaf that does not exist yet under a real directory.
+///
+/// The pairing is the test. Before BR-6 the jail canonicalized and, when that
+/// failed because the target was not there, fell back to the **lexical** path —
+/// which spells `escape-dir/new.txt` inside the root, passes `starts_with`, and
+/// leaves the OS to follow the link on open. Refusing everything unresolvable
+/// would also close that hole and would break creating files in the repo, so the
+/// second half of this test is what says the fix is the right one.
+#[test]
+fn read_refuses_a_new_leaf_through_an_escaping_link_and_keeps_accepting_one_in_the_repo() {
+    let fx = LinkFixture::new("read-new-leaf");
+    fx.link_out_dir("escape-dir");
+    let ctx = ToolContext::new(&fx.root);
+
+    // Control: the link really does reach outside content, so the refusals below
+    // are about a live escape route and not a dead one.
+    let existing = ReadTool.run(&ctx, &json!({ "path": "escape-dir/outside-secret.txt" }));
+    assert!(existing.is_error, "{}", existing.content);
+    assert!(
+        existing.content.contains("escapes the repo root"),
+        "an existing file through a directory link must be the jail's refusal: {}",
+        existing.content
+    );
+
+    // AC-6: the leaf does not exist, so canonicalizing the whole path fails.
+    let out = ReadTool.run(&ctx, &json!({ "path": "escape-dir/new.txt" }));
+    assert!(
+        out.is_error,
+        "a new leaf under an escaping link must be refused, got: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("escapes the repo root"),
+        "the refusal must be the jail's, decided on the resolved path: {}",
+        out.content
+    );
+    assert!(
+        !out.content.contains("OUTSIDE-ONLY"),
+        "the refusal must not quote anything from outside the jail"
+    );
+
+    // The over-refusal guard: a not-yet-existing file under a genuine in-root
+    // directory clears the jail. `read` then fails on the *open*, which is a
+    // different sentence — the one a `write` tool would not fail on at all.
+    let missing = ReadTool.run(&ctx, &json!({ "path": "src/not-created-yet.rs" }));
+    assert!(missing.is_error, "{}", missing.content);
+    assert!(
+        !missing.content.contains("escapes the repo root"),
+        "a new file in the repo was refused by the jail — the fix over-refuses: {}",
+        missing.content
+    );
+    assert!(
+        missing.content.contains("could not read"),
+        "the failure must be the open, not the jail: {}",
+        missing.content
+    );
+    fx.cleanup();
+}
+
+/// **AC-6, `edit`.** The write half, stated as the thing that actually matters:
+/// nothing lands outside the root.
+///
+/// `edit` cannot exploit this today — it reads before it writes, so the open
+/// fails first — which is exactly why this is closed prospectively. The assertion
+/// is therefore about the jail's verdict *and* about the outside directory being
+/// untouched, so the day a `write`/`create` tool joins the set, the refusal it
+/// inherits is already proven.
+#[test]
+fn edit_refuses_to_reach_a_new_leaf_through_an_escaping_link() {
+    let fx = LinkFixture::new("edit-new-leaf");
+    fx.link_out_dir("escape-dir");
+    let ctx = ToolContext::new(&fx.root);
+
+    // Positive control: this tool, in this repo, does edit files.
+    let public = EditTool.run(
+        &ctx,
+        &json!({
+            "path": "src/main.rs",
+            "old_string": "PUBLIC-MARKER-9f3a",
+            "new_string": "PUBLIC-MARKER-9f3a-edited",
+        }),
+    );
+    assert!(!public.is_error, "{}", public.content);
+
+    let out = EditTool.run(
+        &ctx,
+        &json!({
+            "path": "escape-dir/new.txt",
+            "old_string": "anything",
+            "new_string": "OWNED",
+        }),
+    );
+    assert!(
+        out.is_error,
+        "a new leaf under an escaping link must be refused, got: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("escapes the repo root"),
+        "the refusal must be the jail's: {}",
+        out.content
+    );
+    assert!(
+        !fx.outside.join("new.txt").exists(),
+        "the refused edit created a file outside the repo root"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.outside.join("outside-secret.txt")).unwrap(),
+        OUTSIDE_SECRET,
+        "the refused edit must not have written through the link"
+    );
+    fx.cleanup();
+}
+
+/// **The dangling link — TASK-120 flagged it, BR-6 closes it.** The link entry
+/// exists, so `canonicalize` fails on the link *itself*; the discarded lexical
+/// fallback therefore minted `notes.txt` — an in-jail identity — for a file that
+/// lives outside the root the moment anyone creates it.
+///
+/// Nothing leaked then (the read failed next) and nothing leaks now; what changed
+/// is that the jail no longer answers a path it cannot resolve, so no id is minted
+/// under a name the daemon never opened (ADR-B). Paired with a live link, whose
+/// read still succeeds — the refusal is about resolution failing, not about links.
+#[test]
+fn a_dangling_link_is_refused_rather_than_minted_under_its_own_name() {
+    let fx = LinkFixture::new("dangling");
+    fx.link_in("live.txt");
+    fx.dangling_link_out("notes.txt");
+    let ctx = ToolContext::new(&fx.root);
+
+    // Control: a link that resolves is still answered, by its target's identity.
+    let live = ReadTool.run(&ctx, &json!({ "path": "live.txt" }));
+    assert!(!live.is_error, "{}", live.content);
+    assert_eq!(sole_identity(&live), CANONICAL_ID);
+
+    for out in [
+        ReadTool.run(&ctx, &json!({ "path": "notes.txt" })),
+        EditTool.run(
+            &ctx,
+            &json!({
+                "path": "notes.txt",
+                "old_string": "anything",
+                "new_string": "OWNED",
+            }),
+        ),
+    ] {
+        assert!(
+            out.is_error,
+            "a dangling link must be refused, got: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("broken symlink"),
+            "the refusal must name why the path has no answer: {}",
+            out.content
+        );
+        assert!(
+            matches!(&out.provenance, ToolProvenance::Sources(ids) if ids.is_empty()),
+            "a refused path minted an identity: {:?}",
+            out.provenance
+        );
+    }
+    // And nothing was created at the link's target.
+    assert!(
+        !fx.outside.join("never-created.txt").exists(),
+        "the refused call wrote through the dangling link"
+    );
     fx.cleanup();
 }
