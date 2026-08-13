@@ -19,19 +19,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// Path to the `teton` binary under test.
-fn teton_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_teton"))
-}
-
-/// Path to the sibling `teton-code` daemon binary (built alongside `teton` into the
-/// same target directory under `--workspace`).
-fn daemon_bin() -> PathBuf {
-    teton_bin()
-        .parent()
-        .expect("teton binary has a parent dir")
-        .join("teton-code")
-}
+mod common;
+use common::{daemon_bin, teton_bin};
 
 // ---------------------------------------------------------------------------
 // `teton --version` — hermetic (no daemon needed)
@@ -459,24 +448,9 @@ fn teton_doctor_and_cost_report_against_a_live_daemon() {
 // The daemon is spawned with no `TETON_LOCAL_SCRIPT`, so the consent gate is
 // genuinely live and a proposal is genuinely outstanding when the CLI attaches.
 
-/// Skip cleanly when the sibling daemon has not been built (a bare
-/// `cargo test -p teton` does not build it; the workspace run does).
-fn daemon_or_skip() -> Option<PathBuf> {
-    let daemon = daemon_bin();
-    if daemon.exists() {
-        return Some(daemon);
-    }
-    let _ = std::io::stderr().write_all(
-        b"skipping CLI consent e2e: teton-code binary not built (run under --workspace)\n",
-    );
-    None
-}
-
 #[test]
 fn teton_renders_the_first_run_proposal_and_accepts_it_interactively() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
@@ -569,9 +543,7 @@ fn teton_renders_the_first_run_proposal_and_accepts_it_interactively() {
 
 #[test]
 fn teton_yes_answers_the_first_run_proposal_with_no_input() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
@@ -595,9 +567,7 @@ fn teton_yes_answers_the_first_run_proposal_with_no_input() {
 
 #[test]
 fn teton_model_list_renders_the_catalog_and_each_entry_fit() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
@@ -809,9 +779,7 @@ fn assert_no_turn_ran(output: &str, what: &str) {
 /// that had died.
 #[test]
 fn slash_help_lists_every_command_and_no_turn_is_attempted() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -945,9 +913,7 @@ fn cost_report_from_first_marker<'a>(output: &'a str, what: &str) -> &'a str {
 /// on `starts_with`.)
 #[test]
 fn slash_cost_renders_the_daemons_report_mid_session() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -1005,9 +971,7 @@ fn slash_cost_renders_the_daemons_report_mid_session() {
 /// asserted over the whole output, in order.
 #[test]
 fn slash_verbose_toggles_the_route_notice_around_real_turns() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -1183,9 +1147,7 @@ fn mask_session_id(transcript: &str, what: &str) -> String {
 /// arithmetic result.
 #[test]
 fn slash_clear_runs_no_turn_and_says_when_there_was_nothing_to_drop() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -1259,9 +1221,7 @@ fn slash_clear_runs_no_turn_and_says_when_there_was_nothing_to_drop() {
 /// visible consequence of it having done so.
 #[test]
 fn slash_clear_drops_the_conversation_the_next_prompt_would_have_carried() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -1353,9 +1313,7 @@ fn slash_clear_drops_the_conversation_the_next_prompt_would_have_carried() {
 /// paragraph above holds in reserve.
 #[test]
 fn slash_quit_ends_the_session_exactly_as_ctrl_d_does() {
-    let Some(daemon_bin) = daemon_or_skip() else {
-        return;
-    };
+    let daemon_bin = daemon_bin();
     let teton = teton_bin();
     let history = "/model\n/cost\n";
 
@@ -1440,9 +1398,7 @@ fn slash_quit_ends_the_session_exactly_as_ctrl_d_does() {
 /// dispatch table in the shipped binary and becomes a turn.
 #[test]
 fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -1555,9 +1511,7 @@ fn an_escaped_line_and_a_plain_line_both_reach_the_model() {
 /// in `slash.rs`.
 #[test]
 fn slash_model_set_runs_the_shared_flow_against_a_live_daemon() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -1643,9 +1597,7 @@ fn slash_model_set_runs_the_shared_flow_against_a_live_daemon() {
 /// anyway would pass every assertion but that one.
 #[test]
 fn a_piped_model_set_is_refused_and_changes_nothing() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -1706,9 +1658,7 @@ fn a_piped_model_set_is_refused_and_changes_nothing() {
 /// waiver that only *looks* applied would show up.
 #[test]
 fn yes_waives_the_in_session_above_floor_confirmation_without_eating_a_line() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -1754,9 +1704,7 @@ fn yes_waives_the_in_session_above_floor_confirmation_without_eating_a_line() {
 /// this asserts on the prompt text too.
 #[test]
 fn provider_add_without_a_model_refuses_before_asking_for_a_credential() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
@@ -1794,9 +1742,7 @@ fn provider_add_without_a_model_refuses_before_asking_for_a_credential() {
 /// broken this path.
 #[test]
 fn a_local_provider_still_registers_without_a_model() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
@@ -1831,9 +1777,7 @@ fn a_local_provider_still_registers_without_a_model() {
 /// fixture config would have been migrated already.)
 #[test]
 fn provider_list_renders_the_declared_model() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
@@ -1859,9 +1803,7 @@ fn provider_list_renders_the_declared_model() {
 /// the `--model` check does.
 #[test]
 fn provider_add_refuses_an_id_that_is_already_registered() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
@@ -1923,9 +1865,7 @@ fn provider_add_refuses_an_id_that_is_already_registered() {
 /// and would leave the marker untested.
 #[test]
 fn policy_show_renders_the_daemons_resolved_table() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, &["Done."]);
     let teton = teton_bin();
 
@@ -2166,9 +2106,7 @@ fn policy_show_renders_the_daemons_resolved_table() {
 /// that silently did nothing would look exactly like one that worked.
 #[test]
 fn the_two_web_commands_reach_the_daemon_and_render_its_answer() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -2222,9 +2160,7 @@ fn the_two_web_commands_reach_the_daemon_and_render_its_answer() {
 /// be measuring the address gate rather than the offline ending it is named for.
 #[test]
 fn a_web_lookup_is_consented_reported_and_counted_in_the_cost_report() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     // A port nobody is listening on: the fetch connects to nothing.
     let url = format!("http://127.0.0.1:{}/tokio", closed_port());
     let tool_call = format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{url}\"}}}}");
@@ -2355,9 +2291,7 @@ const EDIT_CALL: &str = r#"{"tool": "edit", "arguments": {"path": "notes.txt", "
 /// count that stayed at one cannot be a session that quietly stopped.
 #[test]
 fn permission_levels_change_what_a_session_asks_about() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let replies = [
         EDIT_CALL,
         "guarded edit turn done.",
@@ -2454,9 +2388,7 @@ fn permission_levels_change_what_a_session_asks_about() {
 /// `[failed]`, `[done]` with a single question at the front.
 #[test]
 fn a_tightened_level_outranks_a_session_grant_over_a_pipe() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let replies = [
         SHELL_CALL,
         "granted.",
@@ -2523,9 +2455,7 @@ fn a_tightened_level_outranks_a_session_grant_over_a_pipe() {
 /// from the same table that dispatches it.
 #[test]
 fn bare_permissions_reads_the_level_on_a_pipe_and_help_lists_it() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
 
@@ -2592,9 +2522,7 @@ fn bare_permissions_reads_the_level_on_a_pipe_and_help_lists_it() {
 /// that had persisted through either route would fail here.
 #[test]
 fn a_permission_level_does_not_survive_the_session() {
-    let Some(daemon) = daemon_or_skip() else {
-        return;
-    };
+    let daemon = daemon_bin();
     let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
     let teton = teton_bin();
     let config_path = daemon.root.join("config.toml");
@@ -2640,9 +2568,7 @@ fn a_permission_level_does_not_survive_the_session() {
 /// rather than a gap someone later mistakes for full coverage.
 #[test]
 fn a_level_line_typed_at_an_open_prompt_answers_the_prompt_and_changes_nothing() {
-    let Some(daemon_path) = daemon_or_skip() else {
-        return;
-    };
+    let daemon_path = daemon_bin();
 
     for arriving in ["full", "plan"] {
         let replies = [
