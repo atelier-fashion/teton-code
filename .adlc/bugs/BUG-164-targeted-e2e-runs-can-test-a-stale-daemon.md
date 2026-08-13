@@ -138,8 +138,15 @@ after touching `crates/tetond/src/main.rs`:
   matching the pre-fix baseline, confirming the rejected approach's regression is gone.
 - `cargo clippy -p teton --all-targets`: clean under workspace `deny` lints.
 
+## Lessons Captured
+
+- `LESSON-510` — a harness that checked a binary exists has not checked it is the
+  one under test. Covers the proxy-property failure, the same-package scoping of
+  `CARGO_BIN_EXE_<name>`, and why detection beat repair here.
+
 ## Files Changed
 
+- `.adlc/knowledge/lessons/LESSON-510-existence-is-not-freshness.md` — new.
 - `crates/teton/tests/common/mod.rs` — new. Shared `teton_bin()` / `daemon_bin()`;
   the freshness check and its rationale.
 - `crates/teton/tests/cli_e2e.rs` — use the shared helpers; drop the local
