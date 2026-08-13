@@ -1,7 +1,7 @@
 ---
 id: TASK-126
 title: "Assert every ConfigError variant Config::validate can raise"
-status: draft
+status: complete
 parent: REQ-571
 created: 2026-08-13
 updated: 2026-08-13
@@ -21,11 +21,11 @@ parallel.
 
 ## Acceptance Criteria
 
-- [ ] AC-10: `UnknownDefaultProvider`, `UnknownCategoryProvider`, `UnknownTierFallback`, and `WebPermissionAllowNamesOff` each have a test asserting they are raised for their triggering input.
-- [ ] AC-11: a check enumerates every `ConfigError` variant constructed in `Config::validate()` and fails if any lacks an asserting test — so BR-10 holds for variants added later, not just today's four.
-- [ ] Tests live INLINE in `crates/teton-core/src/config.rs`, matching the crate's existing convention. `teton-core` has no `tests/` directory and must not gain one for this.
-- [ ] New assertions match the existing shape: `assert_eq!(cfg.validate().unwrap_err(), ConfigError::Variant { .. })`.
-- [ ] `cargo clippy --all-targets` clean.
+- [x] AC-10: `UnknownDefaultProvider`, `UnknownCategoryProvider`, `UnknownTierFallback`, and `WebPermissionAllowNamesOff` each have a test asserting they are raised for their triggering input.
+- [x] AC-11: a check enumerates every `ConfigError` variant constructed in `Config::validate()` and fails if any lacks an asserting test — so BR-10 holds for variants added later, not just today's four.
+- [x] Tests live INLINE in `crates/teton-core/src/config.rs`, matching the crate's existing convention. `teton-core` has no `tests/` directory and must not gain one for this.
+- [x] New assertions match the existing shape: `assert_eq!(cfg.validate().unwrap_err(), ConfigError::Variant { .. })`.
+- [x] `cargo clippy --all-targets` clean.
 
 ## Technical Notes
 
