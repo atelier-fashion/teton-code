@@ -4,13 +4,34 @@
   "startedAt": "2026-08-13T18:13:08Z",
   "completed": false,
   "currentPhase": 4,
-  "completedPhases": [0, 1, 2, 3],
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3
+  ],
   "integrationBranch": "main",
   "phaseHistory": [
-    { "phase": 0, "name": "Resolve Repos + Worktree (same-branch resume of existing worktree; PR #121 reused as draft-PR-early)", "completedAt": "2026-08-13T18:13:08Z" },
-    { "phase": 1, "name": "Validate Spec (ran in-session pre-invocation; 3 blockers fixed in 3a3c971; status approved)", "completedAt": "2026-08-13T18:13:08Z" },
-    { "phase": 2, "name": "Architect (ran in-session pre-invocation; 5 ADRs + 9 tasks in a733e89)", "completedAt": "2026-08-13T18:13:08Z" },
-    { "phase": 3, "name": "Validate Architecture & Tasks (ran in-session pre-invocation; file-list fix 4ce8911)", "completedAt": "2026-08-13T18:13:08Z" }
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Worktree (same-branch resume of existing worktree; PR #121 reused as draft-PR-early)",
+      "completedAt": "2026-08-13T18:13:08Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec (ran in-session pre-invocation; 3 blockers fixed in 3a3c971; status approved)",
+      "completedAt": "2026-08-13T18:13:08Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect (ran in-session pre-invocation; 5 ADRs + 9 tasks in a733e89)",
+      "completedAt": "2026-08-13T18:13:08Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks (ran in-session pre-invocation; file-list fix 4ce8911)",
+      "completedAt": "2026-08-13T18:13:08Z"
+    }
   ],
   "repos": {
     "teton-code": {
@@ -27,11 +48,18 @@
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
+  "mergeOrder": [
+    "teton-code"
+  ],
   "phase4": {
-    "currentTask": null,
-    "inFlight": [],
-    "completedTasks": [],
+    "currentTask": "TASK-119",
+    "inFlight": [
+      "TASK-119"
+    ],
+    "completedTasks": [
+      "TASK-118",
+      "TASK-126"
+    ],
     "failedTasks": []
   }
 }
