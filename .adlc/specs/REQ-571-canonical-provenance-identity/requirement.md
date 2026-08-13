@@ -1,7 +1,7 @@
 ---
 id: REQ-571
 title: "Canonical provenance identity for privacy-boundary enforcement"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-13
 updated: 2026-08-13
