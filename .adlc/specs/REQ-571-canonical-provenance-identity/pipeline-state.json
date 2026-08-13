@@ -3,12 +3,13 @@
   "branch": "feat/REQ-571-canonical-provenance-identity",
   "startedAt": "2026-08-13T18:13:08Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -30,6 +31,11 @@
     {
       "phase": 3,
       "name": "Validate Architecture & Tasks (ran in-session pre-invocation; file-list fix 4ce8911)",
+      "completedAt": "2026-08-13T18:13:08Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement (9 tasks, 4 tiers, all agent-dispatched)",
       "completedAt": "2026-08-13T18:13:08Z"
     }
   ],
@@ -53,10 +59,7 @@
   ],
   "phase4": {
     "currentTask": null,
-    "inFlight": [
-      "TASK-121",
-      "TASK-125"
-    ],
+    "inFlight": [],
     "completedTasks": [
       "TASK-118",
       "TASK-126",
@@ -64,7 +67,9 @@
       "TASK-120",
       "TASK-124",
       "TASK-123",
-      "TASK-122"
+      "TASK-122",
+      "TASK-121",
+      "TASK-125"
     ],
     "failedTasks": []
   }
