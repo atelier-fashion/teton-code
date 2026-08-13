@@ -3,14 +3,16 @@
   "branch": "feat/REQ-571-canonical-provenance-identity",
   "startedAt": "2026-08-13T18:13:08Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -42,6 +44,16 @@
     {
       "phase": 5,
       "name": "Verify (6-agent panel; 1 must-fix security + minors; 2 reflector Qs resolved by Brett)",
+      "completedAt": "2026-08-13T18:13:08Z"
+    },
+    {
+      "phase": 6,
+      "name": "PR ready (already-open #121; body+title finalized, requirement marked complete)",
+      "completedAt": "2026-08-13T18:13:08Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR cleanup + CI green (6/6 checks; no stray debug/TODO/secret)",
       "completedAt": "2026-08-13T18:13:08Z"
     }
   ],
@@ -98,5 +110,7 @@
       "session-pin confirmed (BR-4 amended)",
       "provenance_rejected made required \u2014 compiler found an 8th uncovered sink"
     ]
-  }
+  },
+  "terminal": "pr-ready",
+  "terminalNote": "Phase 8 (merge/deploy) is a user-reserved action; halting pr-ready per session scope. No deploy target (OSS lib+daemon, brew-distributed at release-tag time, not per-merge)."
 }
