@@ -15,19 +15,22 @@ tags: ["br-1", "boundary-enforcement", "provenance", "path-canonicalization", "s
 ## Description
 
 The BR-1 privacy guarantee — "paths marked `local-only` never leave the machine" —
-is currently bypassable. Every harness tool resolves the file it opens to a
-canonical path, but `read` and `edit` tag the result's egress provenance with the
-**raw, model-supplied request string** instead. The boundary matcher normalizes
-only a single leading `./`, so any other spelling of the same protected file
-matches no glob, carries provenance that matches nothing, and is forwarded to a
-remote provider intact.
+is currently bypassable. The harness resolves the file it opens to a canonical
+path, but `read` and `edit` tag the result's egress provenance with the **raw,
+model-supplied request string** instead. The boundary matcher normalizes only a
+single leading `./`, so any other spelling of the same protected file matches no
+glob, carries provenance that matches nothing, and is forwarded to a remote
+provider intact.
 
-Seven spellings of the same file evade a `secrets/**` boundary, including
-absolute-inside-root (`/Users/x/repo/secrets/prod.env`), `..`-traversing
-(`src/../secrets/prod.env`), and repeated-`./` forms. An in-repo symlink reaches
-the same bytes under an innocuous name. The gap is reachable by prompt injection
-from any file, dependency README, MCP tool result, or fetched page — no `shell`
-call is needed, so the session never gains `Unknown` provenance.
+Against a `secrets/**` boundary, seven spellings of the same file were all
+accepted by path resolution and **five of them evaded the boundary** — the bare
+relative and `./`-prefixed forms were correctly blocked; absolute-inside-root
+(`/Users/x/repo/secrets/prod.env`), repeated-`./` (`.//`, `././`), and
+`..`-traversing-but-inside-root (`src/../secrets/prod.env`) were not. An in-repo
+symlink reaches the same bytes under an innocuous name. The gap is reachable by
+prompt injection from any file, dependency README, MCP tool result, or fetched
+page — no `shell` call is needed, so the session never gains `Unknown`
+provenance.
 
 Every backstop shares the single normalization gap rather than compensating for
 it: session taint calls the same matcher on the same raw sources, so the session
@@ -63,7 +66,7 @@ repo root under an in-jail relative name.
 | Event | Trigger | Payload |
 |-------|---------|---------|
 | privacy_block | Egress inspection finds a boundary-matching or `Unknown` provenance source on a remote-bound turn | Matched `provenance_id`, boundary glob, session id |
-| provenance_rejected | A provenance source fails the fail-closed well-formedness check (absolute, or `.`/`..` segment) | Offending source, originating tool name |
+| provenance_rejected | A provenance source fails the fail-closed well-formedness check (absolute, or `.`/`..` segment) | Offending source, originating tool name. **User-visible** — delivered on the client protocol, not daemon stderr only (see Resolved Questions, OQ-2) |
 
 ### Permissions
 
@@ -74,28 +77,35 @@ unconditional and applies to every session regardless of permission level.
 
 - [ ] BR-1: Egress provenance for a tool result MUST be derived from the resolved filesystem identity of the file(s) the tool actually accessed, never from the request argument. (informed by LESSON-432, LESSON-494)
 - [ ] BR-2: Provenance MUST be expressed in exactly one canonical form — repo-root-relative, `/`-separated — and boundary matching MUST operate only on that form. (informed by LESSON-494)
-- [ ] BR-3: All spellings of a path that resolve to the same file MUST yield identical provenance, and therefore identical boundary verdicts. The enumerated set is: bare relative, `./`-prefixed, repeated `./`, absolute-inside-root, `..`-traversing-but-inside-root, and in-repo symlink to the target.
-- [ ] BR-4: A provenance source that is absolute, or retains a `.` or `..` segment after derivation, MUST be rejected fail-closed at the egress inspection point, independently of whether any boundary is configured. This guard is redundant by design and MUST carry its own test. (informed by LESSON-508)
-- [ ] BR-5: A directory-walking tool MUST NOT surface content from a file whose resolved identity lies outside the repo root. In-repo symlinks that resolve inside the root MUST be attributed to their resolved target, not to the link name.
+- [ ] BR-3: All spellings of a path that resolve to the same file MUST yield the identical `provenance_id`, and therefore identical boundary verdicts. The enumerated set is: bare relative, `./`-prefixed, repeated `./` (`.//`, `././`), absolute-inside-root, and `..`-traversing-but-inside-root. (Symlinks are governed by BR-5, not by this rule — a symlink is a different path resolving to the same file, not a spelling of one.)
+- [ ] BR-4: A provenance source that is absolute, or retains a `.` or `..` segment after derivation, MUST be rejected fail-closed at the egress inspection point, independently of whether any boundary is configured, and MUST emit a `provenance_rejected` event visible to the client. This guard is redundant by design and MUST carry its own test. (informed by LESSON-505, LESSON-508)
+- [ ] BR-5: Symlink handling is split by tool class, because explicit single-file access and directory traversal have different risks:
+  - `read` / `edit` (explicit, single target): a symlink resolving **inside** the repo root MUST be attributed to its resolved target, not to the link name. A symlink resolving **outside** the root MUST be refused.
+  - `grep` / `glob` (traversal): symlink entries MUST be skipped entirely, regardless of where they resolve. Traversal cannot follow a link without risking cycles and duplicate results under two names, and skipping is the same posture as ripgrep's default.
 - [ ] BR-6: Path containment for a not-yet-existing target MUST be decided against a resolved existing ancestor, never against a lexical path that traversed unresolved components. (informed by LESSON-494)
-- [ ] BR-7: Every tool that surfaces file content into model context MUST be enumerated and covered by boundary tests. Carrying a path argument MUST NOT exempt a tool from coverage — that exemption is the specific error this REQ corrects. (informed by LESSON-432, LESSON-502)
+- [ ] BR-7: Every tool that surfaces external or file content into model context MUST be enumerated, and each MUST be covered by a boundary test. Carrying a path argument MUST NOT exempt a tool from coverage — that exemption is the specific error this REQ corrects. The enumeration MUST be an artifact that fails when a new content-surfacing tool is added without coverage, not a one-time review. (informed by LESSON-432, LESSON-502)
 - [ ] BR-8: Existing boundary-matcher assertions that absolute and `..`-bearing paths match no repo-relative glob remain correct at the matcher layer and MUST be retained, but each MUST be paired with a tool-layer test proving such spellings can never reach the matcher. (informed by LESSON-502)
-- [ ] BR-9: A session whose context includes any boundary-matching source MUST pin to the local tier, and that pin MUST hold on recovery paths (failover, retry), not only the primary path. (informed by BUG-156)
+- [ ] BR-9: The existing session-taint pin and its failover/retry coverage (delivered by BUG-156, already resolved) MUST continue to hold for sessions tainted through a *non-canonical* spelling. This REQ adds no new pinning behavior; it ensures the existing pin is actually reached now that such spellings taint at all. (informed by BUG-156)
 - [ ] BR-10: Every `ConfigError` variant that `Config::validate()` can raise MUST have a test asserting it is raised for the input that triggers it. `validate()` is fail-closed and gates daemon startup, so an unasserted variant is an unguarded startup gate. This is stated as a general rule, not a fixed list, so a newly added variant inherits the obligation. (informed by LESSON-508)
+- [ ] BR-11: When a resolved path differs from the request string, `read`/`edit` output MUST show both — the request and what it resolved to — so the model is not told it read something other than what it read. Provenance and display remain separate values; only provenance governs enforcement. (see Resolved Questions, OQ-3)
 
 ## Acceptance Criteria
 
-- [ ] AC-1: With boundary `secrets/**`, an egress-capture test drives `read` against all six spellings in BR-3 and asserts every one produces `privacy_block`, with a positive control asserting non-boundary content IS present in the captured payload (so the zero-leak claim cannot be vacuous). (informed by LESSON-479, LESSON-502)
-- [ ] AC-2: The same six-spelling matrix is applied to `edit`, and each spelling is blocked.
-- [ ] AC-3: A test creates an in-repo symlink pointing at a boundary-protected file; `read`, `edit`, `grep`, and `glob` each either refuse it or attribute it to the resolved target, and no captured payload contains the protected bytes.
-- [ ] AC-4: A test creates an in-repo symlink pointing OUTSIDE the repo root; `grep` and `glob` do not surface its content and do not report it under an in-jail relative path.
+- [ ] AC-1: With boundary `secrets/**`, an egress-capture test drives `read` against all five spellings in BR-3 and asserts (a) every one produces `privacy_block`, and (b) every one yields the byte-identical `provenance_id` — which is what pins BR-2. A positive control asserts non-boundary content IS present in the captured payload, so the zero-leak claim cannot be vacuous. (informed by LESSON-479, LESSON-502)
+- [ ] AC-2: The same five-spelling matrix is applied to `edit`, with the same two assertions.
+- [ ] AC-3: A test creates an in-repo symlink pointing at a boundary-protected file. `read` and `edit` attribute it to the resolved target and the turn is blocked; no captured payload contains the protected bytes.
+- [ ] AC-4: A test creates two symlinks — one resolving inside the repo root, one outside. `grep` and `glob` skip both: neither file's content is surfaced, and neither is reported under an in-jail relative path. A third case asserts a symlink *cycle* terminates the walk rather than hanging.
 - [ ] AC-5: A unit test asserts the BR-4 fail-closed rejection fires for an absolute source and for a `..`-bearing source, with no boundary configured.
 - [ ] AC-6: A test asserts a not-yet-existing path routed through a symlinked directory (`link/new` where `link` resolves outside the root) is refused.
 - [ ] AC-7: Mutation check — reverting provenance derivation to the raw argument in `read`, and separately in `edit`, each causes at least one test to fail. Neither tool's coverage may ride on the other's. (informed by LESSON-502)
-- [ ] AC-8: A test asserts that a session tainted via a non-canonical spelling pins to the local tier, and that a subsequent model-composed `web_fetch` is refused. (informed by BUG-156)
+- [ ] AC-8: A test asserts that a session tainted via a non-canonical spelling reaches the existing local-tier pin, and that a subsequent model-composed `web_fetch` is refused. (informed by BUG-156)
 - [ ] AC-9: The full pre-existing egress-capture, `web_lookup_egress`, and `mcp_egress` suites pass unchanged — this REQ adds coverage and must not weaken any existing assertion.
 - [ ] AC-10: Tests assert the four currently-unasserted `ConfigError` variants — `UnknownDefaultProvider`, `UnknownCategoryProvider`, `UnknownTierFallback`, `WebPermissionAllowNamesOff` — are each raised for their triggering input. Verified absent at spec time: each has zero references past the `#[cfg(test)]` boundary in `crates/teton-core/src/config.rs`, while every named sibling variant has at least one.
 - [ ] AC-11: A check enumerates every `ConfigError` variant constructed in `Config::validate()` and fails if any lacks an asserting test, so BR-10 holds for variants added later rather than only for today's four.
+- [ ] AC-12: A test enumerates every tool that can surface external or file content into model context — at minimum `read`, `edit`, `grep`, `glob`, `shell`, `web_fetch`, and MCP tool results — and asserts each has at least one boundary test. Adding a content-surfacing tool without coverage MUST fail this test. This is the BR-7 artifact.
+- [ ] AC-13: For each retained boundary-matcher assertion covered by BR-8, a corresponding tool-layer test exists proving that spelling cannot reach the matcher. The pairing is explicit — a comment or shared fixture name links the two — so neither can be deleted alone.
+- [ ] AC-14: A test asserts `provenance_rejected` is delivered to a connected client, not only written to daemon logs. (informed by LESSON-505)
+- [ ] AC-15: A test asserts that when a request string and its resolved path differ, `read` output contains both, and that when they match, output is unchanged from today.
 
 ## External Dependencies
 
@@ -105,13 +115,15 @@ unconditional and applies to every session regardless of permission level.
 
 - The repo root canonicalizes successfully at tool-context construction; a repo root that cannot be resolved already fails closed today and that behavior is retained.
 - Boundary globs are authored as repo-root-relative patterns. This REQ does not introduce absolute-path globs.
-- REQ id allocated with remote high-water verification (not degraded).
+- Nothing currently depends on `read`/`edit` echoing the literal request string. Verified at spec time: no test asserts on the echoed path, and `with_paths` has seven call sites, all within the four tools and two egress tests.
 
-## Open Questions
+## Resolved Questions
 
-- [ ] Should an in-repo symlink whose target is also in-repo be permitted and attributed to its target, or refused outright? Attribution is more permissive and preserves legitimate workflows; refusal is simpler to reason about. BR-5 currently specifies attribution.
-- [ ] Should `provenance_rejected` (BR-4) surface as a user-visible event, or only as a daemon-internal fail-closed refusal? LESSON-505 argues audit signals that only reach daemon stderr are weak controls.
-- [ ] Does any legitimate workflow depend on `read` reporting the literal argument spelling back to the model in its output text? Changing provenance does not require changing the displayed string, but the two are currently the same value.
+Recorded so the reasoning survives the decision.
+
+- **OQ-1 — in-repo symlinks: attribute, refuse, or split?** *Split by tool class* (BR-5). Attribution falls out of BR-1/BR-2 almost for free, since provenance is already the canonical path relative to the root, whereas blanket refusal needs extra symlink-detection logic and breaks legitimate in-repo links. But traversal is different from explicit access: a walker that follows links risks cycles and reports one file under two names, so `grep`/`glob` skip them — matching ripgrep's default.
+- **OQ-2 — should `provenance_rejected` be user-visible?** *Yes, on the client protocol* (BR-4, AC-14). LESSON-505: an audit signal that reaches only daemon stderr is a weak control, because the same-uid attacker it guards against can suppress or truncate it. LESSON-508: a redundant guard nobody can observe is the one that gets deleted as noise.
+- **OQ-3 — should `read` echo the literal request spelling?** *Show both when they differ* (BR-11, AC-15). A model that reads through a symlink or an absolute path would otherwise be told it read something other than what it read. Display and provenance stay separate values; only provenance governs enforcement.
 
 ## Out of Scope
 
