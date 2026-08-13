@@ -26,6 +26,8 @@ an unverified claim.
 - `crates/tetond/src/harness/tools/mcp.rs` — argument-derived paths use `ProvenanceId::claimed`.
 - `crates/tetond/src/harness/digest.rs` — update the `tool_result_provenance` bridge.
 - `crates/tetond/src/egress/provenance.rs` — `Provenance` carries `ProvenanceId`.
+- `crates/tetond/src/egress/inspector.rs`, `crates/tetond/src/egress/mod.rs` — test fixtures using `Provenance::tainted_by(&str)` follow the type change (production logic untouched here; TASK-122 owns its production edits).
+- `crates/tetond/src/sessions.rs`, `crates/tetond/src/carry.rs`, `crates/tetond/src/runtime.rs` — `#[cfg(test)]` fixtures constructing `ToolProvenance::path/paths/none` from strings follow the type change. Verified at architect time these are the only non-listed constructor sites, and all are test-module-only.
 - `crates/tetond/tests/egress_capture.rs` — add the spelling matrix.
 
 ## Acceptance Criteria
