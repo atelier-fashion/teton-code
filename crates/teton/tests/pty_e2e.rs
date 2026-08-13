@@ -41,29 +41,8 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-/// Path to the `teton` binary under test.
-fn teton_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_teton"))
-}
-
-/// Path to the sibling `teton-code` daemon binary.
-fn daemon_bin() -> PathBuf {
-    let mut p = teton_bin();
-    p.pop();
-    p.join("teton-code")
-}
-
-/// Skip rather than fail when the daemon was not built — same posture as
-/// `cli_e2e`'s `daemon_or_skip`, so a `-p teton` run without `--workspace`
-/// reports honestly instead of going red.
-fn daemon_or_skip() -> Option<PathBuf> {
-    let daemon = daemon_bin();
-    if daemon.exists() {
-        return Some(daemon);
-    }
-    eprintln!("skipping pty e2e: teton-code binary not built (run under --workspace)");
-    None
-}
+mod common;
+use common::{daemon_bin, teton_bin};
 
 /// How long to wait for a marker before declaring it absent. Generous: this
 /// asserts on **state reached**, never on a fixed sleep, so a slow machine costs
@@ -216,9 +195,7 @@ impl Drop for TestDaemon {
 /// appear until a turn runs — which is the defect this REQ exists to fix.
 #[test]
 fn an_idle_session_renders_an_event_with_nothing_typed() {
-    let Some(daemon_path) = daemon_or_skip() else {
-        return;
-    };
+    let daemon_path = daemon_bin();
     let daemon = TestDaemon::spawn(&daemon_path);
 
     let pty = native_pty_system()
@@ -314,9 +291,7 @@ fn an_idle_session_renders_an_event_with_nothing_typed() {
 /// nothing reaches a network.
 #[test]
 fn the_status_row_shows_the_session_s_web_capability() {
-    let Some(daemon_path) = daemon_or_skip() else {
-        return;
-    };
+    let daemon_path = daemon_bin();
     let url = format!("http://127.0.0.1:{}/tokio", closed_port());
     let tool_call = format!("{{\"tool\": \"web\", \"arguments\": {{\"url\": \"{url}\"}}}}");
     // Every tier bound to the local (scripted) tier, so the turn is served here
@@ -424,9 +399,7 @@ fn closed_port() -> u16 {
 ///    stranded — the transcript ends with exactly one of each.
 #[test]
 fn the_status_row_renders_below_the_frame_and_survives_a_redraw() {
-    let Some(daemon_path) = daemon_or_skip() else {
-        return;
-    };
+    let daemon_path = daemon_bin();
     // A scripted tier so a typed prompt actually produces a turn — which is what
     // forces the frame down and redraws it, the redraw this test is about. Every
     // tier is bound to the local (scripted) provider, the same binding the web
