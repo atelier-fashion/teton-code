@@ -23,6 +23,9 @@
 //!   [`RouteOutcome`] out. Its phase-policy evaluator was deleted with its last
 //!   caller when [`category::resolve`] became the one resolver (REQ-558 ADR-J).
 //! - [`boundary`] — pure privacy-boundary glob matching.
+//! - [`provenance_id`] — [`ProvenanceId`], the minted identity a privacy
+//!   verdict keys on. Constructible only through its named constructors, so a
+//!   raw `String` cannot enter the provenance channel (REQ-571 ADR-A).
 //! - [`lifetime`] — the daemon's arm/disarm/defer/commit decision as a pure
 //!   state machine, so the exit-on-last-client behaviour is testable without a
 //!   socket, launchd, or a TTY (REQ-565 BR-9).
@@ -36,6 +39,7 @@ pub mod lifetime;
 pub mod mcp;
 pub mod phase;
 pub mod policy;
+pub mod provenance_id;
 
 pub use boundary::{match_boundary, BoundaryError, BoundaryMatcher};
 // REQ-558: `TierBinding`/`CategoryOverride` live beside the resolver that reads
@@ -66,6 +70,10 @@ pub use entities::{
 pub use mcp::{McpServerConfig, McpTransport};
 pub use phase::Phase;
 pub use policy::{ProviderHealth, RouteOutcome};
+// REQ-571 ADR-A: re-exported at the crate root because the provenance channel
+// spans the daemon's tools, its egress inspector, and this crate's boundary
+// matcher — `teton_core::ProvenanceId` is the one path all three name it by.
+pub use provenance_id::{ProvenanceError, ProvenanceId};
 
 /// Returns the crate version (equal to the workspace version).
 #[must_use]

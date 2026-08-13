@@ -708,6 +708,7 @@ fn exposed_tool_specs(tools: &ToolRegistry, max_tools: Option<u32>) -> Vec<ToolS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
     use std::sync::Arc;
 
     use crate::harness::context::ToolProvenance;
@@ -791,7 +792,7 @@ mod tests {
         let mut ctx = ContextManager::new("SYSTEM PROMPT", 10_000);
         ctx.push_user("read a.rs");
         ctx.push_model(r#"{"tool":"read","arguments":{"path":"a.rs"}}"#);
-        ctx.push_tool_result("read", Some("a.rs".to_owned()), "file body");
+        ctx.push_tool_result("read", Some(fixture_id("a.rs")), "file body");
         ctx.prepare(&mut crate::harness::context::NoopProvenanceHook)
     }
 
@@ -938,8 +939,8 @@ mod tests {
         let mut ctx = ContextManager::new("system", 10_000);
         ctx.push_user("do the thing");
         ctx.push_model("{\"tool\":\"read\"}");
-        ctx.push_tool_result("read", Some("src/lib.rs".to_owned()), "code");
-        ctx.push_tool_result("read", Some("secrets/prod.env".to_owned()), "API_KEY=1");
+        ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
+        ctx.push_tool_result("read", Some(fixture_id("secrets/prod.env")), "API_KEY=1");
         // A tool result with no touched files (e.g. a benign status) contributes
         // nothing and is not unknown.
         ctx.push_tool_result("shell", None, "ok");
@@ -956,7 +957,7 @@ mod tests {
         // REQ-544 C-1: a `shell` result folds in as UNKNOWN, which makes the whole
         // context's provenance unknown → egress fail-closes on it.
         let mut ctx = ContextManager::new("system", 10_000);
-        ctx.push_tool_result("read", Some("src/lib.rs".to_owned()), "code");
+        ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
         ctx.push_tool_result_prov(
             "shell",
             ToolProvenance::Unknown,
@@ -1261,7 +1262,7 @@ mod tests {
         let mut ctx = ContextManager::new("SYSTEM PROMPT", 10_000);
         ctx.push_user("please edit the file");
         ctx.push_model(r#"{"tool":"read","arguments":{"path":"a.rs"}}"#);
-        ctx.push_tool_result("read", Some("a.rs".to_owned()), "file body");
+        ctx.push_tool_result("read", Some(fixture_id("a.rs")), "file body");
 
         let mut hook = crate::harness::context::NoopProvenanceHook;
         let prepared = ctx.prepare(&mut hook);

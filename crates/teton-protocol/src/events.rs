@@ -93,6 +93,9 @@ pub enum Event {
     /// Boundary content would have gone remote (spec: `privacy_block`). Teton
     /// differentiator — no ACP equivalent.
     PrivacyBlock(PrivacyBlock),
+    /// A provenance source could not be minted into an identity and was refused
+    /// (REQ-571 ADR-D). Teton differentiator — no ACP equivalent.
+    ProvenanceRejected(ProvenanceRejected),
     /// A model call completed and produced a cost record (spec: `cost_recorded`).
     CostRecorded(CostRecorded),
     /// An adapter fell back to another provider (spec: `provider_degraded`).
@@ -146,6 +149,7 @@ impl Event {
             Event::SessionTitled(_) => "session_titled",
             Event::RouteDecided(_) => "route_decided",
             Event::PrivacyBlock(_) => "privacy_block",
+            Event::ProvenanceRejected(_) => "provenance_rejected",
             Event::CostRecorded(_) => "cost_recorded",
             Event::ProviderDegraded(_) => "provider_degraded",
             Event::ModelLifecycle(_) => "model_lifecycle",
@@ -483,6 +487,90 @@ pub enum PrivacyAction {
     Stripped,
     /// The whole call was re-routed to the local tier.
     ReroutedToLocal,
+}
+
+// ---------------------------------------------------------------------------
+// provenance_rejected (REQ-571 ADR-D — Teton differentiator)
+// ---------------------------------------------------------------------------
+
+/// A provenance source could not be minted into a canonical identity, so the
+/// daemon refused to trust it (spec: `provenance_rejected`).
+///
+/// A privacy verdict keys on "which repo file did this content come from?".
+/// When something *asserts* a source the daemon cannot turn into a
+/// repo-root-relative identity — an absolute path, a `..`-bearing one — the
+/// honest answer is not "then there is no source here": that assertion may well
+/// have named a boundary file, and dropping it would fail **open** on exactly
+/// the value that matters. The daemon fails closed instead, and says so here.
+///
+/// ## Why it is on the protocol at all (LESSON-505)
+///
+/// An audit signal that reaches only daemon stderr is a weak control against an
+/// adversary running as the same user: stderr is the one surface that adversary
+/// can most easily silence, and no client ever sees it. A refusal that changes
+/// what the session may do is something the *user* has to be able to see, so it
+/// is broadcast like every other privacy decision.
+///
+/// ## Wire compatibility: [`crate::PROTOCOL_VERSION`] does not move
+///
+/// [`Event`] is internally tagged on `event`, so this variant is a purely
+/// additive tag value: no existing frame changes shape, no existing field is
+/// re-typed, and nothing that could already be sent parses differently. The
+/// asymmetric case — a client that has never heard of `provenance_rejected`
+/// receiving one — cannot arise, because a client only ever receives frames
+/// from the daemon it handshook with, and a daemon that can emit this variant
+/// is a build that has the variant. This is the same reasoning that kept
+/// `PrivacyBlock::cause` off the version counter (REQ-562 ADR-7), and the
+/// opposite of REQ-558's `ConfigSnapshot` re-typing, which changed a shape both
+/// ends already exchanged and therefore *did* move it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvenanceRejected {
+    /// The offending source, sanitized and length-capped by the daemon.
+    ///
+    /// This is **attacker-influenced text** — a remote MCP server names the
+    /// paths it claims to have touched — so it is reported for diagnosis and is
+    /// never treated as a path. The daemon strips control characters (which
+    /// could otherwise forge a line in whatever renders this) and truncates
+    /// before the value reaches this field; a consumer still renders it as
+    /// untrusted data.
+    pub source: String,
+    /// The tool whose call carried the assertion, when the refusal happened
+    /// where that is known.
+    ///
+    /// `None` for the redundant egress-inspection guard, which sees an
+    /// assembled provenance long after it left any single tool and cannot
+    /// honestly name one. Not an "unknown tool" — a refusal raised somewhere
+    /// that has no tool, which is a different sentence to render.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool: Option<String>,
+    /// Why the source was refused.
+    pub reason: ProvenanceRejection,
+}
+
+/// Why a provenance source was refused (REQ-571 ADR-D).
+///
+/// The canonical form of a provenance identity is a non-empty, repo-root
+/// -relative, `/`-separated path with no `.`, `..`, or empty segment. Each
+/// variant names one way a source failed that, because they are different
+/// problems: an absolute path is a claim about another part of the filesystem,
+/// a `..` is a traversal only the filesystem can resolve, and an empty one
+/// names nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceRejection {
+    /// The source is absolute. Boundary globs are authored repo-root-relative,
+    /// so an absolute source would silently match none of them.
+    Absolute,
+    /// The source retains a `..` segment. It is never collapsed lexically:
+    /// `a/link/../b` need not be `a/b`, so only the filesystem can say what it
+    /// resolves through, and a caller that skipped canonicalization is refused.
+    ParentTraversal,
+    /// The source retains a `.` or empty segment, so it is not the canonical
+    /// spelling boundary matching is defined against.
+    NotCanonical,
+    /// Nothing was left after normalization — an empty string or a lone `.`.
+    /// There is no file to attribute.
+    Empty,
 }
 
 // ---------------------------------------------------------------------------
@@ -2243,6 +2331,93 @@ mod tests {
             })
             .collect();
         assert_eq!(tags, ["boundary", "redaction", "scan_unavailable"]);
+    }
+
+    #[test]
+    fn provenance_rejected_round_trips_with_and_without_a_tool() {
+        for tool in [Some("mcp__fs__read_file".to_owned()), None] {
+            round_trip(&ProvenanceRejected {
+                source: "/etc/passwd".to_owned(),
+                tool,
+                reason: ProvenanceRejection::Absolute,
+            });
+        }
+    }
+
+    /// The four refusals are four different problems, so they must not collapse
+    /// into one wire value — a consumer that cannot tell an absolute claim from
+    /// a traversal cannot say which one to fix.
+    #[test]
+    fn every_provenance_rejection_reason_serializes_distinctly() {
+        let reasons = [
+            ProvenanceRejection::Absolute,
+            ProvenanceRejection::ParentTraversal,
+            ProvenanceRejection::NotCanonical,
+            ProvenanceRejection::Empty,
+        ];
+        let wire: Vec<String> = reasons
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        assert_eq!(
+            wire,
+            [
+                "\"absolute\"",
+                "\"parent_traversal\"",
+                "\"not_canonical\"",
+                "\"empty\""
+            ]
+        );
+        for reason in reasons {
+            round_trip(&ProvenanceRejected {
+                source: "sub/../secrets/prod.env".to_owned(),
+                tool: None,
+                reason,
+            });
+        }
+    }
+
+    /// The wire-compatibility claim that keeps [`crate::PROTOCOL_VERSION`] at 2:
+    /// the new variant is a new tag value on an internally-tagged enum, so the
+    /// frame carries the same `event` discriminator every other event does and
+    /// no existing frame's shape moved. Asserted rather than commented, because
+    /// the version note is only as good as the encoding it describes.
+    #[test]
+    fn provenance_rejected_is_an_additive_tag_on_the_event_envelope() {
+        let env = EventEnvelope::new(
+            7,
+            Some(SessionId::from("s1")),
+            Event::ProvenanceRejected(ProvenanceRejected {
+                source: "/etc/passwd".to_owned(),
+                tool: Some("mcp__fs__read_file".to_owned()),
+                reason: ProvenanceRejection::Absolute,
+            }),
+        );
+        let wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+        assert_eq!(wire["event"], "provenance_rejected");
+        assert_eq!(wire["source"], "/etc/passwd");
+        assert_eq!(wire["reason"], "absolute");
+        assert_eq!(env.event_name(), "provenance_rejected");
+        round_trip(&env);
+
+        // `tool` is omitted rather than null when the refusal names no tool.
+        let guard = EventEnvelope::new(
+            8,
+            None,
+            Event::ProvenanceRejected(ProvenanceRejected {
+                source: "../outside".to_owned(),
+                tool: None,
+                reason: ProvenanceRejection::ParentTraversal,
+            }),
+        );
+        let wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&guard).unwrap()).unwrap();
+        assert!(
+            wire.as_object().unwrap().get("tool").is_none(),
+            "an absent tool must not serialize as a key: {wire}"
+        );
+        round_trip(&guard);
     }
 
     /// BR-6 at the protocol layer: a redaction cause can carry a locator and

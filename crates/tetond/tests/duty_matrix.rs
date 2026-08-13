@@ -53,6 +53,7 @@ use futures::stream;
 use serde_json::json;
 
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
+use teton_core::ProvenanceId;
 use teton_inference::{Engine, MockEngine};
 use teton_providers::transport::{HttpMethod, TransportError, TransportRequest, TransportResponse};
 use teton_providers::{
@@ -62,6 +63,17 @@ use teton_providers::{
 
 use tetond::egress::{Egress, NoopSink, Provenance};
 use tetond::harness::context::{summarize_if_large, APPROX_BYTES_PER_TOKEN};
+
+/// Mint the identity of a fixture file (REQ-571 ADR-A).
+///
+/// The provenance channel accepts only a [`ProvenanceId`], and an integration
+/// test cannot reach the crate-internal fixture helper, so each test binary
+/// states its own. A fixture naming a path that is not an identity is a broken
+/// fixture, hence the panic.
+fn source_id(path: &str) -> ProvenanceId {
+    ProvenanceId::claimed(path).expect("fixture path must be a provenance id")
+}
+
 use tetond::harness::{
     title, ContextManager, DutyKind, DutyRoute, RefinedOutcome, ToolDuties, ToolOutcome,
     ToolProvenance, ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
@@ -378,7 +390,7 @@ fn pressured(tainted: bool) -> ContextManager {
         if tainted {
             ctx.push_tool_result_prov(
                 "read",
-                ToolProvenance::path("secrets/prod.env"),
+                ToolProvenance::path(source_id("secrets/prod.env")),
                 format!("{text} {SECRET}"),
             );
         } else {
@@ -436,9 +448,9 @@ async fn exercise(duty: Duty, route: &DutyRoute, tainted: bool) -> Observed {
         Duty::Digest => {
             let text = oversized(if tainted { SECRET } else { "ordinary" });
             let provenance = if tainted {
-                ToolProvenance::path("secrets/prod.env")
+                ToolProvenance::path(source_id("secrets/prod.env"))
             } else {
-                ToolProvenance::path("src/lib.rs")
+                ToolProvenance::path(source_id("src/lib.rs"))
             };
             let out =
                 summarize_if_large(route, "read", &text, DIGEST_THRESHOLD_TOKENS, &provenance)
@@ -459,10 +471,10 @@ async fn exercise(duty: Duty, route: &DutyRoute, tainted: bool) -> Observed {
         Duty::Triage => {
             let lines = matches(tainted);
             let content = lines.join("\n");
-            let paths: Vec<String> = if tainted {
-                vec!["secrets/prod.env".to_owned(), "src/b.rs".to_owned()]
+            let paths: Vec<ProvenanceId> = if tainted {
+                vec![source_id("secrets/prod.env"), source_id("src/b.rs")]
             } else {
-                vec!["src/a.rs".to_owned(), "src/b.rs".to_owned()]
+                vec![source_id("src/a.rs"), source_id("src/b.rs")]
             };
             // `measuring` is how `run` tells `refine` how many matches it
             // found — a fact that no longer travels in the rendered text
@@ -509,7 +521,7 @@ async fn exercise(duty: Duty, route: &DutyRoute, tainted: bool) -> Observed {
             let (request, provenance) = if tainted {
                 (
                     format!("Rotate the production key in secrets/prod.env — it is {SECRET}."),
-                    Provenance::tainted_by("secrets/prod.env"),
+                    Provenance::tainted_by(source_id("secrets/prod.env")),
                 )
             } else {
                 (

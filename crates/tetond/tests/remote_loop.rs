@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use teton_core::effort::{EffortLevel, ResolvedEffort};
+use teton_core::ProvenanceId;
 
 use async_trait::async_trait;
 
@@ -37,6 +38,17 @@ use teton_providers::{OpenAiCompatAdapter, OpenAiCompatConfig};
 use tetond::broadcast::EventBus;
 use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::Egress;
+
+/// Mint the identity of a fixture file (REQ-571 ADR-A).
+///
+/// The provenance channel accepts only a [`ProvenanceId`], and an integration
+/// test cannot reach the crate-internal fixture helper, so each test binary
+/// states its own. A fixture naming a path that is not an identity is a broken
+/// fixture, hence the panic.
+fn source_id(path: &str) -> ProvenanceId {
+    ProvenanceId::claimed(path).expect("fixture path must be a provenance id")
+}
+
 use tetond::harness::{
     build_system_prompt, run_session_turn_with_source, ContextManager, DutyRoute, HarnessConfig,
     HarnessError, NoopProvenanceHook, PendingPermissions, PermissionConfig, PermissionGate,
@@ -384,7 +396,7 @@ async fn remote_turn_over_boundary_context_is_blocked_and_never_billed() {
     // tagged with the boundary path. Any remote turn from here must be blocked.
     ctx.push_tool_result(
         "read",
-        Some("secrets/prod.env".to_owned()),
+        Some(source_id("secrets/prod.env")),
         "API_KEY=sk-live-DO-NOT-LEAK-abc123",
     );
 

@@ -97,6 +97,26 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Mint a [`ProvenanceId`](teton_core::ProvenanceId) for a **test fixture**,
+/// panicking on a path that is not one (REQ-571).
+///
+/// Test-only and deliberately so, the same posture as
+/// [`RetainedContext::from_blocks`](crate::harness::context::RetainedContext):
+/// production code that reached for it does not compile, which is what keeps
+/// ADR-A's "only a resolved identity enters the provenance channel" a property of
+/// the shipped binary rather than a convention. A fixture naming an un-mintable
+/// path is a broken fixture, so a panic is the right failure.
+///
+/// One helper for the whole crate rather than one per test module: several
+/// modules need it, and a second copy is a second place the fixture form could
+/// drift from the real one.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn fixture_id(path: &str) -> teton_core::ProvenanceId {
+    teton_core::ProvenanceId::claimed(path)
+        .unwrap_or_else(|e| panic!("fixture path {path:?} is not an identity: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

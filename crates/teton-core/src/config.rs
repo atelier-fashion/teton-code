@@ -2006,7 +2006,7 @@ mod tests {
     use crate::entities::{
         BoundaryMode, ModelProvider, ProviderCapabilities, ProviderKind, ToolCallTier,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     // ---- REQ-557: model identity, default provider, usability, migration ----
 
@@ -5025,5 +5025,266 @@ cache_ttl_secs = 60
         }
         assert_eq!(ShutdownPolicyKind::parse("keep-alive"), None);
         assert_eq!(ShutdownPolicyKind::parse(""), None);
+    }
+
+    // ---- REQ-571 BR-10: every ConfigError `validate` can raise is asserted ----
+    //
+    // `Config::validate` is fail-closed and gates daemon startup, so a variant it
+    // can raise with nothing asserting it is an unguarded startup gate. The four
+    // tests below close the gaps that existed (AC-10); the enumeration after them
+    // is what keeps the set honest for variants added later (AC-11).
+
+    #[test]
+    fn a_default_provider_naming_an_unregistered_id_is_rejected() {
+        // REQ-557 BR-6: a dangling `default_provider` is a validity error, not a
+        // route that fails later, further from the cause, with the wrong name
+        // attached (LESSON-456).
+        let mut cfg = sample_config();
+        cfg.default_provider = Some("ghost".to_owned());
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::UnknownDefaultProvider {
+                default_provider: "ghost".to_owned(),
+                registered: "anthropic-prod, deepseek, local".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_tier_fallback_naming_an_unregistered_provider_is_rejected() {
+        // `the_dangling_binding_error_names_the_tier_or_category_it_came_from`
+        // pins two of the table's four dangling-reference slots by variant; this
+        // is a third. The four checks are copies of the same six lines, which is
+        // exactly where a wrong one hides — the shared-message test above them
+        // cannot tell `UnknownTierFallback` from `UnknownTierProvider`, because
+        // both name the id and list the registered ones.
+        let mut cfg = sample_config();
+        cfg.tiers[3].fallback_id = Some("ghost".to_owned());
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::UnknownTierFallback {
+                tier: Tier::Think,
+                fallback_id: "ghost".to_owned(),
+                registered: "anthropic-prod, deepseek, local".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_category_override_naming_an_unregistered_provider_is_rejected() {
+        // The fourth slot: the category's own provider, as opposed to its
+        // fallback.
+        let mut cfg = sample_config();
+        cfg.categories[0].provider_id = "ghost".to_owned();
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::UnknownCategoryProvider {
+                category: ConfigurableCategory::Review,
+                provider_id: "ghost".to_owned(),
+                registered: "anthropic-prod, deepseek, local".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_permission_allow_list_naming_off_is_rejected_by_validate() {
+        // `a_permission_allow_member_that_names_no_tier_is_refused_at_load`
+        // drives the same rule through `Config::load` and asserts on the
+        // message. This pins the variant, so the rule cannot come to be served
+        // by some other error whose text happens to mention the key — and it
+        // pins the *member* rule rather than the list: a legitimate tier sits
+        // beside the rejected one here.
+        let mut cfg = sample_config();
+        cfg.web.permission_allow = vec![WebTier::FetchUserUrl, WebTier::Off];
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigError::WebPermissionAllowNamesOff
+        );
+    }
+
+    /// This file's own source, embedded at compile time.
+    ///
+    /// `include_str!` rather than a runtime read of `src/`: BUG-159 is the trap
+    /// where a source-scanning test panics because something rewrote the file
+    /// between the walk and the read — which is precisely what this repo's
+    /// mutation-check convention (LESSON-441) does between `cargo test` runs.
+    /// Embedding removes the race rather than tolerating it: there is no runtime
+    /// read left to lose, and the bytes scanned are by construction the ones
+    /// that produced the binary running the scan.
+    const THIS_SOURCE: &str = include_str!("config.rs");
+
+    /// This file split at the `#[cfg(test)]` boundary: `(production, tests)`.
+    fn source_halves() -> (&'static str, &'static str) {
+        let at = THIS_SOURCE
+            .find("\n#[cfg(test)]\n")
+            .expect("config.rs must still carry its `#[cfg(test)]` boundary");
+        THIS_SOURCE.split_at(at)
+    }
+
+    /// Every `ConfigError` variant named in `text`, ignoring comment lines.
+    ///
+    /// Comments are dropped because a doc comment linking a variant is not a
+    /// raise, and the test half carries two that name a variant ADR-G retired.
+    fn config_error_variants(text: &str) -> BTreeSet<String> {
+        const PREFIX: &str = "ConfigError::";
+        let mut named = BTreeSet::new();
+        for line in text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+        {
+            let mut rest = line;
+            while let Some(at) = rest.find(PREFIX) {
+                rest = &rest[at + PREFIX.len()..];
+                let variant: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                // A bare `ConfigError::` (this function's own needle, quoted
+                // above) names nothing; a variant starts with a capital.
+                if variant.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    named.insert(variant);
+                }
+            }
+        }
+        named
+    }
+
+    /// The body of `fn <name>` in `lines`, delimited by rustfmt's indentation: a
+    /// method's closing brace is the first later line that is exactly its own
+    /// indent followed by `}`. `None` when there is no such function.
+    fn fn_body(lines: &[&str], name: &str) -> Option<String> {
+        let signature = format!("fn {name}(");
+        let (start, indent) = lines.iter().enumerate().find_map(|(index, line)| {
+            let trimmed = line.trim_start();
+            let at = trimmed.find(&signature)?;
+            // Only visibility/qualifier keywords may precede it, so a line that
+            // merely mentions the call is not mistaken for its definition.
+            let is_definition = trimmed[..at].split_whitespace().all(|word| {
+                matches!(word, "pub" | "const" | "async" | "unsafe") || word.starts_with("pub(")
+            });
+            if is_definition {
+                Some((index, line.len() - trimmed.len()))
+            } else {
+                None
+            }
+        })?;
+        let closer = format!("{}}}", " ".repeat(indent));
+        let end = lines[start..].iter().position(|line| *line == closer)? + start;
+        Some(lines[start..=end].join("\n"))
+    }
+
+    /// The `self.<name>(` calls made in a function body.
+    fn self_calls(body: &str) -> Vec<String> {
+        const PREFIX: &str = "self.";
+        let mut called = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find(PREFIX) {
+            rest = &rest[at + PREFIX.len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            // `self.providers.len()` names a field, not a call.
+            if rest[name.len()..].starts_with('(') {
+                called.push(name);
+            }
+        }
+        called
+    }
+
+    /// Every function reachable from `Config::validate` through `self.…()`
+    /// calls, as name -> body.
+    ///
+    /// Walked rather than listed: a validation helper added later is swept
+    /// without anyone remembering to name it here. A hand-kept list of helpers
+    /// would fail in the same way a hand-kept list of variants does, which is
+    /// the failure AC-11 exists to remove.
+    fn validate_call_tree(production: &str) -> BTreeMap<String, String> {
+        let lines: Vec<&str> = production.lines().collect();
+        let mut bodies: BTreeMap<String, String> = BTreeMap::new();
+        let mut pending = vec!["validate".to_owned()];
+        while let Some(name) = pending.pop() {
+            if bodies.contains_key(&name) {
+                continue;
+            }
+            let Some(body) = fn_body(&lines, &name) else {
+                continue;
+            };
+            pending.extend(self_calls(&body));
+            bodies.insert(name, body);
+        }
+        bodies
+    }
+
+    /// AC-11: the check that keeps AC-10 from being a snapshot of today's
+    /// variants.
+    ///
+    /// It walks `Config::validate`'s call tree in this file's own source,
+    /// collects every `ConfigError` variant constructed anywhere in it, and
+    /// fails naming any the test half never references. A variant added to a
+    /// validation helper next year is therefore covered on the day it is
+    /// written, with no list to update.
+    ///
+    /// What it can and cannot see: a reference from the test half is the proxy
+    /// for "asserted", and it cannot tell an assertion from a mention. So it is
+    /// a floor rather than a proof — but the hole it closes is a variant with
+    /// *no* test touching it at all, which is the one BR-10 is about.
+    #[test]
+    fn every_config_error_variant_validate_can_raise_is_asserted_by_a_test() {
+        let (production, tests) = source_halves();
+        let tree = validate_call_tree(production);
+        let raised: BTreeSet<String> = tree
+            .values()
+            .flat_map(|body| config_error_variants(body))
+            .collect();
+
+        // Floors first, so a scan that silently sees nothing fails instead of
+        // passing vacuously — BUG-159's lesson is that a source scan without a
+        // floor turns into a green that means nothing.
+        assert!(
+            tree.contains_key("validate") && tree.len() >= 5,
+            "the walk did not reach `validate` and its helpers, so the extractor \
+             is broken rather than the config: {:?}",
+            tree.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            raised.contains("UnknownDefaultProvider"),
+            "the walk read `validate`'s own body but found nothing it raises"
+        );
+        assert!(
+            raised.contains("WebPermissionAllowNamesOff"),
+            "the walk did not follow `validate` into its helpers"
+        );
+        assert!(
+            raised.len() >= 20,
+            "only {} variants found in validate's call tree; the scan is broken",
+            raised.len()
+        );
+
+        // `ConfigError` is `validate`'s error type and nothing else's, so a
+        // construction in this file that the walk did not see means the walk
+        // missed a function — or a raise has escaped `validate`, which needs a
+        // human either way rather than silent under-coverage.
+        assert_eq!(
+            raised,
+            config_error_variants(production),
+            "a `ConfigError` is constructed outside the call tree walked from \
+             `validate`: either a helper the walk missed, or a raise that has \
+             escaped `validate` and needs its own coverage rule"
+        );
+
+        let asserted = config_error_variants(tests);
+        let unasserted: Vec<&str> = raised
+            .iter()
+            .filter(|variant| !asserted.contains(*variant))
+            .map(String::as_str)
+            .collect();
+        assert!(
+            unasserted.is_empty(),
+            "`Config::validate` can raise these, and no test names them: \
+             {unasserted:?}. `validate` is fail-closed and gates daemon startup, so \
+             each is an unguarded startup gate — give each one a test asserting \
+             `cfg.validate().unwrap_err()` equals it (BR-10)."
+        );
     }
 }

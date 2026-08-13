@@ -12,12 +12,27 @@
 //! error to the loop; an internal failure is folded into a [`ToolOutcome`] with
 //! `is_error = true` so the *model* sees it and can retry (never a silent
 //! success — AC).
+//!
+//! # Symlink posture splits by tool class (REQ-571 ADR-C, BR-5)
+//!
+//! Explicit single-file access and directory traversal carry different risks, so
+//! they answer links differently:
+//!
+//! - **`read` / `edit`** resolve the link in [`ToolContext::resolve`]. Inside the
+//!   root the *target* is the identity — the link name is not — so a link to a
+//!   boundary file is judged as that boundary file. Outside the root the call is
+//!   refused by the jail.
+//! - **`grep` / `glob`** skip link entries outright, wherever they resolve, via
+//!   [`skip_symlink_entry`]. A walker that follows links surfaces one file under
+//!   two names — two provenance ids for one identity, which ADR-A exists to
+//!   prevent — and can cycle.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use teton_core::ProvenanceId;
 
 use super::context::ToolProvenance;
 use super::duty::DutyRoute;
@@ -66,13 +81,42 @@ impl ToolContext {
     /// escapes the repo root.
     ///
     /// Relative paths join onto the root; absolute paths are taken as-is and then
-    /// checked. `.`/`..` are collapsed lexically, and existing paths are
-    /// canonicalized so a symlink pointing outside the root is caught too.
+    /// checked. `.`/`..` are collapsed lexically, and the result is resolved
+    /// against the filesystem — through the deepest ancestor that exists, so a
+    /// symlink pointing outside the root is caught whether or not the leaf has
+    /// been created yet (`canonical_through_existing_ancestor`, below).
+    ///
+    /// # A link is answered by its target (REQ-571 ADR-C)
+    ///
+    /// Canonicalization is what implements the `read`/`edit` half of the
+    /// split-by-tool-class posture: an in-root link resolves to its target, so
+    /// both halves of the identity below describe the file actually opened and a
+    /// link named `notes.txt` pointing at `secrets/prod.env` is judged as
+    /// `secrets/prod.env`. A link resolving outside the root fails the
+    /// `starts_with` check and is refused. Walking tools take the opposite
+    /// posture — see [`skip_symlink_entry`].
+    ///
+    /// # One call yields both halves of the identity (REQ-571 ADR-B)
+    ///
+    /// The return is a [`Resolved`], not a bare path: the file the tool opens and
+    /// the [`ProvenanceId`] the privacy boundary matches on are derived here,
+    /// together, from the same canonical value — so the gate decides on the parse
+    /// the executor used and the two cannot drift (LESSON-494). A tool that
+    /// resolved a path and then tagged provenance from its own argument is not a
+    /// mistake this signature permits.
     ///
     /// # Errors
     /// Returns [`ToolError::Jail`] when the resolved path is not inside the root
-    /// (or the root itself cannot be resolved).
-    pub fn resolve(&self, raw: &str) -> Result<PathBuf, ToolError> {
+    /// (or the root itself cannot be resolved), when the path cannot be resolved
+    /// at all because it passes through a broken link, and — the same refusal, one
+    /// step later — when the resolved path has no repo-relative identity to mint.
+    ///
+    /// **There is no fallback to `raw`, ever** (ADR-B). A mint failure means the
+    /// resolved path is not a file under the root, which is precisely the case
+    /// where substituting the caller's own string would be worst: it is the
+    /// attacker-controlled value, and the boundary would then be matched against
+    /// something the daemon never opened. The operation is refused instead.
+    pub fn resolve(&self, raw: &str) -> Result<Resolved, ToolError> {
         let root = self
             .repo_root
             .canonicalize()
@@ -85,16 +129,122 @@ impl ToolContext {
         };
         let normalized = lexical_normalize(&joined);
 
-        // Canonicalize when the target exists so a symlink cannot tunnel out of
-        // the jail; fall back to the lexical form for not-yet-created paths.
-        let checked = normalized.canonicalize().unwrap_or(normalized);
+        // Containment is decided on a *resolved* path — never on one that still
+        // holds untraversed components (REQ-571 BR-6).
+        let checked = canonical_through_existing_ancestor(&normalized).ok_or_else(|| {
+            ToolError::jail(format!(
+                "path `{raw}` cannot be resolved: it passes through a broken symlink"
+            ))
+        })?;
 
         if !checked.starts_with(&root) {
             return Err(ToolError::jail(format!(
                 "path `{raw}` escapes the repo root"
             )));
         }
-        Ok(checked)
+        // The `starts_with` above is exactly `strip_prefix`'s precondition, so the
+        // only reachable mint failure is a resolved path that names no file under
+        // the root — `.`, or the root itself. The message stays content-free and
+        // repeats only what the caller already supplied.
+        let provenance = ProvenanceId::from_resolved(&root, &checked)
+            .map_err(|_| ToolError::jail(format!("path `{raw}` names no file in the repo root")))?;
+        Ok(Resolved {
+            path: checked,
+            provenance,
+        })
+    }
+}
+
+/// A path the jail accepted, together with the identity egress will judge it by
+/// (REQ-571 ADR-B).
+///
+/// The two fields are produced by one [`ToolContext::resolve`] call and are two
+/// views of one canonical value: `path` is what the tool opens, `provenance` is
+/// what a privacy boundary matches. Returning them as a pair is what makes
+/// "the gate decides on the parse the executor used" structural — there is no
+/// intermediate state in which a tool holds one without the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// The canonical, in-jail path to open.
+    pub path: PathBuf,
+    /// The repo-relative identity of that path, for egress provenance.
+    pub provenance: ProvenanceId,
+}
+
+/// Whether a directory entry must be skipped by a **walking** tool (`grep`,
+/// `glob`) — REQ-571 ADR-C, BR-5.
+///
+/// # Skipping links is the decision, not a gap
+///
+/// A future contributor will read `grep`/`glob` ignoring a symlink as an
+/// oversight and be tempted to follow it. It is not. Two reasons, both
+/// load-bearing:
+///
+/// 1. **One file, two identities.** A followed link surfaces the same bytes
+///    under the link's name *and* under the target's, so egress sees two
+///    provenance ids for one file identity — precisely what ADR-A exists to
+///    prevent. `read`/`edit` can resolve to a single target because they name one
+///    file; a walk cannot, because it reports the name it arrived by.
+/// 2. **A walk that follows links can cycle** (`a -> b`, `b -> a`, or a
+///    directory link pointing at an ancestor).
+///
+/// It is also ripgrep's default, so it matches what a user expects of a repo
+/// search.
+///
+/// # Why the test is `is_symlink()` and never `!is_dir()`
+///
+/// [`std::fs::DirEntry::file_type`] reads the *entry*, so it does **not**
+/// traverse the link ([`std::fs::metadata`] does). That non-traversal is the root
+/// cause this closes: a link reported `is_dir() == false`, fell into the walkers'
+/// file branch, and that branch's `read_to_string` *did* follow it — so a link to
+/// a file outside the jail was read out and reported under an in-jail relative
+/// path. Inferring "not a link" from `!is_dir()` reproduces the bug exactly.
+pub(crate) fn skip_symlink_entry(file_type: std::fs::FileType) -> bool {
+    file_type.is_symlink()
+}
+
+/// Resolve `path` as far as the filesystem actually goes: canonicalize the
+/// deepest ancestor that exists, then re-join the components that do not exist
+/// yet. `None` means the path has no answer at all — see below.
+///
+/// # Containment is decided on a resolved path, never a lexical one (REQ-571 BR-6)
+///
+/// The obvious spelling — `path.canonicalize().unwrap_or(path)` — is a jail
+/// escape waiting for a `write`/`create` tool. `canonicalize` fails for a target
+/// that does not exist *yet*, and the fallback then hands the containment check a
+/// string whose components were never traversed: `link/new`, where `link` points
+/// outside the repo, is lexically inside the root and passes, and the **OS**
+/// resolves the link on open. Resolving the ancestor closes it, because `link`
+/// itself does exist — canonicalizing it yields the outside directory, and the
+/// re-joined `link/new` fails `starts_with(root)` like any other escape.
+///
+/// A not-yet-existing path under a genuine in-root directory still resolves and
+/// is still accepted: creating new files in the repo is the case this must not
+/// break, and it is what distinguishes "resolve the ancestor" from "require the
+/// path to exist".
+///
+/// # A dangling link is refused, not resolved lexically
+///
+/// If a component exists ([`Path::symlink_metadata`] succeeds) yet does not
+/// canonicalize, it is a broken symlink — or, rarely, a component that just
+/// became unreadable. Either way the daemon cannot say where an open would land,
+/// and the discarded fallback would have minted an identity under the *link's*
+/// own in-jail name for a file that may live anywhere. ADR-B's no-fallback rule
+/// applies exactly here, so the walk stops and the caller refuses.
+fn canonical_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            let mut resolved = canonical;
+            resolved.extend(tail.iter().rev().copied());
+            return Some(resolved);
+        }
+        if cursor.symlink_metadata().is_ok() {
+            return None;
+        }
+        tail.push(cursor.file_name()?);
+        cursor = cursor.parent()?;
     }
 }
 
@@ -203,12 +353,17 @@ impl ToolOutcome {
         self
     }
 
-    /// Tag this outcome with the set of repo-relative `paths` it read/enumerated.
+    /// Tag this outcome with the identities of the files it read/enumerated.
+    ///
+    /// `paths` are [`ProvenanceId`]s — minted by [`ToolContext::resolve`] for the
+    /// file a tool opened, or by [`ProvenanceId::from_resolved`] for each entry a
+    /// walker surfaced. A raw request string is not accepted and cannot be made
+    /// into one implicitly (REQ-571 ADR-A), which is what stops the next tool
+    /// added here from re-opening the hole `read`/`edit` had.
     #[must_use]
-    pub fn with_paths<I, S>(self, paths: I) -> Self
+    pub fn with_paths<I>(self, paths: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = ProvenanceId>,
     {
         self.with_provenance(ToolProvenance::paths(paths))
     }
@@ -647,7 +802,59 @@ mod tests {
         std::fs::write(root.join("a.txt"), "hi").unwrap();
         let ctx = ToolContext::new(&root);
         let resolved = ctx.resolve("a.txt").unwrap();
-        assert!(resolved.starts_with(root.canonicalize().unwrap()));
+        assert!(resolved.path.starts_with(root.canonicalize().unwrap()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-571 ADR-B: one call, one identity, no drift.**
+    ///
+    /// Every spelling of one file resolves to the same canonical path *and* the
+    /// same [`ProvenanceId`] — the value a boundary glob is matched against. The
+    /// tool-layer half of BR-3: `teton-core` proves the arithmetic, this proves
+    /// that the daemon's canonicalization feeds it, which is what the
+    /// `..`-traversing spelling needs.
+    #[test]
+    fn every_spelling_of_one_file_resolves_to_one_identity() {
+        let root = temp_root("spell");
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/prod.env"), "API_KEY=1\n").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let ctx = ToolContext::new(&root);
+
+        let absolute = canonical_root.join("secrets/prod.env");
+        let absolute = absolute.to_string_lossy().into_owned();
+        for spelling in [
+            "secrets/prod.env",
+            "./secrets/prod.env",
+            ".//secrets/prod.env",
+            "././secrets/prod.env",
+            &absolute,
+            "src/../secrets/prod.env",
+        ] {
+            let resolved = ctx
+                .resolve(spelling)
+                .unwrap_or_else(|e| panic!("spelling {spelling:?} must resolve: {e}"));
+            assert_eq!(
+                resolved.provenance.as_str(),
+                "secrets/prod.env",
+                "spelling {spelling:?} minted a divergent identity"
+            );
+            assert_eq!(resolved.path, canonical_root.join("secrets/prod.env"));
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **ADR-B, the no-fallback rule.** A path that resolves to no file under the
+    /// root has no identity, and the answer is a refusal — never the caller's own
+    /// string standing in for one.
+    #[test]
+    fn a_path_with_no_repo_relative_identity_is_refused() {
+        let root = temp_root("noid");
+        let ctx = ToolContext::new(&root);
+        // The root itself: inside the jail, but it names no file to attribute.
+        let err = ctx.resolve(".").unwrap_err();
+        assert!(matches!(err, ToolError::Jail(_)), "{err:?}");
+        assert!(err.to_string().contains("names no file"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -667,6 +874,80 @@ mod tests {
         let err = ctx.resolve("/etc/hosts").unwrap_err();
         assert!(matches!(err, ToolError::Jail(_)));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-571 BR-6, the case the ancestor walk exists for.** The leaf does not
+    /// exist, so canonicalizing the whole path fails — but `link` does exist and
+    /// resolves outside the repo, so the re-joined path is outside and refused.
+    /// The discarded lexical fallback accepted this.
+    #[test]
+    fn resolve_refuses_a_new_leaf_reached_through_an_escaping_link() {
+        let root = temp_root("newleaf-esc");
+        let outside = temp_root("newleaf-out");
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        // Fixture control: the link is live and really does leave the root.
+        assert_eq!(
+            root.join("link").canonicalize().unwrap(),
+            outside.canonicalize().unwrap()
+        );
+        let ctx = ToolContext::new(&root);
+
+        let err = ctx.resolve("link/new.txt").unwrap_err();
+        assert!(matches!(err, ToolError::Jail(_)), "{err:?}");
+        assert!(err.to_string().contains("escapes the repo root"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// **The over-refusal guard.** Resolving the ancestor is not "the path must
+    /// exist": a file that has not been created yet, under a real in-root
+    /// directory, still resolves and still mints its own identity — including
+    /// through an in-root link, which is answered by its target like any other
+    /// spelling (ADR-C).
+    #[test]
+    fn resolve_still_accepts_a_not_yet_existing_path_under_the_root() {
+        let root = temp_root("newleaf-ok");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::os::unix::fs::symlink("src", root.join("link")).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let ctx = ToolContext::new(&root);
+
+        let resolved = ctx.resolve("src/new.rs").unwrap();
+        assert_eq!(resolved.provenance.as_str(), "src/new.rs");
+        assert_eq!(resolved.path, canonical_root.join("src/new.rs"));
+
+        // A missing intermediate directory is a new path too, not an escape.
+        let resolved = ctx.resolve("src/deep/new.rs").unwrap();
+        assert_eq!(resolved.provenance.as_str(), "src/deep/new.rs");
+
+        // Through an in-root link: the target names the file, so the id is the
+        // target's — the same rule an existing file gets.
+        let resolved = ctx.resolve("link/new.rs").unwrap();
+        assert_eq!(resolved.provenance.as_str(), "src/new.rs");
+        assert_eq!(resolved.path, canonical_root.join("src/new.rs"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The dangling link (TASK-120 flagged it, this closes it).** The link
+    /// exists but resolves nowhere, so the daemon cannot say where an open would
+    /// land — and the discarded fallback would have minted an id under the link's
+    /// own in-jail name for a file that lives outside. Refused instead (ADR-B).
+    #[test]
+    fn resolve_refuses_a_dangling_link_rather_than_minting_its_own_name() {
+        let root = temp_root("dangling");
+        let outside = temp_root("dangling-out");
+        std::os::unix::fs::symlink(outside.join("never-created.txt"), root.join("notes.txt"))
+            .unwrap();
+        // Fixture control: the entry exists, and it is the *resolution* that fails.
+        assert!(root.join("notes.txt").symlink_metadata().is_ok());
+        assert!(root.join("notes.txt").canonicalize().is_err());
+        let ctx = ToolContext::new(&root);
+
+        let err = ctx.resolve("notes.txt").unwrap_err();
+        assert!(matches!(err, ToolError::Jail(_)), "{err:?}");
+        assert!(err.to_string().contains("broken symlink"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

@@ -433,6 +433,7 @@ fn speaker(block: &ContextBlock) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
 
     use std::sync::{Arc, Mutex};
 
@@ -448,7 +449,7 @@ mod tests {
         let mut ctx = ContextManager::new("sys", 10_000);
         ctx.push_user("port the download client to the new retry API");
         ctx.push_model("{\"tool\":\"read\"}");
-        ctx.push_tool_result("read", Some("src/download.rs".to_owned()), "fn get() {}");
+        ctx.push_tool_result("read", Some(fixture_id("src/download.rs")), "fn get() {}");
         ctx.push_model("I will edit it now");
         ctx.blocks().to_vec()
     }
@@ -821,7 +822,7 @@ mod tests {
         ctx.push_user("rotate the key");
         ctx.push_tool_result_prov(
             "read",
-            ToolProvenance::path("secrets/prod.env"),
+            ToolProvenance::path(fixture_id("secrets/prod.env")),
             "API_KEY=sk-live-DO-NOT-LEAK",
         );
         ctx.push_model("ok");

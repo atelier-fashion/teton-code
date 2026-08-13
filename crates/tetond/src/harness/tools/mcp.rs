@@ -226,9 +226,38 @@ fn tool_error_sentence(tool: &str, err: &McpError) -> String {
 
 /// The [`ToolProvenance`] of an MCP tool result: the set of boundary-relevant
 /// paths the call's arguments referenced ([`call_provenance`]).
+///
+/// ## The one place `claimed()` belongs (REQ-571 ADR-A)
+///
+/// The ids here are minted by [`ProvenanceId::claimed`](teton_core::ProvenanceId::claimed)
+/// inside [`call_provenance`], not by `from_resolved`, and the separate
+/// constructor is the point: the daemon cannot observe what a remote server
+/// touched, so this provenance is an *assertion* rather than a record. Seeing
+/// `claimed` in `read`, `edit`, `grep`, or `glob` would be a bug; seeing it here
+/// is the honest statement of a weaker guarantee.
+///
+/// It is derived from the arguments **whatever key they sit under** — a boundary
+/// path passed as `resource` is caught exactly as one passed as `path` — and an
+/// assertion that cannot be minted at all taints the whole call to
+/// [`ToolProvenance::Unknown`] rather than quietly contributing nothing (see
+/// `collect_paths`). Failing toward taint is the only direction a provenance may
+/// be rounded.
+///
+/// ## The refusal is *reported* one layer down, not here (REQ-571 TASK-122)
+///
+/// This function runs on the same arguments
+/// [`McpRegistry::call_tool`](crate::mcp::McpRegistry::call_tool) already walked
+/// on the way out, and that is where the `provenance_rejected` event is
+/// published. Emitting again here would double-report every refusal — one for
+/// the call, one for the result it produced — for a user whose session went
+/// local exactly once.
 #[must_use]
 fn mcp_result_provenance(args: &Value) -> ToolProvenance {
-    ToolProvenance::paths(call_provenance(args).sources())
+    let provenance = call_provenance(args);
+    if provenance.is_unknown() {
+        return ToolProvenance::Unknown;
+    }
+    ToolProvenance::paths(provenance.ids().cloned())
 }
 
 /// The provenance an MCP result must carry given whether its server is
@@ -278,6 +307,7 @@ pub async fn register_mcp_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
     use serde_json::json;
 
     #[test]
@@ -452,7 +482,7 @@ mod tests {
         // precise argument-derived provenance — Unknown is NOT forced.
         assert_eq!(
             result_provenance(false, &json!({ "file": "secrets/prod.env" })),
-            ToolProvenance::path("secrets/prod.env")
+            ToolProvenance::path(fixture_id("secrets/prod.env"))
         );
         // No path-shaped args → empty provenance (a genuinely public result), not
         // Unknown — so it does NOT needlessly taint the session.
@@ -469,10 +499,10 @@ mod tests {
         // path passed under a non-`path` key (here `file`) is still tagged, not
         // folded in with empty provenance the way the old narrow `path_arg` did.
         let prov = mcp_result_provenance(&json!({ "file": "secrets/prod.env" }));
-        assert_eq!(prov, ToolProvenance::path("secrets/prod.env"));
+        assert_eq!(prov, ToolProvenance::path(fixture_id("secrets/prod.env")));
         // A path-shaped value under an arbitrary key is also caught.
         let prov2 = mcp_result_provenance(&json!({ "whatever": "secrets/leak.txt" }));
-        assert_eq!(prov2, ToolProvenance::path("secrets/leak.txt"));
+        assert_eq!(prov2, ToolProvenance::path(fixture_id("secrets/leak.txt")));
         // No path-shaped args → no provenance.
         assert_eq!(
             mcp_result_provenance(&json!({ "q": "hello", "n": 3 })),

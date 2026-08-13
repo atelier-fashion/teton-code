@@ -308,6 +308,7 @@ fn strip_terminal_controls(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
 
     use std::sync::{Arc, Mutex};
 
@@ -711,7 +712,7 @@ mod tests {
         let err = name_session(
             &route,
             secret_bearing,
-            &Provenance::tainted_by("secrets/prod.env"),
+            &Provenance::tainted_by(fixture_id("secrets/prod.env")),
         )
         .await
         .expect_err("boundary content must not be titled remotely");

@@ -94,6 +94,9 @@ pub const DIGEST_DUTY: DutyKind = DutyKind::new(Category::Digest, DIGEST_OUTPUT_
 #[must_use]
 pub fn tool_result_provenance(provenance: &ToolProvenance) -> Provenance {
     match provenance {
+        // REQ-571: both sides now speak `ProvenanceId`, so the bridge carries the
+        // identity across rather than re-deriving one from a string — there is no
+        // second normalization here to drift from the one that minted it.
         ToolProvenance::Sources(paths) => {
             let mut prov = Provenance::empty();
             for path in paths {
@@ -108,6 +111,7 @@ pub fn tool_result_provenance(provenance: &ToolProvenance) -> Provenance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
 
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
@@ -213,7 +217,7 @@ mod tests {
             "read",
             &text,
             50,
-            &ToolProvenance::path("src/main.rs"),
+            &ToolProvenance::path(fixture_id("src/main.rs")),
         )
         .await;
 
@@ -244,7 +248,7 @@ mod tests {
             "read",
             &text,
             50,
-            &ToolProvenance::path("secrets/prod.env"),
+            &ToolProvenance::path(fixture_id("secrets/prod.env")),
         )
         .await;
 
@@ -303,7 +307,7 @@ mod tests {
             "read",
             &oversized(),
             50,
-            &ToolProvenance::path("secrets/prod.env"),
+            &ToolProvenance::path(fixture_id("secrets/prod.env")),
         )
         .await;
 
@@ -395,7 +399,7 @@ mod tests {
         assert!(tool_result_provenance(&ToolProvenance::none()).is_empty());
         assert!(tool_result_provenance(&ToolProvenance::Unknown).is_unknown());
 
-        let two = ToolProvenance::Sources(BTreeSet::from(["a.rs".to_owned(), "b.rs".to_owned()]));
+        let two = ToolProvenance::Sources(BTreeSet::from([fixture_id("a.rs"), fixture_id("b.rs")]));
         let prov = tool_result_provenance(&two);
         assert!(prov.contains("a.rs") && prov.contains("b.rs"));
         assert!(!prov.is_unknown());

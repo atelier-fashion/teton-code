@@ -35,8 +35,9 @@ pub mod client;
 pub mod registry;
 
 pub use client::{
-    call_provenance, namespaced_tool_name, parse_namespaced_tool_name, EgressGate, HttpConnection,
-    McpClient, McpConnection, McpError, McpServerInfo, McpTool, McpToolResult, StdioConnection,
+    call_provenance, call_provenance_detailed, namespaced_tool_name, parse_namespaced_tool_name,
+    CallProvenance, EgressGate, HttpConnection, McpClient, McpConnection, McpError, McpServerInfo,
+    McpTool, McpToolResult, RejectedSource, StdioConnection,
 };
 pub use registry::{
     DefaultConnector, DiscoveredTool, McpConnector, McpRegistry, McpServerConfig, McpTransport,

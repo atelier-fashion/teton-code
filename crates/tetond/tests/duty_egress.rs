@@ -45,6 +45,7 @@ use futures::stream;
 use serde_json::json;
 
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
+use teton_core::ProvenanceId;
 use teton_providers::transport::{HttpMethod, TransportError, TransportRequest, TransportResponse};
 use teton_providers::{
     CapabilityProfile, Provider, ProviderError, StopReason, TokenUsage, Transport, TurnCompletion,
@@ -53,6 +54,17 @@ use teton_providers::{
 
 use tetond::egress::{Egress, NoopSink, Provenance};
 use tetond::harness::context::summarize_if_large;
+
+/// Mint the identity of a fixture file (REQ-571 ADR-A).
+///
+/// The provenance channel accepts only a [`ProvenanceId`], and an integration
+/// test cannot reach the crate-internal fixture helper, so each test binary
+/// states its own. A fixture naming a path that is not an identity is a broken
+/// fixture, hence the panic.
+fn source_id(path: &str) -> ProvenanceId {
+    ProvenanceId::claimed(path).expect("fixture path must be a provenance id")
+}
+
 use tetond::harness::{
     context_provenance, title, ContextManager, DutyKind, DutyRoute, ToolDuties, ToolOutcome,
     ToolProvenance, ToolRegistry, COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
@@ -184,7 +196,7 @@ fn boundary_bearing_turn() -> ContextManager {
     ctx.push_user("Read the production config and then find the parser.");
     ctx.push_tool_result_prov(
         "read",
-        ToolProvenance::path(SECRET_PATH),
+        ToolProvenance::path(source_id(SECRET_PATH)),
         format!("API_KEY={SECRET}"),
     );
     ctx
@@ -237,7 +249,7 @@ async fn a_digest_of_clean_content_sends_inside_a_boundary_bearing_turn() {
         "read",
         &oversized,
         64,
-        &ToolProvenance::path("src/lib.rs"),
+        &ToolProvenance::path(source_id("src/lib.rs")),
     )
     .await;
 
@@ -288,7 +300,7 @@ async fn a_triage_of_clean_matches_sends_inside_a_boundary_bearing_turn() {
             // The match count travels on the outcome, not in the text
             // (REQ-561 verify M3): two matches, so the ranking is worth making.
             ToolOutcome::ok(content)
-                .with_paths(["src/a.rs", "src/b.rs"])
+                .with_paths([source_id("src/a.rs"), source_id("src/b.rs")])
                 .measuring(2),
         )
         .await;
@@ -375,7 +387,7 @@ async fn a_compaction_of_a_boundary_bearing_conversation_is_refused_whole() {
         for i in 0..5 {
             ctx.push_tool_result_prov(
                 "read",
-                ToolProvenance::path(SECRET_PATH),
+                ToolProvenance::path(source_id(SECRET_PATH)),
                 format!("block {i} {SECRET} {}", "x".repeat(1_000)),
             );
         }
