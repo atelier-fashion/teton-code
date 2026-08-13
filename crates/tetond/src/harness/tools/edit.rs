@@ -15,6 +15,7 @@
 
 use serde_json::{json, Value};
 
+use super::read::shown_path;
 use super::{str_arg, Resolved, Tool, ToolContext, ToolOutcome};
 
 /// Replaces a single exact occurrence of a string in a file.
@@ -98,8 +99,14 @@ impl Tool for EditTool {
                     // remotely. REQ-571 BR-2: the identity is the resolved one,
                     // never `raw` — a `./`- or absolute-spelled edit of a boundary
                     // file used to tag a value no boundary glob could match.
+                    //
+                    // REQ-571 BR-11: and the model is told *which* file it just
+                    // rewrote — `shown_path` names the resolved target alongside
+                    // the request whenever an edit through a link or an absolute
+                    // path landed somewhere other than where the request reads.
                     Ok(()) => ToolOutcome::ok(format!(
-                        "edited `{raw}`: replaced 1 occurrence. Verify the change before finishing."
+                        "edited {}: replaced 1 occurrence. Verify the change before finishing.",
+                        shown_path(&raw, &provenance)
                     ))
                     .with_paths([provenance]),
                     Err(e) => ToolOutcome::error(format!("could not write `{raw}`: {}", e.kind())),
@@ -184,6 +191,77 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("2 times"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\nx\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-571 AC-15, the common case**, on the `edit` success line. Exact
+    /// comparison against the literal, not `contains`: the claim is that nothing
+    /// was added, and `contains` cannot make that claim.
+    #[test]
+    fn a_matching_request_renders_byte_identically() {
+        let root = temp_root("bytes");
+        std::fs::write(root.join("f.rs"), "const V: u32 = 1;\n").unwrap();
+        let ctx = ToolContext::new(&root);
+        let out = EditTool.run(
+            &ctx,
+            &json!({ "path": "f.rs", "old_string": "= 1;", "new_string": "= 2;" }),
+        );
+        assert_eq!(
+            out.content,
+            "edited `f.rs`: replaced 1 occurrence. Verify the change before finishing."
+        );
+
+        // And `./f.rs` is the same request in different words, so the same bytes.
+        let out = EditTool.run(
+            &ctx,
+            &json!({ "path": "./f.rs", "old_string": "= 2;", "new_string": "= 3;" }),
+        );
+        assert_eq!(
+            out.content,
+            "edited `./f.rs`: replaced 1 occurrence. Verify the change before finishing."
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-571 AC-15, the divergent case**, on the `edit` success line: the
+    /// model is told which file its write actually landed on, and the identity
+    /// egress judges the turn by is unaffected by that text (BR-11).
+    #[test]
+    fn a_divergent_request_shows_both_forms() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("diverge");
+        let file = root.join("f.rs");
+        let absolute = {
+            let p = root.canonicalize().unwrap().join("f.rs");
+            p.to_string_lossy().into_owned()
+        };
+        let ctx = ToolContext::new(&root);
+
+        for spelling in [absolute.as_str(), "src/../f.rs"] {
+            std::fs::write(&file, "const V: u32 = 1;\n").unwrap();
+            let out = EditTool.run(
+                &ctx,
+                &json!({ "path": spelling, "old_string": "= 1;", "new_string": "= 2;" }),
+            );
+            assert!(!out.is_error, "{spelling:?}: {}", out.content);
+            assert_eq!(
+                out.content,
+                format!(
+                    "edited `{spelling}` -> `f.rs`: replaced 1 occurrence. \
+                     Verify the change before finishing."
+                ),
+                "spelling {spelling:?} must name the file it wrote"
+            );
+            let ToolProvenance::Sources(ids) = &out.provenance else {
+                panic!("spelling {spelling:?} produced unknown provenance");
+            };
+            let ids: Vec<&str> = ids.iter().map(teton_core::ProvenanceId::as_str).collect();
+            assert_eq!(
+                ids,
+                vec!["f.rs"],
+                "the displayed text is not the identity: {spelling:?}"
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

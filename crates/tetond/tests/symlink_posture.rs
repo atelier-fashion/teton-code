@@ -1,4 +1,5 @@
-//! REQ-571 AC-3/AC-4 — symlink posture splits by tool class (BR-5, ADR-C).
+//! REQ-571 AC-3/AC-4 — symlink posture splits by tool class (BR-5, ADR-C) — and
+//! AC-15, the model-facing half of that posture (BR-11).
 //!
 //! A symlink is a second name for a file, and the two tool classes must answer
 //! it differently:
@@ -16,6 +17,13 @@
 //! the claim is "these bytes did not leave" rather than "this function returned
 //! the string I expected". Each tool gets its own repo, `Egress`, and sink, so
 //! neither tool's coverage rides on the other's (LESSON-502).
+//!
+//! A link is therefore the sharpest case for BR-11 as well: the file `read`
+//! opens is genuinely not the one the request names, so unless the output says
+//! both, the model is the only party to the exchange that does not know which
+//! file it is holding. The AC-15 cases at the foot of this file assert that it
+//! is told — and that being told changes nothing about the verdict, since the
+//! displayed text and the enforced identity are separate values.
 //!
 //! Every fixture that asserts an absence pairs it with a positive control — a
 //! live link proving the refusal is not merely a broken link, and a public turn
@@ -581,6 +589,175 @@ fn walkers_terminate_on_a_symlink_cycle() {
             "cycle member {name:?} was searched: {}",
             grepped.content
         );
+    }
+    fx.cleanup();
+}
+
+/// **AC-15, `read`.** Reading through a link shows the name asked for *and* the
+/// name that answered, so the model holding `secrets/prod.env`'s bytes is not
+/// told it read `notes.txt`.
+///
+/// The link is the case that motivates BR-11: `read` returns line-numbered
+/// content and nothing else, so before this there was no name in the output at
+/// all — the model kept the one from its own request, which is precisely the
+/// name that is wrong here.
+#[test]
+fn read_shows_both_the_link_and_the_target_it_resolved_to() {
+    let fx = LinkFixture::new("show-read");
+    fx.link_in("notes.txt");
+    let ctx = ToolContext::new(&fx.root);
+
+    let out = ReadTool.run(&ctx, &json!({ "path": "notes.txt" }));
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("notes.txt"),
+        "the request the model made is missing from the answer: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains(CANONICAL_ID),
+        "the file actually read is missing from the answer: {}",
+        out.content
+    );
+    // Display is display: the identity egress judges this turn by is the target's
+    // alone, exactly as it was before the note existed.
+    assert_eq!(sole_identity(&out), CANONICAL_ID);
+    fx.cleanup();
+}
+
+/// **AC-15, `edit`.** The same for a write that landed through a link — the more
+/// consequential half, since the model is about to verify a change to a file it
+/// may believe is somewhere else.
+#[test]
+fn edit_shows_both_the_link_and_the_target_it_wrote() {
+    let fx = LinkFixture::new("show-edit");
+    fx.link_in("notes.txt");
+    let ctx = ToolContext::new(&fx.root);
+
+    let out = EditTool.run(
+        &ctx,
+        &json!({
+            "path": "notes.txt",
+            "old_string": "sk-live-DO-NOT-LEAK-abc123",
+            "new_string": "sk-live-DO-NOT-LEAK-rotated",
+        }),
+    );
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("notes.txt") && out.content.contains(CANONICAL_ID),
+        "the success line must name both the request and the file written: {}",
+        out.content
+    );
+    // The write really did land on the target, so the name shown is a fact about
+    // this edit and not a decoration.
+    assert!(
+        std::fs::read_to_string(fx.root.join(CANONICAL_ID))
+            .unwrap()
+            .contains("rotated"),
+        "fixture: the edit must have gone through the link"
+    );
+    assert_eq!(sole_identity(&out), CANONICAL_ID);
+    fx.cleanup();
+}
+
+/// **AC-15, the common case — byte-identical.** When the request already spells
+/// the file that answered it, both tools render exactly what they rendered
+/// before BR-11.
+///
+/// Asserted by exact comparison against the literal rendering, never
+/// `contains`: "still contains the old text" is what a stray note bolted on top
+/// would also satisfy, and the overwhelming majority of real calls take this
+/// path — a note here would be a per-turn tax on every read in every session.
+#[test]
+fn a_matching_request_renders_byte_identically() {
+    let fx = LinkFixture::new("byte-identical");
+    // Links exist in the tree but are not what is asked for: a plain request
+    // stays plain even in a repo that contains links.
+    fx.link_in("notes.txt");
+    fx.link_out("escape.txt");
+    let ctx = ToolContext::new(&fx.root);
+
+    let out = ReadTool.run(&ctx, &json!({ "path": "src/main.rs" }));
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(out.content, format!("     1\t{PUBLIC_CONTENT}\n"));
+
+    let out = EditTool.run(
+        &ctx,
+        &json!({
+            "path": "src/main.rs",
+            "old_string": "PUBLIC-MARKER-9f3a",
+            "new_string": "PUBLIC-MARKER-9f3a-edited",
+        }),
+    );
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        out.content,
+        "edited `src/main.rs`: replaced 1 occurrence. Verify the change before finishing."
+    );
+    fx.cleanup();
+}
+
+/// **BR-11, display is not provenance.** One file read twice — once under a name
+/// that diverges, once under its own — renders *differently* and is judged
+/// *identically*: same minted id, same block, same reported path.
+///
+/// This is the structural claim exercised end to end. `with_paths` takes
+/// [`ProvenanceId`]s and not strings (ADR-A), so no text assembled for the model
+/// can reach the boundary matcher; what this test adds is that the property
+/// survives at the real choke point, which is where a future "helpful" change
+/// that derived the tagged path from the displayed one would be caught.
+#[tokio::test]
+async fn divergent_display_cannot_move_the_boundary_verdict() {
+    let fx = LinkFixture::new("display-verdict");
+    fx.link_in("notes.txt");
+    let ctx = ToolContext::new(&fx.root);
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let egress = Egress::new(capture.clone(), local_only_boundaries(), sink.clone());
+    let egress_ctx = EgressContext::new("anthropic").with_session("sess-display");
+
+    // Positive control first (LESSON-479).
+    let public = ReadTool.run(&ctx, &json!({ "path": "src/main.rs" }));
+    assert!(!public.is_error, "{}", public.content);
+    let (req, prov) = turn_from(&public, PUBLIC_CONTENT);
+    assert!(
+        egress.send(req, &prov, &egress_ctx).await.is_ok(),
+        "a public read must still reach the wire"
+    );
+
+    let via_link = ReadTool.run(&ctx, &json!({ "path": "notes.txt" }));
+    let direct = ReadTool.run(&ctx, &json!({ "path": CANONICAL_ID }));
+    assert!(!via_link.is_error, "{}", via_link.content);
+    assert!(!direct.is_error, "{}", direct.content);
+    assert_ne!(
+        via_link.content, direct.content,
+        "fixture: the two spellings must actually render differently, or the \
+         equality below is a claim about nothing"
+    );
+    assert_eq!(
+        via_link.provenance, direct.provenance,
+        "the displayed text moved the identity — display and provenance are \
+         supposed to be separate values"
+    );
+
+    for (label, out) in [
+        ("through the link", &via_link),
+        ("by its own name", &direct),
+    ] {
+        let (req, prov) = turn_from(out, SECRET_ENV);
+        match egress.send(req, &prov, &egress_ctx).await {
+            Err(EgressError::PrivacyBlocked { ref path, .. }) => {
+                assert_eq!(path, CANONICAL_ID, "read {label}");
+            }
+            other => panic!("a read {label} must block identically: {other:?}"),
+        }
+    }
+
+    assert_only_the_public_turn_went_out(&capture.captured());
+    let events = sink.events();
+    assert_eq!(events.len(), 2, "one privacy_block per blocked spelling");
+    for (_, block) in &events {
+        assert_eq!(block.path, CANONICAL_ID);
     }
     fx.cleanup();
 }
