@@ -29,10 +29,10 @@ use teton_protocol::events::{
     AttachConsentRequested, BlockCause, ConsentScope, DaemonClientAttach, DaemonLifetimeStage,
     Event, EventEnvelope, EvictionReason, FailureClass, ModelLifecycle, ModelSelectionProposed,
     PermissionOption, PermissionOptionKind, PermissionRequest, PhaseTransition, PrefixCache,
-    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProviderDegraded,
-    RouteDecided, SessionGrantMinted, SessionUpdatePayload, ToolCallStatus, WebConsentDecided,
-    WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome, WebTier,
-    OPTION_ID_ENABLE_PERMANENT,
+    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected,
+    ProvenanceRejection, ProviderDegraded, RouteDecided, SessionGrantMinted, SessionUpdatePayload,
+    ToolCallStatus, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome,
+    WebTier, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -282,6 +282,14 @@ pub fn render_event(
         }
         Event::PrivacyBlock(pb) => {
             surface.line(LineKind::Notice, &format_privacy(pb));
+            EventOutcome::Rendered
+        }
+        // Never verbose-gated, for the same reason `privacy_block` is not: this
+        // is a refusal that changed what the session may do, and LESSON-505 is
+        // that an audit signal only a daemon log carries is a weak control. A
+        // user who cannot see it cannot act on it.
+        Event::ProvenanceRejected(pr) => {
+            surface.line(LineKind::Notice, &format_provenance_rejected(pr));
             EventOutcome::Rendered
         }
         Event::ProviderDegraded(pd) => {
@@ -1236,6 +1244,40 @@ fn format_privacy(pb: &PrivacyBlock) -> String {
     }
 }
 
+/// The `provenance_rejected` notice (REQ-571 ADR-D).
+///
+/// ## The source is rendered with `{:?}`, deliberately
+///
+/// `source` is attacker-influenced text: a remote MCP server chose it. The
+/// daemon already strips control characters and truncates before it goes on the
+/// wire, and this is the second half of that posture rather than a duplicate of
+/// it — `{:?}` escapes any control byte that reached here anyway, so nothing in
+/// a hostile source can move the cursor, colour the terminal, or fake a second
+/// notice line. It also makes the value visibly a quoted string rather than
+/// something the reader might take for a path the daemon endorses.
+fn format_provenance_rejected(pr: &ProvenanceRejected) -> String {
+    let reason = match pr.reason {
+        ProvenanceRejection::Absolute => "it is absolute, and boundaries are repo-relative",
+        ProvenanceRejection::ParentTraversal => {
+            "it retains a `..` segment, which only the filesystem could resolve"
+        }
+        ProvenanceRejection::NotCanonical => "it is not in canonical form",
+        ProvenanceRejection::Empty => "it names no file",
+    };
+    match &pr.tool {
+        Some(tool) => format!(
+            "privacy: {tool} claimed the source {:?} — refused because {reason}; \
+             that result is treated as unknown-origin and held local",
+            pr.source
+        ),
+        None => format!(
+            "privacy: the source {:?} reached the egress check un-minted — refused \
+             because {reason}; the call was blocked",
+            pr.source
+        ),
+    }
+}
+
 fn format_degraded(pd: &ProviderDegraded) -> String {
     let class = match pd.failure_class {
         FailureClass::ToolCallFailure => "tool-call failure",
@@ -1539,6 +1581,63 @@ mod tests {
         assert!(surface.any_line_contains(LineKind::Notice, "re-routed to the local tier"));
         assert!(surface.any_line_contains(LineKind::Notice, "degraded: flaky"));
         assert!(surface.any_line_contains(LineKind::Notice, "fell back to anthropic"));
+    }
+
+    /// REQ-571 ADR-D: a rejected provenance source reaches the terminal, and it
+    /// reaches it *without* the source being able to draw on the terminal.
+    ///
+    /// Two claims, and the second is the one worth a test: the source is
+    /// attacker-influenced text, so a hostile spelling carrying an ANSI escape
+    /// and a newline must render as escaped characters on one line rather than
+    /// as cursor movement and a forged second notice.
+    #[test]
+    fn a_rejected_provenance_source_renders_as_inert_escaped_text() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        render_event(
+            &envelope(Event::ProvenanceRejected(ProvenanceRejected {
+                source: "/etc/passwd".to_owned(),
+                tool: Some("mcp__fs__read_file".to_owned()),
+                reason: ProvenanceRejection::Absolute,
+            })),
+            &mut surface,
+            &mut state,
+        );
+        render_event(
+            &envelope(Event::ProvenanceRejected(ProvenanceRejected {
+                // A source that would like to end this line and start another.
+                source: "\u{1b}[31m../evil\nprivacy: nothing to see here".to_owned(),
+                tool: None,
+                reason: ProvenanceRejection::ParentTraversal,
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        let lines = surface.lines_of(LineKind::Notice);
+        assert_eq!(lines.len(), 2, "one notice per rejection: {lines:?}");
+
+        // The tool is named, the source is quoted, and the reason is a sentence
+        // a user can act on.
+        assert!(lines[0].contains("mcp__fs__read_file"), "{}", lines[0]);
+        assert!(lines[0].contains("\"/etc/passwd\""), "{}", lines[0]);
+        assert!(lines[0].contains("absolute"), "{}", lines[0]);
+
+        // Nothing raw survives: no escape byte, no embedded newline.
+        assert!(
+            !lines[1].contains('\u{1b}'),
+            "an escape byte reached the terminal: {:?}",
+            lines[1]
+        );
+        assert!(
+            !lines[1].contains('\n'),
+            "a hostile source forged a second line: {:?}",
+            lines[1]
+        );
+        // And the guard's line does not invent a tool it cannot know.
+        assert!(!lines[1].contains("claimed the source"), "{}", lines[1]);
+        assert!(lines[1].contains("`..`"), "{}", lines[1]);
     }
 
     /// The three causes reach the terminal as three different sentences, and the
