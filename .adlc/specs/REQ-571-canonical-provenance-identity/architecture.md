@@ -185,3 +185,17 @@ Add to Key Patterns:
 > its own named constructor so the weaker guarantee is visible at the call site
 > rather than merged into the strong one (REQ-571 ADR-A, LESSON-432,
 > LESSON-443).
+
+## Amendment (Phase 4, as-landed)
+
+The ADR-A blast-radius estimate ("seven `with_paths` call sites") was low: the
+compiler surfaced `crates/tetond/src/mcp/client.rs` (`collect_paths` /
+`call_provenance`) — a **production** site building egress provenance directly
+from raw MCP argument strings, exactly the class of hole ADR-A closes. It now
+mints via `ProvenanceId::claimed`. Recorded here per the architect-phase rule
+that call sites beyond the plan feed back into the spec rather than being
+quietly absorbed. Two consequences worth naming: an un-mintable claimed path
+(absolute or `..`-bearing MCP argument) now taints the call `Unknown` —
+fail-closed where the old code failed open, observable only when a boundary is
+configured; and the spelling matrix is six-wide, not five (`.//x` and `././x`
+are distinct model-emittable spellings).

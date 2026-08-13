@@ -52,13 +52,16 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-119",
+    "currentTask": null,
     "inFlight": [
-      "TASK-119"
+      "TASK-120",
+      "TASK-122",
+      "TASK-124"
     ],
     "completedTasks": [
       "TASK-118",
-      "TASK-126"
+      "TASK-126",
+      "TASK-119"
     ],
     "failedTasks": []
   }
