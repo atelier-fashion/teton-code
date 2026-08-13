@@ -70,7 +70,8 @@ impl Tool for EditTool {
 
         // One call yields the file to write AND the identity egress judges it by
         // (REQ-571 ADR-B); see `read` for why the request text is not that
-        // identity.
+        // identity, and why an in-root symlink is attributed to the file it
+        // resolves to while one leaving the root is refused (ADR-C).
         let Resolved { path, provenance } = match ctx.resolve(&raw) {
             Ok(r) => r,
             Err(e) => return e.into(),

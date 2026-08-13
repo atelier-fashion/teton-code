@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use teton_core::ProvenanceId;
 
-use super::{str_arg, Tool, ToolContext, ToolOutcome};
+use super::{skip_symlink_entry, str_arg, Tool, ToolContext, ToolOutcome};
 
 /// Directory names never descended into (noise / not source).
 const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
@@ -94,6 +94,16 @@ fn walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<ProvenanceId>) {
             Ok(t) => t,
             Err(_) => continue,
         };
+        // REQ-571 ADR-C: a link is skipped before either branch below — this is
+        // the deliberate posture for walking tools, and it is tested on the entry
+        // rather than inferred from `!is_dir()`. See `skip_symlink_entry` for both
+        // halves of why. Here the harm is the sharper one: the listed name *is*
+        // the minted id, so a followed link both names a second identity for one
+        // file and, for a link out of the jail, advertises an outside file under
+        // an in-jail path.
+        if skip_symlink_entry(file_type) {
+            continue;
+        }
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if file_type.is_dir() {

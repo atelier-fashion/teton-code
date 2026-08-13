@@ -32,7 +32,10 @@ use std::path::Path;
 use teton_core::ProvenanceId;
 
 use super::glob::glob_match;
-use super::{opt_str_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome};
+use super::{
+    opt_str_arg, skip_symlink_entry, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties,
+    ToolOutcome,
+};
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::triage;
 
@@ -341,6 +344,13 @@ fn search(
             Ok(t) => t,
             Err(_) => continue,
         };
+        // REQ-571 ADR-C: a link is skipped before either branch below — this is
+        // the deliberate posture for walking tools, and it is tested on the entry
+        // rather than inferred from `!is_dir()`. See `skip_symlink_entry` for both
+        // halves of why.
+        if skip_symlink_entry(file_type) {
+            continue;
+        }
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if file_type.is_dir() {

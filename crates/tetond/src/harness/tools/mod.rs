@@ -12,6 +12,20 @@
 //! error to the loop; an internal failure is folded into a [`ToolOutcome`] with
 //! `is_error = true` so the *model* sees it and can retry (never a silent
 //! success — AC).
+//!
+//! # Symlink posture splits by tool class (REQ-571 ADR-C, BR-5)
+//!
+//! Explicit single-file access and directory traversal carry different risks, so
+//! they answer links differently:
+//!
+//! - **`read` / `edit`** resolve the link in [`ToolContext::resolve`]. Inside the
+//!   root the *target* is the identity — the link name is not — so a link to a
+//!   boundary file is judged as that boundary file. Outside the root the call is
+//!   refused by the jail.
+//! - **`grep` / `glob`** skip link entries outright, wherever they resolve, via
+//!   [`skip_symlink_entry`]. A walker that follows links surfaces one file under
+//!   two names — two provenance ids for one identity, which ADR-A exists to
+//!   prevent — and can cycle.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -69,6 +83,16 @@ impl ToolContext {
     /// Relative paths join onto the root; absolute paths are taken as-is and then
     /// checked. `.`/`..` are collapsed lexically, and existing paths are
     /// canonicalized so a symlink pointing outside the root is caught too.
+    ///
+    /// # A link is answered by its target (REQ-571 ADR-C)
+    ///
+    /// Canonicalization is what implements the `read`/`edit` half of the
+    /// split-by-tool-class posture: an in-root link resolves to its target, so
+    /// both halves of the identity below describe the file actually opened and a
+    /// link named `notes.txt` pointing at `secrets/prod.env` is judged as
+    /// `secrets/prod.env`. A link resolving outside the root fails the
+    /// `starts_with` check and is refused. Walking tools take the opposite
+    /// posture — see [`skip_symlink_entry`].
     ///
     /// # One call yields both halves of the identity (REQ-571 ADR-B)
     ///
@@ -138,6 +162,38 @@ pub struct Resolved {
     pub path: PathBuf,
     /// The repo-relative identity of that path, for egress provenance.
     pub provenance: ProvenanceId,
+}
+
+/// Whether a directory entry must be skipped by a **walking** tool (`grep`,
+/// `glob`) — REQ-571 ADR-C, BR-5.
+///
+/// # Skipping links is the decision, not a gap
+///
+/// A future contributor will read `grep`/`glob` ignoring a symlink as an
+/// oversight and be tempted to follow it. It is not. Two reasons, both
+/// load-bearing:
+///
+/// 1. **One file, two identities.** A followed link surfaces the same bytes
+///    under the link's name *and* under the target's, so egress sees two
+///    provenance ids for one file identity — precisely what ADR-A exists to
+///    prevent. `read`/`edit` can resolve to a single target because they name one
+///    file; a walk cannot, because it reports the name it arrived by.
+/// 2. **A walk that follows links can cycle** (`a -> b`, `b -> a`, or a
+///    directory link pointing at an ancestor).
+///
+/// It is also ripgrep's default, so it matches what a user expects of a repo
+/// search.
+///
+/// # Why the test is `is_symlink()` and never `!is_dir()`
+///
+/// [`std::fs::DirEntry::file_type`] reads the *entry*, so it does **not**
+/// traverse the link ([`std::fs::metadata`] does). That non-traversal is the root
+/// cause this closes: a link reported `is_dir() == false`, fell into the walkers'
+/// file branch, and that branch's `read_to_string` *did* follow it — so a link to
+/// a file outside the jail was read out and reported under an in-jail relative
+/// path. Inferring "not a link" from `!is_dir()` reproduces the bug exactly.
+pub(crate) fn skip_symlink_entry(file_type: std::fs::FileType) -> bool {
+    file_type.is_symlink()
 }
 
 /// Collapse `.` and `..` components lexically, without touching the filesystem.

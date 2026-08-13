@@ -46,6 +46,11 @@ impl Tool for ReadTool {
         // One call yields the file to open AND the identity egress judges it by
         // (REQ-571 ADR-B) — so the boundary is matched on the same canonical
         // value this read opens, whatever spelling the model used to ask for it.
+        //
+        // A symlink is a spelling too (ADR-C): `resolve` canonicalizes, so an
+        // in-root link is attributed to its *target* — reading `notes.txt ->
+        // secrets/prod.env` is a read of `secrets/prod.env` and pins the turn as
+        // one — and a link resolving outside the root is refused by the jail.
         let Resolved { path, provenance } = match ctx.resolve(&raw) {
             Ok(r) => r,
             Err(e) => return e.into(),
