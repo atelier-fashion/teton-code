@@ -70,6 +70,7 @@ use teton_core::ProvenanceId;
 use teton_inference::{Completion, Engine, EngineError, GenParams};
 use teton_protocol::events::{
     BlockCause, Event, FindingKind as WireFindingKind, PrivacyAction, PrivacyBlock,
+    ProvenanceRejected,
 };
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
@@ -203,6 +204,8 @@ impl PrivacyEventSink for CapturingSink {
             .expect("sink poisoned")
             .push((session_id, block));
     }
+    // Required no-op: this AC-9 fixture captures blocks, not rejections.
+    fn provenance_rejected(&self, _session_id: Option<SessionId>, _rejected: ProvenanceRejected) {}
 }
 
 /// A provider that serializes its `TurnRequest` onto the transport — the

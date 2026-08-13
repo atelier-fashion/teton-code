@@ -4195,6 +4195,13 @@ mod tests {
             ) {
                 *self.calls.lock().unwrap() += 1;
             }
+            // Required no-op: this fixture counts privacy_block calls only.
+            fn provenance_rejected(
+                &self,
+                _session_id: Option<SessionId>,
+                _rejected: teton_protocol::events::ProvenanceRejected,
+            ) {
+            }
         }
 
         let sink = Arc::new(CountingSink {

@@ -350,24 +350,16 @@ pub trait PrivacyEventSink: Send + Sync {
     /// Publish a `provenance_rejected` event (REQ-571 ADR-D), scoped to
     /// `session_id` when known.
     ///
-    /// ## Why this one has a default body and `privacy_block` does not
-    ///
-    /// The default drops the event, and that is a real cost, so it is worth
-    /// being precise about what it buys. Every sink in the daemon that can
-    /// reach a client — [`EventBus`], and the runtime's tainting wrapper around
-    /// it — overrides it; the implementations that would inherit the default
-    /// are [`NoopSink`] and the capture fixtures in the egress suites, which
-    /// have no subscriber to inform either way. Making it required would have
-    /// bought nothing there and forced an edit to six suites whose job is to
-    /// stay still while this REQ moves the code under them.
-    ///
-    /// A sink added *later* is the case the default is genuinely weaker for. If
-    /// that sink is another delivery path to a user, it must override this —
-    /// LESSON-505 is that a refusal only the daemon log carries is a weak
-    /// control, and inheriting silence here is exactly that failure.
-    fn provenance_rejected(&self, session_id: Option<SessionId>, rejected: ProvenanceRejected) {
-        let _ = (session_id, rejected);
-    }
+    /// Required, with no default body — deliberately, like `privacy_block`. A
+    /// sink added later that is another delivery path to a user MUST make a
+    /// conscious choice here, because inheriting a silent no-op is exactly the
+    /// LESSON-505 failure: a refusal only the daemon log carries is a weak
+    /// control. Making it required turns "a future sink forgot" into a compile
+    /// error rather than a silent gap (REQ-571 verify, Brett's call). The cost
+    /// is an explicit — and, for a sink with no subscriber, empty — impl on
+    /// [`NoopSink`] and the egress-suite capture fixtures, which is the point:
+    /// an empty body there is a stated decision, not an accident.
+    fn provenance_rejected(&self, session_id: Option<SessionId>, rejected: ProvenanceRejected);
 }
 
 /// The production sink: broadcast to attached clients over the daemon event bus.
@@ -387,6 +379,9 @@ pub struct NoopSink;
 
 impl PrivacyEventSink for NoopSink {
     fn privacy_block(&self, _session_id: Option<SessionId>, _block: PrivacyBlock) {}
+    // Explicit no-op: NoopSink has no subscriber, so dropping the event is the
+    // stated decision the required method forces (not an inherited silence).
+    fn provenance_rejected(&self, _session_id: Option<SessionId>, _rejected: ProvenanceRejected) {}
 }
 
 /// Per-call context the choke point needs but the [`TransportRequest`] cannot

@@ -30,7 +30,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
-use teton_protocol::events::{Event, PermissionRequest, PrivacyAction, PrivacyBlock};
+use teton_protocol::events::{
+    Event, PermissionRequest, PrivacyAction, PrivacyBlock, ProvenanceRejected,
+};
 use teton_protocol::methods::PermissionOutcome;
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
@@ -196,6 +198,8 @@ impl PrivacyEventSink for CapturingSink {
     fn privacy_block(&self, session_id: Option<SessionId>, block: PrivacyBlock) {
         self.events.lock().unwrap().push((session_id, block));
     }
+    // Required no-op: this AC-9 fixture captures blocks, not rejections.
+    fn provenance_rejected(&self, _session_id: Option<SessionId>, _rejected: ProvenanceRejected) {}
 }
 
 fn contains_bytes(haystack: &[u8], needle: &str) -> bool {
