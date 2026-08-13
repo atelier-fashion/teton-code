@@ -35,6 +35,7 @@ use teton_core::category::{
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
+use teton_core::ProvenanceId;
 use teton_core::ToolCallTier;
 
 use teton_inference::{ChatFormat, Engine, MockEngine};
@@ -52,6 +53,16 @@ use tetond::classify::{self, ClassificationSignal};
 use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::{Egress, EgressError, NoopSink, Provenance};
 use tetond::router::{to_protocol_phase, Route, Router};
+
+/// Mint the identity of a fixture file (REQ-571 ADR-A).
+///
+/// The provenance channel accepts only a [`ProvenanceId`], and an integration
+/// test cannot reach the crate-internal fixture helper, so each test binary
+/// states its own. A fixture naming a path that is not an identity is a broken
+/// fixture, hence the panic.
+fn source_id(path: &str) -> ProvenanceId {
+    ProvenanceId::claimed(path).expect("fixture path must be a provenance id")
+}
 
 // --------------------------------------------------------------------------
 // Fixtures
@@ -670,7 +681,7 @@ async fn routed_remote_call_produces_cost_record_and_passes_boundary_inspection(
     let err = egress
         .send(
             request("API_KEY=sk-live-DO-NOT-LEAK"),
-            &Provenance::tainted_by("secrets/prod.env"),
+            &Provenance::tainted_by(source_id("secrets/prod.env")),
             &blocked_ctx,
         )
         .await

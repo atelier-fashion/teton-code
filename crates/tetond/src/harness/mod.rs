@@ -108,7 +108,9 @@ pub use permissions::{
 pub use redact::REDACT_DUTY;
 pub use shell_duty::SHELL_DUTY;
 pub use title::TITLE_DUTY;
-pub use tools::{RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome, ToolRegistry};
+pub use tools::{
+    RefinedOutcome, Resolved, Tool, ToolContext, ToolDuties, ToolOutcome, ToolRegistry,
+};
 pub use triage::TRIAGE_DUTY;
 pub use turn_loop::{
     build_system_prompt, run_session_turn, run_session_turn_with_source, HarnessConfig,

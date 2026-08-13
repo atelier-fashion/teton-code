@@ -8,6 +8,7 @@
 
 use serde_json::{json, Value};
 use std::path::Path;
+use teton_core::ProvenanceId;
 
 use super::{str_arg, Tool, ToolContext, ToolOutcome};
 
@@ -59,19 +60,30 @@ impl Tool for GlobTool {
         }
         let truncated = matches.len() > MAX_RESULTS;
         matches.truncate(MAX_RESULTS);
-        let mut out = matches.join("\n");
+        let mut out = matches
+            .iter()
+            .map(ProvenanceId::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
         if truncated {
             out.push_str(&format!("\n... (capped at {MAX_RESULTS} results)"));
         }
         // REQ-544 C-1: the enumerated files ARE the result's content, so tag the
         // outcome with them — a glob that surfaces a `local-only` file blocks the
-        // next remote turn at egress.
+        // next remote turn at egress. REQ-571: the listed name and the tagged
+        // identity are one value, so the two cannot disagree about what was
+        // surfaced.
         ToolOutcome::ok(out).with_paths(matches)
     }
 }
 
-/// Recursively collect relative paths under `dir` that match `pattern`.
-fn walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
+/// Recursively collect the identities of files under `dir` matching `pattern`.
+///
+/// REQ-571: minted by [`ProvenanceId::from_resolved`] rather than by an inline
+/// `strip_prefix` + separator fixup — the same arithmetic, but stated once (see
+/// [`grep::search`](super::grep)). The id doubles as the listed name, so a file
+/// cannot be shown under one spelling and tagged under another.
+fn walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<ProvenanceId>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -89,10 +101,9 @@ fn walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
                 continue;
             }
             walk(root, &path, pattern, out);
-        } else if let Ok(rel) = path.strip_prefix(root) {
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            if glob_match(pattern, &rel) {
-                out.push(rel);
+        } else if let Ok(id) = ProvenanceId::from_resolved(root, &path) {
+            if glob_match(pattern, id.as_str()) {
+                out.push(id);
             }
         }
     }
@@ -131,6 +142,7 @@ fn wild(p: &[u8], s: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
     use std::path::PathBuf;
 
     #[test]
@@ -203,7 +215,10 @@ mod tests {
         assert!(!out.is_error);
         assert_eq!(
             out.provenance,
-            ToolProvenance::paths(["secrets/dev.env", "secrets/prod.env"])
+            ToolProvenance::paths([
+                fixture_id("secrets/dev.env"),
+                fixture_id("secrets/prod.env")
+            ])
         );
         std::fs::remove_dir_all(&root).ok();
     }

@@ -17,6 +17,8 @@
 
 use std::collections::BTreeSet;
 
+use teton_core::ProvenanceId;
+
 /// The sentinel "path" reported when a request is blocked because some content
 /// carried **unknown** provenance rather than a specific boundary source.
 ///
@@ -27,21 +29,30 @@ use std::collections::BTreeSet;
 /// repo path, and by construction leaks no file content.
 pub const UNKNOWN_PROVENANCE_PATH: &str = "<unknown-provenance>";
 
-/// The set of repo-relative source paths a piece of content was derived from.
+/// The set of repo-relative source identities a piece of content was derived
+/// from.
 ///
 /// A `BTreeSet` keeps the sources ordered so that inspection and any diagnostic
-/// output are deterministic (a property the egress-capture tests rely on). Paths
-/// are stored exactly as the reader supplied them; boundary matching normalizes
-/// them (see [`crate::egress::inspector`]).
+/// output are deterministic (a property the egress-capture tests rely on).
 ///
 /// Beyond the known sources, provenance carries an [`unknown`](Provenance::is_unknown)
 /// bit: content the daemon *could not attribute to a specific file set* (a
 /// `shell` result, say). Unknown provenance is **fail-closed** at egress — when
 /// any boundary is configured it is blocked exactly like a boundary hit, because
 /// the daemon cannot prove the content is boundary-free (REQ-544 C-1).
+///
+/// # Minted in, `&str` out (REQ-571 ADR-A)
+///
+/// A source enters only as a [`ProvenanceId`] — there is no way to add a raw
+/// string, which is what stops the next contributor to this channel from tagging
+/// content with a value the daemon merely *received* rather than resolved. It
+/// leaves as `&str` ([`Provenance::sources`]), because everything downstream —
+/// glob matching, the `privacy_block` event's `path`, the typed error — crosses
+/// a protocol boundary where the canonical form is the payload. Narrowing
+/// construction is the invariant; String is still the currency at the seam.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Provenance {
-    sources: BTreeSet<String>,
+    sources: BTreeSet<ProvenanceId>,
     /// Some contributing content had indeterminate origin: block fail-closed.
     unknown: bool,
 }
@@ -58,11 +69,11 @@ impl Provenance {
         }
     }
 
-    /// Provenance for content read from a single file at `path`.
+    /// Provenance for content read from the single file `path` names.
     #[must_use]
-    pub fn tainted_by(path: impl Into<String>) -> Self {
+    pub fn tainted_by(path: ProvenanceId) -> Self {
         let mut sources = BTreeSet::new();
-        sources.insert(path.into());
+        sources.insert(path);
         Self {
             sources,
             unknown: false,
@@ -102,15 +113,24 @@ impl Provenance {
         self.sources.is_empty() && !self.unknown
     }
 
-    /// The source paths, in deterministic (sorted) order.
+    /// The source paths in canonical form, in deterministic (sorted) order —
+    /// the seam where a minted identity becomes the `&str` boundary matching and
+    /// the `privacy_block` event consume.
     pub fn sources(&self) -> impl Iterator<Item = &str> {
-        self.sources.iter().map(String::as_str)
+        self.sources.iter().map(ProvenanceId::as_str)
     }
 
-    /// Whether `path` is one of this provenance's sources.
+    /// The source identities themselves, for a consumer that carries provenance
+    /// onward rather than matching on it — the MCP bridge, which re-tags a tool
+    /// result with the same ids the call was inspected under.
+    pub fn ids(&self) -> impl Iterator<Item = &ProvenanceId> {
+        self.sources.iter()
+    }
+
+    /// Whether `path` (in canonical form) is one of this provenance's sources.
     #[must_use]
     pub fn contains(&self, path: &str) -> bool {
-        self.sources.contains(path)
+        self.sources.iter().any(|s| s.as_str() == path)
     }
 
     /// Number of distinct sources.
@@ -151,10 +171,10 @@ pub struct ContextBlock {
 }
 
 impl ContextBlock {
-    /// A block read verbatim from `path`. Its provenance is `{path}`.
+    /// A block read verbatim from the file `path` names. Its provenance is
+    /// `{path}`.
     #[must_use]
-    pub fn from_file(path: impl Into<String>, content: impl Into<String>) -> Self {
-        let path = path.into();
+    pub fn from_file(path: ProvenanceId, content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             provenance: Provenance::tainted_by(path),
@@ -222,6 +242,7 @@ pub fn assembled_provenance(blocks: &[ContextBlock]) -> Provenance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
 
     #[test]
     fn empty_provenance_has_no_sources() {
@@ -233,7 +254,7 @@ mod tests {
 
     #[test]
     fn tainted_by_records_the_source() {
-        let p = Provenance::tainted_by("secrets/prod.env");
+        let p = Provenance::tainted_by(fixture_id("secrets/prod.env"));
         assert!(!p.is_empty());
         assert!(p.contains("secrets/prod.env"));
         assert_eq!(p.sources().collect::<Vec<_>>(), vec!["secrets/prod.env"]);
@@ -241,9 +262,9 @@ mod tests {
 
     #[test]
     fn merge_is_a_set_union_without_duplicates() {
-        let mut a = Provenance::tainted_by("a.txt");
-        a.merge(&Provenance::tainted_by("b.txt"));
-        a.merge(&Provenance::tainted_by("a.txt")); // duplicate ignored
+        let mut a = Provenance::tainted_by(fixture_id("a.txt"));
+        a.merge(&Provenance::tainted_by(fixture_id("b.txt")));
+        a.merge(&Provenance::tainted_by(fixture_id("a.txt"))); // duplicate ignored
         assert_eq!(a.len(), 2);
         // Deterministic, sorted order.
         assert_eq!(a.sources().collect::<Vec<_>>(), vec!["a.txt", "b.txt"]);
@@ -251,14 +272,15 @@ mod tests {
 
     #[test]
     fn union_folds_both_sides() {
-        let u = Provenance::tainted_by("x").union(&Provenance::tainted_by("y"));
+        let u =
+            Provenance::tainted_by(fixture_id("x")).union(&Provenance::tainted_by(fixture_id("y")));
         assert!(u.contains("x"));
         assert!(u.contains("y"));
     }
 
     #[test]
     fn a_file_block_carries_its_path_as_provenance() {
-        let b = ContextBlock::from_file("secrets/key.pem", "-----BEGIN KEY-----");
+        let b = ContextBlock::from_file(fixture_id("secrets/key.pem"), "-----BEGIN KEY-----");
         assert!(b.provenance().contains("secrets/key.pem"));
     }
 
@@ -272,7 +294,8 @@ mod tests {
     fn a_derived_summary_inherits_the_source_provenance() {
         // The BR-1 "derived verbatim" clause: a summary OF a boundary file is
         // itself boundary content, even though it shares no bytes with the file.
-        let original = ContextBlock::from_file("secrets/prod.env", "API_KEY=super-secret-xyzzy");
+        let original =
+            ContextBlock::from_file(fixture_id("secrets/prod.env"), "API_KEY=super-secret-xyzzy");
         let summary = original.derive("This file configures the production API credentials.");
         assert_eq!(summary.provenance(), original.provenance());
         assert!(summary.provenance().contains("secrets/prod.env"));
@@ -282,7 +305,7 @@ mod tests {
 
     #[test]
     fn a_chain_of_derivations_still_carries_the_original_source() {
-        let original = ContextBlock::from_file("secrets/a", "raw");
+        let original = ContextBlock::from_file(fixture_id("secrets/a"), "raw");
         let once = original.derive("summary");
         let twice = once.derive("summary of the summary");
         assert!(twice.provenance().contains("secrets/a"));
@@ -292,8 +315,8 @@ mod tests {
     fn assembled_provenance_unions_every_block() {
         let blocks = vec![
             ContextBlock::synthetic("system"),
-            ContextBlock::from_file("src/main.rs", "fn main() {}"),
-            ContextBlock::from_file("secrets/prod.env", "API_KEY=1"),
+            ContextBlock::from_file(fixture_id("src/main.rs"), "fn main() {}"),
+            ContextBlock::from_file(fixture_id("secrets/prod.env"), "API_KEY=1"),
         ];
         let prov = assembled_provenance(&blocks);
         assert_eq!(prov.len(), 2);
@@ -324,13 +347,13 @@ mod tests {
     #[test]
     fn unknown_is_monotonic_under_merge() {
         // Once any contributor is unknown, the union stays unknown (fail-closed).
-        let mut p = Provenance::tainted_by("src/main.rs");
+        let mut p = Provenance::tainted_by(fixture_id("src/main.rs"));
         assert!(!p.is_unknown());
         p.merge(&Provenance::unknown());
         assert!(p.is_unknown());
         assert!(p.contains("src/main.rs"), "known sources are retained");
         // Merging a clean provenance never clears the unknown bit.
-        p.merge(&Provenance::tainted_by("README.md"));
+        p.merge(&Provenance::tainted_by(fixture_id("README.md")));
         assert!(p.is_unknown());
     }
 

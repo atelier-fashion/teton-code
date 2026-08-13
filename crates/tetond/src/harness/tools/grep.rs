@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
+use teton_core::ProvenanceId;
 
 use super::glob::glob_match;
 use super::{opt_str_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome};
@@ -308,8 +309,15 @@ fn render_ranked(matches: &[&str], order: &[usize], capped: bool) -> String {
 }
 
 /// Recursively search text files under `dir`. `matched` accumulates the
-/// repo-relative paths of every file that produced at least one hit — the egress
-/// provenance of the result (REQ-544 C-1).
+/// repo-relative identity of every file that produced at least one hit — the
+/// egress provenance of the result (REQ-544 C-1).
+///
+/// REQ-571: the id is minted by [`ProvenanceId::from_resolved`] rather than by an
+/// inline `strip_prefix` + separator fixup. Same arithmetic, one implementation:
+/// the convention "every walker repeats this idiom correctly" is exactly what
+/// `read`/`edit` failed to hold, so the idiom is no longer copied. A file whose
+/// id cannot be minted surfaces nothing — untagged content is content egress
+/// could not judge.
 #[allow(clippy::too_many_arguments)]
 fn search(
     root: &Path,
@@ -318,7 +326,7 @@ fn search(
     ignore_case: bool,
     file_glob: Option<&str>,
     out: &mut Vec<String>,
-    matched: &mut BTreeSet<String>,
+    matched: &mut BTreeSet<ProvenanceId>,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -342,12 +350,13 @@ fn search(
             search(root, &path, needle, ignore_case, file_glob, out, matched);
             continue;
         }
-        let rel = match path.strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+        let id = match ProvenanceId::from_resolved(root, &path) {
+            Ok(id) => id,
             Err(_) => continue,
         };
+        let rel = id.as_str();
         if let Some(g) = file_glob {
-            if !glob_match(g, &rel) {
+            if !glob_match(g, rel) {
                 continue;
             }
         }
@@ -364,7 +373,7 @@ fn search(
                 line.to_owned()
             };
             if haystack.contains(needle) {
-                matched.insert(rel.clone());
+                matched.insert(id.clone());
                 out.push(format!("{rel}:{}: {}", i + 1, line.trim_end()));
                 if out.len() > MAX_MATCHES {
                     return;
@@ -377,6 +386,7 @@ fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
     use std::path::PathBuf;
 
     /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
@@ -446,7 +456,10 @@ mod tests {
         // result with that file — so the next remote turn is blocked at egress.
         let out = GrepTool.run(&ctx, &json!({ "pattern": "sk-live" }));
         assert!(!out.is_error);
-        assert_eq!(out.provenance, ToolProvenance::path("secrets/prod.env"));
+        assert_eq!(
+            out.provenance,
+            ToolProvenance::path(fixture_id("secrets/prod.env"))
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -974,7 +987,7 @@ mod tests {
         assert_eq!(refined.duty_error, None, "the fixture must reach the duty");
         assert_eq!(
             raw.provenance,
-            ToolProvenance::paths(["hit.rs", "secrets/prod.env"]),
+            ToolProvenance::paths([fixture_id("hit.rs"), fixture_id("secrets/prod.env")]),
             "the fixture must match exactly the two files"
         );
 

@@ -34,6 +34,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
+use teton_core::ProvenanceId;
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
     BlockDetail, ByteStream, HttpMethod, TransportRequest, TransportResponse,
@@ -421,13 +422,32 @@ const PATH_KEYS: &[&str] = &[
 
 /// Recursively collect path-shaped string values into `prov`. `key` is the object
 /// key the current `value` sits under, when any.
+///
+/// ## An un-mintable claim fails toward taint (REQ-571 ADR-A/ADR-D)
+///
+/// [`ProvenanceId::claimed`] is the constructor for a path a third party
+/// *asserted* — a remote MCP server names what it touched and nothing on this
+/// machine can confirm it. When the assertion cannot be minted at all (it is
+/// absolute, or retains a `..`), the honest answer is not "there is no source
+/// here": an absolute argument may well name a boundary file (`/repo/secrets/x`),
+/// and before this it was tagged verbatim and then silently matched no
+/// repo-relative glob — the BR-2 hole, on the MCP path. So the whole call's
+/// provenance is marked **unknown**, which egress fail-closes exactly as it does
+/// a `shell` result. Dropping the value instead would be failing open.
+///
+/// This bites only when a boundary is configured — the inspector runs nowhere
+/// else — and the cost of the conservative answer is a session pinned local, the
+/// same posture REQ-544 C-1 already takes.
 fn collect_paths(key: Option<&str>, value: &Value, prov: &mut Provenance) {
     match value {
         Value::String(s) => {
             let key_is_path =
                 key.is_some_and(|k| PATH_KEYS.contains(&k.to_ascii_lowercase().as_str()));
             if key_is_path || looks_like_path(s) {
-                prov.merge(&Provenance::tainted_by(s.clone()));
+                match ProvenanceId::claimed(s) {
+                    Ok(id) => prov.merge(&Provenance::tainted_by(id)),
+                    Err(_) => prov.mark_unknown(),
+                }
             }
         }
         Value::Array(items) => {

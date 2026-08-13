@@ -758,6 +758,7 @@ impl Default for SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
 
     #[test]
     fn structured_session_requires_a_phase() {
@@ -1041,7 +1042,7 @@ mod tests {
             text: text.to_owned(),
             provenance: Provenance::Tool {
                 tool: tool.to_owned(),
-                provenance: ToolProvenance::path(path),
+                provenance: ToolProvenance::path(fixture_id(path)),
             },
         }
     }
@@ -1137,7 +1138,7 @@ mod tests {
         let mut ctx = ContextManager::new("head", 1_000_000).with_budget_bytes(2_000);
         ctx.push_tool_result(
             "read",
-            Some("secrets/prod.env".to_owned()),
+            Some(fixture_id("secrets/prod.env")),
             "x".repeat(1_500),
         );
         ctx.push_user("x".repeat(1_500));
@@ -1157,7 +1158,7 @@ mod tests {
                 .retained()
                 .dropped_provenance()
                 .sources()
-                .contains("secrets/prod.env"),
+                .contains(&fixture_id("secrets/prod.env")),
             "the next prompt would carry boundary-derived content with nothing \
              to scope it"
         );
@@ -1167,7 +1168,7 @@ mod tests {
                 Provenance::Tool {
                     provenance: ToolProvenance::Sources(paths),
                     ..
-                } if paths.contains("secrets/prod.env")
+                } if paths.contains(&fixture_id("secrets/prod.env"))
             )),
             "fixture: the boundary block really was dropped, so the provenance \
              above can only have come from the accumulator"

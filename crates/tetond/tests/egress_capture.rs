@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
+use teton_core::ProvenanceId;
 use teton_protocol::events::{Event, PrivacyAction, PrivacyBlock};
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::transport::{
@@ -32,6 +33,16 @@ use teton_providers::transport::{
 
 use tetond::egress::provenance::{assembled_provenance, ContextBlock};
 use tetond::egress::{Egress, EgressContext, EgressError, PrivacyEventSink, Provenance};
+
+/// Mint the identity of a fixture file (REQ-571 ADR-A).
+///
+/// The provenance channel accepts only a [`ProvenanceId`], and an integration
+/// test cannot reach the crate-internal fixture helper, so each test binary
+/// states its own. A fixture naming a path that is not an identity is a broken
+/// fixture, hence the panic.
+fn source_id(path: &str) -> ProvenanceId {
+    ProvenanceId::claimed(path).expect("fixture path must be a provenance id")
+}
 
 /// Secrets that must never appear in captured egress. Distinct markers so a leak
 /// is unambiguous.
@@ -134,8 +145,8 @@ async fn scripted_session_leaks_zero_boundary_bytes_and_blocks_deliberate_egress
         "https://api.anthropic.com/v1/messages",
         &[
             ContextBlock::synthetic("You are Teton Code."),
-            ContextBlock::from_file("src/main.rs", "fn main() { println!(\"hi\"); }"),
-            ContextBlock::from_file("README.md", "# Teton Code"),
+            ContextBlock::from_file(source_id("src/main.rs"), "fn main() { println!(\"hi\"); }"),
+            ContextBlock::from_file(source_id("README.md"), "# Teton Code"),
         ],
     );
     let r1 = egress.send(req, &prov, &ctx).await;
@@ -147,8 +158,8 @@ async fn scripted_session_leaks_zero_boundary_bytes_and_blocks_deliberate_egress
         "https://api.anthropic.com/v1/messages",
         &[
             ContextBlock::synthetic("You are Teton Code."),
-            ContextBlock::from_file("src/main.rs", "fn main() {}"),
-            ContextBlock::from_file("secrets/prod.env", SECRET_ENV),
+            ContextBlock::from_file(source_id("src/main.rs"), "fn main() {}"),
+            ContextBlock::from_file(source_id("secrets/prod.env"), SECRET_ENV),
         ],
     );
     let r2 = egress.send(req, &prov, &ctx).await;
@@ -171,7 +182,7 @@ async fn scripted_session_leaks_zero_boundary_bytes_and_blocks_deliberate_egress
     }
 
     // Turn 3 — provenance survives DERIVATION: a summary of a boundary file.
-    let secret_block = ContextBlock::from_file("secrets/config.yaml", SECRET_YAML);
+    let secret_block = ContextBlock::from_file(source_id("secrets/config.yaml"), SECRET_YAML);
     let summary = secret_block.derive("Summary: this file holds the production DB credentials.");
     assert!(
         !summary.content().contains("hunter2"),
@@ -239,7 +250,10 @@ async fn error_and_event_paths_exclude_boundary_content() {
 
     let (req, prov) = assemble(
         "https://api.anthropic.com/v1/messages",
-        &[ContextBlock::from_file("secrets/prod.env", SECRET_ENV)],
+        &[ContextBlock::from_file(
+            source_id("secrets/prod.env"),
+            SECRET_ENV,
+        )],
     );
     let err = egress.send(req, &prov, &ctx).await.expect_err("must block");
 
@@ -269,7 +283,7 @@ async fn adapter_seam_is_enforced() {
     let egress = Egress::new(capture.clone(), local_only_boundaries(), sink.clone());
 
     let scoped = egress.scoped(
-        Provenance::tainted_by("secrets/prod.env"),
+        Provenance::tainted_by(source_id("secrets/prod.env")),
         EgressContext::new("anthropic"),
     );
     let request = TransportRequest {
@@ -352,7 +366,10 @@ async fn a_full_permission_level_still_blocks_boundary_content_and_still_reports
     // cannot be satisfied by an egress that refuses everything.
     let (req, prov) = assemble(
         "https://api.anthropic.com/v1/messages",
-        &[ContextBlock::from_file("src/main.rs", "fn main() {}")],
+        &[ContextBlock::from_file(
+            source_id("src/main.rs"),
+            "fn main() {}",
+        )],
     );
     assert!(
         egress.send(req, &prov, &ctx).await.is_ok(),
@@ -362,7 +379,10 @@ async fn a_full_permission_level_still_blocks_boundary_content_and_still_reports
     // A boundary read is still blocked, at the most permissive level there is.
     let (req, prov) = assemble(
         "https://api.anthropic.com/v1/messages",
-        &[ContextBlock::from_file("secrets/prod.env", SECRET_ENV)],
+        &[ContextBlock::from_file(
+            source_id("secrets/prod.env"),
+            SECRET_ENV,
+        )],
     );
     let blocked = egress.send(req, &prov, &ctx).await;
     assert!(
@@ -375,7 +395,7 @@ async fn a_full_permission_level_still_blocks_boundary_content_and_still_reports
 
     // A derived summary is still blocked, so the level did not weaken
     // provenance either.
-    let derived = ContextBlock::from_file("secrets/config.yaml", SECRET_YAML)
+    let derived = ContextBlock::from_file(source_id("secrets/config.yaml"), SECRET_YAML)
         .derive("Summary: this file holds the production DB credentials.");
     let (req, prov) = assemble(
         "https://api.anthropic.com/v1/messages",

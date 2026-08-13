@@ -116,6 +116,7 @@ pub fn inspect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
     use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 
     fn boundary(glob: &str, mode: BoundaryMode) -> PrivacyBoundary {
@@ -141,8 +142,8 @@ mod tests {
     fn provenance_outside_every_boundary_is_allowed() {
         let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
         let m = matcher(&bs);
-        let prov =
-            Provenance::tainted_by("src/main.rs").union(&Provenance::tainted_by("README.md"));
+        let prov = Provenance::tainted_by(fixture_id("src/main.rs"))
+            .union(&Provenance::tainted_by(fixture_id("README.md")));
         assert_eq!(
             inspect(&prov, &m, PrivacyAction::ReroutedToLocal),
             Inspection::Allowed
@@ -153,7 +154,7 @@ mod tests {
     fn a_local_only_source_is_blocked_with_its_path() {
         let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
         let m = matcher(&bs);
-        let prov = Provenance::tainted_by("secrets/prod.env");
+        let prov = Provenance::tainted_by(fixture_id("secrets/prod.env"));
         let out = inspect(&prov, &m, PrivacyAction::ReroutedToLocal);
         let v = out.violation().expect("blocked");
         assert_eq!(v.path, "secrets/prod.env");
@@ -164,9 +165,9 @@ mod tests {
     fn one_boundary_source_among_many_safe_ones_still_blocks() {
         let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
         let m = matcher(&bs);
-        let prov = Provenance::tainted_by("src/a.rs")
-            .union(&Provenance::tainted_by("secrets/leak.txt"))
-            .union(&Provenance::tainted_by("src/b.rs"));
+        let prov = Provenance::tainted_by(fixture_id("src/a.rs"))
+            .union(&Provenance::tainted_by(fixture_id("secrets/leak.txt")))
+            .union(&Provenance::tainted_by(fixture_id("src/b.rs")));
         let out = inspect(&prov, &m, PrivacyAction::ReroutedToLocal);
         assert_eq!(
             out.violation().map(|v| v.path.as_str()),
@@ -182,7 +183,7 @@ mod tests {
         // payload — so it is not the redactor that would unblock this arm.
         let bs = vec![boundary("vendor/**", BoundaryMode::RedactThenRemote)];
         let m = matcher(&bs);
-        let prov = Provenance::tainted_by("vendor/private.json");
+        let prov = Provenance::tainted_by(fixture_id("vendor/private.json"));
         assert!(inspect(&prov, &m, PrivacyAction::ReroutedToLocal).is_blocked());
     }
 
@@ -192,8 +193,8 @@ mod tests {
         // first is always reported, run after run.
         let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
         let m = matcher(&bs);
-        let prov =
-            Provenance::tainted_by("secrets/z.env").union(&Provenance::tainted_by("secrets/a.env"));
+        let prov = Provenance::tainted_by(fixture_id("secrets/z.env"))
+            .union(&Provenance::tainted_by(fixture_id("secrets/a.env")));
         for _ in 0..8 {
             let out = inspect(&prov, &m, PrivacyAction::ReroutedToLocal);
             assert_eq!(
@@ -207,7 +208,7 @@ mod tests {
     fn action_is_carried_through_to_the_violation() {
         let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
         let m = matcher(&bs);
-        let prov = Provenance::tainted_by("secrets/x");
+        let prov = Provenance::tainted_by(fixture_id("secrets/x"));
         let out = inspect(&prov, &m, PrivacyAction::Stripped);
         assert_eq!(out.violation().unwrap().action, PrivacyAction::Stripped);
     }
@@ -216,7 +217,7 @@ mod tests {
     fn no_boundaries_configured_allows_everything() {
         let bs: Vec<PrivacyBoundary> = Vec::new();
         let m = matcher(&bs);
-        let prov = Provenance::tainted_by("anything/at/all");
+        let prov = Provenance::tainted_by(fixture_id("anything/at/all"));
         assert_eq!(
             inspect(&prov, &m, PrivacyAction::ReroutedToLocal),
             Inspection::Allowed
@@ -245,7 +246,7 @@ mod tests {
         // shell contribution alone is enough to fail closed.
         let bs = vec![boundary("secrets/**", BoundaryMode::LocalOnly)];
         let m = matcher(&bs);
-        let mut prov = Provenance::tainted_by("src/main.rs");
+        let mut prov = Provenance::tainted_by(fixture_id("src/main.rs"));
         prov.mark_unknown();
         assert!(inspect(&prov, &m, PrivacyAction::ReroutedToLocal).is_blocked());
     }

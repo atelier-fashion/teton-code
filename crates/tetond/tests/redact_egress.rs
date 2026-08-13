@@ -66,6 +66,7 @@ use futures::stream;
 use teton_core::category::{Category as CoreCategory, CategoryTable};
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_core::policy::ProviderHealth;
+use teton_core::ProvenanceId;
 use teton_inference::{Completion, Engine, EngineError, GenParams};
 use teton_protocol::events::{
     BlockCause, Event, FindingKind as WireFindingKind, PrivacyAction, PrivacyBlock,
@@ -88,6 +89,16 @@ use tetond::egress::{Egress, EgressContext, EgressError, NoopSink, PrivacyEventS
 use tetond::harness::redact::{scan, REDACTION_OUTPUT_CONTRACT};
 use tetond::harness::{DutyRoute, REDACT_DUTY};
 use tetond::router::Router;
+
+/// Mint the identity of a fixture file (REQ-571 ADR-A).
+///
+/// The provenance channel accepts only a [`ProvenanceId`], and an integration
+/// test cannot reach the crate-internal fixture helper, so each test binary
+/// states its own. A fixture naming a path that is not an identity is a broken
+/// fixture, hence the panic.
+fn source_id(path: &str) -> ProvenanceId {
+    ProvenanceId::claimed(path).expect("fixture path must be a provenance id")
+}
 
 // ===========================================================================
 // Sentinels
@@ -493,7 +504,7 @@ fn assemble(blocks: &[ContextBlock]) -> (TransportRequest, Provenance) {
 fn clean_provenance_payload(text: &str) -> (TransportRequest, Provenance) {
     assemble(&[
         ContextBlock::synthetic("You are Teton Code."),
-        ContextBlock::from_file("src/main.rs", text),
+        ContextBlock::from_file(source_id("src/main.rs"), text),
     ])
 }
 
@@ -601,7 +612,7 @@ async fn a_planted_credential_with_clean_provenance_is_blocked_and_the_event_nam
     // --- AC-11: the ordering, by scanner call count ------------------------
     let (refused, refused_provenance) = assemble(&[
         ContextBlock::synthetic("You are Teton Code."),
-        ContextBlock::from_file("secrets/prod.env", BOUNDARY_SECRET),
+        ContextBlock::from_file(source_id("secrets/prod.env"), BOUNDARY_SECRET),
     ]);
     let err = egress
         .send(refused, &refused_provenance, &ctx())

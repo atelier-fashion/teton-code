@@ -287,6 +287,7 @@ fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
 
     use std::sync::{Arc, Mutex};
 
@@ -595,7 +596,7 @@ mod tests {
             "find the parser",
             "grep `parse`",
             &matches(),
-            &Provenance::tainted_by("src/a.rs".to_owned()),
+            &Provenance::tainted_by(fixture_id("src/a.rs")),
         )
         .await
         .expect("clean matches rank remotely");
@@ -623,7 +624,7 @@ mod tests {
             "find the key",
             "grep `API_KEY`",
             &offered,
-            &Provenance::tainted_by("secrets/prod.env".to_owned()),
+            &Provenance::tainted_by(fixture_id("secrets/prod.env")),
         )
         .await
         .expect_err("boundary content must not be ranked remotely");

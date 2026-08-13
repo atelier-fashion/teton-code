@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
+use teton_core::ProvenanceId;
 use teton_protocol::events::CostRecord;
 use teton_protocol::Phase;
 use teton_providers::transport::{
@@ -34,6 +35,16 @@ use teton_providers::transport::{
 
 use tetond::cost::{CostAttribution, CostEventSink, CostLedger, PriceTable};
 use tetond::egress::{Egress, EgressContext, EgressError, NoopSink, Provenance};
+
+/// Mint the identity of a fixture file (REQ-571 ADR-A).
+///
+/// The provenance channel accepts only a [`ProvenanceId`], and an integration
+/// test cannot reach the crate-internal fixture helper, so each test binary
+/// states its own. A fixture naming a path that is not an identity is a broken
+/// fixture, hence the panic.
+fn source_id(path: &str) -> ProvenanceId {
+    ProvenanceId::claimed(path).expect("fixture path must be a provenance id")
+}
 
 /// A distinctive secret the harness sends in request bodies; it must never turn
 /// up in any ledger row (BR-7).
@@ -223,7 +234,7 @@ async fn a_privacy_blocked_call_is_never_billed() {
     let err = egress
         .send(
             request(SECRET),
-            &Provenance::tainted_by("secrets/prod.env"),
+            &Provenance::tainted_by(source_id("secrets/prod.env")),
             &ctx,
         )
         .await

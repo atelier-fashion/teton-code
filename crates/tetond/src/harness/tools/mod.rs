@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use teton_core::ProvenanceId;
 
 use super::context::ToolProvenance;
 use super::duty::DutyRoute;
@@ -69,10 +70,26 @@ impl ToolContext {
     /// checked. `.`/`..` are collapsed lexically, and existing paths are
     /// canonicalized so a symlink pointing outside the root is caught too.
     ///
+    /// # One call yields both halves of the identity (REQ-571 ADR-B)
+    ///
+    /// The return is a [`Resolved`], not a bare path: the file the tool opens and
+    /// the [`ProvenanceId`] the privacy boundary matches on are derived here,
+    /// together, from the same canonical value — so the gate decides on the parse
+    /// the executor used and the two cannot drift (LESSON-494). A tool that
+    /// resolved a path and then tagged provenance from its own argument is not a
+    /// mistake this signature permits.
+    ///
     /// # Errors
     /// Returns [`ToolError::Jail`] when the resolved path is not inside the root
-    /// (or the root itself cannot be resolved).
-    pub fn resolve(&self, raw: &str) -> Result<PathBuf, ToolError> {
+    /// (or the root itself cannot be resolved), and — the same refusal, one step
+    /// later — when the resolved path has no repo-relative identity to mint.
+    ///
+    /// **There is no fallback to `raw`, ever** (ADR-B). A mint failure means the
+    /// resolved path is not a file under the root, which is precisely the case
+    /// where substituting the caller's own string would be worst: it is the
+    /// attacker-controlled value, and the boundary would then be matched against
+    /// something the daemon never opened. The operation is refused instead.
+    pub fn resolve(&self, raw: &str) -> Result<Resolved, ToolError> {
         let root = self
             .repo_root
             .canonicalize()
@@ -94,8 +111,33 @@ impl ToolContext {
                 "path `{raw}` escapes the repo root"
             )));
         }
-        Ok(checked)
+        // The `starts_with` above is exactly `strip_prefix`'s precondition, so the
+        // only reachable mint failure is a resolved path that names no file under
+        // the root — `.`, or the root itself. The message stays content-free and
+        // repeats only what the caller already supplied.
+        let provenance = ProvenanceId::from_resolved(&root, &checked)
+            .map_err(|_| ToolError::jail(format!("path `{raw}` names no file in the repo root")))?;
+        Ok(Resolved {
+            path: checked,
+            provenance,
+        })
     }
+}
+
+/// A path the jail accepted, together with the identity egress will judge it by
+/// (REQ-571 ADR-B).
+///
+/// The two fields are produced by one [`ToolContext::resolve`] call and are two
+/// views of one canonical value: `path` is what the tool opens, `provenance` is
+/// what a privacy boundary matches. Returning them as a pair is what makes
+/// "the gate decides on the parse the executor used" structural — there is no
+/// intermediate state in which a tool holds one without the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// The canonical, in-jail path to open.
+    pub path: PathBuf,
+    /// The repo-relative identity of that path, for egress provenance.
+    pub provenance: ProvenanceId,
 }
 
 /// Collapse `.` and `..` components lexically, without touching the filesystem.
@@ -203,12 +245,17 @@ impl ToolOutcome {
         self
     }
 
-    /// Tag this outcome with the set of repo-relative `paths` it read/enumerated.
+    /// Tag this outcome with the identities of the files it read/enumerated.
+    ///
+    /// `paths` are [`ProvenanceId`]s — minted by [`ToolContext::resolve`] for the
+    /// file a tool opened, or by [`ProvenanceId::from_resolved`] for each entry a
+    /// walker surfaced. A raw request string is not accepted and cannot be made
+    /// into one implicitly (REQ-571 ADR-A), which is what stops the next tool
+    /// added here from re-opening the hole `read`/`edit` had.
     #[must_use]
-    pub fn with_paths<I, S>(self, paths: I) -> Self
+    pub fn with_paths<I>(self, paths: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = ProvenanceId>,
     {
         self.with_provenance(ToolProvenance::paths(paths))
     }
@@ -647,7 +694,59 @@ mod tests {
         std::fs::write(root.join("a.txt"), "hi").unwrap();
         let ctx = ToolContext::new(&root);
         let resolved = ctx.resolve("a.txt").unwrap();
-        assert!(resolved.starts_with(root.canonicalize().unwrap()));
+        assert!(resolved.path.starts_with(root.canonicalize().unwrap()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-571 ADR-B: one call, one identity, no drift.**
+    ///
+    /// Every spelling of one file resolves to the same canonical path *and* the
+    /// same [`ProvenanceId`] — the value a boundary glob is matched against. The
+    /// tool-layer half of BR-3: `teton-core` proves the arithmetic, this proves
+    /// that the daemon's canonicalization feeds it, which is what the
+    /// `..`-traversing spelling needs.
+    #[test]
+    fn every_spelling_of_one_file_resolves_to_one_identity() {
+        let root = temp_root("spell");
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/prod.env"), "API_KEY=1\n").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let ctx = ToolContext::new(&root);
+
+        let absolute = canonical_root.join("secrets/prod.env");
+        let absolute = absolute.to_string_lossy().into_owned();
+        for spelling in [
+            "secrets/prod.env",
+            "./secrets/prod.env",
+            ".//secrets/prod.env",
+            "././secrets/prod.env",
+            &absolute,
+            "src/../secrets/prod.env",
+        ] {
+            let resolved = ctx
+                .resolve(spelling)
+                .unwrap_or_else(|e| panic!("spelling {spelling:?} must resolve: {e}"));
+            assert_eq!(
+                resolved.provenance.as_str(),
+                "secrets/prod.env",
+                "spelling {spelling:?} minted a divergent identity"
+            );
+            assert_eq!(resolved.path, canonical_root.join("secrets/prod.env"));
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **ADR-B, the no-fallback rule.** A path that resolves to no file under the
+    /// root has no identity, and the answer is a refusal — never the caller's own
+    /// string standing in for one.
+    #[test]
+    fn a_path_with_no_repo_relative_identity_is_refused() {
+        let root = temp_root("noid");
+        let ctx = ToolContext::new(&root);
+        // The root itself: inside the jail, but it names no file to attribute.
+        let err = ctx.resolve(".").unwrap_err();
+        assert!(matches!(err, ToolError::Jail(_)), "{err:?}");
+        assert!(err.to_string().contains("names no file"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
 

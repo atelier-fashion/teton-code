@@ -1056,6 +1056,7 @@ fn classify_reqwest_error(error: &reqwest::Error) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_id;
     use std::sync::Mutex;
 
     /// A `Transport` that records what it was asked to send and returns an empty
@@ -1116,7 +1117,7 @@ mod tests {
         let inner = CaptureTransport::default();
         let sent = inner.sent.clone();
         let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()));
-        let prov = Provenance::tainted_by("src/main.rs");
+        let prov = Provenance::tainted_by(fixture_id("src/main.rs"));
         let ctx = EgressContext::new("anthropic");
         let resp = egress
             .send(a_request("public code"), &prov, &ctx)
@@ -1136,7 +1137,7 @@ mod tests {
             boundaries(),
             Arc::new(CapturingSink::default()),
         );
-        let prov = Provenance::tainted_by("secrets/prod.env");
+        let prov = Provenance::tainted_by(fixture_id("secrets/prod.env"));
         let ctx = EgressContext::new("anthropic");
         let err = egress
             .send(a_request("API_KEY=super-secret-xyzzy"), &prov, &ctx)
@@ -1162,7 +1163,7 @@ mod tests {
     async fn a_block_emits_a_privacy_block_event() {
         let sink = Arc::new(CapturingSink::default());
         let egress = Egress::new(CaptureTransport::default(), boundaries(), sink.clone());
-        let prov = Provenance::tainted_by("secrets/prod.env");
+        let prov = Provenance::tainted_by(fixture_id("secrets/prod.env"));
         let ctx = EgressContext::new("deepseek").with_session("sess-under-test");
         let _ = egress.send(a_request("secret"), &prov, &ctx).await;
         let events = sink.events.lock().unwrap();
@@ -1177,7 +1178,7 @@ mod tests {
         let sink = Arc::new(CapturingSink::default());
         let egress = Egress::new(CaptureTransport::default(), boundaries(), sink.clone());
         let scoped = egress.scoped(
-            Provenance::tainted_by("secrets/prod.env"),
+            Provenance::tainted_by(fixture_id("secrets/prod.env")),
             EgressContext::new("anthropic"),
         );
         // Adapter-style call through the object-safe seam.
@@ -1320,7 +1321,7 @@ mod tests {
         let err = egress
             .send(
                 a_request("API_KEY=super-secret-xyzzy"),
-                &Provenance::tainted_by("secrets/prod.env"),
+                &Provenance::tainted_by(fixture_id("secrets/prod.env")),
                 &ctx,
             )
             .await
@@ -1340,7 +1341,7 @@ mod tests {
         egress
             .send(
                 a_request("public code"),
-                &Provenance::tainted_by("src/main.rs"),
+                &Provenance::tainted_by(fixture_id("src/main.rs")),
                 &ctx,
             )
             .await

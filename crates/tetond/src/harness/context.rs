@@ -35,6 +35,8 @@
 
 use std::collections::BTreeSet;
 
+use teton_core::ProvenanceId;
+
 use super::compact::{
     compact_prompt, read_compaction, under_pressure, worth_compacting, worth_compacting_again,
     Compaction,
@@ -50,11 +52,23 @@ use super::duty::DutyRoute;
 /// reports the repo-relative paths it read/enumerated ([`ToolProvenance::Sources`]),
 /// or, when its touched files are unknowable (a `shell` command runs arbitrary
 /// code), it reports [`ToolProvenance::Unknown`], which egress fail-closes.
+///
+/// # Only a minted identity may enter (REQ-571 ADR-A)
+///
+/// The element type is [`ProvenanceId`], not `String`, and there is no
+/// conversion from one to the other. Before REQ-571 this channel accepted
+/// anything `Into<String>`, so "these are repo-relative paths" was a doc comment:
+/// `grep`/`glob` happened to pass `strip_prefix(root)` output while `read`/`edit`
+/// happened to pass the model's own request argument, and both type-checked
+/// identically — which is how `read` came to tag `/abs/repo/secrets/x` or
+/// `./secrets/x`, neither of which a `secrets/**` boundary glob matches. Tagging
+/// a raw request string is now a compile error rather than a review catch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolProvenance {
-    /// The tool surfaced content derived from these repo-relative paths. An empty
-    /// set means it touched no repo file (a pure computation, a benign status).
-    Sources(BTreeSet<String>),
+    /// The tool surfaced content derived from these repo-relative identities. An
+    /// empty set means it touched no repo file (a pure computation, a benign
+    /// status).
+    Sources(BTreeSet<ProvenanceId>),
     /// The tool's touched files cannot be determined (e.g. `shell`): fail-closed
     /// at egress whenever any boundary is configured.
     Unknown,
@@ -67,24 +81,29 @@ impl ToolProvenance {
         ToolProvenance::Sources(BTreeSet::new())
     }
 
-    /// Provenance for a single touched `path`.
+    /// Provenance for a single touched file, named by its minted identity.
     #[must_use]
-    pub fn path(path: impl Into<String>) -> Self {
+    pub fn path(path: ProvenanceId) -> Self {
         let mut set = BTreeSet::new();
-        set.insert(path.into());
+        set.insert(path);
         ToolProvenance::Sources(set)
     }
 
-    /// Provenance for a set of touched paths.
+    /// Provenance for a set of touched files.
+    ///
+    /// The set dedupes by identity, so two spellings of one file occupy one slot
+    /// rather than two.
     #[must_use]
-    pub fn paths<I, S>(paths: I) -> Self
+    pub fn paths<I>(paths: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = ProvenanceId>,
     {
-        ToolProvenance::Sources(paths.into_iter().map(Into::into).collect())
+        ToolProvenance::Sources(paths.into_iter().collect())
     }
 }
+
+#[cfg(test)]
+pub(crate) use crate::fixture_id;
 
 /// Where a piece of context came from — the basis for egress provenance tagging
 /// (BR-1).
@@ -204,8 +223,8 @@ pub struct PreparedPrompt {
 /// crossed silently.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DroppedProvenance {
-    /// Repo-relative paths the forgotten blocks' tools touched.
-    sources: BTreeSet<String>,
+    /// Repo-relative identities the forgotten blocks' tools touched.
+    sources: BTreeSet<ProvenanceId>,
     /// Whether any forgotten block carried [`ToolProvenance::Unknown`].
     ///
     /// Beside the set rather than replacing it, because "unknown" and "these
@@ -235,9 +254,9 @@ impl DroppedProvenance {
         self.unknown |= other.unknown;
     }
 
-    /// The paths forgotten blocks touched.
+    /// The identities forgotten blocks touched.
     #[must_use]
-    pub fn sources(&self) -> &BTreeSet<String> {
+    pub fn sources(&self) -> &BTreeSet<ProvenanceId> {
         &self.sources
     }
 
@@ -665,11 +684,11 @@ impl ContextManager {
 
     /// Append a tool result, tagged with the tool and (optionally) the single
     /// file it concerns. A convenience over [`ContextManager::push_tool_result_prov`]:
-    /// `None` → no file provenance, `Some(p)` → the single touched path `p`.
+    /// `None` → no file provenance, `Some(id)` → the single touched file `id`.
     pub fn push_tool_result(
         &mut self,
         tool: impl Into<String>,
-        path: Option<String>,
+        path: Option<ProvenanceId>,
         text: impl Into<String>,
     ) {
         let provenance = match path {
@@ -1701,7 +1720,7 @@ mod tests {
         let mut ctx = ContextManager::new("SYSTEM", 10_000);
         ctx.push_user("hello");
         ctx.push_model("{\"tool\":\"read\"}");
-        ctx.push_tool_result("read", Some("a.rs".to_owned()), "file body");
+        ctx.push_tool_result("read", Some(fixture_id("a.rs")), "file body");
 
         let mut hook = RecordingProvenanceHook::default();
         let prompt = ctx.assemble(&mut hook);
@@ -1718,7 +1737,7 @@ mod tests {
             hook.seen[3],
             Provenance::Tool {
                 tool: "read".to_owned(),
-                provenance: ToolProvenance::path("a.rs"),
+                provenance: ToolProvenance::path(fixture_id("a.rs")),
             }
         );
     }
@@ -2875,10 +2894,10 @@ mod tests {
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
         ctx.push_tool_result(
             "read",
-            Some("secrets/prod.env".to_owned()),
+            Some(fixture_id("secrets/prod.env")),
             "K=".to_owned() + &"1".repeat(1_000),
         );
-        ctx.push_tool_result("read", Some("src/lib.rs".to_owned()), "x".repeat(1_000));
+        ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "x".repeat(1_000));
         ctx.push_user("y".repeat(1_000));
         ctx.push_user("and now?");
         assert!(ctx.under_compaction_pressure());
@@ -2892,7 +2911,10 @@ mod tests {
                 assert_eq!(tool, "compact");
                 assert_eq!(
                     provenance,
-                    &ToolProvenance::paths(["secrets/prod.env", "src/lib.rs"])
+                    &ToolProvenance::paths([
+                        fixture_id("secrets/prod.env"),
+                        fixture_id("src/lib.rs")
+                    ])
                 );
             }
             other => panic!("the replacement must carry tool provenance, got {other:?}"),
@@ -2922,7 +2944,7 @@ mod tests {
         ctx.push_user("y".repeat(1_500));
         // Retained, and NOT in the forget set — but the duty is shown it, so its
         // paragraph may describe it.
-        ctx.push_tool_result("read", Some("secrets/prod.env".to_owned()), "K=hunter2");
+        ctx.push_tool_result("read", Some(fixture_id("secrets/prod.env")), "K=hunter2");
         ctx.push_user("and now?");
         assert!(ctx.under_compaction_pressure());
 
@@ -2933,7 +2955,7 @@ mod tests {
         match &ctx.blocks()[0].provenance {
             Provenance::Tool { provenance, .. } => assert_eq!(
                 provenance,
-                &ToolProvenance::paths(["secrets/prod.env"]),
+                &ToolProvenance::paths([fixture_id("secrets/prod.env")]),
                 "the summary was written from a prompt containing the boundary \
                  file and came out with clean provenance"
             ),
@@ -3005,7 +3027,7 @@ mod tests {
     async fn a_compaction_of_unknown_provenance_stays_unknown() {
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
         ctx.push_tool_result_prov("shell", ToolProvenance::Unknown, "x".repeat(1_000));
-        ctx.push_tool_result("read", Some("src/lib.rs".to_owned()), "y".repeat(1_000));
+        ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "y".repeat(1_000));
         ctx.push_user("z".repeat(1_000));
         ctx.push_user("and now?");
 
@@ -3073,7 +3095,7 @@ mod tests {
         let mut ctx = ContextManager::new("SYSTEM HEAD ONE", 10_000);
         ctx.push_user("what is in a.rs?");
         ctx.push_model("let me read it");
-        ctx.push_tool_result("read", Some("a.rs".to_owned()), "fn main() {}");
+        ctx.push_tool_result("read", Some(fixture_id("a.rs")), "fn main() {}");
         ctx.into_retained().into_blocks()
     }
 
@@ -3137,7 +3159,7 @@ mod tests {
         let mut first = ContextManager::new("HEAD", 10_000);
         first.push_user("read the config");
         first.push_model("reading");
-        first.push_tool_result("read", Some("src/lib.rs".to_owned()), "code");
+        first.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
         first.push_tool_result_prov("shell", ToolProvenance::Unknown, "ran a command");
         let before: Vec<Provenance> = first
             .blocks()
@@ -3283,12 +3305,16 @@ mod tests {
         ctx.push_user("what is in the production config?");
         ctx.push_tool_result(
             "read",
-            Some("secrets/prod.env".to_owned()),
+            Some(fixture_id("secrets/prod.env")),
             format!("API_KEY=1 {}", "x".repeat(1_000)),
         );
         ctx.push_model("It holds the production API key.");
         for i in 0..4 {
-            ctx.push_tool_result("read", Some(format!("src/{i}.rs")), "x".repeat(1_000));
+            ctx.push_tool_result(
+                "read",
+                Some(fixture_id(&format!("src/{i}.rs"))),
+                "x".repeat(1_000),
+            );
         }
         assert!(context_provenance(&ctx).contains("secrets/prod.env"));
 
@@ -3301,7 +3327,7 @@ mod tests {
         assert!(
             ctx.dropped_provenance()
                 .sources()
-                .contains("secrets/prod.env"),
+                .contains(&fixture_id("secrets/prod.env")),
             "the dropped block's provenance died with it"
         );
         assert!(
@@ -3318,7 +3344,7 @@ mod tests {
     #[test]
     fn a_dropped_unknown_result_still_fails_the_context_closed() {
         let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
-        ctx.push_tool_result("read", Some("src/lib.rs".to_owned()), "x".repeat(1_000));
+        ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "x".repeat(1_000));
         ctx.push_tool_result_prov("shell", ToolProvenance::Unknown, "x".repeat(1_000));
         for _ in 0..4 {
             ctx.push_user("x".repeat(1_000));
@@ -3326,7 +3352,10 @@ mod tests {
         ctx.truncate_to_budget();
 
         assert!(ctx.dropped_provenance().is_unknown());
-        assert!(ctx.dropped_provenance().sources().contains("src/lib.rs"));
+        assert!(ctx
+            .dropped_provenance()
+            .sources()
+            .contains(&fixture_id("src/lib.rs")));
         let prov = context_provenance(&ctx);
         assert!(
             prov.is_unknown(),
@@ -3349,7 +3378,7 @@ mod tests {
             ContextManager::new("HEAD ONE", 1_000_000).with_budget_bytes(TEST_BUDGET_BYTES);
         first.push_tool_result(
             "read",
-            Some("secrets/prod.env".to_owned()),
+            Some(fixture_id("secrets/prod.env")),
             "x".repeat(1_000),
         );
         for _ in 0..5 {

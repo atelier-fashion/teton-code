@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use super::{opt_u64_arg, str_arg, Tool, ToolContext, ToolOutcome};
+use super::{opt_u64_arg, str_arg, Resolved, Tool, ToolContext, ToolOutcome};
 
 /// Maximum lines returned when no `limit` is given — keeps a single read from
 /// overwhelming a weak model's context.
@@ -43,8 +43,11 @@ impl Tool for ReadTool {
             Ok(p) => p,
             Err(e) => return e.into(),
         };
-        let path = match ctx.resolve(&raw) {
-            Ok(p) => p,
+        // One call yields the file to open AND the identity egress judges it by
+        // (REQ-571 ADR-B) — so the boundary is matched on the same canonical
+        // value this read opens, whatever spelling the model used to ask for it.
+        let Resolved { path, provenance } = match ctx.resolve(&raw) {
+            Ok(r) => r,
             Err(e) => return e.into(),
         };
 
@@ -59,12 +62,14 @@ impl Tool for ReadTool {
         let limit = opt_u64_arg(args, "limit").map_or(DEFAULT_LINE_LIMIT, |n| n as usize);
 
         let lines: Vec<&str> = contents.lines().collect();
-        // BR-1 (REQ-544 C-1): the result surfaces this file's content, so tag the
-        // outcome with the path the model gave (repo-relative, the form
-        // boundaries match against). Egress blocks a later remote turn that
-        // carries this if `raw` is under a `local-only` boundary.
+        // BR-1 (REQ-544 C-1), corrected by REQ-571 BR-2: the result surfaces this
+        // file's content, so tag the outcome with the **resolved** identity — not
+        // with `raw`, which is the model's request text and may spell the same
+        // file as `./secrets/x`, `/abs/repo/secrets/x`, or `src/../secrets/x`.
+        // None of those match a `secrets/**` boundary glob; the minted id always
+        // does.
         if lines.is_empty() {
-            return ToolOutcome::ok(format!("`{raw}` is empty.")).with_paths([raw]);
+            return ToolOutcome::ok(format!("`{raw}` is empty.")).with_paths([provenance]);
         }
 
         let start = offset.saturating_sub(1).min(lines.len());
@@ -82,7 +87,7 @@ impl Tool for ReadTool {
                 end + 1
             ));
         }
-        ToolOutcome::ok(out).with_paths([raw])
+        ToolOutcome::ok(out).with_paths([provenance])
     }
 }
 
@@ -146,7 +151,7 @@ mod tests {
 
     #[test]
     fn a_successful_read_reports_the_touched_path_as_provenance() {
-        use crate::harness::context::ToolProvenance;
+        use crate::harness::context::{fixture_id, ToolProvenance};
         let root = temp_root("prov");
         std::fs::write(root.join("secrets.env"), "API_KEY=1\n").unwrap();
         let ctx = ToolContext::new(&root);
@@ -154,7 +159,51 @@ mod tests {
         assert!(!out.is_error);
         // REQ-544 C-1: the result is tagged with the file it read, so a later
         // remote turn carrying it is caught at egress.
-        assert_eq!(out.provenance, ToolProvenance::path("secrets.env"));
+        assert_eq!(
+            out.provenance,
+            ToolProvenance::path(fixture_id("secrets.env"))
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **REQ-571 BR-2/BR-3 at the tool.** Every spelling of one boundary file
+    /// tags the *same* identity, and it is the canonical repo-relative one a
+    /// `secrets/**` glob matches — not the request text.
+    ///
+    /// The absolute and `..`-traversing spellings are the ones that used to slip
+    /// through: `with_paths([raw])` tagged `/abs/repo/secrets/prod.env`, which no
+    /// repo-relative boundary glob matches, so the read was surfaced to the model
+    /// with provenance that could never block a later remote turn.
+    #[test]
+    fn every_spelling_of_one_file_tags_the_same_canonical_identity() {
+        use crate::harness::context::ToolProvenance;
+        let root = temp_root("spell");
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/prod.env"), "API_KEY=1\n").unwrap();
+        let absolute = root.canonicalize().unwrap().join("secrets/prod.env");
+        let absolute = absolute.to_string_lossy().into_owned();
+        let ctx = ToolContext::new(&root);
+
+        for spelling in [
+            "secrets/prod.env",
+            "./secrets/prod.env",
+            ".//secrets/prod.env",
+            "././secrets/prod.env",
+            &absolute,
+            "src/../secrets/prod.env",
+        ] {
+            let out = ReadTool.run(&ctx, &json!({ "path": spelling }));
+            assert!(!out.is_error, "{spelling:?}: {}", out.content);
+            let ToolProvenance::Sources(ids) = &out.provenance else {
+                panic!("spelling {spelling:?} produced unknown provenance");
+            };
+            let ids: Vec<&str> = ids.iter().map(teton_core::ProvenanceId::as_str).collect();
+            assert_eq!(
+                ids,
+                vec!["secrets/prod.env"],
+                "spelling {spelling:?} tagged the wrong identity"
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 }
