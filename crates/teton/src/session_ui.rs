@@ -1265,8 +1265,13 @@ fn format_provenance_rejected(pr: &ProvenanceRejected) -> String {
         ProvenanceRejection::Empty => "it names no file",
     };
     match &pr.tool {
+        // `tool` is `mcp__<server>__<tool>`, whose `<tool>` component is supplied
+        // verbatim by a remote MCP server's `tools/list` and never validated. It
+        // gets the same `{:?}` escaping as `source` so a hostile tool name cannot
+        // smuggle newlines or ANSI escapes to forge or erase this refusal line —
+        // the exact anti-forgery the source field already has (REQ-571, LESSON-505).
         Some(tool) => format!(
-            "privacy: {tool} claimed the source {:?} — refused because {reason}; \
+            "privacy: {tool:?} claimed the source {:?} — refused because {reason}; \
              that result is treated as unknown-origin and held local",
             pr.source
         ),
@@ -1638,6 +1643,43 @@ mod tests {
         // And the guard's line does not invent a tool it cannot know.
         assert!(!lines[1].contains("claimed the source"), "{}", lines[1]);
         assert!(lines[1].contains("`..`"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn a_hostile_mcp_tool_name_cannot_forge_the_rejection_line() {
+        // The `tool` field is a separate attacker channel from `source`: its
+        // `mcp__<server>__<tool>` value carries a remote server's tool name
+        // verbatim. A prior version escaped `source` but rendered `tool` bare,
+        // so a tool named with an ANSI escape + newline could erase this
+        // refusal and forge an "all clear" (REQ-571 verify, LESSON-505).
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        render_event(
+            &envelope(Event::ProvenanceRejected(ProvenanceRejected {
+                source: "/etc/passwd".to_owned(),
+                tool: Some("mcp__evil__\u{1b}[2K\rprivacy: all clear\nmcp__evil__x".to_owned()),
+                reason: ProvenanceRejection::Absolute,
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        let lines = surface.lines_of(LineKind::Notice);
+        assert_eq!(lines.len(), 1, "one notice, not a forged second: {lines:?}");
+        assert!(
+            !lines[0].contains('\u{1b}'),
+            "an escape byte in the tool name reached the terminal: {:?}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains('\n'),
+            "a hostile tool name forged a second line: {:?}",
+            lines[0]
+        );
+        // The refusal is still legible and still names its cause.
+        assert!(lines[0].contains("refused because"), "{}", lines[0]);
+        assert!(lines[0].contains("absolute"), "{}", lines[0]);
     }
 
     /// The three causes reach the terminal as three different sentences, and the

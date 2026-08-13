@@ -432,6 +432,41 @@ mod tests {
         }
     }
 
+    /// The load-bearing agreement between the two canonical-form checkers that
+    /// live in different crates (`teton_core::provenance_id::mint`, reached here
+    /// via the real `ProvenanceId::claimed` constructor, and this module's
+    /// `malformed_reason`): whatever a genuine mint *produces* MUST pass the
+    /// guard. The two are deliberately asymmetric — `mint` elides `.`/empty
+    /// segments on input while the guard rejects them on output — so the
+    /// invariant is one-directional (mint-output ⊆ guard-accepts), NOT that the
+    /// functions are identical. Non-canonical inputs that mint normalizes away
+    /// are exactly where a naive "assert both agree" test would wrongly fail.
+    /// This is what stops the prose claim in `malformed_reason`'s doc from
+    /// silently drifting into a lie if either function's rules change.
+    #[test]
+    fn every_minted_identity_passes_the_guard() {
+        // Non-canonical but mintable spellings (no `..`, which `claimed` refuses)
+        // — each normalizes to the same canonical id, which the guard must accept.
+        for input in [
+            "secrets/prod.env",
+            "./secrets/prod.env",
+            ".//secrets/prod.env",
+            "secrets/./prod.env",
+            "a/b//c",
+        ] {
+            let id = ProvenanceId::claimed(input)
+                .unwrap_or_else(|e| panic!("{input:?} should mint, got {e:?}"));
+            let prov = Provenance::tainted_by(id.clone());
+            assert_eq!(
+                first_malformed_source(&prov),
+                None,
+                "mint produced {:?} from {input:?}, but the guard rejected it — \
+                 the two canonical-form checkers have drifted",
+                id.as_str()
+            );
+        }
+    }
+
     /// The reported source is sanitized before it leaves: a hostile spelling
     /// cannot smuggle a newline or an escape sequence into whatever renders the
     /// `provenance_rejected` event.

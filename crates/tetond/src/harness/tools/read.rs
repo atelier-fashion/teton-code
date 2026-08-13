@@ -208,7 +208,8 @@ mod tests {
 
     #[test]
     fn a_successful_read_reports_the_touched_path_as_provenance() {
-        use crate::harness::context::{fixture_id, ToolProvenance};
+        use crate::fixture_id;
+        use crate::harness::context::ToolProvenance;
         let root = temp_root("prov");
         std::fs::write(root.join("secrets.env"), "API_KEY=1\n").unwrap();
         let ctx = ToolContext::new(&root);
