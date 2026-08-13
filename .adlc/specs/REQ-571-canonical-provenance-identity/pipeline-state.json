@@ -3,13 +3,14 @@
   "branch": "feat/REQ-571-canonical-provenance-identity",
   "startedAt": "2026-08-13T18:13:08Z",
   "completed": false,
-  "currentPhase": 5,
+  "currentPhase": 6,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -36,6 +37,11 @@
     {
       "phase": 4,
       "name": "Implement (9 tasks, 4 tiers, all agent-dispatched)",
+      "completedAt": "2026-08-13T18:13:08Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (6-agent panel; 1 must-fix security + minors; 2 reflector Qs resolved by Brett)",
       "completedAt": "2026-08-13T18:13:08Z"
     }
   ],
@@ -87,6 +93,10 @@
       "mint/malformed_reason shared-primitive refactor (test added instead)"
     ],
     "reflectorQuestions": 2,
-    "halted": "awaiting user answers to 2 reflector questions"
+    "halted": "resolved",
+    "reflectorQuestions_resolved": [
+      "session-pin confirmed (BR-4 amended)",
+      "provenance_rejected made required \u2014 compiler found an 8th uncovered sink"
+    ]
   }
 }
