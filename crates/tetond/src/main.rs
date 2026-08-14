@@ -99,7 +99,7 @@ fn main() -> anyhow::Result<ExitCode> {
 
     let socket_path_for_teardown = paths.socket.clone();
 
-    runtime.block_on(async move {
+    let served = runtime.block_on(async move {
         // Assemble the runtime (local tier, providers, cost ledger, MCP) from
         // config and the environment, sharing the event bus so cost and privacy
         // events reach attached clients.
@@ -169,11 +169,36 @@ fn main() -> anyhow::Result<ExitCode> {
 
         shutdown(&daemon, &supervisor, &socket_path_for_teardown);
         Ok::<(), anyhow::Error>(())
-    })?;
+    });
 
-    // `_instance` drops here, *after* `shutdown` unlinked the socket — the
-    // ordering BR-3 depends on. See `shutdown`.
-    Ok(ExitCode::SUCCESS)
+    // BUG-166: die by `_exit`, never by `exit()`.
+    //
+    // A llama-build daemon that has loaded the model cannot survive libc
+    // `exit()`: ggml's Metal backend holds its device registry in a
+    // function-local C++ static whose destructor — run by `__cxa_finalize`
+    // inside `exit()` — hard-asserts that every Metal buffer was already
+    // freed (`GGML_ASSERT([rsets->data count] == 0)`, ggml-metal-device.m).
+    // With the model weights still resident that assert aborts, turning
+    // every routine shutdown (exit-with-last-client, SIGTERM) into SIGABRT
+    // plus a macOS crash report. `std::process::exit` runs the same
+    // handlers; only `_exit` skips them.
+    //
+    // Nothing this skips is load-bearing. Everything that must outlive the
+    // process already does: the cost ledger is SQLite in autocommit (durable
+    // per `record`), `shutdown` unlinked the socket, and the daemon reports
+    // on stderr, which Rust does not buffer. `_instance`'s flock releases at
+    // process death — the same instant, relative to the unlink, that BR-3
+    // got from its drop at the end of `main`.
+    let code = match served {
+        Ok(()) => 0,
+        Err(err) => {
+            // The stderr a `?`-return printed before this path existed; the
+            // CLI surfaces this tail when an autostart fails (E-4).
+            eprintln!("Error: {err:?}");
+            1
+        }
+    };
+    unsafe { libc::_exit(code) }
 }
 
 /// The ordered teardown (REQ-565 BR-8).
@@ -194,7 +219,9 @@ fn main() -> anyhow::Result<ExitCode> {
 ///    still owns the lock (BR-3).
 /// 5. **report** the exit.
 ///
-/// The lock is released last, by `_instance` dropping at the end of `main`.
+/// The lock is released last, when the process dies — `main` ends in `_exit`
+/// (BUG-166), so `_instance`'s flock is released by process death rather than
+/// by its drop, at the same point in the order.
 fn shutdown(daemon: &Arc<Daemon>, supervisor: &Arc<LifetimeSupervisor>, socket: &std::path::Path) {
     let sessions_closed = u32::try_from(daemon.sessions.list().len()).unwrap_or(u32::MAX);
 
