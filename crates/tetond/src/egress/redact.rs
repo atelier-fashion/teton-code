@@ -1909,8 +1909,18 @@ mod tests {
     ///    the budget for escaping. An assumption nobody checks is a number that
     ///    drifts.
     /// 2. The total cap is at least **twice** that whole body.
+    ///
+    /// Since REQ-572 the prompt's capability clause is **per state**, and the
+    /// states are different lengths — so the measurement is the worst of them,
+    /// swept rather than sampled. The failure message states the remaining
+    /// margin, because "it fits" and "it fits by nine bytes" are different
+    /// facts, and only one of them survives the next sentence somebody adds to
+    /// the bundled guide (AC-9).
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
+        use teton_core::capability::{SearchGap, WebCapabilityState};
+        use teton_core::config::WebTier;
+
         use crate::harness::tools::ToolRegistry;
         use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
 
@@ -1918,21 +1928,59 @@ mod tests {
         // description is in the prompt: the larger of the two harness configs
         // is the one the overhead has to cover.
         //
-        // This registry is the **opted-out** shape (REQ-563 D-1): no web tool,
-        // and therefore the BR-6 opt-in clause in its place. The opted-in shape
-        // — web tool docs, no clause — is measured against this same constant
-        // beside the tool, because building one needs a permission gate and a
-        // choke-point seam that do not belong in this module.
-        let config = HarnessConfig::for_strong_model();
-        let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
-        let budget = config.context_budget_bytes;
+        // This registry is the **opted-out** shape (REQ-563 D-1): no web tool.
+        // The opted-in shape — web tool docs in place of the off clause — is
+        // measured against this same constant beside the tool, because building
+        // one needs a permission gate and a choke-point seam that do not belong
+        // in this module.
+        let base = HarnessConfig::for_strong_model();
+        let budget = base.context_budget_bytes;
         let escaping = budget / 10;
+
+        // Every state a clause can be built from, plus the unsupplied case that
+        // falls back to the registry. A state added to the classifier without a
+        // row here would go unmeasured, which is how a prompt grows past a
+        // ceiling one capability at a time.
+        let states = [
+            None,
+            Some(WebCapabilityState::OffAvailable),
+            Some(WebCapabilityState::SearchUnavailable {
+                reason: SearchGap::NoLocalModel,
+            }),
+            Some(WebCapabilityState::Ready(WebTier::Search)),
+        ];
+        let worst = states
+            .into_iter()
+            .map(|web_capability| {
+                let config = HarnessConfig {
+                    web_capability,
+                    ..base.clone()
+                };
+                build_system_prompt(&ToolRegistry::with_builtins(), &config).len()
+            })
+            .max()
+            .expect("the state sweep is not empty");
+
+        let spent = worst + escaping;
         assert!(
-            system.len() + escaping <= REDACT_BODY_OVERHEAD_BYTES,
+            spent <= REDACT_BODY_OVERHEAD_BYTES,
             "the assumed body overhead no longer covers what a body carries: a \
-             {}-byte system prompt plus {escaping} bytes of escaping against an \
-             assumed {REDACT_BODY_OVERHEAD_BYTES}",
-            system.len()
+             {worst}-byte system prompt (the largest capability clause) plus \
+             {escaping} bytes of escaping against an assumed \
+             {REDACT_BODY_OVERHEAD_BYTES} — over by {} bytes. Shorten the bundled \
+             guide or a clause; do not raise the overhead without re-checking the \
+             two claims below.",
+            spent - REDACT_BODY_OVERHEAD_BYTES
+        );
+        // The margin is asserted, not merely implied by the line above: a
+        // system prompt that exactly filled the overhead would pass that
+        // assertion and leave the next added sentence nowhere to go.
+        let margin = REDACT_BODY_OVERHEAD_BYTES - spent;
+        assert!(
+            margin > 0,
+            "the system prompt now fills the assumed overhead exactly ({worst} bytes \
+             of prompt + {escaping} of escaping = {REDACT_BODY_OVERHEAD_BYTES}), \
+             leaving no margin at all"
         );
 
         let body = budget + REDACT_BODY_OVERHEAD_BYTES;
