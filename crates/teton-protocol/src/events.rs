@@ -1621,6 +1621,23 @@ pub struct CapabilityDeadEnd {
     pub capability: String,
 }
 
+impl CapabilityDeadEnd {
+    /// A turn needed a remote provider and none is configured (REQ-572 AC-2).
+    ///
+    /// The **settled** absence only: a provider registered without a model, an
+    /// unset `default_provider` and a routing mismatch are all configured
+    /// remote tiers whose remedy the turn's own error sentence already names,
+    /// and a tier that is merely still warming is not a dead end at all.
+    pub const REMOTE_PROVIDER: &'static str = "remote_provider";
+    /// A web lookup dead-ended on the `[web]` capability — the tool refused a
+    /// tier the configured ceiling does not reach.
+    ///
+    /// Named here beside [`Self::REMOTE_PROVIDER`] rather than spelled as a
+    /// literal at the emission site, so the daemon and the client that renders
+    /// the id cannot come to hold two spellings of one capability.
+    pub const WEB_SEARCH: &'static str = "web_search";
+}
+
 // ---------------------------------------------------------------------------
 // prefix_cache
 // ---------------------------------------------------------------------------

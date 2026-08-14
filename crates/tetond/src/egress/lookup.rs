@@ -703,9 +703,7 @@ impl LookupRecorder for NoopLookupRecorder {
 ///
 /// Total, and the same boundary bridge
 /// [`to_protocol_category`](crate::router::to_protocol_category) is — two enums,
-/// one meaning, and the map stated once. Deliberately **one-way** for the same
-/// reason that one is: the core ladder is what config and the gates read, and
-/// nothing on the wire should be able to name a ceiling.
+/// one meaning, and the map stated once.
 ///
 /// Both directions of drift are build failures rather than review catches: the
 /// match below is exhaustive over the core ladder, so a variant added or renamed
@@ -720,6 +718,31 @@ pub fn to_protocol_web_tier(tier: CoreWebTier) -> WireWebTier {
         CoreWebTier::FetchUserUrl => WireWebTier::FetchUserUrl,
         CoreWebTier::FetchAnyUrl => WireWebTier::FetchAnyUrl,
         CoreWebTier::Search => WireWebTier::Search,
+    }
+}
+
+/// The inverse of [`to_protocol_web_tier`], for the one direction REQ-572 opens.
+///
+/// This bridge used to be deliberately one-way, on the reading that "nothing on
+/// the wire should be able to name a ceiling". The guided setup flow is what
+/// changes that, and changes it in the only shape that stays safe: a `[web]`
+/// tier named in `web/setup_preview` / `web/setup_commit` is an **answer the
+/// user just typed**, and it does not become a ceiling by arriving — it becomes
+/// a *candidate* config that `Config::validate` refuses or accepts exactly as
+/// it would refuse or accept the same table read from disk at startup (REQ-572
+/// ADR-2). What the old rule was protecting against — a client raising the
+/// ceiling by asserting it — is prevented by the session gate on those methods
+/// and by the validator, not by the absence of this function.
+///
+/// Exhaustive over the wire ladder, so a variant added there fails to compile
+/// here rather than silently folding onto a neighbouring tier.
+#[must_use]
+pub fn from_protocol_web_tier(tier: WireWebTier) -> CoreWebTier {
+    match tier {
+        WireWebTier::Off => CoreWebTier::Off,
+        WireWebTier::FetchUserUrl => CoreWebTier::FetchUserUrl,
+        WireWebTier::FetchAnyUrl => CoreWebTier::FetchAnyUrl,
+        WireWebTier::Search => CoreWebTier::Search,
     }
 }
 
