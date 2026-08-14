@@ -18,6 +18,32 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Fixed
+
+- **The search credential can now ride the header your backend actually wants
+  (BUG-165).** `[web] search_key_ref` was always sent as
+  `Authorization: Bearer <key>` — and neither of the search backends REQ-563
+  itself names as examples accepts that shape (Brave wants
+  `X-Subscription-Token: <key>`, Kagi wants `Authorization: Bot <key>`), so
+  configuring either got a 401 on every search that looked exactly like a bad
+  key. A new optional `[web] search_auth` names the shape as a template, with
+  `{key}` marking where the resolved secret goes:
+
+  ```toml
+  [web]
+  search_auth = "X-Subscription-Token: {key}"   # Brave's shape
+  # search_auth = "Authorization: Bot {key}"    # Kagi's shape
+  ```
+
+  Unset means `Authorization: Bearer {key}`, so an existing config behaves
+  exactly as before. The key itself stays in the OS keychain under
+  `search_key_ref` — a template without `{key}`, or one set with no
+  `search_key_ref` beside it, is refused at load with the fix named — and the
+  credential is still bound to the endpoint's origin, so the new shapes can
+  travel nowhere the old one couldn't.
+
 ## [0.1.13] - 2026-08-09
 
 ### Added

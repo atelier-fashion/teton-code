@@ -375,6 +375,27 @@ pub struct WebConfig {
     /// unconfigurable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_key_ref: Option<String>,
+    /// The header the resolved search credential rides, as a template with
+    /// `{key}` marking where the secret goes — e.g.
+    /// `"X-Subscription-Token: {key}"` (Brave's shape) or
+    /// `"Authorization: Bot {key}"` (Kagi's) (BUG-165).
+    ///
+    /// **Absent means `Authorization: Bearer {key}`** — the shape an
+    /// OpenAI-compatible endpoint expects, and the only shape this machine
+    /// spoke before this key existed. BR-8's "no blessed search backend" cuts
+    /// both ways: nothing ships a default backend, so nothing can assume every
+    /// backend's header either — the shape is a key, not a constant.
+    ///
+    /// A template, never the header itself: the value carries no secret (BR-7).
+    /// `{key}` is replaced with the resolved [`Self::search_key_ref`] only at
+    /// the moment the endpoint-bound transport is built, and
+    /// [`Config::validate`] refuses a value without `{key}` for the same
+    /// reason it refuses a raw key in `search_key_ref`. It is likewise refused
+    /// beside an *absent* `search_key_ref`: a shape with no credential to
+    /// place is a setting the daemon would silently ignore, which is the
+    /// "knob did nothing" defect REQ-558 spent an ADR removing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_auth: Option<String>,
     /// An optional allowlist constraining **model-chosen** destinations only
     /// (BR-11).
     ///
@@ -427,6 +448,7 @@ impl Default for WebConfig {
             permission_allow: Vec::new(),
             search_endpoint: None,
             search_key_ref: None,
+            search_auth: None,
             allowed_domains: None,
             cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
         }
@@ -441,6 +463,118 @@ impl WebConfig {
     pub fn is_unset(&self) -> bool {
         *self == Self::default()
     }
+
+    /// The parsed [`Self::search_auth`] shape: [`SearchAuthShape::bearer`]
+    /// when the key is absent or blank ("not configured" is one state, not
+    /// two — the reading `validate_web` gives a blank `search_endpoint`), and
+    /// `None` when a value is present but does not parse.
+    ///
+    /// [`Config::validate`] refuses an unparseable value at load, so `None`
+    /// is reachable only through a config that skipped validation. A caller
+    /// declining to assume validation ran must read `None` as **attach no
+    /// credential** — never as "fall back to Bearer": the one thing a
+    /// mis-spelled shape must not produce is the credential riding a shape
+    /// the user did not write.
+    #[must_use]
+    pub fn search_auth_shape(&self) -> Option<SearchAuthShape> {
+        match self
+            .search_auth
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            None => Some(SearchAuthShape::bearer()),
+            Some(template) => parse_search_auth(template),
+        }
+    }
+}
+
+/// The parsed shape of [`WebConfig::search_auth`]: which header the search
+/// credential rides, and the scheme word (if any) in front of the secret.
+/// Carries no secret itself — the secret enters only through
+/// [`Self::header_value`], at the caller's moment of use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchAuthShape {
+    /// The header name, lowercased: header names are case-insensitive on the
+    /// wire, and the transport composes them lowercase.
+    pub header: String,
+    /// The word in front of the secret (`Bearer`, `Bot`, …), or `None` when
+    /// the header carries the bare key.
+    pub scheme: Option<String>,
+}
+
+impl SearchAuthShape {
+    /// What an absent `search_auth` means: `Authorization: Bearer {key}`,
+    /// the only shape this machine spoke before BUG-165.
+    #[must_use]
+    pub fn bearer() -> Self {
+        Self {
+            header: "authorization".to_owned(),
+            scheme: Some("Bearer".to_owned()),
+        }
+    }
+
+    /// The header value with `secret` in the `{key}` position. The secret
+    /// exists only in the return value — callers hand it to the
+    /// endpoint-bound transport and drop it.
+    #[must_use]
+    pub fn header_value(&self, secret: &str) -> String {
+        match &self.scheme {
+            Some(scheme) => format!("{scheme} {secret}"),
+            None => secret.to_owned(),
+        }
+    }
+}
+
+/// Parse a [`WebConfig::search_auth`] template, or `None` when the value is
+/// not one of the two accepted spellings:
+///
+/// - `Header-Name: {key}` — the bare secret in a header of that name.
+/// - `Header-Name: Scheme {key}` — one scheme word, one space, the secret.
+///
+/// The header name must be an RFC 7230 token and the scheme a single token,
+/// deliberately narrow: a template is a *shape*, and the moment it accepts
+/// arbitrary bytes it can carry the secret itself — the thing
+/// `search_key_ref` exists to keep out of this file. The strictness also
+/// keeps the template honest about the wire: `"Bot{key}"` (no space) is
+/// refused rather than silently rendered with one.
+#[must_use]
+pub fn parse_search_auth(template: &str) -> Option<SearchAuthShape> {
+    let (name, value) = template.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+        return None;
+    }
+    let value = value.trim();
+    if value.matches("{key}").count() != 1 {
+        return None;
+    }
+    let prefix = value.strip_suffix("{key}")?;
+    let scheme = if prefix.is_empty() {
+        None
+    } else {
+        // One space between the scheme and the secret; the token check
+        // refuses whitespace, so `"Two words {key}"` and `"Bot  {key}"`
+        // both fail here rather than parse to something surprising.
+        let word = prefix.strip_suffix(' ')?;
+        if word.is_empty() || !word.bytes().all(is_http_token_byte) {
+            return None;
+        }
+        Some(word.to_owned())
+    };
+    Some(SearchAuthShape {
+        header: name.to_ascii_lowercase(),
+        scheme,
+    })
+}
+
+/// An RFC 7230 `tchar` — the bytes a header name or auth-scheme word may
+/// contain.
+const fn is_http_token_byte(byte: u8) -> bool {
+    matches!(byte,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+        | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
 }
 
 /// Tool permissions (the `[permissions]` table, REQ-560).
@@ -1104,6 +1238,41 @@ pub enum ConfigError {
     )]
     UnrecognizedWebSearchKeyRef,
 
+    /// `[web] search_auth` does not parse as a credential-header template
+    /// (BUG-165).
+    ///
+    /// The message teaches both accepted spellings rather than only naming
+    /// the rule, because the likeliest author is someone transcribing a
+    /// backend's documentation — and refuses to echo the value: the likeliest
+    /// *malformed* template is one where the user pasted the key itself in
+    /// place of `{key}`, and this message is loggable (BR-7).
+    #[error(
+        "[web] search_auth is not a usable credential-header template. Write the one header the \
+         search key rides, with `{{key}}` where the secret goes: \"X-Subscription-Token: {{key}}\" \
+         (bare key) or \"Authorization: Bot {{key}}\" (one scheme word in front). The key itself \
+         stays in the OS keychain under search_key_ref — a template without `{{key}}` is refused \
+         for the same reason a raw key in search_key_ref is (BR-7). When unset, the credential is \
+         sent as \"Authorization: Bearer {{key}}\". (The value is not echoed: a malformed \
+         template may carry the key itself, and this message is loggable.)"
+    )]
+    InvalidWebSearchAuth,
+
+    /// `[web] search_auth` is set while no `search_key_ref` names a credential
+    /// (BUG-165).
+    ///
+    /// The template says how a credential rides; `search_key_ref` names the
+    /// credential. One without the other is a setting the daemon would
+    /// silently ignore — the "knob did nothing" shape (REQ-558's lesson, the
+    /// same reading [`ConfigError::WebPermissionAllowNamesOff`] gives a member
+    /// that switches nothing off) — and the author almost certainly believes
+    /// they configured auth.
+    #[error(
+        "[web] search_auth is set, but no search_key_ref names a credential to place in it. Add \
+         `[web] search_key_ref` (a keychain/env/op reference — never the key itself, BR-7), or \
+         remove search_auth if the backend needs no credential."
+    )]
+    WebSearchAuthWithoutKeyRef,
+
     /// A `[web] allowed_domains` entry is not shaped like a bare domain pattern
     /// (REQ-563 BR-11).
     ///
@@ -1732,6 +1901,24 @@ impl Config {
         if let Some(key_ref) = &web.search_key_ref {
             if !is_recognized_auth_ref(key_ref) {
                 return Err(ConfigError::UnrecognizedWebSearchKeyRef);
+            }
+        }
+
+        // BUG-165: the credential-header template, parsed by the same function
+        // the daemon reads the shape through — so the shape that validates is
+        // the shape that rides. A blank value is as unset as an absent one,
+        // the `endpoint` reading above.
+        let search_auth = web
+            .search_auth
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(template) = search_auth {
+            if parse_search_auth(template).is_none() {
+                return Err(ConfigError::InvalidWebSearchAuth);
+            }
+            if web.search_key_ref.is_none() {
+                return Err(ConfigError::WebSearchAuthWithoutKeyRef);
             }
         }
 
@@ -4414,6 +4601,128 @@ cache_ttl_secs = 60
         // at the search tier would make it unconfigurable.
         Config::load("[web]\ntier = \"search\"\nsearch_endpoint = \"https://searx.internal\"\n")
             .expect("an unauthenticated search backend must be configurable");
+    }
+
+    /// BUG-165 — the `search_auth` template parses to the shape that rides,
+    /// through the one function validation and the daemon share.
+    #[test]
+    fn a_search_auth_template_parses_to_its_header_and_scheme() {
+        // The REQ's own example backends' spellings, which are the reason the
+        // key exists: neither is Bearer.
+        let brave =
+            parse_search_auth("X-Subscription-Token: {key}").expect("Brave's shape must parse");
+        assert_eq!(brave.header, "x-subscription-token", "names are lowercased");
+        assert_eq!(brave.scheme, None);
+        assert_eq!(brave.header_value("s3cret"), "s3cret");
+
+        let kagi = parse_search_auth("Authorization: Bot {key}").expect("Kagi's shape must parse");
+        assert_eq!(kagi.header, "authorization");
+        assert_eq!(kagi.scheme.as_deref(), Some("Bot"));
+        assert_eq!(kagi.header_value("s3cret"), "Bot s3cret");
+
+        // An absent (or blank) key means the pre-BUG-165 constant, spelled by
+        // the same accessor the daemon reads.
+        for unset in [None, Some(String::new()), Some("   ".to_owned())] {
+            let web = WebConfig {
+                search_auth: unset.clone(),
+                ..WebConfig::default()
+            };
+            assert_eq!(
+                web.search_auth_shape(),
+                Some(SearchAuthShape::bearer()),
+                "{unset:?} must mean the Bearer default"
+            );
+        }
+        assert_eq!(
+            SearchAuthShape::bearer().header_value("s3cret"),
+            "Bearer s3cret"
+        );
+
+        // A present-but-unparseable value is `None` — attach nothing — never
+        // a silent fall-back to Bearer.
+        let web = WebConfig {
+            search_auth: Some("not a template".to_owned()),
+            ..WebConfig::default()
+        };
+        assert_eq!(web.search_auth_shape(), None);
+    }
+
+    /// The template grammar is a *shape*, and everything that is not one of
+    /// its two spellings is refused — most importantly a value where the user
+    /// pasted the key itself in place of `{key}`.
+    #[test]
+    fn a_malformed_search_auth_is_rejected_without_echoing_it() {
+        let pasted_key = "X-Subscription-Token: BSAj4f1c9TOPSECRETshouldNeverLeak";
+        for (bad, why) in [
+            (pasted_key, "a pasted key in place of {key}"),
+            ("Authorization: Bearer", "no {key} at all"),
+            ("{key}", "no header name"),
+            (": {key}", "an empty header name"),
+            ("X Subscription Token: {key}", "spaces in the header name"),
+            ("Authorization: Two words {key}", "a multi-word scheme"),
+            ("Authorization: Bot{key}", "no space before {key}"),
+            ("Authorization: {key} Bot", "{key} not at the end"),
+            ("Authorization: {key} {key}", "two {key} markers"),
+            ("Authorization: Bot  {key}", "two spaces before {key}"),
+        ] {
+            assert_eq!(parse_search_auth(bad), None, "parsed anyway: {why}");
+            let err = web_config(WebConfig {
+                search_key_ref: Some("keychain:search".to_owned()),
+                search_auth: Some(bad.to_owned()),
+                ..WebConfig::default()
+            })
+            .validate()
+            .expect_err(why);
+            assert_eq!(err, ConfigError::InvalidWebSearchAuth, "{why}");
+        }
+
+        // The message teaches both accepted spellings and echoes nothing: the
+        // likeliest malformed template carries the credential itself, and the
+        // message is loggable (the `UnrecognizedWebSearchKeyRef` posture).
+        let msg = ConfigError::InvalidWebSearchAuth.to_string();
+        assert!(
+            msg.contains("{key}"),
+            "the placeholder must be taught: {msg}"
+        );
+        assert!(
+            msg.contains("X-Subscription-Token: {key}") && msg.contains("Authorization: Bot {key}"),
+            "both accepted spellings must be readable from the message: {msg}"
+        );
+        assert!(
+            !msg.contains("TOPSECRET"),
+            "the error must never echo the value: {msg}"
+        );
+    }
+
+    /// `search_auth` beside an absent `search_key_ref` is a knob that does
+    /// nothing — the daemon would build a credential-free transport and
+    /// silently ignore the shape — so it is refused at load instead.
+    #[test]
+    fn a_search_auth_without_a_key_ref_is_rejected() {
+        let err = web_config(WebConfig {
+            search_auth: Some("X-Subscription-Token: {key}".to_owned()),
+            ..WebConfig::default()
+        })
+        .validate()
+        .expect_err("a shape with no credential to place must be refused");
+        assert_eq!(err, ConfigError::WebSearchAuthWithoutKeyRef);
+
+        // A blank value is as unset as an absent one, so it demands nothing.
+        web_config(WebConfig {
+            search_auth: Some("  ".to_owned()),
+            ..WebConfig::default()
+        })
+        .validate()
+        .expect("a blank search_auth is not configured, so it requires nothing");
+
+        // And the pair together is the configuration this key exists for.
+        Config::load(
+            "[web]\ntier = \"search\"\n\
+             search_endpoint = \"https://api.search.brave.com/res/v1/web/search\"\n\
+             search_key_ref = \"keychain:brave-search\"\n\
+             search_auth = \"X-Subscription-Token: {key}\"\n",
+        )
+        .expect("the spec's own example backend must be configurable");
     }
 
     /// A `search_endpoint` that could never be requested is a mistake at the

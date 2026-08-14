@@ -47,6 +47,7 @@ model.
 | WebConfig | tier | enum(off, fetch_user_url, fetch_any_url, search) | required, default `off`; ordered — each tier includes the ones below it |
 | WebConfig | search_endpoint | url | optional; required before the `search` tier can be offered |
 | WebConfig | search_key_ref | string | optional; name of an OS-keychain entry, never a key value |
+| WebConfig | search_auth | string (header template) | optional; the header the resolved key rides, with `{key}` marking the secret's place (e.g. `X-Subscription-Token: {key}`); absent = `Authorization: Bearer {key}` (**amended by BUG-165**) |
 | WebConfig | allowed_domains | list of domain patterns | optional; when set, constrains model-chosen destinations only; absent = tier grants alone govern |
 | WebCache | entry | url hash, reduced content, fetched_at, ttl | local-only data; content-addressed; never syncs or egresses |
 | SessionState | web_grant | enum(none, once, session) × tier | session-scoped; resets every session; never written back to config |
@@ -112,7 +113,7 @@ model.
 
 ## External Dependencies
 
-- A user-supplied search backend for the `search` tier (e.g., Brave Search API, Kagi, or a self-hosted SearxNG instance). None is bundled or defaulted.
+- A user-supplied search backend for the `search` tier (e.g., Brave Search API, Kagi, or a self-hosted SearxNG instance). None is bundled or defaulted. (**Amended by BUG-165:** these examples authenticate in three different shapes — Brave `X-Subscription-Token: <key>`, Kagi `Authorization: Bot <key>`, SearxNG none — which is why `search_auth` exists; the shipped implementation originally hardcoded `Authorization: Bearer` and answered 401 for both commercial examples.)
 - No new bundled dependencies for fetch: the egress module's existing HTTP transport carries lookups.
 
 ## Assumptions
