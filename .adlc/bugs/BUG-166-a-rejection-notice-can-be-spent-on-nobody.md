@@ -232,8 +232,17 @@ Bundled residuals, all landed in the same pass:
   "unless they offer it" to the guide's sentence fails the test that the old
   substring needles passed.
 
+## Lessons Captured
+
+- `LESSON-516` — a notice budget's key must match its audience, and its spend
+  must match delivery: the three design questions (who is the audience, when
+  is it spent, what bounds the key set) that would have caught this at the
+  spec table, plus the arrears-or-not decision rule.
+
 ## Files Changed
 
+- `.adlc/knowledge/lessons/LESSON-516-a-budgets-key-must-match-its-audience.md`
+  — new.
 - `crates/tetond/src/server.rs` — the re-keyed budget
   (`setup_rejections_announced`), existence-gated spend in
   `refuse_commit_without_session_access`, length gates at the four driving
