@@ -1,13 +1,28 @@
 ---
 id: TASK-136
-title: "Pin the new attestation seam: refusal, mutation, degradation, full-flow, reader-loop-free"
-status: draft
+title: "Pin the new attestation seam: refusal, mutation, degradation, ordering, off-dispatch"
+status: complete
 parent: REQ-575
 created: 2026-08-14
 updated: 2026-08-14
 dependencies: [TASK-135]
 repo: teton-code
 ---
+
+> **Implementation note (reconciled during Phase 4).** `web_setup_flow.rs` is a
+> *spawned-binary* harness (env-driven `DaemonOptions`), so a live-refusing
+> verifier cannot be injected there — the AlwaysFailsVerifier/degradation gating
+> tests live in-process in `server::tests`. **AC-2 (accepting-verifier full
+> flow) moved to TASK-137**, where the spawned-binary `TETON_PRESENCE_ACCEPT`
+> seam is the only way to reach the granted path over the real socket; it is the
+> same test as AC-6. The **reader-loop-free property** is pinned by
+> `the_commit_left_the_reader_loop_dispatch_while_the_reads_stayed` (the commit
+> is no longer served inline by `dispatch`, so it runs on the shared
+> `blocks_on_a_human` task) plus the existing shared-machinery reader-loop tests
+> (`the_reader_loop_keeps_serving_while_a_consent_is_pending`,
+> `the_reader_loop_serves_sessions_while_a_proposal_is_outstanding`) — a
+> `ParkingVerifier` double was judged disproportionate for a property the shared
+> machinery already covers.
 
 ## Description
 

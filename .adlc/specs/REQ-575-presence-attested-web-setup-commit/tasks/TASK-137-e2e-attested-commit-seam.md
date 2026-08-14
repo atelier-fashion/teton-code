@@ -28,7 +28,10 @@ build still refuses those seams (AC-6). See `architecture.md` ADR-3.
 ## Acceptance Criteria
 
 - [ ] An attested `/web setup` commit through the spawned daemon lands and the
-      lookup serves in the same session (AC-6, granted path over the real socket).
+      lookup serves in the same session (AC-6 **and AC-2** — reconciled from
+      TASK-136: in a spawned-binary harness the `TETON_PRESENCE_ACCEPT` seam is
+      the only way to reach the accepting/granted path, so AC-2 and AC-6 are the
+      same test).
 - [ ] The release-build refusal of `TETON_TEST_SEAMS` is untouched — do not weaken
       or bypass the `seam_verifier`/master-switch contract (a release build must
       still refuse to honor the seam).

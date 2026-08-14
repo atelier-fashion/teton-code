@@ -7734,4 +7734,53 @@ mod tests {
              past the degraded presence gate: {committed}"
         );
     }
+
+    /// **`web/setup_commit` left the synchronous dispatch (REQ-575 ADR-1) — the
+    /// reader loop cannot park on its presence prompt.**
+    ///
+    /// It may attest, and a presence prompt parks on a human, so like
+    /// `model/confirm` it runs on `handle_client`'s `blocks_on_a_human` task
+    /// rather than inline in `dispatch`. The direct proof it is no longer served
+    /// on the reader loop: `dispatch` answers `method not found` for it, while the
+    /// setup *reads* (`plan`, `preview`) — which never attest — are still served
+    /// there. The full client path still reaches the commit (the
+    /// `web_setup_flow` / `multi_client` integration suites drive it end to end),
+    /// which is what makes this the "moved off the reader loop" fact rather than
+    /// "removed". Re-adding it to `dispatch` (reintroducing the parking hazard)
+    /// turns this red.
+    #[test]
+    fn the_commit_left_the_reader_loop_dispatch_while_the_reads_stayed() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+
+        let commit = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            commit.contains(&error_code::METHOD_NOT_FOUND.to_string()),
+            "web/setup_commit must not be served inline by `dispatch` — it runs on \
+             the blocks_on_a_human task so a Touch ID prompt cannot park the reader \
+             loop: {commit}"
+        );
+
+        let preview = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            WebSetupPreviewParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            !preview.contains(&error_code::METHOD_NOT_FOUND.to_string()),
+            "web/setup_preview is a read that never attests, so it stays on the \
+             synchronous dispatch: {preview}"
+        );
+    }
 }
