@@ -618,17 +618,24 @@ pub fn render_event(
 /// The line a completed `/web setup` renders (REQ-572 BR-14, OQ-2).
 ///
 /// It says three things, and the third is the settled answer to OQ-2: the
-/// capability is on, the file it was written to, and that **nothing has been
-/// looked up**. No lookup is auto-offered — the flow performs no egress (BR-13),
-/// and the next question that needs the web raises the ordinary per-lookup
-/// consent. A notice that stopped after "enabled" would leave a user expecting
-/// their last question to be answered now, which it will not be.
+/// capability is on, that it was written to config rather than held in memory,
+/// and that **nothing has been looked up**. No lookup is auto-offered — the flow
+/// performs no egress (BR-13), and the next question that needs the web raises
+/// the ordinary per-lookup consent. A notice that stopped after "enabled" would
+/// leave a user expecting their last question to be answered now, which it will
+/// not be.
+///
+/// The event's `config_path` is deliberately **not** rendered. This notice goes
+/// to every open session on the machine, not only to the one that ran the
+/// walkthrough, and an absolute path is a home directory and therefore a
+/// username on somebody else's screen and in somebody else's scrollback. The
+/// field stays on the wire — a surface that has a reason to show it still can —
+/// and `teton status` is where the path a session is using is asked for.
 fn format_web_setup_completed(completed: &WebSetupCompleted) -> String {
     format!(
-        "web lookup enabled (`{}`) — written to {}. Nothing has been looked up yet: the next \
-         web-needing question will ask before anything leaves the machine.",
+        "web lookup enabled (`{}`) — written to your Teton config. Nothing has been looked up \
+         yet: the next web-needing question will ask before anything leaves the machine.",
         web_tier_name(completed.tier),
-        completed.config_path
     )
 }
 
@@ -3176,8 +3183,15 @@ mod tests {
         assert!(notice.contains("web lookup enabled"), "{notice}");
         assert!(notice.contains("`search`"), "{notice}");
         assert!(
-            notice.contains("/Users/x/.config/teton/config.toml"),
-            "the user must be able to go read what they agreed to: {notice}"
+            notice.contains("written to your Teton config"),
+            "the user must learn the change is durable and not session-local: {notice}"
+        );
+        // The path is on the wire and off the screen. This notice reaches every
+        // open session, and an absolute config path is a home directory — a
+        // username on a screen that is not the one that ran the walkthrough.
+        assert!(
+            !notice.contains("/Users/x"),
+            "the completion notice must not print an absolute path: {notice}"
         );
         assert!(
             notice.contains(

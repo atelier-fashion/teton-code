@@ -1180,10 +1180,12 @@ string proves storage.
    the exact `[web]` table and `searches would go to: api.search.brave.com`, and
    the completion notice:
    ```
-   web lookup enabled (`search`) — written to <config path>. Nothing has been
-   looked up yet: the next web-needing question will ask before anything leaves
-   the machine.
+   web lookup enabled (`search`) — written to your Teton config. Nothing has
+   been looked up yet: the next web-needing question will ask before anything
+   leaves the machine.
    ```
+   The notice names no path on purpose: it reaches every open session, and an
+   absolute config path is a home directory on somebody else's screen.
 4. Check the store and the config, in that order:
    ```
    security find-generic-password -s teton -a web-search      # must succeed
