@@ -946,9 +946,10 @@ fn refuse_daemon_wide(conn: &ConnState, id: &Id) -> Option<String> {
 /// model-supplied shell word, so a non-descendant same-UID process still passes
 /// it. That residual is tolerable for a config read. It is **not** tolerable for
 /// a commitment whose blast radius is the whole machine — a model change, a
-/// multi-gigabyte download, or writing the `[web]` egress table — which is why
-/// three methods ask for presence on top: `model/confirm`, `model/set`, and
-/// (REQ-575) `web/setup_commit`.
+/// multi-gigabyte download, writing the `[web]` egress table, or (REQ-576)
+/// rewriting the provider/privacy config — which is why four methods ask for
+/// presence on top: `model/confirm`, `model/set`, (REQ-575) `web/setup_commit`,
+/// and (REQ-576) `config/set`.
 ///
 /// The split is the spec's rather than a convenience: `config/get`, `cost/query`
 /// and `web/refresh` stay layer (a) only. Prompting a human to evict a cached
@@ -958,10 +959,12 @@ fn refuse_daemon_wide(conn: &ConnState, id: &Id) -> Option<String> {
 /// rewrites `config.toml` or live-swaps daemon-wide in-memory state must be
 /// classified against BR-10(b) in its own architecture phase — the omission of
 /// exactly that classification is how REQ-572 finding 7 arose (a daemon-wide
-/// committing method shipped with no BR-10(b) analysis). `config/set` is the
-/// known next candidate — a larger blast radius still (`RegisterProvider`,
-/// `SetPrivacyBoundary`) — deliberately left at layer (a) here and tracked in
-/// REQ-576, so a fourth caller is a decision, not drift.
+/// committing method shipped with no BR-10(b) analysis). `config/set` — the
+/// largest blast radius of the four (`RegisterProvider` names an egress endpoint,
+/// `SetPrivacyBoundary` rewrites the privacy boundary) — was the known next
+/// candidate and is now gated (REQ-576), reversing its BUG-162 layer-(a)-only
+/// posture. The four daemon-wide config-writers known today are all classified;
+/// the obligation stands for the next one.
 ///
 /// Unlike the consent path this does **not** record into the attestation
 /// registry. There is no consent `request_id` here to bind to — these methods
@@ -1574,6 +1577,7 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                 || m == ModelConfirmParams::METHOD
                 || m == ModelSetParams::METHOD
                 || m == WebSetupCommitParams::METHOD
+                || m == ConfigSetParams::METHOD
         );
         if blocks_on_a_human {
             let daemon = Arc::clone(&daemon);
@@ -1593,13 +1597,14 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                     handle_model_set(&daemon, &conn, id, params).await
                 } else if method == WebSetupCommitParams::METHOD {
                     handle_web_setup_commit(&daemon, &conn, id, params).await
+                } else if method == ConfigSetParams::METHOD {
+                    handle_config_set(&daemon, &conn, id, params).await
                 } else {
                     // Unreachable: the `blocks_on_a_human` `matches!` guard admits
-                    // exactly the five methods branched above. Made explicit rather
-                    // than a catch-all so a future sixth member (REQ-576's
-                    // `config/set`) that updates the guard but forgets a branch
-                    // fails loudly here instead of being silently misrouted into
-                    // `handle_web_setup_commit`.
+                    // exactly the six methods branched above. Made explicit rather
+                    // than a catch-all so a future seventh member that updates the
+                    // guard but forgets a branch fails loudly here instead of being
+                    // silently misrouted into the last handler.
                     unreachable!("blocks_on_a_human admitted an unrouted method: {method}")
                 };
                 // The fence for the same reason `dispatch`'s responses take it:
@@ -2187,14 +2192,14 @@ fn dispatch(
         PermissionRespondParams::METHOD => {
             Some(handle_permission_respond(daemon, conn, id, params))
         }
-        // `model/confirm` and `model/set` are deliberately absent alongside
-        // `session/attach`: since REQ-570 BR-10(b) both may run an OS presence
-        // prompt that parks on a human, so they run on their own task (see
-        // `handle_client`).
+        // `model/confirm`, `model/set` and (REQ-576) `config/set` are deliberately
+        // absent alongside `session/attach`: since REQ-570 BR-10(b) each may run an
+        // OS presence prompt that parks on a human, so they run on their own task
+        // (see `handle_client`'s `blocks_on_a_human`). `config/get` stays here — a
+        // read is layer (a) only.
         ModelListParams::METHOD => Some(ok_string(id, &daemon.runtime.model_list())),
         ModelStatusParams::METHOD => Some(ok_string(id, &daemon.runtime.model_status())),
         ConfigGetParams::METHOD => Some(handle_config_get(daemon, conn, id)),
-        ConfigSetParams::METHOD => Some(handle_config_set(daemon, conn, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, conn, id)),
         WebOverrideParams::METHOD => Some(handle_web_override(daemon, conn, id, params)),
         // REQ-572: the setup *reads* are session-scoped, so they belong here
@@ -2719,14 +2724,37 @@ fn handle_config_get(daemon: &Daemon, conn: &ConnState, id: Id) -> String {
 }
 
 /// Apply a configuration mutation (`config/set`), rejecting it on validation
-/// failure (e.g. a raw key in `auth_ref`, BR-7).
-fn handle_config_set(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
-    // BR-10(a) / BUG-162, deliberately downgraded there and gated here anyway:
-    // config lives at `base_dir/config.toml`, which any same-UID process can
-    // already write directly, so this removes *immediacy* (no daemon restart
-    // needed) rather than a capability. Defense in depth, not the emergency the
-    // raw audit finding suggested.
+/// failure (e.g. a raw key in `auth_ref`).
+///
+/// **A BR-10(b) daemon-wide commitment (REQ-576).** `config/set` durably
+/// rewrites `config.toml` and live-swaps the daemon-wide in-memory config, and
+/// its `ConfigUpdate` reaches the egress boundary (`RegisterProvider` names a
+/// remote endpoint) and the privacy boundary itself (`SetPrivacyBoundary`). That
+/// blast radius is the whole machine, so — like `model/confirm`, `model/set` and
+/// `web/setup_commit` — it runs the shared [`refuse_unattested_commitment`] on
+/// top of the ancestry gate, and moved off the reader-loop `dispatch` onto
+/// `handle_client`'s `blocks_on_a_human` task so the prompt cannot stall the
+/// connection.
+///
+/// **This reverses the BUG-162 posture** once recorded here. That posture kept
+/// config/set at layer (a) only, reasoning that config lives at
+/// `base_dir/config.toml` — which a same-UID process can already edit — so the
+/// RPC "removes immediacy, not capability." REQ-570/REQ-575 established that this
+/// mitigation is insufficient for a *commitment*: the same "can edit the file
+/// then restart" argument applies to `model/set`, which is gated anyway, and the
+/// immediacy the RPC removes — a silent, no-restart live swap of the egress and
+/// privacy config — is exactly the quiet path an attacker wants. So it attests.
+async fn handle_config_set(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    // BR-10(a) / BUG-162: the ancestry gate stops the daemon's own children.
     if let Some(refusal) = refuse_daemon_wide(conn, &id) {
+        return refusal;
+    }
+    // BR-10(b) / REQ-576: and because the blast radius is the whole machine — an
+    // egress endpoint, the privacy boundary — a human too. Degrades (not refuses)
+    // where no presence mechanism exists (REQ-570 BR-8), so shipped builds and
+    // `teton provider add` gain no new prompt. Ordered after the ancestry gate so
+    // a caller that may not act here at all is refused without a prompt appearing.
+    if let Some(refusal) = refuse_unattested_commitment(daemon, conn, &id).await {
         return refusal;
     }
     let params: ConfigSetParams = match serde_json::from_value(params) {
@@ -4172,21 +4200,23 @@ mod tests {
     /// off the reader loop" (the sync `#[test]` bridge [`route_setup`] delegates
     /// here rather than deciding it a second time).
     ///
-    /// Five methods run on their own task because they may park on a human, so
+    /// Six methods run on their own task because they may park on a human, so
     /// they are absent from [`dispatch`]: `session/attach`, `attach/consent`,
-    /// `model/confirm`, `model/set`, and (REQ-575) `web/setup_commit`. A test
-    /// that reached only for `dispatch` would get `METHOD_NOT_FOUND` for those
-    /// and could report a security gate as "passing" while never invoking it —
-    /// so the routing is mirrored here rather than duplicated per test.
+    /// `model/confirm`, `model/set`, (REQ-575) `web/setup_commit`, and (REQ-576)
+    /// `config/set`. A test that reached only for `dispatch` would get
+    /// `METHOD_NOT_FOUND` for those and could report a security gate as "passing"
+    /// while never invoking it — so the routing is mirrored here rather than
+    /// duplicated per test.
     ///
     /// `web/setup_commit` is the odd one out: its **layer (a)** gate is
     /// session-scoped (`may_drive`, via `refuse_commit_without_session_access`),
-    /// not the ancestry gate the other four daemon-wide methods use — so it is
+    /// not the ancestry gate the other daemon-wide methods use — so it is
     /// deliberately absent from [`daemon_wide_methods`], and its BR-10(b)
     /// commitment coverage lives in its own session-scoped tests
     /// (`a_web_setup_commit_refuses_when_the_presence_check_fails` and siblings)
     /// rather than in the shared daemon-wide table, which cannot supply an
-    /// attached owner.
+    /// attached owner. `config/set`, by contrast, IS a `daemon_wide_method`
+    /// (ancestry gate), so its commitment coverage rides the shared table.
     async fn route_for_test(
         daemon: &Daemon,
         conn: &ConnState,
@@ -4204,6 +4234,8 @@ mod tests {
             handle_model_set(daemon, conn, id, params).await
         } else if method == WebSetupCommitParams::METHOD {
             handle_web_setup_commit(daemon, conn, id, params).await
+        } else if method == ConfigSetParams::METHOD {
+            handle_config_set(daemon, conn, id, params).await
         } else {
             dispatch(daemon, conn, id, method, params).expect("a routed method answers")
         }
@@ -4284,7 +4316,11 @@ mod tests {
         //
         // A refusing verifier is the fixture rather than an accepting one:
         // "presence was demanded" is only observable when it can fail.
-        let commitments = [ModelConfirmParams::METHOD, ModelSetParams::METHOD];
+        let commitments = [
+            ModelConfirmParams::METHOD,
+            ModelSetParams::METHOD,
+            ConfigSetParams::METHOD,
+        ];
 
         for (method, params) in daemon_wide_methods() {
             let daemon = Arc::new(Daemon::new().with_presence_verifier(Box::new(
@@ -4331,7 +4367,15 @@ mod tests {
     /// the reduced posture is not silently confused with a satisfied one.
     #[tokio::test]
     async fn a_commitment_degrades_to_layer_a_where_no_mechanism_exists() {
-        for method in [ModelConfirmParams::METHOD, ModelSetParams::METHOD] {
+        // Config/set (REQ-576) joins the two model methods: all three are BR-10(b)
+        // commitments that must degrade — not refuse — where no mechanism exists.
+        // Listed explicitly (this test does not loop `daemon_wide_methods()`), so a
+        // future commitment must be added here as well as to `commitments` above.
+        for method in [
+            ModelConfirmParams::METHOD,
+            ModelSetParams::METHOD,
+            ConfigSetParams::METHOD,
+        ] {
             let params = daemon_wide_methods()
                 .into_iter()
                 .find(|(m, _)| *m == method)
