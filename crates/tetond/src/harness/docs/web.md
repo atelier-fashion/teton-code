@@ -14,8 +14,11 @@ order and writes nothing until the last answer.
 - `search` — also search through a backend the user names.
 
 Each tier includes the ones before it. Enabling a tier is not consenting to a
-lookup: every lookup still asks before anything leaves the machine, and a fresh
-cache hit performs no egress and asks nothing. `search` additionally needs the
+lookup: a lookup asks before anything leaves the machine **unless** that tier
+has already been granted — for the session, or permanently via `[web]
+permission_allow` — and a fresh cache hit performs no egress and asks nothing.
+The three tiers are consented separately, so an answer about one is never an
+answer about the others. `search` additionally needs the
 local model, because every query is scanned before it leaves — a machine with
 no local model can fetch but cannot search, and the tier menu marks it
 unavailable there rather than writing a tier that would refuse every query.
@@ -38,6 +41,12 @@ which reads exactly like a bad key and is not one:
   and the parse finds no results.
 
 ## The rest of the table
+
+`permission_allow` is the durable half of the consent prompt: it lists the
+tiers whose "enable permanently" answer was given, one entry each, and defaults
+to empty. Removing a tier from it restores asking for that tier and nothing
+else. It cannot widen `tier` — the ceiling is checked before any prompt exists,
+so a tier listed here that `tier` does not reach simply never comes up.
 
 `allowed_domains` constrains model-composed destinations only: absent means
 unrestricted, present but empty means nothing is allowed, and a URL the user

@@ -351,9 +351,10 @@ const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
 /// **This is the number that used to sit under the harness's context budget**
 /// (32,768) and block every context-budget-full remote turn. It is now
 /// **108,280** — 3.3× that budget, 2.58× a full body with the system prompt and
-/// JSON overhead on top of it (2.6× before REQ-577 widened the overhead term). The collision is closed rather than measured;
-/// what `docs/manual-verification.md` now records is the *chunk-count
-/// distribution*, which is where the cost went.
+/// JSON overhead on top of it (2.6× before REQ-577 widened the overhead term).
+/// The collision is closed rather than measured; what
+/// `docs/manual-verification.md` now records is the *chunk-count distribution*,
+/// which is where the cost went.
 pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK_MAX_BYTES;
 
 /// How much the pipeline trusts a finding — **derived, never self-reported**
@@ -1949,8 +1950,8 @@ mod tests {
     /// facts, and only one of them survives the next sentence somebody adds to
     /// the bundled guide (AC-9).
     ///
-    /// **Recorded headroom at REQ-577:** the worst prompt is 5,711 bytes, so
-    /// `spent` is 8,987 against a 9,216-byte overhead — **229 bytes of margin**
+    /// **Recorded headroom at REQ-577:** the worst prompt is 5,847 bytes, so
+    /// `spent` is 9,123 against a 9,216-byte overhead — **93 bytes of margin**
     /// over the 48-byte floor. It was 67 before this REQ, against an 8 KiB
     /// overhead; `teton_docs`'s 274 bytes of tool docs did not fit in the 19
     /// bytes that left, which is why the assumption moved rather than the floor.
@@ -1960,10 +1961,18 @@ mod tests {
     /// purposes: the guide named the four tiers and said what none of them was
     /// *for*, and the model composed "deep reasoning" onto `reflex` in 4 of 4
     /// trials, handing the user a command that binds their think-tier provider
-    /// to the always-on duties. The 9,216 is not to be raised again to make
-    /// room for prose — the ADR-2 fallback (recipes move into the `providers`
-    /// topic, which is a tool result rather than resident prompt) is what the
-    /// next sentence buys itself with.
+    /// to the always-on duties, leaving 229.
+    ///
+    /// The phase-5 endpoint correction spent 136 of that 229. Every recipe
+    /// endpoint gained the request path Teton actually POSTs to
+    /// (`/chat/completions`, or `/v1/messages` for Anthropic, which had no
+    /// endpoint at all), and the step's own shape line lost the two-form
+    /// `anthropic`-without-`--endpoint` spelling that was wrong. The bytes were
+    /// paid out of the margin rather than out of the assumption: **the 9,216 is
+    /// not to be raised again to make room for prose** — the ADR-2 fallback
+    /// (recipes move into the `providers` topic, which is a tool result rather
+    /// than resident prompt) is what the next sentence buys itself with, and 93
+    /// bytes is close enough to the floor that the next one probably has to.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};

@@ -244,12 +244,14 @@ differentiators:
 ### Hooking up an external model
 
 ```bash
-# Register the provider (remote kinds must declare --model; the API key is
-# read from TETON_PROVIDER_KEY or prompted for, and stored in the OS
-# keychain — never written to a file):
-teton provider add opus --kind anthropic --model claude-opus-5
+# Register the provider. Every remote kind needs --kind, --endpoint and
+# --model; the API key is read from TETON_PROVIDER_KEY or prompted for, and
+# stored in the OS keychain — never written to a file. --endpoint is the full
+# request URL, posted exactly as given, not a vendor's base_url:
+teton provider add opus --kind anthropic \
+  --endpoint https://api.anthropic.com/v1/messages --model claude-opus-5
 teton provider add kimi --kind openai-compatible \
-  --endpoint https://api.moonshot.ai/v1 --model kimi-k3
+  --endpoint https://api.moonshot.ai/v1/chat/completions --model kimi-k3
 
 # Route work to it — a whole tier (reflex | scan | build | think), with an
 # optional fallback, or a single category ahead of its tier:

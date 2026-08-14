@@ -58,6 +58,20 @@
 //! | REQ-577 BR-2 (web topic ↔ suggestion catalog auth shapes) | [`the_web_topic_and_the_suggestion_catalog_agree`] |
 //! | REQ-577 BR-1 / BR-2 / AC-7 (bundled guide recipes ↔ recipe catalog, bidirectional) | [`the_bundled_guide_and_the_recipe_catalog_agree`] |
 //! | REQ-577 BR-2 / AC-7 (README walkthrough ↔ recipe catalog, bidirectional) | [`the_readme_recipes_and_the_catalog_agree`] |
+//! | REQ-577 BR-2 (recipe notes ↔ the prose that echoes them, bidirectional) | [`the_recipe_notes_and_the_prose_that_echoes_them_agree`] |
+//! | REQ-577 BR-2 (policy topic ↔ `Category::tier()`) | [`the_policy_topic_files_every_category_under_its_own_tier`] |
+//!
+//! ## Facts are checked **paired**, not as sets (phase-5)
+//!
+//! The guide and README gates originally asked two separate questions — is this
+//! endpoint somewhere in the text, is this model somewhere in the text — and a
+//! surface can answer yes to both while pairing Moonshot's endpoint with
+//! Anthropic's model. Every individual fact checks out and the command is dead.
+//! So the guide's recipe line is now split per vendor and each endpoint's model
+//! must be in **its own** segment, and the README's block is read one
+//! `provider add` at a time with `(kind, endpoint, model)` required to be a
+//! combination some single recipe ships. Both sweep example models in the
+//! reverse direction as well, which the endpoint-only reverse legs did not.
 //!
 //! ## A third prose surface, on a second catalog (REQ-577)
 //!
@@ -110,7 +124,7 @@ use tetond::egress::{
     Authorship, Egress, HttpTransport, LookupContext, LookupRequest, NoopSink, RedactionGate,
     RedactionVerdict, TaintView,
 };
-use tetond::provider_recipes::recipe_catalog;
+use tetond::provider_recipes::{recipe_catalog, ProviderRecipe};
 use tetond::web_setup_catalog::suggestion_catalog;
 
 // ---------------------------------------------------------------------------
@@ -740,6 +754,159 @@ fn readme_recipe_commands() -> &'static str {
     after.split_once("```").map_or(after, |(block, _)| block)
 }
 
+/// The bundled guide's recipe **list**, split into one segment per vendor.
+///
+/// The list is everything from the first catalog endpoint the line carries
+/// onward, which is derived rather than anchored on a phrase — one less piece of
+/// prose that can be reworded out from under this suite. Segments are cut on
+/// `;`, which is how the line separates vendors, so each vendor's endpoint and
+/// its example model land in the **same** segment or the pairing check fails.
+///
+/// That pairing is the whole reason this exists. Asserting "the line contains
+/// this endpoint" and "the line contains this model" separately passes a line
+/// that names Moonshot's endpoint beside DeepSeek's model — six right facts in
+/// the wrong six places, which is a worse failure than a missing one because
+/// every individual fact checks out.
+///
+/// **Panics** when no catalog endpoint appears at all: the forward direction
+/// below would then hold vacuously over an empty list.
+fn guide_recipe_segments(catalog: &[ProviderRecipe]) -> Vec<&'static str> {
+    let line = guide_recipe_line();
+    let first = catalog
+        .iter()
+        .filter_map(|r| r.endpoint.as_deref())
+        .filter_map(|endpoint| line.find(endpoint))
+        .min()
+        .unwrap_or_else(|| {
+            panic!(
+                "the bundled guide's recipe step carries none of the catalog's endpoints, \
+                 so there is no recipe list to split. Restore the recipes in \
+                 crates/tetond/src/harness/self_config.md, or re-anchor this \
+                 check.\nline: {line}"
+            )
+        });
+    // Back up over the opening backtick the endpoint is wrapped in. Cutting
+    // between a backtick and the URL it opens inverts the parity of every
+    // backtick after it, so the first segment's model would be read as prose and
+    // its prose as a model — a parse that fails *quietly*, giving one fewer
+    // candidate than there are vendors.
+    let start = if first > 0 && line.as_bytes()[first - 1] == b'`' {
+        first - 1
+    } else {
+        first
+    };
+    line[start..].split(';').collect()
+}
+
+/// The segment of the guide's recipe list that carries `endpoint`, and the proof
+/// that exactly one does.
+///
+/// Two matches would mean the split is not separating vendors — which would make
+/// every pairing assertion below true of a line that pairs nothing.
+fn guide_segment_for<'a>(segments: &[&'a str], endpoint: &str, id: &str) -> &'a str {
+    let matches: Vec<&&str> = segments.iter().filter(|s| s.contains(endpoint)).collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "`{id}`'s endpoint `{endpoint}` appears in {} of the guide's recipe segments, not \
+         exactly one. Either the recipe is missing from \
+         crates/tetond/src/harness/self_config.md, or the `;` separators no longer divide \
+         the list one vendor per segment — in which case this pairing check is reading \
+         several vendors as one and would pass a line that gave a vendor its neighbour's \
+         model.\nsegments: {segments:?}",
+        matches.len()
+    );
+    matches[0]
+}
+
+/// The backticked tokens in `text` that could be a model id.
+///
+/// Everything in the guide's recipe list is written in backticks — URLs, model
+/// ids, and the odd path fragment like `/v1` — so the model ids are what is left
+/// after removing what a model id demonstrably is not: a URL, a path, a flag, or
+/// a whole command (which has spaces in it). The filter is deliberately about
+/// *shape* rather than a list of known non-models: a needle list would have to
+/// be extended by whoever adds the next parenthetical, and forgetting to do so
+/// fails open.
+fn backticked_model_candidates(text: &str) -> Vec<&str> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|token| {
+            !token.is_empty()
+                && !token.contains("://")
+                && !token.starts_with('/')
+                && !token.starts_with('-')
+                && !token.contains(char::is_whitespace)
+        })
+        .collect()
+}
+
+/// `block` with its `#` comment lines dropped.
+///
+/// The flag sweeps below claim to read *the commands a reader pastes*, and the
+/// block's comments are prose about those commands — prose that legitimately
+/// names flags ("every remote kind needs `--kind`, `--endpoint` and `--model`").
+/// Parsing a flag out of a sentence and then asserting its "value" is a real
+/// endpoint is how this gate reports `--endpoint and`. URLs are still swept over
+/// the **whole** block, comments included, because a stale URL in a comment is
+/// exactly as copyable as one in a command.
+fn without_comments(block: &str) -> String {
+    block
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every `teton provider add …` command in `block`, each rejoined into one
+/// logical line.
+///
+/// The README wraps its longer registrations with a trailing `\`, so a
+/// line-by-line read would see the id and the kind on one line and the endpoint
+/// and the model on the next — and a per-command check that split a command in
+/// half would be checking two fragments against a whole recipe. Continuations
+/// are folded back before anything is parsed.
+///
+/// **Panics** when the block contains no registration: this is the input to a
+/// pairing sweep, and a sweep over nothing passes.
+fn readme_provider_add_commands(block: &str) -> Vec<String> {
+    let mut commands: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in block.lines() {
+        let trimmed = line.trim();
+        let continues = trimmed.ends_with('\\');
+        let body = trimmed.trim_end_matches('\\').trim_end();
+        match current.as_mut() {
+            Some(open) => {
+                open.push(' ');
+                open.push_str(body);
+            }
+            None if body.starts_with("teton provider add ") => {
+                current = Some(body.to_owned());
+            }
+            None => continue,
+        }
+        if !continues {
+            if let Some(done) = current.take() {
+                commands.push(done);
+            }
+        }
+    }
+    // A command left open by a trailing `\` at the end of the block is still a
+    // command, and dropping it would be the fail-open this suite is written
+    // against.
+    if let Some(open) = current.take() {
+        commands.push(open);
+    }
+    assert!(
+        !commands.is_empty(),
+        "the README's command block contains no `teton provider add` line, so the \
+         per-command pairing sweep would pass over nothing.\nblock:\n{block}"
+    );
+    commands
+}
+
 /// The value following every occurrence of `flag ` in `text`, taken to the next
 /// whitespace.
 ///
@@ -787,39 +954,66 @@ fn the_bundled_guide_and_the_recipe_catalog_agree() {
         catalog.len()
     );
     let line = guide_recipe_line();
+    let segments = guide_recipe_segments(&catalog);
 
-    // Catalog → guide: every vendor's endpoint and example model is on the line.
+    // Catalog → guide, **paired per vendor**: each endpoint is on the line, and
+    // the example model that belongs to it is in the *same* segment.
     for recipe in &catalog {
-        match &recipe.endpoint {
-            Some(endpoint) => assert!(
-                line.contains(endpoint.as_str()),
-                "the catalog gives `{}` the endpoint `{endpoint}` and the bundled guide's \
-                 recipe step does not carry it, so a model composing that command has to \
-                 invent a URL. Edit crates/tetond/src/harness/self_config.md — the catalog \
-                 (crates/tetond/src/provider_recipes.rs) is the source and it moves first, \
-                 and mind the byte ceiling the two prompt-margin tests pin.\nline: {line}",
+        let endpoint = recipe.endpoint.as_deref().unwrap_or_else(|| {
+            panic!(
+                "the catalog gives `{}` no endpoint. Every kind a recipe may name is \
+                 `is_remote()`, and `Config::validate` demands an endpoint for those — a \
+                 recipe without one is a `provider add` the daemon refuses after the key \
+                 is already in the keychain (BUG-170). Fix \
+                 crates/tetond/src/provider_recipes.rs.",
                 recipe.id_suggestion
-            ),
-            // The absent endpoint is a fact the guide has to state, not a gap it
-            // may leave: a model that has never been told the `anthropic` kind
-            // carries its own address will pattern-match `--endpoint` onto it
-            // from the five neighbours that do.
-            None => assert!(
-                line.contains("no `--endpoint`"),
-                "the catalog gives `{}` no endpoint — its kind knows its own address — and \
-                 the guide's recipe step never says so, so the one vendor whose command \
-                 takes no `--endpoint` reads like the five that do.\nline: {line}",
-                recipe.id_suggestion
-            ),
-        }
+            )
+        });
         assert!(
-            line.contains(recipe.example_model.as_str()),
-            "the catalog's example model for `{}` is `{}` and the bundled guide's recipe \
-             step names a different one or none. A retired model id is a 404 the user \
-             cannot debug from the message. Edit \
-             crates/tetond/src/harness/self_config.md.\nline: {line}",
+            line.contains(endpoint),
+            "the catalog gives `{}` the endpoint `{endpoint}` and the bundled guide's \
+             recipe step does not carry it, so a model composing that command has to \
+             invent a URL. Edit crates/tetond/src/harness/self_config.md — the catalog \
+             (crates/tetond/src/provider_recipes.rs) is the source and it moves first, \
+             and mind the byte ceiling the two prompt-margin tests pin.\nline: {line}",
+            recipe.id_suggestion
+        );
+        let segment = guide_segment_for(&segments, endpoint, &recipe.id_suggestion);
+        assert!(
+            segment.contains(recipe.example_model.as_str()),
+            "the guide names `{}`'s endpoint and names `{}` somewhere, but not in the same \
+             recipe segment — so the line pairs that endpoint with some other vendor's \
+             model. Every fact would check out individually and the command the model \
+             composes would still be wrong. Edit \
+             crates/tetond/src/harness/self_config.md.\nsegment: {segment}",
             recipe.id_suggestion,
             recipe.example_model
+        );
+    }
+
+    // Guide → catalog, the models: a model id printed here is one a user pastes
+    // into `--model`, so it has to be an example this repository verified. The
+    // endpoints get the same treatment further down, over the whole file.
+    let models: BTreeSet<&str> = catalog.iter().map(|r| r.example_model.as_str()).collect();
+    let named = segments
+        .iter()
+        .flat_map(|segment| backticked_model_candidates(segment))
+        .collect::<Vec<_>>();
+    assert!(
+        named.len() >= catalog.len(),
+        "the guide's recipe list yielded {} model candidates for {} recipes, so the parse \
+         is reading less than the list holds: {named:?}",
+        named.len(),
+        catalog.len()
+    );
+    for model in named {
+        assert!(
+            models.contains(model),
+            "the bundled guide's recipe list names `{model}` and no recipe offers that \
+             example. A model id in the resident prompt is one the agent reads out on \
+             every provider question: re-verify it against the vendor's current models \
+             page, then update crates/tetond/src/provider_recipes.rs and the guide \
+             together.\ncatalog: {models:?}"
         );
     }
 
@@ -881,6 +1075,9 @@ fn the_readme_recipes_and_the_catalog_agree() {
     );
     let section = readme_recipe_section();
     let commands = readme_recipe_commands();
+    // The flag parses read commands; the URL parse further down reads the whole
+    // block. See `without_comments` for why the two differ.
+    let runnable = without_comments(commands);
 
     // Catalog → README, the roster: the section claims which vendors ship, and a
     // vendor the binary knows that the README never names is a recipe nobody
@@ -923,6 +1120,54 @@ fn the_readme_recipes_and_the_catalog_agree() {
         kimi.example_model
     );
 
+    // README → catalog, **per command**: a `provider add` line is a unit, and
+    // its three third-party facts have to come from one recipe. Checking the
+    // endpoint set and the model set separately passes a command that gives
+    // Moonshot's endpoint Anthropic's model — every fact verified, the command
+    // still dead. This is the check that would have caught the shipped defect
+    // directly rather than by way of the model id that happened to also be
+    // stale (BUG-170).
+    for command in readme_provider_add_commands(&runnable) {
+        let Some(kind) = flag_values(&command, "--kind")
+            .first()
+            .map(|k| (*k).to_owned())
+        else {
+            panic!(
+                "a `teton provider add` line in the README's block passes no `--kind`, so \
+                 the command names no adapter at all.\ncommand: {command}"
+            );
+        };
+        let endpoint = flag_values(&command, "--endpoint")
+            .first()
+            .map(|e| (*e).to_owned());
+        let model = flag_values(&command, "--model")
+            .first()
+            .map(|m| (*m).to_owned());
+        let paired = catalog.iter().any(|recipe| {
+            kind_flag(recipe.kind) == kind
+                && recipe.endpoint.as_deref() == endpoint.as_deref()
+                && Some(recipe.example_model.as_str()) == model.as_deref()
+        });
+        assert!(
+            paired,
+            "the README's command block registers a provider with \
+             kind={kind:?} endpoint={endpoint:?} model={model:?}, and no single recipe \
+             ships that combination. Each of the three may be a fact this repository \
+             verified and the command still be one that cannot work — a base URL where a \
+             request URL belongs, or one vendor's model against another's endpoint. Edit \
+             the README, or crates/tetond/src/provider_recipes.rs if the vendor \
+             moved.\ncommand: {command}\ncatalog: {:?}",
+            catalog
+                .iter()
+                .map(|r| (
+                    kind_flag(r.kind),
+                    r.endpoint.clone(),
+                    r.example_model.clone()
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // README → catalog: every third-party fact the block spells must be one this
     // repository verified. Parsed off the flags rather than by scanning prose,
     // so what is checked is precisely what a reader would paste.
@@ -932,8 +1177,8 @@ fn the_readme_recipes_and_the_catalog_agree() {
         .collect();
     let models: BTreeSet<&str> = catalog.iter().map(|r| r.example_model.as_str()).collect();
 
-    let shown_endpoints = flag_values(commands, "--endpoint");
-    let shown_models = flag_values(commands, "--model");
+    let shown_endpoints = flag_values(&runnable, "--endpoint");
+    let shown_models = flag_values(&runnable, "--model");
     // Non-vacuity: the block registers at least the two providers it routes
     // between, one of them remote.
     assert!(
@@ -1054,13 +1299,19 @@ fn the_providers_topic_and_the_recipe_catalog_agree() {
                  first.\ncommand: {command}",
                 recipe.id_suggestion
             ),
-            // The absent endpoint is a *fact*, not a gap: the `anthropic` kind
-            // carries its own address, so a printed `--endpoint` is a user error
-            // the topic would be teaching.
+            // Unreachable while every registerable kind is `is_remote()`, which
+            // is every kind a recipe may name — kept because the arm is where a
+            // future non-remote kind would land, and because a `_ => {}` here
+            // would be the fail-open this suite is written against. Round 1's
+            // catalog did reach it, on the strength of a belief that the
+            // `anthropic` adapter carried its own address; it does not, and the
+            // recipe that said so produced a registration `config/set` refused
+            // (BUG-170).
             None => assert!(
                 !command.contains("--endpoint"),
-                "the catalog gives `{}` no endpoint — its kind knows its own address — and \
-                 the topic prints one anyway.\ncommand: {command}",
+                "the catalog gives `{}` no endpoint and the topic prints one anyway. Note \
+                 that a *remote* kind with no endpoint is itself a defect the recipe \
+                 catalog's own sweep catches first.\ncommand: {command}",
                 recipe.id_suggestion
             ),
         }
@@ -1111,6 +1362,312 @@ fn the_providers_topic_and_the_recipe_catalog_agree() {
              unlisted — every URL this topic prints is one a user will paste into a \
              command.\noffered: {offered:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recipe notes ↔ the prose that echoes them (REQ-577 BR-2)
+// ---------------------------------------------------------------------------
+
+/// `text` with backticks and asterisks removed, lowercased, whitespace
+/// collapsed — the form the note-echo rows are matched in.
+///
+/// The same claim is written three ways by three conventions: a catalog note is
+/// plain prose in a Rust string, the topic wraps flags and paths in backticks,
+/// and the guide does too under a byte ceiling that decides where the backticks
+/// go. Matching raw would make this gate a formatting check, which is the kind
+/// that gets deleted the first time it fires for a reason nobody cares about.
+fn normalized(text: &str) -> String {
+    text.replace(['`', '*'], "")
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One recipe note and the phrase that must survive into each prose surface.
+///
+/// Hand-written per vendor rather than derived, the [`CONTRACTS`] posture: a
+/// note is a sentence and its prose echo is a different sentence, so "the same
+/// claim" is a judgment somebody makes once and writes down — not a substring
+/// relation a rule could compute.
+struct NoteEcho {
+    /// The recipe this row is about, keyed by suggested id.
+    id: &'static str,
+    /// The claim, as it must appear in the catalog note.
+    in_note: &'static str,
+    /// The claim, as it must appear in the `providers` topic.
+    in_topic: &'static str,
+    /// The claim, as it must appear in the guide's segment for this vendor —
+    /// or `None` where the guide states the fact **structurally** rather than
+    /// in prose and has no bytes to spare for saying it twice.
+    in_guide: Option<&'static str>,
+}
+
+/// The note-echo table: one row per recipe that carries a note.
+///
+/// A note exists because the command shape alone does not say something. That
+/// makes it exactly the kind of fact that is true in the typed source and
+/// missing from the prose a user actually reads — the drift this REQ's gates
+/// exist for, one altitude below the endpoints.
+const NOTE_ECHOES: &[NoteEcho] = &[
+    // The guide row is `None` here on purpose: the guide carries this fact in
+    // the endpoint itself (`…/v1/messages` beside five `…/chat/completions`),
+    // which the pairing gate above already pins byte for byte. Spending resident
+    // prompt on a prose restatement of a URL the same line prints would be
+    // paying twice, with 93 bytes of margin left.
+    NoteEcho {
+        id: "anthropic",
+        in_note: "messages api path",
+        in_topic: "messages api",
+        in_guide: None,
+    },
+    NoteEcho {
+        id: "deepseek",
+        in_note: "no /v1",
+        in_topic: "no /v1",
+        in_guide: Some("no /v1"),
+    },
+    NoteEcho {
+        id: "ollama",
+        in_note: "ignores the key",
+        in_topic: "ignores the key",
+        // The guide's shortest true spelling. It has to say *something*: round 1
+        // said "local and keyless", and a user told there is no key step meets
+        // an echo-off prompt the recipe promised would not come.
+        in_guide: Some("any key"),
+    },
+];
+
+/// **A recipe's note and the prose that repeats it say the same thing**
+/// (REQ-577 BR-2, extended).
+///
+/// The endpoint gates above pin the facts a command *contains*. A note is the
+/// fact a command does not contain — why this path has no `/v1`, why Ollama
+/// still asks for a key — and it reaches a user only through prose. So it drifts
+/// the same way an endpoint does, silently and in either direction, and it is
+/// gated the same way.
+///
+/// Bidirectional at the table level as well as the surface level: a recipe that
+/// gains a note with no row here fails, and a row naming a recipe that has no
+/// note fails as stale. That is what stops the table quietly describing a
+/// catalog that has moved on.
+#[test]
+fn the_recipe_notes_and_the_prose_that_echoes_them_agree() {
+    let catalog = recipe_catalog();
+    let segments = guide_recipe_segments(&catalog);
+    let topic = normalized(PROVIDERS_TOPIC);
+
+    // Catalog → table: every note has a row.
+    for recipe in &catalog {
+        let Some(note) = recipe.notes.as_deref() else {
+            continue;
+        };
+        let row = NOTE_ECHOES
+            .iter()
+            .find(|row| row.id == recipe.id_suggestion)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the catalog gives `{}` the note {note:?} and `NOTE_ECHOES` has no row \
+                     for it. A note is a fact the command shape does not carry, so it \
+                     reaches the user only through prose — add the row and the prose, or \
+                     drop the note if it was not worth saying.",
+                    recipe.id_suggestion
+                )
+            });
+
+        let note = normalized(note);
+        assert!(
+            note.contains(row.in_note),
+            "`{}`'s note no longer says {:?}. Either the note was reworded and this row is \
+             stale, or the claim was dropped and the prose below still makes it — update \
+             both together.\nnote: {note}",
+            recipe.id_suggestion,
+            row.in_note
+        );
+        assert!(
+            topic.contains(row.in_topic),
+            "the catalog note for `{}` claims {:?} and the `providers` topic never says \
+             it. The topic is where a note gets said at length — it is a tool result, not \
+             resident prompt, so it has the room. Edit \
+             crates/tetond/src/harness/docs/providers.md.",
+            recipe.id_suggestion,
+            row.in_topic
+        );
+        if let Some(expected) = row.in_guide {
+            let endpoint = recipe
+                .endpoint
+                .as_deref()
+                .expect("every recipe carries an endpoint; the sweep above pins that");
+            let segment = normalized(guide_segment_for(
+                &segments,
+                endpoint,
+                &recipe.id_suggestion,
+            ));
+            assert!(
+                segment.contains(expected),
+                "the catalog note for `{}` claims {expected:?} and the guide's own recipe \
+                 segment for it does not. This row is `Some` because the guide cannot \
+                 state this one structurally, so dropping it drops the fact from the \
+                 resident prompt — where it is the only copy a turn sees without a tool \
+                 call. Edit crates/tetond/src/harness/self_config.md (mind the margin), or \
+                 set this row's `in_guide` to `None` and say why.\nsegment: {segment}",
+                recipe.id_suggestion
+            );
+        }
+    }
+
+    // Table → catalog: a row for a recipe with no note is a row describing a
+    // claim nothing makes any more.
+    for row in NOTE_ECHOES {
+        let recipe = catalog
+            .iter()
+            .find(|r| r.id_suggestion == row.id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`NOTE_ECHOES` has a row for `{}` and the catalog ships no such recipe. \
+                     Remove the row; do not re-add the recipe to satisfy it.",
+                    row.id
+                )
+            });
+        assert!(
+            recipe.notes.is_some(),
+            "`NOTE_ECHOES` has a row for `{}` and that recipe carries no note, so this row \
+             pins prose against nothing. Remove the row, or restore the note if it was \
+             dropped by accident.",
+            row.id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The policy topic ↔ the category table (REQ-577 BR-2, third typed source)
+// ---------------------------------------------------------------------------
+
+/// The `teton_docs` policy topic, gated on the compiled-in category table.
+const POLICY_TOPIC: &str = include_str!("../src/harness/docs/policy.md");
+
+/// **Every category is documented on the tier it actually inherits from**
+/// (REQ-577 BR-2).
+///
+/// `Category::tier()` is a `const fn` — a category's tier is compile-time, not
+/// configuration — which makes the policy topic's four "Carries …" lines a
+/// hand-written second spelling of a table the binary already ships. That is
+/// precisely the shape this file exists to gate, and it is free: no third-party
+/// fact, no verification round, just two spellings that must agree.
+///
+/// The claim is stronger than "appears somewhere": a category must appear under
+/// **its own** tier and under no other. A user reading that `edit` is carried by
+/// `think` binds the wrong tier and pays a frontier price for every file write,
+/// and the topic would have been "correct" by any containment check.
+#[test]
+fn the_policy_topic_files_every_category_under_its_own_tier() {
+    use teton_core::category::{Category, ConfigurableCategory, Tier};
+
+    // The tier list, and *only* the tier list. Scoped to its own section first:
+    // the `think` bullet is last, so a segment that ran to the end of the file
+    // would swallow the binding examples and the "nine bindable categories"
+    // sentence — and then contain every category name, which makes the
+    // wrong-tier half of this test pass on any topic at all.
+    const TIERS_HEADING: &str = "## The four tiers";
+    let (_, after_heading) = POLICY_TOPIC.split_once(TIERS_HEADING).unwrap_or_else(|| {
+        panic!(
+            "the policy topic (crates/tetond/src/harness/docs/policy.md) no longer has a \
+             `{TIERS_HEADING}` heading, so this check has nothing to scope to. Restore it, \
+             or re-anchor — do not leave the tier table unchecked."
+        )
+    });
+    let tier_list = after_heading.split("\n## ").next().unwrap_or(after_heading);
+
+    let tier_segment = |tier: Tier| -> String {
+        let needle = format!("- `{}`", tier.as_str());
+        let (_, after) = tier_list.split_once(needle.as_str()).unwrap_or_else(|| {
+            panic!(
+                "the policy topic has no `{needle}` bullet under `{TIERS_HEADING}`, so a \
+                 tier the binary ships is one the topic never describes. Add it, or \
+                 re-anchor this check — do not leave the table unchecked."
+            )
+        });
+        after.split("\n- `").next().unwrap_or(after).to_owned()
+    };
+    let segments: Vec<(Tier, String)> = Tier::ALL
+        .into_iter()
+        .map(|tier| (tier, tier_segment(tier)))
+        .collect();
+    // Non-vacuity: four bullets that between them name every category once. A
+    // scoping mistake shows up here rather than as a silently permissive sweep.
+    let named: usize = Category::ALL
+        .into_iter()
+        .filter(|c| {
+            segments
+                .iter()
+                .any(|(_, seg)| seg.contains(&format!("`{}`", c.as_str())))
+        })
+        .count();
+    assert_eq!(
+        named,
+        Category::ALL.len(),
+        "the four tier bullets name {named} of {} categories between them; the section \
+         parse is reading less than the topic holds.\nsegments: {segments:?}",
+        Category::ALL.len()
+    );
+
+    for category in Category::ALL {
+        let name = format!("`{}`", category.as_str());
+        for (tier, segment) in &segments {
+            let documented = segment.contains(name.as_str());
+            let belongs = *tier == category.tier();
+            assert_eq!(
+                documented,
+                belongs,
+                "`Category::{category:?}` inherits the `{}` tier, and the policy topic's \
+                 `{}` bullet {} it. A category filed under the wrong tier sends a reader \
+                 to bind the wrong one — and every containment check in this file would \
+                 still pass, because the name is present. Edit \
+                 crates/tetond/src/harness/docs/policy.md; \
+                 `Category::tier()` in teton-core is the source and it is a `const fn`, \
+                 so it does not move for prose.\nsegment: {segment}",
+                category.tier().as_str(),
+                tier.as_str(),
+                if documented { "names" } else { "omits" },
+            );
+        }
+    }
+
+    // The topic also counts the bindable categories out loud, and the count is
+    // the kind of number that survives a variant being added.
+    for category in ConfigurableCategory::ALL {
+        assert!(
+            POLICY_TOPIC.contains(&format!("`{}`", category.as_str())),
+            "the policy topic never names the bindable category `{}`, so a user reading it \
+             cannot reach a binding the CLI accepts.",
+            category.as_str()
+        );
+    }
+    assert!(
+        POLICY_TOPIC.contains(&format!(
+            "The {} bindable categories",
+            spelled_out(ConfigurableCategory::ALL.len())
+        )),
+        "the policy topic's bindable-category count no longer matches \
+         `ConfigurableCategory::ALL` ({}). Update the sentence — a wrong count reads as \
+         authority and sends somebody hunting for a category that does not exist.",
+        ConfigurableCategory::ALL.len()
+    );
+}
+
+/// The English spelling of a small count, for the one sentence in the policy
+/// topic that writes its number out.
+fn spelled_out(n: usize) -> &'static str {
+    match n {
+        8 => "eight",
+        9 => "nine",
+        10 => "ten",
+        11 => "eleven",
+        _ => panic!(
+            "the policy topic spells its category count in words and this helper has no \
+             spelling for {n}; add one rather than switching the prose to a digit"
+        ),
     }
 }
 

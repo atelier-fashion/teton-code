@@ -259,9 +259,21 @@ const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", DOCS_TOOL_NAME];
 ///
 /// That inverts the risk in the direction it should be inverted. Adding a tool
 /// to the tree without touching this function gets the conservative treatment at
-/// every level, rather than being silently unclassified. A new *read-only*
-/// first-party tool that nobody adds to [`READ_ONLY_TOOLS`] merely asks — a
-/// degradation, not a hole.
+/// every level, rather than being silently unclassified.
+///
+/// **What that costs a first-party read-only tool, stated accurately.** This
+/// comment used to end "a new *read-only* first-party tool that nobody adds to
+/// [`READ_ONLY_TOOLS`] merely asks — a degradation, not a hole", and REQ-577's
+/// own live run falsified it. `teton_docs` was exactly that tool, and the
+/// consequence was not "merely asks": at `guarded` it interrupted the turn with
+/// a prompt for a read of bytes compiled into the binary, and at `plan` — the
+/// level a user picks *because* they want reading and nothing else — the
+/// default is `Deny`, so the daemon refused to read its own documentation
+/// outright. The omission is silent in CI, too, because exposure tests assert
+/// the tool is in the list and being *callable* is a different claim. So: the
+/// fallback is safe in the direction that matters (nothing is silently
+/// permitted), and it is not free — an unclassified read-only tool is denied at
+/// `plan`, which for a knowledge tool is indistinguishable from not shipping it.
 ///
 /// ## `full` is an allow-all table, not a skipped gate (REQ-560 BR-4)
 ///

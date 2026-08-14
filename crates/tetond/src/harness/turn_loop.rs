@@ -56,6 +56,7 @@ use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
 use super::reply::StreamGate;
 use super::shell_duty::SHELL_DUTY;
+use super::tools::docs::bounded_topic_echo;
 use super::tools::{
     RefinedOutcome, ToolContext, ToolDuties, ToolOutcome, ToolRegistry, DOCS_TOOL_NAME,
     WEB_TOOL_NAME,
@@ -1271,11 +1272,19 @@ fn describe_call(call: &ToolCall) -> String {
         // `teton_docs` in the status line says only that the agent went to look
         // something up; the topic says what it went to look up, which is the
         // difference between a legible turn and a mysterious one.
+        //
+        // Bounded by the tool's own `bounded_topic_echo`, because this is a
+        // *model-supplied* string on its way into a UI line and an event
+        // payload. A `read` path is at least a path; a topic is whatever the
+        // model typed, and a weak model that emits a runaway argument would
+        // otherwise put all of it in the status line. The same bound is applied
+        // in the unknown-topic error, and it is the tool's constant rather than
+        // a second number here.
         DOCS_TOOL_NAME => call
             .arguments
             .get("topic")
             .and_then(Value::as_str)
-            .map(|topic| format!("{DOCS_TOOL_NAME} {topic}"))
+            .map(|topic| format!("{DOCS_TOOL_NAME} {}", bounded_topic_echo(topic)))
             .unwrap_or_else(|| call.name.clone()),
         other => other.to_owned(),
     }
@@ -2079,6 +2088,25 @@ mod tests {
             DOCS_TOOL_NAME,
             "a non-string topic falls back rather than rendering a number as one"
         );
+
+        // The argument is model-supplied, so the title is bounded: a runaway
+        // topic would otherwise be copied whole into a status line and into the
+        // `tool_call` event's payload. Same bound as the tool's own error, from
+        // the tool's own constant.
+        let runaway = "q".repeat(500);
+        let title = titled(serde_json::json!({ "topic": runaway }));
+        assert!(
+            title.len() < 200,
+            "a {}-char topic produced a {}-char title; the echo is bounded so a weak \
+             model cannot write the status line: {title}",
+            runaway.len(),
+            title.len()
+        );
+        assert!(
+            title.starts_with(&format!("{DOCS_TOOL_NAME} qqq")),
+            "the bounded title still names the tool and the start of what it was asked \
+             for: {title}"
+        );
     }
 
     #[test]
@@ -2236,6 +2264,57 @@ mod tests {
                  BUG-168 rules it was written under: imperative, stated outright, no \
                  em-dash aside, no meta-instruction in front of it. Do not just delete \
                  the assertion."
+            );
+        }
+    }
+
+    /// **REQ-577 / verification.md round 1: the routing step says what each
+    /// tier is *for*, and says the failing mapping outright.**
+    ///
+    /// This one is not a design preference; it is a fix with a measurement
+    /// behind it. The guide used to enumerate the tiers as
+    /// `<reflex|scan|build|think>` and say nothing about what any of them was
+    /// for. Asked "hook up Kimi for deep reasoning", the local tier filled the
+    /// slot from the head of that enumeration and answered
+    /// `teton policy set-tier reflex kimi` — in **4 of 4** trials, calling
+    /// `reflex` "the reflex tier (for deep reasoning)". A user pasting that
+    /// binds their paid think-tier provider to `route`, `redact` and `title`:
+    /// every turn, at reflex latency expectations, with nothing on `think`.
+    ///
+    /// Two things are pinned, because the fix has two halves and the second is
+    /// the one that is easy to lose in a tidy-up. The purposes make the mapping
+    /// *derivable*; the last sentence states it **outright**, which is BUG-168's
+    /// rule — this model reproduces text it is given far more reliably than it
+    /// executes instructions about text, and a mapping it has to infer is one it
+    /// infers wrong under composition pressure. Round 2 of the same matrix
+    /// passed 3/3 with both sentences present.
+    ///
+    /// Both profiles, like every clause pin in this module: a strong model
+    /// mis-binding a tier costs the user just as much, and is harder to notice
+    /// because the rest of the answer is right.
+    #[test]
+    fn the_system_prompt_says_what_each_routing_tier_is_for() {
+        const PURPOSES: &str = "`reflex` always-on duties, `scan` bulk reads, `build` edits, \
+                                `think` deep reasoning.";
+        const DICTATED: &str = "Deep reasoning means `think`.";
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                system.contains(PURPOSES),
+                "the guide's routing step no longer says what the four tiers are for. It \
+                 enumerated them without their purposes once, and the local tier answered \
+                 `set-tier reflex` to a deep-reasoning request 4/4 (REQ-577 \
+                 verification.md round 1). If the wording was changed deliberately, update \
+                 this expectation — and re-run verification.md §7's matrix, because a \
+                 prompt change here is unverified until it is A/B'd.\n{system}"
+            );
+            assert!(
+                system.contains(DICTATED),
+                "the guide no longer states the deep-reasoning → `think` mapping outright. \
+                 The purposes alone leave it to be inferred, and inference is what failed \
+                 4/4 in REQ-577 verification.md round 1 (BUG-168's rule: dictate the \
+                 payload, do not describe it). Update this expectation rather than \
+                 deleting it, and re-run the live matrix.\n{system}"
             );
         }
     }

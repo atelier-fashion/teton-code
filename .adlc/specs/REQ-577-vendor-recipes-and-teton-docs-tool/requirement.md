@@ -103,6 +103,16 @@ No new event types. `teton_docs` calls never produce egress events (BR-6).
   (`REDACT_BODY_OVERHEAD_BYTES` ceiling and `MIN_PROMPT_HEADROOM_BYTES`) on
   every harness profile; the margin tests stay green and their headroom is
   re-recorded. (informed by BUG-160, BUG-168)
+  <!-- Amended 2026-08-14 (TASK-145): the `REDACT_BODY_OVERHEAD_BYTES` half of
+  this rule was *not* met as drafted. That ceiling moved 8 → 9 KiB to fit the
+  new tool's description; see architecture.md § Deviations for the arithmetic
+  and why no trim could close the deficit. `MIN_PROMPT_HEADROOM_BYTES` is
+  untouched, which is the half BR-4 forbids trading, and every subsequent
+  prompt change — the tier purposes, and phase 5's endpoint paths — was paid
+  out of the margin rather than by moving the ceiling again. Recorded headroom
+  at merge: 93 bytes (opted-out) and 141 (opted-in), against the 48-byte
+  floor. -->
+
 - [ ] BR-5: Referral posture: the prompt states imperatively that the agent
   cannot run Teton's own setup commands and must give the user the exact
   commands to run. The sentence follows the BUG-168 wording rules — stated
@@ -143,14 +153,28 @@ No new event types. `teton_docs` calls never produce egress events (BR-6).
   <id>` — with zero repository-search tool calls (at most one `teton_docs`
   call). Baseline pre-fix run recorded for comparison.
 - [x] AC-2: Same method: "How do I connect Claude?" answers with the
-  `--kind anthropic` recipe (no endpoint flag) and the routing step; the
-  control question ("What version is this crate? Check Cargo.toml.") still
-  calls `read` — the tool path is unchanged.
-  <!-- AC-1/AC-2 ticked from the TASK-147 live run, verification.md: round 1
-  (2026-08-14) failed AC-1 on `set-tier reflex`; round 2, after the tier
-  purposes were added to the resident guide, passes 3/3 with both exact
-  commands and zero repository-search calls. AC-3..AC-8 remain unticked here:
-  they are CI claims and this run does not speak to them. -->
+  `--kind anthropic` recipe ~~(no endpoint flag)~~ **and its endpoint** and the
+  routing step; the control question ("What version is this crate? Check
+  Cargo.toml.") still calls `read` — the tool path is unchanged.
+  <!-- AC-1/AC-2 ticked from the live runs recorded in verification.md.
+  Round 1 (2026-08-14) failed AC-1 on `set-tier reflex`. Round 2, after the tier
+  purposes were added to the resident guide, passed 3/3 — but against a catalog
+  whose endpoints were vendor base URLs, so the "exact" commands it recorded
+  could not have served a turn (BUG-170). Round 3, after the endpoint
+  correction, passes AC-1 3/3 and AC-2 2/2 with commands that are runnable, 0
+  repository-search calls, 0 permission prompts in 8 sessions, and the control
+  still reading Cargo.toml.
+
+  AC-2's "(no endpoint flag)" parenthetical is **struck as falsified**, not
+  satisfied: `Config::validate` refuses any `is_remote()` provider without an
+  endpoint and `Anthropic` is one, so the drafted criterion described a command
+  that stores the user's key and is then rejected. The tick is against the AC's
+  intent — the anthropic kind's own recipe plus the routing step — and rounds 1
+  and 2 stand in verification.md as the record of a criterion met exactly and
+  still wrong.
+
+  AC-3..AC-8 remain unticked here: they are CI claims and no live run speaks to
+  them. -->
 - [ ] AC-3: `teton_docs` returns the providers topic containing every
   canonical recipe; an unknown topic returns the didactic error naming all
   valid topics (unit + e2e).
@@ -190,6 +214,24 @@ No new event types. `teton_docs` calls never produce egress events (BR-6).
   not, the fallback posture is: recipes live only in the `teton_docs`
   providers topic, the guide keeps the generic shape, and AC-1 is satisfied
   via the one-docs-call path — BR-4's margins are never traded away.
+  <!-- Falsified 2026-08-14 (TASK-145), and not by the guide. The ~1.4 KB was
+  measured against an 8 KiB `REDACT_BODY_OVERHEAD_BYTES`; the real slack before
+  any guide growth was 19 bytes, and `teton_docs`'s own tool docs cost 274 — a
+  deficit that predates every recipe and that the fallback above does not reach,
+  since the fallback moves guide prose and BR-7 forbids dropping the tool. The
+  ceiling moved instead (architecture.md § Deviations). Everything the guide
+  then spent — 493 bytes of recipes and referral, 95 of tier purposes, 136 of
+  request paths in phase 5 — came out of the margin that bought, leaving 93.
+  The fallback posture is unspent and stands as the answer for the next
+  sentence; at 93 bytes it is probably what the next one has to use. -->
+
+- A vendor's documented `base_url` is a usable value for `--endpoint`. **False,
+  and the assumption was never written down here, which is how it survived.**
+  `--endpoint` is the absolute request URL, POSTed verbatim by both adapters;
+  nothing appends a path. Round 1 of the catalog shipped five base URLs and one
+  absent endpoint on the strength of it (BUG-170). Recorded now so a seventh
+  vendor added from a quickstart page meets the stated rule rather than the
+  same inference: **take the URL the vendor's own `curl` example posts to.**
 - No new frame delimiters or envelopes are needed; topic bodies are plain
   markdown rendered through the existing untrusted-content framing. If
   architecture does introduce one, ADR-009's two-sided marker/neutralizer

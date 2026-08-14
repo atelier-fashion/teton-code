@@ -44,6 +44,12 @@ at its first call. See topic `providers` for what a 401 usually means.
 ## Where config lives
 
 `config.toml` in Teton's state directory: `$XDG_RUNTIME_DIR/teton` when that is
-set, otherwise `~/Library/Application Support/teton` on macOS. `TETON_CONFIG`
-overrides both. Cost history and the downloaded model sit beside it. Keys never
-do.
+set, otherwise `$HOME/Library/Application Support/teton` on macOS, and — when
+neither variable is set, which is unusual and usually means a stripped
+environment — the OS temp directory's `teton`. `TETON_CONFIG` overrides all
+three. Cost history and the downloaded model sit beside it. Keys never do.
+
+The third case is worth recognizing rather than debugging: a daemon started
+without `HOME` binds under the temp directory, so it has its own empty config
+and its own socket, and doctor reports "not running" from any shell that has
+`HOME` set. The paths doctor prints are the first line of that answer.

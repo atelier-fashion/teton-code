@@ -16,6 +16,25 @@
 //! before this REQ, and one of them had already gone stale by the time this
 //! catalog was written.
 //!
+//! # An endpoint here is a whole request URL, not a base URL
+//!
+//! This is the fact the first version of this file got wrong, and it is worth
+//! stating before the data rather than after it. Teton's `--endpoint` is the
+//! **absolute URL the adapter POSTs to, verbatim**: `OpenAiCompatAdapter`
+//! builds its request with `url: self.config.endpoint.clone()` and
+//! `AnthropicAdapter` with `url: self.endpoint.clone()`. Nothing anywhere joins
+//! a path onto it. So a recipe carrying a vendor's *`base_url`* — the value
+//! their SDK quickstart hands to an OpenAI client, which the client then
+//! appends `/chat/completions` to — describes a provider that registers
+//! cleanly, passes validation, and 404s on its first turn. That failure lands a
+//! step away from its cause, which is the same BUG-165 texture this module was
+//! written to end, arriving through the module itself (BUG-170).
+//!
+//! Every endpoint below is therefore the vendor's documented request URL,
+//! path included, and the seam test at the bottom of this file asserts the
+//! shape against the adapter each `kind` selects rather than trusting the
+//! spelling to stay right.
+//!
 //! # Verified, not recalled (BR-3, LESSON-512)
 //!
 //! Every endpoint, kind, and example model below was read off the vendor's own
@@ -25,6 +44,15 @@
 //! `deepseek-chat`/`deepseek-reasoner` pair and Moonshot's `kimi-k2` — so a
 //! catalog written from memory would have shipped two dead model names on day
 //! one. A named example in a spec is a test vector, and a test vector is checked.
+//!
+//! The endpoints were re-read a **second** time the same day, against the same
+//! vendor pages, once the base-URL/request-URL confusion above was found. Three
+//! of the six vendors had moved their documentation *host* since the first
+//! pass (`platform.moonshot.ai` → `platform.kimi.ai`, `docs.claude.com` →
+//! `platform.claude.com`, and OpenAI's `platform.openai.com/docs/api-reference`
+//! → `developers.openai.com/api/reference`, the old path now answering 403
+//! rather than redirecting). None of the *API* hosts moved with them, which is
+//! the distinction the per-entry comments record.
 //!
 //! Endpoints move at roughly release cadence; model names move faster. So every
 //! [`ProviderRecipe::example_model`] is exactly that — an example — and
@@ -75,11 +103,23 @@ pub struct ProviderRecipe {
     pub id_suggestion: String,
     /// The vendor's display name, spelled the way the vendor spells it.
     pub label: String,
-    /// Which adapter the vendor speaks, and therefore whether
-    /// [`endpoint`](Self::endpoint) is required.
+    /// Which adapter the vendor speaks, and therefore which URL shape
+    /// [`endpoint`](Self::endpoint) has to be.
     pub kind: ProviderKind,
-    /// The base URL to pass as `--endpoint`, or `None` when the kind carries its
-    /// own address and the flag must be omitted.
+    /// The **absolute request URL** to pass as `--endpoint` — what the adapter
+    /// POSTs to, character for character, with no path joined on.
+    ///
+    /// Not a base URL. A vendor's quickstart `base_url` is what an OpenAI SDK
+    /// appends `/chat/completions` to; Teton has no such step, so a base URL
+    /// here is a provider that registers and then 404s (BUG-170).
+    ///
+    /// `Option` rather than `String` because the *type* admits a kind that
+    /// carries its own address, and `ProviderKind` is wider than this catalog.
+    /// Today every registerable vendor kind is
+    /// [`ProviderKind::is_remote`](teton_core::entities::ProviderKind::is_remote),
+    /// and `Config::validate` rejects a remote provider whose endpoint is
+    /// missing or blank — so today every entry is `Some`, and the test below
+    /// derives that requirement from `is_remote` rather than restating it.
     pub endpoint: Option<String>,
     /// A model the vendor serves today, offered as an example to substitute —
     /// never as a recommendation and never as "the current best".
@@ -103,99 +143,128 @@ pub struct ProviderRecipe {
 #[must_use]
 pub fn recipe_catalog() -> Vec<ProviderRecipe> {
     vec![
-        // Verified 2026-08-14 against Anthropic's models overview
-        // (platform.claude.com/docs/en/about-claude/models/overview): the
-        // current Claude API ids are `claude-opus-5`, `claude-sonnet-5`,
-        // `claude-fable-5` and `claude-haiku-4-5`; `claude-opus-5` is the one
-        // the page tells an unsure reader to start with.
+        // Verified 2026-08-14 (round 2) against Anthropic's Messages API
+        // reference (platform.claude.com/docs/en/api/messages — docs.claude.com
+        // now 301s there), whose curl example posts to
+        // `https://api.anthropic.com/v1/messages`. Model id from the same
+        // site's models overview: `claude-opus-5` is a current API id and the
+        // one an unsure reader is told to start with. (The reference page's own
+        // example body still names `claude-opus-4-6`, which that overview lists
+        // under legacy models — a reminder that a vendor's curl block and its
+        // model table are two facts, checked separately.)
         ProviderRecipe {
             id_suggestion: "anthropic".to_owned(),
             label: "Anthropic".to_owned(),
             kind: ProviderKind::Anthropic,
-            // Absent because the adapter carries the Messages API address, not
-            // because it is unknown — the same distinction the web catalog draws
-            // for a backend that wants no header. Passing `--endpoint` here is a
-            // user error, so the recipe must not model one.
-            endpoint: None,
+            // Round 1 shipped `None` here on the theory that "the adapter
+            // carries the Messages API address". It does not: `AnthropicAdapter`
+            // is constructed from `provider.endpoint` like every other kind, and
+            // `Config::validate` refuses a remote provider without one. The
+            // recipe that omitted it produced a `provider add` that stored the
+            // user's key in the keychain and *then* had the registration
+            // rejected (BUG-170).
+            endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
             example_model: "claude-opus-5".to_owned(),
-            notes: Some("no --endpoint: the anthropic kind knows its own address".to_owned()),
+            // The one vendor here whose path is not `/chat/completions`: this
+            // is the Messages API, a different protocol, which is exactly what
+            // `--kind anthropic` selects. A reader pattern-matching the five
+            // neighbours onto this line gets a 404.
+            notes: Some("the Messages API path, not /chat/completions".to_owned()),
         },
-        // Verified 2026-08-14 against OpenAI's API reference
-        // (developers.openai.com/api/docs/api-reference/chat/create), whose curl
-        // example posts to `https://api.openai.com/v1/chat/completions`, and its
-        // model page for gpt-5.6, which states the `gpt-5.6` alias routes to
-        // GPT-5.6 Sol (`gpt-5.6-sol`). The alias is the better example: it is
-        // shorter to type and does not pin a user to one snapshot.
+        // Verified 2026-08-14 (round 2) against OpenAI's API reference
+        // (developers.openai.com/api/reference — platform.openai.com's old
+        // `/docs/api-reference` path now answers 403 rather than redirecting),
+        // whose curl example posts to
+        // `https://api.openai.com/v1/chat/completions`. The models page states
+        // that `gpt-5.6` is an alias onto GPT-5.6 Sol (`gpt-5.6-sol`); the alias
+        // is the better example because it does not pin a user to one snapshot.
         ProviderRecipe {
             id_suggestion: "openai".to_owned(),
             label: "OpenAI".to_owned(),
             // The kind is named after this API because this API is the shape
             // every other entry below imitates; OpenAI gets no special adapter.
             kind: ProviderKind::OpenaiCompatible,
-            endpoint: Some("https://api.openai.com/v1".to_owned()),
+            endpoint: Some("https://api.openai.com/v1/chat/completions".to_owned()),
             example_model: "gpt-5.6".to_owned(),
             notes: None,
         },
-        // Verified 2026-08-14 against Kimi's API overview
-        // (platform.kimi.ai/docs/api/overview — platform.moonshot.ai now 301s
-        // there, while the *API* host is unchanged), which tells developers to
-        // set `base_url` to `https://api.moonshot.ai/v1` and to use the OpenAI
-        // SDKs directly; the models overview names `kimi-k3` as the flagship.
-        // The README's `kimi-k2` is the drift this REQ's prose gate exists to
-        // catch — it was already stale when this line was written.
+        // Verified 2026-08-14 (round 2) against Kimi's chat API page
+        // (platform.kimi.ai/docs/api/chat — platform.moonshot.ai now 301s
+        // there, while the *API* host is unchanged), whose curl example posts to
+        // `https://api.moonshot.ai/v1/chat/completions`. The same page's model
+        // list carries `kimi-k3` alongside the `kimi-k2.x` line. The README's
+        // `kimi-k2` was the drift this REQ's prose gate exists to catch — it was
+        // already stale when this line was first written.
         ProviderRecipe {
             id_suggestion: "kimi".to_owned(),
             label: "Moonshot (Kimi)".to_owned(),
             kind: ProviderKind::OpenaiCompatible,
-            endpoint: Some("https://api.moonshot.ai/v1".to_owned()),
+            endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
             example_model: "kimi-k3".to_owned(),
             notes: None,
         },
-        // Verified 2026-08-14 against DeepSeek's API docs (api-docs.deepseek.com):
-        // the OpenAI-format `base_url` is `https://api.deepseek.com` and the
-        // first-call example posts to `https://api.deepseek.com/chat/completions`
-        // with `"model": "deepseek-v4-pro"`. The REQ's drafted
-        // `deepseek-chat`/`deepseek-reasoner` no longer appear on the models
-        // page; `deepseek-v4-flash` is the other current id.
+        // Verified 2026-08-14 (round 2) against DeepSeek's API docs
+        // (api-docs.deepseek.com): the "Your First API Call" curl posts to
+        // `https://api.deepseek.com/chat/completions`, and the parameters table
+        // gives the OpenAI-format `base_url` as `https://api.deepseek.com` with
+        // no `/v1`. The `/v1` spelling is **not** in the current documentation
+        // at all — the old "v1 has no relationship with the model's version"
+        // note is gone — though it still routes (an unauthenticated POST to
+        // either form answers 401, not 404). Undocumented-but-working is not a
+        // fact this catalog ships, so the documented form is the one here.
+        // `deepseek-v4-pro` is current (GA 2026-08-13, `deepseek-v4-flash` is
+        // the other); the REQ's drafted `deepseek-chat`/`deepseek-reasoner` pair
+        // was retired outright on 2026-07-24 and is dead rather than deprecated.
         ProviderRecipe {
             id_suggestion: "deepseek".to_owned(),
             label: "DeepSeek".to_owned(),
             kind: ProviderKind::OpenaiCompatible,
-            endpoint: Some("https://api.deepseek.com".to_owned()),
+            endpoint: Some("https://api.deepseek.com/chat/completions".to_owned()),
             example_model: "deepseek-v4-pro".to_owned(),
-            // The one endpoint here that is not a `/v1`, which is exactly the
-            // kind of small difference a user pattern-matches away and then
-            // spends an afternoon on.
-            notes: Some("base URL takes no /v1 suffix".to_owned()),
+            // The one OpenAI-compatible URL here with no `/v1` segment, which is
+            // exactly the kind of small difference a user pattern-matches away
+            // from its five neighbours and then spends an afternoon on. Stated
+            // as a fact about *this path* rather than about a "base URL": the
+            // round-1 note said the base URL took no suffix, which was true of a
+            // value Teton never asks for and read as licence to hand the adapter
+            // a base URL.
+            notes: Some("the only /chat/completions path here with no /v1".to_owned()),
         },
-        // Verified 2026-08-14 against Ollama's OpenAI-compatibility page
-        // (docs.ollama.com/api/openai-compatibility): it serves
-        // `http://localhost:11434/v1/` and says an API key is "required but
-        // ignored" by the client libraries, i.e. the server authenticates
-        // nothing. `llama3.2` is one of the models the page's own examples name.
-        // The trailing slash is dropped here to match the other entries' base
-        // form; both resolve to the same routes.
+        // Verified 2026-08-14 (round 2) against Ollama's OpenAI-compatibility
+        // page (docs.ollama.com/openai), whose curl posts to
+        // `http://localhost:11434/v1/chat/completions` and whose Python example
+        // carries `'api_key': 'ollama',  # required but ignored`. `llama3.2` is
+        // a live library tag (ollama.com/library/llama3.2). The host is an
+        // example of a shape rather than an address — a user running Ollama
+        // elsewhere substitutes their own.
         ProviderRecipe {
             id_suggestion: "ollama".to_owned(),
             label: "Ollama".to_owned(),
             kind: ProviderKind::OpenaiCompatible,
-            endpoint: Some("http://localhost:11434/v1".to_owned()),
+            endpoint: Some("http://localhost:11434/v1/chat/completions".to_owned()),
             example_model: "llama3.2".to_owned(),
-            // The only entry that needs no key at all, and the only endpoint
-            // that is an example of a shape rather than an address — a user who
-            // runs Ollama elsewhere substitutes their own host.
-            notes: Some("local and keyless: serves the models you have pulled".to_owned()),
+            // Round 1 called this entry "keyless", which is true of the *server*
+            // and false of the *command*: `teton provider add` reads a secret
+            // for every kind but `local` (teton/src/main.rs), so a user told
+            // there is "no key step at all" meets a prompt the recipe said would
+            // not come. Both halves are stated, because only saying the second
+            // would make Ollama look like it needs an account.
+            notes: Some(
+                "Ollama ignores the key, but provider add still asks for one — any \
+                 placeholder does"
+                    .to_owned(),
+            ),
         },
-        // Verified 2026-08-14 against xAI's overview (docs.x.ai/docs/overview),
-        // whose quickstart constructs the OpenAI client with
-        // `base_url="https://api.x.ai/v1"`, and its models page, which lists
-        // `grok-4.6` first and tells the reader to use it "for everything else,
-        // including code".
+        // Verified 2026-08-14 (round 2) against xAI's API reference
+        // (docs.x.ai/docs/api-reference), whose curl posts to
+        // `https://api.x.ai/v1/chat/completions`, and its models page, which
+        // lists `grok-4.6` alongside `grok-4.5` and `grok-4.3` and calls it the
+        // most capable of them.
         ProviderRecipe {
             id_suggestion: "grok".to_owned(),
             label: "Grok (xAI)".to_owned(),
             kind: ProviderKind::OpenaiCompatible,
-            endpoint: Some("https://api.x.ai/v1".to_owned()),
+            endpoint: Some("https://api.x.ai/v1/chat/completions".to_owned()),
             example_model: "grok-4.6".to_owned(),
             notes: None,
         },
@@ -262,10 +331,10 @@ mod tests {
             drift("Anthropic's provider kind")
         );
         assert_eq!(
-            anthropic.endpoint,
-            None,
+            anthropic.endpoint.as_deref(),
+            Some("https://api.anthropic.com/v1/messages"),
             "{}",
-            drift("Anthropic's absent endpoint — the adapter carries the address")
+            drift("Anthropic's Messages API request URL")
         );
         assert_eq!(
             anthropic.example_model,
@@ -275,7 +344,7 @@ mod tests {
         );
         assert_eq!(
             anthropic.notes.as_deref(),
-            Some("no --endpoint: the anthropic kind knows its own address"),
+            Some("the Messages API path, not /chat/completions"),
             "{}",
             drift("Anthropic's note")
         );
@@ -290,7 +359,7 @@ mod tests {
         );
         assert_eq!(
             openai.endpoint.as_deref(),
-            Some("https://api.openai.com/v1"),
+            Some("https://api.openai.com/v1/chat/completions"),
             "{}",
             drift("OpenAI's endpoint")
         );
@@ -317,7 +386,7 @@ mod tests {
         );
         assert_eq!(
             kimi.endpoint.as_deref(),
-            Some("https://api.moonshot.ai/v1"),
+            Some("https://api.moonshot.ai/v1/chat/completions"),
             "{}",
             drift("Moonshot's endpoint — the docs site moved to kimi.ai, the API host did not")
         );
@@ -339,7 +408,7 @@ mod tests {
         );
         assert_eq!(
             deepseek.endpoint.as_deref(),
-            Some("https://api.deepseek.com"),
+            Some("https://api.deepseek.com/chat/completions"),
             "{}",
             drift("DeepSeek's endpoint, which deliberately carries no /v1")
         );
@@ -351,7 +420,7 @@ mod tests {
         );
         assert_eq!(
             deepseek.notes.as_deref(),
-            Some("base URL takes no /v1 suffix"),
+            Some("the only /chat/completions path here with no /v1"),
             "{}",
             drift("DeepSeek's note")
         );
@@ -366,7 +435,7 @@ mod tests {
         );
         assert_eq!(
             ollama.endpoint.as_deref(),
-            Some("http://localhost:11434/v1"),
+            Some("http://localhost:11434/v1/chat/completions"),
             "{}",
             drift("Ollama's endpoint")
         );
@@ -378,9 +447,9 @@ mod tests {
         );
         assert_eq!(
             ollama.notes.as_deref(),
-            Some("local and keyless: serves the models you have pulled"),
+            Some("Ollama ignores the key, but provider add still asks for one — any placeholder does"),
             "{}",
-            drift("Ollama's note, which is the only place `keyless` is stated")
+            drift("Ollama's note, which is the only place the key step is qualified")
         );
 
         let grok = &catalog[5];
@@ -393,7 +462,7 @@ mod tests {
         );
         assert_eq!(
             grok.endpoint.as_deref(),
-            Some("https://api.x.ai/v1"),
+            Some("https://api.x.ai/v1/chat/completions"),
             "{}",
             drift("Grok's endpoint")
         );
@@ -406,24 +475,36 @@ mod tests {
         assert_eq!(grok.notes, None, "{}", drift("Grok's absent note"));
     }
 
-    /// An endpoint is required exactly when the kind does not carry its own.
+    /// An endpoint is required exactly when
+    /// [`ProviderKind::is_remote`] says the daemon will demand one.
     ///
-    /// The two failures are asymmetric and both silent. A remote kind missing an
-    /// endpoint yields a command with a hole in it — the BUG-160 shape this REQ
-    /// exists to close. An `anthropic` entry *carrying* one yields a command with
-    /// a flag the adapter ignores or rejects, which teaches the user a wrong fact
-    /// about the CLI. The golden above pins today's six; this pins the rule, so
-    /// a seventh vendor added later cannot get it wrong.
+    /// **Keyed off `is_remote`, not off a hand-written match**, and that is the
+    /// whole substance of this test. Round 1 spelled the rule out here as
+    /// `matches!(kind, OpenaiCompatible)` — a second, independent opinion about
+    /// which kinds need an endpoint — and it disagreed with the one that
+    /// decides: `Config::validate` demands an endpoint for every `is_remote()`
+    /// kind, and `Anthropic` is one. The catalog shipped `endpoint: None` for
+    /// Anthropic and this test *agreed with it*, because both sides were the
+    /// same author's belief rather than the daemon's rule. A recipe is only
+    /// checked against the config it has to produce when the check reads the
+    /// predicate the config layer reads (BUG-170).
+    ///
+    /// The two failures it now catches are asymmetric and both silent. A remote
+    /// kind missing an endpoint yields a `provider add` that stores the user's
+    /// key and is then refused by `config/set`. A non-remote kind carrying one
+    /// yields a flag the adapter never reads.
     #[test]
     fn an_endpoint_is_present_exactly_when_the_kind_needs_one() {
         for recipe in recipe_catalog() {
-            let needs_endpoint = matches!(recipe.kind, ProviderKind::OpenaiCompatible);
             assert_eq!(
                 recipe.endpoint.is_some(),
-                needs_endpoint,
-                "`{}` is kind {:?} but endpoint={:?}",
+                recipe.kind.is_remote(),
+                "`{}` is kind {:?}, whose `is_remote()` is {} — and `Config::validate` \
+                 demands an endpoint for exactly the remote kinds — but this recipe has \
+                 endpoint={:?}",
                 recipe.id_suggestion,
                 recipe.kind,
+                recipe.kind.is_remote(),
                 recipe.endpoint
             );
             if let Some(endpoint) = &recipe.endpoint {
@@ -434,6 +515,105 @@ mod tests {
                     recipe.id_suggestion
                 );
             }
+        }
+    }
+
+    /// **The class-closer: every recipe is a `provider add` that both the config
+    /// layer and the adapter accept** (BUG-170).
+    ///
+    /// The golden above pins the strings and the sweep above pins the rule, and
+    /// round 1 had both — green, complete, and describing two commands that
+    /// could not work. What neither of them did was carry a recipe across the
+    /// seam it exists to be pushed through. This test does exactly that, twice:
+    ///
+    /// 1. **Would `provider add` survive?** The recipe is assembled into the
+    ///    [`ModelProvider`] that `teton provider add` builds — same kind, same
+    ///    endpoint, same model, an `auth_ref` in the keychain's own form — and
+    ///    dropped into a [`Config`] that must then [`Config::validate`]. This is
+    ///    the check `config/set` runs before persisting, so a recipe that fails
+    ///    here is a recipe whose command is refused *after* the user's key is
+    ///    already in the keychain.
+    ///
+    /// 2. **Would the first turn reach anything?** The endpoint is POSTed
+    ///    verbatim — `OpenAiCompatAdapter::build_request` sets `url` to
+    ///    `config.endpoint`, `AnthropicAdapter` likewise — so the path has to be
+    ///    the one that adapter's protocol serves: `/chat/completions` for the
+    ///    OpenAI shape, `/v1/messages` for Anthropic's. A vendor `base_url`
+    ///    passes every other test in this file and 404s here.
+    ///
+    /// The failure messages state the verbatim-POST contract rather than naming
+    /// the expected suffix, because the next person to see one will be adding a
+    /// seventh vendor from its quickstart page — and a quickstart page is where
+    /// base URLs come from.
+    #[test]
+    fn every_recipe_is_a_registration_the_daemon_accepts_and_an_adapter_can_post() {
+        use teton_core::config::Config;
+        use teton_core::entities::{ModelProvider, ProviderCapabilities};
+
+        let catalog = recipe_catalog();
+        assert!(
+            catalog.len() >= 6,
+            "the catalog ships {} recipes; this sweep is narrower than the roster",
+            catalog.len()
+        );
+
+        for recipe in &catalog {
+            // Exactly what `build_provider_registration` assembles, minus the
+            // keychain round trip: `auth_ref` is the `keychain://teton/<id>`
+            // shape `Keychain::store` returns, because `validate` rejects an
+            // unrecognized scheme and a `None` here would test a different
+            // command than the one the recipes tell a user to run.
+            let provider = ModelProvider {
+                id: recipe.id_suggestion.clone(),
+                kind: recipe.kind,
+                endpoint: recipe.endpoint.clone(),
+                model: Some(recipe.example_model.clone()),
+                auth_ref: Some(format!("keychain://teton/{}", recipe.id_suggestion)),
+                capabilities: ProviderCapabilities::default(),
+            };
+            let config = Config {
+                providers: vec![provider],
+                ..Config::default()
+            };
+            config.validate().unwrap_or_else(|err| {
+                panic!(
+                    "`teton provider add {}` built from this recipe produces a config the \
+                     daemon refuses: {err}. `config/set` validates before it persists, and \
+                     `provider add` reads the user's key into the keychain *before* it \
+                     calls — so this recipe's command takes a credential and then fails. \
+                     Fix the recipe in crates/tetond/src/provider_recipes.rs.",
+                    recipe.id_suggestion
+                )
+            });
+
+            let endpoint = recipe.endpoint.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "`{}` has no endpoint; the sweep above should have caught that first",
+                    recipe.id_suggestion
+                )
+            });
+            // The suffix each adapter's protocol actually serves. Written as a
+            // match on `kind` so a new kind cannot be added without deciding
+            // what its request path looks like.
+            let required_suffix = match recipe.kind {
+                ProviderKind::Anthropic => "/v1/messages",
+                ProviderKind::OpenaiCompatible => "/chat/completions",
+                other => panic!(
+                    "`{}` is kind {other:?}, which no vendor recipe may name",
+                    recipe.id_suggestion
+                ),
+            };
+            assert!(
+                endpoint.ends_with(required_suffix),
+                "`{}`'s endpoint is `{endpoint}`, and Teton POSTs `--endpoint` **verbatim** \
+                 — nothing joins a path onto it. A {:?} provider's request URL therefore \
+                 has to end `{required_suffix}`; a vendor's `base_url` (the value their SDK \
+                 quickstart appends a path to) registers cleanly and 404s on the first \
+                 turn, a step away from its cause. Re-read the vendor's own curl example \
+                 and ship the URL it posts to.",
+                recipe.id_suggestion,
+                recipe.kind
+            );
         }
     }
 

@@ -50,12 +50,29 @@ user having asked for it.
   event, and works in a fully offline session. It also never stops a turn to
   ask your permission — there is nothing to consent to — at any permission
   level, including `plan`, where reading is the only thing allowed. It is
-  exempt from the
-  tool-count cap that trims tool lists on weak or degraded providers, so it is
-  present in exactly the sessions whose model is least likely to know Teton's
-  setup surface, and it never displaces a file tool to get there. An upgrade
-  therefore sends nothing anywhere new — the tool's whole content is knowledge
-  that shipped with the binary you installed.
+  exempt from the tool-count cap that trims tool lists on weak or degraded
+  providers, so it is present in exactly the sessions whose model is least
+  likely to know Teton's setup surface, and it never displaces a file tool to
+  get there. An upgrade therefore sends nothing anywhere new — the tool's whole
+  content is knowledge that shipped with the binary you installed.
+
+### Fixed
+
+- **The provider commands in the README could not have worked, and now do
+  (BUG-170).** Two of them have shipped since 0.1.13. The `anthropic` example
+  passed no `--endpoint`, which the daemon refuses — *after* `provider add` has
+  already read your API key into the keychain — and the Kimi example passed
+  Moonshot's `base_url`, which registers a provider whose every call 404s.
+  Teton's `--endpoint` is the whole request URL and is posted exactly as given;
+  nothing appends a path to it, so a vendor's `base_url` is the wrong half of
+  the URL. Every recipe now carries the URL the vendor's own `curl` example
+  posts to, Anthropic included (`https://api.anthropic.com/v1/messages`).
+  **If you registered a provider from an older README, `teton provider list`
+  will show its endpoint — add the path (`/chat/completions`, or `/v1/messages`
+  for an `anthropic` kind) and re-run `provider add` with the same id to update
+  it.** A new test drives each recipe through config validation and the request
+  builder, so a recipe that cannot serve a turn is a build failure rather than a
+  documentation bug.
 
 ### Changed
 

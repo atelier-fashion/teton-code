@@ -492,3 +492,116 @@ machine. Round 1 is the standing evidence that a byte-level prompt change moves
 behaviour that the change was not about — the recipes fixed the endpoint and
 broke the tier. Any future edit to `self_config.md` re-opens this question and
 should re-run §7's matrix rather than reason about it.
+
+---
+
+# Round 3 — after the endpoint correction (2026-08-14, same day)
+
+Rounds 1 and 2 stand as written. This round exists because the *facts* rounds 1
+and 2 verified so carefully were the wrong kind of URL: every recipe endpoint
+was a vendor `base_url` and Anthropic had none at all, so the exact commands
+those rounds recorded as passes could not have served a turn (BUG-170). The
+behaviour was right and the payload was wrong, which is why a live run that
+checked "does it emit the catalog value" could not catch it — it emitted the
+catalog value faithfully, 4/4.
+
+**Candidate-only, per the instruction and per sense**: the baseline is
+unchanged and unrebuilt, and its round-1 results still stand as the comparison.
+Nothing in this round is a claim about the baseline.
+
+## 11. What changed since round 2
+
+- Every catalog endpoint is now the vendor's documented **request** URL
+  (`…/chat/completions`, and `https://api.anthropic.com/v1/messages` for
+  Anthropic, which previously had `endpoint: None`). Re-verified against each
+  vendor's own `curl` example — see TASK-143's round-2 Verification Record.
+- The guide's recipe step lost its two-form
+  `anthropic`-without-`--endpoint` spelling and gained
+  `All three are required. `--endpoint` is the full request URL, not a base
+  URL.` **+136 bytes**, paid out of the margin; `REDACT_BODY_OVERHEAD_BYTES`
+  was **not** raised again.
+
+| Prompt shape | Worst prompt | Spent | Margin (floor 48) |
+|---|---|---|---|
+| opted-out (`egress::redact`) | 5,847 B (was 5,711) | 9,123 | **93** (was 229) |
+| web opted-in (`tools::web`) | 5,799 B (was 5,663) | 9,075 | **141** (was 277) |
+
+## 12. Isolation
+
+Same LESSON-482 method as §2, fresh base dir `/tmp/t577d` (round 1 and 2's
+`/tmp/t577b` / `/tmp/t577c` are gone), `model-selection.toml` copied, weights
+**symlinked** to the same 18,556,689,568-byte inode — nothing downloaded, the
+real file never written. Serialized per F-4: no other `--shutdown-policy never`
+daemon was resident at any point, and the user's own Homebrew daemon was left
+alone. Same `/tmp/t577proj` cwd (a three-file crate at `version = "0.4.2"` that
+documents nothing about Teton). Release build: `cargo build --release
+--workspace --features tetond/llama`. One CLI process per trial, one prompt per
+session; a permission prompt would have stalled the session to its 90 s bound,
+which is itself the observation.
+
+## 13. The re-run
+
+8 sessions. Replies byte-identical within each shape.
+
+| Trial | Result |
+|---|---|
+| **A1/A2/A3** — "I want to hook up Kimi for deep reasoning" | `teton provider add kimi --kind openai-compatible --endpoint https://api.moonshot.ai/v1/chat/completions --model kimi-k3` **and** `teton policy set-tier think kimi`. 0 tool calls of any kind. **3/3 PASS** |
+| **B1/B2** — "How do I connect Claude?" | `teton provider add claude --kind anthropic --endpoint https://api.anthropic.com/v1/messages --model claude-opus-5` **and** `teton policy set-tier think claude`. 0 tool calls. **2/2 PASS** |
+| **C1** — control | ` - read Cargo.toml [done]` → "The crate version is 0.4.2". **PASS**, tool path unchanged |
+| **P1** — docs probe | ` - teton_docs providers [running]` → **`[done]`**, no permission prompt; the answer names all four topics and all six vendors *with the corrected endpoints*, including DeepSeek's missing `/v1`. **PASS** |
+
+`? permission requested` appears in **zero** of the 8 sessions. No ` - read`,
+` - grep`, ` - glob` or ` - shell` line appears in any shape-A or shape-B
+session.
+
+**D1 (diagnostic, no AC covers it) — "How do I hook up Together AI as a
+provider?"** A vendor the catalog does *not* ship, which is the only shape that
+tests the new clause rather than the recipes. The model answered
+`--endpoint https://api.together.ai/v1/chat/completions` — a full request URL,
+composed for a vendor it had no recipe for — then hedged that the exact
+endpoint should be checked against the vendor's docs, and the web-off clause
+fired. That is the clause doing the job it was added for: the generalization
+from six recipes to an unlisted seventh now carries the right URL *shape*. It
+is one trial on one vendor and is recorded as a diagnostic, not as evidence for
+an AC.
+
+## 14. Verdicts
+
+| Criterion | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|
+| **AC-1** — exact two commands, zero repo-search, ≤ 1 `teton_docs`, ≥ 3 trials | **FAIL** (`set-tier reflex`) | PASS (3/3) — but with a `base_url` endpoint that could not have served a turn | **PASS** — 3/3, both commands exact **and runnable**, 0 tool calls |
+| **AC-2** — `--kind anthropic` recipe + routing step; control still calls `read` | PASS | PASS | **PASS as amended** — see below; 2/2 plus the control |
+| Requirement Permissions row — `teton_docs` callable without a prompt | violated | holds | **holds** — P1 completes, 0 prompts in 8 sessions |
+
+**AC-2 is amended, not merely re-passed.** Its drafted letter reads "answers
+with the `--kind anthropic` recipe (**no endpoint flag**)", and that clause is
+now known to be false as a requirement: `Config::validate` refuses any
+`is_remote()` provider without an endpoint, and `Anthropic` is one, so a reply
+that omitted `--endpoint` would be handing the user a command that stores their
+key and is then rejected. Round 3 records the AC's *intent* — the anthropic kind
+answered with its own recipe plus the routing step, and the control's tool path
+unchanged — and the parenthetical is superseded by BUG-170. Rounds 1 and 2
+recorded "no `--endpoint`: correct" as a pass against the drafted letter; that
+is left as written, because it is the evidence that a criterion can be met
+exactly and still be wrong.
+
+**REQ-577's acceptance state after round 3: AC-1 and AC-2 are both
+live-verified against a build whose commands are runnable.** AC-3 through AC-8
+remain CI claims covered by TASK-143..146.
+
+Findings F-3 (the tool is not reached on provider-setup shapes — the inline
+recipes answer without it; P1 again shows it works when it *is* reached), F-4
+(serialize the daemons — observed, obeyed, no OOM this round) and F-5 (clause
+bleed — D1 shows the web-off clause firing on a provider question, which is the
+other direction from round 1's observation) are unchanged and stand as
+recorded.
+
+**The caveat from round 2 now has three instances behind it.** Round 1: the
+recipes fixed the endpoint and broke the tier. Round 2: the tier fix held.
+Round 3: the same prompt, 136 bytes longer, kept both. Every one of those was
+unknowable without running it. Any future edit to `self_config.md` re-opens the
+question and should re-run §7's matrix rather than reason about it.
+
+**Run by:** Claude (Fable 5 agent), 2026-08-14, at Brett Luelling's direction.
+**Platform:** macOS (Darwin 25.6.0), Apple Silicon, 48 GiB, local tier
+qwen3-coder-30b-a3b, temperature-0.2 profile. **Not signed off by a human.**

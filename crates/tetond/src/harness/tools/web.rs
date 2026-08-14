@@ -2224,16 +2224,17 @@ mod tests {
     /// clause, description and schema together — is the largest one the daemon
     /// ever builds. The margin is asserted rather than left implied (AC-9).
     ///
-    /// **Recorded headroom at REQ-577:** the worst prompt here is 5,663 bytes,
-    /// so `spent` is 8,939 against a 9,216-byte overhead — **277 bytes of
+    /// **Recorded headroom at REQ-577:** the worst prompt here is 5,799 bytes,
+    /// so `spent` is 9,075 against a 9,216-byte overhead — **141 bytes of
     /// margin** over the 48-byte floor (865 before TASK-144 added 493 bytes of
     /// vendor recipes and the referral sentence to the bundled guide, then 372
-    /// before TASK-147 added 95 bytes of tier purposes to the routing step;
-    /// both shapes moved by exactly those, because the guide is included
-    /// verbatim in each). It was 115 before this REQ, against an
-    /// 8 KiB overhead. This shape stays the *smaller* of the two prompts
-    /// measured against that constant, because a registered web tool replaces
-    /// the opt-out clause rather than adding to it.
+    /// before TASK-147 added 95 bytes of tier purposes to the routing step, then
+    /// 277 before the phase-5 correction added 136 bytes of request paths to
+    /// every recipe endpoint; all three moved both shapes by exactly the same
+    /// amount, because the guide is included verbatim in each). It was 115
+    /// before this REQ, against an 8 KiB overhead. This shape stays the
+    /// *smaller* of the two prompts measured against that constant, because a
+    /// registered web tool replaces the opt-out clause rather than adding to it.
     #[tokio::test]
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};

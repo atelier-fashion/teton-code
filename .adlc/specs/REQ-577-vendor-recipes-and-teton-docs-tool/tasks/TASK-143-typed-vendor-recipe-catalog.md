@@ -83,3 +83,55 @@ Two of this task's drafted starting facts had already gone stale and were
 
 Endpoints all matched the drafted values. `platform.moonshot.ai` now 301s to
 `platform.kimi.ai`, but the *API* host `api.moonshot.ai` is unchanged.
+
+### Round 2 (2026-08-14, phase 5) — the endpoints were the wrong *kind* of URL
+
+Round 1 above is kept whole because it is the evidence for what went wrong: it
+verified every value against the vendor and **not one of them against Teton's
+own `--endpoint` contract**. That flag is the absolute request URL, POSTed
+verbatim (`openai_compat.rs:139`, `anthropic.rs:141`); nothing joins a path onto
+it. So five of the six rows recorded a `base_url` — the value an OpenAI SDK
+*appends* `/chat/completions` to — and the sixth recorded no endpoint at all on
+the theory that the Anthropic adapter carried its own address, which
+`Config::validate` disproves by refusing any `is_remote()` provider without one.
+Filed as BUG-170; the round-1 table is what a corrected record is corrected
+*from*.
+
+Re-verified against the same vendors' current pages on the same day, this time
+reading each vendor's own `curl` example rather than its `base_url` line:
+
+| Vendor | kind | endpoint (full request URL) | example_model | source consulted |
+|--------|------|------------------------------|---------------|------------------|
+| Anthropic | `anthropic` | `https://api.anthropic.com/v1/messages` | `claude-opus-5` | platform.claude.com Messages API reference curl; models overview |
+| OpenAI | `openai-compatible` | `https://api.openai.com/v1/chat/completions` | `gpt-5.6` | developers.openai.com API reference curl; models page (alias → `gpt-5.6-sol`) |
+| Moonshot (Kimi) | `openai-compatible` | `https://api.moonshot.ai/v1/chat/completions` | `kimi-k3` | platform.kimi.ai chat API curl + model list |
+| DeepSeek | `openai-compatible` | `https://api.deepseek.com/chat/completions` | `deepseek-v4-pro` | api-docs.deepseek.com "Your First API Call" curl; models & pricing |
+| Ollama | `openai-compatible` | `http://localhost:11434/v1/chat/completions` | `llama3.2` | docs.ollama.com/openai curl + `'api_key': 'ollama', # required but ignored` |
+| Grok (xAI) | `openai-compatible` | `https://api.x.ai/v1/chat/completions` | `grok-4.6` | docs.x.ai API reference curl + models list |
+
+Model ids were unchanged from round 1 and re-confirmed. Three findings the
+second pass added:
+
+- **Three vendors had moved their documentation host** since round 1 the same
+  day: `platform.moonshot.ai` → `platform.kimi.ai`, `docs.claude.com` →
+  `platform.claude.com`, and OpenAI's `platform.openai.com/docs/api-reference` →
+  `developers.openai.com/api/reference` — the last of which now answers **403**
+  rather than redirecting, so a scripted re-check against the old URL fails
+  silently. No *API* host moved with its docs.
+- **DeepSeek's `/v1` alias is no longer documented at all.** The old "v1 has no
+  relationship with the model's version" note is gone from every current page
+  checked (landing, chat-completions reference, pricing, FAQ, updates). It does
+  still route — an unauthenticated POST to either form answers 401, not 404 —
+  but undocumented-but-working is not a fact this catalog ships, so the
+  documented no-`/v1` form is what the recipe carries and the note now describes
+  the path rather than a "base URL".
+- **Anthropic's own reference example is internally stale**: its curl block
+  posts to the right URL with `"model": "claude-opus-4-6"`, which the same
+  site's models overview files under legacy models. A vendor's curl example and
+  its model table are two facts and are checked separately.
+
+What makes this class not recur is not this table. It is
+`every_recipe_is_a_registration_the_daemon_accepts_and_an_adapter_can_post`,
+which pushes each recipe through `Config::validate` and asserts the endpoint
+path against the adapter its `kind` selects — mutation-checked against both
+round-1 spellings.
