@@ -28,6 +28,14 @@ the reader loop stays free while the commit parks on a human. See
   model/confirm+model/set seams. (3) AC-3: with the shipped no-mechanism verifier
   (`UnavailableVerifier`), the commit is NOT refused by attestation (it proceeds
   to the runtime) and the stated degradation notice path is exercised.
+- `crates/tetond/src/server.rs` (test module) — (AC-4, ordering / BR-2) with
+  `AlwaysFailsVerifier` installed (a verifier that WOULD refuse if reached), a
+  commit from an **unattached** connection returns `NOT_ATTACHED` — **not** the
+  attestation error — proving the session gate fires before the verifier is
+  consulted; and a commit with an **unmintable** session id returns
+  `INVALID_PARAMS` before the verifier is consulted. `AlwaysFailsVerifier` is
+  the tripwire: if the attestation check ran first, these callers would get the
+  attestation refusal instead, and the assertions fail.
 - `crates/tetond/tests/web_setup_flow.rs` — (4) AC-2: with
   `AcceptingVerifier::default()` installed via `with_presence_verifier`, the full
   plan → preview → commit → same-session live lookup passes unchanged. (5) the
@@ -40,6 +48,10 @@ the reader loop stays free while the commit parks on a human. See
 - [ ] AC-1 present-but-refusing verifier: commit refused with the attestation
       code; config on disk byte-identical; in-memory config not swapped — all
       asserted by inspection.
+- [ ] AC-4 ordering (BR-2): with `AlwaysFailsVerifier` as a tripwire, an
+      unattached caller gets `NOT_ATTACHED` and an unmintable session id gets
+      `INVALID_PARAMS` — both refused before the verifier is consulted, so no
+      prompt can appear for a caller that may not act.
 - [ ] AC-5 mutation: removing the attestation line turns at least one of these
       tests red, and does so independently of the model-method seams.
 - [ ] AC-3 degradation: no-mechanism verifier → commit lands, stated notice, zero
