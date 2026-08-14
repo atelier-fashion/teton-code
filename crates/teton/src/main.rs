@@ -18,8 +18,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSnapshot, ConfigUpdate,
-    ContentClass, CostQueryParams, CostQueryResult, CostReportView, ModelListParams,
+    CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSetResult, ConfigSnapshot,
+    ConfigUpdate, ContentClass, CostQueryParams, CostQueryResult, CostReportView, ModelListParams,
     ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig,
     ProviderConfig, SessionCreateParams, SessionPermissionsParams, TierBindingConfig,
 };
@@ -47,7 +47,7 @@ mod uninstall;
 mod web_setup_ui;
 
 use client::{Connection, UiContext};
-use keychain::Keychain;
+use keychain::{Cleanup, Keychain, PriorKey};
 use prompt::{FramedStdinPrompter, Prompter, StdinPrompter};
 use render::{stdout_surface, stdout_surface_with_color, LineKind, Surface};
 use session_ui::SessionState;
@@ -1346,6 +1346,12 @@ fn run_provider_add(
     } else {
         Some(read_secret(id)?)
     };
+    // What the store inside `build_provider_registration` is about to displace,
+    // read in the same breath — the store destroys the answer, and a rejected
+    // registration owes the machine an undo decided by exactly this (BUG-171).
+    let prior = secret
+        .as_ref()
+        .map(|_| PriorKey::read(keychain.as_ref(), id));
     let config = build_provider_registration(
         id,
         kind,
@@ -1363,32 +1369,31 @@ fn run_provider_add(
     let params = ConfigSetParams {
         update: ConfigUpdate::RegisterProvider(config),
     };
-    match conn.call(params, &mut ctx)? {
-        Ok(res) if res.applied => ctx.surface.line(
-            LineKind::Info,
-            &format!(
-                "provider `{id}` registered ({}). Key stored in the OS keychain (ref {auth}); \
-                 no key written to disk.",
-                kind_label(kind)
-            ),
-        ),
-        Ok(_) => ctx.surface.line(
-            LineKind::Notice,
-            &format!("provider `{id}`: the daemon did not apply the registration."),
-        ),
-        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
-            LineKind::Notice,
-            &format!(
-                "provider `{id}`: key stored in the OS keychain (ref {auth}); this daemon build \
-                 does not implement config/set yet, so registration is pending TASK-013."
-            ),
-        ),
-        Err(err) => ctx.surface.line(
-            LineKind::Error,
-            &format!("provider `{id}` registration rejected: {}", err.message),
-        ),
+    // Bound rather than `?`-ed past: a transport failure is not the same event
+    // as a daemon that answered "no" — the registration may or may not have
+    // landed, and a key this run stored must be accounted for out loud on every
+    // path (BUG-171).
+    match conn.call(params, &mut ctx) {
+        Ok(outcome) => {
+            report_registration_outcome(
+                outcome,
+                id,
+                kind,
+                &auth,
+                prior.as_ref(),
+                keychain.as_ref(),
+                ctx.surface,
+            );
+            Ok(())
+        }
+        Err(transport) => {
+            if prior.is_some() {
+                ctx.surface
+                    .line(LineKind::Notice, &registration_unanswered_line(id, &auth));
+            }
+            Err(transport)
+        }
     }
-    Ok(())
 }
 
 /// `teton provider list`.
@@ -1831,6 +1836,150 @@ fn build_provider_registration(
         model,
         auth_ref,
     })
+}
+
+/// Render the daemon's answer to a provider registration, and settle the
+/// keychain entry the attempt stored (BUG-171).
+///
+/// `prior` is `Some` exactly when this run stored a credential; it is what the
+/// account held *before* that store, and it decides what a rejection owes the
+/// machine. The flow-agnostic three-state undo lives in [`PriorKey::undo`] —
+/// what belongs here is *when* it runs (only on a rejection: `config/set`
+/// validates before it persists, so a refused registration leaves the stored
+/// entry referenced by nothing) and the sentences rendered about it.
+///
+/// Split from [`run_provider_add`] so every arm is drivable from a test with a
+/// mock keychain and a recording surface — the real flow's connection cannot
+/// be, and a rollback is exactly the kind of branch that regresses silently.
+fn report_registration_outcome(
+    outcome: Result<ConfigSetResult, RpcError>,
+    id: &str,
+    kind: ProviderKind,
+    auth: &str,
+    prior: Option<&PriorKey>,
+    keychain: &dyn Keychain,
+    surface: &mut dyn Surface,
+) {
+    match outcome {
+        // The keychain sentence is claimed only when a key was stored — a local
+        // provider stored nothing, and the old unconditional line told it a
+        // key was in the keychain under ref `—`.
+        Ok(res) if res.applied => surface.line(
+            LineKind::Info,
+            &match prior {
+                Some(_) => format!(
+                    "provider `{id}` registered ({}). Key stored in the OS keychain (ref {auth}); \
+                     no key written to disk.",
+                    kind_label(kind)
+                ),
+                None => format!("provider `{id}` registered ({}).", kind_label(kind)),
+            },
+        ),
+        Ok(_) => {
+            surface.line(
+                LineKind::Notice,
+                &format!("provider `{id}`: the daemon did not apply the registration."),
+            );
+            // "Did not apply" is true of the config and **false of the
+            // keychain** when this run stored a key — and no delete is licensed
+            // here: an already-present identical registration may reference the
+            // entry, so taking it out could break a working provider.
+            if prior.is_some() {
+                surface.line(
+                    LineKind::Notice,
+                    &format!(
+                        "The key you typed is in the OS keychain (ref {auth}) and was left \
+                         there — a registration the daemon already had may reference it; \
+                         `teton provider list` shows whether `{id}` is configured."
+                    ),
+                );
+            }
+        }
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => surface.line(
+            LineKind::Notice,
+            &match prior {
+                // The key is deliberately *kept*: registration is pending, not
+                // refused, and the entry is what that registration will
+                // reference once a daemon that implements config/set is running.
+                Some(_) => format!(
+                    "provider `{id}`: key stored in the OS keychain (ref {auth}); this daemon \
+                     build does not implement config/set yet, so registration is pending \
+                     TASK-013."
+                ),
+                None => format!(
+                    "provider `{id}`: this daemon build does not implement config/set yet, so \
+                     registration is pending TASK-013."
+                ),
+            },
+        ),
+        Err(err) => {
+            let cleanup = prior.map(|prior| prior.undo(keychain));
+            surface.line(
+                LineKind::Error,
+                &format!("provider `{id}` registration rejected: {}", err.message),
+            );
+            if let Some(cleanup) = cleanup {
+                surface.line(LineKind::Notice, &provider_cleanup_line(id, &cleanup));
+            }
+        }
+    }
+}
+
+/// What the rejection path did about the keychain entry the attempt stored —
+/// said out loud, including when it did nothing (`/web setup`'s `cleanup_line`,
+/// re-worded for an account named by the provider id).
+///
+/// A failure to clean up is reported rather than swallowed: the user is the
+/// only one who can act on the keychain by hand, and a credential left in a
+/// state they were never told about is exactly the residue BUG-171 was. Each
+/// arm that leaves an entry behind therefore ends in the command that finishes
+/// the job it could not.
+fn provider_cleanup_line(id: &str, cleanup: &Cleanup) -> String {
+    match cleanup {
+        Cleanup::Deleted(Ok(())) => {
+            "the key that was stored for this attempt has been removed from your keychain; \
+             nothing was registered and nothing references it."
+                .to_owned()
+        }
+        Cleanup::Deleted(Err(err)) => format!(
+            "the key stored for this attempt could not be removed from your keychain ({err}) — \
+             it is unreferenced, and `security delete-generic-password -s teton -a {id}` \
+             clears it."
+        ),
+        Cleanup::Restored(Ok(())) => format!(
+            "the keychain entry `{id}` has been put back to the credential it held before \
+             this attempt."
+        ),
+        Cleanup::Restored(Err(err)) => format!(
+            "the credential the keychain entry `{id}` held before this attempt could not be \
+             put back ({err}) — the entry now holds the key you just typed. \
+             `security add-generic-password -U -s teton -a {id} -w` restores it by hand."
+        ),
+        Cleanup::LeftInPlace(why) => format!(
+            "your keychain could not be read before this attempt ({why}), so the key you typed \
+             was left in the `{id}` entry rather than risk removing a credential something \
+             else still uses — `security delete-generic-password -s teton -a {id}` removes it \
+             once you have checked nothing does."
+        ),
+    }
+}
+
+/// What a registration call the daemon never answered says about the stored key
+/// (BUG-171, mirroring `/web setup`'s ambiguous-commit treatment).
+///
+/// Deliberately **no** keychain mutation on this path: the registration either
+/// landed or did not, this process cannot tell, and either undo is destructive
+/// in one of the two states — a delete orphans a landed registration, a restore
+/// resurrects a key the user meant to replace. The user gets the ambiguity
+/// itself, with the command that resolves it.
+fn registration_unanswered_line(id: &str, auth: &str) -> String {
+    format!(
+        "the daemon did not answer the registration call, so provider `{id}` may or may not be \
+         registered — `teton provider list` shows which. The key you typed is in the OS keychain \
+         (ref {auth}) and was left there: taking it out would break the provider if the \
+         registration did land; if it did not, \
+         `security delete-generic-password -s teton -a {id}` removes it."
+    )
 }
 
 /// Read a provider API key from `TETON_PROVIDER_KEY` or, failing that, stdin.
@@ -2835,6 +2984,295 @@ mod tests {
                 .unwrap();
         assert!(config.auth_ref.is_none());
         assert!(keychain.stored_secret("local").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-171: a rejected registration must settle the keychain entry it
+    // stored. These drive `report_registration_outcome` the way
+    // `run_provider_add` does — prior read, then store, then the daemon's
+    // answer — with the mock keychain proving what each arm did about it.
+    // -----------------------------------------------------------------------
+
+    /// The prior read and the store, sequenced the way `run_provider_add`
+    /// sequences them; returns the ref the config carries and the prior state
+    /// the undo will consult.
+    fn stored_registration(kc: &MockKeychain, id: &str, secret: &str) -> (String, PriorKey) {
+        let prior = PriorKey::read(kc, id);
+        let config = build_provider_registration(
+            id,
+            ProviderKind::Anthropic,
+            Some("https://api.anthropic.com/v1/messages".to_owned()),
+            Some("claude-opus-5".to_owned()),
+            kc,
+            Some(secret),
+        )
+        .unwrap();
+        (config.auth_ref.unwrap(), prior)
+    }
+
+    /// The BUG-170 rejection: a remote kind whose endpoint the daemon's
+    /// validator refused. Any non-`METHOD_NOT_FOUND` error takes this arm.
+    fn rejection() -> Result<ConfigSetResult, RpcError> {
+        Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "provider `opus` is a remote provider and must set an `endpoint`",
+        ))
+    }
+
+    /// AC: the exact BUG-170 sequence — prompt, store, register, refuse — now
+    /// takes the stored key back out and says so.
+    #[test]
+    fn a_rejected_registration_takes_back_the_key_it_stored() {
+        let kc = MockKeychain::new();
+        let (auth, prior) = stored_registration(&kc, "opus", "sk-typed-this-run");
+        let mut surface = RecordingSurface::new();
+
+        report_registration_outcome(
+            rejection(),
+            "opus",
+            ProviderKind::Anthropic,
+            &auth,
+            Some(&prior),
+            &kc,
+            &mut surface,
+        );
+
+        assert!(
+            kc.is_empty(),
+            "the credential stored for the refused attempt must be gone"
+        );
+        assert_eq!(kc.deletes(), vec!["opus".to_owned()]);
+        assert!(surface.any_line_contains(LineKind::Error, "registration rejected"));
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "removed from your keychain"),
+            "the cleanup must be said out loud: {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+    }
+
+    /// The reason the undo is restore-or-delete rather than a blind delete: the
+    /// keychain account is the provider id, so an id colliding with a live
+    /// entry (here, the `/web setup` key) would have that credential destroyed
+    /// — the displaced bytes must come back instead.
+    #[test]
+    fn a_rejected_registration_restores_the_credential_it_displaced() {
+        let kc = MockKeychain::new();
+        kc.store("web-search", "sk-live-search-key").unwrap();
+        let (auth, prior) = stored_registration(&kc, "web-search", "sk-typed-this-run");
+        let mut surface = RecordingSurface::new();
+
+        report_registration_outcome(
+            rejection(),
+            "web-search",
+            ProviderKind::Anthropic,
+            &auth,
+            Some(&prior),
+            &kc,
+            &mut surface,
+        );
+
+        assert_eq!(
+            kc.stored_secret("web-search").as_deref(),
+            Some("sk-live-search-key"),
+            "the displaced credential must be back, byte for byte"
+        );
+        assert!(
+            kc.deletes().is_empty(),
+            "a restore is a store, not a delete"
+        );
+        assert!(surface.any_line_contains(LineKind::Notice, "put back"));
+    }
+
+    /// A cleanup the keychain refuses is reported with the command that
+    /// finishes it — the user is the only one who can act on the store by hand.
+    #[test]
+    fn a_cleanup_the_keychain_refuses_names_the_manual_command() {
+        let kc = MockKeychain::new();
+        let (auth, prior) = stored_registration(&kc, "opus", "sk-typed-this-run");
+        kc.fail_delete_with("the keychain is locked");
+        let mut surface = RecordingSurface::new();
+
+        report_registration_outcome(
+            rejection(),
+            "opus",
+            ProviderKind::Anthropic,
+            &auth,
+            Some(&prior),
+            &kc,
+            &mut surface,
+        );
+
+        assert_eq!(
+            kc.stored_secret("opus").as_deref(),
+            Some("sk-typed-this-run"),
+            "a refused delete leaves the entry where it was"
+        );
+        assert!(
+            surface.any_line_contains(
+                LineKind::Notice,
+                "security delete-generic-password -s teton -a opus"
+            ),
+            "the manual command must name the entry: {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+    }
+
+    /// A keychain that would not answer the pre-store read licenses neither
+    /// undo — the entry is left alone and the reason is said.
+    #[test]
+    fn an_unreadable_keychain_leaves_the_typed_key_and_says_why() {
+        let kc = MockKeychain::new();
+        kc.fail_read_with("the keychain is locked");
+        let (auth, prior) = stored_registration(&kc, "opus", "sk-typed-this-run");
+        let mut surface = RecordingSurface::new();
+
+        report_registration_outcome(
+            rejection(),
+            "opus",
+            ProviderKind::Anthropic,
+            &auth,
+            Some(&prior),
+            &kc,
+            &mut surface,
+        );
+
+        assert_eq!(
+            kc.stored_secret("opus").as_deref(),
+            Some("sk-typed-this-run"),
+            "neither undo may run when the prior state is unknown"
+        );
+        assert!(kc.deletes().is_empty());
+        assert!(surface.any_line_contains(LineKind::Notice, "could not be read"));
+    }
+
+    /// A local provider stored nothing, so a rejection has nothing to clean up
+    /// — and no cleanup sentence to render.
+    #[test]
+    fn a_local_provider_rejection_has_nothing_to_clean_up() {
+        let kc = MockKeychain::new();
+        let mut surface = RecordingSurface::new();
+
+        report_registration_outcome(
+            rejection(),
+            "local2",
+            ProviderKind::Local,
+            "—",
+            None,
+            &kc,
+            &mut surface,
+        );
+
+        assert!(kc.deletes().is_empty());
+        assert!(surface.any_line_contains(LineKind::Error, "registration rejected"));
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "no key was stored, so no keychain sentence is owed"
+        );
+    }
+
+    /// The success arm keeps the key, names the ref — and claims the keychain
+    /// sentence only when a key was actually stored.
+    #[test]
+    fn a_successful_registration_keeps_the_key_and_names_the_ref() {
+        let kc = MockKeychain::new();
+        let (auth, prior) = stored_registration(&kc, "opus", "sk-typed-this-run");
+        let mut surface = RecordingSurface::new();
+
+        report_registration_outcome(
+            Ok(ConfigSetResult { applied: true }),
+            "opus",
+            ProviderKind::Anthropic,
+            &auth,
+            Some(&prior),
+            &kc,
+            &mut surface,
+        );
+        assert_eq!(
+            kc.stored_secret("opus").as_deref(),
+            Some("sk-typed-this-run")
+        );
+        assert!(kc.deletes().is_empty());
+        assert!(surface.any_line_contains(LineKind::Info, "keychain://teton/opus"));
+
+        // A registered local provider stored no key, and its line claims none —
+        // the old unconditional sentence reported a key under ref `—`.
+        let mut local_surface = RecordingSurface::new();
+        report_registration_outcome(
+            Ok(ConfigSetResult { applied: true }),
+            "local2",
+            ProviderKind::Local,
+            "—",
+            None,
+            &kc,
+            &mut local_surface,
+        );
+        let lines = local_surface.lines_of(LineKind::Info);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("registered") && !lines[0].contains("keychain"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    /// The pre-BUG-171 arms that deliberately keep the key still do — an old
+    /// daemon's pending registration will reference the entry once upgraded —
+    /// and the not-applied arm now says where the key is instead of leaving a
+    /// rotation invisible.
+    #[test]
+    fn the_keeping_arms_keep_the_key_and_account_for_it() {
+        let kc = MockKeychain::new();
+        let (auth, prior) = stored_registration(&kc, "opus", "sk-typed-this-run");
+
+        let mut surface = RecordingSurface::new();
+        report_registration_outcome(
+            Err(RpcError::new(
+                error_code::METHOD_NOT_FOUND,
+                "no such method",
+            )),
+            "opus",
+            ProviderKind::Anthropic,
+            &auth,
+            Some(&prior),
+            &kc,
+            &mut surface,
+        );
+        assert_eq!(
+            kc.stored_secret("opus").as_deref(),
+            Some("sk-typed-this-run"),
+            "a pending registration keeps its key"
+        );
+        assert!(kc.deletes().is_empty());
+        assert!(surface.any_line_contains(LineKind::Notice, "pending TASK-013"));
+
+        let mut surface = RecordingSurface::new();
+        report_registration_outcome(
+            Ok(ConfigSetResult { applied: false }),
+            "opus",
+            ProviderKind::Anthropic,
+            &auth,
+            Some(&prior),
+            &kc,
+            &mut surface,
+        );
+        assert_eq!(
+            kc.stored_secret("opus").as_deref(),
+            Some("sk-typed-this-run"),
+            "an unapplied registration may already reference the entry — no delete is licensed"
+        );
+        assert!(kc.deletes().is_empty());
+        assert!(surface.any_line_contains(LineKind::Notice, &format!("ref {auth}")));
+    }
+
+    /// The unanswered-call sentence: the one path where neither undo is safe,
+    /// so it must name both the ref and the command that resolves the ambiguity.
+    #[test]
+    fn the_unanswered_line_names_the_ref_and_the_escape_hatch() {
+        let line = registration_unanswered_line("opus", "keychain://teton/opus");
+        assert!(line.contains("may or may not be registered"));
+        assert!(line.contains("keychain://teton/opus"));
+        assert!(line.contains("teton provider list"));
+        assert!(line.contains("security delete-generic-password -s teton -a opus"));
     }
 
     #[test]

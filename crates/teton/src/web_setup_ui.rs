@@ -61,8 +61,6 @@
 //! ordering, the delete-on-failure and every abort point be pinned with no
 //! socket, no keychain and no tty (REQ-556/REQ-560 BR-8's pattern).
 
-use std::fmt;
-
 use teton_protocol::events::{WebCapabilityState, WebTier};
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -73,7 +71,7 @@ use teton_protocol::methods::{
 use teton_protocol::{SessionId, GENERIC_SEARCH_AUTH_TEMPLATE};
 
 use crate::client::{Connection, UiContext};
-use crate::keychain::{auth_ref_for, Keychain, KeychainError};
+use crate::keychain::{auth_ref_for, Cleanup, Keychain, PriorKey};
 use crate::prompt::Prompter;
 use crate::render::{LineKind, Surface};
 use crate::session_ui::web_tier_name;
@@ -441,7 +439,7 @@ pub(crate) fn drive(
     // run put there, and after it there is no way left to find out what that was.
     let (key_ref, prior) = match answers.search_key.as_deref() {
         Some(secret) => {
-            let prior = PriorKey::read(keychain);
+            let prior = PriorKey::read(keychain, SEARCH_KEY_ACCOUNT);
             match keychain.store(SEARCH_KEY_ACCOUNT, secret) {
                 Ok(reference) => (Some(reference), Some(prior)),
                 Err(err) => {
@@ -504,86 +502,13 @@ pub(crate) fn drive(
 
 // ---------------------------------------------------------------------------
 // The undo (ADR-3, BR-11)
+//
+// The three-state read-before-write machinery this flow was built on —
+// `PriorKey` and `Cleanup` — moved to `crate::keychain` when `teton provider
+// add` became its second caller (BUG-171). What stays here is what is this
+// flow's own: the account it stores into, and the sentences it renders about
+// each outcome.
 // ---------------------------------------------------------------------------
-
-/// What the keychain held for [`SEARCH_KEY_ACCOUNT`] *before* this run stored
-/// anything.
-///
-/// Read once, immediately before the store, because the store is what destroys
-/// the answer. Which variant this is decides what a refused commit owes the
-/// machine — and the three are genuinely three, not a `bool` with a failure
-/// case: "nothing was here" licenses a delete, "this was here" obliges a
-/// restore, and "I could not find out" licenses neither.
-enum PriorKey {
-    /// The account was empty. This run created the entry, so the undo is to
-    /// remove it (BR-11's "any keychain entry the aborted flow run itself
-    /// created").
-    Absent,
-    /// The account already held a credential — a rotation. The live config still
-    /// references it, so the undo is to put those exact bytes back. A delete
-    /// here destroys a working setup the user never agreed to give up.
-    Present(String),
-    /// The store could not be read. Both undos are unsafe: the delete might take
-    /// out a credential in use, and there is nothing to restore.
-    Unreadable(KeychainError),
-}
-
-/// Hand-written for the same reason `Answers` withholds its derive: `Present`
-/// holds the displaced credential's plaintext, and a derived `Debug` would
-/// print a live key into any `{:?}`, panic message, or future test assertion
-/// — the exact residue the AC-5 sweep exists to catch.
-impl fmt::Debug for PriorKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Absent => f.write_str("PriorKey::Absent"),
-            Self::Present(_) => f.write_str("PriorKey::Present(<redacted>)"),
-            Self::Unreadable(err) => write!(f, "PriorKey::Unreadable({err})"),
-        }
-    }
-}
-
-impl PriorKey {
-    /// Read the account, classifying a missing entry as a state rather than a
-    /// failure.
-    ///
-    /// A read failure does **not** stop the flow. It is a transient backend
-    /// condition on the one platform that has a backend at all, the user has
-    /// asked for this key to be stored, and refusing here would trade a
-    /// hypothetical loss for a certain one. What it does is downgrade the undo
-    /// to "leave it alone and say so".
-    fn read(keychain: &dyn Keychain) -> Self {
-        match keychain.read(SEARCH_KEY_ACCOUNT) {
-            Ok(Some(existing)) => PriorKey::Present(existing),
-            Ok(None) => PriorKey::Absent,
-            Err(err) => PriorKey::Unreadable(err),
-        }
-    }
-
-    /// Undo this run's store, given what it displaced.
-    fn undo(&self, keychain: &dyn Keychain) -> Cleanup {
-        match self {
-            PriorKey::Absent => Cleanup::Deleted(keychain.delete(SEARCH_KEY_ACCOUNT)),
-            PriorKey::Present(previous) => {
-                Cleanup::Restored(keychain.store(SEARCH_KEY_ACCOUNT, previous).map(|_| ()))
-            }
-            // The reason travels with the decision: "left alone" without "because
-            // your keychain would not answer" reads as the flow shrugging.
-            PriorKey::Unreadable(err) => Cleanup::LeftInPlace(err.to_string()),
-        }
-    }
-}
-
-/// What the failure path did about the entry this run wrote.
-#[derive(Debug)]
-enum Cleanup {
-    /// The entry this run created was removed — or the removal was refused.
-    Deleted(Result<(), KeychainError>),
-    /// The credential this run displaced was put back — or could not be.
-    Restored(Result<(), KeychainError>),
-    /// Nothing was touched, because nothing could be shown to be the safe move.
-    /// Carries why the store could not be read.
-    LeftInPlace(String),
-}
 
 // ---------------------------------------------------------------------------
 // Collection
@@ -1125,12 +1050,14 @@ fn ambiguous_commit_line(prior: &Option<PriorKey>) -> String {
     );
     match prior {
         None => {}
-        Some(PriorKey::Present(_)) => line.push_str(&format!(
+        Some(prior) if prior.displaced() => line.push_str(&format!(
             " The key you typed is in your keychain as `{SEARCH_KEY_ACCOUNT}`, in place of the one \
              that was there before, and was left there: taking it back out would break the setup \
              if the write did land."
         )),
-        Some(PriorKey::Absent | PriorKey::Unreadable(_)) => line.push_str(&format!(
+        // Absent or unreadable: nothing known to be displaced, so the removal
+        // command is safe to offer once the user has confirmed nothing landed.
+        Some(_) => line.push_str(&format!(
             " The key you typed is in your keychain as `{SEARCH_KEY_ACCOUNT}` and was left there: \
              taking it back out would break the setup if the write did land. If it did not, \
              `security delete-generic-password -s teton -a {SEARCH_KEY_ACCOUNT}` removes it."
