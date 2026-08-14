@@ -3,12 +3,14 @@
   "branch": "feat/REQ-575-presence-attested-web-setup-commit",
   "startedAt": "2026-08-14T00:00:00Z",
   "completed": false,
-  "currentPhase": 2,
-  "completedPhases": [0, 1],
+  "currentPhase": 4,
+  "completedPhases": [0, 1, 2, 3],
   "integrationBranch": "main",
   "phaseHistory": [
     { "phase": 0, "name": "Resolve Repos + Worktree + Preflight + Draft PR", "completedAt": "2026-08-14T11:53:05Z" },
-    { "phase": 1, "name": "Validate Requirement Spec", "completedAt": "2026-08-14T11:54:00Z", "verdict": "APPROVED (OQ-3 deferred to /architect)" }
+    { "phase": 1, "name": "Validate Requirement Spec", "completedAt": "2026-08-14T11:54:00Z", "verdict": "APPROVED (OQ-3 deferred to /architect)" },
+    { "phase": 2, "name": "Architect & Break Into Tasks", "completedAt": "2026-08-14T12:05:00Z", "notes": "OQ-3 resolved (ADR-2): config/set -> REQ-576; consent-path scoped out. Tasks 135-138." },
+    { "phase": 3, "name": "Validate Architecture & Tasks", "completedAt": "2026-08-14T12:08:00Z", "verdict": "VALIDATED (fixed AC-4 orphan -> TASK-136)" }
   ],
   "notes": "Working in place in the harness-provided worktree great-gagarin-419527 rather than creating a nested .worktrees/REQ-575 (the harness already isolated this session; the spec was uncommitted here and a fresh worktree from origin/main would have stranded it). Branch renamed in-place to the ADLC-conventional feat/REQ-575 name.",
   "repos": {
