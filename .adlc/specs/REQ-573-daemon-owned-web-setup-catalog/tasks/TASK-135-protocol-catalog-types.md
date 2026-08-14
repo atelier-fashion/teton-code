@@ -1,7 +1,7 @@
 ---
 id: TASK-135
 title: "Protocol: WebSetupCatalog types, suggestion_catalog field, shared generic template"
-status: draft
+status: complete
 parent: REQ-573
 created: 2026-08-14
 updated: 2026-08-14
@@ -30,21 +30,21 @@ Add the catalog vocabulary to `teton-protocol`: `WebBackendSuggestion`,
 
 ## Acceptance Criteria
 
-- [ ] Struct shapes match architecture.md "Protocol changes" exactly: `id`,
+- [x] Struct shapes match architecture.md "Protocol changes" exactly: `id`,
       `label`, `endpoint` required strings; `host`, `auth_template`, `notes`
       optional with `#[serde(default, skip_serializing_if)]`; `needs_key`
       bool; catalog carries `default_auth_template` + `backends`
-- [ ] Derives match house style for sibling types (`Debug, Clone, PartialEq,
+- [x] Derives match house style for sibling types (`Debug, Clone, PartialEq,
       Eq, Serialize, Deserialize`); no `Default` that could manufacture data
-- [ ] Round-trip test covers a populated catalog (all optional fields both
+- [x] Round-trip test covers a populated catalog (all optional fields both
       present and absent across entries)
-- [ ] A `WebSetupPlanResult` JSON **without** `suggestion_catalog` deserializes
+- [x] A `WebSetupPlanResult` JSON **without** `suggestion_catalog` deserializes
       with `None` (AC-1 absent-field direction, BUG-158 additive-skew rule)
-- [ ] A populated result serialized then deserialized is equal; the field is
+- [x] A populated result serialized then deserialized is equal; the field is
       omitted from the wire when `None`
-- [ ] `PROTOCOL_VERSION` untouched (min == max == 2);
+- [x] `PROTOCOL_VERSION` untouched (min == max == 2);
       `this_build_advertises_only_the_version_its_types_can_read` still passes
-- [ ] `cargo test -p teton-protocol` green
+- [x] `cargo test -p teton-protocol` green
 
 ## Technical Notes
 
