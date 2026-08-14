@@ -1,7 +1,7 @@
 ---
 id: TASK-137
 title: "Spawned-binary e2e: an attested /web setup commit through the presence seam"
-status: draft
+status: complete
 parent: REQ-575
 created: 2026-08-14
 updated: 2026-08-14

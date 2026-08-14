@@ -525,6 +525,76 @@ fn the_committed_table_serves_a_lookup_in_the_same_session() {
     assert_no_boundary_bytes();
 }
 
+/// **REQ-575 AC-2 + AC-6: the granted path with presence *actively satisfied*,
+/// over the real socket.**
+///
+/// The in-process unit tests inject `AlwaysFailsVerifier` to prove the BR-10(b)
+/// gate refuses; this proves the other side. A spawned daemon whose presence
+/// mechanism is present and satisfied — reached the only way a separate process
+/// can, through `TETON_TEST_SEAMS=1` + `TETON_PRESENCE_ACCEPT=1`, which installs
+/// `AcceptingVerifier` (see `attest::seam_verifier`) — commits, writes the
+/// `[web]` table, and the capability is live in the same session with no
+/// restart.
+///
+/// The master-switch contract is untouched and is *why* this is safe against the
+/// adversary the REQ is about: a **release** build refuses to start with
+/// `TETON_TEST_SEAMS` set (DECISION 3 / E-6), so this accept-seam does not exist
+/// in the artifact users run. This is a debug-test-only door, asked for twice.
+#[test]
+fn an_attested_commit_lands_over_the_socket_through_the_presence_seam() {
+    let mut config = String::new();
+    config.push_str("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
+    config.push_str(&every_tier_bound_to("local"));
+    config.push_str("[privacy]\nredact = false\n\n");
+
+    let ws = Workspace::new("setup-attested");
+    ws.write_config(&config);
+    // A scripted local tier so the daemon has a working reflex tier; the commit,
+    // not a turn, is what is under test here.
+    let script_path = ws.write_script("done");
+    let daemon = Daemon::spawn(
+        &ws,
+        probe()
+            .script(script_path)
+            .env("TETON_TEST_SEAMS", "1")
+            .env("TETON_PRESENCE_ACCEPT", "1"),
+    );
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    let before_bytes = std::fs::read(&ws.config_path).expect("the fixture config exists");
+
+    let committed = client.call("web/setup_commit", answers(&session, "fetch_user_url", None));
+    assert_eq!(
+        committed["result"]["applied"].as_bool(),
+        Some(true),
+        "a commit whose presence check is satisfied through the seam must apply — \
+         the granted path over the socket: {committed}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    let written = std::fs::read_to_string(&ws.config_path).expect("the config was written");
+    assert!(
+        written.contains("[web]") && written.contains("fetch_user_url"),
+        "the attested commit must write the `[web]` table:\n{written}"
+    );
+    assert_ne!(
+        written.as_bytes(),
+        before_bytes.as_slice(),
+        "the attested commit must actually change the file it was given"
+    );
+
+    // Live in the same session, no restart — the whole point of the flow.
+    let after = plan(&mut client, &session);
+    assert_eq!(
+        after["result"]["state"]["state"].as_str(),
+        Some("ready"),
+        "the capability must be live after an attested commit, with no restart: {after}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC-7 — partial configuration is guidance, in both directions
 // ---------------------------------------------------------------------------
