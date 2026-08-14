@@ -1,7 +1,7 @@
 ---
 id: BUG-165
 title: "The search credential only speaks Bearer, and the spec's own example backends do not"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-13
 updated: 2026-08-13
@@ -128,6 +128,27 @@ credential named, is a config the daemon would silently ignore.
 shape that fails to parse at use time (unvalidated config) attaches no
 credential and says so on stderr, the same fail-closed posture as an
 unresolvable `search_key_ref`.
+
+## Verification
+
+- `cargo test --workspace --no-fail-fast`: 2302 passed, 0 failed, 48 test
+  targets, exit 0 — after a full `cargo build --workspace` (the BUG-164
+  freshness rule).
+- New wire-level test (`the_configured_search_auth_shape_is_the_shape_on_the_wire`)
+  reads both named example shapes off a real loopback socket: Brave's
+  template puts `x-subscription-token: <secret>` on the wire with **no**
+  `Authorization` header beside it; Kagi's puts `authorization: Bot <secret>`.
+  The pre-existing binding test still pins the absent-key default to
+  `Authorization: Bearer` and the origin-bound travel rules.
+- `cargo clippy --workspace --all-targets` clean; `cargo fmt --all -- --check`
+  clean; `tools/release/changelog-section.sh` accepts the new `[Unreleased]`
+  section (exit 0).
+
+## Deployment
+
+- No service deploys in this repo (plain OSS flow, PR-gated CI on `main`).
+  The fix rides the next tagged release; the `[Unreleased]` changelog section
+  becomes its upgrade notes.
 
 ## Lessons Captured
 
