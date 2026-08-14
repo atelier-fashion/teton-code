@@ -922,13 +922,17 @@ mod tests {
         );
     }
 
+    /// The native tool-spec projection sees the same exposure the prompt does —
+    /// the cap bounding the non-exempt tools, and the cap-exempt `teton_docs`
+    /// riding through it (REQ-577 BR-7). A projection that applied the cap its
+    /// own way would give a native tool-caller a different tool set than the
+    /// prompt describes.
     #[test]
     fn exposed_tool_specs_respects_the_cap() {
         let tools = ToolRegistry::with_builtins();
         let specs = exposed_tool_specs(&tools, Some(2));
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].name, "read");
-        assert_eq!(specs[1].name, "edit");
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["read", "edit", "teton_docs"]);
         // Each spec carries a description and a schema the provider can serialize.
         assert!(!specs[0].description.is_empty());
         assert!(specs[0].input_schema.is_object());

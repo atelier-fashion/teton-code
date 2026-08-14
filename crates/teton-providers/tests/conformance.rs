@@ -859,3 +859,99 @@ fn an_undeclared_byom_endpoint_sends_the_effort_field_on_its_first_call() {
         "and never both shapes (AC-2b)",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The endpoint contract (BUG-170)
+// ---------------------------------------------------------------------------
+
+/// A `Transport` that records the **URL** of every request it is handed.
+///
+/// [`CapturingTransport`] above records bodies, which is what the effort tests
+/// needed. The claim below is about the other field, and it needs its own
+/// capture for the same reason that one exists: reading `build_request`'s source
+/// and concluding "it assigns `self.endpoint`" is code inspection, and a
+/// wire-level claim is discharged by a capture or not at all.
+#[derive(Default)]
+struct UrlCapturingTransport {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl UrlCapturingTransport {
+    fn urls(&self) -> Vec<String> {
+        self.seen.lock().expect("capture lock").clone()
+    }
+}
+
+#[async_trait]
+impl Transport for UrlCapturingTransport {
+    async fn execute(
+        &self,
+        request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
+        self.seen.lock().expect("capture lock").push(request.url);
+        let body = futures::stream::iter(std::iter::empty::<Result<Vec<u8>, TransportError>>());
+        Ok(TransportResponse {
+            location: None,
+            status: 200,
+            body: Box::pin(body),
+        })
+    }
+}
+
+/// **A configured endpoint is the request URL, verbatim — no adapter joins a
+/// path onto it** (BUG-170).
+///
+/// This is a load-bearing premise that nothing used to assert. The daemon's
+/// recipe catalog ships one URL per vendor and
+/// `provider_recipes::tests::every_recipe_is_a_registration_the_daemon_accepts_and_an_adapter_can_post`
+/// checks each one's *path* against the adapter its kind selects — which is only
+/// a meaningful check if the adapter really does request that exact path. Round
+/// 1 of that catalog shipped five vendor `base_url`s precisely because everyone
+/// involved assumed the opposite: that something downstream would complete the
+/// URL the way an OpenAI SDK completes a `base_url`. Nothing does, and now
+/// something says so.
+///
+/// The sentinel is deliberately **not** a plausible endpoint. A URL ending
+/// `/chat/completions` would pass this test even under an adapter that appended
+/// `/chat/completions` to whatever it was given; a sentinel with a nonsense path
+/// and a query string can only survive being passed through untouched.
+#[test]
+fn a_configured_endpoint_is_the_request_url_verbatim() {
+    const SENTINEL: &str = "https://endpoint.test/sentinel/path?x=1";
+
+    for (kind, adapter) in [
+        (
+            "anthropic",
+            Box::new(AnthropicAdapter::new("a", SENTINEL)) as Box<dyn Provider>,
+        ),
+        (
+            "openai-compatible",
+            Box::new(OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
+                "o", SENTINEL,
+            ))) as Box<dyn Provider>,
+        ),
+    ] {
+        let transport = UrlCapturingTransport::default();
+        // The stream is allowed to fail — an empty body is a truncated stream —
+        // because the request has already been built and captured by then.
+        let _ = block_on(adapter.stream_turn(sample_request(), &transport));
+        let urls = transport.urls();
+        assert_eq!(
+            urls.len(),
+            1,
+            "the `{kind}` adapter issued {} requests for one turn; the capture below \
+             assumes exactly one",
+            urls.len()
+        );
+        assert_eq!(
+            urls[0], SENTINEL,
+            "the `{kind}` adapter was configured with `{SENTINEL}` and requested \
+             `{}` instead. The configured endpoint is the whole request URL and is POSTed \
+             as given: nothing may join a path, strip a query, or normalize a trailing \
+             slash. Every vendor recipe the daemon ships is written against this contract \
+             (BUG-170) — if an adapter ever needs to complete a URL, the recipes and their \
+             seam test have to move first.",
+            urls[0]
+        );
+    }
+}

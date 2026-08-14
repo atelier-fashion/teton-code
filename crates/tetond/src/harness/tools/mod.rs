@@ -1,10 +1,15 @@
 //! Built-in agent tools: the small, verified tool set the loop dispatches.
 //!
-//! The tool set is deliberately tiny — read, edit, glob, grep, shell — because
-//! the harness is designed for **weak models** first (the product thesis, BR-6):
-//! a short loop over a handful of legible tools that a small local model can
-//! drive reliably, with a mandatory verification step. Strong models simply get
-//! a longer leash (a higher `max_turns`), not a different shape.
+//! The tool set is deliberately tiny — read, edit, glob, grep, shell, and
+//! `teton_docs` — because the harness is designed for **weak models** first
+//! (the product thesis, BR-6): a short loop over a handful of legible tools that
+//! a small local model can drive reliably, with a mandatory verification step.
+//! Strong models simply get a longer leash (a higher `max_turns`), not a
+//! different shape.
+//!
+//! Five of the six answer questions about the *user's* repository.
+//! [`docs`] answers questions about Teton, out of bodies compiled into this
+//! binary, and is the only built-in that touches no path at all (REQ-577).
 //!
 //! Every tool runs inside a **repo-root jail** ([`ToolContext`]): a path that
 //! escapes the root — via `..`, an absolute path, or a symlink that resolves
@@ -37,6 +42,7 @@ use teton_core::ProvenanceId;
 use super::context::ToolProvenance;
 use super::duty::DutyRoute;
 
+pub mod docs;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -45,6 +51,7 @@ pub mod read;
 pub mod shell;
 pub mod web;
 
+pub use docs::{DocsTool, DOCS_TOOL_NAME};
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -614,7 +621,16 @@ impl ToolRegistry {
     }
 
     /// A registry with the full built-in tool set, in weak-model priority order:
-    /// read, edit, grep, glob, shell.
+    /// read, edit, grep, glob, shell — plus `teton_docs`, registered
+    /// **cap-exempt** (REQ-577 ADR-3).
+    ///
+    /// `teton_docs` is here, in the constructor, precisely because it is
+    /// *unconditional*: making it a step every caller performs would make
+    /// "present in every session" a claim about call sites, and BR-7's one
+    /// unacceptable outcome is that it is silently absent from one. Registered
+    /// here it is inherited by every fixture, the offline path and the templated
+    /// smoke without any of them being edited. Its exemption is explained on
+    /// [`Self::register_cap_exempt`], where the exempt set is enumerated.
     ///
     /// The **opt-in** `web` tool is deliberately not here (REQ-563 D-1): it
     /// exists only on a machine whose `[web] tier` is above `off`, which is a
@@ -626,6 +642,11 @@ impl ToolRegistry {
     /// tools — so an explicitly opted-in capability is never displaced by a
     /// degraded provider's `max_tools` cap (REQ-563 decision 2026-08-09) while
     /// the cap still bounds the optional MCP tools around it (BR-6).
+    ///
+    /// The two are therefore opposite by design and for the same reason: what
+    /// decides where a tool registers is whether its presence is a *config*
+    /// question. `web`'s is, so it registers where the config is known;
+    /// `teton_docs`'s is not, so it registers where no config can reach it.
     #[must_use]
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
@@ -634,6 +655,7 @@ impl ToolRegistry {
         reg.register(Arc::new(GrepTool));
         reg.register(Arc::new(GlobTool));
         reg.register(Arc::new(ShellTool::default()));
+        reg.register_cap_exempt(Arc::new(DocsTool));
         reg
     }
 
@@ -655,11 +677,36 @@ impl ToolRegistry {
     /// A cap-exempt tool is always exposed by [`Self::exposed_names`]/[`Self::docs`]
     /// regardless of the cut, and the cap applies to the remaining (non-exempt)
     /// tools — so exempting one tool raises the effective exposure budget by
-    /// exactly one and never displaces a built-in. Exactly one tool registers
-    /// this way: the opt-in `web` tool (REQ-563 decision 2026-08-09). A user who
-    /// explicitly turned the capability on must reach it on every provider, and
-    /// `DEGRADED_MAX_TOOLS` equals the built-in count, so a plain registration
-    /// would be cut on every non-`Native` profile.
+    /// exactly one and never displaces a built-in.
+    ///
+    /// # The exempt set, and why each member is in it
+    ///
+    /// Two tools register this way, and their reasons are **different**. That is
+    /// the membership rule: an exemption is granted for a stated reason, and a
+    /// reason that merely repeats an existing member's is a sign the cap is being
+    /// argued with rather than an exemption being earned. Enumerated here so the
+    /// set stays something a reader can check instead of a place tools accumulate.
+    ///
+    /// - **`web`** (REQ-563 decision 2026-08-09) — *the user's opt-in must
+    ///   survive the cap.* The capability exists only because someone turned it
+    ///   on, and a setting that silently stops applying on some providers is a
+    ///   setting that lies. It also registers *late*, after any MCP tools, so
+    ///   without exemption it would be first against the wall.
+    /// - **`teton_docs`** (REQ-577 BR-7, ADR-3) — *self-serving product
+    ///   knowledge, needed most exactly where the cap bites.* The cap exists
+    ///   because weak tool-callers drown in tool schemas; this tool is one string
+    ///   argument and one line of description, so it barely adds to that load —
+    ///   while the profiles the cap applies to are the local and degraded ones,
+    ///   which are precisely the sessions whose model does not know Teton's own
+    ///   setup surface and would otherwise search the user's repository for it
+    ///   (BUG-160).
+    ///
+    /// Neither is a raised cap, deliberately. `DEGRADED_MAX_TOOLS` equals the
+    /// built-in count, so with a count-based fix availability is an arithmetic
+    /// coincidence that the next built-in silently breaks — the trap LESSON-496
+    /// documents, where "cut first under pressure" became "never available"
+    /// because the limit equalled the count. An enumerated exempt set is a rule;
+    /// a number that happens to be big enough is not.
     pub fn register_cap_exempt(&mut self, tool: Arc<dyn Tool>) {
         self.tools.push(Registration {
             tool,
@@ -993,13 +1040,80 @@ mod tests {
         assert!(outcome.content.contains("read"));
     }
 
+    /// The cap the daemon actually applies to a weak tool-caller, read from the
+    /// production mapping rather than re-typed.
+    ///
+    /// `DEGRADED_MAX_TOOLS` is private to `teton-providers`, and copying its
+    /// value here would make this file's assertions agree with a number instead
+    /// of with the profile. Derived through
+    /// [`CapabilityProfile::harness_profile`] it is the same value the runtime
+    /// hands `docs`/`exposed_names`, so a change to the cap is felt here rather
+    /// than quietly diverged from.
+    fn degraded_cap() -> Option<u32> {
+        use teton_core::ToolCallTier;
+        use teton_providers::capability::CapabilityProfile;
+
+        CapabilityProfile {
+            tool_call_tier: ToolCallTier::Degraded,
+            ..CapabilityProfile::default()
+        }
+        .harness_profile()
+        .max_tools
+    }
+
+    /// **BR-6's cut, and REQ-577 BR-7's exemption from it, on the real
+    /// built-in registry.**
+    ///
+    /// The cut is asserted on the *non-exempt* five: `Some(2)` keeps `read` and
+    /// `edit` and drops the rest of them, while `teton_docs` rides through
+    /// untouched at every setting — which is the mechanism, not the ordering.
+    /// `teton_docs` is registered **last**, so a registry that had merely got
+    /// lucky with position would be the first thing any of these caps discarded.
     #[test]
     fn docs_are_capped_by_max_tools_for_degraded_providers() {
         let reg = ToolRegistry::with_builtins();
-        assert_eq!(reg.exposed_names(None).len(), 5);
-        assert_eq!(reg.exposed_names(Some(2)), vec!["read", "edit"]);
-        assert!(reg.docs(Some(1)).contains("read"));
-        assert!(!reg.docs(Some(1)).contains("shell"));
+        assert_eq!(
+            reg.exposed_names(None),
+            vec!["read", "edit", "grep", "glob", "shell", "teton_docs"]
+        );
+        assert_eq!(
+            reg.exposed_names(Some(2)),
+            vec!["read", "edit", "teton_docs"],
+            "the cap bounds the five non-exempt built-ins and never the exempt tool"
+        );
+        // Matched on the rendered entry (`- <name>: …`) rather than on the bare
+        // name: `teton_docs`'s own description carries the topic index, which
+        // spells `web` and `doctor`, so a substring search over the whole block
+        // would answer for tools that are not in it.
+        assert!(reg.docs(Some(1)).contains("- read:"));
+        assert!(!reg.docs(Some(1)).contains("- shell:"));
+
+        // AC-5: on the profile the daemon derives for a weak tool-caller — the
+        // one whose cap *equals* the built-in count, and therefore the one a
+        // non-exempt sixth tool would never survive (LESSON-496) — the five
+        // built-ins and `teton_docs` are all exposed.
+        let cap = degraded_cap();
+        assert!(
+            cap.is_some(),
+            "the degraded profile no longer caps tools at all, so this test asserts \
+             nothing about the cut `teton_docs` is exempt from"
+        );
+        let exposed = reg.exposed_names(cap);
+        for builtin in ["read", "edit", "grep", "glob", "shell"] {
+            assert!(exposed.contains(&builtin), "{exposed:?}");
+        }
+        assert!(
+            exposed.contains(&DOCS_TOOL_NAME),
+            "`{DOCS_TOOL_NAME}` is absent under the degraded cap {cap:?}, which is BR-7's \
+             one unacceptable outcome: the profiles that cap tools are exactly the ones \
+             whose model does not know Teton's own setup surface. Restore the \
+             `register_cap_exempt` registration in `with_builtins`; do not raise the \
+             cap.\nexposed: {exposed:?}"
+        );
+        assert!(
+            reg.docs(cap).contains(&format!("- {DOCS_TOOL_NAME}:")),
+            "the tool docs the model reads must mirror `exposed_names`"
+        );
     }
 
     /// A stand-in for any tool, to exercise the registry's exposure rules
@@ -1022,18 +1136,24 @@ mod tests {
         }
     }
 
-    /// **REQ-563 decision 2026-08-09: a cap-exempt tool survives the cut that
-    /// bounds the rest.**
+    /// **REQ-563 decision 2026-08-09, extended by REQ-577 ADR-3: every
+    /// cap-exempt tool survives the cut that bounds the rest.**
     ///
     /// `DEGRADED_MAX_TOOLS` equals the built-in count (5), so a plain cap of 5
     /// would leave no room for an opted-in `web` tool registered after the
     /// built-ins and MCP. Cap-exemption raises the effective budget by exactly
-    /// one: the five built-ins survive, the optional (non-exempt) MCP tool is
-    /// still cut, and the exempt tool is exposed regardless of the cap.
+    /// the number of exempt tools: the five built-ins survive, the optional
+    /// (non-exempt) MCP tool is still cut, and **both** exempt tools are exposed
+    /// regardless of the cap.
+    ///
+    /// The fixture now starts from a registry that *already* carries one exempt
+    /// tool — `with_builtins` registers `teton_docs` that way — which is the
+    /// case worth pinning: the arithmetic must hold for a set, not for the one
+    /// exemption that happened to exist when it was written.
     #[test]
     fn a_cap_exempt_tool_is_never_displaced_by_the_max_tools_cut() {
-        // The registration order the daemon uses: built-ins, then MCP, then the
-        // cap-exempt web tool.
+        // The registration order the daemon uses: built-ins (including the
+        // cap-exempt `teton_docs`), then MCP, then the cap-exempt web tool.
         let mut reg = ToolRegistry::with_builtins();
         reg.register(Arc::new(StubTool("mcp")));
         reg.register_cap_exempt(Arc::new(StubTool("web")));
@@ -1053,16 +1173,24 @@ mod tests {
             exposed.contains(&"web"),
             "an explicitly opted-in cap-exempt tool was cut: {exposed:?}"
         );
+        assert!(
+            exposed.contains(&DOCS_TOOL_NAME),
+            "the built-in cap-exempt tool was cut: {exposed:?}"
+        );
         assert_eq!(
             exposed.len(),
-            6,
-            "exemption raises the effective budget by exactly one"
+            7,
+            "exemption raises the effective budget by exactly the number of exempt \
+             tools — five capped built-ins plus two exempt: {exposed:?}"
         );
 
-        // docs mirror exposed_names.
+        // docs mirror exposed_names. Matched on the rendered entry, because
+        // `teton_docs`'s description names `web` in its topic index and would
+        // otherwise answer for the web tool's own line.
         let docs = reg.docs(Some(5));
-        assert!(docs.contains("web"), "{docs}");
-        assert!(!docs.contains("mcp"), "{docs}");
+        assert!(docs.contains("- web:"), "{docs}");
+        assert!(docs.contains(&format!("- {DOCS_TOOL_NAME}:")), "{docs}");
+        assert!(!docs.contains("- mcp:"), "{docs}");
     }
 
     /// **REQ-567 AC-6, the structural half: the model cannot clear a session.**
@@ -1097,7 +1225,7 @@ mod tests {
         let reg = ToolRegistry::with_builtins();
         // Non-vacuity: the registry under test is the populated one.
         assert!(
-            reg.get("read").is_some() && reg.names().len() == 5,
+            reg.get("read").is_some() && reg.names().len() == 6,
             "the built-in set is missing, so the sweep below proves nothing: {:?}",
             reg.names()
         );

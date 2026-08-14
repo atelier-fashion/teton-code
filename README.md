@@ -244,12 +244,14 @@ differentiators:
 ### Hooking up an external model
 
 ```bash
-# Register the provider (remote kinds must declare --model; the API key is
-# read from TETON_PROVIDER_KEY or prompted for, and stored in the OS
-# keychain — never written to a file):
-teton provider add opus --kind anthropic --model claude-opus-5
+# Register the provider. Every remote kind needs --kind, --endpoint and
+# --model; the API key is read from TETON_PROVIDER_KEY or prompted for, and
+# stored in the OS keychain — never written to a file. --endpoint is the full
+# request URL, posted exactly as given, not a vendor's base_url:
+teton provider add opus --kind anthropic \
+  --endpoint https://api.anthropic.com/v1/messages --model claude-opus-5
 teton provider add kimi --kind openai-compatible \
-  --endpoint https://api.moonshot.ai/v1 --model kimi-k2
+  --endpoint https://api.moonshot.ai/v1/chat/completions --model kimi-k3
 
 # Route work to it — a whole tier (reflex | scan | build | think), with an
 # optional fallback, or a single category ahead of its tier:
@@ -264,6 +266,12 @@ teton doctor
 
 Config lives in `config.toml` in Teton's state directory (override with
 `TETON_CONFIG`); API keys are never stored in it.
+
+Recipes for Anthropic, OpenAI, Moonshot (Kimi), DeepSeek, Ollama and
+Grok (xAI) ship inside the binary. Ask in a session and the agent hands back
+the exact `provider add` and `policy set-tier` commands for any of them, filled
+in — it never runs them for you, and it never asks you to type a key into the
+conversation.
 
 Two promises, both made visible:
 
@@ -316,9 +324,14 @@ restart. Enter, an empty answer, EOF or Ctrl-C at any prompt leaves the config
 untouched and stores no key. On a piped (non-terminal) session the command asks
 nothing at all and prints the hand-edit instructions below instead.
 
-Enabling is not consenting. Every lookup still asks before anything leaves the
-machine; the durable-consent key (`permission_allow`) is written only when you
-answer "enable permanently" at a lookup prompt, never by `/web setup`.
+Enabling is not consenting. A lookup asks before anything leaves the machine
+unless that tier has already been granted — for the session, or permanently via
+`[web] permission_allow`. The durable-consent key is written only when you
+answer "enable permanently" at a lookup prompt, never by `/web setup`; once it
+is written, lookups at that tier stop asking. The three tiers are consented
+separately, so an answer about one is never an answer about the others.
+Removing a tier from `permission_allow` restores asking for it, and takes
+effect when the daemon next starts.
 
 Backends whose shapes are known to work:
 

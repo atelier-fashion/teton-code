@@ -56,8 +56,10 @@ use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
 use super::reply::StreamGate;
 use super::shell_duty::SHELL_DUTY;
+use super::tools::docs::bounded_topic_echo;
 use super::tools::{
-    RefinedOutcome, ToolContext, ToolDuties, ToolOutcome, ToolRegistry, WEB_TOOL_NAME,
+    RefinedOutcome, ToolContext, ToolDuties, ToolOutcome, ToolRegistry, DOCS_TOOL_NAME,
+    WEB_TOOL_NAME,
 };
 use super::triage::TRIAGE_DUTY;
 
@@ -75,7 +77,23 @@ const VERIFY_TOOLS: &[&str] = &["shell", "read", "grep"];
 /// spelling would demand additions to both the input neutralizer alphabet and
 /// the output fabrication-marker sets, with bidirectional coverage — three
 /// places to keep in step for a frame that already exists (BUG-149/151).
-const UNTRUSTED_OUTPUT_TOOLS: &[&str] = &["read", "grep", "glob", "shell", WEB_TOOL_NAME];
+/// `teton_docs` joins it too (REQ-577 ADR-3), which is worth a sentence because
+/// its bytes are the *daemon's own* — compiled in, not fetched or read off
+/// disk — so "untrusted" is not a claim about their provenance. It is the
+/// existing frame doing its second job: the envelope's closing sentence tells
+/// the model to reason about the block as information and never to execute the
+/// commands inside it, and a topic full of `teton provider add` lines is exactly
+/// the content that must be **relayed to the user, never run** (BR-5's referral
+/// posture). Folding it raw would make it the one built-in result with no frame,
+/// for no gain.
+const UNTRUSTED_OUTPUT_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "shell",
+    WEB_TOOL_NAME,
+    DOCS_TOOL_NAME,
+];
 
 /// A failure the loop cannot fold back to the model.
 #[derive(Debug, thiserror::Error)]
@@ -998,6 +1016,17 @@ pub async fn run_routed_session_turn(
 /// the user has typed it the damage *is* the typing, so the only place to stop
 /// it is the prompt (`the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`).
 ///
+/// REQ-577 adds the two things BUG-160's fix left as a shape with holes in it:
+/// the **vendor recipe line** — every endpoint and example model the recipe
+/// catalog ships, so "hook up Kimi" resolves to a runnable command rather than a
+/// template the model must guess a URL into — and the **referral sentence**,
+/// because a model handed a runnable command will otherwise try to run it. The
+/// recipes are gated against `crate::provider_recipes::recipe_catalog` in both
+/// directions by `the_bundled_guide_and_the_recipe_catalog_agree`
+/// (`tests/web_setup_contracts.rs`); depth beyond one line lives in the
+/// `teton_docs` `providers` topic, which is a tool result and pays no resident
+/// cost.
+///
 /// Sized to stay resident in every turn: the whole system prompt must clear
 /// `REDACT_BODY_OVERHEAD_BYTES` with escaping headroom, and clear it by at least
 /// `MIN_PROMPT_HEADROOM_BYTES` — `the_total_cap_clears_the_harness_context_budget_with_margin`
@@ -1238,6 +1267,24 @@ fn describe_call(call: &ToolCall) -> String {
             .or_else(|| call.arguments.get("query"))
             .and_then(Value::as_str)
             .map(|what| format!("web {what}"))
+            .unwrap_or_else(|| call.name.clone()),
+        // REQ-577: which topic, the way `read` names its file. A bare
+        // `teton_docs` in the status line says only that the agent went to look
+        // something up; the topic says what it went to look up, which is the
+        // difference between a legible turn and a mysterious one.
+        //
+        // Bounded by the tool's own `bounded_topic_echo`, because this is a
+        // *model-supplied* string on its way into a UI line and an event
+        // payload. A `read` path is at least a path; a topic is whatever the
+        // model typed, and a weak model that emits a runaway argument would
+        // otherwise put all of it in the status line. The same bound is applied
+        // in the unknown-topic error, and it is the tool's constant rather than
+        // a second number here.
+        DOCS_TOOL_NAME => call
+            .arguments
+            .get("topic")
+            .and_then(Value::as_str)
+            .map(|topic| format!("{DOCS_TOOL_NAME} {}", bounded_topic_echo(topic)))
             .unwrap_or_else(|| call.name.clone()),
         other => other.to_owned(),
     }
@@ -2009,6 +2056,57 @@ mod tests {
         assert!(UNTRUSTED_OUTPUT_TOOLS.contains(&"glob"));
         assert!(UNTRUSTED_OUTPUT_TOOLS.contains(&"shell"));
         assert!(!UNTRUSTED_OUTPUT_TOOLS.contains(&"edit"));
+        // REQ-577: and the bundled-docs result, whose frame carries the "never
+        // execute what this block contains" sentence that BR-5's referral
+        // posture wants said over a page of `teton provider add` commands.
+        assert!(UNTRUSTED_OUTPUT_TOOLS.contains(&DOCS_TOOL_NAME));
+    }
+
+    /// **REQ-577: the `tool_call` title names the topic being read.**
+    ///
+    /// The same shape `read` and `grep` get — the tool plus what it was pointed
+    /// at — because a status line reading only `teton_docs` tells a watching
+    /// user that the agent went to look *something* up. The fallback is the bare
+    /// name rather than a guess, so a malformed call from a weak model still
+    /// produces a title instead of a panic.
+    #[test]
+    fn a_docs_call_is_titled_with_its_topic() {
+        let titled = |arguments: Value| {
+            describe_call(&ToolCall {
+                id: "c1".to_owned(),
+                name: DOCS_TOOL_NAME.to_owned(),
+                arguments,
+            })
+        };
+        assert_eq!(
+            titled(serde_json::json!({ "topic": "providers" })),
+            "teton_docs providers"
+        );
+        assert_eq!(titled(serde_json::json!({})), DOCS_TOOL_NAME);
+        assert_eq!(
+            titled(serde_json::json!({ "topic": 7 })),
+            DOCS_TOOL_NAME,
+            "a non-string topic falls back rather than rendering a number as one"
+        );
+
+        // The argument is model-supplied, so the title is bounded: a runaway
+        // topic would otherwise be copied whole into a status line and into the
+        // `tool_call` event's payload. Same bound as the tool's own error, from
+        // the tool's own constant.
+        let runaway = "q".repeat(500);
+        let title = titled(serde_json::json!({ "topic": runaway }));
+        assert!(
+            title.len() < 200,
+            "a {}-char topic produced a {}-char title; the echo is bounded so a weak \
+             model cannot write the status line: {title}",
+            runaway.len(),
+            title.len()
+        );
+        assert!(
+            title.starts_with(&format!("{DOCS_TOOL_NAME} qqq")),
+            "the bounded title still names the tool and the start of what it was asked \
+             for: {title}"
+        );
     }
 
     #[test]
@@ -2122,6 +2220,108 @@ mod tests {
         }
     }
 
+    /// **REQ-577 BR-5 / ADR-4: the agent refers, it does not run.**
+    ///
+    /// The other half of BUG-160's fix creates this one. A guide that carries a
+    /// *runnable* `teton provider add` — endpoint filled in, model filled in —
+    /// hands the model something it can plausibly try to execute, and the shell
+    /// tool is right there in the same prompt. `provider add` is human-gated on
+    /// purpose: it reads a credential echo-off from a TTY the agent does not
+    /// have, so an agent that runs it either hangs on a prompt nobody sees or
+    /// registers a provider with no key behind it. Neither failure names its
+    /// cause, and both are cheaper to forbid than to detect.
+    ///
+    /// Pinned by **whole-line equality**, the posture
+    /// `the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`
+    /// arrived at (BUG-168 residual (d)): substring needles here would be
+    /// satisfied by the recipe line's own words, and an in-line weakening
+    /// (`unless the user asks you to`) would compose straight around one.
+    ///
+    /// Both profiles, for the reason every clause test in this module checks
+    /// both: a strong model that runs the user's `provider add` for them is no
+    /// better than the local tier doing it, and worse at being noticed.
+    #[test]
+    fn the_system_prompt_tells_the_model_to_refer_setup_commands_not_run_them() {
+        const REFERRAL: &str = "You cannot run these commands yourself: give the user the exact \
+                                commands to run, filled in from the recipes here.";
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            let Some(line) = system
+                .lines()
+                .find(|line| line.trim_start().starts_with("You cannot run"))
+            else {
+                panic!(
+                    "the guide no longer tells the model it cannot run Teton's own setup \
+                     commands — and it now ships a runnable one, so the next thing the \
+                     model reaches for is the shell tool.\n{system}"
+                );
+            };
+            assert_eq!(
+                line.trim(),
+                REFERRAL,
+                "the referral sentence was edited. If the wording was changed \
+                 deliberately, update this expectation to the new wording — and keep the \
+                 BUG-168 rules it was written under: imperative, stated outright, no \
+                 em-dash aside, no meta-instruction in front of it. Do not just delete \
+                 the assertion."
+            );
+        }
+    }
+
+    /// **REQ-577 / verification.md round 1: the routing step says what each
+    /// tier is *for*, and says the failing mapping outright.**
+    ///
+    /// This one is not a design preference; it is a fix with a measurement
+    /// behind it. The guide used to enumerate the tiers as
+    /// `<reflex|scan|build|think>` and say nothing about what any of them was
+    /// for. Asked "hook up Kimi for deep reasoning", the local tier filled the
+    /// slot from the head of that enumeration and answered
+    /// `teton policy set-tier reflex kimi` — in **4 of 4** trials, calling
+    /// `reflex` "the reflex tier (for deep reasoning)". A user pasting that
+    /// binds their paid think-tier provider to `route`, `redact` and `title`:
+    /// every turn, at reflex latency expectations, with nothing on `think`.
+    ///
+    /// Two things are pinned, because the fix has two halves and the second is
+    /// the one that is easy to lose in a tidy-up. The purposes make the mapping
+    /// *derivable*; the last sentence states it **outright**, which is BUG-168's
+    /// rule — this model reproduces text it is given far more reliably than it
+    /// executes instructions about text, and a mapping it has to infer is one it
+    /// infers wrong under composition pressure. Round 2 of the same matrix
+    /// passed 3/3 with both sentences present.
+    ///
+    /// Both profiles, like every clause pin in this module: a strong model
+    /// mis-binding a tier costs the user just as much, and is harder to notice
+    /// because the rest of the answer is right.
+    #[test]
+    fn the_system_prompt_says_what_each_routing_tier_is_for() {
+        const PURPOSES: &str = "`reflex` always-on duties, `scan` bulk reads, `build` edits, \
+                                `think` deep reasoning.";
+        const DICTATED: &str = "Deep reasoning means `think`.";
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                system.contains(PURPOSES),
+                "the guide's routing step no longer says what the four tiers are for. It \
+                 enumerated them without their purposes once, and the local tier answered \
+                 `set-tier reflex` to a deep-reasoning request 4/4 (REQ-577 \
+                 verification.md round 1). If the wording was changed deliberately, update \
+                 this expectation — and re-run the live matrix, because a prompt change \
+                 here is unverified until it is A/B'd. The runnable procedure is \
+                 verification.md §12-13 (round 3); §7 is the pre-fix version and its \
+                 expectations are the defects.\n{system}"
+            );
+            assert!(
+                system.contains(DICTATED),
+                "the guide no longer states the deep-reasoning → `think` mapping outright. \
+                 The purposes alone leave it to be inferred, and inference is what failed \
+                 4/4 in REQ-577 verification.md round 1 (BUG-168's rule: dictate the \
+                 payload, do not describe it). Update this expectation rather than \
+                 deleting it, and re-run the live matrix per verification.md §12-13 (not \
+                 §7, whose expectations are the pre-fix defects).\n{system}"
+            );
+        }
+    }
+
     /// **REQ-572 verify: the model must never solicit a credential in chat.**
     ///
     /// This REQ's whole subject is a model that has been given something useful
@@ -2198,7 +2398,11 @@ mod tests {
             WEB_TOOL_NAME
         }
         fn description(&self) -> &str {
-            "Fetch one web page by URL. Opt-in; every lookup asks the user."
+            // Kept in step with the real `DESCRIPTION_FETCH` by hand. Nothing
+            // gates on it — these tests key on the tool's *name* — but a stub
+            // carrying a sentence the product corrected is a copy that reads as
+            // authority the next time somebody greps for the claim.
+            "Fetch one web page by URL. Opt-in; asks unless already allowed."
         }
         fn input_schema(&self) -> Value {
             serde_json::json!({ "type": "object" })

@@ -60,6 +60,7 @@ use teton_protocol::{RequestId, SessionId};
 use crate::broadcast::EventBus;
 use crate::egress::to_protocol_web_tier;
 use crate::harness::tools::web::{permission_key_for, tier_name, WEB_PERMISSION_KEYS};
+use crate::harness::tools::DOCS_TOOL_NAME;
 
 /// Policy for a single tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +226,19 @@ impl Default for PermissionConfig {
 /// Safe to enumerate because it is first-party and closed. Its complement — the
 /// set of tools that might change something — is open (every MCP server adds to
 /// it), and is never enumerated anywhere.
-const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep"];
+///
+/// [`DOCS_TOOL_NAME`] belongs here for a stronger reason than the other three:
+/// they read the user's files, and this one reads nothing at all. Its bodies are
+/// `include_str!`d into the binary and served from process memory — no path, no
+/// transport, no user data (REQ-577 BR-6) — so there is no question a prompt
+/// could usefully ask about a call. Leaving it off the list is what the
+/// TASK-147 live A/B caught: at `guarded` it prompted (`? permission requested:
+/// teton_docs`), and at `plan` it would have been **denied**, which is the
+/// daemon refusing to read its own documentation on the level a user picks
+/// precisely because they want reading and nothing else. The requirement's
+/// Permissions row says "without a permission prompt"; this line is what makes
+/// that true.
+const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", DOCS_TOOL_NAME];
 
 /// Expand a [`PermissionLevel`] into the policy table the gate enforces.
 ///
@@ -246,9 +259,21 @@ const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep"];
 ///
 /// That inverts the risk in the direction it should be inverted. Adding a tool
 /// to the tree without touching this function gets the conservative treatment at
-/// every level, rather than being silently unclassified. A new *read-only*
-/// first-party tool that nobody adds to [`READ_ONLY_TOOLS`] merely asks — a
-/// degradation, not a hole.
+/// every level, rather than being silently unclassified.
+///
+/// **What that costs a first-party read-only tool, stated accurately.** This
+/// comment used to end "a new *read-only* first-party tool that nobody adds to
+/// [`READ_ONLY_TOOLS`] merely asks — a degradation, not a hole", and REQ-577's
+/// own live run falsified it. `teton_docs` was exactly that tool, and the
+/// consequence was not "merely asks": at `guarded` it interrupted the turn with
+/// a prompt for a read of bytes compiled into the binary, and at `plan` — the
+/// level a user picks *because* they want reading and nothing else — the
+/// default is `Deny`, so the daemon refused to read its own documentation
+/// outright. The omission is silent in CI, too, because exposure tests assert
+/// the tool is in the list and being *callable* is a different claim. So: the
+/// fallback is safe in the direction that matters (nothing is silently
+/// permitted), and it is not free — an unclassified read-only tool is denied at
+/// `plan`, which for a knowledge tool is indistinguishable from not shipping it.
 ///
 /// ## `full` is an allow-all table, not a skipped gate (REQ-560 BR-4)
 ///
@@ -1061,6 +1086,7 @@ mod tests {
                     ("read", Allow),
                     ("glob", Allow),
                     ("grep", Allow),
+                    (DOCS_TOOL_NAME, Allow),
                     ("edit", Ask),
                     ("shell", Ask),
                 ],
@@ -1071,6 +1097,7 @@ mod tests {
                     ("read", Allow),
                     ("glob", Allow),
                     ("grep", Allow),
+                    (DOCS_TOOL_NAME, Allow),
                     ("edit", Allow),
                     ("shell", Ask),
                 ],
@@ -1081,6 +1108,10 @@ mod tests {
                     ("read", Allow),
                     ("glob", Allow),
                     ("grep", Allow),
+                    // The level whose whole promise is "reading only" must not
+                    // be the level that refuses the daemon's own documentation
+                    // (REQ-577 BR-6; TASK-147 F-2 found it denied here).
+                    (DOCS_TOOL_NAME, Allow),
                     ("edit", Deny),
                     ("shell", Deny),
                 ],
@@ -1314,6 +1345,75 @@ mod tests {
             0,
             "plan denies without asking — a prompt was registered"
         );
+    }
+
+    /// **REQ-577 BR-6: a bundled-docs read is never a question, at any level.**
+    ///
+    /// The test class TASK-147's live A/B showed was missing. Everything about
+    /// `teton_docs` was pinned except whether it could actually be *called*:
+    /// `tools/mod.rs` asserts it is exposed on every profile and survives the
+    /// `max_tools` cap (BR-7), and those tests were green while a real session
+    /// printed `? permission requested: teton_docs` and, on a denial, `[failed]`.
+    /// Exposure is the tool being offered; this is the tool being usable, and
+    /// they are different claims with different failure modes.
+    ///
+    /// Asserted at **every** level rather than at `guarded` alone, because the
+    /// two failures are not the same shape: `guarded` and `edits` interrupted a
+    /// turn with a question that has no useful answer, and `plan` — the level a
+    /// user picks *because* they want reading and nothing else — refused
+    /// outright. Driven off `ALL`, so a fifth level is covered the day it lands.
+    ///
+    /// A maintainer who reaches this assertion after moving `teton_docs` off
+    /// [`READ_ONLY_TOOLS`]: the requirement's Permissions row is what this pins
+    /// ("call `teton_docs` … without a permission prompt"), so change the row
+    /// and this test together, or leave both alone. Deleting the assertion
+    /// restores a defect that CI could not see for a whole REQ.
+    ///
+    /// **The timeout is load-bearing**, for the reason [`answer_next`]'s comment
+    /// gives one frame up and this test found the hard way: under the very
+    /// regression it guards, the policy becomes `ask`, `authorize` publishes a
+    /// prompt and waits for an answer that no one in this test will ever give,
+    /// and an un-bounded await turns the regression into a **hang** rather than
+    /// a failure. A hang reads as infrastructure trouble and gets retried; a
+    /// failure gets read. (Verified by mutation: with `teton_docs` removed from
+    /// [`READ_ONLY_TOOLS`] the first draft of this test hung until it was
+    /// killed, which is how this paragraph got written.)
+    #[tokio::test]
+    async fn a_bundled_docs_read_is_allowed_at_every_level_and_asks_nothing() {
+        for level in PermissionLevel::ALL {
+            let (bus, pending, gate) = leveled_gate(*level);
+            let mut sub = bus.subscribe(16);
+
+            let decision = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                gate.authorize(DOCS_TOOL_NAME, Some("teton_docs providers".to_owned())),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{level}: `{DOCS_TOOL_NAME}` blocked waiting for an answer, so its \
+                     policy is `ask` — it is no longer in READ_ONLY_TOOLS, and a docs \
+                     read now stops every turn to ask a question with no useful answer"
+                )
+            });
+            assert_eq!(
+                decision,
+                PermissionDecision::Allowed,
+                "`{DOCS_TOOL_NAME}` must run at {level} — it reads no path, no \
+                 network and no user data, so there is nothing to consent to"
+            );
+            assert_eq!(
+                pending.pending_count(),
+                0,
+                "{level}: `{DOCS_TOOL_NAME}` registered a prompt — a docs read \
+                 must not stop a turn to ask"
+            );
+            assert!(
+                sub.try_recv().is_none(),
+                "{level}: `{DOCS_TOOL_NAME}` published an event; a call that \
+                 asks nothing must be silent on the bus"
+            );
+        }
     }
 
     /// REQ-560 BR-5 / AC-3: a grant is an answer to a question the level decides

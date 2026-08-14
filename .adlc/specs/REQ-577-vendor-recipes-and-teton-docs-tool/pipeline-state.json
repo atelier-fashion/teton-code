@@ -1,0 +1,89 @@
+{
+  "req": "REQ-577",
+  "branch": "feat/REQ-577-vendor-recipes-and-teton-docs-tool",
+  "startedAt": "2026-08-14T19:14:15Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve Repos + Create Worktrees + Preflight",
+      "completedAt": "2026-08-14T19:14:18Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-14T19:16:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-14T19:34:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-14T19:36:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-14T21:55:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify (Reflect + Review)",
+      "completedAt": "2026-08-15T00:20:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create Pull Request",
+      "completedAt": "2026-08-15T00:30:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-15T00:45:00Z"
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-577",
+      "branch": "feat/REQ-577-vendor-recipes-and-teton-docs-tool",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/144",
+      "prNumber": 144,
+      "prCreatedAt": "2026-08-14T19:14:18Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-143",
+      "TASK-145",
+      "TASK-144",
+      "TASK-146",
+      "TASK-147"
+    ],
+    "failedTasks": []
+  }
+}
