@@ -129,8 +129,16 @@ shape that fails to parse at use time (unvalidated config) attaches no
 credential and says so on stderr, the same fail-closed posture as an
 unresolvable `search_key_ref`.
 
+## Lessons Captured
+
+- `LESSON-512` — a spec's named example is a test case, not decoration: the
+  acceptance suite asserted the implementer's own constant, and the only
+  artifact that could disagree with it was the example list nobody read as an
+  obligation. Covers the "no blessed X cuts both ways" corollary.
+
 ## Files Changed
 
+- `.adlc/knowledge/lessons/LESSON-512-a-named-example-is-a-test-case.md` — new.
 - `crates/teton-core/src/config.rs` — `WebConfig::search_auth` field,
   `SearchAuthShape` + `parse_search_auth`, two `ConfigError` variants,
   `validate_web` rules, tests.
