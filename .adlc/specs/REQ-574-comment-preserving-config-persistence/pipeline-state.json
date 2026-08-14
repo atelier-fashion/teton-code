@@ -2,7 +2,7 @@
   "req": "REQ-574",
   "branch": "feat/REQ-574-comment-preserving-config-persistence",
   "startedAt": "2026-08-14T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-14T00:00:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup (merge + knowledge capture)",
+      "completedAt": "2026-08-14T00:00:00Z"
     }
   ],
   "integrationBranch": "main",
@@ -67,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/134",
       "prNumber": 134,
       "prCreatedAt": "2026-08-14",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
