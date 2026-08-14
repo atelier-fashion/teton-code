@@ -451,11 +451,11 @@ fn a_readiness_probe_that_never_handshakes_does_not_start_the_clock() {
 }
 
 // ---------------------------------------------------------------------------
-// BR-5/BUG-166: a signal runs the ordered teardown, and the exit is clean
+// BR-5/BUG-169: a signal runs the ordered teardown, and the exit is clean
 // ---------------------------------------------------------------------------
 
 /// SIGTERM must end in exit status 0 with the socket unlinked — the `brew
-/// services stop` path (BR-5), and the path BUG-166 found broken in llama
+/// services stop` path (BR-5), and the path BUG-169 found broken in llama
 /// builds: leaving `main` through libc `exit()` ran ggml's Metal static
 /// destructors, which abort when the model is still resident, turning every
 /// routine stop into SIGABRT plus a macOS crash report. `main` now ends in

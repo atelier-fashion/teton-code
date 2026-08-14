@@ -137,7 +137,7 @@ teton-protocol = { path = "../teton-protocol" }
 # compile.
 teton-core = { path = "../teton-core", features = ["test-seam"] }
 # The daemon-lifetime suite delivers a real SIGTERM to the spawned daemon
-# (BR-5/BUG-166): the claim is about the process's exit status under a signal,
+# (BR-5/BUG-169): the claim is about the process's exit status under a signal,
 # which only `kill(2)` can pose.
 libc = "0.2"
 

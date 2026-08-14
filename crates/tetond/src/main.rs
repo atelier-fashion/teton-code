@@ -171,7 +171,7 @@ fn main() -> anyhow::Result<ExitCode> {
         Ok::<(), anyhow::Error>(())
     });
 
-    // BUG-166: die by `_exit`, never by `exit()`.
+    // BUG-169: die by `_exit`, never by `exit()`.
     //
     // A llama-build daemon that has loaded the model cannot survive libc
     // `exit()`: ggml's Metal backend holds its device registry in a
@@ -220,7 +220,7 @@ fn main() -> anyhow::Result<ExitCode> {
 /// 5. **report** the exit.
 ///
 /// The lock is released last, when the process dies — `main` ends in `_exit`
-/// (BUG-166), so `_instance`'s flock is released by process death rather than
+/// (BUG-169), so `_instance`'s flock is released by process death rather than
 /// by its drop, at the same point in the order.
 fn shutdown(daemon: &Arc<Daemon>, supervisor: &Arc<LifetimeSupervisor>, socket: &std::path::Path) {
     let sessions_closed = u32::try_from(daemon.sessions.list().len()).unwrap_or(u32::MAX);
