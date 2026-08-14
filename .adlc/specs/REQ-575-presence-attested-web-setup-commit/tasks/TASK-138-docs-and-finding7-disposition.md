@@ -1,7 +1,7 @@
 ---
 id: TASK-138
 title: "AC-8 manual-verification stub, REQ-572 finding-7 disposition, config/set residual note"
-status: draft
+status: complete
 parent: REQ-575
 created: 2026-08-14
 updated: 2026-08-14
