@@ -1,7 +1,7 @@
 ---
 id: REQ-577
 title: "Vendor provider recipes and a bundled teton_docs knowledge tool"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-14
 updated: 2026-08-14
