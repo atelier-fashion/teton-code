@@ -49,8 +49,11 @@ BUG-162 layer-(a)-only comment. Foundational task; the others depend on it. See
       production).
 - [ ] `config/set` added to `route_for_test` and to the `commitments` list; the
       shared `only_a_daemon_wide_commitment_demands_presence` now asserts config/set
-      **refuses** under `AlwaysFailsVerifier`, and `a_commitment_degrades_to_layer_a_where_no_mechanism_exists`
-      + `layer_a_refuses_independently_of_any_attestation_mechanism` still pass for it.
+      **refuses** under `AlwaysFailsVerifier` (AC-3 mutation for this seam), and
+      **AC-2 (degradation)** is asserted by `a_commitment_degrades_to_layer_a_where_no_mechanism_exists`
+      + `layer_a_refuses_independently_of_any_attestation_mechanism` now covering
+      config/set — a shipped no-mechanism build lets config/set reach the runtime,
+      gaining no new prompt.
 - [ ] No stale three-method / "known next candidate" BR-10(b) framing in
       `server.rs`; the set is named as four (BR-5 code half, AC-5 code half).
 - [ ] The `handle_config_set` comment records the reversal honestly (BR-7).
