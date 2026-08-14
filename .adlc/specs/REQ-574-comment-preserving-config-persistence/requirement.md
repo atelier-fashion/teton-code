@@ -1,7 +1,7 @@
 ---
 id: REQ-574
 title: "Comment- and unknown-key-preserving config persistence"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-14
 updated: 2026-08-14
