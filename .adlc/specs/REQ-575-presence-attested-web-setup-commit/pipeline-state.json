@@ -1,0 +1,35 @@
+{
+  "req": "REQ-575",
+  "branch": "feat/REQ-575-presence-attested-web-setup-commit",
+  "startedAt": "2026-08-14T00:00:00Z",
+  "completed": false,
+  "currentPhase": 2,
+  "completedPhases": [0, 1],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    { "phase": 0, "name": "Resolve Repos + Worktree + Preflight + Draft PR", "completedAt": "2026-08-14T11:53:05Z" },
+    { "phase": 1, "name": "Validate Requirement Spec", "completedAt": "2026-08-14T11:54:00Z", "verdict": "APPROVED (OQ-3 deferred to /architect)" }
+  ],
+  "notes": "Working in place in the harness-provided worktree great-gagarin-419527 rather than creating a nested .worktrees/REQ-575 (the harness already isolated this session; the spec was uncommitted here and a fresh worktree from origin/main would have stranded it). Branch renamed in-place to the ADLC-conventional feat/REQ-575 name.",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.claude/worktrees/great-gagarin-419527",
+      "branch": "feat/REQ-575-presence-attested-web-setup-commit",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/132",
+      "prNumber": 132,
+      "prCreatedAt": "2026-08-14T11:53:05Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}

@@ -1,7 +1,7 @@
 ---
 id: REQ-575
 title: "Presence attestation for the web setup commit"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-14
 updated: 2026-08-14
@@ -185,11 +185,17 @@ per-connection budget are untouched.
   checklist line in the architecture template, so the next daemon-wide
   commitment method cannot skip it silently? (Template changes ride
   `/template-drift` conventions; deciding this here would be scope creep.)
-- [ ] OQ-3 (raised at `/validate`, deferred to this phase by product owner):
-  **two live sibling methods meet BR-5's trigger and keep the mitigation this
-  REQ's Description rejects, and are not classified here.** `/architect` must
-  decide gate-vs-scope-out for each, and this REQ must not ship claiming a
-  complete BR-10(b) set until it does.
+- [x] OQ-3 (raised at `/validate`, deferred to this phase by product owner) —
+  **RESOLVED in architecture (ADR-2).** `config/set` (the larger sibling) is
+  gated in its own tracked follow-up, **REQ-576**, not folded here: gating it
+  reverses a documented BUG-162 decision and touches `SetPrivacyBoundary`, so
+  it warrants its own spec/review rather than a rider on a web-setup REQ. The
+  consent-path `persist_web_tier` is scoped out as a documented low-severity
+  residual (raise-only, cannot author the endpoint), with its disposition
+  folded into REQ-576. REQ-575 closes finding 7 as filed (`web/setup_commit`)
+  and states the `config/set` residual plainly; it does **not** claim a
+  complete BR-10(b) set — after REQ-575 the set is three methods, and REQ-576
+  makes it four. Original finding preserved below.
     - **`config/set`** (`handle_config_set`, server.rs) — live in dispatch,
       gated with **`refuse_daemon_wide` (layer a) only**. Through
       `apply_config_update` it durably rewrites `config.toml` and swaps the
