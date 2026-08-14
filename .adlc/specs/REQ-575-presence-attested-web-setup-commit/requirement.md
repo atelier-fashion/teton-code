@@ -66,8 +66,13 @@ Why extend rather than formally accept the residual:
 
 Recorded honestly, at the strength it has: this brings `web/setup_commit` to
 **parity with `model/set`** — protection is real where a presence mechanism
-exists and stated-but-degraded where none does. It does not close the
-REQ-569 ADR-A ancestry escape, and it does not claim to.
+exists and stated-but-degraded where none does. **The shipped release build is
+one of the degraded ones**: it is built without the `presence` feature (because
+REQ-570's mechanism is not yet release-verified — its AC-3b manual pass is
+outstanding), so on the artifact users install this control degrades to allow
+and finding 7's exposure persists there, exactly as `model/set`'s does. Enabling
+`presence` on release builds is a REQ-570-scope decision, not this REQ's. It does
+not close the REQ-569 ADR-A ancestry escape, and it does not claim to.
 
 ## System Model
 

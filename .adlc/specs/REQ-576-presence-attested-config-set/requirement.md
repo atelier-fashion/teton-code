@@ -10,7 +10,18 @@ domain: "harness"
 stack: ["rust", "daemon", "cli"]
 concerns: ["security", "privacy"]
 tags: ["attestation", "presence", "config-set", "register-provider", "privacy-boundary", "daemon-wide", "br-10b", "egress", "bug-162"]
+priority: high
+follow_up_to: REQ-575
 ---
+
+> **Urgency (recorded at filing).** This is a **high-priority** follow-up, not a
+> someday item. `config/set` is a *larger* daemon-wide config-writer than the
+> `web/setup_commit` REQ-575 just gated (it can redirect egress via
+> `RegisterProvider` and rewrite the privacy boundary via `SetPrivacyBoundary`),
+> and it remains layer-(a)-only until this REQ lands. The stated residual in
+> REQ-575's architecture (ADR-2) and REQ-572's finding-7 disposition both point
+> here; leaving it open indefinitely is exactly the drift REQ-575 BR-5's standing
+> obligation exists to prevent. Should follow REQ-575 promptly.
 
 ## Description
 

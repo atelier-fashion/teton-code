@@ -9,20 +9,26 @@ dependencies: [TASK-135]
 repo: teton-code
 ---
 
-> **Implementation note (reconciled during Phase 4).** `web_setup_flow.rs` is a
-> *spawned-binary* harness (env-driven `DaemonOptions`), so a live-refusing
-> verifier cannot be injected there — the AlwaysFailsVerifier/degradation gating
-> tests live in-process in `server::tests`. **AC-2 (accepting-verifier full
-> flow) moved to TASK-137**, where the spawned-binary `TETON_PRESENCE_ACCEPT`
-> seam is the only way to reach the granted path over the real socket; it is the
-> same test as AC-6. The **reader-loop-free property** is pinned by
-> `the_commit_left_the_reader_loop_dispatch_while_the_reads_stayed` (the commit
-> is no longer served inline by `dispatch`, so it runs on the shared
-> `blocks_on_a_human` task) plus the existing shared-machinery reader-loop tests
-> (`the_reader_loop_keeps_serving_while_a_consent_is_pending`,
-> `the_reader_loop_serves_sessions_while_a_proposal_is_outstanding`) — a
-> `ParkingVerifier` double was judged disproportionate for a property the shared
-> machinery already covers.
+> **Implementation note (reconciled during Phase 4, updated after the verify
+> pass).** `web_setup_flow.rs` is a *spawned-binary* harness (env-driven
+> `DaemonOptions`), so a live-refusing verifier cannot be injected there — the
+> AlwaysFailsVerifier/degradation gating tests live in-process in `server::tests`.
+> **AC-2 (accepting-verifier full flow) moved to TASK-137**, where the
+> spawned-binary `TETON_PRESENCE_ACCEPT` seam is the only way to reach the granted
+> path over the real socket; it is the same test as AC-6.
+>
+> The **reader-loop liveness property** is pinned two ways: structurally by
+> `the_commit_left_the_reader_loop_dispatch_while_the_reads_stayed` (the commit is
+> no longer served inline by `dispatch`), and — added in the verify pass, after
+> the 6-agent review judged structural coverage insufficient — behaviourally by
+> `a_parked_web_setup_commit_does_not_stall_the_connection` (multi_client.rs): a
+> `ParkingVerifier` blocks inside `verify` on a multi-thread runtime (the
+> production `block_in_place` branch), and a concurrent `session/list` on the same
+> connection is served while the commit is parked. AC-1's disk-inspection clause
+> is likewise satisfied over the socket by a new `TETON_PRESENCE_ACCEPT=fail`
+> seam + `a_presence_refused_commit_writes_nothing_and_swaps_nothing`
+> (web_setup_flow.rs), which reads the config bytes and live state back rather
+> than inferring from the error code.
 
 ## Description
 

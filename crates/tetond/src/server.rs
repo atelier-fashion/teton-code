@@ -954,9 +954,14 @@ fn refuse_daemon_wide(conn: &ConnState, id: &Id) -> Option<String> {
 /// and `web/refresh` stay layer (a) only. Prompting a human to evict a cached
 /// document would train them to click through the prompt that matters.
 ///
-/// `config/set` is the known next candidate — a larger blast radius still
-/// (`RegisterProvider`, `SetPrivacyBoundary`) — deliberately left at layer (a)
-/// here and tracked in REQ-576, so a fourth caller is a decision, not drift.
+/// **Standing obligation (REQ-575 BR-5).** Any future method that durably
+/// rewrites `config.toml` or live-swaps daemon-wide in-memory state must be
+/// classified against BR-10(b) in its own architecture phase — the omission of
+/// exactly that classification is how REQ-572 finding 7 arose (a daemon-wide
+/// committing method shipped with no BR-10(b) analysis). `config/set` is the
+/// known next candidate — a larger blast radius still (`RegisterProvider`,
+/// `SetPrivacyBoundary`) — deliberately left at layer (a) here and tracked in
+/// REQ-576, so a fourth caller is a decision, not drift.
 ///
 /// Unlike the consent path this does **not** record into the attestation
 /// registry. There is no consent `request_id` here to bind to — these methods
@@ -1586,8 +1591,16 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                     handle_model_confirm(&daemon, &conn, id, params).await
                 } else if method == ModelSetParams::METHOD {
                     handle_model_set(&daemon, &conn, id, params).await
-                } else {
+                } else if method == WebSetupCommitParams::METHOD {
                     handle_web_setup_commit(&daemon, &conn, id, params).await
+                } else {
+                    // Unreachable: the `blocks_on_a_human` `matches!` guard admits
+                    // exactly the five methods branched above. Made explicit rather
+                    // than a catch-all so a future sixth member (REQ-576's
+                    // `config/set`) that updates the guard but forgets a branch
+                    // fails loudly here instead of being silently misrouted into
+                    // `handle_web_setup_commit`.
+                    unreachable!("blocks_on_a_human admitted an unrouted method: {method}")
                 };
                 // The fence for the same reason `dispatch`'s responses take it:
                 // any event already delivered to this client's subscription
@@ -4154,13 +4167,26 @@ mod tests {
         ]
     }
 
-    /// Route a request the way [`handle_client`] does.
+    /// Route a request the way [`handle_client`] does — the **single** routing
+    /// authority the test module has, so no test re-encodes "which methods run
+    /// off the reader loop" (the sync `#[test]` bridge [`route_setup`] delegates
+    /// here rather than deciding it a second time).
     ///
-    /// Four methods run on their own task because they may park on a human, so
-    /// they are absent from [`dispatch`]. A test that reached only for
-    /// `dispatch` would get `METHOD_NOT_FOUND` for those and could report a
-    /// security gate as "passing" while never invoking it — so the routing is
-    /// mirrored here rather than duplicated per test.
+    /// Five methods run on their own task because they may park on a human, so
+    /// they are absent from [`dispatch`]: `session/attach`, `attach/consent`,
+    /// `model/confirm`, `model/set`, and (REQ-575) `web/setup_commit`. A test
+    /// that reached only for `dispatch` would get `METHOD_NOT_FOUND` for those
+    /// and could report a security gate as "passing" while never invoking it —
+    /// so the routing is mirrored here rather than duplicated per test.
+    ///
+    /// `web/setup_commit` is the odd one out: its **layer (a)** gate is
+    /// session-scoped (`may_drive`, via `refuse_commit_without_session_access`),
+    /// not the ancestry gate the other four daemon-wide methods use — so it is
+    /// deliberately absent from [`daemon_wide_methods`], and its BR-10(b)
+    /// commitment coverage lives in its own session-scoped tests
+    /// (`a_web_setup_commit_refuses_when_the_presence_check_fails` and siblings)
+    /// rather than in the shared daemon-wide table, which cannot supply an
+    /// attached owner.
     async fn route_for_test(
         daemon: &Daemon,
         conn: &ConnState,
@@ -4176,6 +4202,8 @@ mod tests {
             handle_model_confirm(daemon, conn, id, params).await
         } else if method == ModelSetParams::METHOD {
             handle_model_set(daemon, conn, id, params).await
+        } else if method == WebSetupCommitParams::METHOD {
+            handle_web_setup_commit(daemon, conn, id, params).await
         } else {
             dispatch(daemon, conn, id, method, params).expect("a routed method answers")
         }
@@ -6968,25 +6996,19 @@ mod tests {
         })
     }
 
-    /// Drive `web/setup_commit` the way `handle_client` does after REQ-575: the
-    /// commit left the synchronous `dispatch` (it may run a presence prompt off
-    /// the reader loop, ADR-1), so a unit test reaches its async handler on a
-    /// throwaway current-thread runtime. With the default `UnavailableVerifier`
-    /// the BR-10(b) check degrades and never parks, so every outcome these tests
-    /// assert is byte-identical to when the method sat in `dispatch`.
-    fn commit_on_reader(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime for the async commit handler")
-            .block_on(handle_web_setup_commit(daemon, conn, id, params))
-    }
-
-    /// Route a setup method as `handle_client` now splits them: `web/setup_commit`
-    /// to its async handler (above), the plan/preview reads to synchronous
-    /// `dispatch`. A drop-in for `dispatch` at the setup seams — same
-    /// `Option<String>` return — so a migrated call site is a bare rename with its
-    /// `.unwrap()` intact.
+    /// The synchronous `#[test]` bridge to [`route_for_test`], so the setup
+    /// family's pre-existing `#[test]` functions can drive `web/setup_commit`
+    /// (which left the reader-loop `dispatch` in REQ-575 and may attest on its
+    /// own task) without the whole group being rewritten to `#[tokio::test]`.
+    ///
+    /// **Routing is not decided here.** It delegates to [`route_for_test`] — the
+    /// single routing authority — inside a throwaway current-thread runtime, so
+    /// the "which methods run off the reader loop" decision cannot drift between
+    /// two helpers. Returns `Option<String>` to stay a drop-in for `dispatch(...)`
+    /// at the migrated `.unwrap()` call sites. With the default
+    /// `UnavailableVerifier` the BR-10(b) check degrades and never parks, so
+    /// every migrated test's outcome is byte-identical to when it called
+    /// `dispatch` directly.
     fn route_setup(
         daemon: &Daemon,
         conn: &ConnState,
@@ -6994,11 +7016,13 @@ mod tests {
         method: &str,
         params: Value,
     ) -> Option<String> {
-        if method == WebSetupCommitParams::METHOD {
-            Some(commit_on_reader(daemon, conn, id, params))
-        } else {
-            dispatch(daemon, conn, id, method, params)
-        }
+        Some(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime for the async setup handler")
+                .block_on(route_for_test(daemon, conn, id, method, params)),
+        )
     }
 
     /// The `web_setup_rejected` events queued on `sub` right now.
@@ -7656,7 +7680,14 @@ mod tests {
         let owner = unattached(&daemon);
         let session = a_session_owned_by(&daemon, &owner);
 
-        let refused = commit_on_reader(&daemon, &owner, Id::Number(2), setup_params(&session));
+        let refused = route_setup(
+            &daemon,
+            &owner,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
         assert!(
             refused.contains(&error_code::ATTESTATION_FAILED.to_string()),
             "the session's own client still meets the presence gate: {refused}"
@@ -7685,8 +7716,14 @@ mod tests {
         let session = a_session_owned_by(&daemon, &owner);
         let intruder = unattached(&daemon);
 
-        let unattached_refusal =
-            commit_on_reader(&daemon, &intruder, Id::Number(2), setup_params(&session));
+        let unattached_refusal = route_setup(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
         assert!(
             unattached_refusal.contains(&error_code::NOT_ATTACHED.to_string())
                 && !unattached_refusal.contains(&error_code::ATTESTATION_FAILED.to_string()),
@@ -7695,8 +7732,14 @@ mod tests {
         );
 
         let oversized = SessionId::from(format!("sess-{}", "a".repeat(4096)).as_str());
-        let unmintable_refusal =
-            commit_on_reader(&daemon, &owner, Id::Number(3), setup_params(&oversized));
+        let unmintable_refusal = route_setup(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            WebSetupCommitParams::METHOD,
+            setup_params(&oversized),
+        )
+        .unwrap();
         assert!(
             unmintable_refusal.contains(&error_code::INVALID_PARAMS.to_string())
                 && !unmintable_refusal.contains(&error_code::ATTESTATION_FAILED.to_string()),
@@ -7721,7 +7764,14 @@ mod tests {
         let owner = unattached(&daemon);
         let session = a_session_owned_by(&daemon, &owner);
 
-        let committed = commit_on_reader(&daemon, &owner, Id::Number(2), setup_params(&session));
+        let committed = route_setup(
+            &daemon,
+            &owner,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
         assert!(
             !committed.contains(&error_code::ATTESTATION_FAILED.to_string())
                 && !committed.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string()),

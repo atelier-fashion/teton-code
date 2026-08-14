@@ -142,12 +142,20 @@ test migrates rather than being added-to:
   line from `handle_web_setup_commit` turns at least one test red,
   independently of the `model/confirm`/`model/set` seams (LESSON-508 rule 2 —
   a redundant/parallel guard needs its own deletion test).
-- **Add** an integration test (web_setup_flow.rs): with `AcceptingVerifier`,
-  the full plan → preview → commit → live-pickup flow passes unchanged (AC-2);
-  and, mirroring the `model_consent.rs` reader-loop test (~2328), a
-  `web/setup_commit` that parks on a (simulated) presence prompt does not stall
-  a second RPC on the same connection (the reason for the `blocks_on_a_human`
-  move).
+- **Add** an integration test: the granted path over the socket via the
+  `TETON_PRESENCE_ACCEPT` seam (AC-2/AC-6,
+  `an_attested_commit_lands_over_the_socket_through_the_presence_seam` in
+  web_setup_flow.rs — a spawned-binary harness, so the accepting verifier is
+  reached through the seam rather than `with_presence_verifier`).
+- **Add** the reader-loop liveness test the `blocks_on_a_human` move exists for:
+  `a_parked_web_setup_commit_does_not_stall_the_connection` (multi_client.rs),
+  which installs a `ParkingVerifier` that blocks inside `verify` on a
+  multi-thread runtime (exercising the production `block_in_place` branch) and
+  asserts a concurrent `session/list` on the same connection is still served
+  while the commit is parked. *(As-built: this replaced the earlier plan to fold
+  the check into web_setup_flow.rs — that harness is spawned-binary and cannot
+  inject a blocking verifier; the in-process socket harness in multi_client.rs
+  can.)*
 - **Add** a degradation test (AC-3): with the shipped no-mechanism verifier the
   commit lands and the stated notice is emitted, with zero new prompts.
 - **Add/extend** the spawned-binary e2e (AC-6): an attested `/web setup` commit

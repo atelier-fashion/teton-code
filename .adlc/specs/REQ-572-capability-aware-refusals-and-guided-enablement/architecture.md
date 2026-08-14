@@ -207,13 +207,27 @@ exactly this class for `model/confirm`/`model/set` (BR-10(b): daemon-wide
 commitments need presence attestation) but was not applied to
 `web/setup_commit` when REQ-572 added it.
 
-**Disposition — CLOSED for `web/setup_commit` by REQ-575.** The commit is now the
-third BR-10(b) commitment: it runs the same `refuse_unattested_commitment` check,
-degrading (not refusing) where no presence mechanism exists, and moved off the
-reader-loop `dispatch` onto the `blocks_on_a_human` task so the prompt cannot
-stall the connection. Recorded at parity with `model/set`: real on presence
-builds, stated-but-degraded elsewhere; it does **not** close the REQ-569 ADR-A
-ancestry escape (BR-10(b) is the compensating control).
+**Disposition — closed on presence builds; degraded (by design) on the shipped
+build.** REQ-575 makes the commit the third BR-10(b) commitment: it runs the same
+`refuse_unattested_commitment` check and moved off the reader-loop `dispatch` onto
+the `blocks_on_a_human` task so the prompt cannot stall the connection. It is at
+**exact parity with `model/set`**, and the honest strength is:
+
+- On a `--features presence` macOS build the control **bites** — an attested
+  human is required, verified end to end.
+- The **release artifact is built without `presence`** (`cargo build --release
+  --features tetond/llama`, no `presence` — because REQ-570's presence mechanism
+  is not yet release-verified; its AC-3b manual pass is itself still outstanding).
+  There `refuse_unattested_commitment` takes the no-mechanism arm and **degrades
+  to allow** with a stderr notice, so **on the shipped binary finding 7's
+  exposure persists** — the same-UID `setsid`/`NotDescendant` process can still
+  rewrite `[web]` with no human. This is the intended REQ-570 BR-8 asymmetry
+  (identical to `model/set`, so no *new* hole), stated so "closed" is not read as
+  covering the shipped product.
+
+It does **not** close the REQ-569 ADR-A ancestry escape (BR-10(b) is the
+compensating control). Shipping the control on release builds is a REQ-570-scope
+decision (enable `presence` once its own AC-3b lands), not REQ-575's.
 
 **Tracked residual — `config/set`.** REQ-575's validation surfaced that
 `config/set` (`RegisterProvider` = an egress endpoint, `SetPrivacyBoundary` = the
