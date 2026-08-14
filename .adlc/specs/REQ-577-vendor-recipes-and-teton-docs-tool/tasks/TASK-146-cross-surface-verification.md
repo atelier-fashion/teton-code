@@ -1,7 +1,7 @@
 ---
 id: TASK-146
 title: "Cross-surface verification: egress, offline, gated sweep, changelog"
-status: draft
+status: complete
 parent: REQ-577
 created: 2026-08-14
 updated: 2026-08-14
@@ -30,16 +30,16 @@ gated-target sweep, and the release notes (spec BR-6, BR-7; AC-5, AC-6).
 
 ## Acceptance Criteria
 
-- [ ] New offline + egress tests green and non-vacuous (each asserts the
+- [x] New offline + egress tests green and non-vacuous (each asserts the
   positive content of the reply, not just the absence of egress —
   LESSON-520's pairing rule).
-- [ ] Full workspace build then test per the BUG-164 freshness rule:
+- [x] Full workspace build then test per the BUG-164 freshness rule:
   `cargo build --workspace` followed by `cargo test --workspace
   --no-fail-fast` — all green, count reported honestly.
-- [ ] Gated sweep passes: `cargo check -p tetond -p teton-inference
+- [x] Gated sweep passes: `cargo check -p tetond -p teton-inference
   --features tetond/llama,teton-inference/llama --tests` (LESSON-515;
   `template_smoke` consumes `with_builtins()` and must still compile).
-- [ ] `cargo clippy --workspace --all-targets` clean; `cargo fmt --all --
+- [x] `cargo clippy --workspace --all-targets` clean; `cargo fmt --all --
   --check` clean; `tools/release/changelog-section.sh` accepts the new
   section (exit 0) if that gate exists on this branch.
 

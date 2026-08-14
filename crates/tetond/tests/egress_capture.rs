@@ -738,3 +738,125 @@ async fn edit_blocks_every_boundary_spelling_under_one_identity() {
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// REQ-577 AC-6 — `teton_docs` against the capture transport
+// ---------------------------------------------------------------------------
+
+/// **REQ-577 BR-6 (AC-6): serving a bundled topic puts nothing on the wire.**
+///
+/// The claim `teton_docs` makes is a negative one — no network at call time —
+/// and this suite's whole reason to exist is that a negative claim about egress
+/// is settled by *capturing outbound traffic*, not by reading the tool's source
+/// and seeing no client in it (the AC-5 stance at the top of this file). So the
+/// real transport seam is wired and live around the call, and the assertion is
+/// that its record is empty.
+///
+/// Three things make it non-vacuous, which is the same discipline the spelling
+/// matrix above follows:
+///
+/// - **The tool really served the topic.** The body is checked against
+///   [`recipe_catalog`] — imported, never re-typed — so an empty or truncated
+///   result cannot satisfy "nothing went out".
+/// - **The transport really records.** The control leg at the end deliberately
+///   sends the served body through the same [`Egress`] and finds it captured. An
+///   instrument that recorded nothing at all would otherwise prove the same
+///   thing about a working tool and a broken one (LESSON-479).
+/// - **The fixture really has something to leak.** [`spelling_repo`] plants a
+///   `local-only` file with a live-looking key in the repo the tool is jailed
+///   to; a docs tool that had gone reading paths had one to find.
+#[tokio::test]
+async fn teton_docs_serves_its_topic_without_reaching_the_transport() {
+    use tetond::harness::tools::{DocsTool, DOCS_TOOL_NAME};
+    use tetond::harness::{Tool, ToolContext, ToolProvenance};
+    use tetond::provider_recipes::recipe_catalog;
+
+    let root = spelling_repo("docs");
+    let ctx = ToolContext::new(&root);
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let egress = Egress::new(capture.clone(), local_only_boundaries(), sink.clone());
+    let egress_ctx = EgressContext::new("anthropic").with_session("sess-teton-docs");
+
+    let out = DocsTool.run(&ctx, &serde_json::json!({ "topic": "providers" }));
+    assert!(!out.is_error, "{}", out.content);
+
+    // The positive half: every vendor fact the catalog ships is in the body the
+    // model received. Read from the catalog rather than spelled out here, so a
+    // moved endpoint fails this test instead of leaving it asserting nothing —
+    // and so this file never becomes a second place a vendor URL lives (BR-2).
+    let catalog = recipe_catalog();
+    assert_eq!(
+        catalog.len(),
+        6,
+        "the recipe roster changed; this sweep is narrower than the catalog"
+    );
+    for recipe in &catalog {
+        if let Some(endpoint) = &recipe.endpoint {
+            assert!(
+                out.content.contains(endpoint.as_str()),
+                "the `providers` topic carries no endpoint for {}",
+                recipe.label
+            );
+        }
+        assert!(
+            out.content.contains(recipe.example_model.as_str()),
+            "the `providers` topic carries no example model for {}",
+            recipe.label
+        );
+    }
+
+    // Nothing was opened, so there is no identity to carry. `Unknown` — the
+    // reading `shell` must take — would fail-close the next remote turn over the
+    // daemon's own documentation, so it is asserted against rather than assumed.
+    match &out.provenance {
+        ToolProvenance::Sources(ids) => assert!(
+            ids.is_empty(),
+            "`{DOCS_TOOL_NAME}` claimed a source it never opened: {:?}",
+            ids.iter().map(ProvenanceId::as_str).collect::<Vec<_>>()
+        ),
+        ToolProvenance::Unknown => {
+            panic!("a body compiled into this binary has knowable provenance")
+        }
+    }
+
+    // The claim itself: the live transport was asked for nothing.
+    assert!(
+        capture.captured().is_empty(),
+        "serving a bundled topic put {} request(s) on the wire",
+        capture.captured().len()
+    );
+    assert!(
+        sink.events().is_empty(),
+        "a call that touched no boundary raised a privacy block: {:?}",
+        sink.events()
+    );
+
+    // The control leg: the same transport, the same body, deliberately sent —
+    // and captured. This is what makes the emptiness above an observation about
+    // `teton_docs` rather than about an instrument that never records.
+    let (req, prov) = turn_from(&out, "");
+    assert!(
+        egress.send(req, &prov, &egress_ctx).await.is_ok(),
+        "bundled docs are not boundary content and must reach the wire when sent"
+    );
+    let captured = capture.captured();
+    assert_eq!(captured.len(), 1, "the control leg never went out");
+    let moonshot = catalog
+        .iter()
+        .find(|r| r.label == "Moonshot (Kimi)")
+        .and_then(|r| r.endpoint.as_deref())
+        .expect("the Moonshot recipe ships an endpoint");
+    assert!(
+        contains_bytes(&captured[0].body, moonshot),
+        "the control leg carried no topic content, so the capture proves nothing"
+    );
+    for secret in [SECRET_ENV, "sk-live"] {
+        assert!(
+            !contains_bytes(&captured[0].body, secret),
+            "boundary bytes rode out on a tool that reads no files"
+        );
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}

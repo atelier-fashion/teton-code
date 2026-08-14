@@ -18,6 +18,50 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Added
+
+- **Teton now hands you the exact command for the provider you name
+  (REQ-577).** "How do I connect Claude / Kimi / DeepSeek?" is answered from
+  recipes that ship inside the binary — the vendor's real endpoint, which
+  provider kind it speaks, and an example model — for Anthropic, OpenAI,
+  Moonshot (Kimi), DeepSeek, Ollama and Grok (xAI). Previously the best
+  available answer was a `provider add` template with a hole where the endpoint
+  goes, and the local model routinely went hunting through your repository for
+  a fact only Teton knows.
+
+  The prompt now also states outright what it could only imply before: Teton
+  **cannot run its own setup commands**. Registration stays yours to perform —
+  the key is still read echo-off into the OS keychain and never typed into a
+  conversation — and the agent's job is to give you the exact lines to run.
+
+  The recipes have exactly one source. The bundled guide, the README's own
+  quick-start commands and the new `providers` doc topic are checked against it
+  in CI in both directions, so an endpoint that moves fails the build instead of
+  quietly shipping a command that connects to nothing.
+
+- **A `teton_docs` tool, so Teton's own documentation grows without growing
+  every prompt (REQ-577).** The model can read four bundled topics on demand —
+  `providers`, `policy`, `web`, `doctor` — rather than carrying that depth in
+  the resident prompt of every turn. Nothing is fetched: the topics are
+  compiled into this binary and served out of process memory, so a docs read
+  opens no file, no socket and no network destination, produces no egress
+  event, and works in a fully offline session. It is exempt from the
+  tool-count cap that trims tool lists on weak or degraded providers, so it is
+  present in exactly the sessions whose model is least likely to know Teton's
+  setup surface, and it never displaces a file tool to get there. An upgrade
+  therefore sends nothing anywhere new — the tool's whole content is knowledge
+  that shipped with the binary you installed.
+
+### Changed
+
+- Internal sizing only, recorded because it is an assumption and not a
+  measurement: the assumed system-prompt overhead that sizes the redaction
+  chunk cap moved 8 → 9 KiB to fit the new tool's description (REQ-577). The
+  redaction input ceiling and its chunk count are unchanged, and no behavior
+  or limit a user can observe moves with it.
+
 ## [0.1.15] - 2026-08-14
 
 ### Added

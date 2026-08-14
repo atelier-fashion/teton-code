@@ -25,11 +25,13 @@ use teton_protocol::SessionId;
 use tetond::broadcast::EventBus;
 use tetond::harness::context::Provenance;
 use tetond::harness::shell_duty::SHELL_OUTPUT_CONTRACT;
+use tetond::harness::tools::DOCS_TOOL_NAME;
 use tetond::harness::{
-    build_system_prompt, run_session_turn, ContextManager, HarnessConfig, PendingPermissions,
-    PermissionConfig, PermissionGate, RecordingProvenanceHook, SessionEvents, ToolContext,
-    ToolRegistry,
+    build_system_prompt, context_provenance, run_session_turn, ContextManager, HarnessConfig,
+    PendingPermissions, PermissionConfig, PermissionGate, RecordingProvenanceHook, SessionEvents,
+    ToolContext, ToolRegistry,
 };
+use tetond::provider_recipes::recipe_catalog;
 
 /// A local [`Engine`] that replays a fixed script of replies, one per turn, and
 /// counts how many times it was called. When the script is exhausted it returns
@@ -369,6 +371,168 @@ async fn malformed_tool_calls_do_not_cause_an_unbounded_loop() {
     // It stopped at the ceiling rather than running forever.
     assert_eq!(outcome.stop_reason, StopReason::MaxTurnRequests);
     assert_eq!(outcome.turns, 4);
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-577 AC-5 / AC-6 — the bundled-docs tool on the offline path
+// ---------------------------------------------------------------------------
+
+/// **REQ-577 BR-6/BR-7 (AC-5, AC-6): a session with no network answers a Teton
+/// setup question out of this binary.**
+///
+/// The offline path is where that claim is worth making, for two reasons. It is
+/// the session shape a first-run user actually has when they ask how to connect
+/// a provider — there is no provider yet to ask — and it is the one where "zero
+/// egress" is a fact about the *code* rather than about this fixture's luck:
+/// [`run_session_turn`] takes no `Transport`, no provider and no network handle,
+/// exactly as the top of this file describes.
+///
+/// **Non-vacuous by pairing (LESSON-520).** A zero-egress assertion over a turn
+/// that served an *empty* result would pass while the feature was broken, so the
+/// positive half here asserts the body the model received carries every endpoint
+/// and example model the recipe catalog ships. Those values are read from
+/// [`recipe_catalog`] rather than typed out again: a recipe that moves fails
+/// this test instead of quietly turning its own assertion into a tautology, and
+/// this file is deliberately *not* a place where a second spelling of a vendor's
+/// endpoint lives (BR-2 keeps that to the catalog and its golden).
+#[tokio::test]
+async fn an_offline_session_serves_a_teton_docs_topic_with_zero_egress() {
+    let repo = temp_repo();
+
+    // Turn 1 asks the binary; turn 2 hands the user the commands and stops. No
+    // `read`, no `grep`, no `shell` — the repository is never consulted, which
+    // is the behavior BUG-160 could not produce for lack of a docs tool.
+    let script = [
+        r#"Teton's own docs carry the exact commands.
+{"tool": "teton_docs", "arguments": {"topic": "providers"}}"#,
+        "Register the provider with `teton provider add`, then point a tier at it with \
+         `teton policy set-tier`. Both are yours to run — I cannot run them for you.",
+    ];
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine: Arc<Mutex<dyn Engine>> =
+        Arc::new(Mutex::new(ScriptedEngine::new(&script, Arc::clone(&calls))));
+
+    let config = HarnessConfig::default();
+    let tools = ToolRegistry::with_builtins();
+    let tool_ctx = ToolContext::new(&repo);
+
+    let system = build_system_prompt(&tools, &config);
+    // AC-5's exposure half, on the profile this file drives. A model can only
+    // call what the prompt named, so a docs call the loop happily serves but the
+    // prompt never advertised would make the rest of this test a statement about
+    // a fixture rather than about a session (BR-7: the one unacceptable outcome
+    // is *silently absent*).
+    assert!(
+        system.contains(DOCS_TOOL_NAME),
+        "`{DOCS_TOOL_NAME}` is not exposed in the offline session's system prompt"
+    );
+
+    let mut ctx = ContextManager::new(system, config.context_budget_tokens);
+    ctx.push_user("How do I hook up Kimi for deep reasoning?");
+
+    let bus = Arc::new(EventBus::new());
+    let pending = Arc::new(PendingPermissions::new());
+    let session_id = SessionId::from("offline-docs-1");
+    let gate = PermissionGate::new(
+        session_id.clone(),
+        PermissionConfig::permissive(),
+        Arc::clone(&bus),
+        Arc::clone(&pending),
+    );
+    let events = SessionEvents::new(Arc::clone(&bus), session_id);
+    let mut hook = RecordingProvenanceHook::default();
+
+    let outcome = run_session_turn(
+        &engine,
+        ChatFormat::Flat,
+        &tools,
+        &tool_ctx,
+        &gate,
+        &events,
+        &mut ctx,
+        &config,
+        &mut hook,
+    )
+    .await
+    .expect("local turn completes");
+
+    assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+    assert!(
+        !outcome.edited,
+        "a docs read edits nothing, so the mandatory-verification shape is not in play"
+    );
+
+    // --- the positive half: what the model actually received -----------------
+    let served = ctx
+        .blocks()
+        .iter()
+        .rev()
+        .find(|b| matches!(b.provenance, Provenance::Tool { .. }))
+        .map(|b| b.text.clone())
+        .expect("the docs result was folded into context");
+
+    let catalog = recipe_catalog();
+    assert_eq!(
+        catalog.len(),
+        6,
+        "the recipe roster changed; this sweep is narrower than the catalog"
+    );
+    for recipe in &catalog {
+        if let Some(endpoint) = &recipe.endpoint {
+            assert!(
+                served.contains(endpoint.as_str()),
+                "the served `providers` topic carries no endpoint for {}: {served}",
+                recipe.label
+            );
+        }
+        assert!(
+            served.contains(recipe.example_model.as_str()),
+            "the served `providers` topic carries no example model for {}: {served}",
+            recipe.label
+        );
+    }
+
+    // --- the negative half: nothing left, and nothing was touched ------------
+    // Every model call was served by the LOCAL scripted engine (two turns: the
+    // docs call, then the answer), and there is no transport in the loop's
+    // signature to have reached a provider with.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the local engine served every turn"
+    );
+    assert!(!hook.seen.is_empty());
+    assert!(hook.seen.iter().all(|p| matches!(
+        p,
+        Provenance::System | Provenance::User | Provenance::Model | Provenance::Tool { .. }
+    )));
+
+    // The context the *next* turn would carry names no source at all: the body
+    // came out of the binary, so there is no identity to mint. `Unknown` would
+    // be the other failure — a docs read that fail-closed every later remote
+    // turn over the daemon's own documentation.
+    let provenance = context_provenance(&ctx);
+    assert!(
+        !provenance.is_unknown(),
+        "a bundled body has knowable provenance"
+    );
+    assert_eq!(
+        provenance.len(),
+        0,
+        "`{DOCS_TOOL_NAME}` opened no path: {:?}",
+        provenance.sources().collect::<Vec<_>>()
+    );
+
+    // And the repository really was left alone — the file this fixture ships is
+    // the one thing a tool that had gone looking would have had to open.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        "pub const ANSWER: u32 = 1;\n",
+        "the session touched the repository"
+    );
 
     std::fs::remove_dir_all(&repo).ok();
 }
