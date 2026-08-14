@@ -1,7 +1,7 @@
 ---
 id: REQ-576
 title: "Presence attestation for config/set (the larger daemon-wide sibling)"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-14
 updated: 2026-08-14
