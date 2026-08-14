@@ -1636,6 +1636,21 @@ impl CapabilityDeadEnd {
     /// literal at the emission site, so the daemon and the client that renders
     /// the id cannot come to hold two spellings of one capability.
     pub const WEB_SEARCH: &'static str = "web_search";
+    /// A lookup dead-ended at the `fetch_user_url` tier — the tool refused a
+    /// fetch of a URL the user themselves pasted, because the configured ceiling
+    /// does not reach even that.
+    ///
+    /// Here for [`Self::WEB_SEARCH`]'s reason, and here *now* because the reason
+    /// was only half-served while one of the three tiers had a constant and the
+    /// other two did not: the emission site derives the id from the tier
+    /// (`permission_key_for`), so all three ids are already in the wire
+    /// vocabulary — two of them only as strings nothing pins. A rename of either
+    /// would have gone silently past every test.
+    pub const WEB_FETCH_USER_URL: &'static str = "web_fetch_user_url";
+    /// A lookup dead-ended at the `fetch_any_url` tier — a fetch of a URL the
+    /// *model* chose, refused by the configured ceiling. See
+    /// [`Self::WEB_FETCH_USER_URL`].
+    pub const WEB_FETCH_ANY_URL: &'static str = "web_fetch_any_url";
 }
 
 // ---------------------------------------------------------------------------

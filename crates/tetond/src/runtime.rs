@@ -2345,7 +2345,14 @@ impl DaemonRuntime {
         // than built, because a gate rebuilt per turn forgets every
         // "allow for this session" answer at the end of the turn that earned it.
         let gate = self.permission_gate_for(&session_id, events, &config);
-        let tools = self.build_tools(&router, events, &session_id, &gate).await;
+        // This turn's config snapshot, handed on rather than re-read: the route,
+        // the gate, the registry and the capability clause below are then four
+        // readings of ONE config, so a commit that lands mid-turn moves the next
+        // turn instead of leaving this one's prompt disagreeing with its own
+        // tool set (REQ-572 verify).
+        let tools = self
+            .build_tools(&router, events, &session_id, &gate, &config)
+            .await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
         // not send one — under launchd it is `/`, which is what had every tool
@@ -2721,19 +2728,27 @@ impl DaemonRuntime {
     /// special case: [`ToolRegistry::exposed_names`] caps from the front, so a
     /// degraded provider's `max_tools` cuts the opt-in capability before it cuts
     /// a server the user configured.
+    ///
+    /// `config` is the **caller's** snapshot, not a second read of the mutex
+    /// (REQ-572 verify): [`Self::run_prompt_turn`] already clones the config to
+    /// build its route, its gate and its capability clause, and a `web/setup_
+    /// commit` landing between that clone and this one gave the turn a prompt
+    /// that said the capability was off while the registry it was handed had the
+    /// tool in it. One turn, one snapshot — which is also what makes ADR-1's
+    /// "the config **is** the flow state" true per turn rather than per read.
     async fn build_tools(
         self: &Arc<Self>,
         router: &Router,
         events: &Arc<EventBus>,
         session_id: &SessionId,
         gate: &Arc<PermissionGate>,
+        config: &Config,
     ) -> ToolRegistry {
         let mut tools = ToolRegistry::with_builtins();
-        let config = self.config.lock().expect("config mutex poisoned").clone();
         if !self.mcp_servers.is_empty() {
             if let Ok(transport) = HttpTransport::new() {
                 let egress =
-                    Arc::new(self.mcp_egress(transport, router, &config, events, session_id));
+                    Arc::new(self.mcp_egress(transport, router, config, events, session_id));
                 let registry =
                     Arc::new(
                         McpRegistry::with_egress(
@@ -2770,7 +2785,9 @@ impl DaemonRuntime {
             Arc::new(RuntimeLookupSeam {
                 runtime: Arc::clone(self),
                 router: router.clone(),
-                config,
+                // The seam outlives this call, so it takes an owned copy — of
+                // the caller's snapshot, which is the whole point.
+                config: config.clone(),
                 events: Arc::clone(events),
                 session_id: session_id.clone(),
             }),
@@ -6689,6 +6706,39 @@ fn web_table_summary(web: &WebConfig) -> WebTableSummary {
     }
 }
 
+/// Query-parameter **names** that mean a credential is riding in the URL.
+///
+/// Lowercased and compared whole, so `key` matches and `keyword` does not. The
+/// list is the four spellings the search backends this flow suggests actually
+/// use; it is a heuristic and says so in its sentence, because the alternative
+/// — saying nothing — is how a key ends up in a config file, a shell history and
+/// every `web_lookup` destination string that endpoint ever produces.
+const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
+
+/// Whether `endpoint`'s query string carries a parameter whose **name** says it
+/// holds a credential (REQ-572 verify).
+///
+/// Name-based, and the value is never read, let alone echoed: what the warning
+/// needs to say is "there is a key in this URL", and reading the value to say it
+/// would put a secret in a `Vec<String>` that travels to a client and into a
+/// transcript (BR-6's rule, which the whole web event family follows).
+///
+/// A hand-split rather than a URL parse, for the reason the whole function is a
+/// warning and not a gate: an endpoint that does not parse has its own arm
+/// below, and this one has to work on the string the user typed.
+fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
+    endpoint
+        .split_once('?')
+        .map(|(_, query)| query)
+        .into_iter()
+        .flat_map(|query| query.split(['&', ';']))
+        .filter_map(|pair| pair.split('=').next())
+        .any(|name| {
+            let name = name.trim().to_ascii_lowercase();
+            CREDENTIAL_QUERY_KEYS.contains(&name.as_str())
+        })
+}
+
 /// Non-fatal notes about a candidate the validator already accepted.
 ///
 /// Warnings, never errors — a candidate the validator **refuses** is a
@@ -6697,7 +6747,18 @@ fn web_table_summary(web: &WebConfig) -> WebTableSummary {
 /// configurations and still probably not what the user meant, each stated as
 /// the consequence rather than as a scolding.
 fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String> {
-    let mut warnings = Vec::new();
+    // First, and unconditional, because it is the one note that is true of every
+    // commit and is the only thing on this list the user cannot undo: the write
+    // is a whole-document `Config::to_toml`, so a hand-edited config comes back
+    // canonicalised — comments gone, key order normalised, anything this build's
+    // schema does not know about dropped. Disclosed rather than fixed here: a
+    // `toml_edit` round-trip is a separate change to the one config-write body
+    // this daemon has, and a user confirming a preview deserves to know now
+    // rather than to find out from `git diff`.
+    let mut warnings = vec![
+        "saving rewrites the whole config file — comments and unrecognized keys do not survive."
+            .to_owned(),
+    ];
     if candidate.tier < WebTier::Search && candidate.search_endpoint.is_some() {
         warnings.push(format!(
             "`search_endpoint` is written, but `[web] tier` is \"{}\", which does not reach \
@@ -6733,6 +6794,23 @@ fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String>
             Some(_) => {}
         }
     }
+    // A key in the URL itself. Legitimate for a backend that takes no header —
+    // which is why it is a note and not a refusal — and worth saying out loud
+    // because `search_endpoint` is the one `[web]` field that is *not* treated
+    // as a secret anywhere: it goes in the config in clear, and its host travels
+    // in every `web_lookup` event. The name is matched and the value is never
+    // read, so this note cannot itself become the leak it is warning about.
+    if candidate
+        .search_endpoint
+        .as_deref()
+        .is_some_and(endpoint_query_names_a_credential)
+    {
+        warnings.push(
+            "the endpoint's query string looks like it carries a credential; keys belong in \
+             the keychain (`search_key_ref`), not in a config file."
+                .to_owned(),
+        );
+    }
     // The candidate is a re-derivation, not a patch (BR-8), so an answer that
     // omits a key the current table has is an answer that removes it. Said out
     // loud, because the preview is where a user can still say no.
@@ -6754,10 +6832,26 @@ fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String>
     .map(|(key, _, _)| key)
     .collect();
     if !dropped.is_empty() {
-        warnings.push(format!(
+        let mut removal = format!(
             "this replaces the current `[web]` table: {} will be removed.",
             dropped.join(", ")
-        ));
+        );
+        // Dropping the *reference* does not drop the secret. The key's whole
+        // lifecycle lives in the client process (ADR-3), so the daemon has no
+        // way to delete it and would not be the right holder if it had — but it
+        // is the party that knows the reference is about to stop existing, and a
+        // user who is never told is left with a live credential nothing points
+        // at. The entry named is the one `/web setup` writes (service `teton`,
+        // account `web-search`), not one parsed out of the reference: building a
+        // shell command out of a config string is how a note becomes an
+        // instruction to run something the user did not write.
+        if dropped.contains(&"search_key_ref") {
+            removal.push_str(
+                " The stored key remains in the keychain; remove it with: \
+                 security delete-generic-password -s teton -a web-search",
+            );
+        }
+        warnings.push(removal);
     }
     warnings
 }
@@ -15203,10 +15297,9 @@ provider_id = "on-device"
         async fn the_web_tool_is_registered_exactly_when_the_tier_is_above_off() {
             for tier in WebTier::ALL {
                 let runtime = runtime_at(tier);
-                let router = {
-                    let config = runtime.config.lock().expect("config mutex").clone();
-                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
-                };
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let events = Arc::new(EventBus::new());
                 let session = SessionId::from("s");
                 let gate = Arc::new(PermissionGate::new(
@@ -15216,7 +15309,9 @@ provider_id = "on-device"
                     Arc::clone(&runtime.pending),
                 ));
 
-                let tools = runtime.build_tools(&router, &events, &session, &gate).await;
+                let tools = runtime
+                    .build_tools(&router, &events, &session, &gate, &config)
+                    .await;
 
                 assert_eq!(
                     tools.get(WEB_TOOL_NAME).is_some(),
@@ -15245,6 +15340,68 @@ provider_id = "on-device"
                     }
                 }
             }
+        }
+
+        /// **One turn, one config snapshot** (REQ-572 verify).
+        ///
+        /// [`DaemonRuntime::run_prompt_turn`] clones the config to build its
+        /// route, its permission gate and the prompt's capability clause;
+        /// `build_tools` used to take a *second* clone off the mutex. A
+        /// `web/setup_commit` landing between the two gave that turn a system
+        /// prompt saying the capability was off while the registry it was handed
+        /// had the web tool in it — the model reading a contradiction and one of
+        /// the two being wrong for a whole turn.
+        ///
+        /// Asserted where the seam actually is, and in both directions, because
+        /// a signature that takes a config it then ignores would pass a
+        /// one-directional check: the registry follows the config it is **given**
+        /// even when the runtime's live config says the opposite. That is the
+        /// property that makes "the caller's snapshot" true rather than merely
+        /// written down.
+        #[tokio::test]
+        async fn the_tool_registry_follows_the_config_it_is_handed_not_the_live_one() {
+            let runtime = runtime_at(WebTier::Off);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("s");
+            let gate = Arc::new(PermissionGate::new(
+                session.clone(),
+                crate::harness::table_for(runtime.default_permission_level),
+                Arc::clone(&events),
+                Arc::clone(&runtime.pending),
+            ));
+            let live = runtime.config.lock().expect("config mutex").clone();
+            let router = build_router(&live, runtime.local_tier_available(), &BTreeMap::new());
+
+            // The live config is `off`; the snapshot says `fetch_any_url`. This
+            // is the shape of a turn that read the config *before* a commit
+            // landed — except here the turn is the one holding the older answer.
+            let snapshot = Config {
+                web: WebConfig {
+                    tier: WebTier::FetchAnyUrl,
+                    ..live.web.clone()
+                },
+                ..live.clone()
+            };
+            assert!(
+                runtime
+                    .build_tools(&router, &events, &session, &gate, &snapshot)
+                    .await
+                    .get(WEB_TOOL_NAME)
+                    .is_some(),
+                "the registry re-read the live config instead of using the turn's \
+                 snapshot, so a turn's prompt and its tool set can disagree"
+            );
+            // And the other direction: the live config is untouched by any of
+            // this, so the same call with the live snapshot has no web tool.
+            assert!(
+                runtime
+                    .build_tools(&router, &events, &session, &gate, &live)
+                    .await
+                    .get(WEB_TOOL_NAME)
+                    .is_none(),
+                "non-vacuity: the live config really does say `off`, so the \
+                 registration above came from the snapshot"
+            );
         }
 
         /// **BR-3's ingestion.** A message that pastes a URL and asks about it
@@ -15559,10 +15716,9 @@ provider_id = "on-device"
             let registry = |runtime: Arc<DaemonRuntime>,
                             events: Arc<EventBus>,
                             session: SessionId| async move {
-                let router = {
-                    let config = runtime.config.lock().expect("config mutex").clone();
-                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
-                };
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let gate = Arc::new(PermissionGate::new(
                     session.clone(),
                     crate::harness::table_for(runtime.default_permission_level),
@@ -15570,7 +15726,7 @@ provider_id = "on-device"
                     Arc::clone(&runtime.pending),
                 ));
                 runtime
-                    .build_tools(&router, &events, &session, &gate)
+                    .build_tools(&router, &events, &session, &gate, &config)
                     .await
                     .get(WEB_TOOL_NAME)
                     .is_some()
@@ -16053,6 +16209,195 @@ provider_id = "on-device"
                     "the notice carried another session's tier: {completed:?}"
                 );
             }
+        }
+
+        /// **Every preview discloses that the write is a whole-file rewrite**
+        /// (the verify pass's honest-disclosure floor).
+        ///
+        /// The commit's one write body is `Config::to_toml` over the whole
+        /// document, so a hand-edited config comes back canonicalised: comments
+        /// gone, unrecognized keys dropped. That is a real loss, it is not
+        /// undoable, and the preview is the last moment a user can decline it —
+        /// so the note is unconditional and first, rather than conditioned on
+        /// the daemon somehow knowing whether *this* file has comments in it.
+        ///
+        /// Pinned as the first element and not merely as "present anywhere":
+        /// a warning list is read from the top, and this is the one that is true
+        /// of every commit.
+        #[test]
+        fn every_preview_says_the_save_rewrites_the_whole_file() {
+            let (runtime, _path) = runtime_on_disk("web-setup-rewrite-note");
+            with_local_model(&runtime);
+            for params in [
+                preview_params(WireWebTier::FetchUserUrl, None, None, None),
+                preview_params(
+                    WireWebTier::Search,
+                    Some("https://search.example.com/search?format=json"),
+                    Some("keychain://teton/web-search"),
+                    None,
+                ),
+            ] {
+                let preview = runtime.web_setup_preview(&params).expect("previews");
+                let first = preview
+                    .warnings
+                    .first()
+                    .unwrap_or_else(|| panic!("no warnings at all: {:?}", preview.warnings));
+                assert!(
+                    first.contains("rewrites the whole config file") && first.contains("comments"),
+                    "the rewrite is the one loss a preview cannot let a user \
+                     discover afterwards: {first}"
+                );
+            }
+        }
+
+        /// **A key in the endpoint's query string is named, and never echoed.**
+        ///
+        /// `search_endpoint` is the one `[web]` field treated as non-secret
+        /// everywhere — it sits in the config in clear and its host rides every
+        /// `web_lookup` event — so a user who pastes a backend URL with the key
+        /// already in it has put a credential somewhere nothing will redact.
+        ///
+        /// A note rather than a refusal (a keyless-header backend is a real
+        /// shape), and the assertion has two halves: the warning appears, and
+        /// the planted secret does **not**, anywhere in the answer. The second
+        /// half is the one that matters — a warning that quoted the parameter to
+        /// be helpful would be the leak it is about.
+        #[test]
+        fn a_credential_shaped_query_parameter_is_named_without_echoing_it() {
+            let (runtime, _path) = runtime_on_disk("web-setup-url-key");
+            with_local_model(&runtime);
+            let planted = "sk-live-do-not-echo-me";
+
+            let preview = runtime
+                .web_setup_preview(&preview_params(
+                    WireWebTier::Search,
+                    Some(&format!(
+                        "https://search.example.com/search?api_key={planted}"
+                    )),
+                    None,
+                    None,
+                ))
+                .expect("a key in the URL is a legal configuration, not a refusal");
+            assert!(
+                preview
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("looks like it carries a credential")),
+                "{:?}",
+                preview.warnings
+            );
+            for warning in &preview.warnings {
+                assert!(
+                    !warning.contains(planted),
+                    "the warning echoed the secret it is about: {warning}"
+                );
+            }
+            assert!(
+                !preview
+                    .search_host
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(planted),
+                "the host must be a host: {:?}",
+                preview.search_host
+            );
+
+            // Falsification: an ordinary parameter draws no such note, so the
+            // arm is a credential detector and not a "there is a query string"
+            // detector.
+            let benign = runtime
+                .web_setup_preview(&preview_params(
+                    WireWebTier::Search,
+                    Some("https://searx.example.com/search?format=json&keyword=rust"),
+                    None,
+                    None,
+                ))
+                .expect("previews");
+            assert!(
+                !benign
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("carries a credential")),
+                "`format` and `keyword` are not credentials: {:?}",
+                benign.warnings
+            );
+        }
+
+        /// **Dropping the reference does not drop the key, and the user is told
+        /// how to.**
+        ///
+        /// ADR-3 puts the secret's whole lifecycle in the client process, so the
+        /// daemon cannot delete the keychain entry — but it is the party that
+        /// knows the reference is about to stop existing, and a user who is
+        /// never told is left holding a live credential nothing points at.
+        ///
+        /// The command names the entry `/web setup` writes rather than one
+        /// parsed out of the reference: a shell command assembled from a config
+        /// string is an instruction to run something the user did not write.
+        #[test]
+        fn dropping_the_key_reference_says_how_to_remove_the_key_itself() {
+            let (runtime, _path) = runtime_on_disk("web-setup-drop-key");
+            with_local_model(&runtime);
+            let events = Arc::new(EventBus::new());
+            runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(
+                        WireWebTier::Search,
+                        Some("https://search.example.com/search"),
+                        Some("keychain://teton/web-search"),
+                        None,
+                    )),
+                    &events,
+                )
+                .expect("the search setup lands");
+
+            let preview = runtime
+                .web_setup_preview(&preview_params(WireWebTier::FetchUserUrl, None, None, None))
+                .expect("previews");
+            let removal = preview
+                .warnings
+                .iter()
+                .find(|w| w.contains("search_key_ref") && w.contains("removed"))
+                .unwrap_or_else(|| panic!("no removal note: {:?}", preview.warnings));
+            assert!(
+                removal.contains("security delete-generic-password -s teton -a web-search"),
+                "the note has to say what to actually run, or the key just \
+                 stays: {removal}"
+            );
+
+            // Falsification: dropping something that is *not* the key reference
+            // says nothing about the keychain — there would be nothing there to
+            // remove, and an unconditional line would train the user to skip it.
+            let (runtime, _path) = runtime_on_disk("web-setup-drop-endpoint");
+            with_local_model(&runtime);
+            runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(
+                        WireWebTier::Search,
+                        Some("https://searx.example.com/search?format=json"),
+                        None,
+                        None,
+                    )),
+                    &events,
+                )
+                .expect("a keyless search setup lands");
+            let lowered = runtime
+                .web_setup_preview(&preview_params(WireWebTier::FetchUserUrl, None, None, None))
+                .expect("previews");
+            assert!(
+                lowered
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("search_endpoint") && w.contains("removed")),
+                "non-vacuity: something really is being dropped: {:?}",
+                lowered.warnings
+            );
+            assert!(
+                !lowered.warnings.iter().any(|w| w.contains("keychain")),
+                "there was never a key, so there is nothing to tell the user to \
+                 delete: {:?}",
+                lowered.warnings
+            );
         }
 
         // -- BR-7: the preview→commit window ----------------------------------

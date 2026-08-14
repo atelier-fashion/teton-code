@@ -1957,11 +1957,32 @@ mod tests {
         // which is the tier→subject mapping's single definition. The bridge
         // between those two single definitions is this equality, asserted
         // rather than assumed.
+        //
+        // **All three tiers**, since the verify pass: the dead-end ids this tool
+        // emits are `permission_key_for`'s answers, so every tier above `off`
+        // already puts its key into the wire vocabulary — but only `web_search`
+        // had a constant to be pinned against, which left the other two as
+        // strings a rename could move on one side and not the other. Swept from
+        // `WebTier::ALL` rather than listed, so a tier added later has to be
+        // given both spellings before this compiles.
+        use teton_protocol::events::CapabilityDeadEnd;
+        for (tier, catalog_id) in [
+            (WebTier::FetchUserUrl, CapabilityDeadEnd::WEB_FETCH_USER_URL),
+            (WebTier::FetchAnyUrl, CapabilityDeadEnd::WEB_FETCH_ANY_URL),
+            (WebTier::Search, CapabilityDeadEnd::WEB_SEARCH),
+        ] {
+            assert_eq!(
+                permission_key_for(tier).expect("every tier above off has a key"),
+                catalog_id,
+                "the consent subject and the dead-end catalog id for {tier:?} have \
+                 drifted apart; a client would render one capability under two names"
+            );
+        }
         assert_eq!(
             PERMISSION_KEY_SEARCH,
-            teton_protocol::events::CapabilityDeadEnd::WEB_SEARCH,
-            "the consent subject and the dead-end catalog id for web search have \
-             drifted apart; a client would render one capability under two names"
+            CapabilityDeadEnd::WEB_SEARCH,
+            "and the search key by its own name, which is the one the two \
+             emission sites share"
         );
     }
 
