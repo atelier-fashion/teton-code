@@ -780,12 +780,17 @@ async fn allow_for_this_session_lasts_to_session_end_and_not_beyond() {
 /// condition is expressed (D-1) — is asked about the reloaded config. It
 /// answered `false` before the consent and must answer `true` after.
 ///
-/// **Also the REQ-576 ADR-3 no-regression pin.** `config/set` became a BR-10(b)
-/// commitment (REQ-576), but this consent-path `enable_permanent` write was
-/// deliberately **not** brought under presence (raise-only, can't author an
-/// endpoint; gating it would prompt on the ordinary "yes, permanently" answer).
-/// This test proves that acceptance holds: the path persists with **no presence
-/// step** — a future edit that accidentally gated it would make this go red.
+/// **Context for the REQ-576 ADR-3 accept decision.** `config/set` became a
+/// BR-10(b) commitment (REQ-576), but this consent-path `enable_permanent` write
+/// was deliberately **not** brought under presence (raise-only within an
+/// already-configured `[web]` table, can't author an endpoint; gating it would
+/// prompt on the ordinary "yes, permanently" answer). This test exercises that
+/// path end to end and shows it persists with no presence step. It is **not** a
+/// fail-closed regression pin for that decision, and does not claim to be: it
+/// drives `PermissionGate` directly (no `permission/respond` RPC, no verifier
+/// plumbed into the fixture), so it would not catch a future edit that gated the
+/// RPC seam. The accept decision is recorded where it is made —
+/// `PermissionGate::persist_web_tier`'s doc — not enforced by this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enable_permanent_writes_a_ceiling_the_next_daemon_start_honours() {
     let dir = scratch("permanent");

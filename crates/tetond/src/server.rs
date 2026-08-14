@@ -1567,9 +1567,11 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         // commitment now asks for presence too, and that prompt parks on a human
         // exactly as the consent one does. `web/setup_commit` joins them for the
         // same reason (REQ-575): writing the `[web]` egress table is a daemon-wide
-        // commitment, so it now attests, and its handler moved off the reader-loop
-        // `dispatch` to here rather than parking every other RPC on this
-        // connection behind a Touch ID prompt.
+        // commitment, so it now attests. `config/set` joins them for the same
+        // reason (REQ-576): rewriting the provider/privacy config (an egress
+        // endpoint, the privacy boundary) is the largest such commitment. Each
+        // moved off the reader-loop `dispatch` to here rather than parking every
+        // other RPC on this connection behind a Touch ID prompt.
         let blocks_on_a_human = matches!(
             method,
             m if m == SessionAttachParams::METHOD
@@ -4165,7 +4167,27 @@ mod tests {
         assert!(daemon.grants.is_empty(), "and mint nothing");
     }
 
-    /// The seven daemon-wide methods BUG-162 enumerates, with the params each
+    /// The BR-10(b) **commitment** subset of the daemon-wide methods — the ones
+    /// that additionally demand presence (a model change, a multi-GB download,
+    /// writing the `[web]` egress table, or rewriting the provider/privacy config).
+    /// A single source so a fifth commitment is one edit, not two hand-synced
+    /// lists — the drift `a_commitment_degrades_to_layer_a_where_no_mechanism_exists`
+    /// and `only_a_daemon_wide_commitment_demands_presence` would otherwise court
+    /// (REQ-576 review). The remaining `daemon_wide_methods()` entries
+    /// (`config/get`, `cost/query`, `web/refresh`, `session/create`) are layer (a)
+    /// only.
+    /// (These are the three *daemon-wide* commitments; the fourth BR-10(b)
+    /// method, `web/setup_commit`, is session-scoped — `may_drive`, not the
+    /// ancestry gate — so it is not in `daemon_wide_methods()` and has its own
+    /// tests.)
+    const COMMITMENT_METHODS: &[&str] = &[
+        ModelConfirmParams::METHOD,
+        ModelSetParams::METHOD,
+        ConfigSetParams::METHOD,
+    ];
+
+    /// The seven daemon-wide methods BUG-162 enumerates (of which the three in
+    /// [`COMMITMENT_METHODS`] are BR-10(b) commitments), with the params each
     /// needs to get *past* parsing — so a refusal below is the ancestry gate
     /// answering and never a malformed-params rejection wearing the same shape.
     fn daemon_wide_methods() -> Vec<(&'static str, Value)> {
@@ -4180,8 +4202,17 @@ mod tests {
             ),
             (ConfigGetParams::METHOD, serde_json::json!({})),
             (
+                // A **valid** `ConfigUpdate` (tag `op`), so config/set gets *past*
+                // parsing exactly as this table's doc promises — the gate refusals
+                // above are the ancestry/presence gates answering, never a
+                // malformed-params rejection wearing the same shape, and the
+                // degrade test reaches the runtime rather than dying at the parse.
                 ConfigSetParams::METHOD,
-                serde_json::json!({"update": {"local_model": {"auto_accept": true}}}),
+                serde_json::json!({"update": {
+                    "op": "set_privacy_boundary",
+                    "path_glob": "daemon-wide-fixture/**",
+                    "mode": "local_only",
+                }}),
             ),
             (CostQueryParams::METHOD, serde_json::json!({})),
             (
@@ -4316,11 +4347,7 @@ mod tests {
         //
         // A refusing verifier is the fixture rather than an accepting one:
         // "presence was demanded" is only observable when it can fail.
-        let commitments = [
-            ModelConfirmParams::METHOD,
-            ModelSetParams::METHOD,
-            ConfigSetParams::METHOD,
-        ];
+        let commitments = COMMITMENT_METHODS;
 
         for (method, params) in daemon_wide_methods() {
             let daemon = Arc::new(Daemon::new().with_presence_verifier(Box::new(
@@ -4367,15 +4394,12 @@ mod tests {
     /// the reduced posture is not silently confused with a satisfied one.
     #[tokio::test]
     async fn a_commitment_degrades_to_layer_a_where_no_mechanism_exists() {
-        // Config/set (REQ-576) joins the two model methods: all three are BR-10(b)
-        // commitments that must degrade — not refuse — where no mechanism exists.
-        // Listed explicitly (this test does not loop `daemon_wide_methods()`), so a
-        // future commitment must be added here as well as to `commitments` above.
-        for method in [
-            ModelConfirmParams::METHOD,
-            ModelSetParams::METHOD,
-            ConfigSetParams::METHOD,
-        ] {
+        // The BR-10(b) daemon-wide commitments must degrade — not refuse — where
+        // no mechanism exists. Driven off the shared [`COMMITMENT_METHODS`] so a
+        // future commitment is one edit, not two hand-synced lists (this test does
+        // not loop `daemon_wide_methods()`; it needs the *degrade* posture, so it
+        // iterates only the commitment subset).
+        for &method in COMMITMENT_METHODS {
             let params = daemon_wide_methods()
                 .into_iter()
                 .find(|(m, _)| *m == method)
@@ -7899,7 +7923,7 @@ mod tests {
             Id::Number(2),
             ConfigSetParams::METHOD,
             serde_json::json!({"update": {"op": "register_provider", "id": "x",
-                "kind": "openai", "endpoint": "http://127.0.0.1:9", "model": "m"}}),
+                "kind": "openai-compatible", "endpoint": "http://127.0.0.1:9", "model": "m"}}),
         )
         .unwrap();
         assert!(

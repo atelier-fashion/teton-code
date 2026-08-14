@@ -128,11 +128,19 @@ regression concern). Decide gate-vs-accept explicitly rather than by omission.
 
 ## Open Questions
 
-- [ ] OQ-1: Do any programmatic (non-CLI, non-user-initiated) `config/set`
-  callers exist that a presence prompt would deadlock or break? Enumerate all
-  `apply_config_update` call paths before gating.
-- [ ] OQ-2: Should `SetPrivacyBoundary` carry a distinct, stronger prompt reason
-  than `RegisterProvider`, given it mutates the privacy promise directly?
+- [x] OQ-1 — **RESOLVED in architecture (ADR-2), re-verified at implementation.**
+  No: `apply_config_update` has exactly one production caller (`handle_config_set`);
+  the three other references are test code. No first-run/migration/programmatic
+  path reaches it (first-run uses the already-gated `model/confirm`/`model/set`),
+  so a prompt deadlocks nothing.
+- [x] OQ-2 — **RESOLVED in architecture (ADR-2).** Generic prompt for v1:
+  `refuse_unattested_commitment`/`PresenceVerifier::verify` carry no per-method
+  reason string, so a distinct `SetPrivacyBoundary` prompt is a mechanism-layer
+  change, deferred as a future nicety rather than done half-way.
+- [ ] OQ-3 (surfaced at verify): should a consent-path `enable_permanent` answer
+  be further bounded in *which* tier it may persist (ADR-3 accepted it as
+  raise-only within an already-configured `[web]` table; the tier raise is a
+  bounded capability increase). Deferred; the accept decision stands for now.
 
 ## Out of Scope
 

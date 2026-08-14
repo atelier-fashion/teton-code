@@ -881,16 +881,27 @@ impl PermissionGate {
     /// write reaches the same `config.toml` the daemon-wide commitments do, so it
     /// meets REQ-575 BR-5's classification trigger — and it is **accepted, not
     /// gated**. It is raise-only within an already-configured `[web]` table (it
-    /// appends the answered tier and raises the ceiling; see `persist_web_tier`'s
-    /// own docs on the runtime) and cannot author an endpoint, a credential, or a
-    /// new capability — the powers `config/set`/`web/setup_commit` gate. It is
-    /// reached only by a user answering `enable_permanent` on a genuine web-consent
-    /// prompt in their own session, via `permission/respond`, not by a daemon-wide
-    /// commitment method. Bringing it under presence would put a Touch ID prompt
-    /// on that ordinary "yes, permanently" answer (a REQ-570 AC-8 regression) for
-    /// marginal security value. The no-regression proof is
+    /// appends the answered tier and raises the ceiling — see
+    /// [`crate::runtime::DaemonRuntime::persist_web_tier`], the seam it writes
+    /// through) and cannot author an endpoint, a credential, or a new capability —
+    /// the powers `config/set`/`web/setup_commit` gate.
+    ///
+    /// **The residual, stated honestly.** The tier raise *is* a bounded capability
+    /// increase, so the "a same-UID process can edit `config.toml` anyway"
+    /// argument — the very one REQ-575/REQ-576 reject for `config/set` — is what is
+    /// being leaned on here. The distinction that justifies the asymmetry: this
+    /// path can only *raise a tier within web the user already configured*, up to
+    /// the ceiling they set and past `Config::validate`, reached only when the user
+    /// themselves answers `enable_permanent` on a genuine web-consent prompt in
+    /// their own session (a `permission/respond` answer, not a daemon-wide
+    /// commitment method) — never author a *new* endpoint/boundary the way
+    /// `config/set` can. Gating it would put a Touch ID prompt on that ordinary
+    /// "yes, permanently" answer (a REQ-570 AC-8 regression) for marginal value.
+    /// Whether a consent answer should be further bounded in *which* tier it may
+    /// persist is left as a follow-up (REQ-576 OQ). The happy path is exercised by
     /// `enable_permanent_writes_a_ceiling_the_next_daemon_start_honours`
-    /// (web_consent_matrix.rs): the path persists with no presence step.
+    /// (web_consent_matrix.rs) — which shows it persists with no presence step, but
+    /// is not a fail-closed regression pin (see that test's own note).
     fn persist_web_tier(&self, tier: WebTier) -> WebConsentScope {
         let Some(sink) = &self.web_persistence else {
             eprintln!(

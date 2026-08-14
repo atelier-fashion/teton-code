@@ -34,21 +34,21 @@ egress/privacy-critical `ConfigUpdate` variants, plus the config/set-specific
 
 ## Acceptance Criteria
 
-- [ ] AC-1 (RegisterProvider): refused with `ATTESTATION_FAILED`; config.toml
+- [x] AC-1 (RegisterProvider): refused with `ATTESTATION_FAILED`; config.toml
       byte-identical on disk; live config unchanged — all by inspection.
-- [ ] AC-1 (SetPrivacyBoundary): same, for the privacy-boundary variant — the
+- [x] AC-1 (SetPrivacyBoundary): same, for the privacy-boundary variant — the
       one the spec calls out as directly mutating the privacy promise.
-- [ ] Non-vacuity: pair with the accepting/served path (a `config/set` under
+- [x] Non-vacuity: pair with the accepting/served path (a `config/set` under
       `TETON_PRESENCE_ACCEPT=1` or the default degrade) that **does** change the
       file, so a regression that let a refused config/set write flips the refusal
       assertions.
-- [ ] Routing pin: `dispatch` answers `METHOD_NOT_FOUND` for config/set; the
+- [x] Routing pin: `dispatch` answers `METHOD_NOT_FOUND` for config/set; the
       integration suites still reach it over the socket.
-- [ ] Reader-loop liveness is inherited (config/set uses the identical
+- [x] Reader-loop liveness is inherited (config/set uses the identical
       `blocks_on_a_human` machinery REQ-575's
       `a_parked_web_setup_commit_does_not_stall_the_connection` pins) — reference
       that in the routing-pin doc comment rather than duplicating the ParkingVerifier.
-- [ ] `cargo test -p tetond` (targeted integration + lib) green after a workspace build.
+- [x] `cargo test -p tetond` (targeted integration + lib) green after a workspace build.
 
 ## Technical Notes
 

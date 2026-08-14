@@ -45,14 +45,14 @@ config/set is closed. Non-`server.rs` files (no overlap with TASK-140). See
 
 ## Acceptance Criteria
 
-- [ ] `persist_web_tier` carries the ADR-3 accept rationale in a comment (BR-6).
-- [ ] A test asserts `enable_permanent` still persists without a presence prompt
+- [x] `persist_web_tier` carries the ADR-3 accept rationale in a comment (BR-6).
+- [x] A test asserts `enable_permanent` still persists without a presence prompt
       (AC-4 no-regression), at the strength the accept decision was made.
-- [ ] `docs/manual-verification.md` has a REQ-576 AC-6 entry marked outstanding.
-- [ ] No stale three-method / "config/set is the known next candidate" framing
+- [x] `docs/manual-verification.md` has a REQ-576 AC-6 entry marked outstanding.
+- [x] No stale three-method / "config/set is the known next candidate" framing
       remains in `.adlc` docs; the four-method set is named where the split is
       explained (AC-5 non-code half; TASK-140 owns the `server.rs` half).
-- [ ] REQ-572 finding-7 disposition and REQ-575 OQ-3/ADR-2 record config/set as
+- [x] REQ-572 finding-7 disposition and REQ-575 OQ-3/ADR-2 record config/set as
       closed by REQ-576.
 
 ## Technical Notes

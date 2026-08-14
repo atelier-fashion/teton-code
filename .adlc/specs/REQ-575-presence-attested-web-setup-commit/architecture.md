@@ -108,7 +108,9 @@ unfit as a rider on a spec written for `web/setup_commit`:
   finding 7 as filed (the `web/setup_commit` method); config/set is the
   larger sibling, tracked in REQ-576, and the PR/architecture say so plainly.
   The `refuse_daemon_wide`-only gate on config/set is a **stated residual**
-  for the life of REQ-576, not a silent one.
+  for the life of REQ-576, not a silent one. **Update (REQ-576 has since
+  landed):** config/set is now gated under BR-10(b) — the residual is closed;
+  the four daemon-wide config-writers known today are all classified.
 
 **Consent-path `persist_web_tier` (via `permission/respond` +
 `enable_permanent`) — scoped out, documented residual.** It durably writes

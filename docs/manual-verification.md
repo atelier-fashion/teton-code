@@ -1381,7 +1381,8 @@ on a presence build for the config writer with the largest blast radius.
 1. `cargo build --features presence` (macOS, Apple M-series). Confirm
    `TETON_TEST_SEAMS` / `TETON_PRESENCE_ACCEPT` are **unset**.
 2. Start the daemon; run `teton provider add <id> --model <m> …` (a
-   `RegisterProvider`), or a `teton privacy add` (`SetPrivacyBoundary`).
+   `RegisterProvider`), or a `teton boundary add <glob> --mode <mode>`
+   (`SetPrivacyBoundary`).
 3. **Approve** at the OS prompt. Expect: the command succeeds, `config.toml`
    gains the entry, and the change is live with no restart.
 4. Repeat and **cancel** the OS prompt. Expect: refused with a distinct
