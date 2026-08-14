@@ -1,7 +1,7 @@
 ---
 id: TASK-144
 title: "Guide + README recipes, referral clause, and prose gates"
-status: draft
+status: complete
 parent: REQ-577
 created: 2026-08-14
 updated: 2026-08-14
@@ -38,20 +38,20 @@ provider examples, and add the bidirectional prose↔catalog CI gates
 
 ## Acceptance Criteria
 
-- [ ] Both margin tests stay green with recorded headroom updated in their
+- [x] Both margin tests stay green with recorded headroom updated in their
   comments: `the_total_cap_clears_the_harness_context_budget_with_margin`
   (egress/redact.rs:1938) and
   `the_web_tool_docs_clear_the_outbound_body_overhead` (tools/web.rs:2227)
   — the 48-byte floor is never traded away (BR-4). If the floor breaks,
   apply the ADR-2 fallback (recipes move to the providers topic; gates
   retarget) instead of shrinking the floor.
-- [ ] Mutating a catalog endpoint without the guide fails the new gate, and
+- [x] Mutating a catalog endpoint without the guide fails the new gate, and
   editing a guide/README endpoint without the catalog fails it too —
   demonstrate both directions once locally and note it in the commit message
   (AC-7).
-- [ ] Referral clause pinned on both profiles; existing key-rule sentence
+- [x] Referral clause pinned on both profiles; existing key-rule sentence
   preserved verbatim (BR-5).
-- [ ] `cargo test -p tetond` green; clippy + fmt clean.
+- [x] `cargo test -p tetond` green; clippy + fmt clean.
 
 ## Technical Notes
 

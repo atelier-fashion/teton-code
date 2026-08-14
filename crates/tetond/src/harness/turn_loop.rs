@@ -1015,6 +1015,17 @@ pub async fn run_routed_session_turn(
 /// the user has typed it the damage *is* the typing, so the only place to stop
 /// it is the prompt (`the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`).
 ///
+/// REQ-577 adds the two things BUG-160's fix left as a shape with holes in it:
+/// the **vendor recipe line** — every endpoint and example model the recipe
+/// catalog ships, so "hook up Kimi" resolves to a runnable command rather than a
+/// template the model must guess a URL into — and the **referral sentence**,
+/// because a model handed a runnable command will otherwise try to run it. The
+/// recipes are gated against `crate::provider_recipes::recipe_catalog` in both
+/// directions by `the_bundled_guide_and_the_recipe_catalog_agree`
+/// (`tests/web_setup_contracts.rs`); depth beyond one line lives in the
+/// `teton_docs` `providers` topic, which is a tool result and pays no resident
+/// cost.
+///
 /// Sized to stay resident in every turn: the whole system prompt must clear
 /// `REDACT_BODY_OVERHEAD_BYTES` with escaping headroom, and clear it by at least
 /// `MIN_PROMPT_HEADROOM_BYTES` — `the_total_cap_clears_the_harness_context_budget_with_margin`
@@ -2177,6 +2188,54 @@ mod tests {
                 "the guide no longer tells the model that Teton's own \
                  configuration is not in the user's repo — that clause is \
                  what stops the file hunt:\n{system}"
+            );
+        }
+    }
+
+    /// **REQ-577 BR-5 / ADR-4: the agent refers, it does not run.**
+    ///
+    /// The other half of BUG-160's fix creates this one. A guide that carries a
+    /// *runnable* `teton provider add` — endpoint filled in, model filled in —
+    /// hands the model something it can plausibly try to execute, and the shell
+    /// tool is right there in the same prompt. `provider add` is human-gated on
+    /// purpose: it reads a credential echo-off from a TTY the agent does not
+    /// have, so an agent that runs it either hangs on a prompt nobody sees or
+    /// registers a provider with no key behind it. Neither failure names its
+    /// cause, and both are cheaper to forbid than to detect.
+    ///
+    /// Pinned by **whole-line equality**, the posture
+    /// `the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`
+    /// arrived at (BUG-168 residual (d)): substring needles here would be
+    /// satisfied by the recipe line's own words, and an in-line weakening
+    /// (`unless the user asks you to`) would compose straight around one.
+    ///
+    /// Both profiles, for the reason every clause test in this module checks
+    /// both: a strong model that runs the user's `provider add` for them is no
+    /// better than the local tier doing it, and worse at being noticed.
+    #[test]
+    fn the_system_prompt_tells_the_model_to_refer_setup_commands_not_run_them() {
+        const REFERRAL: &str = "You cannot run these commands yourself: give the user the exact \
+                                commands to run, filled in from the recipes here.";
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            let Some(line) = system
+                .lines()
+                .find(|line| line.trim_start().starts_with("You cannot run"))
+            else {
+                panic!(
+                    "the guide no longer tells the model it cannot run Teton's own setup \
+                     commands — and it now ships a runnable one, so the next thing the \
+                     model reaches for is the shell tool.\n{system}"
+                );
+            };
+            assert_eq!(
+                line.trim(),
+                REFERRAL,
+                "the referral sentence was edited. If the wording was changed \
+                 deliberately, update this expectation to the new wording — and keep the \
+                 BUG-168 rules it was written under: imperative, stated outright, no \
+                 em-dash aside, no meta-instruction in front of it. Do not just delete \
+                 the assertion."
             );
         }
     }

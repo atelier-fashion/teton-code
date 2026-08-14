@@ -2224,9 +2224,12 @@ mod tests {
     /// clause, description and schema together — is the largest one the daemon
     /// ever builds. The margin is asserted rather than left implied (AC-9).
     ///
-    /// **Recorded headroom at REQ-577:** the worst prompt here is 5,075 bytes,
-    /// so `spent` is 8,351 against a 9,216-byte overhead — **865 bytes of
-    /// margin** over the 48-byte floor. It was 115 before this REQ, against an
+    /// **Recorded headroom at REQ-577:** the worst prompt here is 5,568 bytes,
+    /// so `spent` is 8,844 against a 9,216-byte overhead — **372 bytes of
+    /// margin** over the 48-byte floor (865 before TASK-144 added 493 bytes of
+    /// vendor recipes and the referral sentence to the bundled guide; both
+    /// shapes moved by exactly that, because the guide is included verbatim in
+    /// each). It was 115 before this REQ, against an
     /// 8 KiB overhead. This shape stays the *smaller* of the two prompts
     /// measured against that constant, because a registered web tool replaces
     /// the opt-out clause rather than adding to it.

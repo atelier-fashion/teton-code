@@ -1949,11 +1949,17 @@ mod tests {
     /// facts, and only one of them survives the next sentence somebody adds to
     /// the bundled guide (AC-9).
     ///
-    /// **Recorded headroom at REQ-577:** the worst prompt is 5,123 bytes, so
-    /// `spent` is 8,399 against a 9,216-byte overhead — **817 bytes of margin**
+    /// **Recorded headroom at REQ-577:** the worst prompt is 5,616 bytes, so
+    /// `spent` is 8,892 against a 9,216-byte overhead — **324 bytes of margin**
     /// over the 48-byte floor. It was 67 before this REQ, against an 8 KiB
     /// overhead; `teton_docs`'s 274 bytes of tool docs did not fit in the 19
     /// bytes that left, which is why the assumption moved rather than the floor.
+    /// TASK-144 then spent 493 of the 817 that bought: 379 bytes of vendor
+    /// recipe line and a 114-byte referral sentence in the bundled guide. The
+    /// 9,216 is not to be raised again to make room for prose — the ADR-2
+    /// fallback (recipes move into the `providers` topic, which is a tool
+    /// result rather than resident prompt) is what the next sentence buys
+    /// itself with.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};

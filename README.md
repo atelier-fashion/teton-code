@@ -249,7 +249,7 @@ differentiators:
 # keychain — never written to a file):
 teton provider add opus --kind anthropic --model claude-opus-5
 teton provider add kimi --kind openai-compatible \
-  --endpoint https://api.moonshot.ai/v1 --model kimi-k2
+  --endpoint https://api.moonshot.ai/v1 --model kimi-k3
 
 # Route work to it — a whole tier (reflex | scan | build | think), with an
 # optional fallback, or a single category ahead of its tier:
@@ -264,6 +264,12 @@ teton doctor
 
 Config lives in `config.toml` in Teton's state directory (override with
 `TETON_CONFIG`); API keys are never stored in it.
+
+Recipes for Anthropic, OpenAI, Moonshot (Kimi), DeepSeek, Ollama and
+Grok (xAI) ship inside the binary. Ask in a session and the agent hands back
+the exact `provider add` and `policy set-tier` commands for any of them, filled
+in — it never runs them for you, and it never asks you to type a key into the
+conversation.
 
 Two promises, both made visible:
 

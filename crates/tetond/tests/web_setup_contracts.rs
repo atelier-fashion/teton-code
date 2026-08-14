@@ -56,6 +56,8 @@
 //! | BUG-165 continuity (the unnamed backend's default) | [`the_unnamed_backend_default_is_a_whole_contract`] |
 //! | REQ-577 BR-2 / AC-7 (providers topic ↔ recipe catalog, bidirectional) | [`the_providers_topic_and_the_recipe_catalog_agree`] |
 //! | REQ-577 BR-2 (web topic ↔ suggestion catalog auth shapes) | [`the_web_topic_and_the_suggestion_catalog_agree`] |
+//! | REQ-577 BR-1 / BR-2 / AC-7 (bundled guide recipes ↔ recipe catalog, bidirectional) | [`the_bundled_guide_and_the_recipe_catalog_agree`] |
+//! | REQ-577 BR-2 / AC-7 (README walkthrough ↔ recipe catalog, bidirectional) | [`the_readme_recipes_and_the_catalog_agree`] |
 //!
 //! ## A third prose surface, on a second catalog (REQ-577)
 //!
@@ -66,6 +68,14 @@
 //! [`tetond::provider_recipes::recipe_catalog`] and `web.md` against the search
 //! catalog this file was built for. Two catalogs, one rule: a fact spelled in
 //! prose must be a fact some typed source ships, and the reverse.
+//!
+//! The same REQ puts recipe facts into the two older surfaces as well — the
+//! guide's resident recipe line and the README's provider walkthrough — so each
+//! of those now carries two gates: the web-setup one it was built for, and
+//! [`the_bundled_guide_and_the_recipe_catalog_agree`] /
+//! [`the_readme_recipes_and_the_catalog_agree`] beside it. What every one of
+//! them pins is the **third-party** half — an endpoint, a header shape, a model
+//! id. Provider ids are the user's own namespace and stay deliberately free.
 //!
 //! ## What "the production builder" means here, exactly
 //!
@@ -657,6 +667,307 @@ fn the_readme_backend_rows_and_the_catalog_agree() {
              dropped or renamed, or the catalog \
              (crates/tetond/src/web_setup_catalog.rs) if the backend is real and \
              unlisted.\noffered: {offered:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Guide + README recipes ↔ the recipe catalog (REQ-577 BR-1 / BR-2 / AC-7)
+// ---------------------------------------------------------------------------
+
+/// The line that opens the bundled guide's numbered recipe step.
+///
+/// The recipe facts are asserted **inside this one line**, not against the whole
+/// file, so an endpoint that survives only somewhere else in the guide — in a
+/// `[web]` example, in a sentence about something adjacent — does not answer for
+/// the step a model actually reads when it is composing a `provider add`.
+const GUIDE_RECIPE_ANCHOR: &str = "1. `teton provider add";
+
+/// The bundled guide's recipe step, as one line.
+///
+/// **Panics** when the anchor is gone rather than returning an empty string: a
+/// parse that fails open is the `ENDPOINT_HELP` mistake this suite's header
+/// describes, and every assertion downstream would then hold over nothing.
+fn guide_recipe_line() -> &'static str {
+    BUNDLED_GUIDE
+        .lines()
+        .find(|line| line.trim_start().starts_with(GUIDE_RECIPE_ANCHOR))
+        .unwrap_or_else(|| {
+            panic!(
+                "the bundled guide (crates/tetond/src/harness/self_config.md) no longer \
+                 opens its recipe step with `{GUIDE_RECIPE_ANCHOR}`, so this check has \
+                 nothing to read. Restore the step, or re-anchor this test on whatever \
+                 replaced it — do not leave the recipes unchecked."
+            )
+        })
+}
+
+/// The heading the README's provider walkthrough lives under.
+const README_RECIPES_ANCHOR: &str = "### Hooking up an external model";
+
+/// The README's provider walkthrough: the anchored heading through to the next
+/// `###`, and nothing else in the file.
+///
+/// Scoped for the same reason [`readme_backend_rows`] is. The README names
+/// `claude-opus-5` again in the local-model prose and shows unrelated URLs in
+/// the web section; unscoped, either would answer for a recipe fact that is not
+/// there. **Panics** on a missing anchor.
+fn readme_recipe_section() -> &'static str {
+    let (_, after) = README.split_once(README_RECIPES_ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "the README no longer carries a `{README_RECIPES_ANCHOR}` heading, so this \
+             check has nothing to read. Restore it, or re-anchor this test on whatever \
+             replaced it — do not leave the walkthrough unchecked."
+        )
+    });
+    after.split("\n### ").next().unwrap_or(after)
+}
+
+/// The fenced `bash` block inside the README's provider walkthrough — the
+/// commands a reader copies, which is where a stale vendor fact does its damage.
+///
+/// **Panics** when the fence is gone: a walkthrough with no commands in it is a
+/// section this gate must not silently pass.
+fn readme_recipe_commands() -> &'static str {
+    let section = readme_recipe_section();
+    let (_, after) = section.split_once("```bash\n").unwrap_or_else(|| {
+        panic!(
+            "the README's `{README_RECIPES_ANCHOR}` section no longer opens a ```bash \
+             block, so the commands this gate pins are unreadable. Restore the block, or \
+             re-anchor this test — do not leave the commands unchecked.\nsection:\n{section}"
+        )
+    });
+    after.split_once("```").map_or(after, |(block, _)| block)
+}
+
+/// The value following every occurrence of `flag ` in `text`, taken to the next
+/// whitespace.
+///
+/// The trailing space in the needle is load-bearing: the README's own comment
+/// writes `--model;` in prose, and a needle without it would collect a
+/// semicolon and assert about a value nobody wrote.
+fn flag_values<'a>(text: &'a str, flag: &str) -> Vec<&'a str> {
+    let needle = format!("{flag} ");
+    text.match_indices(&needle)
+        .map(|(at, _)| {
+            let rest = &text[at + needle.len()..];
+            rest.split_whitespace().next().unwrap_or("")
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// **The bundled guide's recipe line and the recipe catalog say the same thing,
+/// in both directions** (REQ-577 BR-1, BR-2, AC-7).
+///
+/// The guide is the only recipe surface that is *resident* — it is in every
+/// system prompt, so it is what answers "hook up Kimi" with no tool call at all,
+/// and it is the copy under a hard byte ceiling. Being hand-written under a
+/// ceiling is exactly why it cannot be trusted to stay true on its own (ADR-2):
+/// what keeps it true is this test.
+///
+/// Both directions fail differently, so both are checked and each message names
+/// the side to edit. A catalog endpoint the guide never prints is a vendor the
+/// model cannot name without a `teton_docs` round trip; a URL the guide prints
+/// that no recipe ships is a third-party fact nothing in this repository
+/// verified, pasted straight into somebody's shell.
+///
+/// What is pinned is the **third-party** half — endpoints and example models.
+/// The suggested provider ids (`opus`, `kimi`) are the user's own namespace and
+/// are deliberately free to differ between surfaces; pinning them would gate a
+/// naming choice as though it were a fact about Moonshot.
+#[test]
+fn the_bundled_guide_and_the_recipe_catalog_agree() {
+    let catalog = recipe_catalog();
+    // Non-vacuity: an empty catalog would satisfy every loop below.
+    assert!(
+        catalog.len() >= 6,
+        "the recipe catalog ships {} entries; the sweep below is narrower than the \
+         roster it is supposed to cover",
+        catalog.len()
+    );
+    let line = guide_recipe_line();
+
+    // Catalog → guide: every vendor's endpoint and example model is on the line.
+    for recipe in &catalog {
+        match &recipe.endpoint {
+            Some(endpoint) => assert!(
+                line.contains(endpoint.as_str()),
+                "the catalog gives `{}` the endpoint `{endpoint}` and the bundled guide's \
+                 recipe step does not carry it, so a model composing that command has to \
+                 invent a URL. Edit crates/tetond/src/harness/self_config.md — the catalog \
+                 (crates/tetond/src/provider_recipes.rs) is the source and it moves first, \
+                 and mind the byte ceiling the two prompt-margin tests pin.\nline: {line}",
+                recipe.id_suggestion
+            ),
+            // The absent endpoint is a fact the guide has to state, not a gap it
+            // may leave: a model that has never been told the `anthropic` kind
+            // carries its own address will pattern-match `--endpoint` onto it
+            // from the five neighbours that do.
+            None => assert!(
+                line.contains("no `--endpoint`"),
+                "the catalog gives `{}` no endpoint — its kind knows its own address — and \
+                 the guide's recipe step never says so, so the one vendor whose command \
+                 takes no `--endpoint` reads like the five that do.\nline: {line}",
+                recipe.id_suggestion
+            ),
+        }
+        assert!(
+            line.contains(recipe.example_model.as_str()),
+            "the catalog's example model for `{}` is `{}` and the bundled guide's recipe \
+             step names a different one or none. A retired model id is a 404 the user \
+             cannot debug from the message. Edit \
+             crates/tetond/src/harness/self_config.md.\nline: {line}",
+            recipe.id_suggestion,
+            recipe.example_model
+        );
+    }
+
+    // Guide → catalog, over the **whole** guide rather than the anchored line:
+    // any URL this file prints is one a model will read out to a user, wherever
+    // in the file it sits. The web catalog is admitted as a second source
+    // because the guide's `[web]` half legitimately names search endpoints.
+    let from_recipes: BTreeSet<&str> = catalog
+        .iter()
+        .filter_map(|r| r.endpoint.as_deref())
+        .collect();
+    let web = suggestion_catalog();
+    let from_web: BTreeSet<&str> = web.backends.iter().map(|b| b.endpoint.as_str()).collect();
+    let in_guide = http_urls(BUNDLED_GUIDE);
+    assert!(
+        in_guide.len() >= from_recipes.len(),
+        "the URL parse found {} URLs in a guide that must teach {} recipe endpoints, so it \
+         is reading less than the guide holds: {in_guide:?}",
+        in_guide.len(),
+        from_recipes.len()
+    );
+    for url in in_guide {
+        assert!(
+            from_recipes.contains(url) || from_web.contains(url),
+            "the bundled guide prints `{url}` and neither the recipe catalog \
+             (crates/tetond/src/provider_recipes.rs) nor the web suggestion catalog \
+             (crates/tetond/src/web_setup_catalog.rs) ships a vendor with that endpoint. \
+             Edit crates/tetond/src/harness/self_config.md if the recipe was dropped or \
+             renamed, or the catalog if the vendor is real and unlisted — every URL this \
+             guide prints reaches a user's shell unverified.\nrecipes: {from_recipes:?}\n\
+             web: {from_web:?}"
+        );
+    }
+}
+
+/// **The README's provider walkthrough and the recipe catalog say the same
+/// thing, in both directions** (REQ-577 BR-2, AC-7).
+///
+/// This gate is the one with a defect already on its record. The README shipped
+/// `--model kimi-k2` against Moonshot's real endpoint from before this REQ was
+/// written, and it was still there when the catalog was: a reader who copied the
+/// block got a correct-looking command and a 404 on a retired model. Nothing
+/// caught it because nothing was looking, which is the whole argument for
+/// checking prose mechanically rather than carefully.
+///
+/// Scope, decided rather than drifted into: what is pinned is the facts a third
+/// party owns — endpoints, example models, and the roster of vendors the binary
+/// claims to know. The `<id>` in each command (`opus`, `kimi`) is a *user-chosen
+/// alias*, free to differ from the catalog's suggestion and from the guide's,
+/// and gating it would turn a naming choice into a false failure.
+#[test]
+fn the_readme_recipes_and_the_catalog_agree() {
+    let catalog = recipe_catalog();
+    assert!(
+        catalog.len() >= 6,
+        "the recipe catalog ships {} entries; the sweep below is narrower than the \
+         roster it is supposed to cover",
+        catalog.len()
+    );
+    let section = readme_recipe_section();
+    let commands = readme_recipe_commands();
+
+    // Catalog → README, the roster: the section claims which vendors ship, and a
+    // vendor the binary knows that the README never names is a recipe nobody
+    // reading the README will ever ask for.
+    for recipe in &catalog {
+        assert!(
+            section.contains(recipe.label.as_str()),
+            "the recipe catalog ships `{}` and the README's `{README_RECIPES_ANCHOR}` \
+             section never names it, so the roster in print is smaller than the roster in \
+             the binary. Edit the README — crates/tetond/src/provider_recipes.rs is the \
+             source and it moves first.\nsection:\n{section}",
+            recipe.label
+        );
+    }
+
+    // Catalog → README, the worked example: the block registers Moonshot, and
+    // both of its third-party facts have to be the catalog's. This is the entry
+    // that drifted, so it is the entry named explicitly rather than left to the
+    // reverse direction, which would pass a block that dropped it entirely.
+    let kimi = catalog
+        .iter()
+        .find(|r| r.label.contains("Kimi"))
+        .expect("the catalog still ships the Moonshot recipe the README works through");
+    let kimi_endpoint = kimi
+        .endpoint
+        .as_deref()
+        .expect("Moonshot is an openai-compatible kind and carries an endpoint");
+    assert!(
+        commands.contains(kimi_endpoint),
+        "the catalog gives Moonshot the endpoint `{kimi_endpoint}` and the README's \
+         command block does not carry it. Edit the README block.\ncommands:\n{commands}"
+    );
+    assert!(
+        commands.contains(kimi.example_model.as_str()),
+        "the catalog's example model for Moonshot is `{}` and the README's command block \
+         names a different one. This is exactly the drift that shipped — the block carried \
+         `kimi-k2` after the vendor had moved on — so update the README, or \
+         crates/tetond/src/provider_recipes.rs if the vendor moved \
+         again.\ncommands:\n{commands}",
+        kimi.example_model
+    );
+
+    // README → catalog: every third-party fact the block spells must be one this
+    // repository verified. Parsed off the flags rather than by scanning prose,
+    // so what is checked is precisely what a reader would paste.
+    let endpoints: BTreeSet<&str> = catalog
+        .iter()
+        .filter_map(|r| r.endpoint.as_deref())
+        .collect();
+    let models: BTreeSet<&str> = catalog.iter().map(|r| r.example_model.as_str()).collect();
+
+    let shown_endpoints = flag_values(commands, "--endpoint");
+    let shown_models = flag_values(commands, "--model");
+    // Non-vacuity: the block registers at least the two providers it routes
+    // between, one of them remote.
+    assert!(
+        !shown_endpoints.is_empty() && shown_models.len() >= 2,
+        "the flag parse read {shown_endpoints:?} and {shown_models:?} out of the README's \
+         command block, which is less than the two registrations it walks through — the \
+         parse is reading something other than the block.\ncommands:\n{commands}"
+    );
+    for endpoint in shown_endpoints {
+        assert!(
+            endpoints.contains(endpoint),
+            "the README's command block passes `--endpoint {endpoint}` and the recipe \
+             catalog ships no vendor with that endpoint. Edit the README if the recipe was \
+             dropped or renamed, or crates/tetond/src/provider_recipes.rs if the vendor is \
+             real and unlisted.\ncatalog: {endpoints:?}"
+        );
+    }
+    for model in shown_models {
+        assert!(
+            models.contains(model),
+            "the README's command block passes `--model {model}` and no recipe offers that \
+             example. A model id in print outlives the release that served it: re-verify \
+             against the vendor's current models page, then update \
+             crates/tetond/src/provider_recipes.rs and the README together.\ncatalog: \
+             {models:?}"
+        );
+    }
+    // And the same claim once more over the raw URLs, so a vendor fact smuggled
+    // into the block as prose rather than as a flag value is caught too.
+    for url in http_urls(commands) {
+        assert!(
+            endpoints.contains(url),
+            "the README's command block shows `{url}` and the recipe catalog ships no \
+             vendor with that endpoint.\ncatalog: {endpoints:?}"
         );
     }
 }
