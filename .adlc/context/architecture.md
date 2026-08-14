@@ -195,7 +195,14 @@
   that cross the seam in e2e, not by twin goldens that each verify their own
   author. Corollary: a seam that gains a sanitizer takes over every legitimate
   use of the alphabet it destroys — styling moves inside the seam, applied
-  after defusing (REQ-573, LESSON-517).
+  after defusing (REQ-573, LESSON-517). Second instance: the provider recipe
+  catalog (REQ-577), which adds two rules — a fact a catalog ships about an
+  external system is verified against **both halves of its contract**, the
+  third party's and the product's own consuming seam, with a seam test
+  crossing the two (LESSON-523); and the cap-exempt tool set admits members
+  only for a stated, doc-commented rationale distinct per tool (web = user
+  opt-in; teton_docs = self-serving product knowledge), so the exempt set
+  stays a checked rule rather than a dumping ground (LESSON-524).
 
 ## ADRs
 
