@@ -56,6 +56,11 @@
 //!   per-session user-pasted-URL set, and the domain allowlist. Nothing here
 //!   opens a socket and nothing here decides whether a lookup is allowed —
 //!   egress belongs to [`egress`], the gates beside it.
+//! - [`web_setup_catalog`] — the search backends `/web setup` suggests (REQ-573
+//!   ADR-A), as one pure factory over static product data. It lives daemon-side
+//!   so a backend's endpoint and header shape are written down once and clients
+//!   render what they were handed, rather than each keeping a copy that drifts
+//!   from the others — which is what BUG-165 was.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
 //!
 //! Socket and lock path resolution lives in the shared
@@ -88,6 +93,7 @@ pub mod sessions;
 pub mod single_instance;
 pub mod structured;
 pub mod web;
+pub mod web_setup_catalog;
 
 pub use server::{bind_listener, serve, Daemon};
 

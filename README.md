@@ -301,8 +301,9 @@ It asks, in this order, and writes nothing until the last answer:
    above the prompt.
 3. **does this backend need an API key? [Y/n]** — answer `n` for a keyless
    self-hosted backend.
-4. **auth header template** — Enter takes the default,
-   `Authorization: Bearer {key}`.
+4. **auth header template** — Enter takes the offered default: the matched
+   backend's own header (Brave and Kagi each want their own), or
+   `Authorization: Bearer {key}` for a backend the daemon does not name.
 5. **API key** — not echoed. It goes straight into the OS keychain as
    `keychain://teton/web-search`; only that *reference* is written to your
    config, and only that reference crosses the socket to the daemon.
@@ -331,24 +332,34 @@ The `?format=json` on a SearxNG endpoint is load-bearing: without it the
 instance answers with a web page rather than JSON.
 
 <!--
-Drift check. The three backend rows above, the `[web]` keys below, and the
-keychain reference are the same strings as four places in the tree, and all of
-them must move together:
-  - `crates/tetond/src/harness/self_config.md` — the guide bundled into the
-    system prompt, and the single source REQ-572's AC-8 backend contract suite
-    (`crates/tetond/tests/web_setup_contracts.rs`) enumerates the suggestion
-    list from, so a backend added there without a contract fixture fails the
-    suite;
-  - `crates/teton/src/web_setup_ui.rs` — `ENDPOINT_HELP` (what `/web setup`
-    prints above the endpoint prompt) and `instruction_lines` (what a piped
-    session is told);
-  - `crates/tetond/tests/config_preservation.rs` — `README_WEB_BLOCK` is the
-    fenced `[web]` block below, copied byte-for-byte, and
-    `the_fixture_is_the_readmes_own_block_byte_for_byte` reads *this file* at
-    test time and fails on any edit inside the fence the fixture did not follow
-    (REQ-574 AC-1 wants the README's own block as the preservation test vector,
-    not a paraphrase of it). It is the only machine-checked entry in this list;
-    the other three are kept honest by this note;
+Drift check. One in-tree source for the three backend rows above:
+`crates/tetond/src/web_setup_catalog.rs`. The rows are a prose mirror of it —
+change the catalog first, then this table. The `[web]` key names and the
+`keychain://teton/web-search` reference below are the bundled guide's strings,
+and the guide is itself checked against that catalog.
+
+Where every surface's sync is enforced:
+  - this table: `the_readme_backend_rows_and_the_catalog_agree` in
+    `crates/tetond/tests/web_setup_contracts.rs` (REQ-573 BR-5) reads these rows
+    and the catalog and fails the build in either direction — a catalog endpoint
+    or header shape missing from a row, or a row naming a URL no suggestion
+    offers;
+  - the same file (REQ-572 AC-8) enumerates the catalog typed, parsing no one's
+    source text, so a backend added to the catalog without a contract fixture
+    fails CI;
+  - `crates/tetond/src/harness/self_config.md`, the guide bundled into the
+    system prompt, is checked against the catalog in both directions
+    (`the_bundled_guide_and_the_catalog_agree`) — a template only one side
+    names fails, whichever side moved;
+  - `crates/teton/src/web_setup_ui.rs` keeps no copy: `/web setup` renders the
+    catalog the daemon hands it on `web/setup_plan`, the piped instructions
+    included;
+  - the fenced `[web]` block below: `README_WEB_BLOCK` in
+    `crates/tetond/tests/config_preservation.rs` is that block copied
+    byte-for-byte, and `the_fixture_is_the_readmes_own_block_byte_for_byte`
+    reads *this file* at test time and fails on any edit inside the fence the
+    fixture did not follow (REQ-574 AC-1 wants the README's own block as the
+    preservation test vector, not a paraphrase of it);
   - `crates/teton-core/src/config_doc.rs` — `HAND_WRITTEN_CONFIG` embeds the
     same block again, as the delta engine's own unit-test vector. Nothing there
     reads this file, so that copy is not self-enforcing: move it by hand when

@@ -234,9 +234,12 @@ fn a_fresh_config_tells_the_model_the_capability_is_off() {
         ("the capability exists and is off", "switched off"),
         ("the in-session enablement path", "/web setup"),
         ("the config key", "[web] tier"),
+        // Spelled as the missing premise since BUG-168: web-off beside "use
+        // tools" read as "so check the files instead" until the prompt said
+        // outright that outside-world facts are never in them.
         (
             "and it must forbid the repository hunt",
-            "instead of searching the repository for it",
+            "do not search the repository",
         ),
     ] {
         assert!(
@@ -520,6 +523,161 @@ fn the_committed_table_serves_a_lookup_in_the_same_session() {
         lookups[0]
     );
     assert_no_boundary_bytes();
+}
+
+/// **REQ-575 AC-2 + AC-6: the granted path with presence *actively satisfied*,
+/// over the real socket.**
+///
+/// The in-process unit tests inject `AlwaysFailsVerifier` to prove the BR-10(b)
+/// gate refuses; this proves the other side. A spawned daemon whose presence
+/// mechanism is present and satisfied — reached the only way a separate process
+/// can, through `TETON_TEST_SEAMS=1` + `TETON_PRESENCE_ACCEPT=1`, which installs
+/// `AcceptingVerifier` (see `attest::seam_verifier`) — commits, writes the
+/// `[web]` table, and the capability is live in the same session with no
+/// restart.
+///
+/// The master-switch contract is untouched and is *why* this is safe against the
+/// adversary the REQ is about: a **release** build refuses to start with
+/// `TETON_TEST_SEAMS` set (DECISION 3 / E-6), so this accept-seam does not exist
+/// in the artifact users run. This is a debug-test-only door, asked for twice.
+#[test]
+fn an_attested_commit_lands_over_the_socket_through_the_presence_seam() {
+    let mut config = String::new();
+    config.push_str("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
+    config.push_str(&every_tier_bound_to("local"));
+    config.push_str("[privacy]\nredact = false\n\n");
+
+    let ws = Workspace::new("setup-attested");
+    ws.write_config(&config);
+    // A scripted local tier so the daemon has a working reflex tier; the commit,
+    // not a turn, is what is under test here.
+    let script_path = ws.write_script("done");
+    let daemon = Daemon::spawn(
+        &ws,
+        probe()
+            .script(script_path)
+            .env("TETON_TEST_SEAMS", "1")
+            .env("TETON_PRESENCE_ACCEPT", "1"),
+    );
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    let before_bytes = std::fs::read(&ws.config_path).expect("the fixture config exists");
+
+    let committed = client.call(
+        "web/setup_commit",
+        answers(&session, "fetch_user_url", None),
+    );
+    assert_eq!(
+        committed["result"]["applied"].as_bool(),
+        Some(true),
+        "a commit whose presence check is satisfied through the seam must apply — \
+         the granted path over the socket: {committed}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    let written = std::fs::read_to_string(&ws.config_path).expect("the config was written");
+    assert!(
+        written.contains("[web]") && written.contains("fetch_user_url"),
+        "the attested commit must write the `[web]` table:\n{written}"
+    );
+    assert_ne!(
+        written.as_bytes(),
+        before_bytes.as_slice(),
+        "the attested commit must actually change the file it was given"
+    );
+
+    // Live in the same session, no restart — the whole point of the flow.
+    let after = plan(&mut client, &session);
+    assert_eq!(
+        after["result"]["state"]["state"].as_str(),
+        Some("ready"),
+        "the capability must be live after an attested commit, with no restart: {after}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+}
+
+/// **REQ-575 AC-1: a presence-refused commit is refused, and the proof is the
+/// bytes on disk and the live state — not the error code.**
+///
+/// AC-1 demands the refusal be shown "by inspecting both [disk and in-memory
+/// config], not inferred from the error." The in-process unit test
+/// (`a_web_setup_commit_refuses_when_the_presence_check_fails`) can only reason
+/// from the returned code because a bare `Daemon::new()` has no config file at
+/// all. This test closes that gap: a spawned daemon with a **real config file**
+/// and a **present-but-refusing** verifier (`TETON_PRESENCE_ACCEPT=fail`, the
+/// only way to reach `AlwaysFailsVerifier` in a separate process) is asked to
+/// commit by the session's own attached client, and the evidence is read back
+/// from the world:
+///
+///   1. the config file is **byte-identical** to before the refused commit, and
+///   2. the daemon still reports the capability `off_available` (no live swap).
+///
+/// The error code is asserted too, but it is the *weakest* of the three claims;
+/// (1) and (2) are what AC-1 asks for.
+#[test]
+fn a_presence_refused_commit_writes_nothing_and_swaps_nothing() {
+    let mut config = String::new();
+    config.push_str("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
+    config.push_str(&every_tier_bound_to("local"));
+    config.push_str("[privacy]\nredact = false\n\n");
+
+    let ws = Workspace::new("setup-refused");
+    ws.write_config(&config);
+    let script_path = ws.write_script("done");
+    let daemon = Daemon::spawn(
+        &ws,
+        probe()
+            .script(script_path)
+            .env("TETON_TEST_SEAMS", "1")
+            .env("TETON_PRESENCE_ACCEPT", "fail"),
+    );
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    // The machine starts off-but-available, with no `[web]` table.
+    let before = plan(&mut client, &session);
+    assert_eq!(
+        before["result"]["state"]["state"].as_str(),
+        Some("off_available"),
+        "the fixture must start off-but-available: {before}"
+    );
+    let before_bytes = std::fs::read(&ws.config_path).expect("the fixture config exists");
+
+    let refused = client.call(
+        "web/setup_commit",
+        answers(&session, "fetch_user_url", None),
+    );
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(teton_protocol::jsonrpc::error_code::ATTESTATION_FAILED),
+        "the commit must be refused at the BR-10(b) presence gate: {refused}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+
+    // (1) Inspected on disk, not inferred: the file is byte-identical.
+    assert_eq!(
+        std::fs::read(&ws.config_path).ok().as_deref(),
+        Some(before_bytes.as_slice()),
+        "AC-1: a presence-refused commit must leave config.toml byte-identical on disk"
+    );
+
+    // (2) Inspected in the live daemon, not inferred: the capability was not
+    // swapped in — the derived state is still off, so no in-memory `[web]` table
+    // was installed.
+    let after = plan(&mut client, &session);
+    assert_eq!(
+        after["result"]["state"]["state"].as_str(),
+        Some("off_available"),
+        "AC-1: a presence-refused commit must not live-swap the in-memory config \
+         (state would read `ready` if it had): {after}"
+    );
+    assert!(
+        after["result"]["current_web"].is_null(),
+        "and no `[web]` table is present in the running config after the refusal: {after}"
+    );
 }
 
 // ---------------------------------------------------------------------------

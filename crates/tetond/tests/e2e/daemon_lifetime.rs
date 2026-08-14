@@ -451,6 +451,62 @@ fn a_readiness_probe_that_never_handshakes_does_not_start_the_clock() {
 }
 
 // ---------------------------------------------------------------------------
+// BR-5/BUG-169: a signal runs the ordered teardown, and the exit is clean
+// ---------------------------------------------------------------------------
+
+/// SIGTERM must end in exit status 0 with the socket unlinked — the `brew
+/// services stop` path (BR-5), and the path BUG-169 found broken in llama
+/// builds: leaving `main` through libc `exit()` ran ggml's Metal static
+/// destructors, which abort when the model is still resident, turning every
+/// routine stop into SIGABRT plus a macOS crash report. `main` now ends in
+/// `_exit`, which skips them. This build has no llama engine, so the abort
+/// itself cannot reproduce here; what this pins is the contract the fix
+/// preserves — signal → ordered teardown, reported and attributed → status 0,
+/// socket gone.
+#[test]
+fn a_sigterm_runs_the_ordered_teardown_and_exits_zero() {
+    let (workspace, script) = workspace("term");
+    // Pinned `never`: the only way this daemon can exit is the signal, so the
+    // clean status below is the signal path's doing and nobody else's.
+    let mut daemon = Daemon::spawn(
+        &workspace,
+        DaemonOptions::default()
+            .real_lifetime()
+            .script(script.clone())
+            .arg("--shutdown-policy")
+            .arg("never"),
+    );
+
+    // A handshaked client first, so the daemon under the signal is one that
+    // has actually served, not one still in its startup grace.
+    let client = daemon.connect();
+    drop(client);
+
+    let pid = i32::try_from(daemon.pid()).expect("a pid fits in i32");
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert_eq!(rc, 0, "SIGTERM must be deliverable to the daemon");
+
+    let status = daemon
+        .wait_for_exit(EXIT_WINDOW)
+        .expect("a SIGTERM'd daemon must exit");
+    assert!(
+        status.success(),
+        "the exit must be clean, got {status}; log:\n{}",
+        daemon.log()
+    );
+
+    let log = daemon.log();
+    assert!(
+        log.contains("daemon_shutdown") && log.contains("\"signal\""),
+        "the teardown must run and attribute the exit to the signal; log:\n{log}"
+    );
+    assert!(
+        !daemon.socket().exists(),
+        "the ordered teardown must unlink the socket; log:\n{log}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Policy diagnostics (BR-7)
 // ---------------------------------------------------------------------------
 

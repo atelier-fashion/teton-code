@@ -1518,6 +1518,16 @@ async fn the_setup_methods_answer_an_attached_client_over_the_socket() {
             .is_empty(),
         "and the plan must name the missing piece rather than only greying it out: {plan}"
     );
+    // REQ-573: the suggestion catalog rides the same result — asserted on the
+    // dispatched JSON, not a struct built in-process, so a serialization-layer
+    // drop of the field fails here independently of any client's rendering.
+    assert_eq!(
+        plan["result"]["suggestion_catalog"]["backends"]
+            .as_array()
+            .map(Vec::len),
+        Some(3),
+        "the daemon-owned suggestion catalog must travel on the wire: {plan}"
+    );
 
     a.send(4, "web/setup_preview", setup_params(&sid)).await;
     let preview = a.read_response(4).await;
@@ -2240,6 +2250,119 @@ async fn a_monitor_grant_is_minted_when_a_human_approves_a_request_it_did_not_ra
         "a monitor that was granted must actually see the session: {listed}"
     );
 
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A verifier whose `verify` parks — as a real Touch ID prompt does (a blocking
+/// call, run on a blocking-pool thread via `block_in_place`) — until the test
+/// releases it. `availability` reports present so the commit path reaches
+/// `verify`. The release channel matters: a verify that blocked *forever* would
+/// leave a thread the multi-thread runtime cannot join, hanging the whole test
+/// process at teardown. The test drops the sender when it is done, `recv`
+/// returns, and the parked commit unwinds so the runtime can shut down.
+struct ParkingVerifier {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl tetond::attest::PresenceVerifier for ParkingVerifier {
+    fn availability(&self) -> tetond::attest::MechanismAvailability {
+        tetond::attest::MechanismAvailability::Available(
+            tetond::attest::AttestationMethod::OsBiometric,
+        )
+    }
+
+    fn verify(
+        &self,
+        _subject: tetond::grants::ConnectionId,
+        _request: &RequestId,
+    ) -> Result<tetond::attest::PresenceAttestation, tetond::attest::AttestationRefusal> {
+        // Tell the test the prompt was actually reached, then park until released.
+        let _ = self.entered.try_send(());
+        if let Some(rx) = self.release.lock().expect("release lock").take() {
+            let _ = rx.recv();
+        }
+        Err(tetond::attest::AttestationRefusal::Failed)
+    }
+}
+
+/// **REQ-575 ADR-1: a `web/setup_commit` parked on its presence prompt does not
+/// stall the connection's reader loop.**
+///
+/// This is the reason the commit was moved off the synchronous `dispatch` onto
+/// `handle_client`'s `blocks_on_a_human` task. The `ParkingVerifier` blocks
+/// inside `verify` (as a real prompt does) on a multi-thread runtime, so the
+/// commit's presence check runs under `block_in_place` — the production branch
+/// the in-process unit tests never take. While that commit is parked, a
+/// `session/list` on the *same* connection must still be answered.
+///
+/// The `entered` channel makes this non-vacuous: it proves the concurrent
+/// `session/list` was served *after* the commit had actually reached and parked
+/// in the presence gate, not before it got there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_web_setup_commit_does_not_stall_the_connection() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let daemon = Arc::new(
+        Daemon::new().with_presence_verifier(Box::new(ParkingVerifier {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(Some(release_rx)),
+        })),
+    );
+    let path = temp_socket("parking");
+    let listener = server::bind_listener(&path).unwrap();
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut client = TestClient::connect(&path).await;
+    client.handshake(1).await;
+
+    // The creator is auto-attached, so it may drive `web/setup_commit` (clears
+    // the layer-(a) `may_drive` gate) and reach the presence check.
+    client
+        .send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let created = client.read_response(2).await;
+    let session = created["result"]["session_id"]
+        .as_str()
+        .expect("session/create returns an id")
+        .to_owned();
+
+    // Fire the commit but do NOT await its response — it parks in the presence
+    // gate and never answers.
+    client
+        .send(
+            3,
+            "web/setup_commit",
+            json!({"session_id": session, "tier": "fetch_user_url"}),
+        )
+        .await;
+
+    // The prompt must actually be reached, or the test proves nothing about a
+    // *parked* commit. `block_in_place` runs `verify` on a blocking thread, so
+    // this signal arrives while the commit task is suspended.
+    tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the commit must reach and park in the presence gate")
+    })
+    .await
+    .unwrap();
+
+    // The reader loop is free: a concurrent RPC on the SAME connection is served
+    // while the commit is still parked.
+    client.send(4, "session/list", json!({})).await;
+    let listed = timeout(Duration::from_secs(5), client.read_response(4))
+        .await
+        .expect("session/list must be answered while the commit is parked off the reader loop");
+    assert!(
+        listed["result"]["sessions"].is_array(),
+        "the concurrent session/list must return a normal result: {listed}"
+    );
+
+    // Release the parked commit so its blocking thread unwinds and the
+    // multi-thread runtime can shut down instead of hanging at teardown.
+    drop(release_tx);
     server_task.abort();
     let _ = std::fs::remove_file(&path);
 }

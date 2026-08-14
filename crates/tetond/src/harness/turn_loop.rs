@@ -1033,11 +1033,49 @@ const SELF_CONFIG_GUIDE: &str = include_str!("self_config.md");
 ///    configuration is never inside the project being worked on, so a repo
 ///    search for the opt-in is a hunt with no possible ending — the bundled
 ///    guide below says the same thing for provider setup.
+///
+/// And two more from BUG-168, whose live trials on the shipped local model
+/// (qwen3-coder-30b-a3b, both byte-identical across runs) failed a softer
+/// spelling of the same clause:
+///
+/// 4. **Outside-world facts are never in the project files — stated as a
+///    premise, not implied.** The model resolved web-off beside "use tools to
+///    find out what only the files can tell you" as *"since web lookup is
+///    disabled, I'll look for version information in the repository files"* —
+///    the clause's own state-naming became the reason to hunt (3/3 trials).
+///    Forbidding the hunt only works once the prompt says why the files
+///    cannot help.
+/// 5. **The ending is dictated, not described** (LESSON-482). "Say so and
+///    name how to turn it on" put the payload in an em-dash aside behind a
+///    meta-instruction, and the model reproduced the "say so" half and
+///    dropped the aside in 6/6 trials. A model copies a quoted sentence far
+///    more reliably than it executes an instruction about one — and the
+///    two-part reply shape is spelled out because dictating the sentence
+///    alone made the model send it with no answer attached.
+///
+/// The first part is phrased as "answer the **underlying question**" with
+/// concrete noun examples because that is what turned the question-shaped
+/// first part from a generic refusal into an actual answer ("what is the
+/// latest version of X" states its stale best, then the sentence). Do not
+/// promise more than that: in live A/B the first part proved **chaotic for
+/// action-shaped requests** — "can you search the web for X" kept or lost
+/// its from-knowledge half under unrelated prompt-byte changes elsewhere
+/// (a 23-byte trim two sentences away flipped it, twice) — so no test pins
+/// it and no doc should claim it. What this clause guarantees, on every
+/// byte-configuration tried, is the BR-6 core: the opt-in sentence is
+/// reproduced verbatim and the repository is never hunted. Any rewording
+/// here is unverified until A/B'd live (LESSON-482's Applies When has the
+/// isolated-daemon recipe).
 const WEB_OFF_AVAILABLE_CLAUSE: &str =
-    "Web lookup is available on this machine but switched off by default, so you have no web \
-     tool this turn. If a question needs the live web, say so and name how to turn it on — the \
-     user can run `/web setup` in this session, or set `[web] tier` in Teton's config — instead \
-     of searching the repository for it.\n";
+    "Web lookup is available on this machine but switched off, so you have no web tool this \
+     turn. Facts about the world outside this repository — the latest release of a package, \
+     live documentation, anything on the web — are never in the project files, so do not \
+     search the repository for them or for the web setting. When a request needs the live web, \
+     reply in plain text with two parts. First, answer the underlying question from what you \
+     already know — name the endpoint, command, version, or fact they are after, marked as \
+     possibly out of date; skip this only when you know nothing useful. Then end with exactly \
+     this sentence: \"Web lookup is available but switched off; turn it on with `/web setup`, \
+     or set `[web] tier` in Teton's config.\"\n";
 
 /// The ending a search-shaped question must have when the ceiling permits
 /// search but the search leg cannot serve (REQ-572 BR-1, the
@@ -2095,42 +2133,46 @@ mod tests {
     /// no seam that can catch it afterwards: by the time the user has typed it,
     /// the damage is the typing.
     ///
-    /// Pinned by content and on both profiles, exactly like BUG-154's and
-    /// BUG-160's clauses: a strong model that asks for a key in chat is no
-    /// better than the local tier doing it. The needle is the *prohibition*, not
-    /// the command names — the guide already names `teton provider add` and
-    /// `/web setup` several lines up, so asserting on those would stay green with
-    /// this sentence deleted.
+    /// Pinned by **whole-line equality** on both profiles (BUG-168 residual
+    /// (d)), exactly where BUG-154's and BUG-160's clauses are pinned by
+    /// content: a strong model that asks for a key in chat is no better than
+    /// the local tier doing it.
+    ///
+    /// Equality replaced the original substring needles because they were
+    /// weaker than they read: the `"keychain"` needle was satisfied by the
+    /// `[web]` reference line naming `keychain://` — vacuously green with the
+    /// prohibition sentence deleted — and every needle was a substring, so a
+    /// weakening composed *around* one (`... unless they offer it`) passed
+    /// untouched. Equality on the whole line fails on deletion and on any
+    /// in-line edit alike. What it cannot catch is a contradicting sentence
+    /// added elsewhere in the guide; no content pin can, and pretending
+    /// otherwise is how the last set went vacuous.
     #[test]
     fn the_system_prompt_forbids_asking_for_a_credential_in_the_conversation() {
+        const PROHIBITION: &str =
+            "Never ask the user to type an API key or credential into the conversation: point \
+             them at `teton provider add` or `/web setup`, which read it echo-off into the \
+             keychain.";
         for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
             let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
-            for (needle, missing) in [
-                (
-                    "Never ask the user to type an API key",
-                    "the guide no longer forbids soliciting a credential in chat — \
-                     which is the move a model makes the moment it learns a search \
-                     backend needs a key, and it puts the secret in the transcript",
-                ),
-                (
-                    "echo-off",
-                    "the guide no longer says what the alternative path does with \
-                     the key, so 'ask somewhere else' reads as a formality rather \
-                     than as the reason",
-                ),
-                (
-                    "keychain",
-                    "the guide no longer names where the credential actually ends \
-                     up, which is the fact that makes the redirection worth making",
-                ),
-            ] {
-                assert!(
-                    system.contains(needle),
-                    "{missing}. If the wording was changed deliberately, update \
-                     this expectation to the new wording; do not just delete the \
-                     assertion.\n{system}"
+            let Some(line) = system
+                .lines()
+                .find(|line| line.trim_start().starts_with("Never ask"))
+            else {
+                panic!(
+                    "the guide no longer forbids soliciting a credential in chat — which is \
+                     the move a model makes the moment it learns a search backend needs a \
+                     key, and it puts the secret in the transcript.\n{system}"
                 );
-            }
+            };
+            assert_eq!(
+                line.trim(),
+                PROHIBITION,
+                "the prohibition sentence was edited. If the wording was changed \
+                 deliberately, update this expectation to the new wording — an in-line \
+                 weakening (`unless ...`) is exactly what whole-line equality exists to \
+                 catch; do not just delete the assertion."
+            );
         }
     }
 
@@ -2247,6 +2289,19 @@ mod tests {
                 "repositor",
                 "the clause no longer forbids the repository hunt, which is the move \
                  the model makes when no other ending is described (BUG-160)",
+            ),
+            (
+                "are never in the project files",
+                "the clause no longer states that outside-world facts are not in the \
+                 repository — without that premise the local model reads web-off as \
+                 \"so check the files instead\" and hunts the repo anyway (BUG-168, \
+                 3/3 live trials)",
+            ),
+            (
+                "end with exactly this sentence",
+                "the clause went back to describing the enablement offer instead of \
+                 dictating the sentence — the local model reproduces quoted text but \
+                 drops meta-instructed asides (BUG-168, 6/6 live trials)",
             ),
         ] {
             assert!(

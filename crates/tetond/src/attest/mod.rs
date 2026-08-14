@@ -347,6 +347,16 @@ fn seam_verifier() -> Option<Box<dyn PresenceVerifier>> {
         Some("unavailable") => Some(Box::new(UnavailableVerifier::new(
             UnavailableReason::PlatformUnsupported,
         ))),
+        // A present-but-refusing mechanism (REQ-575 AC-1): a spawned daemon whose
+        // presence check is reachable and *fails*. This is the only way to drive
+        // the BR-10(b) refusal against a real daemon with a real config file, so a
+        // test can inspect that a refused commit leaves `config.toml`
+        // byte-identical on disk — the "inspect, don't infer" evidence AC-1 asks
+        // for, which an in-process configless fixture cannot supply. Rides the same
+        // master switch, so it is inert in the shipped binary.
+        Some("fail") => Some(Box::new(AlwaysFailsVerifier::new(
+            AttestationMethod::OsBiometric,
+        ))),
         _ => None,
     }
 }

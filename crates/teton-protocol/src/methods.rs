@@ -1426,6 +1426,76 @@ pub struct WebTableSummary {
     pub search_auth: Option<String>,
 }
 
+/// One search backend the setup flow can suggest, as **data**: the shapes a
+/// user would otherwise have to know by heart, and never a secret (REQ-573
+/// BR-6).
+///
+/// The daemon owns the list (REQ-573 ADR-A) so a backend's endpoint and header
+/// shape are written down in exactly one place; a client renders what it was
+/// handed rather than keeping a second copy that drifts from the first (BR-1).
+///
+/// No `Default`, for [`WebTableSummary`]'s reason: a suggestion built out of
+/// nothing is one a client could show as if a daemon had sent it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebBackendSuggestion {
+    /// Stable identifier, e.g. `searxng` — what callers and tests key on, and
+    /// deliberately not display text, which may be reworded.
+    pub id: String,
+    /// The name to show a user.
+    pub label: String,
+    /// An absolute example endpoint including whatever query the backend
+    /// requires — the string a user can paste as typed.
+    pub endpoint: String,
+    /// The host this suggestion answers for, so a typed endpoint can be
+    /// matched back to it (BR-8). `None` for a self-hosted backend, whose host
+    /// is wherever the user runs it, and the field is then absent from the
+    /// wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// The auth-header template this backend wants, e.g.
+    /// `X-Subscription-Token: {key}` (BUG-165). Present exactly when
+    /// [`Self::needs_key`] is set, absent from the wire otherwise, and
+    /// carrying no credential by construction — `{key}` is where one would go,
+    /// and the substitution happens only when the request is built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_template: Option<String>,
+    /// Whether this backend needs a key at all — what a client **may** default
+    /// its key question to, stated by the daemon rather than re-derived from
+    /// whether [`Self::auth_template`] happens to be present.
+    ///
+    /// A default a client is free not to take: today's CLI asks the key question
+    /// unconditionally, with a yes default of its own, and uses this field only
+    /// to say `(no key)` or `(needs a key)` beside the suggestion (REQ-572
+    /// parity). The field is the daemon's statement of fact about the backend;
+    /// what a client does with it at a prompt is the client's.
+    pub needs_key: bool,
+    /// A sentence to show beside the suggestion, when there is one worth
+    /// showing. `None` is the common case and absent from the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// The backends this daemon suggests, plus the header shape to offer for the
+/// ones it does not know (REQ-573 BR-1).
+///
+/// Sent whole rather than piecemeal so the fallback travels with the list it
+/// falls back from: a client that matched no [`WebBackendSuggestion::host`]
+/// still has a template to offer without declaring one of its own.
+///
+/// No `Default`: an empty catalog manufactured client-side would be
+/// indistinguishable from one a daemon sent, and the `None` on
+/// [`WebSetupPlanResult::suggestion_catalog`] is the "this daemon predates the
+/// catalog" fact the degraded path keys off (BR-3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSetupCatalog {
+    /// The generic header shape, offered when a typed endpoint matches no
+    /// suggestion — [`crate::GENERIC_SEARCH_AUTH_TEMPLATE`], carried as data so
+    /// a client never has to hold its own copy.
+    pub default_auth_template: String,
+    /// The suggestions, in the order a client should show them.
+    pub backends: Vec<WebBackendSuggestion>,
+}
+
 /// Ask what enabling web lookup would involve (REQ-572 BR-1, BR-3).
 ///
 /// Read-only, and the flow's first step: it answers with the capability state
@@ -1468,6 +1538,12 @@ pub struct WebSetupPlanResult {
     /// the fresh-install case this REQ exists for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_web: Option<WebTableSummary>,
+    /// The backends to suggest and the header shape to fall back on (REQ-573
+    /// BR-1), or `None` from a daemon that predates the catalog — the field is
+    /// then absent from the wire and the client names no backend at all rather
+    /// than inventing a list (BR-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion_catalog: Option<WebSetupCatalog>,
 }
 
 impl RpcMethod for WebSetupPlanParams {
@@ -1634,6 +1710,7 @@ mod tests {
     use super::*;
     use crate::events::{ChosenBand, GpuClass, TierBand};
     use crate::ParseCategoryError;
+    use crate::GENERIC_SEARCH_AUTH_TEMPLATE;
 
     /// **Mixed-version skew, on the pairing ADR-007 explicitly endorses.**
     ///
@@ -2652,6 +2729,7 @@ mod tests {
             search_available: false,
             search_gap: Some("search needs the local model, which is not loaded".to_owned()),
             current_web: None,
+            suggestion_catalog: None,
         };
         round_trip(&fresh);
         let wire = serde_json::to_value(&fresh).unwrap();
@@ -2659,6 +2737,10 @@ mod tests {
         assert!(
             wire.get("current_web").is_none(),
             "no `[web]` table must be an absent key, not an empty summary: {wire}"
+        );
+        assert!(
+            wire.get("suggestion_catalog").is_none(),
+            "no catalog must be an absent key, not an empty one: {wire}"
         );
 
         // The configured answer: a table exists, search is offerable, and the
@@ -2675,6 +2757,7 @@ mod tests {
                 search_key_ref: Some("keychain://teton/web-search".to_owned()),
                 search_auth: Some("X-Subscription-Token: {key}".to_owned()),
             }),
+            suggestion_catalog: None,
         };
         round_trip(&configured);
         let wire = serde_json::to_value(&configured).unwrap();
@@ -2694,6 +2777,61 @@ mod tests {
         assert_eq!(
             wire.as_object().unwrap().keys().collect::<Vec<_>>(),
             ["tier"]
+        );
+
+        // The REQ-573 catalog, with every optional field exercised at both
+        // ends: an entry that names a host, a template and a key it needs,
+        // beside one that is self-hosted and needs none. Sentinel values
+        // throughout — what this pins is the shape, not the product list,
+        // which the daemon owns (ADR-A).
+        let with_catalog = WebSetupPlanResult {
+            state: WebCapabilityState::Ready {
+                tier: WebTier::Search,
+            },
+            search_available: true,
+            search_gap: None,
+            current_web: None,
+            suggestion_catalog: Some(WebSetupCatalog {
+                default_auth_template: GENERIC_SEARCH_AUTH_TEMPLATE.to_owned(),
+                backends: vec![
+                    WebBackendSuggestion {
+                        id: "sentinel-hosted".to_owned(),
+                        label: "Sentinel Hosted".to_owned(),
+                        endpoint: "https://sentinel.example.com/api/search".to_owned(),
+                        host: Some("sentinel.example.com".to_owned()),
+                        auth_template: Some("X-Sentinel-Header: {key}".to_owned()),
+                        needs_key: true,
+                        notes: Some("a sentinel note".to_owned()),
+                    },
+                    WebBackendSuggestion {
+                        id: "sentinel-local".to_owned(),
+                        label: "Sentinel Local".to_owned(),
+                        endpoint: "http://localhost:9999/search?format=json".to_owned(),
+                        host: None,
+                        auth_template: None,
+                        needs_key: false,
+                        notes: None,
+                    },
+                ],
+            }),
+        };
+        round_trip(&with_catalog);
+        let wire = serde_json::to_value(&with_catalog).unwrap();
+        assert_eq!(
+            wire["suggestion_catalog"]["default_auth_template"],
+            GENERIC_SEARCH_AUTH_TEMPLATE
+        );
+        assert_eq!(
+            wire["suggestion_catalog"]["backends"][0]["auth_template"],
+            "X-Sentinel-Header: {key}"
+        );
+        // The self-hosted entry: three of its four keys are the ones that
+        // *aren't* there, which is what tells a client it has no host to match
+        // and no header to offer.
+        let self_hosted = &wire["suggestion_catalog"]["backends"][1];
+        assert_eq!(
+            self_hosted.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["endpoint", "id", "label", "needs_key"]
         );
 
         // Preview: the same params the commit takes, at both ends of the
@@ -2769,6 +2907,42 @@ mod tests {
             applied: false,
             tier: WebTier::FetchAnyUrl,
         });
+    }
+
+    /// REQ-573 AC-1's absent direction, and BUG-158's additive-skew rule: a
+    /// plan answer from a daemon that predates the catalog still parses, and
+    /// the missing field reads as "this daemon sent no catalog" rather than
+    /// failing or manufacturing an empty one.
+    ///
+    /// The distinction is the whole point — `None` is what the client's
+    /// degraded path (BR-3) keys off, so a catalog with zero backends would be
+    /// a *different* answer, and one no daemon has any way to send by accident.
+    #[test]
+    fn a_plan_result_from_before_the_catalog_reads_as_no_catalog() {
+        let older = r#"{
+            "state": {"state": "off_available"},
+            "search_available": false,
+            "search_gap": "search needs the local model, which is not loaded"
+        }"#;
+        let parsed: WebSetupPlanResult = serde_json::from_str(older).unwrap();
+        assert_eq!(parsed.suggestion_catalog, None);
+        // Non-vacuity: the rest of the answer really did parse.
+        assert_eq!(parsed.state, WebCapabilityState::OffAvailable);
+        assert!(!parsed.search_available);
+
+        // And an empty catalog is a legible, distinct answer — not the same
+        // fact spelled differently.
+        let empty = r#"{
+            "state": {"state": "off_available"},
+            "search_available": false,
+            "suggestion_catalog": {"default_auth_template": "Sentinel {key}", "backends": []}
+        }"#;
+        let parsed: WebSetupPlanResult = serde_json::from_str(empty).unwrap();
+        let catalog = parsed
+            .suggestion_catalog
+            .expect("an empty catalog is a catalog");
+        assert!(catalog.backends.is_empty());
+        assert_eq!(catalog.default_auth_template, "Sentinel {key}");
     }
 
     /// BR-6 / ADR-3's wire half: **no setup type can carry the key**, in either

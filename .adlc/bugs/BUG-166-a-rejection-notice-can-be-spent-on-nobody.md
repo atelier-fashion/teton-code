@@ -1,7 +1,7 @@
 ---
 id: BUG-166
 title: "A refused commit's one rejection notice can be spent on a session nobody holds"
-status: open
+status: resolved
 severity: high
 created: 2026-08-14
 updated: 2026-08-14
@@ -162,8 +162,117 @@ clause once.
 
 ## Resolution
 
-(filled after fix)
+Both remediation directions landed, because each fixes what the other cannot:
+
+- **Re-keyed per (connection, session).** `ConnState::setup_rejection_spent`
+  (a lifetime `AtomicBool`) became `setup_rejections_announced`
+  (`Mutex<HashSet<SessionId>>`); `may_announce_setup_rejection` claims a
+  (connection, session) pair atomically via the set insert. A connection
+  refused on session A and then on session B now announces into both — each
+  targeted session's user hears about each offending connection exactly once
+  (consequence 2).
+- **Spent only for sessions that exist.** `refuse_commit_without_session_access`
+  asks the registry (`SessionRegistry::contains`, added — `get` without the
+  summary clone) *before* consulting the budget. A refused commit against an
+  id that names nothing publishes nothing and burns nothing (consequence 1),
+  and — a gain the report had not asked for — monitor-scope subscribers, who
+  receive every session-scoped envelope, no longer receive `WebSetupRejected`
+  envelopes wearing attacker-chosen ids. The ordering also keeps the budget
+  set bounded by daemon-minted ids: junk ids never enter it, which is the
+  `session/attach` allocation trap the report flagged.
+- **Delivery-side sliver accepted and recorded**: an existing session with no
+  attached client at publish time still spends its (connection, session)
+  notice into an empty room. The bus is broadcast-with-receive-side-filtering
+  (`may_receive` runs in each connection's forwarder), so publish cannot count
+  entitled recipients without new machinery; the spend is now scoped to that
+  one session rather than the connection's whole budget, which reduces the
+  cost of the sliver from "all future notices" to "that session's one notice".
+- **No arrears, and why that differs from the grant budget** (the Expected
+  Behavior's "or" branch): `GrantAnnouncementBudget`'s arrears exists because
+  each suppressed grant announcement carries information (a different grant
+  was minted). A suppressed rejection here is a byte-identical duplicate to
+  the identical audience; a count of unsent duplicates tells the reader
+  nothing. Recorded in the field docs and the architecture deviation row.
+- **BR-4/AC-4 reconciled**: the REQ-572 architecture spec-mapping row for the
+  rejection announcement now records the re-key, the existence gate, the
+  no-arrears rationale, and the four pinning tests.
+- Consequence 3 (reconnect refreshes the budget) is unchanged and remains the
+  stated limit, for the reason the field docs already carried: the daemon has
+  no subject an attacker cannot re-mint.
+
+Verified by mutation: deleting the existence gate fails
+`a_nonexistent_session_buys_no_notice_and_burns_no_budget`; reverting the key
+to the connection alone fails
+`a_refusal_against_a_second_session_announces_into_that_session_too`.
+
+Bundled residuals, all landed in the same pass:
+
+- **(a)** `/web setup` renders `DIGEST_CHECK_UNAVAILABLE` when the daemon
+  offers no preview digest — placed **before** the confirm question, because
+  declining is the one act the flow offers a user who minds that the commit
+  is no longer pinned to the previewed bytes. Pinned both ways (notice when
+  absent, no notice when present) in
+  `a_previewed_digest_rides_the_commit_and_an_absent_one_does_not`.
+- **(b)** `WebSetupCompleted.config_path` **stays on the wire, recorded as a
+  decision** on the field's doc comment: every receiver is same-UID (monitors
+  additionally consent-granted), the path is derivable by any such peer
+  (`teton status` serves it), so blanking protects nothing from the only
+  parties who can receive it — while the real exposure (a username on
+  somebody else's screen) is a rendering concern already handled by the CLI
+  deliberately not printing it (`format_web_setup_completed`).
+- **(c)** `refuse_unmintable_session_id` now guards `web/override`,
+  `session/permissions`, `session/clear`, and the `session/prompt` spawn;
+  its doc names the full seam list and why `permission/respond` needs no gate
+  (its `may_drive` takes a registry-resolved owner, never the caller's
+  string). Each seam pinned:
+  `an_unmintable_session_id_is_refused_by_every_driving_method_before_the_gate`
+  and `an_unmintable_session_id_is_refused_by_the_prompt_spawn`.
+- **(d)** The credential-prohibition pin is whole-line **equality** on the
+  exact sentence, on both model profiles. Verified by mutation: appending
+  "unless they offer it" to the guide's sentence fails the test that the old
+  substring needles passed.
+
+## Verification
+
+- `cargo test --workspace --no-fail-fast` after a full `cargo build
+  --workspace` (the BUG-164 freshness rule): 2417 passed, 0 failed, 50 test
+  targets, exit 0. `cargo clippy --workspace --all-targets` clean;
+  `cargo fmt --all -- --check` clean; `tools/release/changelog-section.sh`
+  exit 0.
+- Mutation checks run by hand: deleting the existence gate fails
+  `a_nonexistent_session_buys_no_notice_and_burns_no_budget`; weakening the
+  guide's prohibition sentence with "unless they offer it" fails the
+  rewritten content pin (it passed the old needles).
+- CI on PR #130: all seven checks pass on both platforms.
+
+## Deployment
+
+- No service deploys in this repo (plain OSS flow, PR-gated CI on `main`).
+  Merged to `main` as `33d1ce1` (PR #130); the fix rides the next tagged
+  release, and the `[Unreleased]` changelog section becomes its upgrade
+  notes.
+
+## Lessons Captured
+
+- `LESSON-516` — a notice budget's key must match its audience, and its spend
+  must match delivery: the three design questions (who is the audience, when
+  is it spent, what bounds the key set) that would have caught this at the
+  spec table, plus the arrears-or-not decision rule.
 
 ## Files Changed
 
-(filled after fix)
+- `.adlc/knowledge/lessons/LESSON-516-a-budgets-key-must-match-its-audience.md`
+  — new.
+- `crates/tetond/src/server.rs` — the re-keyed budget
+  (`setup_rejections_announced`), existence-gated spend in
+  `refuse_commit_without_session_access`, length gates at the four driving
+  seams, doc rewrites, four new/updated tests.
+- `crates/tetond/src/sessions.rs` — `SessionRegistry::contains`.
+- `crates/tetond/src/harness/turn_loop.rs` — whole-line-equality content pin.
+- `crates/teton/src/web_setup_ui.rs` — `DIGEST_CHECK_UNAVAILABLE` notice
+  before the confirm question; test pins both directions.
+- `crates/teton-protocol/src/events.rs` — the `config_path` on-the-wire
+  decision recorded on the field.
+- `.adlc/specs/REQ-572-capability-aware-refusals-and-guided-enablement/architecture.md`
+  — spec-mapping deviation row amended (BR-4/AC-4).
+- `CHANGELOG.md` — `[Unreleased]` entry.

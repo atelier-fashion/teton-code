@@ -142,7 +142,7 @@ is also where the write happened).
 | Entities: SetupFlow (daemon, session-scoped) | daemon state machine | client-local collection + stateless endpoints | BR-5's motive is thin clients + id hygiene; daemon keeps sole authority over validation/preview/commit, and the id-collision surface BR-5 guards against now has zero instances |
 | Events: setup_started / setup_step / setup_aborted | daemon events | not emitted — no daemon state changes before commit | BR-14 requires announcing **completions and rejections**, which remain events; steps with no daemon effect have nothing to announce (LESSON-505 is about state changes) |
 | AC-11 concurrent flows | id isolation across flows | no shared flow state; commits serialize on the config mutex | the failure mode AC-11 hunts (cross-answered steps) is structurally unrepresentable; the AC's event-delivery leg is still asserted at the client |
-| BR-4 / AC-4 rejection announcement | `web_setup_rejected` published for **both** a refused preview and a refused commit | published for a refused **commit only**, and at most **once per connection** | *As-built, changed during the verify pass — source: the 6-agent review of this REQ's implementation.* Both legs of the spec's version were a same-UID **write primitive**: `session/list` is ungated, so any peer can enumerate session ids, and a refused preview — which writes nothing else at all — turned each call into a line published into a stranger's transcript, at whatever rate the caller liked. The preview therefore refuses silently, on `web/setup_plan`'s own cry-wolf rationale (a notice that fires on demand is one users read past, which costs the real one its attention), and the commit's notice is budgeted per connection like `session_grant_minted` (`ConnState::may_announce_grant`). **The intent holds**: BR-4's subject is something trying to *change* this session's capability, and that is exactly the call that still announces. Enforcement is untouched — every refused preview and every refused commit past the budget is still `NOT_ATTACHED`; only the announcement is bounded. Pinned by `server.rs`'s `a_refused_preview_is_silent_while_a_refused_commit_is_not` and `a_connection_announces_at_most_one_setup_rejection`. |
+| BR-4 / AC-4 rejection announcement | `web_setup_rejected` published for **both** a refused preview and a refused commit | published for a refused **commit only**, at most **once per (connection, session)**, and only when the named session **exists** | *As-built, changed during the verify pass and re-keyed by BUG-166 — sources: the 6-agent review of this REQ's implementation; the post-merge security re-verification.* Both legs of the spec's version were a same-UID **write primitive**: `session/list` is ungated, so any peer can enumerate session ids, and a refused preview — which writes nothing else at all — turned each call into a line published into a stranger's transcript, at whatever rate the caller liked. The preview therefore refuses silently, on `web/setup_plan`'s own cry-wolf rationale (a notice that fires on demand is one users read past, which costs the real one its attention), and the commit's notice is budgeted like `session_grant_minted` (`ConnState::may_announce_grant`). The verify pass keyed that budget on the connection alone and spent it before delivery; BUG-166 found both halves wrong — one refusal aimed at a session id naming *nothing* burned the connection's only notice on an audience of zero (silencing every real notice it owed afterwards), and a connection refused on session A then B announced only into A though B's user is a different reader. The budget is now keyed per (connection, session) and spent only for sessions the registry answers for, which also keeps phantom envelopes wearing attacker-chosen ids out of monitor streams and keeps the budget set bounded by daemon-minted ids. No arrears figure, unlike the grant budget's, because a suppressed repeat here is a byte-identical duplicate to the identical audience. **The intent holds**: BR-4's subject is something trying to *change* this session's capability, and each targeted session's own user now hears about each offending connection exactly once. Enforcement is untouched — every refused preview and every refused commit past the budget is still `NOT_ATTACHED`; only the announcement is bounded. Pinned by `server.rs`'s `a_refused_preview_is_silent_while_a_refused_commit_is_not`, `a_connection_announces_at_most_one_setup_rejection_per_session`, `a_refusal_against_a_second_session_announces_into_that_session_too`, and `a_nonexistent_session_buys_no_notice_and_burns_no_budget`. |
 
 ### ADR-2: The commit re-runs the startup path on a candidate, then swaps
 
@@ -195,6 +195,53 @@ deliberate divergence from AC-6's letter on this one path, accepted for the
 same reason as the kill window above: the ambiguous state licenses no
 mutation, and an honest notice beats a clever guess. Pinned by
 `a_commit_that_never_answered_leaves_the_keychain_alone_and_says_so`.
+
+### Security-review finding 7 — disposition (added by REQ-575, 2026-08-14)
+
+**Finding.** A same-UID process that breaks the ancestry chain with `setsid`
+handshakes as `NotDescendant`, mints its own session via `session/create`
+(auto-attach satisfies `may_drive`), and calls `web/setup_commit` — rewriting
+`config.toml` and live-swapping the in-memory `[web]` config for every session
+with no human in the loop. REQ-570's `refuse_unattested_commitment` guards
+exactly this class for `model/confirm`/`model/set` (BR-10(b): daemon-wide
+commitments need presence attestation) but was not applied to
+`web/setup_commit` when REQ-572 added it.
+
+**Disposition — closed on presence builds; degraded (by design) on the shipped
+build.** REQ-575 makes the commit the third BR-10(b) commitment: it runs the same
+`refuse_unattested_commitment` check and moved off the reader-loop `dispatch` onto
+the `blocks_on_a_human` task so the prompt cannot stall the connection. It is at
+**exact parity with `model/set`**, and the honest strength is:
+
+- On a `--features presence` macOS build the control **bites** — an attested
+  human is required, verified end to end.
+- The **release artifact is built without `presence`** (`cargo build --release
+  --features tetond/llama`, no `presence` — because REQ-570's presence mechanism
+  is not yet release-verified; its AC-3b manual pass is itself still outstanding).
+  There `refuse_unattested_commitment` takes the no-mechanism arm and **degrades
+  to allow** with a stderr notice, so **on the shipped binary finding 7's
+  exposure persists** — the same-UID `setsid`/`NotDescendant` process can still
+  rewrite `[web]` with no human. This is the intended REQ-570 BR-8 asymmetry
+  (identical to `model/set`, so no *new* hole), stated so "closed" is not read as
+  covering the shipped product.
+
+It does **not** close the REQ-569 ADR-A ancestry escape (BR-10(b) is the
+compensating control). Shipping the control on release builds is a REQ-570-scope
+decision (enable `presence` once its own AC-3b lands), not REQ-575's.
+
+**Tracked residual — `config/set` — now CLOSED by REQ-576.** REQ-575's
+validation surfaced that `config/set` (`RegisterProvider` = an egress endpoint,
+`SetPrivacyBoundary` = the privacy boundary itself) is a *larger* daemon-wide
+config writer that was still gated at layer (a) only. **REQ-576 gated it** under
+the same BR-10(b) presence check, reversing its documented BUG-162
+layer-(a)-only posture — so the four daemon-wide config-writers known today
+(`model/confirm`, `model/set`, `web/setup_commit`, `config/set`) are all
+classified. Same shipped-build caveat as above (the release build ships without
+`presence`, so the control degrades there until `presence` ships). The
+consent-path `persist_web_tier` was given a considered disposition in REQ-576
+(ADR-3): **accepted, not gated** — raise-only within an already-configured
+`[web]` table, and gating it would prompt on the ordinary "enable permanently"
+consent answer.
 
 ### ADR-4: `capability_dead_end` fires where the daemon can actually see it
 

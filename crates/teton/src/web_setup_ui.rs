@@ -21,9 +21,20 @@
 //! only to decide which auth-header template the next **prompt offers as its
 //! default** ([`offered_auth`]). That is a question about what to put in front of
 //! a person, not about what is valid — the daemon still validates, and a user who
-//! types a template over the offer is obeyed. Offering the generic Bearer to
-//! somebody who just typed Brave's endpoint is how a walkthrough hands out a
-//! config that 401s.
+//! types a template over the offer is obeyed. Offering the generic template to
+//! somebody who just typed the endpoint of a backend that wants its own header is
+//! how a walkthrough hands out a config that 401s.
+//!
+//! ## The suggestions are the daemon's list, rendered (REQ-573 BR-1)
+//!
+//! Which backends the walkthrough names, what their endpoints look like and which
+//! header each one wants all arrive as data on the plan, in
+//! [`WebSetupCatalog`] — this file holds no copy. A second list here would agree
+//! with the daemon's right up until one of them was edited, and the person who
+//! met the drift would read the 401 as a bad key. A daemon that sends no catalog
+//! is answered by naming no backend at all rather than by falling back to a list
+//! of this file's own (BR-3): the offer degrades to
+//! [`GENERIC_SEARCH_AUTH_TEMPLATE`], the one spelling both binaries share.
 //!
 //! ## The secret's whole life is in this process (ADR-3)
 //!
@@ -55,10 +66,11 @@ use std::fmt;
 use teton_protocol::events::{WebCapabilityState, WebTier};
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
-    WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanParams, WebSetupPlanResult,
-    WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary,
+    WebBackendSuggestion, WebSetupCatalog, WebSetupCommitParams, WebSetupCommitResult,
+    WebSetupPlanParams, WebSetupPlanResult, WebSetupPreviewParams, WebSetupPreviewResult,
+    WebTableSummary,
 };
-use teton_protocol::SessionId;
+use teton_protocol::{SessionId, GENERIC_SEARCH_AUTH_TEMPLATE};
 
 use crate::client::{Connection, UiContext};
 use crate::keychain::{auth_ref_for, Keychain, KeychainError};
@@ -72,11 +84,6 @@ use crate::session_ui::web_tier_name;
 /// daemon is handed — a second copy is how a flow comes to delete an entry it
 /// did not write.
 pub(crate) const SEARCH_KEY_ACCOUNT: &str = "web-search";
-
-/// The header template a backend gets when the user does not name one. The
-/// daemon applies exactly this default when `search_auth` is absent (BUG-165);
-/// it is named here so the prompt can say what pressing Enter means.
-const DEFAULT_SEARCH_AUTH: &str = "Authorization: Bearer {key}";
 
 /// What `/web setup` says when there is no session to set anything up for.
 ///
@@ -104,6 +111,18 @@ const SETUP_ABORTED: &str =
 /// user got as far as reading the bytes and said no to *them*.
 const SETUP_DECLINED: &str =
     "not written. Nothing was changed and no key was stored; run `/web setup` again to start over.";
+
+/// What the flow says when the daemon offered no preview digest (BUG-166
+/// residual (a)).
+///
+/// A daemon built before BR-7's digest field degrades the commit to the
+/// protocol's own "do not check" — correct, and previously silent, which made
+/// the loss of the confirmed-bytes guard a fact only the source code knew.
+/// A version fact, not a failure, so it wears no `error:` prefix (BUG-152) —
+/// the commit still lands; what changed is which guard rides it.
+const DIGEST_CHECK_UNAVAILABLE: &str =
+    "this daemon build offers no preview digest, so the commit is not pinned to the previewed \
+     bytes — upgrade and restart the daemon to restore that check.";
 
 // ---------------------------------------------------------------------------
 // The world seam
@@ -366,7 +385,7 @@ pub(crate) fn drive(
     }
 
     if gate == Gate::Instructions {
-        for (kind, text) in instruction_lines() {
+        for (kind, text) in instruction_lines(plan.suggestion_catalog.as_ref()) {
             io.surface().line(kind, &text);
         }
         return Ok(());
@@ -390,6 +409,19 @@ pub(crate) fn drive(
     };
     for (kind, text) in preview_lines(&preview) {
         io.surface().line(kind, &text);
+    }
+
+    // The previewed document's digest rides the commit so the daemon refuses
+    // to write bytes the user never confirmed (BR-7). An empty digest is a
+    // daemon that predates the field — degrade to the protocol's own
+    // "do not check" rather than sending a value that can only mismatch, and
+    // say so **before the confirm question**: a guard that turns itself off on
+    // version skew must do it where the user can still act on the fact, and
+    // declining is the one act this flow offers (BUG-166 residual (a)).
+    let expect_digest = Some(preview.digest.clone()).filter(|digest| !digest.is_empty());
+    if expect_digest.is_none() {
+        io.surface()
+            .line(LineKind::Notice, DIGEST_CHECK_UNAVAILABLE);
     }
 
     // LESSON-470: the write is the costly wrong answer, so silence declines.
@@ -427,11 +459,6 @@ pub(crate) fn drive(
         None => (None, None),
     };
 
-    // The previewed document's digest rides the commit so the daemon refuses
-    // to write bytes the user never confirmed (BR-7). An empty digest is a
-    // daemon that predates the field — degrade to the protocol's own
-    // "do not check" rather than sending a value that can only mismatch.
-    let expect_digest = Some(preview.digest.clone()).filter(|digest| !digest.is_empty());
     // Bound rather than `?`-ed. A transport failure here is not the same event
     // as a daemon that answered "no": the commit may have landed, and letting
     // the error out would end the session on the one path where the user most
@@ -635,8 +662,11 @@ fn collect(plan: &WebSetupPlanResult, io: &mut dyn SetupIo) -> Option<Answers> {
         });
     }
 
-    for line in ENDPOINT_HELP {
-        io.surface().line(LineKind::Info, line);
+    // The suggestions are the daemon's, rendered (BR-1) — and a daemon that sent
+    // none leaves this file naming no backend rather than inventing a list.
+    let catalog = plan.suggestion_catalog.as_ref();
+    for line in suggestion_lines(catalog) {
+        io.surface().line(LineKind::Info, &line);
     }
     let endpoint = io.prompter().ask(ENDPOINT_QUESTION)?;
     let endpoint = endpoint.trim();
@@ -646,22 +676,22 @@ fn collect(plan: &WebSetupPlanResult, io: &mut dyn SetupIo) -> Option<Answers> {
 
     let needs_key = is_yes_by_default(&io.prompter().ask(KEY_NEEDED_QUESTION)?);
     let (search_auth, search_key) = if needs_key {
-        let offered = offered_auth(endpoint);
-        let auth = io.prompter().ask(&auth_question(offered))?;
+        let offered = offered_auth(endpoint, catalog);
+        let auth = io.prompter().ask(&auth_question(&offered))?;
         let auth = auth.trim();
         // Empty here is an answer — "take what was offered" — and not an abort,
         // which is why the question says what Enter means.
         //
         // What that resolves to differs by offer, and the difference is the
-        // point. For the generic Bearer it is `None`: the daemon writes no
-        // `search_auth` key at all and applies exactly that default, so the
-        // default stays one value in one place instead of being copied into
-        // every config this flow writes. For a backend whose own header was
+        // point. For the catalog's own generic template it is `None`: the daemon
+        // writes no `search_auth` key at all and applies exactly that default,
+        // so the default stays one value in one place instead of being copied
+        // into every config this flow writes. For a backend whose own header was
         // offered, it is that template on the wire — a `None` there would write
-        // a Bearer config against a backend that answers 401 to it, which is a
+        // a generic config against a backend that answers 401 to it, which is a
         // walkthrough handing out a broken setup and blaming the key.
         let auth = if auth.is_empty() {
-            (offered != DEFAULT_SEARCH_AUTH).then(|| offered.to_owned())
+            (offered != default_auth(catalog)).then(|| offered.clone())
         } else {
             Some(auth.to_owned())
         };
@@ -812,59 +842,145 @@ fn tier_menu_lines(plan: &WebSetupPlanResult) -> Vec<String> {
     ]
 }
 
-/// What the endpoint question is preceded by: the shipped suggestions, whose
-/// header templates are the ones the daemon's own guide names (AC-8).
-const ENDPOINT_HELP: &[&str] = &[
-    "name the search backend to query. Shapes that are known to work:",
-    "  self-hosted SearxNG  http://localhost:8888/search?format=json  (no key)",
-    "  Brave Search API     https://api.search.brave.com/res/v1/web/search  \
-     (header `X-Subscription-Token: {key}`)",
-    "  Kagi Search API      https://kagi.com/api/v0/search  (header `Authorization: Bot {key}`)",
-];
+/// What the endpoint question is preceded by when the daemon sent a list to
+/// name. The shapes themselves are the catalog's; only the sentence is here.
+const ENDPOINT_HELP_HEADER: &str = "name the search backend to query. Shapes that are known to \
+                                    work:";
 
-/// The credential header each backend in [`ENDPOINT_HELP`] actually needs,
-/// keyed by the host of the endpoint it is offered under.
+/// The same preamble with nothing to list — a daemon that predates the catalog
+/// (BR-3). It asks the question and names no backend, because a client that
+/// filled the silence with a list of its own is the drift REQ-573 removes.
+const ENDPOINT_HELP_BARE: &str = "name the search backend to query.";
+
+/// The suggestions to show above the endpoint question, rendered from the
+/// catalog the daemon sent (BR-1).
 ///
-/// Two lists, one fact: the block above tells the user what the header is, and
-/// this makes it the offer when they type that endpoint. They are kept adjacent
-/// because a backend added to one and not the other is exactly the trap this
-/// closes — an endpoint the walkthrough suggests, an offered default the backend
-/// rejects, and a 401 the user reads as a bad key.
+/// Every backend fact in the output — the name, the endpoint, the header it
+/// wants, any note — arrives as data. The one thing composed here is the layout:
+/// the labels are padded to the widest one so the endpoints line up in a column,
+/// which is a property of the list rather than of any entry in it.
 ///
-/// **Enumerated elsewhere.** `crates/tetond/tests/web_setup_contracts.rs` reads
-/// *this file's source text* for the product's suggestions: URLs from the
-/// `ENDPOINT_HELP` slice literal (so it must keep that name and stay a
-/// `];`-terminated literal) and credential-header templates from every
-/// backtick-quoted span in the file, which it then requires the daemon's bundled
-/// guide to name too. A template added here whose backend has no contract row
-/// there turns that suite red — which is the arrangement, not an accident.
-const KNOWN_BACKEND_AUTH: &[(&str, &str)] = &[
-    ("api.search.brave.com", "X-Subscription-Token: {key}"),
-    ("kagi.com", "Authorization: Bot {key}"),
-];
+/// A note gets its own line under the entry it belongs to, indented to the same
+/// column. It is a sentence, and a sentence hung off the end of an already-long
+/// row is where a terminal wraps it into the next backend's line — this way the
+/// row a user reads is the same row whether the daemon sent a note or not.
+fn suggestion_lines(catalog: Option<&WebSetupCatalog>) -> Vec<String> {
+    let backends = catalog.map_or(&[][..], |catalog| catalog.backends.as_slice());
+    let Some(label_width) = backends
+        .iter()
+        .map(|entry| entry.label.chars().count())
+        .max()
+    else {
+        return vec![ENDPOINT_HELP_BARE.to_owned()];
+    };
+    let mut lines = vec![ENDPOINT_HELP_HEADER.to_owned()];
+    for entry in backends {
+        lines.push(suggestion_line(entry, label_width));
+        if let Some(notes) = &entry.notes {
+            lines.push(format!("  {blank:label_width$}  {notes}", blank = ""));
+        }
+    }
+    lines
+}
+
+/// One suggestion as the row a user reads.
+///
+/// **`needs_key` decides whether there is a credential; the template only says
+/// how one would ride.** The protocol declares the two present together (see
+/// `WebBackendSuggestion`), so a template beside `needs_key: false` is a
+/// malformed entry — and the row states the field that is *about* the question
+/// the row answers, rather than inferring the answer back out of the template.
+/// The alternative reads a keyless backend to the user as one that wants a
+/// header, which is the wrong half of a contradiction to believe.
+///
+/// (What [`offered_auth`] does with that same template is a different question —
+/// "if you do have a key, how does it ride?" — asked only of a user who has
+/// already said, at the prompt after this row, that they have one.)
+fn suggestion_line(entry: &WebBackendSuggestion, label_width: usize) -> String {
+    let credential = match (&entry.auth_template, entry.needs_key) {
+        (Some(template), true) => format!("(header `{template}`)"),
+        // A backend that wants a key and names no header of its own: the generic
+        // template is what the next prompt will offer, and saying it needs a key
+        // beats saying nothing.
+        (None, true) => "(needs a key)".to_owned(),
+        (_, false) => "(no key)".to_owned(),
+    };
+    format!(
+        "  {label:label_width$}  {endpoint}  {credential}",
+        label = entry.label,
+        endpoint = entry.endpoint,
+    )
+}
+
+/// The template to offer when nothing more specific applies: the catalog's own
+/// default, or the shared protocol constant when no catalog arrived (ADR-B).
+///
+/// The constant is imported rather than spelled out because both binaries need
+/// the *same* string, and a second literal here is exactly the copy this REQ
+/// deletes.
+fn default_auth(catalog: Option<&WebSetupCatalog>) -> &str {
+    catalog.map_or(GENERIC_SEARCH_AUTH_TEMPLATE, |catalog| {
+        catalog.default_auth_template.as_str()
+    })
+}
 
 /// The auth-header template to offer for `endpoint`.
 ///
-/// A known host gets its own backend's header; everything else — including a
-/// self-hosted instance, a proxy, or anything unparseable — gets the generic
-/// Bearer the daemon defaults to. This decides a *default*, never a value: an
-/// answer typed over the offer wins, and the daemon validates either way.
-fn offered_auth(endpoint: &str) -> &'static str {
-    let Some(host) = endpoint_host(endpoint) else {
-        return DEFAULT_SEARCH_AUTH;
-    };
-    KNOWN_BACKEND_AUTH
-        .iter()
-        .find(|(known, _)| host.eq_ignore_ascii_case(known))
-        .map_or(DEFAULT_SEARCH_AUTH, |(_, template)| *template)
+/// A host the catalog names gets that backend's own header; everything else — a
+/// self-hosted instance, a proxy, anything unparseable, or a daemon that sent no
+/// catalog at all — gets the generic default. This decides a *default*, never a
+/// value: an answer typed over the offer wins, and the daemon validates either
+/// way.
+fn offered_auth(endpoint: &str, catalog: Option<&WebSetupCatalog>) -> String {
+    catalog
+        .and_then(|catalog| matched_backend(endpoint, catalog))
+        .and_then(|entry| entry.auth_template.clone())
+        .unwrap_or_else(|| default_auth(catalog).to_owned())
+}
+
+/// The catalog entry a typed endpoint belongs to, by host (BR-8).
+///
+/// Only entries that named a host **and** a header can match. The host half is
+/// BR-8's: a self-hosted backend's host is wherever the user runs it, so there
+/// is nothing to recognise it by. The header half is a degradation rule — an
+/// entry that names a host but no template has nothing to offer, and matching it
+/// would let a malformed first entry shadow a later, well-formed one for the
+/// same host and silently swap that backend's header for the generic default.
+/// Skipping it falls through to the catalog's own default, which is what a host
+/// nobody claimed already gets.
+fn matched_backend<'a>(
+    endpoint: &str,
+    catalog: &'a WebSetupCatalog,
+) -> Option<&'a WebBackendSuggestion> {
+    let host = endpoint_host(endpoint)?;
+    catalog.backends.iter().find(|entry| {
+        entry.auth_template.is_some()
+            && entry
+                .host
+                .as_deref()
+                .is_some_and(|known| host.eq_ignore_ascii_case(known))
+    })
 }
 
 /// The host of an absolute `http(s)` endpoint, or `None` when it is not one.
 ///
 /// Deliberately small and deliberately not a validator: whether the endpoint is
 /// acceptable is the daemon's answer (BR-7), and this only has to be right
-/// enough to recognise a host the product itself suggested. Anything it cannot
-/// read falls back to the generic offer, which is the pre-existing behaviour.
+/// enough to recognise a host the catalog names. Anything it cannot read falls
+/// back to the generic offer, which is the pre-existing behaviour.
+///
+/// **Residual, and the condition it rests on** (LESSON-494). This splits only on
+/// `/`, `?` and `#`, so an authority containing a backslash reads differently
+/// here than it would in a WHATWG-shaped parser — `https://evil.test\@kagi.com/`
+/// is the shape of the disagreement. That is tolerable for exactly two reasons,
+/// both outside this function: `Config::validate` refuses such an endpoint
+/// outright (`teton_core::ConfigError::InvalidWebSearchEndpoint`), so no config
+/// this offer leads to can ever load; and the host the *user* is shown before
+/// confirming comes from the daemon's canonical parse, on
+/// `WebSetupPreviewResult::search_host`, not from this. A disagreement therefore
+/// costs at most a wrong *default* on a config that will be refused. **If that
+/// refusal is ever softened, this parse has to move to the canonical parser** —
+/// the loose read is only safe while the strict one is the gate behind it.
 fn endpoint_host(endpoint: &str) -> Option<&str> {
     let endpoint = endpoint.trim();
     let rest = endpoint
@@ -1029,7 +1145,16 @@ fn ambiguous_commit_line(prior: &Option<PriorKey>) -> String {
 /// collected is named here, in the vocabulary the config file uses, so the same
 /// outcome is reachable by hand. Nothing is read from stdin — the line the user
 /// typed for the session stays theirs.
-fn instruction_lines() -> Vec<(LineKind, String)> {
+///
+/// The two facts a backend owns — an endpoint worth pasting and the header a key
+/// rides — come from the same catalog the walkthrough draws (BR-1). The example
+/// is the catalog's first entry, which is the order a client is told to show
+/// them in; a daemon that sent no catalog gets the field named without an
+/// example rather than one this file made up.
+fn instruction_lines(catalog: Option<&WebSetupCatalog>) -> Vec<(LineKind, String)> {
+    let example_endpoint = catalog
+        .and_then(|catalog| catalog.backends.first())
+        .map(|entry| entry.endpoint.as_str());
     [
         (
             LineKind::Notice,
@@ -1052,9 +1177,12 @@ fn instruction_lines() -> Vec<(LineKind, String)> {
         ),
         (
             LineKind::Info,
-            "  search_endpoint  the backend the `search` tier queries, e.g. \
-             http://localhost:8888/search?format=json"
-                .to_owned(),
+            match example_endpoint {
+                Some(endpoint) => format!(
+                    "  search_endpoint  the backend the `search` tier queries, e.g. {endpoint}"
+                ),
+                None => "  search_endpoint  the backend the `search` tier queries".to_owned(),
+            },
         ),
         (
             LineKind::Info,
@@ -1067,7 +1195,8 @@ fn instruction_lines() -> Vec<(LineKind, String)> {
             LineKind::Info,
             format!(
                 "  search_auth      the header the key rides, `{{key}}` marking the secret \
-                 (default `{DEFAULT_SEARCH_AUTH}`)"
+                 (default `{}`)",
+                default_auth(catalog)
             ),
         ),
         // The reference above names an entry that does not exist yet, and the
@@ -1217,6 +1346,7 @@ mod tests {
             search_available: true,
             search_gap: None,
             current_web: None,
+            suggestion_catalog: Some(shipped_catalog()),
         }
     }
 
@@ -1226,6 +1356,166 @@ mod tests {
             search_available: false,
             search_gap: Some("search needs the local model".to_owned()),
             current_web: None,
+            // A daemon that cannot serve search still sends its catalog: what
+            // this fixture varies is the gap, and nothing else.
+            suggestion_catalog: Some(shipped_catalog()),
+        }
+    }
+
+    /// The catalog as the daemon ships it, at the values the product uses.
+    ///
+    /// **This is the parity fixture** (AC-6). These are the only lines in this
+    /// crate where the shipped backends are spelled out, and they are *test
+    /// data*: the flow reads none of them, which is the point —
+    /// `the_shipped_catalog_renders_the_req_572_wording_byte_for_byte` feeds them
+    /// in and pins the bytes that come out, so a rendering change that moved the
+    /// wording fails here rather than in a user's terminal.
+    ///
+    /// **Nothing checks this copy against the daemon's.** It is a hand-written
+    /// transcription of `tetond::web_setup_catalog::suggestion_catalog()`, and if
+    /// the daemon changed a label tomorrow this fixture would keep asserting the
+    /// old one, green. Two things are load-bearing instead of that: the daemon's
+    /// own golden test is the authority for what the shipped strings *are*
+    /// (ADR-E), and `cli_e2e`'s walkthrough — which runs the real daemon's
+    /// catalog through the real renderer — is the one assertion in CI where the
+    /// two ends meet, so a drift between them fails there. What this fixture pins
+    /// is the renderer, given a catalog.
+    fn shipped_catalog() -> WebSetupCatalog {
+        WebSetupCatalog {
+            default_auth_template: GENERIC_SEARCH_AUTH_TEMPLATE.to_owned(),
+            backends: vec![
+                WebBackendSuggestion {
+                    id: "searxng".to_owned(),
+                    label: "self-hosted SearxNG".to_owned(),
+                    endpoint: "http://localhost:8888/search?format=json".to_owned(),
+                    host: None,
+                    auth_template: None,
+                    needs_key: false,
+                    notes: None,
+                },
+                WebBackendSuggestion {
+                    id: "brave".to_owned(),
+                    label: "Brave Search API".to_owned(),
+                    endpoint: "https://api.search.brave.com/res/v1/web/search".to_owned(),
+                    host: Some("api.search.brave.com".to_owned()),
+                    auth_template: Some("X-Subscription-Token: {key}".to_owned()),
+                    needs_key: true,
+                    notes: None,
+                },
+                WebBackendSuggestion {
+                    id: "kagi".to_owned(),
+                    label: "Kagi Search API".to_owned(),
+                    endpoint: "https://kagi.com/api/v0/search".to_owned(),
+                    host: Some("kagi.com".to_owned()),
+                    auth_template: Some("Authorization: Bot {key}".to_owned()),
+                    needs_key: true,
+                    notes: None,
+                },
+            ],
+        }
+    }
+
+    /// A catalog no daemon would ever ship (LESSON-497): every field says
+    /// "sentinel" out loud, so a rendered line carrying one of these words can
+    /// only have come off the wire.
+    fn sentinel_catalog() -> WebSetupCatalog {
+        WebSetupCatalog {
+            default_auth_template: "X-Sentinel-Default: {key}".to_owned(),
+            backends: vec![
+                WebBackendSuggestion {
+                    id: "sentinel-keyless".to_owned(),
+                    label: "Sentinel Keyless".to_owned(),
+                    endpoint: "http://localhost:9999/sentinel?format=json".to_owned(),
+                    host: None,
+                    auth_template: None,
+                    needs_key: false,
+                    notes: None,
+                },
+                WebBackendSuggestion {
+                    id: "sentinel-backend".to_owned(),
+                    label: "Sentinel Backend With A Long Label".to_owned(),
+                    endpoint: "https://sentinel.example/search".to_owned(),
+                    host: Some("sentinel.example".to_owned()),
+                    auth_template: Some("X-Sentinel-Header: {key}".to_owned()),
+                    needs_key: true,
+                    notes: Some("a sentinel note".to_owned()),
+                },
+            ],
+        }
+    }
+
+    /// A catalog whose entries contradict the shape the protocol declares — the
+    /// wire states a daemon should never produce and this client must not be
+    /// steered by.
+    ///
+    /// Deliberately **not** folded into [`sentinel_catalog`]. That fixture is a
+    /// *well-formed* catalog nothing would ship, and the properties asserted over
+    /// it — every hosted suggestion names the header it wants, every template
+    /// offered is one the list the user just read names — are true of any
+    /// well-formed catalog and false of this one. Merging them would have bought
+    /// this coverage by taking the teeth out of those.
+    fn malformed_catalog() -> WebSetupCatalog {
+        WebSetupCatalog {
+            default_auth_template: "X-Sentinel-Default: {key}".to_owned(),
+            backends: vec![
+                // Says it needs a key and names no header to carry one.
+                WebBackendSuggestion {
+                    id: "sentinel-headerless".to_owned(),
+                    label: "Sentinel Headerless".to_owned(),
+                    endpoint: "https://headerless.sentinel.example/search".to_owned(),
+                    host: Some("headerless.sentinel.example".to_owned()),
+                    auth_template: None,
+                    needs_key: true,
+                    notes: None,
+                },
+                // Names a header while saying it needs no key.
+                WebBackendSuggestion {
+                    id: "sentinel-vestigial".to_owned(),
+                    label: "Sentinel Vestigial".to_owned(),
+                    endpoint: "https://vestigial.sentinel.example/search".to_owned(),
+                    host: Some("vestigial.sentinel.example".to_owned()),
+                    auth_template: Some("X-Sentinel-Vestigial: {key}".to_owned()),
+                    needs_key: false,
+                    notes: None,
+                },
+                // Two entries for one host, the template-less one first: the
+                // shadowing case the host match has to see past.
+                WebBackendSuggestion {
+                    id: "sentinel-shadow-empty".to_owned(),
+                    label: "Sentinel Shadow Empty".to_owned(),
+                    endpoint: "https://shadow.sentinel.example/search".to_owned(),
+                    host: Some("shadow.sentinel.example".to_owned()),
+                    auth_template: None,
+                    needs_key: true,
+                    notes: None,
+                },
+                WebBackendSuggestion {
+                    id: "sentinel-shadow-real".to_owned(),
+                    label: "Sentinel Shadow Real".to_owned(),
+                    endpoint: "https://shadow.sentinel.example/v1/search".to_owned(),
+                    host: Some("shadow.sentinel.example".to_owned()),
+                    auth_template: Some("X-Sentinel-Shadowed: {key}".to_owned()),
+                    needs_key: true,
+                    notes: None,
+                },
+            ],
+        }
+    }
+
+    /// The piped instructions as one string — the BR-12 path, rendered.
+    fn rendered_instructions(catalog: Option<&WebSetupCatalog>) -> String {
+        instruction_lines(catalog)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The plan a daemon that predates the catalog answers with (BR-3).
+    fn plan_without_a_catalog() -> WebSetupPlanResult {
+        WebSetupPlanResult {
+            suggestion_catalog: None,
+            ..plan_ready_for_search()
         }
     }
 
@@ -1253,12 +1543,17 @@ mod tests {
         }
     }
 
+    /// The header template the full walk *types* — a value of the user's own,
+    /// deliberately not a backend's, so what it pins is that a typed answer rides
+    /// the wire as typed.
+    const TYPED_AUTH: &str = "X-Typed-Header: {key}";
+
     /// The answers of a complete search walk with a key.
     const FULL_WALK: &[&str] = &[
         "3",
         "https://example.test/search",
         "y",
-        "X-Subscription-Token: {key}",
+        TYPED_AUTH,
         PLANTED_KEY,
         "y",
     ];
@@ -1267,6 +1562,14 @@ mod tests {
     /// commit — and only when the daemon offered one: an empty digest is a
     /// daemon that predates the field, and inventing a value for it could
     /// only ever mismatch.
+    ///
+    /// The degrade must also be **said** (BUG-166 residual (a)): silently
+    /// dropping the confirmed-bytes check on version skew made the guard's
+    /// absence a fact only the source code knew, and it is rendered before
+    /// the confirm question because declining is the one act the flow offers
+    /// a user who minds. Both directions are pinned — the notice when the
+    /// check is off, its absence when the check is on — or the line would
+    /// drift into constant noise the first time someone hoisted it.
     #[test]
     fn a_previewed_digest_rides_the_commit_and_an_absent_one_does_not() {
         let mut io = FakeIo::new(FULL_WALK);
@@ -1274,6 +1577,10 @@ mod tests {
         let keychain = MockKeychain::new();
         drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
         assert_eq!(io.commits[0].expect_digest.as_deref(), Some("abc123"));
+        assert!(
+            !io.rendered().contains(DIGEST_CHECK_UNAVAILABLE),
+            "a daemon that offered a digest must not be reported as lacking one"
+        );
 
         let mut io = FakeIo::new(FULL_WALK);
         let keychain = MockKeychain::new();
@@ -1281,6 +1588,11 @@ mod tests {
         assert_eq!(
             io.commits[0].expect_digest, None,
             "an empty digest from an old daemon must degrade to the protocol's own do-not-check"
+        );
+        assert!(
+            io.rendered().contains(DIGEST_CHECK_UNAVAILABLE),
+            "and the degrade must be rendered, not silent: the user is about to \
+             confirm bytes the daemon will not be held to"
         );
     }
 
@@ -1329,6 +1641,48 @@ mod tests {
         );
     }
 
+    /// **BR-3 on the piped path, driven through [`drive`] rather than through
+    /// [`instruction_lines`].**
+    ///
+    /// The two degradations compose: no terminal *and* no catalog. Calling
+    /// `instruction_lines(None)` proves what that function renders; it does not
+    /// prove that `drive` hands it the plan's `None` rather than a catalog
+    /// synthesised on the way, nor that the path still asks nothing. Both are
+    /// exactly the sort of thing an edit to the gate could quietly change, so the
+    /// combination is asserted where a user would meet it.
+    #[test]
+    fn a_piped_session_without_a_catalog_names_no_backend_and_still_asks_nothing() {
+        let mut io = FakeIo::new(&["3", "https://example.test/search"]);
+        io.plan = Ok(plan_without_a_catalog());
+        let keychain = MockKeychain::new();
+        drive(&mut io, &keychain, &session(), Gate::Instructions).unwrap();
+
+        assert_eq!(
+            io.prompter.asked, 0,
+            "the instruction path must not read stdin"
+        );
+        assert!(io.previews.is_empty() && io.commits.is_empty());
+        assert!(keychain.is_empty() && keychain.deletes().is_empty());
+
+        let rendered = io.rendered();
+        // The field is still named; no example is invented for it.
+        assert!(
+            rendered.contains("  search_endpoint  the backend the `search` tier queries")
+                && !rendered.contains("e.g."),
+            "no catalog means the field is named without an example:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(GENERIC_SEARCH_AUTH_TEMPLATE),
+            "the header default degrades to the shared protocol constant:\n{rendered}"
+        );
+        for shipped in shipped_catalog().backends {
+            assert!(
+                !rendered.contains(&shipped.label) && !rendered.contains(&shipped.endpoint),
+                "no catalog arrived, so no backend may be named:\n{rendered}"
+            );
+        }
+    }
+
     /// The whole walk: the key reaches the keychain, and only its **reference**
     /// reaches the wire (AC-5, ADR-3).
     #[test]
@@ -1351,10 +1705,7 @@ mod tests {
             Some("keychain://teton/web-search")
         );
         assert_eq!(io.commits[0].tier, WebTier::Search);
-        assert_eq!(
-            io.commits[0].search_auth.as_deref(),
-            Some("X-Subscription-Token: {key}")
-        );
+        assert_eq!(io.commits[0].search_auth.as_deref(), Some(TYPED_AUTH));
         // The preview carried the same reference, which is what makes the bytes
         // the user confirmed the bytes the commit writes.
         assert_eq!(io.previews[0].search_key_ref, io.commits[0].search_key_ref);
@@ -1896,40 +2247,50 @@ mod tests {
         );
     }
 
-    /// AC-8's trap, closed: the walkthrough offers Brave's *own* header when the
-    /// user types Brave's endpoint, and pressing Enter sends that on the wire.
+    /// AC-8's trap, closed: the walkthrough offers a suggested backend's *own*
+    /// header when the user types that backend's endpoint, and pressing Enter
+    /// sends that header on the wire.
     ///
-    /// The generic Bearer against `api.search.brave.com` is a 401 the user reads
-    /// as a bad key — a suggestion list that names the right header in one line
-    /// and offers the wrong one at the next prompt is worse than no suggestion.
+    /// The generic template against a backend that wants its own is a 401 the
+    /// user reads as a bad key — a suggestion list that names the right header in
+    /// one line and offers the wrong one at the next prompt is worse than no
+    /// suggestion. Which backend it is, the catalog decides.
     #[test]
     fn a_known_backend_is_offered_its_own_auth_header_and_enter_takes_it() {
-        const BRAVE_WALK: &[&str] = &[
+        let catalog = shipped_catalog();
+        let entry = catalog
+            .backends
+            .iter()
+            .find(|entry| entry.host.is_some())
+            .expect("the shipped catalog names a backend with a host");
+        let template = entry
+            .auth_template
+            .as_deref()
+            .expect("a hosted suggestion names the header it wants");
+        let mut io = FakeIo::new(&[
             "3",
-            "https://api.search.brave.com/res/v1/web/search",
+            &entry.endpoint,
             "y",
             "", // Enter: take what was offered.
             PLANTED_KEY,
             "y",
-        ];
-        let mut io = FakeIo::new(BRAVE_WALK);
+        ]);
         let keychain = MockKeychain::new();
         drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
 
         assert!(
-            io.prompter
-                .any_question_contains("X-Subscription-Token: {key}"),
+            io.prompter.any_question_contains(template),
             "the offer must be stated in the prompt, since Enter is how it is taken: {:?}",
             io.prompter.questions
         );
         assert_eq!(io.commits.len(), 1);
         assert_eq!(
             io.commits[0].search_auth.as_deref(),
-            Some("X-Subscription-Token: {key}"),
-            "an empty answer must put the offered template on the wire, not a Bearer default"
+            Some(template),
+            "an empty answer must put the offered template on the wire, not the generic default"
         );
 
-        // An unknown host is unchanged: the generic Bearer is offered, and an
+        // An unknown host is unchanged: the generic template is offered, and an
         // empty answer still means "no key at all", so the daemon's one default
         // stays one value in one place.
         let mut io = FakeIo::new(&[
@@ -1944,7 +2305,7 @@ mod tests {
         drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
         assert!(
             io.prompter
-                .any_question_contains("Authorization: Bearer {key}"),
+                .any_question_contains(&catalog.default_auth_template),
             "{:?}",
             io.prompter.questions
         );
@@ -1954,62 +2315,479 @@ mod tests {
         );
     }
 
-    /// The offer is decided from the endpoint's host, and everything it cannot
-    /// read falls back to the generic Bearer — which is the behaviour that was
-    /// there before this table existed.
+    /// The offer is decided from the endpoint's host against the catalog the
+    /// daemon sent, and everything it cannot read falls back to that catalog's
+    /// own default — the behaviour that was there when the table lived in this
+    /// file, now a property of the data.
+    ///
+    /// Driven over both catalogs, so what is asserted is the rule rather than
+    /// the three backends that happen to be shipped today.
     #[test]
     fn the_offered_auth_header_follows_the_endpoints_host() {
-        for endpoint in [
-            "https://api.search.brave.com/res/v1/web/search",
-            "https://API.Search.Brave.com/res/v1/web/search",
-            "https://api.search.brave.com:443/res/v1/web/search?q=x",
-        ] {
-            assert_eq!(
-                offered_auth(endpoint),
-                "X-Subscription-Token: {key}",
-                "{endpoint}"
+        for catalog in [shipped_catalog(), sentinel_catalog()] {
+            let hosted: Vec<_> = catalog
+                .backends
+                .iter()
+                .filter(|entry| entry.host.is_some())
+                .collect();
+            assert!(
+                !hosted.is_empty(),
+                "the fixture must carry a backend there is a host to match"
             );
-        }
-        assert_eq!(
-            offered_auth("https://kagi.com/api/v0/search"),
-            "Authorization: Bot {key}"
-        );
-        for endpoint in [
-            "http://localhost:8888/search?format=json",
-            "https://example.test/search",
-            // A host that merely *contains* a known one is not that host.
-            "https://api.search.brave.com.evil.test/res/v1/web/search",
-            "not-a-url",
-            "",
-            "ftp://api.search.brave.com/x",
-        ] {
-            assert_eq!(offered_auth(endpoint), DEFAULT_SEARCH_AUTH, "{endpoint}");
+            for entry in hosted {
+                let host = entry.host.as_deref().expect("filtered on it");
+                let template = entry
+                    .auth_template
+                    .as_deref()
+                    .expect("a hosted suggestion names the header it wants");
+                for endpoint in [
+                    entry.endpoint.clone(),
+                    // Case and port are not part of the answer.
+                    format!("https://{}/some/path", host.to_uppercase()),
+                    format!("https://{host}:443/some/path?q=x"),
+                ] {
+                    assert_eq!(
+                        offered_auth(&endpoint, Some(&catalog)),
+                        template,
+                        "{endpoint}"
+                    );
+                }
+                for endpoint in [
+                    // A host that merely *contains* a catalogued one is not it.
+                    format!("https://{host}.evil.test/some/path"),
+                    // Nor is one behind a scheme the parse does not read.
+                    format!("ftp://{host}/x"),
+                ] {
+                    assert_eq!(
+                        offered_auth(&endpoint, Some(&catalog)),
+                        catalog.default_auth_template,
+                        "{endpoint}"
+                    );
+                }
+            }
+
+            // A keyless suggestion has no host to be recognised by, so its own
+            // endpoint takes the default too — as does anything unparseable.
+            let keyless = catalog
+                .backends
+                .iter()
+                .find(|entry| entry.host.is_none())
+                .expect("the fixture must carry a self-hosted suggestion");
+            for endpoint in [
+                keyless.endpoint.as_str(),
+                "https://example.test/search",
+                "not-a-url",
+                "",
+            ] {
+                assert_eq!(
+                    offered_auth(endpoint, Some(&catalog)),
+                    catalog.default_auth_template,
+                    "{endpoint}"
+                );
+            }
         }
 
         // The host parse itself, including the parts that are not the host.
         assert_eq!(
-            endpoint_host("https://user:pw@kagi.com:443/api/v0/search#frag"),
-            Some("kagi.com")
+            endpoint_host("https://user:pw@host.example:443/api/v0/search#frag"),
+            Some("host.example")
         );
         assert_eq!(endpoint_host("https:///search"), None);
-        assert_eq!(endpoint_host("kagi.com/api"), None);
+        assert_eq!(endpoint_host("host.example/api"), None);
     }
 
-    /// Every template this flow offers is one a backend actually accepts — the
-    /// list and the table are two spellings of one fact, and the trap is what
-    /// happens when they drift.
+    /// Every template this flow offers is one the list it just drew actually
+    /// names — which used to be a promise between two constants kept side by
+    /// side and is now a property of whatever a daemon sends.
     #[test]
     fn every_offered_template_belongs_to_a_backend_the_help_names() {
-        for (host, template) in KNOWN_BACKEND_AUTH {
+        for catalog in [shipped_catalog(), sentinel_catalog()] {
+            let help = suggestion_lines(Some(&catalog)).join("\n");
+            for entry in &catalog.backends {
+                assert!(
+                    help.contains(&entry.endpoint),
+                    "`{}` is a suggestion the user is never shown:\n{help}",
+                    entry.endpoint
+                );
+                let Some(host) = &entry.host else { continue };
+                let offered = offered_auth(&entry.endpoint, Some(&catalog));
+                assert!(
+                    help.contains(&offered),
+                    "`{offered}` is offered for {host} and named nowhere the user can read it:\n\
+                     {help}"
+                );
+            }
+        }
+    }
+
+    /// **AC-2: every backend fact the walkthrough shows came off the wire.**
+    ///
+    /// Fed a catalog nothing would ever ship, the help lines, the offer at the
+    /// auth prompt and the piped instructions all say the sentinel's words — and
+    /// the shipped backends appear nowhere, which is what proves this file kept
+    /// no list of its own (BR-1).
+    #[test]
+    fn the_suggestions_the_walkthrough_shows_are_the_daemons_catalog() {
+        let catalog = sentinel_catalog();
+        let mut io = FakeIo::new(&[
+            "3",
+            "https://sentinel.example/search",
+            "y",
+            "", // Enter: take the offer, which must be the sentinel's header.
+            PLANTED_KEY,
+            "y",
+        ]);
+        io.plan = Ok(WebSetupPlanResult {
+            suggestion_catalog: Some(catalog.clone()),
+            ..plan_ready_for_search()
+        });
+        let keychain = MockKeychain::new();
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+
+        let rendered = io.rendered();
+        for needle in [
+            "Sentinel Keyless",
+            "http://localhost:9999/sentinel?format=json",
+            "(no key)",
+            "Sentinel Backend With A Long Label",
+            "https://sentinel.example/search",
+            "X-Sentinel-Header: {key}",
+            "a sentinel note",
+        ] {
             assert!(
-                ENDPOINT_HELP.iter().any(|line| line.contains(host)),
-                "`{host}` is offered a header by a walkthrough that never suggests it"
-            );
-            assert!(
-                ENDPOINT_HELP.iter().any(|line| line.contains(template)),
-                "`{template}` is offered for {host} and named nowhere the user can read it"
+                rendered.contains(needle),
+                "`{needle}` was sent and never shown:\n{rendered}"
             );
         }
+        for shipped in shipped_catalog().backends {
+            assert!(
+                !rendered.contains(&shipped.label),
+                "`{}` came from nowhere but this file:\n{rendered}",
+                shipped.label
+            );
+        }
+
+        // The offer at the auth prompt is the matched entry's own header, and
+        // Enter puts it on the wire rather than a default it would 401 to.
+        assert!(
+            io.prompter
+                .any_question_contains("X-Sentinel-Header: {key}"),
+            "{:?}",
+            io.prompter.questions
+        );
+        assert_eq!(
+            io.commits[0].search_auth.as_deref(),
+            Some("X-Sentinel-Header: {key}")
+        );
+
+        // An endpoint the catalog does not name gets the catalog's *own*
+        // default, and an empty answer to it still means "no `search_auth` key".
+        let mut io = FakeIo::new(&[
+            "3",
+            "https://unmatched.example/search",
+            "y",
+            "",
+            PLANTED_KEY,
+            "y",
+        ]);
+        io.plan = Ok(WebSetupPlanResult {
+            suggestion_catalog: Some(catalog.clone()),
+            ..plan_ready_for_search()
+        });
+        let keychain = MockKeychain::new();
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+        assert!(
+            io.prompter
+                .any_question_contains("X-Sentinel-Default: {key}"),
+            "{:?}",
+            io.prompter.questions
+        );
+        assert_eq!(
+            io.commits[0].search_auth, None,
+            "the catalog's default is the daemon's to apply, not this flow's to copy"
+        );
+
+        // And the piped path names the same data: the first suggestion as the
+        // example endpoint, and the catalog's default as the header default.
+        let instructions = rendered_instructions(Some(&catalog));
+        assert!(
+            instructions.contains(&catalog.backends[0].endpoint),
+            "{instructions}"
+        );
+        assert!(
+            instructions.contains(&catalog.default_auth_template),
+            "{instructions}"
+        );
+    }
+
+    /// A catalog entry that contradicts the protocol's shape degrades — it does
+    /// not steer the row it draws, and it does not shadow a well-formed entry for
+    /// the same host.
+    ///
+    /// The list arrives over RPC, so "no daemon would send that" is a statement
+    /// about the daemon this client happens to be talking to and not about the
+    /// wire. Three degradations, each of which used to have a sharper failure:
+    ///
+    /// - a backend that wants a key and names no header reads as needing one,
+    ///   and the offer falls through to the catalog's own default;
+    /// - a header beside `needs_key: false` does not make the row claim a
+    ///   credential the entry says it does not want;
+    /// - a template-less entry no longer wins the host match ahead of the entry
+    ///   that names the header — which would have swapped that backend's real
+    ///   header for the generic default, and produced a config it answers 401 to.
+    #[test]
+    fn a_malformed_catalog_entry_neither_steers_its_row_nor_shadows_a_real_one() {
+        let catalog = malformed_catalog();
+        let lines = suggestion_lines(Some(&catalog));
+        let row = |label: &str| {
+            lines
+                .iter()
+                .find(|line| line.contains(label))
+                .unwrap_or_else(|| panic!("`{label}` is a suggestion nobody is shown:\n{lines:#?}"))
+        };
+        assert!(
+            row("Sentinel Headerless").ends_with("(needs a key)"),
+            "a backend that wants a key and names no header still says so: {:?}",
+            row("Sentinel Headerless")
+        );
+        assert!(
+            row("Sentinel Vestigial").ends_with("(no key)"),
+            "`needs_key` decides whether there is a credential, not the template: {:?}",
+            row("Sentinel Vestigial")
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("X-Sentinel-Vestigial")),
+            "a header on a keyless entry is not a header the row may advertise:\n{lines:#?}"
+        );
+
+        // A host matched to an entry with nothing to offer takes the catalog's
+        // default — the same answer a host nobody claimed gets.
+        assert_eq!(
+            offered_auth("https://headerless.sentinel.example/search", Some(&catalog)),
+            catalog.default_auth_template
+        );
+
+        // And the shadowing case: the template-less entry for this host is first
+        // in the list, and the one that names a header still wins.
+        for endpoint in [
+            "https://shadow.sentinel.example/search",
+            "https://shadow.sentinel.example/v1/search",
+        ] {
+            assert_eq!(
+                offered_auth(endpoint, Some(&catalog)),
+                "X-Sentinel-Shadowed: {key}",
+                "{endpoint}"
+            );
+        }
+    }
+
+    /// **An empty catalog is its own wire state, and it is not `None`.**
+    ///
+    /// A daemon that sent `suggestion_catalog: {"backends": [], ...}` is not a
+    /// daemon that predates the field: it declared a default header and named no
+    /// backend. So the two states agree about the *list* — there is nothing to
+    /// show, and both collapse to the bare preamble — and disagree about the
+    /// *default*, where the present catalog's own value wins over the shared
+    /// protocol constant.
+    ///
+    /// **That asymmetry is deliberate.** A catalog is the daemon's declaration,
+    /// and `default_auth_template` is a field of it: a daemon that sends one is
+    /// authoritative about the header its own validator expects, whether or not
+    /// it also had backends to suggest. Only the `None` case — no catalog at all
+    /// — is the client's to fill, and it fills it with the constant both binaries
+    /// share (ADR-B). Pinned here because "empty list" and "no catalog" look
+    /// alike enough that collapsing them would be an easy, silent edit.
+    #[test]
+    fn an_empty_catalog_shows_no_backend_and_still_declares_its_own_default() {
+        let empty = WebSetupCatalog {
+            default_auth_template: "X-Sentinel-Default: {key}".to_owned(),
+            backends: Vec::new(),
+        };
+        assert_ne!(
+            empty.default_auth_template, GENERIC_SEARCH_AUTH_TEMPLATE,
+            "the fixture is only worth anything while the two differ"
+        );
+
+        // The list half: identical to the no-catalog path, down to the bytes.
+        assert_eq!(suggestion_lines(Some(&empty)), suggestion_lines(None));
+        assert_eq!(suggestion_lines(Some(&empty)), [ENDPOINT_HELP_BARE]);
+
+        // The default half: the daemon's declaration, not the shared constant.
+        assert_eq!(default_auth(Some(&empty)), empty.default_auth_template);
+        assert_eq!(
+            offered_auth("https://anything.example/search", Some(&empty)),
+            empty.default_auth_template
+        );
+
+        // And the piped instructions say both halves: no example endpoint to
+        // name, and the catalog's own header default.
+        let instructions = rendered_instructions(Some(&empty));
+        assert!(
+            !instructions.contains("e.g."),
+            "an empty catalog has no first entry to hold up as an example:\n{instructions}"
+        );
+        assert!(
+            instructions.contains(&empty.default_auth_template)
+                && !instructions.contains(GENERIC_SEARCH_AUTH_TEMPLATE),
+            "the declared default is the one shown:\n{instructions}"
+        );
+    }
+
+    /// **AC-7/BR-3: a daemon that predates the catalog is not a broken
+    /// walkthrough.**
+    ///
+    /// The list nobody sent is not invented, the offer degrades to the shared
+    /// protocol constant rather than to a literal spelled out here, the
+    /// needs-a-key default is still yes, and the walk still writes.
+    #[test]
+    fn a_daemon_that_sends_no_catalog_still_walks_with_the_generic_offer() {
+        let mut io = FakeIo::new(&[
+            "3",
+            "https://example.test/search",
+            "", // Enter at "does this backend need an API key?": still yes.
+            "", // Enter at the auth question: take the generic offer.
+            PLANTED_KEY,
+            "y",
+        ]);
+        io.plan = Ok(plan_without_a_catalog());
+        let keychain = MockKeychain::new();
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains(ENDPOINT_HELP_BARE),
+            "the endpoint is still asked for:\n{rendered}"
+        );
+        for shipped in shipped_catalog().backends {
+            assert!(
+                !rendered.contains(&shipped.label),
+                "no catalog arrived, so no backend may be named:\n{rendered}"
+            );
+        }
+        assert!(
+            io.prompter
+                .any_question_contains(GENERIC_SEARCH_AUTH_TEMPLATE),
+            "the degraded offer is the protocol's own constant: {:?}",
+            io.prompter.questions
+        );
+
+        // The flow completed: the key was collected because the default answer
+        // to the key question is yes, stored, and only its reference sent.
+        assert_eq!(
+            keychain.stored_secret(SEARCH_KEY_ACCOUNT).as_deref(),
+            Some(PLANTED_KEY),
+            "an empty answer to the key question must still ask for a key"
+        );
+        assert_eq!(io.commits.len(), 1);
+        assert_eq!(
+            io.commits[0].search_key_ref.as_deref(),
+            Some("keychain://teton/web-search")
+        );
+        assert_eq!(
+            io.commits[0].search_auth, None,
+            "the generic default is the daemon's to apply"
+        );
+
+        // The piped path degrades the same way: the field is named, no example
+        // is invented for it, and the header default is the shared constant.
+        let instructions = rendered_instructions(None);
+        assert!(
+            instructions.contains(GENERIC_SEARCH_AUTH_TEMPLATE),
+            "{instructions}"
+        );
+        assert!(
+            !instructions.contains("e.g."),
+            "no catalog means no example endpoint to name:\n{instructions}"
+        );
+    }
+
+    /// **AC-6: the wording did not move.** Fed the catalog the daemon ships, the
+    /// walkthrough renders the same lines byte for byte — the suggestions a user
+    /// reads and the instructions a piped session gets are the same strings they
+    /// were when this file held the list itself.
+    ///
+    /// The baseline is **REQ-572, not a release**: `web/setup_plan` and this
+    /// walkthrough first shipped there and are still unreleased, so the wording
+    /// pinned below has never been in a user's hands under a version number. It
+    /// is named for the REQ that wrote it rather than for v0.1.14, which predates
+    /// it.
+    ///
+    /// The literals are the pin, captured from that implementation. They are test
+    /// data and nothing reads them but this assertion, which is what makes the
+    /// refactor provable rather than merely plausible.
+    #[test]
+    fn the_shipped_catalog_renders_the_req_572_wording_byte_for_byte() {
+        assert_eq!(
+            suggestion_lines(Some(&shipped_catalog())),
+            [
+                "name the search backend to query. Shapes that are known to work:",
+                "  self-hosted SearxNG  http://localhost:8888/search?format=json  (no key)",
+                "  Brave Search API     https://api.search.brave.com/res/v1/web/search  \
+                 (header `X-Subscription-Token: {key}`)",
+                "  Kagi Search API      https://kagi.com/api/v0/search  \
+                 (header `Authorization: Bot {key}`)",
+            ]
+        );
+
+        // A note the daemon chooses to send rides *under* its entry, so the rows
+        // above stay the rows pinned here. No entry the daemon ships today
+        // carries a note — this is the shape a note a daemon *may* send takes,
+        // and AC-6 is about the row, not the count.
+        let mut annotated = shipped_catalog();
+        let note = "a note the daemon added";
+        annotated.backends[0].notes = Some(note.to_owned());
+        let annotated = suggestion_lines(Some(&annotated));
+        assert_eq!(
+            annotated
+                .iter()
+                .filter(|line| !line.contains(note))
+                .cloned()
+                .collect::<Vec<_>>(),
+            suggestion_lines(Some(&shipped_catalog())),
+            "a note may add a line and must not touch one"
+        );
+        let note_line = annotated
+            .iter()
+            .find(|line| line.contains(note))
+            .expect("the note is shown at all");
+        let column = suggestion_lines(Some(&shipped_catalog()))[1]
+            .find("http://")
+            .expect("the row names its endpoint");
+        assert_eq!(
+            *note_line,
+            format!("{}{note}", " ".repeat(column)),
+            "the note lines up under the endpoint column"
+        );
+
+        let instructions: Vec<String> = instruction_lines(Some(&shipped_catalog()))
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(
+            instructions,
+            [
+                "`/web setup` collects an endpoint and a key without echoing it, which needs a \
+                 terminal — this session's input is not one, so nothing was read and nothing was \
+                 changed.",
+                "run `teton` in a terminal and type `/web setup`, or write the `[web]` table into \
+                 your config yourself:",
+                "  tier             \"fetch_user_url\" | \"fetch_any_url\" | \"search\" (each \
+                 includes the ones before it)",
+                "  search_endpoint  the backend the `search` tier queries, e.g. \
+                 http://localhost:8888/search?format=json",
+                "  search_key_ref   a keychain reference — `keychain://teton/web-search` — never \
+                 a raw key",
+                "  search_auth      the header the key rides, `{key}` marking the secret (default \
+                 `Authorization: Bearer {key}`)",
+                "the keychain entry itself is written with `security add-generic-password -s \
+                 teton -a web-search -w` — put `-w` last and it prompts for the key instead of \
+                 leaving it in your shell history.",
+                "the `search` tier also needs the local model, which scans every query before it \
+                 leaves the machine.",
+            ]
+        );
     }
 
     /// Both tier spellings reach the same tier, and nothing else resolves to
@@ -2075,6 +2853,7 @@ mod tests {
             search_available: false,
             search_gap: None,
             current_web: None,
+            suggestion_catalog: None,
         };
         let menu = tier_menu_lines(&plan).join("\n");
         assert!(menu.contains(UNNAMED_GAP), "{menu}");
@@ -2091,13 +2870,13 @@ mod tests {
             tier: WebTier::Search,
             search_host: Some("search.example".to_owned()),
             search_key_ref: Some("keychain://teton/web-search".to_owned()),
-            search_auth: Some("Authorization: Bot {key}".to_owned()),
+            search_auth: Some("X-Configured-Header: {key}".to_owned()),
         });
         for needle in [
             "search",
             "search.example",
             "keychain://teton/web-search",
-            "Authorization: Bot {key}",
+            "X-Configured-Header: {key}",
         ] {
             assert!(line.contains(needle), "{line}");
         }
