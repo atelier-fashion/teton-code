@@ -18,6 +18,7 @@ Values for this project:
 - `daemon/lifecycle`
 - `daemon/egress`
 - `daemon/cost-ledger`
+- `daemon/config` (config load/persist seam, on-disk document handling)
 - `inference/local`
 - `inference/probe`
 - `providers/anthropic`
