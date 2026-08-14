@@ -1,7 +1,7 @@
 ---
 id: REQ-573
 title: "Daemon-owned web-setup suggestion catalog in web/setup_plan"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-14
 updated: 2026-08-14
