@@ -44,6 +44,7 @@ mod session_ui;
 mod slash;
 mod status;
 mod uninstall;
+mod web_setup_ui;
 
 use client::{Connection, UiContext};
 use keychain::Keychain;
@@ -506,20 +507,26 @@ fn read_permission_level(conn: &mut Connection, ctx: &mut UiContext<'_>, session
     }
 }
 
-/// Read the daemon's reasoning-effort view into the render cache (REQ-559 /
-/// REQ-560).
+/// Read the daemon's config view into the render cache: the reasoning-effort
+/// view (REQ-559 / REQ-560) and the web capability state (REQ-572).
 ///
-/// Best-effort for the same reason [`read_permission_level`] is: a daemon that
-/// predates the setting leaves it `None`, and the status row then shows the
-/// permission field alone. Silent, because an error line at every startup
-/// against an older daemon would be noise about a feature the user has not asked
-/// for.
+/// One `config/get`, two fields, because they come off one snapshot and a second
+/// call would be a second round-trip for a row that draws once. Best-effort for
+/// the same reason [`read_permission_level`] is: a daemon that predates either
+/// field leaves it `None`, and the status row then shows what it can. Silent,
+/// because an error line at every startup against an older daemon would be noise
+/// about a feature the user has not asked for.
 ///
-/// Kept fresh by `/effort`'s own handler, which caches what the daemon reports
-/// after a set — so the row cannot go on showing a level the user has changed.
-fn read_effort_view(conn: &mut Connection, ctx: &mut UiContext<'_>) {
+/// Both halves are kept fresh by whoever changes them: `/effort`'s handler
+/// caches what the daemon reports after a set, and the `web_setup_completed`
+/// event folds the new ceiling in — so neither can go on showing a value the
+/// user has already changed.
+fn read_config_view(conn: &mut Connection, ctx: &mut UiContext<'_>) {
     if let Ok(Ok(cfg)) = conn.call(ConfigGetParams::default(), ctx) {
         ctx.state.effort = cfg.snapshot.effort;
+        // The daemon's own derivation, from the predicate that also governs tool
+        // exposure — never a second reading of `[web] tier` here (REQ-572 BR-3).
+        ctx.state.web.capability = cfg.snapshot.web_capability;
     }
 }
 
@@ -721,7 +728,7 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
         // rather than showing a guess.
         if interactive {
             read_permission_level(&mut conn, &mut ctx, &session_id);
-            read_effort_view(&mut conn, &mut ctx);
+            read_config_view(&mut conn, &mut ctx);
         }
         // The indicator's animation clock, persisted across turns so the dots do
         // not restart every time a turn ends (REQ-556).
@@ -2988,6 +2995,58 @@ mod tests {
         assert!(
             web_at < motion_at,
             "the indicator must stay last, directly above the frame: {notices:?}"
+        );
+    }
+
+    /// REQ-572: the capability `read_config_view` folds off the config snapshot
+    /// changes what the status field *says* and not whether the row is *drawn*.
+    ///
+    /// Asserted at the paint, because this is where the two could come apart: a
+    /// machine with no `[web]` table — the default everywhere — must go on
+    /// drawing exactly what it drew before (REQ-563 BR-1), and so must a
+    /// configured machine whose session has not touched the web, which is the
+    /// state REQ-563's pty test observes before it engages the row.
+    #[test]
+    fn the_reported_capability_changes_the_field_and_not_the_row() {
+        use teton_protocol::events::{WebCapabilityState, WebTier};
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        let mut ctx = UiContext {
+            surface: &mut surface,
+            state: &mut state,
+            prompter: &mut prompter,
+            answer_permissions: true,
+            answer_model_proposals: true,
+            auto_accept_model: false,
+            typed_input: true,
+            session_id: None,
+        };
+
+        for (capability, expected) in [
+            (WebCapabilityState::OffAvailable, "web: off (available)"),
+            (
+                WebCapabilityState::Ready {
+                    tier: WebTier::FetchAnyUrl,
+                },
+                "web: fetch (configured)",
+            ),
+        ] {
+            ctx.state.web.capability = Some(capability);
+            assert_eq!(
+                paint_status(&mut ctx, 0),
+                0,
+                "the machine's configuration is not something this session did"
+            );
+            // The field exists and is the richer one — what is suppressed is the
+            // row, not the vocabulary.
+            assert_eq!(ctx.state.web.status_field(), expected);
+        }
+        assert!(
+            surface.calls.is_empty(),
+            "nothing at all should have been drawn: {:?}",
+            surface.calls
         );
     }
 

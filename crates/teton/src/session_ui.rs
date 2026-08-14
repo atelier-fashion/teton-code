@@ -26,13 +26,14 @@
 use std::collections::{HashMap, HashSet};
 
 use teton_protocol::events::{
-    AttachConsentRequested, BlockCause, ConsentScope, DaemonClientAttach, DaemonLifetimeStage,
-    Event, EventEnvelope, EvictionReason, FailureClass, ModelLifecycle, ModelSelectionProposed,
-    PermissionOption, PermissionOptionKind, PermissionRequest, PhaseTransition, PrefixCache,
-    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected,
-    ProvenanceRejection, ProviderDegraded, RouteDecided, SessionGrantMinted, SessionUpdatePayload,
-    ToolCallStatus, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome,
-    WebTier, OPTION_ID_ENABLE_PERMANENT,
+    AttachConsentRequested, BlockCause, CapabilityDeadEnd, ConsentScope, DaemonClientAttach,
+    DaemonLifetimeStage, Event, EventEnvelope, EvictionReason, FailureClass, ModelLifecycle,
+    ModelSelectionProposed, PermissionOption, PermissionOptionKind, PermissionRequest,
+    PhaseTransition, PrefixCache, PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock,
+    ProvenanceRejected, ProvenanceRejection, ProviderDegraded, RouteDecided, SessionGrantMinted,
+    SessionUpdatePayload, ToolCallStatus, WebCapabilityState, WebConsentDecided, WebConsentScope,
+    WebLookup, WebLookupKind, WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier,
+    OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -151,11 +152,18 @@ pub struct SessionState {
 
 /// What the session's web capability currently is, for the status row.
 ///
-/// Derived entirely from the event stream rather than from config, and that is
-/// the point: the status row's job is to say what *this session* can do now, and
-/// a config read at startup would keep saying `fetch` through a taint trip that
-/// disabled it. Every field here is written by exactly one event kind.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// Three of its four fields are derived entirely from the event stream rather
+/// than from config, and that is the point: the status row's job is to say what
+/// *this session* can do now, and a config read at startup would keep saying
+/// `fetch` through a taint trip that disabled it. Each of those is written by
+/// exactly one event kind.
+///
+/// [`Self::capability`] is the exception and the reason is symmetric: what the
+/// **machine** is configured for is not observable from this session's events at
+/// all — a session that has never looked anything up produces none — so it comes
+/// from the daemon's own derivation on the config snapshot (REQ-572 BR-3/BR-10)
+/// and is refreshed when a setup commit announces itself.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WebState {
     /// The highest tier this session has been observed to hold, from consent
     /// decisions and from lookups that actually ran.
@@ -169,21 +177,39 @@ pub struct WebState {
     restricted: bool,
     /// The user lifted that restriction with `/web allow` (BR-13, AC-12).
     overridden: bool,
+    /// What the machine's `[web]` table amounts to, as the daemon derived it
+    /// (REQ-572).
+    ///
+    /// `None` means nobody has read a config snapshot yet, or the daemon
+    /// predates the field — both of which are "no answer", and neither is a
+    /// reason to invent one. It carries the wire state rather than a projection
+    /// of it so the one classifier that governs tool exposure is also the one
+    /// this row reads (BR-3, LESSON-456).
+    pub capability: Option<WebCapabilityState>,
 }
 
 impl WebState {
     /// The status-row field: `web: …`.
     ///
-    /// A pure function of the three fields, so it is testable with no terminal —
+    /// A pure function of the four fields, so it is testable with no terminal —
     /// which matters because the row it belongs to is drawn only at a TTY.
     ///
-    /// Order is precedence, not preference. The restricted and overridden states
-    /// are *about* the tiers rather than alternatives to them, and a row can show
-    /// one field: a session that is restricted has had a capability taken away,
-    /// and saying `web: search` while search is refused would be the status row
-    /// contradicting the notice that preceded it.
+    /// Order is precedence, not preference, and REQ-572 did not disturb it. The
+    /// restricted and overridden states are *about* the tiers rather than
+    /// alternatives to them, and a row can show one field: a session that is
+    /// restricted has had a capability taken away, and saying `web: search`
+    /// while search is refused would be the status row contradicting the notice
+    /// that preceded it.
+    ///
+    /// The capability is consulted **last**, in the arm that used to be a flat
+    /// `web: off`, because it answers a different question from the three above
+    /// it: what this session has done is what the others report, and what the
+    /// machine is configured for is only interesting when the session has not
+    /// done anything yet. "Off" and "off but one command away" are the two
+    /// states this REQ exists to tell apart (BR-10), so they no longer share a
+    /// spelling.
     #[must_use]
-    pub fn status_field(self) -> &'static str {
+    pub fn status_field(&self) -> &'static str {
         if self.overridden {
             return "web: overridden";
         }
@@ -191,9 +217,37 @@ impl WebState {
             return "web: restricted (taint)";
         }
         match self.granted {
-            None | Some(WebTier::Off) => "web: off",
             Some(WebTier::FetchUserUrl | WebTier::FetchAnyUrl) => "web: fetch",
             Some(WebTier::Search) => "web: search",
+            None | Some(WebTier::Off) => self.configured_field(),
+        }
+    }
+
+    /// What the machine is configured for, when the session itself has nothing
+    /// to report.
+    ///
+    /// The `(configured)` and `(available)` suffixes are doing work: this row is
+    /// about what *this session* may do, and a bare `web: search` here would
+    /// claim a session-level grant the user has not given — consent is still
+    /// asked per lookup (BR-3 of REQ-563). What these say is that a ceiling
+    /// exists, and what it is.
+    ///
+    /// Every arm is reachable through this function, which is where the AC-4
+    /// assertions read it; [`Self::is_engaged`] records why the *painted* row
+    /// does not reach them yet and what changing that would mean.
+    fn configured_field(&self) -> &'static str {
+        match &self.capability {
+            None => "web: off",
+            Some(WebCapabilityState::OffAvailable) => "web: off (available)",
+            Some(WebCapabilityState::SearchUnavailable { .. }) => "web: search (unavailable)",
+            Some(WebCapabilityState::Ready { tier }) => match tier {
+                // `Ready` never carries `Off` (the wire type says so); if a
+                // daemon ever sends one, "off but available" is the honest
+                // reading of a ceiling of nothing.
+                WebTier::Off => "web: off (available)",
+                WebTier::FetchUserUrl | WebTier::FetchAnyUrl => "web: fetch (configured)",
+                WebTier::Search => "web: search (configured)",
+            },
         }
     }
 
@@ -205,8 +259,23 @@ impl WebState {
     /// still a rendered string ([`Self::status_field`]) because a caller that
     /// draws a full status row needs the field for it; what is suppressed is the
     /// row, not the vocabulary.
+    ///
+    /// **REQ-572 deliberately left this predicate alone.** The capability enters
+    /// what the row *says* and not whether it is *drawn*, so the row keeps
+    /// meaning "what this session has done" — which is what REQ-563's pty
+    /// acceptance test pins, and pins non-vacuously by first observing an absent
+    /// row on a configured machine.
+    ///
+    /// Making a configured or an available capability engage the row is a
+    /// one-arm change here, and it is a **product** decision rather than a
+    /// mechanical one: it would put a permanent row above the prompt of every
+    /// interactive session on every machine, and it would change what the row
+    /// reports from "what this session did" to "what this machine can do". This
+    /// REQ's discoverability is carried by the per-state prompt clause and the
+    /// refusal text (architecture, Half 1), neither of which needs the row, so
+    /// the layout of a session that has not touched the web is unchanged.
     #[must_use]
-    pub fn is_engaged(self) -> bool {
+    pub fn is_engaged(&self) -> bool {
         self.overridden || self.restricted || matches!(self.granted, Some(t) if t != WebTier::Off)
     }
 
@@ -499,20 +568,90 @@ pub fn render_event(
             surface.line(LineKind::Notice, &format_grant_minted(minted));
             EventOutcome::Rendered
         }
-        // REQ-572's three events reach this client as of TASK-127, which added
-        // them to the protocol vocabulary. Their **rendering** is TASK-132's,
-        // with the `/web setup` walkthrough they belong to: BR-14 asks for a
-        // completion and a rejection to be in front of a human, and the
-        // sentence that does that is written where the flow's other sentences
-        // are, not guessed at here.
+        // REQ-572 BR-14 / OQ-2. Never verbose-gated, for `web_consent_decided`'s
+        // reason: the config on disk changed and the machine can now reach the
+        // network in a way it could not a moment ago. A second client attached
+        // to this session watched that happen and is owed the news (LESSON-505).
         //
-        // Arms rather than a `_` catch-all, deliberately: a wildcard would
-        // absorb every event a later REQ adds and turn "this client has no
-        // rendering yet" into a silence nothing fails on.
-        Event::WebSetupCompleted(_) | Event::WebSetupRejected(_) | Event::CapabilityDeadEnd(_) => {
+        // The client that typed `/web setup` renders nothing of its own on a
+        // successful commit, so this line is the completion notice for the
+        // issuer and the bystander alike — one change, one line, drawn by one
+        // piece of code, which is the arrangement `context_cleared` settled on.
+        Event::WebSetupCompleted(completed) => {
+            // The machine's ceiling just moved, and this session's status row
+            // reads it. Folded from the event rather than re-read from config,
+            // because the event is the one thing that arrives *at* the change.
+            state.web.capability = Some(WebCapabilityState::Ready {
+                tier: completed.tier,
+            });
+            surface.line(LineKind::Notice, &format_web_setup_completed(completed));
+            EventOutcome::Rendered
+        }
+        // BR-4/AC-4's defense in depth, announced rather than logged: something
+        // that was not this session's user tried to preview or commit a config
+        // change and was refused. The user is the only one who can act on that,
+        // so it is never verbose-gated either.
+        Event::WebSetupRejected(rejected) => {
+            surface.line(LineKind::Notice, &format_web_setup_rejected(rejected));
+            EventOutcome::Rendered
+        }
+        // Diagnostic chrome, and deliberately thin. The turn that dead-ended
+        // has already told the user what it could not do and what would fix it
+        // — the unserved-turn sentence and the web tool's own refusal both name
+        // their remedy — so an ungated line here would be that fact twice. What
+        // this adds for someone already watching is the capability *id*, which
+        // is what a bug report and the `/web setup` path key on.
+        //
+        // Rendered from the id without branching on it: a client that has never
+        // heard of a capability must still be able to report a dead end in it
+        // (the reason the field is a string at all), and a match arm per id
+        // would be a vocabulary the two ends have to agree on.
+        Event::CapabilityDeadEnd(dead_end) => {
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_capability_dead_end(dead_end));
+            }
             EventOutcome::Rendered
         }
     }
+}
+
+/// The line a completed `/web setup` renders (REQ-572 BR-14, OQ-2).
+///
+/// It says three things, and the third is the settled answer to OQ-2: the
+/// capability is on, the file it was written to, and that **nothing has been
+/// looked up**. No lookup is auto-offered — the flow performs no egress (BR-13),
+/// and the next question that needs the web raises the ordinary per-lookup
+/// consent. A notice that stopped after "enabled" would leave a user expecting
+/// their last question to be answered now, which it will not be.
+fn format_web_setup_completed(completed: &WebSetupCompleted) -> String {
+    format!(
+        "web lookup enabled (`{}`) — written to {}. Nothing has been looked up yet: the next \
+         web-needing question will ask before anything leaves the machine.",
+        web_tier_name(completed.tier),
+        completed.config_path
+    )
+}
+
+/// The line a refused setup call renders (REQ-572 BR-4 / AC-4).
+///
+/// The daemon's `origin` names a *kind* of caller and never an identity, and it
+/// is rendered rather than branched on — the client's only job with it is to
+/// show it. What this adds is the part the user cares about: nothing happened.
+fn format_web_setup_rejected(rejected: &WebSetupRejected) -> String {
+    format!(
+        "web setup refused: the request came from {} rather than from this session's user, so \
+         nothing was previewed and nothing was written.",
+        rejected.origin
+    )
+}
+
+/// The verbose line a capability dead end renders (REQ-572, architecture ADR-4).
+fn format_capability_dead_end(dead_end: &CapabilityDeadEnd) -> String {
+    format!(
+        "capability dead end: `{}` is not configured on this machine, so the turn had nowhere \
+         to go.",
+        dead_end.capability
+    )
 }
 
 /// Put an attach/monitor consent question to the user and build the answer
@@ -2262,6 +2401,122 @@ mod tests {
         assert!(overridden.is_engaged());
     }
 
+    /// REQ-572 AC-4: the two states this REQ exists to tell apart no longer
+    /// share a spelling — "off" (no answer from the daemon) and "off, and one
+    /// command away" are different strings, and a configured ceiling says so
+    /// without claiming a grant this session does not hold.
+    #[test]
+    fn the_capability_field_tells_off_from_off_but_available() {
+        // No answer: a daemon that predates the field, or a snapshot nobody has
+        // read yet. The field says what it always said.
+        let unknown = WebState::default();
+        assert_eq!(unknown.status_field(), "web: off");
+
+        let available = WebState {
+            capability: Some(WebCapabilityState::OffAvailable),
+            ..WebState::default()
+        };
+        assert_eq!(available.status_field(), "web: off (available)");
+
+        for (tier, expected) in [
+            (WebTier::FetchUserUrl, "web: fetch (configured)"),
+            (WebTier::FetchAnyUrl, "web: fetch (configured)"),
+            (WebTier::Search, "web: search (configured)"),
+        ] {
+            let ready = WebState {
+                capability: Some(WebCapabilityState::Ready { tier }),
+                ..WebState::default()
+            };
+            assert_eq!(ready.status_field(), expected, "{tier:?}");
+        }
+
+        let gap = WebState {
+            capability: Some(WebCapabilityState::SearchUnavailable {
+                reason: "search needs the local model".to_owned(),
+            }),
+            ..WebState::default()
+        };
+        assert_eq!(gap.status_field(), "web: search (unavailable)");
+    }
+
+    /// The row's **visibility** rule is REQ-563's and this REQ did not move it:
+    /// a session that has not touched the web draws no row, whatever the machine
+    /// is configured for. It is asserted rather than left implicit because the
+    /// alternative — a permanent capability row above every prompt — is a
+    /// one-arm change away, and it should be a decision somebody takes rather
+    /// than one that arrives with an edit.
+    #[test]
+    fn the_capability_alone_never_makes_the_row_appear() {
+        for capability in [
+            WebCapabilityState::OffAvailable,
+            WebCapabilityState::Ready {
+                tier: WebTier::Search,
+            },
+            WebCapabilityState::SearchUnavailable {
+                reason: "search needs the local model".to_owned(),
+            },
+        ] {
+            let state = WebState {
+                capability: Some(capability.clone()),
+                ..WebState::default()
+            };
+            assert!(
+                !state.is_engaged(),
+                "the machine's configuration is not something this session did: {capability:?}"
+            );
+        }
+
+        // Non-vacuity: the things that *are* this session's still engage it.
+        let mut used = WebState {
+            capability: Some(WebCapabilityState::Ready {
+                tier: WebTier::Search,
+            }),
+            ..WebState::default()
+        };
+        used.observe_tier(WebTier::FetchUserUrl);
+        assert!(used.is_engaged());
+        assert_eq!(used.status_field(), "web: fetch");
+    }
+
+    /// The REQ-563 precedence is untouched: what the **session** did outranks
+    /// what the machine is configured for, in all three directions. A row that
+    /// announced a configured ceiling over a taint restriction would contradict
+    /// the notice the user had just read.
+    #[test]
+    fn the_configured_capability_never_outranks_what_the_session_did() {
+        let configured = || {
+            Some(WebCapabilityState::Ready {
+                tier: WebTier::Search,
+            })
+        };
+
+        let mut granted = WebState {
+            capability: configured(),
+            ..WebState::default()
+        };
+        granted.observe_tier(WebTier::FetchUserUrl);
+        assert_eq!(
+            granted.status_field(),
+            "web: fetch",
+            "an observed grant is what this session actually holds"
+        );
+
+        let restricted = WebState {
+            restricted: true,
+            capability: configured(),
+            ..WebState::default()
+        };
+        assert_eq!(restricted.status_field(), "web: restricted (taint)");
+
+        let overridden = WebState {
+            overridden: true,
+            restricted: true,
+            capability: configured(),
+            ..WebState::default()
+        };
+        assert_eq!(overridden.status_field(), "web: overridden");
+    }
+
     /// The ceiling only ever rises: a refusal after a grant must not read as a
     /// downgrade, and `off` is never "observed".
     #[test]
@@ -2884,6 +3139,137 @@ mod tests {
             ),
             "rendered as {:?}",
             surface.lines_of(LineKind::Notice)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-572: the setup events (BR-14 / AC-4, and OQ-2's settled answer)
+    // ------------------------------------------------------------------
+
+    /// **OQ-2, in one line.** A completed setup says the capability is on, where
+    /// it was written, and — the half that keeps the promise — that nothing has
+    /// been looked up and the next web-needing question will ask first. No
+    /// lookup is fired: the flow performs no egress (BR-13).
+    ///
+    /// Not verbose-gated, asserted: the machine's configuration changed.
+    #[test]
+    fn a_completed_setup_announces_the_tier_and_that_nothing_has_gone_out_yet() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        assert!(!state.verbose, "the default session, deliberately");
+        assert_eq!(
+            state.web.status_field(),
+            "web: off",
+            "non-vacuity: nothing knows about the capability before the commit"
+        );
+
+        render_event(
+            &envelope(Event::WebSetupCompleted(WebSetupCompleted {
+                tier: WebTier::Search,
+                config_path: "/Users/x/.config/teton/config.toml".to_owned(),
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("web lookup enabled"), "{notice}");
+        assert!(notice.contains("`search`"), "{notice}");
+        assert!(
+            notice.contains("/Users/x/.config/teton/config.toml"),
+            "the user must be able to go read what they agreed to: {notice}"
+        );
+        assert!(
+            notice.contains(
+                "the next web-needing question will ask before anything leaves the \
+                           machine"
+            ),
+            "OQ-2's answer is this clause: {notice}"
+        );
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "an enablement is not an error"
+        );
+
+        // The status field learns the new ceiling from the event itself — no
+        // second config read, and no waiting for the next session.
+        assert_eq!(
+            state.web.capability,
+            Some(WebCapabilityState::Ready {
+                tier: WebTier::Search
+            })
+        );
+        assert_eq!(state.web.status_field(), "web: search (configured)");
+    }
+
+    /// AC-4's client leg: a setup call the daemon refused is announced to the
+    /// session's own user, never merely logged (LESSON-505). It names a kind of
+    /// caller — the daemon's own word — and says that nothing happened.
+    #[test]
+    fn a_refused_setup_call_is_announced_and_says_nothing_was_written() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        render_event(
+            &envelope(Event::WebSetupRejected(WebSetupRejected {
+                origin: "an unattached connection".to_owned(),
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("web setup refused"), "{notice}");
+        assert!(notice.contains("an unattached connection"), "{notice}");
+        assert!(notice.contains("nothing was written"), "{notice}");
+        assert!(
+            state.web.capability.is_none(),
+            "a refusal changes no capability state"
+        );
+    }
+
+    /// A dead end is chrome: the turn that hit it already said what it could not
+    /// do and what would fix it, so this renders only for a session that asked
+    /// for the diagnostic detail — and then it names the capability id, which is
+    /// the part a bug report needs.
+    #[test]
+    fn a_capability_dead_end_is_verbose_only_and_names_the_capability() {
+        let dead_end = || {
+            envelope(Event::CapabilityDeadEnd(CapabilityDeadEnd {
+                capability: CapabilityDeadEnd::WEB_SEARCH.to_owned(),
+            }))
+        };
+
+        let mut quiet = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(&dead_end(), &mut quiet, &mut state);
+        assert!(
+            quiet.calls.is_empty(),
+            "a default session renders nothing for it: {:?}",
+            quiet.calls
+        );
+
+        let mut loud = RecordingSurface::new();
+        state.verbose = true;
+        render_event(&dead_end(), &mut loud, &mut state);
+        let notice = loud.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("web_search"), "{notice}");
+        assert!(notice.contains("dead end"), "{notice}");
+
+        // An id this build has never heard of still renders — the field is a
+        // string precisely so a client cannot fail to report one.
+        let mut later = RecordingSurface::new();
+        render_event(
+            &envelope(Event::CapabilityDeadEnd(CapabilityDeadEnd {
+                capability: "a_capability_from_the_future".to_owned(),
+            })),
+            &mut later,
+            &mut state,
+        );
+        assert!(
+            later.any_line_contains(LineKind::Notice, "a_capability_from_the_future"),
+            "{:?}",
+            later.calls
         );
     }
 }
