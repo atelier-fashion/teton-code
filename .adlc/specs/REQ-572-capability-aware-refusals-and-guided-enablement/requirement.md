@@ -1,7 +1,7 @@
 ---
 id: REQ-572
 title: "Capability-aware refusals and guided in-session enablement"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-13
 updated: 2026-08-13
